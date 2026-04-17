@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/rshare-common",
+    "crates/rshare-core",
+    "crates/rshare-net",
+    "crates/rshare-input",
+    "crates/rshare-platform",
+    "apps/rshare-gui",
+    "apps/rshare-cli",
+    "apps/rshare-daemon",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["R-ShareMouse Contributors"]
+repository = "https://github.com/a1112/R-ShareMouse"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "2.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Networking
+quinn = "0.11"
+bytes = "1.7"
+
+# Input handling
+rdev = "0.5"
+enigo = "0.2"
+
+# Clipboard
+arboard = "3.4"
+
+# Configuration
+config = "0.14"
+directories = "5.0"
+toml = "0.8"
+
+# Utils
+uuid = { version = "1.10", features = ["v4", "serde"] }
+hostname = "0.4"
+cfg-if = "1.0"
+
+# GUI
+egui = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }

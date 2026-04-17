@@ -1,0 +1,23 @@
+[package]
+name = "rshare-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rshare-common = { path = "../rshare-common" }
+rshare-platform = { path = "../rshare-platform" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Input event types (for common types)
+rdev = { workspace = true }
+enigo = "0.3"

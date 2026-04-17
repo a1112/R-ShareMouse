@@ -1,0 +1,23 @@
+[package]
+name = "rshare-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rshare-daemon"
+path = "src/main.rs"
+
+[dependencies]
+rshare-core = { path = "../../crates/rshare-core" }
+rshare-net = { path = "../../crates/rshare-net" }
+rshare-input = { path = "../../crates/rshare-input" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hostname = { workspace = true }
