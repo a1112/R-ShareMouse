@@ -1,11 +1,10 @@
 //! Discovery test command
 
+use rshare_net::discovery::{spawn_discovery, DiscoveryConfig, DiscoveryEvent, ServiceDiscovery};
 use std::time::Duration;
 use tokio::time::timeout;
 
 pub async fn run_discover_test() -> anyhow::Result<()> {
-    use rshare_net::discovery::{ServiceDiscovery, DiscoveryConfig, DiscoveryEvent};
-
     println!("R-ShareMouse Discovery Test");
     println!("=========================");
     println!();
@@ -44,7 +43,7 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
     println!("Press Ctrl+C to stop");
     println!();
 
-    discovery.start_with_channel(tx).await?;
+    let discovery_task = spawn_discovery(discovery, tx);
 
     println!("Discovery started! Listening for devices...");
     println!("---");
@@ -53,9 +52,17 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
     loop {
-        match timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Some(event)) => {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!();
+                println!("Total devices found: {}", discovered_count);
+                println!("Stopping discovery...");
+                discovery_task.abort();
+                return Ok(());
+            }
+            event = timeout(Duration::from_secs(1), rx.recv()) => {
                 match event {
+                    Ok(Some(event)) => match event {
                     DiscoveryEvent::DeviceFound(device) => {
                         discovered_count += 1;
                         println!("✓ Device FOUND ({:?}):", start.elapsed());
@@ -78,26 +85,27 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
                     DiscoveryEvent::Error(err) => {
                         println!("! Error: {}", err);
                     }
+                    },
+                    Ok(None) => {
+                        println!("Channel closed");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        print!(".");
+                        std::io::Write::flush(&mut std::io::stdout())?;
+                    }
                 }
-            }
-            Ok(None) => {
-                println!("Channel closed");
-                return Ok(());
-            }
-            Err(_) => {
-                // Timeout - print heartbeat
-                print!(".");
-                std::io::Write::flush(&mut std::io::stdout())?;
             }
         }
     }
 }
 
 /// Interactive discovery test - runs for 30 seconds
-pub async fn run_discover_scan() -> anyhow::Result<()> {
-    use rshare_net::discovery::{ServiceDiscovery, DiscoveryConfig, DiscoveryEvent};
-
-    println!("R-ShareMouse Discovery Scan (30 seconds)");
+pub async fn run_discover_scan(scan_duration: Duration) -> anyhow::Result<()> {
+    println!(
+        "R-ShareMouse Discovery Scan ({} seconds)",
+        scan_duration.as_secs()
+    );
     println!("========================================");
     println!();
 
@@ -116,21 +124,20 @@ pub async fn run_discover_scan() -> anyhow::Result<()> {
 
     let config = DiscoveryConfig {
         port: 27432,
-        broadcast_interval: Duration::from_secs(1),  // Aggressive
+        broadcast_interval: Duration::from_secs(1), // Aggressive
         device_timeout: Duration::from_secs(10),
         mdns_enabled: false,
     };
     discovery = discovery.with_config(config);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    discovery.start_with_channel(tx).await?;
+    let discovery_task = spawn_discovery(discovery, tx);
 
     println!("Scanning...");
     println!("---");
 
     let mut devices = std::collections::HashMap::new();
 
-    let scan_duration = Duration::from_secs(30);
     let start = std::time::Instant::now();
 
     while start.elapsed() < scan_duration {
@@ -153,7 +160,7 @@ pub async fn run_discover_scan() -> anyhow::Result<()> {
         }
     }
 
-    discovery.stop().await.ok();
+    discovery_task.stop().await;
 
     println!();
     println!("---");

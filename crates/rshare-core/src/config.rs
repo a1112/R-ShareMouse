@@ -2,20 +2,24 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
-use uuid::Uuid;
+use std::path::{Path, PathBuf};
 
-use crate::protocol::DeviceId;
+use crate::protocol::{DeviceId, Direction};
 
 /// Application configuration shared by the GUI and engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
+    #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
     pub gui: GuiConfig,
+    #[serde(default)]
     pub input: InputConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     /// Known device hostnames
+    #[serde(default)]
     pub known_devices: Vec<String>,
 }
 
@@ -33,6 +37,14 @@ pub struct GuiConfig {
     pub show_notifications: bool,
     pub start_minimized: bool,
     pub show_tray_icon: bool,
+    #[serde(default)]
+    pub screen_layout: Vec<ScreenLayoutEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenLayoutEntry {
+    pub device_id: DeviceId,
+    pub direction: Direction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,33 +70,58 @@ pub struct SecurityConfig {
     pub lan_only: bool,
 }
 
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            port: 27431,
+            bind_address: "0.0.0.0".to_string(),
+            mdns_enabled: true,
+        }
+    }
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            minimize_to_tray: true,
+            show_notifications: true,
+            start_minimized: false,
+            show_tray_icon: true,
+            screen_layout: Vec::new(),
+        }
+    }
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            clipboard_sync: true,
+            edge_threshold: 10,
+            mouse_wheel_sync: true,
+            key_delay_ms: 0,
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            password_required: false,
+            encryption: true,
+            password_hash: None,
+            trusted_devices: Vec::new(),
+            lan_only: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            network: NetworkConfig {
-                port: 27431,
-                bind_address: "0.0.0.0".to_string(),
-                mdns_enabled: true,
-            },
-            gui: GuiConfig {
-                minimize_to_tray: true,
-                show_notifications: true,
-                start_minimized: false,
-                show_tray_icon: true,
-            },
-            input: InputConfig {
-                clipboard_sync: true,
-                edge_threshold: 10,
-                mouse_wheel_sync: true,
-                key_delay_ms: 0,
-            },
-            security: SecurityConfig {
-                password_required: false,
-                encryption: true,
-                password_hash: None,
-                trusted_devices: Vec::new(),
-                lan_only: true,
-            },
+            network: NetworkConfig::default(),
+            gui: GuiConfig::default(),
+            input: InputConfig::default(),
+            security: SecurityConfig::default(),
             known_devices: Vec::new(),
         }
     }
@@ -213,14 +250,11 @@ impl Default for HotkeyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn temp_config_path(name: &str) -> PathBuf {
         std::env::temp_dir()
-            .join(format!(
-                "rshare-config-test-{}-{}",
-                name,
-                Uuid::new_v4()
-            ))
+            .join(format!("rshare-config-test-{}-{}", name, Uuid::new_v4()))
             .join("config.toml")
     }
 
@@ -234,6 +268,7 @@ mod tests {
         assert!(config.gui.show_notifications);
         assert!(config.gui.show_tray_icon);
         assert!(!config.gui.start_minimized);
+        assert!(config.gui.screen_layout.is_empty());
         assert!(config.input.clipboard_sync);
         assert_eq!(config.input.edge_threshold, 10);
         assert!(config.input.mouse_wheel_sync);
@@ -259,6 +294,10 @@ mod tests {
         config.gui.start_minimized = true;
         config.input.edge_threshold = 24;
         config.security.password_required = true;
+        config.gui.screen_layout.push(ScreenLayoutEntry {
+            device_id: DeviceId::new_v4(),
+            direction: Direction::Right,
+        });
 
         config.save_to_path(&path).unwrap();
         let loaded = Config::load_from_path(&path).unwrap();

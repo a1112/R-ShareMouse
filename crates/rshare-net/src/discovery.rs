@@ -6,9 +6,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant};
 
-use rshare_core::{DeviceId, Message, hello_message, hello_back_message};
+use rshare_core::{hello_back_message, hello_message, DeviceId, Message};
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -320,6 +321,49 @@ impl Drop for ServiceDiscovery {
     }
 }
 
+/// Background discovery task handle.
+///
+/// `ServiceDiscovery::start_with_channel` runs until the service is stopped, so
+/// callers that need to consume events concurrently should use this helper
+/// instead of awaiting `start_with_channel` inline.
+pub struct DiscoveryTask {
+    handle: JoinHandle<()>,
+}
+
+impl DiscoveryTask {
+    /// Abort the background discovery loop and wait for the task to finish.
+    pub async fn stop(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
+    }
+
+    /// Abort the background discovery loop without waiting.
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+
+    /// Check whether the discovery task has already finished.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+/// Spawn a discovery service in the background and forward startup/runtime
+/// errors to the same discovery event stream.
+pub fn spawn_discovery(
+    mut discovery: ServiceDiscovery,
+    event_tx: mpsc::Sender<DiscoveryEvent>,
+) -> DiscoveryTask {
+    let error_tx = event_tx.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(err) = discovery.start_with_channel(event_tx).await {
+            let _ = error_tx.send(DiscoveryEvent::Error(err.to_string())).await;
+        }
+    });
+
+    DiscoveryTask { handle }
+}
+
 /// Serialize a message to bytes
 fn serialize_message(msg: &Message) -> Result<Vec<u8>> {
     serde_json::to_vec(msg).map_err(|e| anyhow::anyhow!("Serialization error: {}", e))
@@ -358,11 +402,7 @@ mod tests {
 
     #[test]
     fn test_message_serialize() {
-        let msg = hello_message(
-            Uuid::new_v4(),
-            "Test".to_string(),
-            "test-host".to_string(),
-        );
+        let msg = hello_message(Uuid::new_v4(), "Test".to_string(), "test-host".to_string());
         let bytes = serialize_message(&msg).unwrap();
         assert!(!bytes.is_empty());
 
@@ -377,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_discovered_device_stale() {
-        let mut device = DiscoveredDevice {
+        let device = DiscoveredDevice {
             id: Uuid::new_v4(),
             name: "Test".to_string(),
             hostname: "test".to_string(),
@@ -387,5 +427,28 @@ mod tests {
 
         assert!(!device.is_stale(Duration::from_secs(10)));
         assert!(device.is_stale(Duration::from_secs(0)));
+    }
+
+    #[tokio::test]
+    async fn spawn_discovery_returns_without_blocking_event_consumer() {
+        let discovery =
+            ServiceDiscovery::new(Uuid::new_v4(), "Test".to_string(), "test-host".to_string())
+                .with_config(DiscoveryConfig {
+                    port: 0,
+                    broadcast_interval: Duration::from_secs(60),
+                    device_timeout: Duration::from_secs(60),
+                    mdns_enabled: false,
+                });
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = spawn_discovery(discovery, tx);
+
+        let no_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            no_event.is_err(),
+            "event consumer should remain independently pollable"
+        );
+
+        task.stop().await;
     }
 }

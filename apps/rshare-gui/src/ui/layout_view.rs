@@ -1,8 +1,8 @@
 //! Screen layout visualization view - enhanced version similar to ShareMouse
 
 use eframe::egui;
+use rshare_core::{config::ScreenLayoutEntry, Direction};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Screen layout view state
 pub struct LayoutView {
@@ -65,7 +65,12 @@ enum EdgeDirection {
 
 impl EdgeDirection {
     fn all() -> &'static [EdgeDirection] {
-        &[EdgeDirection::Left, EdgeDirection::Top, EdgeDirection::Right, EdgeDirection::Bottom]
+        &[
+            EdgeDirection::Left,
+            EdgeDirection::Top,
+            EdgeDirection::Right,
+            EdgeDirection::Bottom,
+        ]
     }
 
     fn name(&self) -> &'static str {
@@ -85,6 +90,37 @@ impl EdgeDirection {
             EdgeDirection::Bottom => EdgeDirection::Top,
         }
     }
+
+    fn to_direction(self) -> Direction {
+        match self {
+            EdgeDirection::Left => Direction::Left,
+            EdgeDirection::Top => Direction::Top,
+            EdgeDirection::Right => Direction::Right,
+            EdgeDirection::Bottom => Direction::Bottom,
+        }
+    }
+
+    fn from_direction(direction: Direction) -> Self {
+        match direction {
+            Direction::Left => EdgeDirection::Left,
+            Direction::Top => EdgeDirection::Top,
+            Direction::Right => EdgeDirection::Right,
+            Direction::Bottom => EdgeDirection::Bottom,
+        }
+    }
+}
+
+fn display_letter(index: usize) -> char {
+    (b'A' + (index.min(25) as u8)) as char
+}
+
+fn brighten(color: egui::Color32, amount: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_premultiplied(
+        color.r().saturating_add(amount),
+        color.g().saturating_add(amount),
+        color.b().saturating_add(amount),
+        color.a(),
+    )
 }
 
 /// Edge hover information
@@ -119,13 +155,13 @@ impl LayoutView {
         let mut screens = HashMap::new();
 
         // Add local screen
-        let mut local_screen = ScreenRect {
+        let local_screen = ScreenRect {
             id: "local".to_string(),
             name: "This PC".to_string(),
             hostname: "Your-Computer".to_string(),
-            x: 300.0,
-            y: 200.0,
-            width: 240.0,
+            x: 170.0,
+            y: 210.0,
+            width: 280.0,
             height: 160.0,
             is_local: true,
             online: true,
@@ -149,9 +185,15 @@ impl LayoutView {
 
     /// Add or update a device screen
     pub fn add_device(&mut self, id: String, name: String, hostname: String, online: bool) {
-        // Generate position based on existing screens
-        let x = 50.0 + (self.screens.len() as f32 * 180.0) % 600.0;
-        let y = 50.0 + (self.screens.len() as f32 * 150.0) % 400.0;
+        if let Some(screen) = self.screens.get_mut(&id) {
+            screen.name = name;
+            screen.hostname = hostname;
+            screen.online = online;
+            return;
+        }
+
+        let x = 170.0 + self.screens.len() as f32 * 290.0;
+        let y = 210.0;
 
         let screen = ScreenRect {
             id: id.clone(),
@@ -159,14 +201,21 @@ impl LayoutView {
             hostname,
             x,
             y,
-            width: 200.0,
-            height: 140.0,
+            width: 280.0,
+            height: 160.0,
             is_local: false,
             online,
             neighbors: [None, None, None, None],
         };
 
         self.screens.insert(id, screen);
+    }
+
+    pub fn set_local_device(&mut self, name: String, hostname: String) {
+        if let Some(local) = self.screens.get_mut("local") {
+            local.name = name;
+            local.hostname = hostname;
+        }
     }
 
     /// Remove a device screen
@@ -183,99 +232,89 @@ impl LayoutView {
         }
     }
 
+    /// Persistable local edge mapping for the engine.
+    pub fn local_screen_layout_entries(&self) -> Vec<ScreenLayoutEntry> {
+        let Some(local) = self.screens.get("local") else {
+            return Vec::new();
+        };
+
+        local
+            .neighbors
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, neighbor_id)| {
+                let neighbor_id = neighbor_id.as_ref()?;
+                let device_id = uuid::Uuid::parse_str(neighbor_id).ok()?;
+                let direction = match idx {
+                    0 => EdgeDirection::Left,
+                    1 => EdgeDirection::Top,
+                    2 => EdgeDirection::Right,
+                    3 => EdgeDirection::Bottom,
+                    _ => return None,
+                };
+
+                Some(ScreenLayoutEntry {
+                    device_id,
+                    direction: direction.to_direction(),
+                })
+            })
+            .collect()
+    }
+
+    /// Apply persisted local edge mappings once matching devices are present.
+    pub fn apply_local_screen_layout(&mut self, entries: &[ScreenLayoutEntry]) {
+        if let Some(local) = self.screens.get_mut("local") {
+            local.neighbors = [None, None, None, None];
+        }
+
+        for entry in entries {
+            let device_id = entry.device_id.to_string();
+            if self.screens.contains_key(&device_id) {
+                self.connect_edge(
+                    "local",
+                    &device_id,
+                    EdgeDirection::from_direction(entry.direction),
+                );
+            }
+        }
+    }
+
     /// Show the layout view
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Header
-        ui.vertical(|ui| {
-            ui.heading("⚙ Screen Layout");
-            ui.label("Arrange screens to define how your mouse moves between devices.");
-            ui.add_space(5.0);
-        });
+    pub fn show(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let desired_size = ui.available_size();
+        let response = ui.allocate_response(desired_size, egui::Sense::click_and_drag());
+        let rect = response.rect;
+        let bottom_height = 42.0;
+        let canvas_rect =
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - bottom_height));
+        let bottom_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - bottom_height), rect.max);
 
-        ui.separator();
-        ui.add_space(10.0);
+        self.draw_background(ui, canvas_rect);
 
-        // Top toolbar
-        ui.horizontal(|ui| {
-            // Mode selection
-            ui.label("Mode:");
-            ui.selectable_value(&mut self.edit_mode, EditMode::Arrange, "📐 Arrange");
-            ui.selectable_value(&mut self.edit_mode, EditMode::Connect, "🔗 Connect");
-
-            ui.separator();
-
-            // View options
-            ui.checkbox(&mut self.show_guides, "Grid");
-            ui.checkbox(&mut self.show_connections, "Connections");
-            ui.checkbox(&mut self.snap_to_grid, "Snap");
-
-            ui.separator();
-
-            // Actions
-            if ui.button("Auto Arrange").clicked() {
-                self.auto_arrange();
-            }
-            if ui.button("Reset").clicked() {
-                *self = Self::new();
-            }
-        });
-
-        ui.add_space(10.0);
-
-        // Main layout area
-        let desired_size = egui::vec2(ui.available_width(), 450.0);
-
-        egui::CentralPanel::default()
-            .show_inside(ui, |ui| {
-                let response = ui.allocate_response(desired_size, egui::Sense::click_and_drag());
-
-                // Draw background
-                self.draw_background(ui, response.rect);
-
-                // Calculate connections to draw
-                let connections = self.calculate_connections();
-
-                // Draw connections (under screens)
-                if self.show_connections {
-                    self.draw_connections(ui, response.rect, &connections);
-                }
-
-                // Draw edge controls
-                if self.edit_mode == EditMode::Connect {
-                    self.draw_edge_controls(ui, response.rect);
-                }
-
-                // Draw screens
-                self.draw_screens(ui, response.rect, &response);
-
-                // Handle interactions
-                self.handle_interactions(&response);
-
-                // Draw tooltip
-                self.draw_tooltip(ui, response.rect);
-            });
-
-        // Bottom panel - device properties
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        self.show_properties_panel(ui);
+        let connections = self.calculate_connections();
+        if self.show_connections {
+            self.draw_connections(ui, canvas_rect, &connections);
+        }
+        if self.edit_mode == EditMode::Connect {
+            self.draw_edge_controls(ui, canvas_rect);
+        }
+        self.draw_screens(ui, canvas_rect, &response);
+        self.handle_interactions(&response);
+        self.draw_tooltip(ui, canvas_rect);
+        self.draw_bottom_bar(ui, bottom_rect);
     }
 
     /// Draw background with grid
     fn draw_background(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         // Fill background
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            egui::Color32::from_rgb(25, 25, 30),
-        );
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(35, 37, 37));
 
         // Draw grid
         if self.show_guides {
             let grid_size = self.grid_size;
-            let color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 10);
+            let color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 7);
             let stroke = egui::Stroke::new(1.0, color);
 
             // Vertical lines
@@ -303,12 +342,16 @@ impl LayoutView {
     }
 
     /// Draw connection arrows between screens
-    fn draw_connections(&self, ui: &mut egui::Ui, canvas_rect: egui::Rect, connections: &[(EdgeInfo, EdgeInfo)]) {
+    fn draw_connections(
+        &self,
+        ui: &mut egui::Ui,
+        canvas_rect: egui::Rect,
+        connections: &[(EdgeInfo, EdgeInfo)],
+    ) {
         for (from, to) in connections {
-            if let (Some(from_screen), Some(to_screen)) = (
-                self.screens.get(&from.screen),
-                self.screens.get(&to.screen),
-            ) {
+            if let (Some(from_screen), Some(to_screen)) =
+                (self.screens.get(&from.screen), self.screens.get(&to.screen))
+            {
                 let from_rect = self.screen_rect(canvas_rect, from_screen);
                 let to_rect = self.screen_rect(canvas_rect, to_screen);
 
@@ -335,11 +378,27 @@ impl LayoutView {
     }
 
     /// Draw screens
-    fn draw_screens(&mut self, ui: &mut egui::Ui, canvas_rect: egui::Rect, response: &egui::Response) {
+    fn draw_screens(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas_rect: egui::Rect,
+        response: &egui::Response,
+    ) {
         self.hovered_screen = None;
+        let mut screens: Vec<(String, ScreenRect)> = self
+            .screens
+            .iter()
+            .map(|(id, screen)| (id.clone(), screen.clone()))
+            .collect();
+        screens.sort_by(|(id_a, a), (id_b, b)| {
+            a.x.partial_cmp(&b.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| id_a.cmp(id_b))
+        });
 
-        for (id, screen) in self.screens.iter() {
-            let rect = self.screen_rect(canvas_rect, screen);
+        for (index, (id, screen)) in screens.into_iter().enumerate() {
+            let rect = self.screen_rect(canvas_rect, &screen);
 
             // Check hover
             if response.hovered() {
@@ -350,97 +409,105 @@ impl LayoutView {
                 }
             }
 
-            // Determine colors
-            let is_selected = self.selected_screen.as_ref() == Some(id);
-            let is_hovered = self.hovered_screen.as_ref() == Some(id);
+            let is_selected = self.selected_screen.as_ref() == Some(&id);
+            let is_hovered = self.hovered_screen.as_ref() == Some(&id);
 
-            let (base_color, border_color, border_width) = if is_selected {
-                (egui::Color32::from_rgb(60, 120, 200), egui::Color32::from_rgb(100, 180, 255), 3.0)
-            } else if is_hovered {
-                (egui::Color32::from_rgb(70, 110, 170), egui::Color32::from_rgb(150, 200, 250), 2.0)
-            } else if screen.is_local {
-                (egui::Color32::from_rgb(50, 100, 160), egui::Color32::from_rgb(100, 150, 200), 2.0)
+            let (base_color, border_color, border_width) = if screen.is_local {
+                (
+                    egui::Color32::from_rgb(125, 145, 212),
+                    egui::Color32::from_rgb(84, 91, 140),
+                    2.0,
+                )
             } else if screen.online {
-                (egui::Color32::from_rgb(45, 90, 140), egui::Color32::from_rgb(80, 130, 180), 2.0)
+                (
+                    egui::Color32::from_rgb(181, 188, 34),
+                    egui::Color32::from_rgb(92, 96, 91),
+                    2.0,
+                )
             } else {
-                (egui::Color32::from_rgb(60, 60, 70), egui::Color32::from_rgb(100, 100, 110), 2.0)
+                (
+                    egui::Color32::from_rgb(60, 60, 70),
+                    egui::Color32::from_rgb(100, 100, 110),
+                    2.0,
+                )
             };
 
-            // Draw screen rectangle with rounded corners
-            let corner_radius = if self.edit_mode == EditMode::Connect { 4.0 } else { 8.0 };
-            ui.painter().rect(
-                rect,
-                corner_radius,
-                base_color,
-                egui::Stroke::new(border_width, border_color),
-            );
+            let fill = if is_hovered {
+                brighten(base_color, 14)
+            } else {
+                base_color
+            };
+            ui.painter().rect_filled(rect, 0.0, fill);
+            ui.painter()
+                .rect_stroke(rect, 0.0, egui::Stroke::new(border_width, border_color));
 
-            // Inner highlight for selected
             if is_selected {
                 ui.painter().rect_stroke(
-                    rect.shrink(3.0),
-                    corner_radius,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 50)),
+                    rect.expand(2.0),
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(160, 170, 230)),
                 );
             }
 
-            // Device name
-            let text_color = if screen.online {
-                egui::Color32::WHITE
+            let badge_radius = 22.0;
+            ui.painter()
+                .circle_filled(rect.center(), badge_radius, egui::Color32::BLACK);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                display_letter(index),
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
+            );
+
+            let label = if screen.name.trim().is_empty() {
+                screen.hostname.as_str()
             } else {
-                egui::Color32::GRAY
+                screen.name.as_str()
             };
-
             ui.painter().text(
-                egui::pos2(rect.center().x, rect.min.y + 20.0),
+                egui::pos2(rect.center().x, rect.max.y - 16.0),
                 egui::Align2::CENTER_CENTER,
-                &screen.name,
-                egui::FontId::proportional(14.0),
-                text_color,
+                label,
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(235),
             );
 
-            // Hostname
-            ui.painter().text(
-                egui::pos2(rect.center().x, rect.min.y + 38.0),
-                egui::Align2::CENTER_CENTER,
-                &screen.hostname,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-
-            // Resolution
-            ui.painter().text(
-                egui::pos2(rect.center().x, rect.center().y + 15.0),
-                egui::Align2::CENTER_CENTER,
-                format!("{}x{}", screen.width as i32, screen.height as i32),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(130),
-            );
-
-            // Status indicator
-            let status_color = if screen.online {
-                egui::Color32::from_rgb(100, 200, 100)
-            } else {
-                egui::Color32::GRAY
-            };
-            let status_pos = egui::pos2(rect.min.x + 10.0, rect.min.y + 10.0);
-            ui.painter().circle_filled(status_pos, 4.0, status_color);
-
-            // Local indicator
-            if screen.is_local {
-                ui.painter().text(
-                    egui::pos2(rect.max.x - 8.0, rect.max.y - 8.0),
-                    egui::Align2::RIGHT_BOTTOM,
-                    "🏠",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgba_premultiplied(255, 255, 255, 100),
-                );
-            }
-
-            // Draw neighbor indicators in Connect mode
             if self.edit_mode == EditMode::Connect {
-                self.draw_neighbor_indicators(ui, &rect, id);
+                self.draw_neighbor_indicators(ui, &rect, &id);
             }
+        }
+    }
+
+    fn draw_bottom_bar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 28, 38));
+        ui.painter().text(
+            egui::pos2(rect.min.x + 18.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            "i",
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_gray(190),
+        );
+        ui.painter().text(
+            egui::pos2(rect.min.x + 36.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Arrange display corresponding to the physical layout on your desk",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_gray(225),
+        );
+
+        let button_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.max.x - 28.0, rect.center().y),
+            egui::vec2(24.0, 24.0),
+        );
+        let response = ui.put(button_rect, egui::Button::new("?"));
+        if response.clicked() {
+            self.edit_mode = if self.edit_mode == EditMode::Arrange {
+                EditMode::Connect
+            } else {
+                EditMode::Arrange
+            };
         }
     }
 
@@ -534,7 +601,7 @@ impl LayoutView {
                         });
                     }
 
-                    if let Some(ref drag) = self.drag_state {
+                    if let Some(ref _drag) = self.drag_state {
                         let delta = response.drag_delta();
                         screen.x += delta.x;
                         screen.y += delta.y;
@@ -596,11 +663,18 @@ impl LayoutView {
         };
 
         // Update connections one at a time to avoid borrow issues
+        self.connect_edge(from, to, from_edge);
+        if let Some(to_screen) = self.screens.get_mut(to) {
+            to_screen.neighbors[to_edge as usize] = Some(from.to_string());
+        }
+    }
+
+    fn connect_edge(&mut self, from: &str, to: &str, from_edge: EdgeDirection) {
         if let Some(from_screen) = self.screens.get_mut(from) {
             from_screen.neighbors[from_edge as usize] = Some(to.to_string());
         }
         if let Some(to_screen) = self.screens.get_mut(to) {
-            to_screen.neighbors[to_edge as usize] = Some(from.to_string());
+            to_screen.neighbors[from_edge.opposite() as usize] = Some(from.to_string());
         }
     }
 
@@ -648,16 +722,14 @@ impl LayoutView {
                         for direction in EdgeDirection::all() {
                             if let Some(neighbor_id) = &screen.neighbors[*direction as usize] {
                                 if let Some(neighbor) = self.screens.get(neighbor_id) {
-                                    ui.label(format!(
-                                        "{} → {}",
-                                        direction.name(),
-                                        neighbor.name
-                                    ));
+                                    ui.label(format!("{} → {}", direction.name(), neighbor.name));
                                 }
                             }
                         }
                         if screen.neighbors.iter().all(|n| n.is_none()) {
-                            ui.label("No connections. Click edge indicators in Connect mode to add.");
+                            ui.label(
+                                "No connections. Click edge indicators in Connect mode to add.",
+                            );
                         }
                     });
                 }
@@ -672,7 +744,7 @@ impl LayoutView {
     fn screen_rect(&self, canvas_rect: egui::Rect, screen: &ScreenRect) -> egui::Rect {
         egui::Rect::from_min_size(
             canvas_rect.min + egui::vec2(screen.x, screen.y),
-            egui::vec2(screen.width, screen.height)
+            egui::vec2(screen.width, screen.height),
         )
     }
 
@@ -704,8 +776,14 @@ impl LayoutView {
                     // Only add each connection once
                     if id < neighbor {
                         connections.push((
-                            EdgeInfo { screen: id.clone(), direction },
-                            EdgeInfo { screen: neighbor.clone(), direction: direction.opposite() },
+                            EdgeInfo {
+                                screen: id.clone(),
+                                direction,
+                            },
+                            EdgeInfo {
+                                screen: neighbor.clone(),
+                                direction: direction.opposite(),
+                            },
                         ));
                     }
                 }
@@ -730,10 +808,9 @@ impl LayoutView {
             a.name.cmp(&b.name)
         });
 
-        let mut x = 100.0;
-        let mut y = 150.0;
-        let spacing = 30.0;
-        let max_width = 700.0;
+        let mut x = 170.0;
+        let y = 210.0;
+        let spacing = 0.0;
 
         for screen in screens {
             if let Some(s) = self.screens.get_mut(&screen.id) {
@@ -741,10 +818,6 @@ impl LayoutView {
                 s.y = y;
 
                 x += s.width + spacing;
-                if x > max_width {
-                    x = 100.0;
-                    y += s.height + spacing;
-                }
             }
         }
     }

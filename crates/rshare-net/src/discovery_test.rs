@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 pub async fn test_discovery() -> anyhow::Result<()> {
-    use crate::discovery::{ServiceDiscovery, DiscoveryConfig, DiscoveryEvent};
+    use crate::discovery::{spawn_discovery, DiscoveryConfig, DiscoveryEvent, ServiceDiscovery};
 
     println!("R-ShareMouse Discovery Test");
     println!("=========================");
@@ -46,7 +46,7 @@ pub async fn test_discovery() -> anyhow::Result<()> {
     println!("Press Ctrl+C to stop");
     println!();
 
-    discovery.start_with_channel(tx).await?;
+    let discovery_task = spawn_discovery(discovery, tx);
 
     println!("Discovery started! Listening for devices...");
     println!("---");
@@ -57,33 +57,31 @@ pub async fn test_discovery() -> anyhow::Result<()> {
 
     while start.elapsed() < duration {
         match timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Some(event)) => {
-                match event {
-                    DiscoveryEvent::DeviceFound(device) => {
-                        println!("✓ Device FOUND:");
-                        println!("    ID: {}", device.id);
-                        println!("    Name: {}", device.name);
-                        println!("    Hostname: {}", device.hostname);
-                        println!("    Addresses: {:?}", device.addresses);
-                        println!("    Last seen: {:?}", device.last_seen);
-                        println!();
-                    }
-                    DiscoveryEvent::DeviceUpdated(device) => {
-                        println!("~ Device UPDATED:");
-                        println!("    ID: {}", device.id);
-                        println!("    Name: {}", device.name);
-                        println!("    Addresses: {:?}", device.addresses);
-                        println!();
-                    }
-                    DiscoveryEvent::DeviceLost(id) => {
-                        println!("✗ Device LOST: {}", id);
-                        println!();
-                    }
-                    DiscoveryEvent::Error(err) => {
-                        println!("! Error: {}", err);
-                    }
+            Ok(Some(event)) => match event {
+                DiscoveryEvent::DeviceFound(device) => {
+                    println!("✓ Device FOUND:");
+                    println!("    ID: {}", device.id);
+                    println!("    Name: {}", device.name);
+                    println!("    Hostname: {}", device.hostname);
+                    println!("    Addresses: {:?}", device.addresses);
+                    println!("    Last seen: {:?}", device.last_seen);
+                    println!();
                 }
-            }
+                DiscoveryEvent::DeviceUpdated(device) => {
+                    println!("~ Device UPDATED:");
+                    println!("    ID: {}", device.id);
+                    println!("    Name: {}", device.name);
+                    println!("    Addresses: {:?}", device.addresses);
+                    println!();
+                }
+                DiscoveryEvent::DeviceLost(id) => {
+                    println!("✗ Device LOST: {}", id);
+                    println!();
+                }
+                DiscoveryEvent::Error(err) => {
+                    println!("! Error: {}", err);
+                }
+            },
             Ok(None) => {
                 println!("Channel closed");
                 break;
@@ -98,7 +96,7 @@ pub async fn test_discovery() -> anyhow::Result<()> {
 
     println!();
     println!("Stopping discovery...");
-    discovery.stop().await?;
+    discovery_task.stop().await;
 
     Ok(())
 }

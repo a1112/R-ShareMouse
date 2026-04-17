@@ -5,8 +5,8 @@
 use eframe::egui;
 
 mod app;
-mod ui;
 mod tray;
+mod ui;
 
 use app::RShareApp;
 
@@ -21,15 +21,16 @@ fn main() -> eframe::Result<()> {
     // Set up egui options
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([600.0, 400.0])
+            .with_title("R-ShareMouse v0.1.0 - Display Manager")
+            .with_inner_size([1180.0, 665.0])
+            .with_min_inner_size([840.0, 520.0])
             .with_icon(load_icon()),
         ..Default::default()
     };
 
     // Run the application
     eframe::run_native(
-        "R-ShareMouse",
+        "R-ShareMouse v0.1.0 - Display Manager",
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
@@ -41,12 +42,11 @@ fn main() -> eframe::Result<()> {
 
 /// Load application icon from embedded data
 fn load_icon() -> egui::IconData {
-    // TODO: Load actual icon from assets
-    // For now, return a simple 1x1 transparent icon
+    let size = 64;
     egui::IconData {
-        rgba: vec![0, 0, 0, 0],
-        width: 1,
-        height: 1,
+        rgba: tray::monitor_icon_rgba(size),
+        width: size,
+        height: size,
     }
 }
 
@@ -62,8 +62,13 @@ fn setup_style(ctx: &egui::Context) {
 
     // Custom colors
     style.visuals.dark_mode = true;
-    style.visuals.panel_fill = egui::Color32::from_gray(30);
-    style.visuals.faint_bg_color = egui::Color32::from_gray(40);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.visuals.panel_fill = egui::Color32::from_rgb(31, 30, 38);
+    style.visuals.window_fill = egui::Color32::from_rgb(32, 34, 34);
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(42, 43, 43);
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(40, 40, 48);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(57, 56, 68);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(95, 92, 115);
 
     ctx.set_style(style);
 }
