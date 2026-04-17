@@ -6,3 +6,4 @@ pub mod devices;
 pub mod config_cmd;
 pub mod status;
 pub mod logs;
+pub mod discover;

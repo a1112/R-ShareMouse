@@ -3,6 +3,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
+use uuid::Uuid;
+
+use crate::protocol::DeviceId;
 
 /// Application configuration shared by the GUI and engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -11,12 +15,16 @@ pub struct Config {
     pub gui: GuiConfig,
     pub input: InputConfig,
     pub security: SecurityConfig,
+    /// Known device hostnames
+    pub known_devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkConfig {
     pub port: u16,
     pub bind_address: String,
+    /// Enable mDNS discovery
+    pub mdns_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,17 +32,30 @@ pub struct GuiConfig {
     pub minimize_to_tray: bool,
     pub show_notifications: bool,
     pub start_minimized: bool,
+    pub show_tray_icon: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputConfig {
     pub clipboard_sync: bool,
     pub edge_threshold: u32,
+    /// Send mouse wheel events
+    pub mouse_wheel_sync: bool,
+    /// Key delay in milliseconds (for macro protection)
+    pub key_delay_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurityConfig {
     pub password_required: bool,
+    /// Enable TLS/SSL encryption
+    pub encryption: bool,
+    /// Password hash (bcrypt)
+    pub password_hash: Option<String>,
+    /// Trusted device IDs
+    pub trusted_devices: Vec<DeviceId>,
+    /// Allow LAN only (prevent WAN access)
+    pub lan_only: bool,
 }
 
 impl Default for Config {
@@ -43,19 +64,28 @@ impl Default for Config {
             network: NetworkConfig {
                 port: 27431,
                 bind_address: "0.0.0.0".to_string(),
+                mdns_enabled: true,
             },
             gui: GuiConfig {
                 minimize_to_tray: true,
                 show_notifications: true,
                 start_minimized: false,
+                show_tray_icon: true,
             },
             input: InputConfig {
                 clipboard_sync: true,
                 edge_threshold: 10,
+                mouse_wheel_sync: true,
+                key_delay_ms: 0,
             },
             security: SecurityConfig {
                 password_required: false,
+                encryption: true,
+                password_hash: None,
+                trusted_devices: Vec::new(),
+                lan_only: true,
             },
+            known_devices: Vec::new(),
         }
     }
 }
@@ -99,6 +129,40 @@ impl Config {
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write config file: {}", path.display()))
     }
+
+    /// Get the bind address for the server
+    pub fn bind_address(&self) -> Result<SocketAddr> {
+        format!("{}:{}", self.network.bind_address, self.network.port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))
+    }
+
+    /// Check if a device is trusted
+    pub fn is_trusted(&self, device_id: &DeviceId) -> bool {
+        self.security.trusted_devices.contains(device_id)
+    }
+
+    /// Add a trusted device
+    pub fn add_trusted_device(&mut self, device_id: DeviceId) {
+        if !self.is_trusted(&device_id) {
+            self.security.trusted_devices.push(device_id);
+        }
+    }
+
+    /// Remove a trusted device
+    pub fn remove_trusted_device(&mut self, device_id: &DeviceId) {
+        self.security.trusted_devices.retain(|id| id != device_id);
+    }
+
+    /// Get the effective edge threshold
+    pub fn edge_threshold(&self) -> u32 {
+        self.input.edge_threshold.max(1).min(100)
+    }
+
+    /// Legacy method for compatibility
+    pub fn config_path() -> PathBuf {
+        default_config_path().unwrap_or_else(|_| PathBuf::from("config.toml"))
+    }
 }
 
 /// Get the default configuration file path.
@@ -119,6 +183,33 @@ pub fn default_config_path() -> Result<PathBuf> {
         .join("config.toml"))
 }
 
+/// Hotkey configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotkeyConfig {
+    /// Toggle sharing hotkey (Ctrl+Alt+S by default)
+    pub toggle_sharing: Option<String>,
+    /// Lock cursor hotkey (Ctrl+Alt+L by default)
+    pub lock_cursor: Option<String>,
+    /// Hotkey to switch to specific screen
+    pub switch_screen: Vec<SwitchScreenHotkey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwitchScreenHotkey {
+    pub hotkey: String,
+    pub device_id: DeviceId,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            toggle_sharing: Some("Ctrl+Alt+S".to_string()),
+            lock_cursor: Some("Ctrl+Alt+L".to_string()),
+            switch_screen: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +219,7 @@ mod tests {
             .join(format!(
                 "rshare-config-test-{}-{}",
                 name,
-                uuid::Uuid::new_v4()
+                Uuid::new_v4()
             ))
             .join("config.toml")
     }
@@ -138,12 +229,17 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network.port, 27431);
         assert_eq!(config.network.bind_address, "0.0.0.0");
+        assert!(config.network.mdns_enabled);
         assert!(config.gui.minimize_to_tray);
         assert!(config.gui.show_notifications);
+        assert!(config.gui.show_tray_icon);
         assert!(!config.gui.start_minimized);
         assert!(config.input.clipboard_sync);
         assert_eq!(config.input.edge_threshold, 10);
+        assert!(config.input.mouse_wheel_sync);
         assert!(!config.security.password_required);
+        assert!(config.security.encryption);
+        assert!(config.security.lan_only);
     }
 
     #[test]
@@ -169,5 +265,35 @@ mod tests {
 
         assert_eq!(loaded, config);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_bind_address() {
+        let config = Config::default();
+        let addr = config.bind_address().unwrap();
+        assert_eq!(addr.port(), 27431);
+        assert_eq!(addr.ip().to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_edge_threshold_bounds() {
+        let mut config = Config::default();
+        config.input.edge_threshold = 0;
+        assert_eq!(config.edge_threshold(), 1);
+
+        config.input.edge_threshold = 200;
+        assert_eq!(config.edge_threshold(), 100);
+    }
+
+    #[test]
+    fn test_trusted_devices() {
+        let mut config = Config::default();
+        let id = DeviceId::new_v4();
+
+        assert!(!config.is_trusted(&id));
+        config.add_trusted_device(id);
+        assert!(config.is_trusted(&id));
+        config.remove_trusted_device(&id);
+        assert!(!config.is_trusted(&id));
     }
 }

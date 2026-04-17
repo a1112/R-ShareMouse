@@ -11,6 +11,9 @@ pub mod codec;
 pub mod encryption;
 pub mod network_manager;
 
+#[cfg(test)]
+pub mod discovery_test;
+
 pub use network_manager::*;
 
 // Re-exports

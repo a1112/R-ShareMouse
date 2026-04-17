@@ -28,3 +28,5 @@ toml = { workspace = true }
 clap = { workspace = true }
 colored = "2.1"
 atty = "0.2"
+uuid = { workspace = true }
+hostname = { workspace = true }

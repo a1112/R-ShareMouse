@@ -9,7 +9,7 @@ mod commands;
 mod config;
 mod output;
 
-use commands::{start, stop, devices, config_cmd};
+use commands::{start, stop, devices, config_cmd, discover};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -103,6 +103,17 @@ enum Commands {
         #[arg(short, long)]
         follow: bool,
     },
+
+    /// Discover devices on the LAN
+    Discover {
+        /// Scan duration in seconds (default: 30)
+        #[arg(short, long, default_value = "30")]
+        duration: u64,
+
+        /// Continuous mode (don't stop until Ctrl+C)
+        #[arg(short, long)]
+        continuous: bool,
+    },
 }
 
 #[tokio::main]
@@ -146,6 +157,13 @@ async fn main() -> Result<()> {
         }
         Commands::Logs { lines, follow } => {
             commands::logs::execute(lines, follow).await?;
+        }
+        Commands::Discover { duration, continuous } => {
+            if continuous {
+                discover::run_discover_test().await?;
+            } else {
+                discover::run_discover_scan().await?;
+            }
         }
     }
 
