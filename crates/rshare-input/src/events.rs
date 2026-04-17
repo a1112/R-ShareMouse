@@ -5,12 +5,18 @@ use serde::{Deserialize, Serialize};
 /// Input event that can be sent between devices
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    MouseMove { x: i32, y: i32 },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
     MouseButton {
         button: MouseButton,
         state: ButtonState,
     },
-    MouseWheel { delta_x: i32, delta_y: i32 },
+    MouseWheel {
+        delta_x: i32,
+        delta_y: i32,
+    },
     Key {
         keycode: KeyCode,
         state: ButtonState,
@@ -262,6 +268,33 @@ impl InputEvent {
                 | InputEvent::Key { .. }
                 | InputEvent::KeyExtended { .. }
         )
+    }
+
+    /// Convert a native macOS platform event into the cross-platform event type.
+    #[cfg(target_os = "macos")]
+    pub fn from_macos_event(event: rshare_platform::MacosInputEvent) -> Self {
+        match event {
+            rshare_platform::MacosInputEvent::MouseMove { x, y } => Self::mouse_move(x, y),
+            rshare_platform::MacosInputEvent::MouseButton { button, down } => {
+                let state = if down {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                Self::mouse_button(MouseButton::from_code(button), state)
+            }
+            rshare_platform::MacosInputEvent::MouseWheel { delta_x, delta_y } => {
+                Self::mouse_wheel(delta_x, delta_y)
+            }
+            rshare_platform::MacosInputEvent::Key { keycode, down } => {
+                let state = if down {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                Self::key(KeyCode::Raw(keycode), state)
+            }
+        }
     }
 }
 

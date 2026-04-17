@@ -3,11 +3,11 @@
 //! This module provides clipboard listeners for different platforms.
 //! Windows uses event-driven Win32 API, while macOS and Linux use polling.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::Duration;
 use rshare_core::clipboard::ClipboardContent;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{interval, Duration};
 
 use super::{ClipboardListener, ClipboardListenerConfig};
 
@@ -16,6 +16,16 @@ struct ListenerState {
     running: Arc<AtomicBool>,
     tx: mpsc::UnboundedSender<ClipboardContent>,
     last_content: Arc<Mutex<Option<ClipboardContent>>>,
+}
+
+impl Clone for ListenerState {
+    fn clone(&self) -> Self {
+        Self {
+            running: self.running.clone(),
+            tx: self.tx.clone(),
+            last_content: self.last_content.clone(),
+        }
+    }
 }
 
 impl ListenerState {
@@ -191,18 +201,17 @@ pub mod macos_impl {
             }
 
             self.state.set_running(true);
-            let running = self.state.running.clone();
-            let tx = self.state.tx.clone();
+            let state = self.state.clone();
             let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
 
             tokio::spawn(async move {
                 let mut interval = interval(poll_interval);
 
-                while running.load(Ordering::Relaxed) {
+                while state.running.load(Ordering::Relaxed) {
                     interval.tick().await;
 
                     if let Ok(content) = get_clipboard_content().await {
-                        let _ = tx.send(content);
+                        state.send_if_changed(content).await;
                     }
                 }
             });
@@ -239,6 +248,12 @@ pub mod macos_impl {
     /// Get current clipboard content (macOS)
     async fn get_clipboard_content() -> anyhow::Result<ClipboardContent> {
         tokio::task::spawn_blocking(|| {
+            if let Ok(files) = crate::macos::current_pasteboard_file_list() {
+                if !files.is_empty() {
+                    return Ok(ClipboardContent::FileList(files));
+                }
+            }
+
             let mut clipboard = arboard::Clipboard::new()?;
             if let Ok(text) = clipboard.get_text() {
                 return Ok(ClipboardContent::Text(text));

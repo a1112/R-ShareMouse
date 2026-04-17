@@ -4,8 +4,8 @@
 //! When files are dragged, they can be converted to ClipboardContent::FileList
 //! for transmission to other devices.
 
-use std::sync::mpsc;
 use rshare_core::clipboard::ClipboardContent;
+use std::sync::mpsc;
 
 /// File drag event
 #[derive(Debug, Clone)]
@@ -123,15 +123,21 @@ mod windows_impl {
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use super::{FileDragDetector, FileDragEvent};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     /// macOS file drag detector
     ///
-    /// Uses NSPasteboard and drag notifications to detect file operations.
+    /// Polls NSPasteboard for file URL changes. macOS does not expose a
+    /// general global drag hook that works across all apps.
     pub struct MacosFileDragDetector {
         tx: mpsc::Sender<FileDragEvent>,
         rx: Option<mpsc::Receiver<FileDragEvent>>,
-        active: bool,
+        running: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
     }
 
     impl MacosFileDragDetector {
@@ -140,32 +146,56 @@ mod macos_impl {
             Self {
                 tx,
                 rx: Some(rx),
-                active: false,
+                running: Arc::new(AtomicBool::new(false)),
+                worker: None,
             }
         }
     }
 
     impl FileDragDetector for MacosFileDragDetector {
         fn start(&mut self) -> anyhow::Result<()> {
-            if self.active {
+            if self.running.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
-            self.active = true;
+            self.running.store(true, Ordering::Relaxed);
+            let running = self.running.clone();
+            let tx = self.tx.clone();
+
+            self.worker = Some(thread::spawn(move || {
+                let mut last_files = Vec::new();
+
+                while running.load(Ordering::Relaxed) {
+                    match crate::macos::current_pasteboard_file_list() {
+                        Ok(files) if !files.is_empty() && files != last_files => {
+                            last_files = files.clone();
+                            let _ = tx.send(FileDragEvent::FilesDragged(files));
+                        }
+                        Ok(files) if files.is_empty() && !last_files.is_empty() => {
+                            last_files.clear();
+                            let _ = tx.send(FileDragEvent::DragCancelled);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::debug!("macOS file drag pasteboard poll failed: {}", err);
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }));
+
             tracing::info!("macOS file drag detector started");
-
-            // TODO: Implement macOS file drag detection
-            // This requires:
-            // 1. Register for drag notifications
-            // 2. Monitor NSPasteboard for file URLs
-            // 3. Parse file:// URLs to get paths
-            // 4. Send events through the channel
-
             Ok(())
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
-            self.active = false;
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("macOS file drag detector thread panicked"))?;
+            }
             tracing::info!("macOS file drag detector stopped");
             Ok(())
         }
@@ -178,6 +208,12 @@ mod macos_impl {
     impl Default for MacosFileDragDetector {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    impl Drop for MacosFileDragDetector {
+        fn drop(&mut self) {
+            let _ = self.stop();
         }
     }
 }

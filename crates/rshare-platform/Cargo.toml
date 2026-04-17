@@ -7,6 +7,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+rshare-common = { path = "../rshare-common" }
 rshare-core = { path = "../rshare-core" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -29,7 +30,7 @@ windows = { version = "0.58", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
 objc = "0.2"
-core-graphics = "0.24"
+core-graphics = { version = "0.24", features = ["highsierra"] }
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]

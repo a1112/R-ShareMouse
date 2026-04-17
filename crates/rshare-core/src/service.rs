@@ -28,8 +28,7 @@ impl ServiceManager {
         let pid_file = state_dir.join("rshare.pid");
 
         // Ensure state directory exists
-        fs::create_dir_all(&state_dir)
-            .context("Failed to create state directory")?;
+        fs::create_dir_all(&state_dir).context("Failed to create state directory")?;
 
         Ok(Self {
             pid_file,
@@ -52,7 +51,9 @@ impl ServiceManager {
 
     /// Get the PID of the running service
     pub fn get_pid(&self) -> Option<u32> {
-        self.read_pid().ok().filter(|&pid| self.is_process_alive(pid))
+        self.read_pid()
+            .ok()
+            .filter(|&pid| self.is_process_alive(pid))
     }
 
     /// Start the service
@@ -159,17 +160,14 @@ impl ServiceManager {
 
     /// Read PID from file
     fn read_pid(&self) -> Result<u32> {
-        let content = fs::read_to_string(&self.pid_file)
-            .context("Failed to read PID file")?;
-        content.trim().parse::<u32>()
-            .context("Invalid PID in file")
+        let content = fs::read_to_string(&self.pid_file).context("Failed to read PID file")?;
+        content.trim().parse::<u32>().context("Invalid PID in file")
     }
 
     /// Write current PID to file
     fn write_pid(&self) -> Result<()> {
         let pid = std::process::id();
-        fs::write(&self.pid_file, pid.to_string())
-            .context("Failed to write PID file")?;
+        fs::write(&self.pid_file, pid.to_string()).context("Failed to write PID file")?;
         tracing::debug!("Wrote PID file: {}", self.pid_file.display());
         Ok(())
     }
@@ -177,8 +175,7 @@ impl ServiceManager {
     /// Remove PID file
     fn remove_pid_file(&self) -> Result<()> {
         if self.pid_file.exists() {
-            fs::remove_file(&self.pid_file)
-                .context("Failed to remove PID file")?;
+            fs::remove_file(&self.pid_file).context("Failed to remove PID file")?;
         }
         Ok(())
     }
@@ -258,8 +255,7 @@ fn get_state_dir() -> Result<PathBuf> {
     let base_dir = if cfg!(target_os = "windows") {
         dirs::config_dir()
     } else if cfg!(target_os = "macos") {
-        dirs::home_dir()
-            .map(|p| p.join("Library").join("Application Support"))
+        dirs::home_dir().map(|p| p.join("Library").join("Application Support"))
     } else {
         // Linux/Unix: use XDG_CONFIG_HOME or ~/.config
         std::env::var("XDG_CONFIG_HOME")
@@ -279,7 +275,6 @@ fn get_state_dir() -> Result<PathBuf> {
 #[cfg(unix)]
 pub fn spawn_daemon() -> Result<()> {
     use anyhow::bail;
-    use std::process::Command;
 
     // Double-fork to daemonize
     unsafe {
@@ -299,10 +294,11 @@ pub fn spawn_daemon() -> Result<()> {
                     0 => {
                         // Daemon process
                         // Change to root directory
-                        libc::chdir("/");
+                        libc::chdir(b"/\0".as_ptr() as *const i8);
 
                         // Redirect stdio to /dev/null
-                        let dev_null = libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_RDWR);
+                        let dev_null =
+                            libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_RDWR);
                         if dev_null != -1 {
                             libc::dup2(dev_null, 0);
                             libc::dup2(dev_null, 1);
@@ -310,7 +306,7 @@ pub fn spawn_daemon() -> Result<()> {
                             libc::close(dev_null);
                         }
 
-                        return Ok(());
+                        Ok(())
                     }
                     _ => std::process::exit(0),
                 }
@@ -318,8 +314,6 @@ pub fn spawn_daemon() -> Result<()> {
             _ => std::process::exit(0),
         }
     }
-
-    Ok(())
 }
 
 /// No-op for daemon mode on non-Unix platforms
