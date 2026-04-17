@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use crate::events::{InputEvent, ButtonState, KeyCode, MouseButton};
+use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton};
 
 /// Callback for input events
 pub type InputCallback = Box<dyn Fn(InputEvent) + Send>;
@@ -62,7 +62,8 @@ impl InputEventChannel {
 
     /// Send an event
     pub fn send(&self, event: InputEvent) -> Result<()> {
-        self.tx.send(event)
+        self.tx
+            .send(event)
             .map_err(|e| anyhow::anyhow!("Failed to send event: {}", e))
     }
 
@@ -138,7 +139,7 @@ impl RDevInputListener {
 
         // Spawn the rdev listener in a blocking task
         tokio::task::spawn_blocking(move || {
-            use rdev::{Event, EventType, listen};
+            use rdev::{listen, Event, EventType};
 
             let callback = move |event: Event| {
                 // Check if we should stop
@@ -178,7 +179,8 @@ impl RDevInputListener {
                                 rdev::Button::Middle => MouseButton::Middle,
                                 _ => MouseButton::Other(0),
                             };
-                            let input_event = InputEvent::mouse_button(mouse_button, ButtonState::Pressed);
+                            let input_event =
+                                InputEvent::mouse_button(mouse_button, ButtonState::Pressed);
                             let _ = channel.send(input_event);
                         }
                     }
@@ -190,13 +192,15 @@ impl RDevInputListener {
                                 rdev::Button::Middle => MouseButton::Middle,
                                 _ => MouseButton::Other(0),
                             };
-                            let input_event = InputEvent::mouse_button(mouse_button, ButtonState::Released);
+                            let input_event =
+                                InputEvent::mouse_button(mouse_button, ButtonState::Released);
                             let _ = channel.send(input_event);
                         }
                     }
                     EventType::Wheel { delta_x, delta_y } => {
                         if config.capture_mouse {
-                            let input_event = InputEvent::mouse_wheel(delta_x as i32, delta_y as i32);
+                            let input_event =
+                                InputEvent::mouse_wheel(delta_x as i32, delta_y as i32);
                             let _ = channel.send(input_event);
                         }
                     }
@@ -313,6 +317,8 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
 pub struct DefaultInputListener {
     config: ListenerConfig,
     running: bool,
+    #[cfg(all(target_os = "macos", not(test)))]
+    macos_listener: Option<rshare_platform::MacosInputListener>,
 }
 
 impl DefaultInputListener {
@@ -320,6 +326,8 @@ impl DefaultInputListener {
         Self {
             config: ListenerConfig::default(),
             running: false,
+            #[cfg(all(target_os = "macos", not(test)))]
+            macos_listener: None,
         }
     }
 
@@ -341,16 +349,45 @@ impl InputListener for DefaultInputListener {
             return Ok(());
         }
 
-        tracing::info!("Input listener starting (using RDev)");
-        self.running = true;
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            use std::sync::{Arc, Mutex as StdMutex};
 
-        // TODO: Register platform-specific input hooks
-        // For now, recommend using RDevInputListener instead
+            tracing::info!("Input listener starting (using native macOS CGEventTap)");
+            let callback = Arc::new(StdMutex::new(_callback));
+            let mut listener = rshare_platform::MacosInputListener::new();
+            listener.start_with_callback(move |event| {
+                let input_event = InputEvent::from_macos_event(event);
+                if let Ok(callback) = callback.lock() {
+                    callback(input_event);
+                }
+            })?;
+            self.macos_listener = Some(listener);
+            self.running = true;
+            return Ok(());
+        }
 
-        Ok(())
+        #[cfg(not(all(target_os = "macos", not(test))))]
+        {
+            tracing::info!("Input listener starting (using RDev)");
+            self.running = true;
+
+            // TODO: Register platform-specific input hooks
+            // For now, recommend using RDevInputListener instead
+
+            Ok(())
+        }
     }
 
     fn stop(&mut self) -> Result<()> {
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            if let Some(listener) = self.macos_listener.as_mut() {
+                listener.stop()?;
+            }
+            self.macos_listener = None;
+        }
+
         self.running = false;
         tracing::info!("Input listener stopped");
         Ok(())

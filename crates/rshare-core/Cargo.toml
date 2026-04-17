@@ -22,3 +22,4 @@ toml = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
 rshare-common = { path = "../rshare-common" }
+libc = "0.2"
