@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>R-ShareMouse</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="window-shell">
+      <header class="titlebar">
+        <div class="titlebar-left">
+          <div class="brand" data-tauri-drag-region="true">
+            <span class="brand-mark"></span>
+            <strong>R-ShareMouse</strong>
+          </div>
+          <button id="serviceToggleBtn" class="toolbar-btn primary">Start Service</button>
+        </div>
+        <div class="titlebar-actions">
+          <button id="minimizeBtn" class="window-btn ghost" aria-label="Minimize">−</button>
+          <button id="maximizeBtn" class="window-btn ghost" aria-label="Toggle Maximize">□</button>
+          <button id="closeBtn" class="window-btn danger" aria-label="Close">×</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="workspace-head">
+          <div>
+            <p class="eyebrow">Device Layout</p>
+            <h1>Discovered Screens</h1>
+          </div>
+          <div class="workspace-actions">
+            <button id="refreshDevicesBtn" class="toolbar-btn">Refresh</button>
+          </div>
+        </section>
+
+        <section class="status-strip">
+          <div>
+            <strong id="heroTitle">Waiting for daemon</strong>
+            <p id="heroSubtitle" class="muted">
+              Start the background daemon to discover devices and simulate their screen positions.
+            </p>
+          </div>
+          <div class="status-metrics">
+            <span id="serviceMetric">Offline</span>
+            <span id="networkMetric">Daemon offline</span>
+            <span id="devicesMetric">0 connected / 0 discovered</span>
+          </div>
+        </section>
+
+        <section class="stage-panel">
+          <div id="screenStage" class="screen-stage"></div>
+        </section>
+
+        <section class="footer-strip">
+          <div class="footer-block">
+            <span class="footer-label">Service</span>
+            <strong id="serviceDetail">Daemon unreachable</strong>
+          </div>
+          <div class="footer-block">
+            <span class="footer-label">Network</span>
+            <strong id="networkDetail">No bind address available</strong>
+          </div>
+          <div class="footer-block">
+            <span class="footer-label">Devices</span>
+            <strong id="devicesDetail">Only the local screen is visible right now</strong>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

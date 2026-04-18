@@ -1,0 +1,25 @@
+[package]
+name = "rshare-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[package.metadata]
+
+[[bin]]
+name = "rshare-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+rshare-core = { path = "../../../crates/rshare-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tauri = { version = "2.2", features = [] }
