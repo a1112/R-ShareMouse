@@ -5,7 +5,7 @@ members = [
     "crates/rshare-net",
     "crates/rshare-input",
     "crates/rshare-platform",
-    "apps/rshare-gui",
+    "apps/rshare-desktop/src-tauri",
     "apps/rshare-cli",
     "apps/rshare-daemon",
 ]
