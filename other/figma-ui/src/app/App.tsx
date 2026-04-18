@@ -1,0 +1,886 @@
+import { useEffect, useState, type ReactNode } from "react";
+import {
+  LayoutGrid,
+  Maximize2,
+  Minus,
+  Monitor,
+  Play,
+  RotateCcw,
+  Settings,
+  Square,
+  Wifi,
+  X,
+} from "lucide-react";
+
+import MonitorManager, {
+  DeviceData as LayoutDevice,
+  MonitorData,
+} from "./components/MonitorManager";
+import { buildDesktopViewModel } from "./desktop-model.mjs";
+import {
+  buildFooterStatus,
+  getHeaderMetrics,
+  getPageLabels,
+  getThemeModeOptions,
+} from "./desktop-shell.mjs";
+import {
+  buildPageChrome,
+  FIGMA_DESKTOP_THEME,
+  getDesktopTheme,
+} from "./desktop-theme.mjs";
+
+type DesktopPage = "layout" | "devices" | "settings";
+
+type DashboardPayload = {
+  status: unknown;
+  devices: Array<{
+    id: string;
+    name: string;
+    hostname: string;
+    addresses?: string[];
+    connected: boolean;
+    last_seen_secs?: number | null;
+  }>;
+};
+
+type TauriInvoke = <T = unknown>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
+
+type ThemeMode = "light" | "dark" | "system";
+
+const POLL_INTERVAL_MS = 1500;
+
+const EMPTY_PAYLOAD: DashboardPayload = {
+  status: null,
+  devices: [],
+};
+
+const PAGE_LABELS: Array<{ key: DesktopPage; label: string }> = getPageLabels();
+
+function getInvoke(): TauriInvoke | null {
+  const tauriWindow = window as Window & {
+    __TAURI__?: {
+      core?: {
+        invoke?: TauriInvoke;
+      };
+    };
+  };
+
+  return tauriWindow.__TAURI__?.core?.invoke ?? null;
+}
+
+async function invokeCommand<T = unknown>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  const invoke = getInvoke();
+  if (!invoke) {
+    throw new Error("Tauri bridge unavailable");
+  }
+
+  return invoke<T>(command, args);
+}
+
+function getLayoutDevices(layoutDevices: Array<Record<string, unknown>>): LayoutDevice[] {
+  return layoutDevices.map((device) => ({
+    id: String(device.id),
+    name: String(device.name),
+    color: String(device.color),
+    online: Boolean(device.online),
+    connected: Boolean(device.connected),
+    type: device.type === "laptop" ? "laptop" : "desktop",
+    expanded: true,
+  }));
+}
+
+function getLayoutMonitors(layoutMonitors: Array<Record<string, unknown>>): MonitorData[] {
+  return layoutMonitors.map((monitor) => ({
+    id: String(monitor.id),
+    label: String(monitor.label),
+    name: String(monitor.name),
+    deviceId: String(monitor.deviceId),
+    resWidth: Number(monitor.resWidth),
+    resHeight: Number(monitor.resHeight),
+    color: String(monitor.color),
+    x: Number(monitor.x),
+    y: Number(monitor.y),
+    w: Number(monitor.w),
+    h: Number(monitor.h),
+    primary: Boolean(monitor.primary),
+    enabled: Boolean(monitor.enabled),
+  }));
+}
+
+export default function App() {
+  const [page, setPage] = useState<DesktopPage>("layout");
+  const [payload, setPayload] = useState<DashboardPayload>(EMPTY_PAYLOAD);
+  const [busy, setBusy] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("system");
+  const [systemPrefersDark, setSystemPrefersDark] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  const model = buildDesktopViewModel(payload);
+  const layoutDevices = getLayoutDevices(model.layout.devices);
+  const layoutMonitors = getLayoutMonitors(model.layout.monitors);
+  const isDark = themeMode === "system" ? systemPrefersDark : themeMode === "dark";
+  const theme = getDesktopTheme(isDark);
+  const chrome = buildPageChrome(page, theme);
+  const footerStatus = buildFooterStatus(model);
+  const headerMetrics = getHeaderMetrics();
+
+  async function refreshDashboard() {
+    try {
+      const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
+      setPayload(snapshot);
+      setError(null);
+    } catch (refreshError) {
+      setPayload(EMPTY_PAYLOAD);
+      setError(String(refreshError));
+    }
+  }
+
+  useEffect(() => {
+    refreshDashboard();
+    const timer = window.setInterval(() => {
+      refreshDashboard();
+      setRefreshTick((value) => value + 1);
+    }, POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const applyPreference = () => setSystemPrefersDark(media.matches);
+
+    applyPreference();
+    media.addEventListener("change", applyPreference);
+
+    return () => media.removeEventListener("change", applyPreference);
+  }, []);
+
+  async function runServiceAction(action: "start" | "stop") {
+    setBusy(true);
+    try {
+      if (action === "start") {
+        await invokeCommand("start_service");
+      } else {
+        await invokeCommand("stop_service");
+      }
+      await refreshDashboard();
+    } catch (actionError) {
+      setError(String(actionError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function connectDevice(deviceId: string) {
+    setBusy(true);
+    try {
+      await invokeCommand("connect_device", { device_id: deviceId });
+      await refreshDashboard();
+    } catch (actionError) {
+      setError(String(actionError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnectDevice(deviceId: string) {
+    setBusy(true);
+    try {
+      await invokeCommand("disconnect_device", { device_id: deviceId });
+      await refreshDashboard();
+    } catch (actionError) {
+      setError(String(actionError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleWindow(command: "minimize_window" | "toggle_maximize_window" | "close_window") {
+    try {
+      await invokeCommand(command);
+    } catch (windowError) {
+      setError(String(windowError));
+    }
+  }
+
+  return (
+    <div
+      className="flex h-full min-h-0 flex-col overflow-hidden"
+      style={{
+        background: theme.frame,
+        color: theme.text,
+      }}
+    >
+      <header
+        className="flex h-12 shrink-0 items-center"
+        style={{
+          borderBottom: `1px solid ${theme.border}`,
+          background: theme.toolbar,
+          paddingLeft: headerMetrics.headerPaddingX,
+          paddingRight: headerMetrics.headerPaddingX,
+        }}
+        data-tauri-drag-region="true"
+      >
+        <div
+          className="flex min-w-[204px] items-center"
+          style={{ gap: headerMetrics.brandGap }}
+          data-tauri-drag-region="true"
+        >
+          <div
+            className="flex h-8 w-8 items-center justify-center rounded-md"
+            style={{
+              background: theme.accentSoft,
+              color: theme.accent,
+              border: `1px solid ${theme.border}`,
+            }}
+          >
+            <Monitor size={16} />
+          </div>
+          <div className="leading-tight" data-tauri-drag-region="true">
+            <div className="text-sm font-semibold">R-ShareMouse</div>
+            <div className="text-[11px]" style={{ color: theme.textSub }}>
+              共享桌面控制
+            </div>
+          </div>
+        </div>
+
+        <div
+          className="ml-3 flex items-center"
+          style={{ gap: headerMetrics.navGap }}
+          data-tauri-drag-region="false"
+        >
+          {PAGE_LABELS.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              className="rounded-md text-sm transition"
+              style={{
+                background: page === item.key ? theme.accentSoft : "transparent",
+                color:
+                  page === item.key
+                    ? theme.text
+                    : theme.textSub,
+                border:
+                  page === item.key
+                    ? `1px solid ${theme.accent}`
+                    : "1px solid transparent",
+                boxShadow:
+                  page === item.key
+                    ? "inset 0 0 0 1px rgba(255,255,255,0.04)"
+                    : "none",
+                paddingLeft: headerMetrics.navButtonPaddingX,
+                paddingRight: headerMetrics.navButtonPaddingX,
+                paddingTop: headerMetrics.navButtonPaddingY,
+                paddingBottom: headerMetrics.navButtonPaddingY,
+              }}
+              onClick={() => setPage(item.key)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        <div
+          className="ml-auto flex items-center"
+          style={{ gap: headerMetrics.actionGap }}
+          data-tauri-drag-region="false"
+        >
+          <button
+            type="button"
+            className="rounded-md text-sm transition"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.sidebar,
+              color: theme.textSub,
+              paddingLeft: headerMetrics.actionButtonPaddingX,
+              paddingRight: headerMetrics.actionButtonPaddingX,
+              paddingTop: headerMetrics.actionButtonPaddingY,
+              paddingBottom: headerMetrics.actionButtonPaddingY,
+            }}
+            onClick={refreshDashboard}
+            title={`刷新 ${refreshTick}`}
+          >
+            <span className="flex items-center gap-2">
+              <RotateCcw size={14} />
+              刷新
+            </span>
+          </button>
+          <button
+            type="button"
+            className="rounded-md text-sm transition"
+            style={{
+              background: model.service.online
+                ? "rgba(197, 48, 48, 0.18)"
+                : theme.accentSoft,
+              color: model.service.online
+                ? "#ffb8c1"
+                : theme.text,
+              border: `1px solid ${
+                model.service.online
+                  ? "rgba(197, 48, 48, 0.4)"
+                  : theme.accent
+              }`,
+              paddingLeft: headerMetrics.actionButtonPaddingX,
+              paddingRight: headerMetrics.actionButtonPaddingX,
+              paddingTop: headerMetrics.actionButtonPaddingY,
+              paddingBottom: headerMetrics.actionButtonPaddingY,
+            }}
+            disabled={busy}
+            onClick={() => runServiceAction(model.service.online ? "stop" : "start")}
+          >
+            <span className="flex items-center gap-2">
+              {model.service.online ? <Square size={13} /> : <Play size={13} />}
+              {model.service.online ? "停止服务" : "启动服务"}
+            </span>
+          </button>
+          <div
+            className="ml-1 flex items-center"
+            style={{ gap: headerMetrics.windowGap }}
+          >
+            <WindowButton onClick={() => handleWindow("minimize_window")} title="最小化" theme={theme} size={headerMetrics.windowButtonSize}>
+              <Minus size={14} />
+            </WindowButton>
+            <WindowButton onClick={() => handleWindow("toggle_maximize_window")} title="最大化" theme={theme} size={headerMetrics.windowButtonSize}>
+              <Maximize2 size={13} />
+            </WindowButton>
+            <WindowButton danger onClick={() => handleWindow("close_window")} title="关闭" theme={theme} size={headerMetrics.windowButtonSize}>
+              <X size={14} />
+            </WindowButton>
+          </div>
+        </div>
+      </header>
+
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {error ? (
+          <section
+            className="mx-4 mt-3 px-4 py-3 text-sm"
+            style={{
+              border: "1px solid rgba(197, 48, 48, 0.45)",
+              background: "rgba(94, 24, 34, 0.55)",
+              color: "#ffb8c1",
+            }}
+          >
+            {error}
+          </section>
+        ) : null}
+
+        <div
+          className="min-h-0 flex-1 overflow-hidden"
+          style={{
+            padding: chrome.contentPadding,
+            background: page === "layout" ? chrome.surface : theme.canvas,
+          }}
+        >
+          {page === "layout" ? (
+            <MonitorManager
+              devices={layoutDevices}
+              monitors={layoutMonitors}
+              isDark={isDark}
+              showThemeToggle={false}
+              showFooter={false}
+              statusText={`布局画布 · ${model.devices.length} 台远端设备`}
+              footerText="拖拽只影响当前界面展示。"
+            />
+          ) : null}
+
+          {page === "devices" ? (
+            <DevicesPage
+              busy={busy}
+              devices={model.devices}
+              onConnect={connectDevice}
+              onDisconnect={disconnectDevice}
+              theme={theme}
+            />
+          ) : null}
+
+          {page === "settings" ? (
+            <SettingsPage
+              localDevice={model.settings.localDevice}
+              inputMode={model.settings.inputMode}
+              privilegeState={model.settings.privilegeState}
+              service={model.service}
+              themeMode={themeMode}
+              onThemeModeChange={setThemeMode}
+              onToggleService={() =>
+                runServiceAction(model.service.online ? "stop" : "start")
+              }
+              busy={busy}
+              theme={theme}
+            />
+          ) : null}
+        </div>
+
+        <footer
+          className="flex h-8 shrink-0 items-center gap-3 px-4 text-xs"
+          style={{
+            borderTop: `1px solid ${theme.border}`,
+            background: theme.sidebar,
+            color: theme.textMuted,
+          }}
+        >
+          <div
+            className="h-2 w-2 rounded-full"
+            style={{
+              background: model.service.online
+                ? model.service.healthy
+                  ? theme.success
+                  : "#d6a64b"
+                : theme.textMuted,
+            }}
+          />
+          <span>{footerStatus.summary}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <Wifi size={12} />
+            <span>{footerStatus.endpoint}</span>
+          </div>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+function DevicesPage({
+  devices,
+  onConnect,
+  onDisconnect,
+  busy,
+  theme,
+}: {
+  devices: Array<{
+    id: string;
+    name: string;
+    hostname: string;
+    address: string;
+    connected: boolean;
+    online: boolean;
+    lastSeenLabel: string;
+  }>;
+  onConnect: (deviceId: string) => void;
+  onDisconnect: (deviceId: string) => void;
+  busy: boolean;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  if (!devices.length) {
+    return (
+      <EmptyPanel
+        title="尚未发现设备"
+        detail="启动守护进程并保持同一局域网后，发现到的设备会同时出现在设备页和布局页。"
+        theme={theme}
+      />
+    );
+  }
+
+  return (
+    <div className="grid h-full grid-cols-1 gap-3 overflow-auto xl:grid-cols-2">
+      {devices.map((device) => (
+        <article
+          key={device.id}
+          className="p-5"
+          style={{
+            background: theme.sidebar,
+            border: `1px solid ${theme.border}`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div className="flex items-start gap-4">
+            <div
+              className="flex h-12 w-12 items-center justify-center rounded-md"
+              style={{
+                background: theme.accentSoft,
+                color: theme.accent,
+              }}
+            >
+              <Monitor size={18} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h2 className="truncate text-lg font-semibold">{device.name}</h2>
+                <span
+                  className="rounded px-2 py-0.5 text-xs"
+                  style={{
+                    background: device.connected
+                      ? "rgba(73, 179, 92, 0.16)"
+                      : "rgba(255,255,255,0.04)",
+                    color: device.connected
+                      ? "#8de29d"
+                      : theme.textSub,
+                  }}
+                >
+                  {device.connected ? "已连接" : "已发现"}
+                </span>
+              </div>
+              <div className="mt-1 text-sm" style={{ color: theme.textMuted }}>
+                {device.hostname}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="rounded-md px-4 py-2 text-sm transition"
+              style={{
+                background: device.connected
+                  ? "rgba(197, 48, 48, 0.18)"
+                  : theme.accentSoft,
+                color: device.connected
+                  ? "#ffb5c0"
+                  : theme.text,
+                border: `1px solid ${
+                  device.connected
+                    ? "rgba(197, 48, 48, 0.35)"
+                    : theme.accent
+                }`,
+              }}
+              disabled={busy}
+              onClick={() =>
+                device.connected ? onDisconnect(device.id) : onConnect(device.id)
+              }
+            >
+              {device.connected ? "断开连接" : "连接"}
+            </button>
+          </div>
+
+          <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+            <InfoRow label="地址" value={device.address} theme={theme} />
+            <InfoRow label="最近出现" value={device.lastSeenLabel} theme={theme} />
+            <InfoRow label="状态" value={device.online ? "可达" : "离线"} theme={theme} />
+            <InfoRow label="布局映射" value={device.connected ? "已联动" : "空闲"} theme={theme} />
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function SettingsPage({
+  localDevice,
+  inputMode,
+  privilegeState,
+  service,
+  themeMode,
+  onThemeModeChange,
+  onToggleService,
+  busy,
+  theme,
+}: {
+  localDevice: {
+    name: string;
+    hostname: string;
+    bindAddress: string;
+    discoveryPort: number | null;
+    pid: number | null;
+  };
+  inputMode: {
+    current: string;
+    available: string[];
+    health: string;
+    reason: string | null;
+  };
+  privilegeState: string;
+  service: {
+    online: boolean;
+    healthy: boolean;
+    discoveredDevices: number;
+    connectedDevices: number;
+  };
+  themeMode: ThemeMode;
+  onThemeModeChange: (mode: ThemeMode) => void;
+  onToggleService: () => void;
+  busy: boolean;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <div className="grid h-full grid-cols-1 gap-3 overflow-auto xl:grid-cols-[1.1fr_0.9fr]">
+      <section
+        className="p-5"
+        style={{
+          background: theme.sidebar,
+          border: `1px solid ${theme.border}`,
+          boxShadow: theme.panelShadow,
+        }}
+      >
+        <div className="mb-5 flex items-center gap-3">
+          <div
+            className="flex h-11 w-11 items-center justify-center rounded-md"
+            style={{
+              background: theme.accentSoft,
+              color: theme.accent,
+            }}
+          >
+            <Settings size={18} />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">本机信息</h2>
+            <p className="text-sm" style={{ color: theme.textMuted }}>
+              当前界面显示的是守护进程快照提供的最小设置集。
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          <InfoRow label="设备名" value={localDevice.name} theme={theme} />
+          <InfoRow label="主机名" value={localDevice.hostname} theme={theme} />
+          <InfoRow label="监听地址" value={localDevice.bindAddress} theme={theme} />
+          <InfoRow label="发现端口" value={localDevice.discoveryPort == null ? "不可用" : String(localDevice.discoveryPort)} theme={theme} />
+          <InfoRow label="守护进程 PID" value={localDevice.pid == null ? "不可用" : String(localDevice.pid)} theme={theme} />
+          <InfoRow label="权限状态" value={privilegeState} theme={theme} />
+        </div>
+      </section>
+
+      <div className="flex flex-col gap-4">
+        <section
+          className="p-5"
+          style={{
+            background: theme.sidebar,
+            border: `1px solid ${theme.border}`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div className="mb-4 flex items-center gap-3">
+            <div
+              className="flex h-11 w-11 items-center justify-center rounded-md"
+              style={{
+                background: "rgba(255,255,255,0.04)",
+                color: theme.textSub,
+              }}
+            >
+              <Wifi size={18} />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold">服务状态</h2>
+              <p className="text-sm" style={{ color: theme.textMuted }}>
+                当前守护进程会话的快速运行信息。
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3 text-sm">
+            <InfoRow label="守护进程" value={service.online ? "运行中" : "已停止"} theme={theme} />
+            <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
+            <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
+            <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
+          </div>
+
+          <button
+            type="button"
+            className="mt-5 rounded-md px-4 py-2 text-sm transition"
+            style={{
+              background: service.online
+                ? "rgba(197, 48, 48, 0.18)"
+                : theme.accentSoft,
+              color: service.online ? "#ffb5c0" : theme.text,
+              border: `1px solid ${
+                service.online
+                  ? "rgba(197, 48, 48, 0.35)"
+                  : theme.accent
+              }`,
+            }}
+            disabled={busy}
+            onClick={onToggleService}
+          >
+            {service.online ? "停止服务" : "启动服务"}
+          </button>
+        </section>
+
+        <section
+          className="p-5"
+          style={{
+            background: theme.sidebar,
+            border: `1px solid ${theme.border}`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div className="mb-4 flex items-center gap-3">
+            <div
+              className="flex h-11 w-11 items-center justify-center rounded-md"
+              style={{
+                background: "rgba(255,255,255,0.04)",
+                color: theme.textSub,
+              }}
+            >
+              <LayoutGrid size={18} />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold">输入后端</h2>
+              <p className="text-sm" style={{ color: theme.textMuted }}>
+                当前输入模式以及降级可见性都来自守护进程。
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3 text-sm">
+            <InfoRow label="当前模式" value={inputMode.current} theme={theme} />
+            <InfoRow label="健康度" value={inputMode.health} theme={theme} />
+            <InfoRow label="原因" value={inputMode.reason ?? "无"} theme={theme} />
+            <InfoRow
+              label="可用后端"
+              value={inputMode.available.length ? inputMode.available.join(", ") : "无"}
+              theme={theme}
+            />
+          </div>
+        </section>
+
+        <section
+          className="p-5"
+          style={{
+            background: theme.sidebar,
+            border: `1px solid ${theme.border}`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div className="mb-4 flex items-center gap-3">
+            <div
+              className="flex h-11 w-11 items-center justify-center rounded-md"
+              style={{
+                background: "rgba(255,255,255,0.04)",
+                color: theme.textSub,
+              }}
+            >
+              <Settings size={18} />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold">界面风格</h2>
+              <p className="text-sm" style={{ color: theme.textMuted }}>
+                选择浅色、深色或跟随系统。
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            {getThemeModeOptions().map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className="rounded-md px-4 py-2 text-sm transition"
+                style={{
+                  background:
+                    themeMode === option.key ? theme.accentSoft : theme.frame,
+                  color: themeMode === option.key ? theme.text : theme.textSub,
+                  border: `1px solid ${
+                    themeMode === option.key ? theme.accent : theme.border
+                  }`,
+                }}
+                onClick={() => onThemeModeChange(option.key as ThemeMode)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function WindowButton({
+  children,
+  onClick,
+  title,
+  danger = false,
+  theme,
+  size,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  title: string;
+  danger?: boolean;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  size: number;
+}) {
+  return (
+    <button
+      type="button"
+      className="flex items-center justify-center rounded-md transition"
+      onClick={onClick}
+      title={title}
+      style={{
+        color: theme.textSub,
+        width: size,
+        height: size,
+      }}
+      onMouseEnter={(event) => {
+        event.currentTarget.style.backgroundColor = danger
+          ? theme.danger
+          : "rgba(255,255,255,0.04)";
+        event.currentTarget.style.color = danger ? "#ffffff" : theme.text;
+      }}
+      onMouseLeave={(event) => {
+        event.currentTarget.style.backgroundColor = "transparent";
+        event.currentTarget.style.color = theme.textSub;
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function EmptyPanel({
+  title,
+  detail,
+  theme,
+}: {
+  title: string;
+  detail: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <div
+      className="flex h-full items-center justify-center p-8"
+      style={{
+        border: `1px dashed ${theme.border}`,
+        background: theme.sidebar,
+      }}
+    >
+      <div className="max-w-xl text-center">
+        <div
+          className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-md"
+          style={{
+            background: theme.accentSoft,
+            color: theme.accent,
+          }}
+        >
+          <Monitor size={20} />
+        </div>
+        <h2 className="text-xl font-semibold">{title}</h2>
+        <p className="mt-3 text-sm leading-6" style={{ color: theme.textMuted }}>
+          {detail}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function InfoRow({
+  label,
+  value,
+  theme,
+}: {
+  label: string;
+  value: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <div
+      className="px-4 py-3"
+      style={{
+        border: `1px solid ${theme.border}`,
+        background: theme.frame,
+      }}
+    >
+      <div
+        className="mb-1 text-xs uppercase tracking-[0.16em]"
+        style={{ color: theme.textMuted }}
+      >
+        {label}
+      </div>
+      <div className="break-all text-sm" style={{ color: theme.text }}>
+        {value}
+      </div>
+    </div>
+  );
+}
