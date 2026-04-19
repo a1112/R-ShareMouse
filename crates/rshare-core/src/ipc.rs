@@ -6,7 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    BackendHealth, BackendKind, DeviceId, PrivilegeState, ResolvedInputMode,
+    BackendHealth, BackendKind, ControlSessionState, DeviceId, LayoutGraph,
+    PrivilegeState, ResolvedInputMode,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -41,6 +42,14 @@ pub struct ServiceStatusSnapshot {
     /// Last backend error message (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_backend_error: Option<String>,
+
+    // Alpha-2 session state fields
+    /// Current control session state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<ControlSessionState>,
+    /// Active control target (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_target: Option<DeviceId>,
 }
 
 impl ServiceStatusSnapshot {
@@ -68,6 +77,8 @@ impl ServiceStatusSnapshot {
             backend_health: None,
             privilege_state: None,
             last_backend_error: None,
+            session_state: None,
+            active_target: None,
         }
     }
 }
@@ -90,6 +101,8 @@ pub enum DaemonRequest {
     Devices,
     Connect { device_id: DeviceId },
     Disconnect { device_id: DeviceId },
+    GetLayout,
+    SetLayout { layout: LayoutGraph },
     Shutdown,
 }
 
@@ -98,6 +111,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Status(ServiceStatusSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),
+    Layout(LayoutGraph),
     Ack,
     Error(String),
 }
