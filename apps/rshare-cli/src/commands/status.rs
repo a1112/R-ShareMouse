@@ -1,71 +1,88 @@
-//! Status command implementation
+//! Status command implementation.
 
 use anyhow::Result;
 use colored::Colorize;
-use crate::output::{header, kv, success, status_ok, status_err};
 
-/// Execute the status command
+use crate::output::{header, kv, status_err, status_ok};
+
+/// Execute the status command.
 pub async fn execute(detailed: bool) -> Result<()> {
     header("Service Status");
 
-    // Check if service is running
-    let pid_file = get_pid_file()?;
-
-    if pid_file.exists() {
-        status_ok("Service Status: Running");
-
-        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            kv("PID", pid.trim());
-        }
-
-        if detailed {
-            print_detailed_status().await?;
-        }
-    } else {
+    let manager = rshare_core::service::ServiceManager::new()?;
+    if !manager.is_running() {
         status_err("Service Status: Stopped");
         return Ok(());
     }
 
-    println!();
-    success("Service is healthy");
+    match rshare_core::daemon_client::request_status().await {
+        Ok(status) => {
+            status_ok("Service Status: Running");
+            kv("PID", &status.pid.to_string());
+            kv("Device", &status.device_name);
+            kv("Hostname", &status.hostname);
+
+            if detailed {
+                print_detailed_status(&status);
+            }
+        }
+        Err(err) => {
+            status_err("Service Status: Unresponsive");
+            if let Some(pid) = manager.get_pid() {
+                kv("PID", &pid.to_string());
+            }
+            kv("Error", &err.to_string());
+        }
+    }
 
     Ok(())
 }
 
-/// Print detailed status information
-async fn print_detailed_status() -> Result<()> {
+fn print_detailed_status(status: &rshare_core::ServiceStatusSnapshot) {
     println!();
     println!("{}", "Network".bold());
-
-    // TODO: Get actual network info from service
-    kv("Listening", "0.0.0.0:4242");
-    kv("Connected Devices", "2");
-    kv("Uptime", "5m 32s");
-
-    println!();
-    println!("{}", "Performance".bold());
-
-    // TODO: Get actual performance metrics
-    kv("Events Sent", "1,234");
-    kv("Events Received", "987");
-    kv("Avg Latency", "8ms");
+    kv("Listening", &status.bind_address);
+    kv("Discovery Port", &status.discovery_port.to_string());
+    kv("Discovered Devices", &status.discovered_devices.to_string());
+    kv("Connected Devices", &status.connected_devices.to_string());
 
     println!();
-    println!("{}", "Resources".bold());
+    println!("{}", "Input Backend".bold());
+    if let Some(input_mode) = &status.input_mode {
+        kv("Mode", &format!("{:?}", input_mode));
+    } else {
+        kv("Mode", "unknown");
+    }
+    if let Some(backend_health) = &status.backend_health {
+        match backend_health {
+            rshare_core::BackendHealth::Healthy => {
+                let health = "healthy".green();
+                kv("Health", &format!("{}", health));
+            }
+            rshare_core::BackendHealth::Degraded { reason } => {
+                let health = format!("degraded: {:?}", reason).yellow();
+                kv("Health", &format!("{}", health));
+            }
+        }
+    }
+    if let Some(available) = &status.available_backends {
+        let backends: String = available
+            .iter()
+            .map(|k| format!("{:?}", k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        kv("Available", &backends);
+    }
+    if let Some(privilege_state) = &status.privilege_state {
+        kv("Session", &format!("{:?}", privilege_state));
+    }
+    if let Some(error) = &status.last_backend_error {
+        let err = error.red();
+        kv("Last Error", &format!("{}", err));
+    }
 
-    // TODO: Get actual resource usage
-    kv("Memory", "24.5 MB");
-    kv("CPU", "2.3%");
-
-    Ok(())
-}
-
-/// Get the PID file path
-fn get_pid_file() -> Result<std::path::PathBuf> {
-    let config_dir = directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rshare");
-
-    Ok(config_dir.join("rshare.pid"))
+    println!();
+    println!("{}", "Identity".bold());
+    kv("Device ID", &status.device_id.to_string());
+    kv("Healthy", if status.healthy { "yes" } else { "no" });
 }

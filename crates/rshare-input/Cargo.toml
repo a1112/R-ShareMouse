@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 rshare-common = { path = "../rshare-common" }
+rshare-core = { path = "../rshare-core" }
 rshare-platform = { path = "../rshare-platform" }
 
 tokio = { workspace = true }

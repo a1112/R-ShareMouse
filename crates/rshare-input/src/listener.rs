@@ -231,6 +231,123 @@ impl RDevInputListener {
         Ok(())
     }
 
+    /// Start listening on a dedicated OS thread.
+    ///
+    /// This is used by synchronous backend adapters that cannot await the
+    /// async `start` method. The rdev listener itself is blocking, so keeping it
+    /// on a dedicated thread also avoids blocking a Tokio worker.
+    pub fn start_background_thread(&self) -> Result<std::thread::JoinHandle<()>> {
+        {
+            let mut running = self.running.blocking_lock();
+            if *running {
+                return Ok(std::thread::spawn(|| {}));
+            }
+            *running = true;
+        }
+
+        tracing::info!("RDev input listener starting on background thread");
+
+        let running = self.running.clone();
+        let channel = self.channel.clone();
+        let config = self.config.clone();
+        let last_mouse_time = self.last_mouse_time.clone();
+        let last_mouse_pos = self.last_mouse_pos.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("rshare-rdev-input-listener".to_string())
+            .spawn(move || {
+                use rdev::{listen, Event, EventType};
+
+                let callback = move |event: Event| {
+                    if !*running.blocking_lock() {
+                        return;
+                    }
+
+                    match event.event_type {
+                        EventType::MouseMove { x, y } => {
+                            if config.capture_mouse {
+                                let now = Instant::now();
+                                let should_send = {
+                                    let mut last_time = last_mouse_time.blocking_lock();
+                                    let elapsed = now.saturating_duration_since(*last_time);
+                                    if elapsed >= config.mouse_debounce {
+                                        *last_time = now;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if should_send {
+                                    let _ =
+                                        channel.send(InputEvent::mouse_move(x as i32, y as i32));
+                                }
+
+                                *last_mouse_pos.blocking_lock() = Some((x as i32, y as i32));
+                            }
+                        }
+                        EventType::ButtonPress(button) => {
+                            if config.capture_mouse {
+                                let mouse_button = match button {
+                                    rdev::Button::Left => MouseButton::Left,
+                                    rdev::Button::Right => MouseButton::Right,
+                                    rdev::Button::Middle => MouseButton::Middle,
+                                    _ => MouseButton::Other(0),
+                                };
+                                let _ = channel.send(InputEvent::mouse_button(
+                                    mouse_button,
+                                    ButtonState::Pressed,
+                                ));
+                            }
+                        }
+                        EventType::ButtonRelease(button) => {
+                            if config.capture_mouse {
+                                let mouse_button = match button {
+                                    rdev::Button::Left => MouseButton::Left,
+                                    rdev::Button::Right => MouseButton::Right,
+                                    rdev::Button::Middle => MouseButton::Middle,
+                                    _ => MouseButton::Other(0),
+                                };
+                                let _ = channel.send(InputEvent::mouse_button(
+                                    mouse_button,
+                                    ButtonState::Released,
+                                ));
+                            }
+                        }
+                        EventType::Wheel { delta_x, delta_y } => {
+                            if config.capture_mouse {
+                                let _ = channel
+                                    .send(InputEvent::mouse_wheel(delta_x as i32, delta_y as i32));
+                            }
+                        }
+                        EventType::KeyPress(key) => {
+                            if config.capture_keyboard {
+                                if let Some(key_code) = rdev_key_to_key_code(key) {
+                                    let _ = channel
+                                        .send(InputEvent::key(key_code, ButtonState::Pressed));
+                                }
+                            }
+                        }
+                        EventType::KeyRelease(key) => {
+                            if config.capture_keyboard {
+                                if let Some(key_code) = rdev_key_to_key_code(key) {
+                                    let _ = channel
+                                        .send(InputEvent::key(key_code, ButtonState::Released));
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if let Err(error) = listen(callback) {
+                    tracing::error!("RDev listen error: {:?}", error);
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("Failed to spawn rdev listener thread: {error}"))?;
+
+        Ok(handle)
+    }
+
     /// Stop listening
     pub async fn stop(&self) -> Result<()> {
         let mut running = self.running.lock().await;
@@ -239,9 +356,22 @@ impl RDevInputListener {
         Ok(())
     }
 
+    /// Stop listening from synchronous adapter code.
+    pub fn stop_blocking(&self) -> Result<()> {
+        let mut running = self.running.blocking_lock();
+        *running = false;
+        tracing::info!("RDev input listener stopped");
+        Ok(())
+    }
+
     /// Check if running
     pub async fn is_running(&self) -> bool {
         *self.running.lock().await
+    }
+
+    /// Check running state from synchronous adapter code.
+    pub fn is_running_blocking(&self) -> bool {
+        *self.running.blocking_lock()
     }
 
     /// Get the last mouse position
@@ -317,6 +447,8 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
 pub struct DefaultInputListener {
     config: ListenerConfig,
     running: bool,
+    #[cfg(all(target_os = "windows", not(test)))]
+    windows_listener: Option<rshare_platform::WindowsInputListener>,
     #[cfg(all(target_os = "macos", not(test)))]
     macos_listener: Option<rshare_platform::MacosInputListener>,
 }
@@ -326,6 +458,8 @@ impl DefaultInputListener {
         Self {
             config: ListenerConfig::default(),
             running: false,
+            #[cfg(all(target_os = "windows", not(test)))]
+            windows_listener: None,
             #[cfg(all(target_os = "macos", not(test)))]
             macos_listener: None,
         }
@@ -349,6 +483,24 @@ impl InputListener for DefaultInputListener {
             return Ok(());
         }
 
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            use std::sync::{Arc, Mutex as StdMutex};
+
+            tracing::info!("Input listener starting (using native Windows low-level hooks)");
+            let callback = Arc::new(StdMutex::new(_callback));
+            let mut listener = rshare_platform::WindowsInputListener::new();
+            listener.start_with_callback(move |event| {
+                let input_event = InputEvent::from_windows_event(event);
+                if let Ok(callback) = callback.lock() {
+                    callback(input_event);
+                }
+            })?;
+            self.windows_listener = Some(listener);
+            self.running = true;
+            return Ok(());
+        }
+
         #[cfg(all(target_os = "macos", not(test)))]
         {
             use std::sync::{Arc, Mutex as StdMutex};
@@ -367,7 +519,10 @@ impl InputListener for DefaultInputListener {
             return Ok(());
         }
 
-        #[cfg(not(all(target_os = "macos", not(test))))]
+        #[cfg(not(any(
+            all(target_os = "windows", not(test)),
+            all(target_os = "macos", not(test))
+        )))]
         {
             tracing::info!("Input listener starting (using RDev)");
             self.running = true;
@@ -380,6 +535,14 @@ impl InputListener for DefaultInputListener {
     }
 
     fn stop(&mut self) -> Result<()> {
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            if let Some(listener) = self.windows_listener.as_mut() {
+                listener.stop()?;
+            }
+            self.windows_listener = None;
+        }
+
         #[cfg(all(target_os = "macos", not(test)))]
         {
             if let Some(listener) = self.macos_listener.as_mut() {
@@ -440,5 +603,35 @@ mod tests {
         let callback = Box::new(|_event| {});
         let result = listener.start(callback);
         assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn capture_falls_back_to_portable_when_windows_hook_setup_fails() {
+        use crate::selection::{BackendCandidate, BackendSelector};
+
+        // When Windows-native is unhealthy, selector should pick portable
+        let candidates = vec![
+            BackendCandidate::unhealthy(
+                rshare_core::BackendKind::WindowsNative,
+                rshare_core::BackendFailureReason::InitializationFailed,
+            ),
+            BackendCandidate::healthy(rshare_core::BackendKind::Portable),
+        ];
+
+        let selector = BackendSelector::new();
+        let result = selector.select(&candidates);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind, rshare_core::BackendKind::Portable);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_capture_reports_correct_kind() {
+        use crate::backend::{CaptureBackend, WindowsNativeCaptureBackend};
+
+        let backend = WindowsNativeCaptureBackend::new();
+        assert_eq!(backend.kind(), rshare_core::BackendKind::WindowsNative);
     }
 }

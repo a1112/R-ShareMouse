@@ -66,7 +66,7 @@ mod windows_impl {
     /// Uses Windows hooks to detect file drag operations from Explorer
     /// and other applications.
     pub struct WindowsFileDragDetector {
-        tx: mpsc::Sender<FileDragEvent>,
+        _tx: mpsc::Sender<FileDragEvent>,
         rx: Option<mpsc::Receiver<FileDragEvent>>,
         active: bool,
     }
@@ -75,7 +75,7 @@ mod windows_impl {
         pub fn new() -> Self {
             let (tx, rx) = mpsc::channel();
             Self {
-                tx,
+                _tx: tx,
                 rx: Some(rx),
                 active: false,
             }

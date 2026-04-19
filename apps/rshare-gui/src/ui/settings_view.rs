@@ -192,17 +192,28 @@ impl SettingsView {
 
         ui.add_space(5.0);
         ui.label("Screen edge threshold:");
-        ui.add(egui::Slider::new(&mut self.edge_threshold, 1..=100)
-            .text("pixels"));
+        ui.add(egui::Slider::new(&mut self.edge_threshold, 1..=100).text("pixels"));
 
         ui.horizontal(|ui| {
             ui.label("Sync format:");
             egui::ComboBox::new("clipboard_format", "Format")
                 .selected_text(format!("{:?}", self.clipboard_format))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.clipboard_format, ClipboardFormat::Text, "Text only");
-                    ui.selectable_value(&mut self.clipboard_format, ClipboardFormat::TextAndImages, "Text + Images");
-                    ui.selectable_value(&mut self.clipboard_format, ClipboardFormat::TextAndHtml, "Text + HTML");
+                    ui.selectable_value(
+                        &mut self.clipboard_format,
+                        ClipboardFormat::Text,
+                        "Text only",
+                    );
+                    ui.selectable_value(
+                        &mut self.clipboard_format,
+                        ClipboardFormat::TextAndImages,
+                        "Text + Images",
+                    );
+                    ui.selectable_value(
+                        &mut self.clipboard_format,
+                        ClipboardFormat::TextAndHtml,
+                        "Text + HTML",
+                    );
                 });
         });
 
@@ -218,7 +229,10 @@ impl SettingsView {
         let prev_require = self.require_password;
         let prev_password = self.password.clone();
 
-        ui.checkbox(&mut self.require_password, "Require password for connections");
+        ui.checkbox(
+            &mut self.require_password,
+            "Require password for connections",
+        );
 
         if self.require_password {
             ui.horizontal(|ui| {

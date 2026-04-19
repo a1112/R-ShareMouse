@@ -81,7 +81,7 @@ impl EnigoInputEmulator {
         Ok(Self {
             config: EmulatorConfig::default(),
             enigo: Arc::new(Mutex::new(enigo)),
-            active: false,
+            active: true,  // Auto-activate on creation
         })
     }
 
@@ -532,12 +532,231 @@ fn macos_char_keycode(value: u8) -> Result<u16> {
     Ok(key)
 }
 
+/// Native Windows input emulator backed by SendInput.
+#[cfg(target_os = "windows")]
+pub struct WindowsNativeInputEmulator {
+    inner: rshare_platform::WindowsInputEmulator,
+    config: EmulatorConfig,
+    active: bool,
+    health: crate::backend::BackendHealth,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for WindowsNativeInputEmulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsNativeInputEmulator")
+            .field("active", &self.active)
+            .field("health", &self.health)
+            .finish()
+    }
+}
+
+// Implement InjectBackend for WindowsNativeInputEmulator
+#[cfg(target_os = "windows")]
+impl crate::backend::InjectBackend for WindowsNativeInputEmulator {
+    fn kind(&self) -> rshare_core::BackendKind {
+        rshare_core::BackendKind::WindowsNative
+    }
+
+    fn health(&self) -> crate::backend::BackendHealth {
+        self.health.clone()
+    }
+
+    fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+        self.emulate(event)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsNativeInputEmulator {
+    pub fn new() -> Result<Self> {
+        let mut inner = rshare_platform::WindowsInputEmulator::new();
+        inner.activate()?;
+
+        Ok(Self {
+            inner,
+            config: EmulatorConfig::default(),
+            active: true,
+            health: crate::backend::BackendHealth::Healthy,
+        })
+    }
+
+    pub fn with_config(mut self, config: EmulatorConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn activate(&mut self) -> Result<()> {
+        self.inner.activate()?;
+        self.active = true;
+        Ok(())
+    }
+
+    pub fn deactivate(&mut self) -> Result<()> {
+        self.inner.deactivate()?;
+        self.active = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn platform_emulator_is_active_for_test(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    fn convert_mouse_button(button: MouseButton) -> Result<u8> {
+        Ok(button.to_code())
+    }
+
+    fn convert_keycode(keycode: KeyCode) -> Result<u16> {
+        use rshare_platform::vk;
+
+        let vk = match keycode {
+            KeyCode::Escape => vk::VK_ESCAPE,
+            KeyCode::Enter => vk::VK_RETURN,
+            KeyCode::Tab => vk::VK_TAB,
+            KeyCode::Backspace => vk::VK_BACK,
+            KeyCode::Delete => vk::VK_DELETE,
+            KeyCode::Insert => vk::VK_INSERT,
+            KeyCode::Home => vk::VK_HOME,
+            KeyCode::End => vk::VK_END,
+            KeyCode::PageUp => vk::VK_PRIOR,
+            KeyCode::PageDown => vk::VK_NEXT,
+            KeyCode::Up => vk::VK_UP,
+            KeyCode::Down => vk::VK_DOWN,
+            KeyCode::Left => vk::VK_LEFT,
+            KeyCode::Right => vk::VK_RIGHT,
+            KeyCode::F1 => 0x70,
+            KeyCode::F2 => 0x71,
+            KeyCode::F3 => 0x72,
+            KeyCode::F4 => 0x73,
+            KeyCode::F5 => 0x74,
+            KeyCode::F6 => 0x75,
+            KeyCode::F7 => 0x76,
+            KeyCode::F8 => 0x77,
+            KeyCode::F9 => 0x78,
+            KeyCode::F10 => 0x79,
+            KeyCode::F11 => 0x7A,
+            KeyCode::F12 => 0x7B,
+            KeyCode::Space => vk::VK_SPACE,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => vk::VK_SHIFT,
+            KeyCode::ControlLeft | KeyCode::ControlRight => vk::VK_CONTROL,
+            KeyCode::AltLeft | KeyCode::AltRight => vk::VK_MENU,
+            KeyCode::SuperLeft => vk::VK_LWIN,
+            KeyCode::SuperRight => vk::VK_RWIN,
+            KeyCode::Raw(raw) => raw as u16,
+            KeyCode::Char(c) => {
+                let c = c.to_ascii_uppercase();
+                if c.is_ascii_alphabetic() {
+                    0x41 + (c - b'A') as u16
+                } else if c.is_ascii_digit() {
+                    0x30 + (c - b'0') as u16
+                } else {
+                    anyhow::bail!("Unsupported character key: {}", c)
+                }
+            }
+            _ => anyhow::bail!("Unsupported keycode: {:?}", keycode),
+        };
+        Ok(vk)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Default for WindowsNativeInputEmulator {
+    fn default() -> Self {
+        Self::new().expect("Failed to create WindowsNativeInputEmulator")
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl InputEmulator for WindowsNativeInputEmulator {
+    fn emulate(&mut self, event: InputEvent) -> Result<()> {
+        if !self.active {
+            anyhow::bail!("Windows native input emulator is not active");
+        }
+
+        match event {
+            InputEvent::MouseMove { x, y } => self.move_mouse(x, y)?,
+            InputEvent::MouseButton { button, state } => match state {
+                ButtonState::Pressed => self.press_button(button)?,
+                ButtonState::Released => self.release_button(button)?,
+            },
+            InputEvent::MouseWheel { delta_x, delta_y } => self.scroll_wheel(delta_x, delta_y)?,
+            InputEvent::Key { keycode, state } => match state {
+                ButtonState::Pressed => self.press_key(keycode)?,
+                ButtonState::Released => self.release_key(keycode)?,
+            },
+            InputEvent::KeyExtended { keycode, state, .. } => match state {
+                ButtonState::Pressed => self.press_key(keycode)?,
+                ButtonState::Released => self.release_key(keycode)?,
+            },
+        }
+
+        if self.config.event_delay.as_millis() > 0 {
+            std::thread::sleep(self.config.event_delay);
+        }
+
+        Ok(())
+    }
+
+    fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
+        let x = (x as f64 * self.config.mouse_scale) as i32;
+        let y = (y as f64 * self.config.mouse_scale) as i32;
+        self.inner.send_mouse_move(x, y)
+    }
+
+    fn move_mouse_relative(&mut self, _dx: i32, _dy: i32) -> Result<()> {
+        anyhow::bail!("Relative mouse movement is not supported by the Windows native emulator")
+    }
+
+    fn press_button(&mut self, button: MouseButton) -> Result<()> {
+        self.inner.send_button(Self::convert_mouse_button(button)?, true)
+    }
+
+    fn release_button(&mut self, button: MouseButton) -> Result<()> {
+        self.inner.send_button(Self::convert_mouse_button(button)?, false)
+    }
+
+    fn click_button(&mut self, button: MouseButton) -> Result<()> {
+        self.press_button(button)?;
+        self.release_button(button)
+    }
+
+    fn scroll_wheel(&mut self, delta_x: i32, delta_y: i32) -> Result<()> {
+        self.inner.send_wheel(delta_x, delta_y)
+    }
+
+    fn press_key(&mut self, keycode: KeyCode) -> Result<()> {
+        self.inner.send_key(Self::convert_keycode(keycode)?, true)
+    }
+
+    fn release_key(&mut self, keycode: KeyCode) -> Result<()> {
+        self.inner.send_key(Self::convert_keycode(keycode)?, false)
+    }
+
+    fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
+        self.press_key(keycode)?;
+        self.release_key(keycode)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 /// Default input emulator.
 #[cfg(target_os = "macos")]
 pub type DefaultInputEmulator = MacosNativeInputEmulator;
 
-/// Default input emulator.
-#[cfg(not(target_os = "macos"))]
+/// Default input emulator (Windows).
+#[cfg(all(windows, not(test)))]
+pub type DefaultInputEmulator = WindowsNativeInputEmulator;
+
+/// Default input emulator (fallback).
+#[cfg(all(not(target_os = "macos"), not(all(windows, not(test)))))]
 pub type DefaultInputEmulator = EnigoInputEmulator;
 
 /// Batch emulator for sending multiple events efficiently
@@ -651,11 +870,8 @@ mod tests {
             return;
         }
 
-        let mut emulator = emulator.unwrap();
-        assert!(!emulator.is_active());
-
-        let result = emulator.activate();
-        assert!(result.is_ok());
+        let emulator = emulator.unwrap();
+        // Emulator is now auto-activated on creation
         assert!(emulator.is_active());
     }
 
@@ -723,5 +939,41 @@ mod tests {
             EnigoInputEmulator::convert_keycode(KeyCode::Enter),
             Some(Key::Return)
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_backend_is_preferred_when_available() {
+        use crate::backend::InjectBackend;
+
+        let backend = WindowsNativeInputEmulator::new();
+        assert!(backend.is_ok());
+
+        let emulator = backend.unwrap();
+        // Emulator is now auto-activated on creation
+        assert!(InputEmulator::is_active(&emulator));
+        assert_eq!(InjectBackend::kind(&emulator), rshare_core::BackendKind::WindowsNative);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_new_activates_platform_emulator() {
+        let emulator = WindowsNativeInputEmulator::new().unwrap();
+
+        assert!(InputEmulator::is_active(&emulator));
+        assert!(emulator.platform_emulator_is_active_for_test());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_inactive_inject_returns_error() {
+        use crate::backend::InjectBackend;
+
+        let mut emulator = WindowsNativeInputEmulator::new().unwrap();
+        emulator.deactivate().unwrap();
+
+        let result = InjectBackend::inject(&mut emulator, InputEvent::mouse_move(10, 10));
+
+        assert!(result.is_err());
     }
 }

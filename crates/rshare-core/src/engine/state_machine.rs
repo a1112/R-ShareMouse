@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use crate::{DeviceId, Direction};
 
@@ -113,7 +112,12 @@ impl EdgeStateMachine {
     }
 
     /// Transition to remote mode
-    pub fn enter_remote(&mut self, target_device: DeviceId, direction: Direction, entry_pos: (i32, i32)) -> Result<()> {
+    pub fn enter_remote(
+        &mut self,
+        target_device: DeviceId,
+        direction: Direction,
+        entry_pos: (i32, i32),
+    ) -> Result<()> {
         if self.is_in_cooldown() {
             anyhow::bail!("Cannot transition: in cooldown period");
         }
@@ -125,7 +129,9 @@ impl EdgeStateMachine {
             entry_pos
         );
 
-        self.mode = CaptureMode::Remote { target: target_device };
+        self.mode = CaptureMode::Remote {
+            target: target_device,
+        };
         self.remote_device = Some(target_device);
         self.exit_direction = Some(direction);
         self.entry_position = Some(entry_pos);
@@ -168,7 +174,10 @@ impl EdgeStateMachine {
                 // Exiting local screen to remote
                 if let Some(target) = target_device {
                     self.enter_remote(target, direction, cursor_pos)?;
-                    Ok(Transition::ToRemote { device: target, direction })
+                    Ok(Transition::ToRemote {
+                        device: target,
+                        direction,
+                    })
                 } else {
                     tracing::debug!("No target device for direction {:?}", direction);
                     Ok(Transition::None)
@@ -239,11 +248,18 @@ pub enum Transition {
     /// No transition occurred
     None,
     /// Transitioning to remote device
-    ToRemote { device: DeviceId, direction: Direction },
+    ToRemote {
+        device: DeviceId,
+        direction: Direction,
+    },
     /// Transitioning back to local
     ToLocal { direction: Direction },
     /// Switching between remote devices
-    SwitchRemote { from: DeviceId, to: DeviceId, direction: Direction },
+    SwitchRemote {
+        from: DeviceId,
+        to: DeviceId,
+        direction: Direction,
+    },
 }
 
 impl Transition {
@@ -327,6 +343,11 @@ impl MultiDeviceStateMachine {
         self.current_mode
     }
 
+    /// Get the local device id this state machine represents.
+    pub fn local_id(&self) -> DeviceId {
+        self.local_id
+    }
+
     /// Transition to remote mode
     pub fn transition_to_remote(&mut self, device_id: DeviceId) -> Result<()> {
         if !self.connections.contains(&device_id) {
@@ -363,7 +384,9 @@ mod tests {
         assert!(mode.is_local());
         assert!(!mode.is_remote());
 
-        let remote = CaptureMode::Remote { target: DeviceId::new_v4() };
+        let remote = CaptureMode::Remote {
+            target: DeviceId::new_v4(),
+        };
         assert!(remote.is_remote());
         assert!(remote.remote_target().is_some());
     }
@@ -404,7 +427,8 @@ mod tests {
 
         // Immediate enter_remote again should fail due to cooldown
         let target2 = DeviceId::new_v4();
-        sm.enter_remote(target2, Direction::Left, (0, 0)).unwrap_err();
+        sm.enter_remote(target2, Direction::Left, (0, 0))
+            .unwrap_err();
     }
 
     #[test]
@@ -427,7 +451,10 @@ mod tests {
     #[test]
     fn test_transition() {
         let device = DeviceId::new_v4();
-        let transition = Transition::ToRemote { device, direction: Direction::Right };
+        let transition = Transition::ToRemote {
+            device,
+            direction: Direction::Right,
+        };
 
         assert!(transition.is_some());
         assert!(transition.is_to_remote());

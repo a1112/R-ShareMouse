@@ -4,11 +4,11 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, broadcast};
 use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
-use crate::{DeviceId, Message};
 use crate::clipboard::{ClipboardContent, ContentType};
+use crate::{DeviceId, Message};
 
 /// Trait for system clipboard listeners
 ///
@@ -87,7 +87,10 @@ pub enum ClipboardEvent {
     /// Local clipboard changed
     LocalChanged(ClipboardContent),
     /// Remote clipboard received
-    RemoteReceived { device: DeviceId, content: ClipboardContent },
+    RemoteReceived {
+        device: DeviceId,
+        content: ClipboardContent,
+    },
     /// Clipboard sync failed
     SyncFailed { device: DeviceId, error: String },
 }
@@ -163,7 +166,10 @@ impl ClipboardSyncService {
             return None;
         }
 
-        if !matches!(self.config.mode, ClipboardSyncMode::Bidirectional | ClipboardSyncMode::SendOnly) {
+        if !matches!(
+            self.config.mode,
+            ClipboardSyncMode::Bidirectional | ClipboardSyncMode::SendOnly
+        ) {
             return None;
         }
 
@@ -215,7 +221,10 @@ impl ClipboardSyncService {
             });
         }
 
-        if !matches!(self.config.mode, ClipboardSyncMode::Bidirectional | ClipboardSyncMode::ReceiveOnly) {
+        if !matches!(
+            self.config.mode,
+            ClipboardSyncMode::Bidirectional | ClipboardSyncMode::ReceiveOnly
+        ) {
             return Ok(ClipboardEvent::SyncFailed {
                 device,
                 error: "Receive disabled".to_string(),
@@ -228,10 +237,7 @@ impl ClipboardSyncService {
         self.stats.items_received += 1;
         self.stats.bytes_received += size as u64;
 
-        Ok(ClipboardEvent::RemoteReceived {
-            device,
-            content,
-        })
+        Ok(ClipboardEvent::RemoteReceived { device, content })
     }
 
     /// Convert ClipboardContent to bytes
@@ -243,16 +249,12 @@ impl ClipboardSyncService {
             ClipboardContent::Html { html, .. } => {
                 Some(("text/html".to_string(), html.as_bytes().to_vec()))
             }
-            ClipboardContent::Image { data, .. } => {
-                Some(("image/png".to_string(), data.clone()))
-            }
+            ClipboardContent::Image { data, .. } => Some(("image/png".to_string(), data.clone())),
             ClipboardContent::FileList(files) => {
                 let data = files.join("\n").into_bytes();
                 Some(("text/uri-list".to_string(), data))
             }
-            ClipboardContent::Other { mime, data } => {
-                Some((mime.clone(), data.clone()))
-            }
+            ClipboardContent::Other { mime, data } => Some((mime.clone(), data.clone())),
             ClipboardContent::Empty => None,
         }
     }
@@ -314,6 +316,7 @@ impl ClipboardSyncService {
 
         // Get the receiver channel from the listener
         let mut listener_rx = listener.receiver();
+        let event_tx = self.event_tx.clone();
 
         // Spawn a task to forward clipboard changes to our service
         tokio::spawn(async move {
@@ -328,8 +331,7 @@ impl ClipboardSyncService {
                     content = listener_rx.recv() => {
                         if let Some(content) = content {
                             tracing::debug!("Clipboard changed: {:?}", content.mime_type());
-                            // In a real implementation, this would send to the service
-                            // For now, just log it
+                            let _ = event_tx.send(ClipboardEvent::LocalChanged(content)).await;
                         }
                     }
                 }
@@ -344,9 +346,7 @@ impl ClipboardSyncService {
         });
 
         tracing::info!("Clipboard listener started");
-        Ok(ClipboardListenerHandle {
-            shutdown_tx,
-        })
+        Ok(ClipboardListenerHandle { shutdown_tx })
     }
 
     /// Stop the running listener
