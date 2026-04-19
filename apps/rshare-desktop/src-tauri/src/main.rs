@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, Config, DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
+use std::{future::Future, pin::Pin};
 use tauri::WebviewWindow;
+
+type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Serialize)]
 struct DashboardStatePayload {
@@ -14,14 +18,11 @@ struct DashboardStatePayload {
 
 #[tauri::command]
 async fn dashboard_state() -> Result<DashboardStatePayload, String> {
-    let status = daemon_client::request_status().await.ok();
-    let devices = if status.is_some() {
-        daemon_client::request_devices().await.unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    Ok(DashboardStatePayload { status, devices })
+    dashboard_state_with(
+        || Box::pin(async { ensure_daemon_status().await }),
+        || Box::pin(async { daemon_client::request_devices().await }),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -120,6 +121,63 @@ async fn show_tray() -> Result<(), String> {
     Ok(())
 }
 
+fn is_ipc_unavailable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_err| io_err.kind() == std::io::ErrorKind::ConnectionRefused)
+            .unwrap_or(false)
+    })
+}
+
+async fn ensure_daemon_status() -> AnyhowResult<ServiceStatusSnapshot> {
+    let config = Config::load().unwrap_or_default();
+    let port = config.network.port;
+    let bind_address = config.network.bind_address.clone();
+    ensure_daemon_status_with(
+        || Box::pin(async { daemon_client::request_status().await }),
+        move || {
+            let bind_address = bind_address.clone();
+            Box::pin(async move {
+                daemon_client::spawn_daemon(Some(port), Some(&bind_address)).await
+            })
+        },
+    )
+    .await
+}
+
+async fn ensure_daemon_status_with<Probe, Spawn>(
+    mut probe_status: Probe,
+    mut spawn_daemon: Spawn,
+) -> AnyhowResult<ServiceStatusSnapshot>
+where
+    Probe: FnMut() -> BoxFutureResult<'static, ServiceStatusSnapshot>,
+    Spawn: FnMut() -> BoxFutureResult<'static, ServiceStatusSnapshot>,
+{
+    match probe_status().await {
+        Ok(status) => Ok(status),
+        Err(err) if is_ipc_unavailable(&err) => spawn_daemon().await,
+        Err(err) => Err(err),
+    }
+}
+
+async fn dashboard_state_with<Ensure, Devices>(
+    mut ensure_status: Ensure,
+    mut request_devices: Devices,
+) -> Result<DashboardStatePayload, String>
+where
+    Ensure: FnMut() -> BoxFutureResult<'static, ServiceStatusSnapshot>,
+    Devices: FnMut() -> BoxFutureResult<'static, Vec<DaemonDeviceSnapshot>>,
+{
+    let status = ensure_status().await.map_err(|err| err.to_string())?;
+    let devices = request_devices().await.unwrap_or_default();
+
+    Ok(DashboardStatePayload {
+        status: Some(status),
+        devices,
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -140,4 +198,172 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn sample_status() -> ServiceStatusSnapshot {
+        ServiceStatusSnapshot {
+            device_id: DeviceId::nil(),
+            device_name: "desktop".to_string(),
+            hostname: "localhost".to_string(),
+            bind_address: "127.0.0.1:24801".to_string(),
+            discovery_port: 24800,
+            pid: 1,
+            discovered_devices: 0,
+            connected_devices: 0,
+            healthy: true,
+            input_mode: None,
+            available_backends: Some(Vec::new()),
+            backend_health: None,
+            privilege_state: None,
+            last_backend_error: None,
+            session_state: None,
+            active_target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_probe_does_not_trigger_spawn() {
+        let spawn_attempts = Arc::new(AtomicUsize::new(0));
+        let expected = sample_status();
+
+        let result = ensure_daemon_status_with(
+            {
+                let expected = expected.clone();
+                move || Box::pin({
+                    let expected = expected.clone();
+                    async move { Ok(expected) }
+                })
+            },
+            {
+                let spawn_attempts = Arc::clone(&spawn_attempts);
+                move || Box::pin({
+                    let spawn_attempts = Arc::clone(&spawn_attempts);
+                    async move {
+                        spawn_attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(sample_status())
+                    }
+                })
+            },
+        )
+        .await
+        .expect("probe should succeed");
+
+        assert_eq!(result.device_id, expected.device_id);
+        assert_eq!(spawn_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_unavailable_startup_triggers_exactly_one_spawn_attempt() {
+        let spawn_attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = ensure_daemon_status_with(
+            || {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let spawn_attempts = Arc::clone(&spawn_attempts);
+                move || Box::pin({
+                    let spawn_attempts = Arc::clone(&spawn_attempts);
+                    async move {
+                        spawn_attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(sample_status())
+                    }
+                })
+            },
+        )
+        .await
+        .expect("spawn should recover IPC-unavailable startup");
+
+        assert!(result.healthy);
+        assert_eq!(spawn_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_ipc_failures_do_not_trigger_spawn() {
+        let spawn_attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = ensure_daemon_status_with(
+            || Box::pin(async { Err(anyhow!("daemon rejected status probe")) }),
+            {
+                let spawn_attempts = Arc::clone(&spawn_attempts);
+                move || Box::pin({
+                    let spawn_attempts = Arc::clone(&spawn_attempts);
+                    async move {
+                        spawn_attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(sample_status())
+                    }
+                })
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(spawn_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_connection_refused_counts_as_ipc_unavailable() {
+        assert!(is_ipc_unavailable(&anyhow!(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "daemon offline",
+        ))));
+
+        assert!(!is_ipc_unavailable(&anyhow!(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timed out",
+        ))));
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_surfaces_non_ipc_probe_failures() {
+        let result = dashboard_state_with(
+            || Box::pin(async { Err(anyhow!("daemon rejected status probe")) }),
+            || Box::pin(async { Ok(Vec::new()) }),
+        )
+        .await;
+
+        let err = result.expect_err("non-IPC probe failure should be surfaced");
+        assert!(err.contains("daemon rejected status probe"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_surfaces_spawn_failures_after_ipc_miss() {
+        let result = dashboard_state_with(
+            || {
+                Box::pin(async {
+                    ensure_daemon_status_with(
+                        || {
+                            Box::pin(async {
+                                Err(anyhow!(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    "daemon offline",
+                                )))
+                            })
+                        },
+                        || Box::pin(async { Err(anyhow!("spawn failed")) }),
+                    )
+                    .await
+                })
+            },
+            || Box::pin(async { Ok(Vec::new()) }),
+        )
+        .await;
+
+        let err = result.expect_err("spawn failure should be surfaced");
+        assert!(err.contains("spawn failed"));
+    }
 }
