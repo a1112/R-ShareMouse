@@ -4,9 +4,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock, Mutex as TokioMutex};
+use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 
-use crate::{discovery::{ServiceDiscovery, DiscoveryEvent, DiscoveredDevice}, connection::{ConnectionManager, ManagerEvent}};
+use crate::{
+    connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
+    discovery::{DiscoveredDevice, ServiceDiscovery},
+};
 use rshare_core::{DeviceId, Message};
 
 /// Network event
@@ -68,6 +71,32 @@ pub struct NetworkManager {
     running: bool,
 }
 
+fn spawn_connection_event_forwarder(
+    mut manager_events: mpsc::Receiver<ManagerEvent>,
+    network_tx: mpsc::Sender<NetworkEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = manager_events.recv().await {
+            let network_event = match event {
+                ManagerEvent::Connected(device_id) => NetworkEvent::DeviceConnected(device_id),
+                ManagerEvent::Disconnected(device_id) => {
+                    NetworkEvent::DeviceDisconnected(device_id)
+                }
+                ManagerEvent::MessageReceived { from, message } => {
+                    NetworkEvent::MessageReceived { from, message }
+                }
+                ManagerEvent::Error { device_id, error } => {
+                    NetworkEvent::ConnectionError { device_id, error }
+                }
+            };
+
+            if network_tx.send(network_event).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 impl NetworkManager {
     /// Create a new network manager
     pub fn new(
@@ -113,14 +142,28 @@ impl NetworkManager {
 
     /// Get all discovered devices
     pub async fn discovered_devices(&self) -> Vec<DiscoveredDevice> {
-        self.discovered_devices.read().await.values().cloned().collect()
+        self.discovered_devices
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Get connected devices
     pub async fn connected_devices(&self) -> Vec<DeviceId> {
-        // For now, return empty list since ConnectionManager doesn't expose all connections
-        // In a real implementation, ConnectionManager would have a connections() method
-        Vec::new()
+        self.connection_infos()
+            .await
+            .into_iter()
+            .filter(|info| info.state == crate::connection::ConnectionState::Connected)
+            .map(|info| info.device_id)
+            .collect()
+    }
+
+    /// Get current connection information snapshots.
+    pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        let conn = self.connection.lock().await;
+        conn.connections()
     }
 
     /// Check if a device is connected
@@ -150,9 +193,14 @@ impl NetworkManager {
         self.running = true;
 
         // Start connection manager (server)
-        {
+        let connection_events = {
             let mut conn = self.connection.lock().await;
             conn.start_server(&self.config.bind_address).await?;
+            conn.events()
+        };
+
+        if let Some(connection_events) = connection_events {
+            spawn_connection_event_forwarder(connection_events, self.event_tx.clone());
         }
 
         // Start discovery with event channel
@@ -220,10 +268,6 @@ impl NetworkManager {
             }
         });
 
-        // Spawn connection event handler
-        // Note: We need to handle this differently since ConnectionManager is inside Mutex
-        // For now, we'll skip this part and handle events differently
-
         tracing::info!("Network manager started");
         Ok(())
     }
@@ -275,5 +319,34 @@ mod tests {
             "test-host".to_string(),
         );
         assert!(!manager.running);
+    }
+
+    #[tokio::test]
+    async fn forwards_connection_message_events_to_network_events() {
+        let device_id = DeviceId::new_v4();
+        let (manager_tx, manager_rx) = mpsc::channel(4);
+        let (network_tx, mut network_rx) = mpsc::channel(4);
+
+        spawn_connection_event_forwarder(manager_rx, network_tx);
+        manager_tx
+            .send(crate::connection::ManagerEvent::MessageReceived {
+                from: device_id,
+                message: Message::MouseMove { x: 1, y: 2 },
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        match event {
+            NetworkEvent::MessageReceived { from, message } => {
+                assert_eq!(from, device_id);
+                assert!(matches!(message, Message::MouseMove { x: 1, y: 2 }));
+            }
+            _ => panic!("Wrong network event"),
+        }
     }
 }

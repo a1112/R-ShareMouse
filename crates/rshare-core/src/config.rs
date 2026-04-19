@@ -2,9 +2,8 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
-use uuid::Uuid;
+use std::path::{Path, PathBuf};
 
 use crate::protocol::DeviceId;
 
@@ -213,14 +212,11 @@ impl Default for HotkeyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn temp_config_path(name: &str) -> PathBuf {
         std::env::temp_dir()
-            .join(format!(
-                "rshare-config-test-{}-{}",
-                name,
-                Uuid::new_v4()
-            ))
+            .join(format!("rshare-config-test-{}-{}", name, Uuid::new_v4()))
             .join("config.toml")
     }
 

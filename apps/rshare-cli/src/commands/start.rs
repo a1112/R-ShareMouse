@@ -1,64 +1,40 @@
-//! Start command implementation
+//! Start command implementation.
 
+use crate::output::{info, success, warning};
 use anyhow::Result;
-use std::path::PathBuf;
 
-/// Execute the start command
+/// Execute the start command.
 pub async fn execute(
     daemon: bool,
     _log_file: Option<String>,
     port: Option<u16>,
     bind: Option<String>,
 ) -> Result<()> {
-    use crate::output::{success, info, warning};
+    let service_manager = rshare_core::service::ServiceManager::new()?;
 
-    if daemon {
-        // Start as daemon
-        warning("Daemon mode not yet implemented, running in foreground");
-    }
-
-    // Load configuration
-    let config_path = get_config_path()?;
-    info(&format!("Using config: {}", config_path.display()));
-
-    // Override config with CLI arguments
-    if let Some(p) = port {
-        info(&format!("Port override: {}", p));
-    }
-    if let Some(ref b) = bind {
-        info(&format!("Bind address override: {}", b));
-    }
-
-    // TODO: Start the actual service
-    // For now, just demonstrate what would happen
-    success("R-ShareMouse service starting...");
-    info(&format!("Listening on: {}:{}", bind.as_deref().unwrap_or("0.0.0.0"), port.unwrap_or(4242)));
-    info("Press Ctrl+C to stop");
-
-    // Simulate running service
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info("Received shutdown signal");
-            success("Service stopped");
+    if service_manager.is_running() {
+        let status = rshare_core::daemon_client::request_status().await.ok();
+        if let Some(status) = status {
+            warning(&format!(
+                "R-ShareMouse service is already running (PID: {})",
+                status.pid
+            ));
+        } else {
+            warning("R-ShareMouse service is already running");
         }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            // In real implementation, this would run indefinitely
-            warning("Demo mode - stopping after 5 seconds");
-        }
+        return Ok(());
     }
+
+    if !daemon {
+        info("Foreground mode now delegates to the managed daemon service");
+    }
+
+    let status = rshare_core::daemon_client::spawn_daemon(port, bind.as_deref()).await?;
+
+    success("R-ShareMouse service started");
+    info(&format!("PID: {}", status.pid));
+    info(&format!("Listening on: {}", status.bind_address));
+    info(&format!("Discovery port: {}", status.discovery_port));
 
     Ok(())
-}
-
-/// Get the configuration file path
-fn get_config_path() -> Result<PathBuf> {
-    let config_dir = directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rshare");
-
-    // Create config directory if it doesn't exist
-    std::fs::create_dir_all(&config_dir)?;
-
-    Ok(config_dir.join("config.toml"))
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 pub async fn run_discover_test() -> anyhow::Result<()> {
-    use rshare_net::discovery::{ServiceDiscovery, DiscoveryConfig, DiscoveryEvent};
+    use rshare_net::discovery::{DiscoveryConfig, DiscoveryEvent, ServiceDiscovery};
 
     println!("R-ShareMouse Discovery Test");
     println!("=========================");
@@ -54,32 +54,34 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
 
     loop {
         match timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Some(event)) => {
-                match event {
-                    DiscoveryEvent::DeviceFound(device) => {
-                        discovered_count += 1;
-                        println!("✓ Device FOUND ({:?}):", start.elapsed());
-                        println!("    ID: {}", device.id);
-                        println!("    Name: {}", device.name);
-                        println!("    Hostname: {}", device.hostname);
-                        println!("    Addresses: {:?}", device.addresses);
-                        println!();
-                    }
-                    DiscoveryEvent::DeviceUpdated(device) => {
-                        println!("~ Device UPDATED:");
-                        println!("    ID: {}", device.id);
-                        println!("    Name: {}", device.name);
-                        println!();
-                    }
-                    DiscoveryEvent::DeviceLost(id) => {
-                        println!("✗ Device LOST: {}", id);
-                        println!();
-                    }
-                    DiscoveryEvent::Error(err) => {
-                        println!("! Error: {}", err);
-                    }
+            Ok(Some(event)) => match event {
+                DiscoveryEvent::DeviceFound(device) => {
+                    discovered_count += 1;
+                    println!(
+                        "✓ Device FOUND #{} ({:?}):",
+                        discovered_count,
+                        start.elapsed()
+                    );
+                    println!("    ID: {}", device.id);
+                    println!("    Name: {}", device.name);
+                    println!("    Hostname: {}", device.hostname);
+                    println!("    Addresses: {:?}", device.addresses);
+                    println!();
                 }
-            }
+                DiscoveryEvent::DeviceUpdated(device) => {
+                    println!("~ Device UPDATED:");
+                    println!("    ID: {}", device.id);
+                    println!("    Name: {}", device.name);
+                    println!();
+                }
+                DiscoveryEvent::DeviceLost(id) => {
+                    println!("✗ Device LOST: {}", id);
+                    println!();
+                }
+                DiscoveryEvent::Error(err) => {
+                    println!("! Error: {}", err);
+                }
+            },
             Ok(None) => {
                 println!("Channel closed");
                 return Ok(());
@@ -94,10 +96,13 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
 }
 
 /// Interactive discovery test - runs for 30 seconds
-pub async fn run_discover_scan() -> anyhow::Result<()> {
-    use rshare_net::discovery::{ServiceDiscovery, DiscoveryConfig, DiscoveryEvent};
+pub async fn run_discover_scan(scan_duration: Duration) -> anyhow::Result<()> {
+    use rshare_net::discovery::{DiscoveryConfig, DiscoveryEvent, ServiceDiscovery};
 
-    println!("R-ShareMouse Discovery Scan (30 seconds)");
+    println!(
+        "R-ShareMouse Discovery Scan ({} seconds)",
+        scan_duration.as_secs()
+    );
     println!("========================================");
     println!();
 
@@ -116,7 +121,7 @@ pub async fn run_discover_scan() -> anyhow::Result<()> {
 
     let config = DiscoveryConfig {
         port: 27432,
-        broadcast_interval: Duration::from_secs(1),  // Aggressive
+        broadcast_interval: Duration::from_secs(1), // Aggressive
         device_timeout: Duration::from_secs(10),
         mdns_enabled: false,
     };
@@ -130,7 +135,6 @@ pub async fn run_discover_scan() -> anyhow::Result<()> {
 
     let mut devices = std::collections::HashMap::new();
 
-    let scan_duration = Duration::from_secs(30);
     let start = std::time::Instant::now();
 
     while start.elapsed() < scan_duration {

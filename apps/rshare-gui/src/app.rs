@@ -2,18 +2,18 @@
 
 use eframe::egui;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use rshare_core::config::Config;
+use rshare_core::{config::Config, DaemonDeviceSnapshot, ServiceStatusSnapshot};
 
-use crate::ui::{
-    main_view::MainView,
-    settings_view::SettingsView,
-    layout_view::LayoutView,
-};
-
+use crate::dashboard::DashboardSummary;
 use crate::tray;
+use crate::ui::{
+    layout_view::LayoutView,
+    main_view::{DashboardAction, MainView},
+    settings_view::SettingsView,
+};
 
 /// Device information for UI display
 #[derive(Debug, Clone)]
@@ -21,8 +21,24 @@ pub struct UiDevice {
     pub id: Uuid,
     pub name: String,
     pub address: String,
-    pub online: bool,
-    pub latency: u32,
+    pub connected: bool,
+    pub last_seen_secs: Option<u64>,
+}
+
+impl From<DaemonDeviceSnapshot> for UiDevice {
+    fn from(value: DaemonDeviceSnapshot) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            address: value
+                .addresses
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            connected: value.connected,
+            last_seen_secs: value.last_seen_secs,
+        }
+    }
 }
 
 /// Active tab/view in the application
@@ -37,262 +53,218 @@ pub enum ActiveTab {
 
 /// Main application state
 pub struct RShareApp {
-    /// Currently active tab
     active_tab: ActiveTab,
-
-    /// Service state
-    service_running: Arc<Mutex<bool>>,
-
-    /// Discovered and connected devices
-    devices: Arc<Mutex<Vec<UiDevice>>>,
-
-    /// Main view state
+    devices: Vec<UiDevice>,
+    device_snapshots: Vec<DaemonDeviceSnapshot>,
+    status_snapshot: Option<ServiceStatusSnapshot>,
     main_view: MainView,
-
-    /// Settings view state
     settings_view: SettingsView,
-
-    /// Layout view state
     layout_view: LayoutView,
-
-    /// Show confirmation dialog
     show_confirmation: bool,
-
-    /// Confirmation message
     confirmation_message: String,
-
-    /// Confirmation callback
     confirmation_action: Option<Box<dyn FnOnce(&mut Self) + Send>>,
-
-    /// Network event receiver
-    network_event_rx: mpsc::Receiver<rshare_net::NetworkEvent>,
-
-    /// Network event sender (for spawning NetworkManager)
-    network_event_tx: mpsc::Sender<rshare_net::NetworkEvent>,
-
-    /// Tokio runtime for async operations
     runtime: tokio::runtime::Runtime,
-
-    /// Local device ID
-    local_device_id: Uuid,
-
-    /// System tray event receiver
     tray_event_rx: Option<std::sync::mpsc::Receiver<tray::TrayEvent>>,
-
-    /// Window visibility
     window_visible: bool,
-
-    /// Application configuration
     config: Config,
-
-    /// Tray manager (for updating tray state)
     tray_manager: Option<tray::TrayManager>,
+    activity_log: Vec<String>,
+    last_refresh: Instant,
 }
 
 impl RShareApp {
     /// Create a new application instance
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Load configuration
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = Config::load().unwrap_or_default();
-
-        // Create channel for network events
-        let (network_event_tx, network_event_rx) = mpsc::channel(100);
-
-        // Create tokio runtime
-        let runtime = tokio::runtime::Runtime::new()
-            .expect("Failed to create tokio runtime");
-
-        // Generate local device ID
-        let local_device_id = Uuid::new_v4();
-
-        // Start with empty device list
-        let devices = vec![];
-
-        // Create settings view from loaded config
         let settings_view = SettingsView::from_config(&config);
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
-        // Create system tray (optional - may fail on some platforms)
-        let mut tray_manager = tray::TrayManager::new().ok();
-        let tray_event_rx = tray_manager.as_mut()
-            .map(|tm| tm.events());
+        let wake_ctx = cc.egui_ctx.clone();
+        let wake_ui: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            wake_ctx.request_repaint();
+        });
+        let mut tray_manager = tray::TrayManager::new_with_waker(Some(wake_ui)).ok();
+        let tray_event_rx = tray_manager.as_mut().map(|tm| tm.events());
 
-        Self {
+        let mut app = Self {
             active_tab: ActiveTab::Main,
-            service_running: Arc::new(Mutex::new(false)),
-            devices: Arc::new(Mutex::new(devices)),
+            devices: Vec::new(),
+            device_snapshots: Vec::new(),
+            status_snapshot: None,
             main_view: MainView::new(),
             settings_view,
             layout_view: LayoutView::new(),
             show_confirmation: false,
             confirmation_message: String::new(),
             confirmation_action: None,
-            network_event_rx,
-            network_event_tx,
             runtime,
-            local_device_id,
             tray_event_rx,
             window_visible: true,
             config,
             tray_manager,
+            activity_log: vec!["Application started".to_string()],
+            last_refresh: Instant::now() - Duration::from_secs(5),
+        };
+
+        app.refresh_daemon_state();
+        app
+    }
+
+    fn service_running(&self) -> bool {
+        self.status_snapshot.is_some()
+    }
+
+    fn push_activity(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.activity_log.insert(0, message);
+        self.activity_log.truncate(20);
+    }
+
+    fn update_tray(&mut self) {
+        let running = self.service_running();
+        if let Some(ref mut tm) = self.tray_manager {
+            tm.set_service_running(running);
+            tm.set_tooltip(if running {
+                "R-ShareMouse - Service Running"
+            } else {
+                "R-ShareMouse - Service Stopped"
+            });
         }
     }
 
-    /// Start the service
+    fn sync_layout_devices(&mut self) {
+        self.layout_view.sync_devices(&self.devices);
+    }
+
+    fn refresh_daemon_state(&mut self) {
+        let previous_running = self.service_running();
+        let status = self.runtime.block_on(rshare_core::daemon_client::request_status()).ok();
+        let devices = if status.is_some() {
+            self.runtime
+                .block_on(rshare_core::daemon_client::request_devices())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        self.status_snapshot = status;
+        self.device_snapshots = devices;
+        self.devices = self
+            .device_snapshots
+            .clone()
+            .into_iter()
+            .map(UiDevice::from)
+            .collect();
+        self.sync_layout_devices();
+        self.update_tray();
+
+        let running = self.service_running();
+        if running && !previous_running {
+            self.push_activity("Daemon connected");
+        } else if !running && previous_running {
+            self.push_activity("Daemon stopped");
+        }
+    }
+
     fn start_service(&mut self) {
-        log::info!("Starting service...");
-
-        // Mark as running
-        *self.service_running.blocking_lock() = true;
-
-        // Update tray icon if available
-        if let Some(ref mut tm) = self.tray_manager {
-            tm.set_service_running(true);
-            tm.set_tooltip("R-ShareMouse - Service Running");
+        match self.runtime.block_on(rshare_core::daemon_client::spawn_daemon(
+            Some(self.config.network.port),
+            Some(&self.config.network.bind_address),
+        )) {
+            Ok(status) => {
+                self.status_snapshot = Some(status);
+                self.push_activity("Service started");
+                self.refresh_daemon_state();
+            }
+            Err(err) => {
+                log::error!("Failed to start service: {}", err);
+                self.push_activity(format!("Failed to start service: {}", err));
+            }
         }
-
-        // Get hostname
-        let hostname = hostname::get()
-            .unwrap_or_else(|_| "unknown".into())
-            .to_string_lossy()
-            .to_string();
-
-        let device_name = format!("{}-R-ShareMouse", hostname);
-        let local_device_id = self.local_device_id;
-
-        // Clone sender for the spawned task
-        let event_tx = self.network_event_tx.clone();
-        let service_running = self.service_running.clone();
-
-        // Spawn network manager in background
-        self.runtime.spawn(async move {
-            let mut network_manager = rshare_net::NetworkManager::new(
-                local_device_id,
-                device_name.clone(),
-                hostname.clone(),
-            );
-
-            // Start the network manager
-            if let Err(e) = network_manager.start().await {
-                log::error!("Failed to start network manager: {}", e);
-                let _ = service_running.lock().await;
-                return;
-            }
-
-            log::info!("Network manager started");
-
-            // Forward events to GUI
-            let mut events = network_manager.events();
-            while *service_running.lock().await {
-                match events.recv().await {
-                    Some(event) => {
-                        if event_tx.send(event).await.is_err() {
-                            log::error!("Failed to send event to GUI");
-                            break;
-                        }
-                    }
-                    None => {
-                        log::warn!("Network event channel closed");
-                        break;
-                    }
-                }
-            }
-
-            // Stop network manager
-            let _ = network_manager.stop().await;
-            log::info!("Network manager stopped");
-        });
     }
 
-    /// Stop the service
     fn stop_service(&mut self) {
-        log::info!("Stopping service...");
-        *self.service_running.blocking_lock() = false;
-
-        // Update tray icon if available
-        if let Some(ref mut tm) = self.tray_manager {
-            tm.set_service_running(false);
-            tm.set_tooltip("R-ShareMouse - Service Stopped");
+        match self
+            .runtime
+            .block_on(rshare_core::daemon_client::request_shutdown())
+        {
+            Ok(_) => {
+                self.push_activity("Service stopped");
+            }
+            Err(err) => {
+                log::error!("Failed to stop service: {}", err);
+                self.push_activity(format!("Failed to stop service: {}", err));
+            }
         }
+        self.refresh_daemon_state();
     }
 
-    /// Add a device to the list
-    pub fn add_device(&self, device: UiDevice) {
-        let mut devices = self.devices.blocking_lock();
-        // Don't add duplicates
-        if !devices.iter().any(|d| d.id == device.id) {
-            devices.push(device);
+    fn connect_device(&mut self, id: Uuid) {
+        match self
+            .runtime
+            .block_on(rshare_core::daemon_client::request_connect(id))
+        {
+            Ok(_) => self.push_activity(format!("Connect requested for {}", id)),
+            Err(err) => {
+                log::error!("Failed to connect {}: {}", id, err);
+                self.push_activity(format!("Connect failed for {}: {}", id, err));
+            }
         }
+        self.refresh_daemon_state();
     }
 
-    /// Update device status
-    pub fn update_device(&self, id: Uuid, online: bool, latency: u32) {
-        let mut devices = self.devices.blocking_lock();
-        if let Some(device) = devices.iter_mut().find(|d| d.id == id) {
-            device.online = online;
-            device.latency = latency;
+    fn disconnect_device(&mut self, id: Uuid) {
+        match self
+            .runtime
+            .block_on(rshare_core::daemon_client::request_disconnect(id))
+        {
+            Ok(_) => self.push_activity(format!("Disconnect requested for {}", id)),
+            Err(err) => {
+                log::error!("Failed to disconnect {}: {}", id, err);
+                self.push_activity(format!("Disconnect failed for {}: {}", id, err));
+            }
         }
+        self.refresh_daemon_state();
     }
 
-    /// Remove a device from the list
-    pub fn remove_device(&self, id: Uuid) {
-        let mut devices = self.devices.blocking_lock();
-        devices.retain(|d| d.id != id);
-    }
-
-    /// Get all devices
-    pub fn get_devices(&self) -> Vec<UiDevice> {
-        self.devices.blocking_lock().clone()
-    }
-
-    /// Show a confirmation dialog
-    fn confirm(&mut self, message: impl Into<String>, action: impl FnOnce(&mut Self) + Send + 'static) {
+    fn confirm(
+        &mut self,
+        message: impl Into<String>,
+        action: impl FnOnce(&mut Self) + Send + 'static,
+    ) {
         self.confirmation_message = message.into();
         self.confirmation_action = Some(Box::new(action));
         self.show_confirmation = true;
     }
+
+    fn handle_dashboard_action(&mut self, action: DashboardAction) {
+        match action {
+            DashboardAction::OpenDevices => self.active_tab = ActiveTab::Devices,
+            DashboardAction::OpenLayout => self.active_tab = ActiveTab::Layout,
+            DashboardAction::OpenSettings => self.active_tab = ActiveTab::Settings,
+            DashboardAction::StartService => self.start_service(),
+            DashboardAction::StopService => {
+                self.confirm("Stop the R-ShareMouse service?", |app| app.stop_service());
+            }
+        }
+    }
 }
 
 impl eframe::App for RShareApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Handle window close event - minimize to tray if configured
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.config.gui.minimize_to_tray {
-                // Consume the close event and hide instead
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.window_visible = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
-            // If not minimizing to tray, let the close proceed
         }
 
-        // Process network events (non-blocking try_recv)
-        while let Ok(event) = self.network_event_rx.try_recv() {
-            match event {
-                rshare_net::NetworkEvent::DeviceFound(device) => {
-                    self.add_device(UiDevice {
-                        id: device.id,
-                        name: device.name,
-                        address: device.addresses.first()
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        online: true,
-                        latency: 0,
-                    });
-                }
-                rshare_net::NetworkEvent::DeviceConnected(id) => {
-                    self.update_device(id, true, 0);
-                }
-                rshare_net::NetworkEvent::DeviceDisconnected(id) => {
-                    self.update_device(id, false, 0);
-                }
-                rshare_net::NetworkEvent::ConnectionError { device_id, .. } => {
-                    self.update_device(device_id, false, 0);
-                }
-                _ => {}
-            }
+        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
+            self.refresh_daemon_state();
+            self.last_refresh = Instant::now();
         }
 
-        // Process tray events (non-blocking try_recv)
         let tray_events: Vec<tray::TrayEvent> = if let Some(ref rx) = self.tray_event_rx {
             let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
@@ -314,11 +286,7 @@ impl eframe::App for RShareApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
                 tray::TrayEvent::ToggleService => {
-                    let is_running = {
-                        let lock = self.service_running.blocking_lock();
-                        *lock
-                    };
-                    if is_running {
+                    if self.service_running() {
                         self.stop_service();
                     } else {
                         self.start_service();
@@ -330,7 +298,6 @@ impl eframe::App for RShareApp {
             }
         }
 
-        // Top menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -366,18 +333,20 @@ impl eframe::App for RShareApp {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Service status indicator
-                    let is_running = self.service_running.blocking_lock().clone();
-                    let status_text = if is_running { "● Running" } else { "○ Stopped" };
-                    let status_color = if is_running {
+                    let summary =
+                        DashboardSummary::from_snapshots(self.status_snapshot.as_ref(), &self.device_snapshots);
+                    let status_color = if summary.service_running {
                         egui::Color32::GREEN
                     } else {
                         egui::Color32::GRAY
                     };
-                    ui.colored_label(status_color, status_text);
+                    ui.colored_label(status_color, &summary.service_label);
 
-                    if ui.button(if is_running { "Stop" } else { "Start" }).clicked() {
-                        if is_running {
+                    if ui
+                        .button(if summary.service_running { "Stop" } else { "Start" })
+                        .clicked()
+                    {
+                        if summary.service_running {
                             self.confirm("Stop the R-ShareMouse service?", |app| app.stop_service());
                         } else {
                             self.start_service();
@@ -387,28 +356,29 @@ impl eframe::App for RShareApp {
             });
         });
 
-        // Tab content
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_tab {
-                ActiveTab::Main => {
-                    self.main_view.show(ui, ctx);
-                }
-                ActiveTab::Devices => {
-                    self.show_devices_tab(ui);
-                }
-                ActiveTab::Layout => {
-                    self.layout_view.show(ui, ctx);
-                }
-                ActiveTab::Settings => {
-                    self.settings_view.show(ui, ctx);
-                }
-                ActiveTab::About => {
-                    self.show_about_tab(ui);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(12, 16, 24))
+                    .inner_margin(egui::Margin::same(20.0)),
+            )
+            .show(ctx, |ui| match self.active_tab {
+            ActiveTab::Main => {
+                let summary =
+                    DashboardSummary::from_snapshots(self.status_snapshot.as_ref(), &self.device_snapshots);
+                if let Some(action) =
+                    self.main_view
+                        .show(ui, ctx, &summary, &self.devices, &self.activity_log)
+                {
+                    self.handle_dashboard_action(action);
                 }
             }
+            ActiveTab::Devices => self.show_devices_tab(ui),
+            ActiveTab::Layout => self.layout_view.show(ui, ctx),
+            ActiveTab::Settings => self.settings_view.show(ui, ctx),
+            ActiveTab::About => self.show_about_tab(ui),
         });
 
-        // Confirmation dialog
         if self.show_confirmation {
             egui::Window::new("Confirm")
                 .collapsible(false)
@@ -434,12 +404,10 @@ impl eframe::App for RShareApp {
                 });
         }
 
-        // Request continuous repaint for smooth animations
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        // Save settings if they were modified
         if self.settings_view.is_modified() {
             self.config = self.settings_view.to_config();
             if let Err(e) = self.config.save() {
@@ -453,17 +421,12 @@ impl eframe::App for RShareApp {
 }
 
 impl RShareApp {
-    /// Show the devices tab
     fn show_devices_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Discovered Devices");
         ui.add_space(10.0);
 
-        let devices = self.get_devices();
-
-        if devices.is_empty() {
-            ui.label("No devices found. Make sure R-ShareMouse is running on other devices.");
-            ui.add_space(10.0);
-            ui.label("Device discovery is active when the service is running.");
+        if self.devices.is_empty() {
+            ui.label("No devices found. Start the service and wait for discovery.");
             return;
         }
 
@@ -477,20 +440,24 @@ impl RShareApp {
                 ui.strong("Action");
                 ui.end_row();
 
-                for device in &devices {
+                let devices = self.devices.clone();
+                for device in devices {
                     ui.label(&device.name);
                     ui.label(&device.address);
-                    if device.online {
-                        ui.colored_label(egui::Color32::GREEN, "● Connected");
+                    let last_seen = device
+                        .last_seen_secs
+                        .map(|secs| format!("{}s ago", secs))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    if device.connected {
+                        ui.colored_label(egui::Color32::GREEN, format!("● Connected ({})", last_seen));
                         if ui.button(format!("Disconnect {}", device.id)).clicked() {
-                            // TODO: Implement disconnect
-                            log::info!("Disconnect requested for {}", device.id);
+                            self.disconnect_device(device.id);
                         }
                     } else {
-                        ui.colored_label(egui::Color32::GRAY, "○ Discovered");
+                        ui.colored_label(egui::Color32::GRAY, format!("○ Discovered ({})", last_seen));
                         if ui.button(format!("Connect {}", device.id)).clicked() {
-                            // TODO: Implement manual connect
-                            log::info!("Connect requested for {}", device.id);
+                            self.connect_device(device.id);
                         }
                     }
                     ui.end_row();
@@ -501,19 +468,18 @@ impl RShareApp {
         ui.heading("Network Status");
         ui.add_space(10.0);
 
-        let is_running = *self.service_running.blocking_lock();
-        if is_running {
+        if let Some(status) = &self.status_snapshot {
             ui.colored_label(egui::Color32::GREEN, "● Network service is running");
-            ui.label("• Device discovery: Active (UDP port 27432)");
-            ui.label("• Listening for connections: 0.0.0.0:27431");
-            ui.label(format!("• Discovered {} device(s)", devices.len()));
+            ui.label(format!("• Listening for connections: {}", status.bind_address));
+            ui.label(format!("• Device discovery: UDP port {}", status.discovery_port));
+            ui.label(format!("• Discovered {} device(s)", status.discovered_devices));
+            ui.label(format!("• Connected {} device(s)", status.connected_devices));
         } else {
             ui.colored_label(egui::Color32::GRAY, "○ Network service is stopped");
             ui.label("Start the service to enable device discovery and connections.");
         }
     }
 
-    /// Show the about tab
     fn show_about_tab(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.heading("R-ShareMouse");

@@ -9,7 +9,7 @@ R-ShareMouse is a cross-platform mouse and keyboard sharing software written in 
 - **Secure**: Encrypted communication using QUIC/TLS
 - **Clipboard sync**: Share clipboard content across devices
 - **Auto-discovery**: Automatically find devices on your local network
-- **GUI & CLI**: Both graphical and command-line interfaces
+- **Desktop UI & CLI**: Borderless Tauri desktop shell plus command-line interface
 
 ## Project Status
 
@@ -56,7 +56,7 @@ rshare version
 ### GUI
 
 ```bash
-# Launch the GUI application
+# Launch the desktop UI
 rshare-gui
 ```
 

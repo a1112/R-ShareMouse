@@ -219,6 +219,16 @@ impl Default for ServiceManager {
     }
 }
 
+/// Get the state directory for R-ShareMouse.
+pub fn state_dir() -> Result<PathBuf> {
+    get_state_dir()
+}
+
+/// Get the PID file path for the local daemon.
+pub fn pid_file_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("rshare.pid"))
+}
+
 /// Handle for a running service
 pub struct ServiceHandle {
     shutdown_tx: tokio::sync::broadcast::Sender<()>,

@@ -1,7 +1,7 @@
 //! Logs command implementation
 
-use anyhow::Result;
 use crate::output::{header, warning};
+use anyhow::Result;
 
 /// Execute the logs command
 pub async fn execute(lines: usize, follow: bool) -> Result<()> {

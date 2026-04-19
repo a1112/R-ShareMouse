@@ -296,6 +296,33 @@ impl InputEvent {
             }
         }
     }
+
+    /// Convert a native Windows low-level hook event into the cross-platform event type.
+    #[cfg(target_os = "windows")]
+    pub fn from_windows_event(event: rshare_platform::WindowsInputEvent) -> Self {
+        match event {
+            rshare_platform::WindowsInputEvent::MouseMove { x, y } => Self::mouse_move(x, y),
+            rshare_platform::WindowsInputEvent::MouseButton { button, down } => {
+                let state = if down {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                Self::mouse_button(MouseButton::from_code(button), state)
+            }
+            rshare_platform::WindowsInputEvent::MouseWheel { delta_x, delta_y } => {
+                Self::mouse_wheel(delta_x, delta_y)
+            }
+            rshare_platform::WindowsInputEvent::Key { vk, down } => {
+                let state = if down {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                Self::key(KeyCode::Raw(vk), state)
+            }
+        }
+    }
 }
 
 /// Convert platform event to InputEvent
@@ -381,5 +408,22 @@ mod tests {
     fn test_should_forward() {
         assert!(InputEvent::mouse_move(0, 0).should_forward());
         assert!(InputEvent::key(KeyCode::Space, ButtonState::Pressed).should_forward());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_event_conversion() {
+        let event = InputEvent::from_windows_event(rshare_platform::WindowsInputEvent::Key {
+            vk: 0x20,
+            down: true,
+        });
+
+        match event {
+            InputEvent::Key { keycode, state } => {
+                assert_eq!(keycode, KeyCode::Raw(0x20));
+                assert_eq!(state, ButtonState::Pressed);
+            }
+            _ => panic!("Wrong event type"),
+        }
     }
 }

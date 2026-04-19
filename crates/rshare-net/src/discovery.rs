@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 
-use rshare_core::{DeviceId, Message, hello_message, hello_back_message};
+use rshare_core::{hello_back_message, hello_message, DeviceId, Message};
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -358,11 +358,7 @@ mod tests {
 
     #[test]
     fn test_message_serialize() {
-        let msg = hello_message(
-            Uuid::new_v4(),
-            "Test".to_string(),
-            "test-host".to_string(),
-        );
+        let msg = hello_message(Uuid::new_v4(), "Test".to_string(), "test-host".to_string());
         let bytes = serialize_message(&msg).unwrap();
         assert!(!bytes.is_empty());
 
@@ -377,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_discovered_device_stale() {
-        let mut device = DiscoveredDevice {
+        let device = DiscoveredDevice {
             id: Uuid::new_v4(),
             name: "Test".to_string(),
             hostname: "test".to_string(),

@@ -1,15 +1,15 @@
 //! QUIC transport layer for low-latency encrypted communication
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::net::SocketAddr;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
-use rshare_core::{DeviceId, Message};
 use super::codec::MessageCodec;
+use rshare_core::{DeviceId, Message};
 
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -19,7 +19,7 @@ pub struct TransportConfig {
 }
 
 pub struct QuicTransport {
-    listener: Option<TcpListener>,
+    server_task: Option<tokio::task::JoinHandle<()>>,
     config: TransportConfig,
     local_device_id: DeviceId,
     incoming_tx: mpsc::Sender<IncomingConnection>,
@@ -37,7 +37,7 @@ impl QuicTransport {
         let (incoming_tx, incoming_rx) = mpsc::channel(10);
 
         Self {
-            listener: None,
+            server_task: None,
             config: TransportConfig::default(),
             local_device_id,
             incoming_tx,
@@ -51,7 +51,8 @@ impl QuicTransport {
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
-        let bind_addr: SocketAddr = bind_addr.parse()
+        let bind_addr: SocketAddr = bind_addr
+            .parse()
             .map_err(|_| anyhow!("Invalid bind address: {}", bind_addr))?;
 
         let listener = TcpListener::bind(bind_addr).await?;
@@ -60,7 +61,7 @@ impl QuicTransport {
         let incoming_tx = self.incoming_tx.clone();
         let local_device_id = self.local_device_id;
 
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             while let Ok((stream, addr)) = listener.accept().await {
                 let incoming_tx = incoming_tx.clone();
 
@@ -78,13 +79,17 @@ impl QuicTransport {
             }
         });
 
-        // Keep a placeholder to indicate we're running
-        self.listener = TcpListener::bind(bind_addr).await.ok();
+        self.server_task = Some(server_task);
         Ok(())
     }
 
-    pub async fn connect(&mut self, remote_addr: &str, _device_id: DeviceId) -> Result<QuicConnection> {
-        let remote_addr: SocketAddr = remote_addr.parse()
+    pub async fn connect(
+        &mut self,
+        remote_addr: &str,
+        _device_id: DeviceId,
+    ) -> Result<QuicConnection> {
+        let remote_addr: SocketAddr = remote_addr
+            .parse()
             .map_err(|_| anyhow!("Invalid remote address: {}", remote_addr))?;
 
         info!("Connecting to {}", remote_addr);
@@ -104,7 +109,10 @@ impl QuicTransport {
     }
 
     pub fn is_running(&self) -> bool {
-        self.listener.is_some()
+        self.server_task
+            .as_ref()
+            .map(|task| !task.is_finished())
+            .unwrap_or(false)
     }
 
     pub fn local_device_id(&self) -> DeviceId {
@@ -112,7 +120,9 @@ impl QuicTransport {
     }
 
     pub async fn close(&mut self) -> Result<()> {
-        self.listener = None;
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
         info!("Transport closed");
         Ok(())
     }
@@ -127,14 +137,19 @@ impl Default for QuicTransport {
 pub struct QuicConnection {
     device_id: Option<DeviceId>,
     remote_addr: SocketAddr,
-    send_channel: mpsc::Sender<Vec<u8>>,
-    message_tx: mpsc::Sender<Message>,
+    send_channel: mpsc::Sender<OutboundFrame>,
+    message_rx: Option<mpsc::Receiver<Message>>,
     _local_device_id: DeviceId,
+}
+
+struct OutboundFrame {
+    data: Vec<u8>,
+    ack: oneshot::Sender<std::result::Result<(), String>>,
 }
 
 impl QuicConnection {
     pub fn new(stream: TcpStream, _local_device_id: DeviceId, remote_addr: SocketAddr) -> Self {
-        let (send_channel, mut send_rx): (mpsc::Sender<Vec<u8>>, _) = mpsc::channel(100);
+        let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(100);
         let (message_tx, _message_rx): (mpsc::Sender<Message>, _) = mpsc::channel(100);
 
         // Clone message_tx for use in spawned task
@@ -147,14 +162,17 @@ impl QuicConnection {
 
             // Writer task
             let writer = async move {
-                while let Some(data) = send_rx.recv().await {
-                    let len = data.len() as u32;
-                    if write_half.write_all(&len.to_be_bytes()).await.is_err() {
+                while let Some(frame) = send_rx.recv().await {
+                    let len = frame.data.len() as u32;
+                    if let Err(error) = write_half.write_all(&len.to_be_bytes()).await {
+                        let _ = frame.ack.send(Err(error.to_string()));
                         break;
                     }
-                    if write_half.write_all(&data).await.is_err() {
+                    if let Err(error) = write_half.write_all(&frame.data).await {
+                        let _ = frame.ack.send(Err(error.to_string()));
                         break;
                     }
+                    let _ = frame.ack.send(Ok(()));
                 }
             };
 
@@ -193,7 +211,7 @@ impl QuicConnection {
             device_id: None,
             remote_addr,
             send_channel,
-            message_tx,
+            message_rx: Some(_message_rx),
             _local_device_id,
         }
     }
@@ -212,38 +230,33 @@ impl QuicConnection {
 
     pub async fn send_message(&self, message: &Message) -> Result<()> {
         let encoded = MessageCodec::encode(message)?;
+        let (ack, written) = oneshot::channel();
 
-        self.send_channel.send(encoded)
+        self.send_channel
+            .send(OutboundFrame { data: encoded, ack })
             .await
             .map_err(|_| anyhow!("Send channel closed"))?;
 
-        Ok(())
+        written
+            .await
+            .map_err(|_| anyhow!("Write confirmation channel closed"))?
+            .map_err(|error| anyhow!("Write failed: {error}"))
     }
 
     pub async fn receive_message(&mut self) -> Result<Message> {
-        // Create a temporary receiver
-        let (tx, rx): (mpsc::Sender<Message>, _) = mpsc::channel(1);
-        let message_tx = self.message_tx.clone();
-
-        // Forward to temporary receiver
-        tokio::spawn(async move {
-            // In a real implementation, you'd have a persistent receiver
-        });
-
-        Err(anyhow!("Use message_channel() instead"))
+        let rx = self
+            .message_rx
+            .as_mut()
+            .ok_or_else(|| anyhow!("Message channel already taken"))?;
+        rx.recv()
+            .await
+            .ok_or_else(|| anyhow!("Message channel closed"))
     }
 
-    pub fn message_channel(&self) -> mpsc::Receiver<Message> {
-        let (tx, rx): (mpsc::Sender<Message>, _) = mpsc::channel(100);
-        let message_tx = self.message_tx.clone();
-
-        tokio::spawn(async move {
-            // Forward messages from internal channel
-            drop(tx);
-            drop(message_tx);
-        });
-
-        rx
+    pub fn message_channel(&mut self) -> mpsc::Receiver<Message> {
+        self.message_rx
+            .take()
+            .expect("Message channel already taken")
     }
 
     pub fn is_connected(&self) -> bool {
@@ -269,13 +282,12 @@ impl ConnectionPool {
         }
     }
 
-    pub fn insert(&self, device_id: DeviceId, conn: QuicConnection) {
-        let conns = self.connections.blocking_lock();
-        let mut conns = conns;
+    pub async fn insert(&self, device_id: DeviceId, conn: QuicConnection) {
+        let mut conns = self.connections.lock().await;
         conns.insert(device_id, conn);
     }
 
-    pub fn get(&self, device_id: &DeviceId) -> Option<&'static QuicConnection> {
+    pub fn get(&self, _device_id: &DeviceId) -> Option<&'static QuicConnection> {
         // Return None - actual implementation would use Arc or different design
         None
     }
@@ -288,8 +300,8 @@ impl ConnectionPool {
         Ok(())
     }
 
-    pub fn remove(&self, device_id: &DeviceId) -> Option<QuicConnection> {
-        let mut conns = self.connections.blocking_lock();
+    pub async fn remove(&self, device_id: &DeviceId) -> Option<QuicConnection> {
+        let mut conns = self.connections.lock().await;
         conns.remove(device_id)
     }
 
@@ -306,8 +318,8 @@ impl ConnectionPool {
         Ok(())
     }
 
-    pub fn cleanup(&self) {
-        let mut conns = self.connections.blocking_lock();
+    pub async fn cleanup(&self) {
+        let mut conns = self.connections.lock().await;
         conns.retain(|_id, conn| conn.is_connected());
     }
 }
@@ -333,9 +345,48 @@ mod tests {
         assert!(!transport.is_running());
     }
 
+    #[tokio::test]
+    async fn start_server_marks_transport_running() {
+        let mut transport = QuicTransport::new(DeviceId::new_v4());
+
+        transport.start_server("127.0.0.1:0").await.unwrap();
+
+        assert!(transport.is_running());
+
+        transport.close().await.unwrap();
+        assert!(!transport.is_running());
+    }
+
     #[test]
     fn test_connection_pool() {
         let pool = ConnectionPool::new(DeviceId::new_v4());
         assert_eq!(pool.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn quic_connection_exposes_received_messages() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, server_addr) = listener.accept().await.unwrap();
+
+        let mut receiver = QuicConnection::new(server_stream, local_id, server_addr);
+        let sender = QuicConnection::new(client_stream, remote_id, addr);
+        let mut messages = receiver.message_channel();
+
+        sender
+            .send_message(&Message::MouseMove { x: 42, y: 24 })
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), messages.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(received, Message::MouseMove { x: 42, y: 24 }));
     }
 }

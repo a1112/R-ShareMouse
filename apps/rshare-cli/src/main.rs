@@ -2,14 +2,14 @@
 //!
 //! Command-line interface for R-ShareMouse.
 
-use clap::{Parser, Subcommand};
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 
 mod commands;
 mod config;
 mod output;
 
-use commands::{start, stop, devices, config_cmd, discover};
+use commands::{config_cmd, devices, discover, start, stop};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -136,7 +136,12 @@ async fn main() -> Result<()> {
 
     // Run command
     match cli.command {
-        Commands::Start { daemon, log_file, port, bind } => {
+        Commands::Start {
+            daemon,
+            log_file,
+            port,
+            bind,
+        } => {
             start::execute(daemon, log_file, port, bind).await?;
         }
         Commands::Stop { force } => {
@@ -158,11 +163,14 @@ async fn main() -> Result<()> {
         Commands::Logs { lines, follow } => {
             commands::logs::execute(lines, follow).await?;
         }
-        Commands::Discover { duration, continuous } => {
+        Commands::Discover {
+            duration,
+            continuous,
+        } => {
             if continuous {
                 discover::run_discover_test().await?;
             } else {
-                discover::run_discover_scan().await?;
+                discover::run_discover_scan(std::time::Duration::from_secs(duration)).await?;
             }
         }
     }

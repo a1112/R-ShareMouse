@@ -1,8 +1,10 @@
 //! Config command implementation
 
+use crate::config::{
+    get_config_path, get_config_value, load_config, save_config, set_config_value,
+};
+use crate::output::{error, header, kv, success, warning};
 use anyhow::Result;
-use crate::output::{header, kv, success, error, warning};
-use crate::config::{load_config, save_config, get_config_value, set_config_value, get_config_path};
 use colored::Colorize;
 
 /// Config subcommands (defined here to avoid circular imports)
@@ -149,10 +151,13 @@ async fn execute_edit() -> Result<()> {
     let config_path = get_config_path()?;
 
     // Get editor from environment
-    let editor = std::env::var("EDITOR")
-        .unwrap_or_else(|_| "notepad".to_string());
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "notepad".to_string());
 
-    warning(&format!("Opening {} with {}...", config_path.display(), editor));
+    warning(&format!(
+        "Opening {} with {}...",
+        config_path.display(),
+        editor
+    ));
 
     // Use spawn to wait for editor to close
     let status = std::process::Command::new(&editor)

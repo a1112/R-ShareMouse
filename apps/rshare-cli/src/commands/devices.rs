@@ -1,21 +1,22 @@
-//! Devices command implementation
+//! Devices command implementation.
 
 use anyhow::Result;
-use crate::output::{header, success, kv, table_header, table_row, status_ok, status_err, warning};
 use colored::Colorize;
 
-/// Device information for display
+use crate::output::{header, kv, status_ok, table_header, table_row, warning};
+
+/// Device information for display.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub hostname: String,
-    pub address: String,
+    pub addresses: String,
     pub status: String,
-    pub latency_ms: Option<u64>,
+    pub last_seen: String,
 }
 
-/// Execute the devices command
+/// Execute the devices command.
 pub async fn execute(detailed: bool, watch: bool) -> Result<()> {
     if watch {
         execute_watch(detailed).await?;
@@ -26,98 +27,78 @@ pub async fn execute(detailed: bool, watch: bool) -> Result<()> {
     Ok(())
 }
 
-/// List all devices
 async fn execute_list(detailed: bool) -> Result<()> {
-    header("Connected Devices");
-
-    // TODO: Get actual device list from service
-    let devices = get_mock_devices();
-
-    if devices.is_empty() {
-        warning("No devices connected");
-        return Ok(());
-    }
-
-    if detailed {
-        print_detailed_devices(&devices);
-    } else {
-        print_device_table(&devices);
-    }
-
-    success(&format!("Total: {} device(s)", devices.len()));
-
+    let devices = fetch_devices().await?;
+    render_devices(&devices, detailed);
     Ok(())
 }
 
-/// Watch for device changes
 async fn execute_watch(detailed: bool) -> Result<()> {
     use tokio::time::{interval, Duration};
 
     warning("Watching for device changes (press Ctrl+C to stop)");
-
     let mut ticker = interval(Duration::from_secs(2));
-    let mut last_count = 0usize;
+    let mut last_count = None;
 
     loop {
-        ticker.tick().await;
-
-        // Clear screen
-        print!("\x1B[2J\x1B[1;1H");
-
-        header("Connected Devices (Watching)");
-
-        let devices = get_mock_devices();
-
-        if devices.len() != last_count {
-            // Device count changed
-            if devices.len() > last_count {
-                success(&format!("New device connected! Total: {}", devices.len()));
-            } else {
-                warning(&format!("Device disconnected! Total: {}", devices.len()));
+        tokio::select! {
+            _ = ticker.tick() => {
+                let devices = fetch_devices().await?;
+                print!("\x1B[2J\x1B[1;1H");
+                if let Some(previous) = last_count {
+                    if previous != devices.len() {
+                        warning(&format!("Device count changed: {} -> {}", previous, devices.len()));
+                    }
+                }
+                last_count = Some(devices.len());
+                render_devices(&devices, detailed);
             }
-            last_count = devices.len();
-        }
-
-        if detailed {
-            print_detailed_devices(&devices);
-        } else {
-            print_device_table(&devices);
-        }
-
-        // Check for Ctrl+C
-        if tokio::signal::ctrl_c().await.is_ok() {
-            break;
+            _ = tokio::signal::ctrl_c() => break,
         }
     }
 
     Ok(())
 }
 
-/// Print devices in table format
+async fn fetch_devices() -> Result<Vec<DeviceInfo>> {
+    let snapshots = rshare_core::daemon_client::request_devices().await?;
+    Ok(snapshots.into_iter().map(DeviceInfo::from).collect())
+}
+
+fn render_devices(devices: &[DeviceInfo], detailed: bool) {
+    header("Devices");
+
+    if devices.is_empty() {
+        warning("No devices discovered");
+        return;
+    }
+
+    if detailed {
+        print_detailed_devices(devices);
+    } else {
+        print_device_table(devices);
+    }
+}
+
 fn print_device_table(devices: &[DeviceInfo]) {
-    table_header(&["NAME", "HOSTNAME", "STATUS", "LATENCY"]);
+    table_header(&["NAME", "HOSTNAME", "STATUS", "LAST SEEN"]);
 
     for device in devices {
-        let latency = device.latency_ms
-            .map(|l| format!("{}ms", l))
-            .unwrap_or_else(|| "—".to_string());
-
-        let status_emoji = match device.status.as_str() {
-            "online" => "🟢",
-            "offline" => "🔴",
+        let status_icon = match device.status.as_str() {
+            "connected" => "🟢",
+            "discovered" => "🟡",
             _ => "⚪",
         };
 
         table_row(&[
-            &format!("{} {}", status_emoji, device.name),
+            &format!("{} {}", status_icon, device.name),
             &device.hostname,
             &device.status,
-            &latency,
+            &device.last_seen,
         ]);
     }
 }
 
-/// Print detailed device information
 fn print_detailed_devices(devices: &[DeviceInfo]) {
     for device in devices {
         println!();
@@ -126,45 +107,39 @@ fn print_detailed_devices(devices: &[DeviceInfo]) {
 
         kv("ID", &device.id);
         kv("Hostname", &device.hostname);
-        kv("Address", &device.address);
+        kv("Addresses", &device.addresses);
+        kv("Last Seen", &device.last_seen);
 
         match device.status.as_str() {
-            "online" => status_ok("Status: Online"),
-            _ => status_err(&format!("Status: {}", device.status)),
-        }
-
-        if let Some(latency) = device.latency_ms {
-            kv("Latency", &format!("{} ms", latency));
+            "connected" => status_ok("Status: Connected"),
+            "discovered" => println!("  [DISCOVERED] Status: Discovered"),
+            other => println!("  [UNKNOWN] Status: {}", other),
         }
     }
 }
 
-/// Get mock device data for demonstration
-fn get_mock_devices() -> Vec<DeviceInfo> {
-    vec![
-        DeviceInfo {
-            id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            name: "Desktop-PC".to_string(),
-            hostname: "desktop-pc".to_string(),
-            address: "192.168.1.100:4242".to_string(),
-            status: "online".to_string(),
-            latency_ms: Some(12),
-        },
-        DeviceInfo {
-            id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
-            name: "MacBook-Pro".to_string(),
-            hostname: "macbook-pro".to_string(),
-            address: "192.168.1.101:4242".to_string(),
-            status: "online".to_string(),
-            latency_ms: Some(8),
-        },
-        DeviceInfo {
-            id: "550e8400-e29b-41d4-a716-446655440002".to_string(),
-            name: "Work-Laptop".to_string(),
-            hostname: "work-laptop".to_string(),
-            address: "192.168.1.102:4242".to_string(),
-            status: "offline".to_string(),
-            latency_ms: None,
-        },
-    ]
+impl From<rshare_core::DaemonDeviceSnapshot> for DeviceInfo {
+    fn from(value: rshare_core::DaemonDeviceSnapshot) -> Self {
+        let last_seen = value
+            .last_seen_secs
+            .map(|secs| format!("{}s ago", secs))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Self {
+            id: value.id.to_string(),
+            name: value.name,
+            hostname: value.hostname,
+            addresses: if value.addresses.is_empty() {
+                "—".to_string()
+            } else {
+                value.addresses.join(", ")
+            },
+            status: if value.connected {
+                "connected".to_string()
+            } else {
+                "discovered".to_string()
+            },
+            last_seen,
+        }
+    }
 }

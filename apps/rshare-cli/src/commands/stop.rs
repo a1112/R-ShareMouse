@@ -1,50 +1,47 @@
-//! Stop command implementation
+//! Stop command implementation.
 
 use anyhow::Result;
-use crate::output::{success, info, warning};
+use std::time::Duration;
 
-/// Execute the stop command
+use crate::output::{info, success, warning};
+
+/// Execute the stop command.
 pub async fn execute(force: bool) -> Result<()> {
-    // Check if service is running
-    let pid_file = get_pid_file()?;
+    let manager = rshare_core::service::ServiceManager::new()?;
 
-    if !pid_file.exists() {
+    if !manager.is_running() {
         warning("R-ShareMouse service is not running");
         return Ok(());
     }
 
-    // Read PID
-    let pid = std::fs::read_to_string(&pid_file)?
-        .trim()
-        .parse::<u32>()?;
-
-    info(&format!("Stopping service (PID: {})...", pid));
-
     if force {
-        // Force kill
-        info("Force stopping...");
-        // In real implementation, send SIGKILL
+        info("Force stopping service...");
+        manager.stop().await?;
         success("Service stopped (force)");
-    } else {
-        // Graceful shutdown
-        info("Attempting graceful shutdown...");
-        // In real implementation, send SIGTERM or use IPC
-        // For now, just remove PID file
-        success("Service stopped");
+        return Ok(());
     }
 
-    // Clean up PID file
-    let _ = std::fs::remove_file(&pid_file);
+    info("Requesting graceful shutdown...");
+    if let Err(err) = rshare_core::daemon_client::request_shutdown().await {
+        warning(&format!(
+            "Graceful shutdown request failed ({}), falling back to process stop",
+            err
+        ));
+        manager.stop().await?;
+        success("Service stopped");
+        return Ok(());
+    }
 
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !manager.is_running() {
+            success("Service stopped");
+            return Ok(());
+        }
+    }
+
+    warning("Service did not exit after graceful shutdown, forcing stop");
+    manager.stop().await?;
+    success("Service stopped");
     Ok(())
-}
-
-/// Get the PID file path
-fn get_pid_file() -> Result<std::path::PathBuf> {
-    let config_dir = directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rshare");
-
-    Ok(config_dir.join("rshare.pid"))
 }

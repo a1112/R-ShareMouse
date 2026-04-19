@@ -7,9 +7,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
 
-use rshare_core::{DeviceId, Message};
+use rshare_core::{
+    hello_back_message, hello_message, protocol::PROTOCOL_VERSION, DeviceId, Message, ScreenInfo,
+};
 
-use super::transport::{QuicTransport, ConnectionPool};
+use super::transport::{ConnectionPool, QuicTransport};
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,41 @@ pub struct ConnectionManager {
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
 }
 
+fn spawn_message_reader(
+    device_id: DeviceId,
+    mut messages: mpsc::Receiver<Message>,
+    first_message: Option<Message>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+) {
+    tokio::spawn(async move {
+        if let Some(message) = first_message {
+            if event_tx
+                .send(ManagerEvent::MessageReceived {
+                    from: device_id,
+                    message,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        while let Some(message) = messages.recv().await {
+            if event_tx
+                .send(ManagerEvent::MessageReceived {
+                    from: device_id,
+                    message,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 impl ConnectionManager {
     pub fn new(local_device_id: DeviceId) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
@@ -86,12 +123,43 @@ impl ConnectionManager {
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
         self.transport.start_server(bind_addr).await?;
 
+        let mut incoming = self.transport.incoming();
         let event_tx = self.event_tx.clone();
-        let _pool = self.pool.clone();
+        let pool = self.pool.clone();
+        let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
-            // Handle incoming connections here
-            // For now, this is a placeholder
+            while let Some(mut incoming) = incoming.recv().await {
+                let (device_id, first_message) =
+                    match receive_incoming_handshake(&mut incoming.connection, local_device_id)
+                        .await
+                    {
+                        Ok((device_id, first_message)) => (device_id, first_message),
+                        Err(error) => {
+                            let device_id = incoming.device_id.unwrap_or_else(DeviceId::new_v4);
+                            let _ = event_tx
+                                .send(ManagerEvent::Error {
+                                    device_id,
+                                    error: error.to_string(),
+                                })
+                                .await;
+                            (device_id, None)
+                        }
+                    };
+                incoming.connection.set_device_id(device_id);
+                let messages = incoming.connection.message_channel();
+
+                spawn_message_reader(device_id, messages, first_message, event_tx.clone());
+                pool.insert(device_id, incoming.connection).await;
+
+                if event_tx
+                    .send(ManagerEvent::Connected(device_id))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         });
 
         Ok(())
@@ -106,14 +174,36 @@ impl ConnectionManager {
         self.connections.insert(device_id, info);
 
         match self.transport.connect(address, device_id).await {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                let first_message =
+                    match perform_outbound_handshake(&mut conn, self.local_device_id).await {
+                        OutboundHandshake::HelloBack {
+                            device_id: remote_id,
+                        } => {
+                            if remote_id != device_id {
+                                tracing::warn!(
+                                    "Connected device id mismatch: expected {}, got {}",
+                                    device_id,
+                                    remote_id
+                                );
+                            }
+                            None
+                        }
+                        OutboundHandshake::Prefetched(message) => Some(message),
+                        OutboundHandshake::Unavailable(error) => {
+                            tracing::debug!("Outbound handshake unavailable: {}", error);
+                            None
+                        }
+                    };
+
                 self.update_connection_state(device_id, ConnectionState::Connected);
-                self.pool.insert(device_id, conn);
+                conn.set_device_id(device_id);
+                let messages = conn.message_channel();
+                spawn_message_reader(device_id, messages, first_message, self.event_tx.clone());
+
+                self.pool.insert(device_id, conn).await;
 
                 let _ = self.event_tx.send(ManagerEvent::Connected(device_id));
-
-                // Note: message handling would need a different design
-                // since QuicConnection doesn't support clone
 
                 Ok(())
             }
@@ -131,7 +221,7 @@ impl ConnectionManager {
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
         if self.connections.remove(device_id).is_some() {
-            self.pool.remove(device_id);
+            self.pool.remove(device_id).await;
             let _ = self.event_tx.send(ManagerEvent::Disconnected(*device_id));
         }
         Ok(())
@@ -158,6 +248,10 @@ impl ConnectionManager {
 
     pub fn get_connection(&self, device_id: &DeviceId) -> Option<&ConnectionInfo> {
         self.connections.get(device_id)
+    }
+
+    pub fn connections(&self) -> Vec<ConnectionInfo> {
+        self.connections.values().cloned().collect()
     }
 
     pub fn is_connected(&self, device_id: &DeviceId) -> bool {
@@ -193,12 +287,78 @@ impl ConnectionManager {
             let _ = self.disconnect(id).await;
         }
 
-        self.pool.cleanup();
+        self.pool.cleanup().await;
         stale
     }
 
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
+    }
+}
+
+enum OutboundHandshake {
+    HelloBack { device_id: DeviceId },
+    Prefetched(Message),
+    Unavailable(anyhow::Error),
+}
+
+async fn receive_incoming_handshake(
+    conn: &mut super::transport::QuicConnection,
+    local_device_id: DeviceId,
+) -> Result<(DeviceId, Option<Message>)> {
+    match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
+        Ok(Ok(Message::Hello {
+            device_id,
+            device_name: _,
+            hostname: _,
+            protocol_version,
+            ..
+        })) if protocol_version == PROTOCOL_VERSION => {
+            conn.send_message(&hello_back_message(
+                local_device_id,
+                "R-ShareMouse".to_string(),
+                hostname::get()
+                    .unwrap_or_else(|_| "unknown".into())
+                    .to_string_lossy()
+                    .to_string(),
+                ScreenInfo::primary(),
+            ))
+            .await?;
+            Ok((device_id, None))
+        }
+        Ok(Ok(message)) => Ok((DeviceId::new_v4(), Some(message))),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok((DeviceId::new_v4(), None)),
+    }
+}
+
+async fn perform_outbound_handshake(
+    conn: &mut super::transport::QuicConnection,
+    local_device_id: DeviceId,
+) -> OutboundHandshake {
+    if let Err(error) = conn
+        .send_message(&hello_message(
+            local_device_id,
+            "R-ShareMouse".to_string(),
+            hostname::get()
+                .unwrap_or_else(|_| "unknown".into())
+                .to_string_lossy()
+                .to_string(),
+        ))
+        .await
+    {
+        return OutboundHandshake::Unavailable(error);
+    }
+
+    match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
+        Ok(Ok(Message::HelloBack {
+            device_id,
+            protocol_version,
+            ..
+        })) if protocol_version == PROTOCOL_VERSION => OutboundHandshake::HelloBack { device_id },
+        Ok(Ok(message)) => OutboundHandshake::Prefetched(message),
+        Ok(Err(error)) => OutboundHandshake::Unavailable(error),
+        Err(_) => OutboundHandshake::Unavailable(anyhow::anyhow!("Handshake timed out")),
     }
 }
 
@@ -214,10 +374,7 @@ mod tests {
 
     #[test]
     fn test_connection_info() {
-        let info = ConnectionInfo::new(
-            DeviceId::new_v4(),
-            "192.168.1.100:27431".to_string(),
-        );
+        let info = ConnectionInfo::new(DeviceId::new_v4(), "192.168.1.100:27431".to_string());
         assert_eq!(info.state, ConnectionState::Connecting);
     }
 
@@ -225,5 +382,147 @@ mod tests {
     async fn test_manager_new() {
         let manager = ConnectionManager::new(DeviceId::new_v4());
         assert_eq!(manager.connected_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn manager_emits_message_received_for_connected_device() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let sender = crate::transport::QuicConnection::new(stream, remote_id, peer_addr);
+            sender
+                .send_message(&Message::MouseMove { x: 7, y: 9 })
+                .await
+                .unwrap();
+        });
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+        manager
+            .connect(remote_id, &address.to_string())
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ManagerEvent::MessageReceived { from, message } => {
+                        break (from, message);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received.0, remote_id);
+        assert!(matches!(received.1, Message::MouseMove { x: 7, y: 9 }));
+    }
+
+    #[tokio::test]
+    async fn manager_emits_message_received_for_incoming_connection() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+        manager.start_server(&address.to_string()).await.unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let sender = crate::transport::QuicConnection::new(stream, remote_id, address);
+        sender
+            .send_message(&Message::MouseMove { x: 11, y: 13 })
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ManagerEvent::MessageReceived { from, message } => {
+                        break (from, message);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(received.1, Message::MouseMove { x: 11, y: 13 }));
+    }
+
+    #[tokio::test]
+    async fn incoming_hello_binds_connection_to_remote_device_id() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+        manager.start_server(&address.to_string()).await.unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let sender = crate::transport::QuicConnection::new(stream, remote_id, address);
+        sender
+            .send_message(&hello_message(
+                remote_id,
+                "remote".to_string(),
+                "remote-host".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let connected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ManagerEvent::Connected(device_id) = events.recv().await.unwrap() {
+                    break device_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(connected, remote_id);
+    }
+
+    #[tokio::test]
+    async fn outbound_connect_accepts_hello_back_identity() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let mut conn = crate::transport::QuicConnection::new(stream, remote_id, peer_addr);
+            let hello = conn.receive_message().await.unwrap();
+            assert!(matches!(hello, Message::Hello { device_id, .. } if device_id == local_id));
+            conn.send_message(&hello_back_message(
+                remote_id,
+                "remote".to_string(),
+                "remote-host".to_string(),
+                ScreenInfo::primary(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let mut manager = ConnectionManager::new(local_id);
+        manager
+            .connect(remote_id, &address.to_string())
+            .await
+            .unwrap();
+
+        assert!(manager.is_connected(&remote_id));
     }
 }

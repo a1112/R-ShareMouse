@@ -54,14 +54,3 @@ pub fn status_ok(label: &str) {
 pub fn status_err(label: &str) {
     println!("  [{}] {}", "ERR".red(), label);
 }
-
-/// Print a status indicator
-pub fn status_warn(label: &str) {
-    println!("  [{}] {}", "WARN".yellow(), label);
-}
-
-/// Check if terminal supports colors
-pub fn supports_color() -> bool {
-    std::env::var("NO_COLOR").is_err()
-        && (atty::is(atty::Stream::Stdout) || atty::is(atty::Stream::Stderr))
-}

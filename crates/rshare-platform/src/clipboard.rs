@@ -7,7 +7,7 @@ use rshare_core::clipboard::ClipboardContent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 
 use super::{ClipboardListener, ClipboardListenerConfig};
 
@@ -47,6 +47,7 @@ impl ListenerState {
         self.running.store(running, Ordering::Relaxed);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn send_if_changed(&self, content: ClipboardContent) {
         let mut last = self.last_content.lock().await;
         let changed = match (&*last, &content) {
@@ -100,7 +101,6 @@ pub mod windows_impl {
             self.state.set_running(true);
             let running = self.state.running.clone();
             let tx = self.state.tx.clone();
-            let last_content = self.state.last_content.clone();
 
             // Spawn message loop task
             tokio::task::spawn_blocking(move || {
@@ -171,6 +171,7 @@ pub mod windows_impl {
 #[cfg(target_os = "macos")]
 pub mod macos_impl {
     use super::*;
+    use tokio::time::interval;
 
     /// macOS clipboard listener using polling
     pub struct MacosClipboardListener {
@@ -274,6 +275,7 @@ pub mod macos_impl {
 #[cfg(target_os = "linux")]
 pub mod linux_impl {
     use super::*;
+    use tokio::time::interval;
 
     /// Linux clipboard listener using polling
     pub struct LinuxClipboardListener {

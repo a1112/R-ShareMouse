@@ -2,7 +2,6 @@
 
 use eframe::egui;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Screen layout view state
 pub struct LayoutView {
@@ -179,6 +178,28 @@ impl LayoutView {
                         *neighbor = None;
                     }
                 }
+            }
+        }
+    }
+
+    /// Synchronize remote device screens with the current discovered device list.
+    pub fn sync_devices(&mut self, devices: &[crate::app::UiDevice]) {
+        let device_ids: std::collections::HashSet<String> = devices
+            .iter()
+            .map(|device| device.id.to_string())
+            .collect();
+
+        self.screens
+            .retain(|id, screen| screen.is_local || device_ids.contains(id));
+
+        for device in devices {
+            let id = device.id.to_string();
+            if let Some(screen) = self.screens.get_mut(&id) {
+                screen.name = device.name.clone();
+                screen.hostname = device.address.clone();
+                screen.online = device.connected;
+            } else {
+                self.add_device(id, device.name.clone(), device.address.clone(), device.connected);
             }
         }
     }
