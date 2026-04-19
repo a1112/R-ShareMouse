@@ -22,6 +22,9 @@ pub mod file_drop;
 // Clipboard listener module
 pub mod clipboard;
 
+// Firewall configuration module
+pub mod firewall;
+
 // Re-exports
 #[cfg(windows)]
 pub use windows::*;
@@ -34,6 +37,7 @@ pub use linux::*;
 
 pub use file_drop::*;
 pub use clipboard::*;
+pub use firewall::*;
 
 /// Clipboard listener configuration
 #[derive(Debug, Clone)]

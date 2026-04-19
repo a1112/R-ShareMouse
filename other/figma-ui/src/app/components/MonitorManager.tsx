@@ -732,7 +732,7 @@ export default function MonitorManager({
   }, []);
 
   return (
-    <div className="w-full h-full flex flex-col select-none overflow-hidden" style={{ background: t.bg, color: t.text }}>
+    <div className="w-full h-full flex flex-col overflow-hidden" style={{ background: t.bg, color: t.text }}>
       {/* ===== Top Toolbar (full width) ===== */}
       <div className="h-[36px] flex items-center px-3 gap-2.5 shrink-0" style={{ borderBottom: `1px solid ${t.border}`, background: t.toolbarBg }}>
         <button

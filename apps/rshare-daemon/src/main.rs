@@ -14,6 +14,9 @@ use rshare_input::{
     InputEvent, InputListener, PortableCaptureBackend, PortableInjectBackend,
 };
 use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
+
+#[cfg(windows)]
+use rshare_platform::firewall;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -675,6 +678,24 @@ async fn main() -> Result<()> {
         .init();
 
     tracing::info!("R-ShareMouse daemon starting...");
+
+    // Configure firewall on Windows to allow discovery and service ports
+    #[cfg(windows)]
+    {
+        match firewall::configure_firewall() {
+            Ok(result) => {
+                if result.is_success() {
+                    tracing::info!("Firewall configured successfully for R-ShareMouse");
+                } else {
+                    tracing::warn!("Firewall configuration incomplete: {:?}", result);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to configure firewall: {}", e);
+                tracing::warn!("Device discovery may not work. Please run as administrator or add firewall rules manually.");
+            }
+        }
+    }
 
     let config = load_config_with_env_overrides()?;
 
