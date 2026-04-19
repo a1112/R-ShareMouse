@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rshare_core::{
-    daemon_client, DaemonDeviceSnapshot, DeviceId, ServiceStatusSnapshot,
+    daemon_client, Config, DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use tauri::WebviewWindow;
@@ -88,6 +88,38 @@ fn start_drag_window(window: WebviewWindow) -> Result<(), String> {
     window.start_dragging().map_err(|err| err.to_string())
 }
 
+// Configuration management
+#[tauri::command]
+async fn get_config() -> Result<Config, String> {
+    Config::load().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn set_config(config: Config) -> Result<(), String> {
+    config.save().map_err(|err| err.to_string())
+}
+
+// Layout management
+#[tauri::command]
+async fn get_layout() -> Result<LayoutGraph, String> {
+    daemon_client::request_layout()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn set_layout(layout: LayoutGraph) -> Result<(), String> {
+    daemon_client::request_set_layout(layout)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn show_tray() -> Result<(), String> {
+    // TODO: Implement system tray via JavaScript frontend API
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -99,7 +131,12 @@ fn main() {
             minimize_window,
             toggle_maximize_window,
             close_window,
-            start_drag_window
+            start_drag_window,
+            get_config,
+            set_config,
+            get_layout,
+            set_layout,
+            show_tray
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri desktop app");

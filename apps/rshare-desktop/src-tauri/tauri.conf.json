@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.rsharemouse.desktop",
   "build": {
-    "beforeBuildCommand": "npm --prefix ../../../other/figma-ui run build",
-    "frontendDist": "../../../other/figma-ui/dist"
+    "beforeBuildCommand": "npm run build --prefix ../src",
+    "frontendDist": "../src/dist",
+    "beforeDevCommand": "npm run dev --prefix ../src"
   },
   "app": {
     "withGlobalTauri": true,
