@@ -12,6 +12,9 @@ pub mod service;
 pub mod ipc;
 pub mod daemon_client;
 pub mod input_mode;
+pub mod layout;
+pub mod runtime;
+pub mod session;
 
 // Re-exports from protocol
 pub use protocol::{
@@ -39,3 +42,15 @@ pub use ipc::{
 pub use input_mode::{
     BackendFailureReason, BackendHealth, BackendKind, PrivilegeState, ResolvedInputMode,
 };
+
+// Re-exports from runtime
+pub use runtime::{
+    BackendRuntimeState, ConnectionState, ControlSessionState, DiscoveryState,
+    PeerDirectoryEntry, SuspendReason,
+};
+
+// Re-exports from layout
+pub use layout::{DisplayNode, LayoutGraph, LayoutLink, LayoutNode};
+
+// Re-exports from session
+pub use session::{CaptureSessionStateMachine, TransitionError};

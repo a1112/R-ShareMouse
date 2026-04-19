@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing;
 
+use crate::DeviceId;
+
 /// Service manager for controlling the R-ShareMouse service lifecycle
 pub struct ServiceManager {
     /// PID file path
@@ -229,6 +231,16 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("rshare.pid"))
 }
 
+/// Get the state file path for the persisted local device identifier.
+pub fn local_device_id_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("device-id"))
+}
+
+/// Load the persisted local device identifier, creating one on first launch.
+pub fn load_or_create_local_device_id() -> Result<DeviceId> {
+    load_or_create_local_device_id_at(local_device_id_path()?)
+}
+
 /// Handle for a running service
 pub struct ServiceHandle {
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -279,6 +291,29 @@ fn get_state_dir() -> Result<PathBuf> {
         .unwrap_or_else(|| PathBuf::from(".rshare"));
 
     Ok(state_dir)
+}
+
+fn load_or_create_local_device_id_at(path: impl AsRef<Path>) -> Result<DeviceId> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create device id directory: {}", parent.display()))?;
+    }
+
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read device id file: {}", path.display()))?;
+        let parsed = content
+            .trim()
+            .parse::<DeviceId>()
+            .with_context(|| format!("Invalid device id in {}", path.display()))?;
+        return Ok(parsed);
+    }
+
+    let device_id = DeviceId::new_v4();
+    fs::write(path, device_id.to_string())
+        .with_context(|| format!("Failed to write device id file: {}", path.display()))?;
+    Ok(device_id)
 }
 
 /// Spawn service in daemon mode (Unix only)
@@ -348,5 +383,18 @@ mod tests {
         let manager = ServiceManager::new().unwrap();
         assert!(manager.is_process_alive(std::process::id()));
         assert!(!manager.is_process_alive(999999));
+    }
+
+    #[test]
+    fn local_device_id_is_stable_once_created() {
+        let path = std::env::temp_dir()
+            .join(format!("rshare-device-id-test-{}", uuid::Uuid::new_v4()))
+            .join("device-id");
+
+        let first = load_or_create_local_device_id_at(&path).unwrap();
+        let second = load_or_create_local_device_id_at(&path).unwrap();
+
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
