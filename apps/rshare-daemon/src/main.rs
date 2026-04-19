@@ -5,9 +5,9 @@
 use anyhow::Result;
 use rshare_core::{
     default_ipc_addr, read_json_line, write_json_line, BackendFailureReason, BackendHealth,
-    BackendKind, BackendRuntimeState, CaptureSessionStateMachine, Config, DaemonDeviceSnapshot,
-    DaemonRequest, DaemonResponse, DeviceId, Direction, LayoutGraph, LayoutNode, Message,
-    ResolvedInputMode, ServiceStatusSnapshot,
+    BackendKind, BackendRuntimeState, CaptureSessionStateMachine, Config, ControlSessionState,
+    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId, Direction, LayoutGraph,
+    LayoutNode, Message, ResolvedInputMode, ServiceStatusSnapshot,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, DefaultInputListener, InjectBackend,
@@ -346,6 +346,7 @@ impl InputRoutingState {
         Self::new(screen_width, screen_height, edge_threshold)
     }
 
+    #[cfg(test)]
     fn remote_target(&self) -> Option<DeviceId> {
         self.remote_target
     }
@@ -358,25 +359,37 @@ impl InputRoutingState {
         self.remote_target = Some(target);
     }
 
-    fn is_right_edge_activation(&self, event: &InputEvent) -> bool {
+    fn hit_edges(&self, event: &InputEvent) -> Vec<Direction> {
         let InputEvent::MouseMove { x, y } = event else {
-            return false;
+            return Vec::new();
         };
 
+        let mut edges = Vec::with_capacity(4);
         let right_edge_start = self.screen_width.saturating_sub(self.edge_threshold) as i32;
-        *x >= right_edge_start && self.is_vertical_screen_coordinate(*y)
-    }
+        let bottom_edge_start = self.screen_height.saturating_sub(self.edge_threshold) as i32;
 
-    fn is_left_edge_release(&self, event: &InputEvent) -> bool {
-        let InputEvent::MouseMove { x, y } = event else {
-            return false;
-        };
+        if *x <= self.edge_threshold as i32 && self.is_vertical_screen_coordinate(*y) {
+            edges.push(Direction::Left);
+        }
+        if *x >= right_edge_start && self.is_vertical_screen_coordinate(*y) {
+            edges.push(Direction::Right);
+        }
+        if *y <= self.edge_threshold as i32 && self.is_horizontal_screen_coordinate(*x) {
+            edges.push(Direction::Top);
+        }
+        if *y >= bottom_edge_start && self.is_horizontal_screen_coordinate(*x) {
+            edges.push(Direction::Bottom);
+        }
 
-        *x <= self.edge_threshold as i32 && self.is_vertical_screen_coordinate(*y)
+        edges
     }
 
     fn is_vertical_screen_coordinate(&self, y: i32) -> bool {
         y >= 0 && y < self.screen_height as i32
+    }
+
+    fn is_horizontal_screen_coordinate(&self, x: i32) -> bool {
+        x >= 0 && x < self.screen_width as i32
     }
 }
 
@@ -412,7 +425,7 @@ fn input_event_to_raw_event(
 }
 
 fn messages_for_input_event(
-    state: &DaemonState,
+    state: &mut DaemonState,
     routing: &mut InputRoutingState,
     forwarder: &mut rshare_core::engine::ForwardingEngine,
     event: InputEvent,
@@ -424,28 +437,64 @@ fn messages_for_input_event(
         .filter(|device| device.connected)
         .map(|device| device.id)
         .collect();
-
     let local_id = state.status.device_id;
+    let edge_hits = routing.hit_edges(&event);
 
-    // Handle edge activation using layout graph
-    if routing.is_right_edge_activation(&event) {
-        if let Some(target) = state.layout.resolve_target(local_id, Direction::Right, &connected_peers) {
+    match state.session.state() {
+        ControlSessionState::RemoteActive { target, entered_via } => {
             routing.set_remote_target(target);
-        }
-    } else if routing.is_left_edge_release(&event) {
-        routing.clear_remote_target();
-        forwarder.clear_target();
-        return Vec::new();
-    }
+            if !is_device_connected(state, target) {
+                state.session.on_target_disconnect(target);
+                routing.clear_remote_target();
+                forwarder.clear_target();
+                return Vec::new();
+            }
 
-    let target = if let Some(remote_target) = routing.remote_target() {
-        if !is_device_connected(state, remote_target) {
+            let return_edge = entered_via.opposite();
+            if edge_hits.contains(&return_edge) {
+                let _ = state.session.on_return_edge_hit(return_edge);
+                routing.clear_remote_target();
+                forwarder.clear_target();
+                return Vec::new();
+            }
+        }
+        ControlSessionState::Suspended { .. } => {
             routing.clear_remote_target();
             forwarder.clear_target();
             return Vec::new();
         }
+        _ => {
+            routing.clear_remote_target();
+            if let Some((edge, target)) = edge_hits.iter().find_map(|edge| {
+                state
+                    .layout
+                    .resolve_target(local_id, *edge, &connected_peers)
+                    .map(|target| (*edge, target))
+            }) {
+                if state.session.on_edge_hit(edge, Some(target)).is_ok() {
+                    routing.set_remote_target(target);
+                } else {
+                    forwarder.clear_target();
+                    return Vec::new();
+                }
+            } else {
+                forwarder.clear_target();
+                return Vec::new();
+            }
+        }
+    }
+
+    let target = if let Some(remote_target) = state.session.active_target() {
+        if !is_device_connected(state, remote_target) {
+            state.session.on_target_disconnect(remote_target);
+            routing.clear_remote_target();
+            forwarder.clear_target();
+            return Vec::new();
+        }
+        routing.set_remote_target(remote_target);
         remote_target
     } else {
+        routing.clear_remote_target();
         forwarder.clear_target();
         return Vec::new();
     };
@@ -573,10 +622,10 @@ async fn run_input_forwarding_loop(
                 };
 
                 let (target, messages) = {
-                    let state = state.read().await;
+                    let mut state = state.write().await;
                     let messages =
-                        messages_for_input_event(&state, &mut routing, &mut forwarder, event);
-                    let target = routing.remote_target();
+                        messages_for_input_event(&mut state, &mut routing, &mut forwarder, event);
+                    let target = state.session.active_target();
                     (target, messages)
                 };
 
@@ -591,8 +640,9 @@ async fn run_input_forwarding_loop(
 
                 let target = {
                     let state = state.read().await;
-                    routing
-                        .remote_target()
+                    state
+                        .session
+                        .active_target()
                         .filter(|target| is_device_connected(&state, *target))
                 };
 
@@ -632,7 +682,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "unknown".into())
         .to_string_lossy()
         .to_string();
-    let device_id = DeviceId::new_v4();
+    let device_id = rshare_core::service::load_or_create_local_device_id()?;
     let device_name = format!("{}-R-ShareMouse", hostname);
     let bind_address = format!("{}:{}", config.network.bind_address, config.network.port);
 
@@ -849,7 +899,7 @@ async fn handle_ipc_client(
         }
         DaemonRequest::SetLayout { layout } => {
             let mut state = state.write().await;
-            state.layout = layout;
+            apply_layout_update(&mut state, layout);
             DaemonResponse::Ack
         }
         DaemonRequest::Shutdown => {
@@ -859,6 +909,11 @@ async fn handle_ipc_client(
     };
 
     write_json_line(&mut stream, &response).await
+}
+
+fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
+    layout.canonicalize_local_device(state.status.device_id);
+    state.layout = layout;
 }
 
 fn load_config_with_env_overrides() -> Result<Config> {
@@ -971,7 +1026,7 @@ mod tests {
 
     #[test]
     fn input_event_forwarding_requires_connected_target() {
-        let state = DaemonState::new(ServiceStatusSnapshot::new(
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
             DeviceId::new_v4(),
             "local".to_string(),
             "local-host".to_string(),
@@ -983,7 +1038,7 @@ mod tests {
         let mut routing = InputRoutingState::for_test(1920, 1080, 10);
 
         let messages = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::key(
@@ -1022,7 +1077,7 @@ mod tests {
         let mut routing = InputRoutingState::for_test(1920, 1080, 10);
 
         let messages = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::key(
@@ -1071,7 +1126,7 @@ mod tests {
         let mut routing = InputRoutingState::for_test(1920, 1080, 10);
 
         let messages = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::mouse_move(1919, 500),
@@ -1080,6 +1135,13 @@ mod tests {
         assert_eq!(routing.remote_target(), Some(remote_id));
         assert_eq!(forwarder.target(), Some(remote_id));
         assert!(!messages.is_empty());
+        assert!(matches!(
+            state.status_snapshot().session_state,
+            Some(rshare_core::ControlSessionState::RemoteActive {
+                target,
+                entered_via: Direction::Right
+            }) if target == remote_id
+        ));
     }
 
     #[test]
@@ -1109,13 +1171,13 @@ mod tests {
         let mut routing = InputRoutingState::for_test(1920, 1080, 10);
 
         let _ = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::mouse_move(1919, 500),
         );
         let messages = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::mouse_move(0, 500),
@@ -1124,6 +1186,56 @@ mod tests {
         assert!(messages.is_empty());
         assert_eq!(routing.remote_target(), None);
         assert_eq!(forwarder.target(), None);
+    }
+
+    #[test]
+    fn left_edge_layout_can_activate_remote_forwarding() {
+        use rshare_core::{Direction, LayoutLink};
+
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, -1920, 0, 1920, 1080));
+        state.layout.add_link(LayoutLink {
+            from_device: local_id,
+            from_edge: Direction::Left,
+            to_device: remote_id,
+            to_edge: Direction::Right,
+        });
+
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let messages = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(0, 500),
+        );
+
+        assert_eq!(routing.remote_target(), Some(remote_id));
+        assert_eq!(forwarder.target(), Some(remote_id));
+        assert!(!messages.is_empty());
     }
 
     #[test]
@@ -1162,13 +1274,13 @@ mod tests {
         let mut routing = InputRoutingState::for_test(1920, 1080, 10);
 
         let _ = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::mouse_move(1919, 500),
         );
         let messages = messages_for_input_event(
-            &state,
+            &mut state,
             &mut routing,
             &mut forwarder,
             rshare_input::InputEvent::key(
@@ -1438,5 +1550,41 @@ mod tests {
         state.session.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
         let snapshot = state.status_snapshot();
         assert!(matches!(snapshot.session_state, Some(ControlSessionState::RemoteActive { .. })));
+    }
+
+    #[test]
+    fn stale_layout_from_previous_daemon_run_must_be_canonicalized_to_current_local_device() {
+        use rshare_core::{Direction, LayoutGraph, LayoutLink};
+
+        let current_local = DeviceId::new_v4();
+        let stale_local = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            current_local,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+
+        let mut layout = LayoutGraph::new(stale_local);
+        layout.add_node(LayoutNode::new(stale_local, 0, 0, 1920, 1080));
+        layout.add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        layout.add_link(LayoutLink::new(
+            stale_local,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+
+        apply_layout_update(&mut state, layout);
+
+        assert_eq!(state.layout.local_device, current_local);
+        assert!(state
+            .layout
+            .links
+            .iter()
+            .any(|link| link.from_device == current_local && link.to_device == remote_id));
     }
 }

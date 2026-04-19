@@ -206,6 +206,36 @@ impl LayoutGraph {
             .filter(|id| id != &self.local_device)
             .collect()
     }
+
+    /// Rewrite the graph so it is owned by the current local device.
+    pub fn canonicalize_local_device(&mut self, current_local: Uuid) {
+        let previous_local = self.local_device;
+        if previous_local != current_local {
+            for node in &mut self.nodes {
+                if node.device_id == previous_local {
+                    node.device_id = current_local;
+                }
+            }
+
+            for link in &mut self.links {
+                if link.from_device == previous_local {
+                    link.from_device = current_local;
+                }
+                if link.to_device == previous_local {
+                    link.to_device = current_local;
+                }
+            }
+
+            self.local_device = current_local;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        self.nodes.retain(|node| seen.insert(node.device_id));
+
+        if self.get_node(current_local).is_none() {
+            self.add_node(LayoutNode::new(current_local, 0, 0, 1920, 1080));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +292,31 @@ mod tests {
 
         graph.remove_node(remote_id);
         assert!(graph.nodes.is_empty());
+    }
+
+    #[test]
+    fn canonicalize_local_device_rewrites_stale_owner_ids() {
+        let stale_local = Uuid::new_v4();
+        let current_local = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(stale_local);
+
+        graph.add_node(LayoutNode::new(stale_local, 0, 0, 1920, 1080));
+        graph.add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        graph.add_link(LayoutLink::new(
+            stale_local,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+
+        graph.canonicalize_local_device(current_local);
+
+        assert_eq!(graph.local_device, current_local);
+        assert!(graph.get_node(current_local).is_some());
+        assert!(graph
+            .links
+            .iter()
+            .any(|link| link.from_device == current_local && link.to_device == remote_id));
     }
 }
