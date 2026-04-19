@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -949,16 +950,53 @@ fn default_local_only_layout(local_device: DeviceId) -> LayoutGraph {
     layout
 }
 
+fn invalid_layout_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.invalid")
+}
+
+fn preserve_invalid_layout_file(path: &Path) {
+    let backup_path = invalid_layout_backup_path(path);
+    if backup_path.exists() {
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    if let Err(error) = fs::rename(path, &backup_path) {
+        tracing::warn!(
+            "Failed to preserve invalid layout file {} as {}: {}",
+            path.display(),
+            backup_path.display(),
+            error
+        );
+    }
+}
+
 fn load_layout_from_path(local_device: DeviceId, path: impl AsRef<Path>) -> Result<LayoutGraph> {
     let path = path.as_ref();
     if !path.exists() {
         return Ok(default_local_only_layout(local_device));
     }
 
-    let content = fs::read_to_string(path)?;
-    let mut layout: LayoutGraph = serde_json::from_str(&content)?;
-    layout.canonicalize_local_device(local_device);
-    Ok(layout)
+    let loaded = fs::read_to_string(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|content| {
+            serde_json::from_str::<LayoutGraph>(&content).map_err(anyhow::Error::from)
+        });
+
+    match loaded {
+        Ok(mut layout) => {
+            layout.canonicalize_local_device(local_device);
+            Ok(layout)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load persisted layout from {}: {}. Falling back to local-only layout.",
+                path.display(),
+                error
+            );
+            preserve_invalid_layout_file(path);
+            Ok(default_local_only_layout(local_device))
+        }
+    }
 }
 
 fn save_layout_to_path(layout: &LayoutGraph, path: impl AsRef<Path>) -> Result<()> {
@@ -968,7 +1006,16 @@ fn save_layout_to_path(layout: &LayoutGraph, path: impl AsRef<Path>) -> Result<(
     }
 
     let encoded = serde_json::to_string_pretty(layout)?;
-    fs::write(path, encoded)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = path.with_extension(format!("json.tmp-{}", nanos));
+    fs::write(&tmp_path, encoded)?;
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -1764,6 +1811,24 @@ mod tests {
         let restarted = load_layout_from_path(local_id, &layout_path).unwrap();
 
         assert_eq!(restarted, first_start.layout);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn daemon_falls_back_to_local_only_layout_when_saved_layout_is_invalid_json() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+
+        std::fs::write(&layout_path, "{ definitely-not-json").unwrap();
+
+        let loaded = load_layout_from_path(local_id, &layout_path).unwrap();
+
+        assert_eq!(loaded, default_local_only_layout(local_id));
+        assert!(
+            layout_path.with_extension("json.invalid").exists(),
+            "invalid layout should be retained for inspection"
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 }
