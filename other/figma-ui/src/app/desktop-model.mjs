@@ -1,5 +1,8 @@
 const DEVICE_COLORS = ["#5b8bd6", "#49b35c", "#d6a64b", "#9b6ef3", "#e56b6f"];
 const LOCAL_DEVICE_COLOR = "#60a5fa";
+const LAYOUT_SCALE = 0.12;
+const CANVAS_ORIGIN_X = 80;
+const CANVAS_ORIGIN_Y = 170;
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -67,6 +70,61 @@ function buildLayoutMonitor(device, index, kind) {
   };
 }
 
+function buildLayoutFromVisibleGraph(visibleLayout, localDevice, remoteDevices) {
+  if (!visibleLayout?.nodes?.length) {
+    return null;
+  }
+
+  const deviceLookup = new Map([
+    [localDevice.id, localDevice],
+    ...remoteDevices.map((device) => [device.id, device]),
+  ]);
+  const layoutDevices = visibleLayout.nodes
+    .map((node) => deviceLookup.get(node.device_id))
+    .filter(Boolean);
+
+  if (!layoutDevices.length) {
+    return null;
+  }
+
+  const layoutMonitors = [];
+  for (const node of visibleLayout.nodes) {
+    const device = deviceLookup.get(node.device_id);
+    if (!device) {
+      continue;
+    }
+
+    for (const display of node.displays ?? []) {
+      const monitorIndex = layoutMonitors.length;
+      const width = Number(display.width ?? 1920);
+      const height = Number(display.height ?? 1080);
+      layoutMonitors.push({
+        id: `${node.device_id}-${display.display_id ?? monitorIndex}`,
+        deviceId: node.device_id,
+        label: String.fromCharCode(65 + monitorIndex),
+        name:
+          device.kind === "local"
+            ? `${device.name} 显示器`
+            : `${device.name} 屏幕`,
+        resWidth: width,
+        resHeight: height,
+        color: device.color,
+        x: Math.round(CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE),
+        y: Math.round(CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE),
+        w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+        h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+        primary: Boolean(display.primary),
+        enabled: true,
+      });
+    }
+  }
+
+  return {
+    devices: layoutDevices,
+    monitors: layoutMonitors,
+  };
+}
+
 function parseBackendHealth(backendHealth) {
   if (!backendHealth) {
     return { health: "未知", reason: null };
@@ -90,10 +148,17 @@ export function buildDesktopViewModel(payload) {
   const status = payload?.status ?? null;
   const localDevice = buildLocalDevice(status);
   const remoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
-  const layoutDevices = [localDevice, ...remoteDevices];
-  const layoutMonitors = layoutDevices.map((device, index) =>
-    buildLayoutMonitor(device, index, device.kind),
+  const daemonLayout = buildLayoutFromVisibleGraph(
+    payload?.visible_layout,
+    localDevice,
+    remoteDevices,
   );
+  const layoutDevices = daemonLayout?.devices ?? [localDevice, ...remoteDevices];
+  const layoutMonitors =
+    daemonLayout?.monitors ??
+    layoutDevices.map((device, index) =>
+      buildLayoutMonitor(device, index, device.kind),
+    );
   const backendState = parseBackendHealth(status?.backend_health);
 
   return {
@@ -101,13 +166,17 @@ export function buildDesktopViewModel(payload) {
       online: Boolean(status),
       healthy: Boolean(status?.healthy),
       label: status ? "运行中" : "已停止",
-      error: status?.last_backend_error ?? null,
+      error: status?.last_backend_error ?? payload?.layout_error ?? null,
       discoveredDevices: status?.discovered_devices ?? remoteDevices.length,
       connectedDevices: status?.connected_devices ?? 0,
+      autoStarted: Boolean(payload?.auto_started),
     },
     layout: {
       devices: layoutDevices,
       monitors: layoutMonitors,
+      remembered: payload?.layout ?? null,
+      visible: payload?.visible_layout ?? null,
+      error: payload?.layout_error ?? null,
     },
     devices: remoteDevices,
     settings: {

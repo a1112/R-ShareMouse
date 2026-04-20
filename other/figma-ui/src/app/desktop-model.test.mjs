@@ -119,3 +119,73 @@ test("buildDesktopViewModel preserves connection status consistently across page
   assert.equal(model.settings.privilegeState, "LockedDesktop");
   assert.equal(model.service.error, "access denied");
 });
+
+test("buildDesktopViewModel renders daemon visible_layout instead of synthesizing device monitors", () => {
+  const payload = {
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "127.0.0.1",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 1,
+      connected_devices: 0,
+      healthy: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote Workstation",
+        hostname: "remote",
+        addresses: ["192.168.1.30"],
+        connected: false,
+        last_seen_secs: 2,
+      },
+    ],
+    layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1280, height: 720, primary: true }],
+        },
+        {
+          device_id: "offline-1",
+          displays: [{ display_id: "primary", x: 1280, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 3200, y: 0, width: 1024, height: 768, primary: true }],
+        },
+      ],
+      links: [],
+    },
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1280, height: 720, primary: true }],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 1280, y: 0, width: 1024, height: 768, primary: true }],
+        },
+      ],
+      links: [],
+    },
+  };
+
+  const model = buildDesktopViewModel(payload);
+
+  assert.deepEqual(model.layout.devices.map((device) => device.id), ["local-1", "remote-1"]);
+  assert.equal(model.layout.monitors.length, 2);
+  assert.equal(model.layout.monitors.some((monitor) => monitor.deviceId === "offline-1"), false);
+  assert.equal(model.layout.monitors[0].resWidth, 1280);
+  assert.equal(model.layout.monitors[1].resWidth, 1024);
+  assert.equal(model.layout.monitors[1].x, 234);
+  assert.equal(model.layout.remembered.nodes.length, 3);
+});

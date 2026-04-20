@@ -41,6 +41,10 @@ type DashboardPayload = {
     connected: boolean;
     last_seen_secs?: number | null;
   }>;
+  layout?: unknown | null;
+  visible_layout?: unknown | null;
+  layout_error?: string | null;
+  auto_started?: boolean;
 };
 
 type TauriInvoke = <T = unknown>(
@@ -386,7 +390,11 @@ export default function App() {
               showThemeToggle={false}
               showFooter={false}
               statusText={`布局画布 · ${model.devices.length} 台远端设备`}
-              footerText="拖拽只影响当前界面展示。"
+              footerText={
+                model.layout.error
+                  ? `布局未保存：${model.layout.error}`
+                  : "布局来自守护进程记忆；离线设备已隐藏。"
+              }
             />
           ) : null}
 
