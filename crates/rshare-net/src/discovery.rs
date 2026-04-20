@@ -1,8 +1,9 @@
 //! Device discovery using mDNS/UDP broadcast
 
 use anyhow::Result;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use if_addrs::{get_if_addrs, IfAddr, Interface};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -169,7 +170,8 @@ impl ServiceDiscovery {
         );
         let hello_bytes = serialize_message(&hello_msg)?;
 
-        let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", self.config.port).parse()?;
+        let mut broadcast_targets = discovery_broadcast_targets(self.config.port);
+        tracing::info!("Discovery broadcast targets: {:?}", broadcast_targets);
 
         while self.running {
             tokio::select! {
@@ -189,8 +191,11 @@ impl ServiceDiscovery {
 
                 // Send periodic broadcasts
                 _ = broadcast_interval.tick() => {
-                    if let Err(e) = socket.send_to(&hello_bytes, broadcast_addr).await {
-                        tracing::warn!("Failed to send broadcast: {}", e);
+                    broadcast_targets = discovery_broadcast_targets(self.config.port);
+                    for target in &broadcast_targets {
+                        if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                            tracing::warn!("Failed to send discovery packet to {}: {}", target, e);
+                        }
                     }
                 }
 
@@ -381,6 +386,82 @@ pub fn broadcast_address(port: u16) -> SocketAddr {
         .expect("valid broadcast address")
 }
 
+fn discovery_broadcast_targets(port: u16) -> Vec<SocketAddr> {
+    let mut targets = HashSet::new();
+
+    match get_if_addrs() {
+        Ok(interfaces) => {
+            for interface in interfaces {
+                if let Some(addr) = interface_broadcast_address(&interface) {
+                    targets.insert(SocketAddr::from((addr, port)));
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Failed to enumerate network interfaces: {}", err);
+        }
+    }
+
+    targets.insert(broadcast_address(port));
+
+    let mut sorted: Vec<_> = targets.into_iter().collect();
+    sorted.sort_by_key(|addr| addr.ip().to_string());
+    sorted
+}
+
+fn interface_broadcast_address(interface: &Interface) -> Option<Ipv4Addr> {
+    if !is_candidate_interface(interface) {
+        return None;
+    }
+
+    match &interface.addr {
+        IfAddr::V4(addr) => addr
+            .broadcast
+            .or_else(|| Some(compute_directed_broadcast(addr.ip, addr.netmask))),
+        IfAddr::V6(_) => None,
+    }
+}
+
+fn is_candidate_interface(interface: &Interface) -> bool {
+    if interface.is_loopback() {
+        return false;
+    }
+    if is_ignored_interface_name(&interface.name) {
+        return false;
+    }
+
+    match &interface.addr {
+        IfAddr::V4(addr) => is_candidate_ipv4(addr.ip),
+        IfAddr::V6(_) => false,
+    }
+}
+
+fn is_candidate_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+}
+
+fn is_ignored_interface_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    const IGNORED_MARKERS: &[&str] = &[
+        "vmware", "virtual", "vbox", "hyper-v", "wintun", "wireguard", "tailscale", "zerotier",
+        "docker", "podman", "vnic", "loopback", "npcap", "tap", "tun",
+    ];
+
+    IGNORED_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn compute_directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    let ip = u32::from(ip);
+    let netmask = u32::from(netmask);
+    Ipv4Addr::from((ip & netmask) | !netmask)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +479,31 @@ mod tests {
         let addr = broadcast_address(27432);
         assert_eq!(addr.port(), 27432);
         assert_eq!(addr.ip().to_string(), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_compute_directed_broadcast() {
+        assert_eq!(
+            compute_directed_broadcast(
+                Ipv4Addr::new(192, 168, 1, 52),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Ipv4Addr::new(192, 168, 1, 255)
+        );
+    }
+
+    #[test]
+    fn test_candidate_ipv4_filters_link_local() {
+        assert!(is_candidate_ipv4(Ipv4Addr::new(192, 168, 1, 52)));
+        assert!(!is_candidate_ipv4(Ipv4Addr::new(169, 254, 14, 146)));
+        assert!(!is_candidate_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_ignored_interface_name_filters_virtual_adapters() {
+        assert!(is_ignored_interface_name("VMware Network Adapter VMnet8"));
+        assert!(is_ignored_interface_name("Wintun Userspace Tunnel"));
+        assert!(!is_ignored_interface_name("WLAN 3"));
     }
 
     #[test]

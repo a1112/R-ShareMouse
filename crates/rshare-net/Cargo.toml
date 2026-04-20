@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
+if-addrs = "0.13"
 
 # mDNS service discovery
 mdns-sd = "0.11"
