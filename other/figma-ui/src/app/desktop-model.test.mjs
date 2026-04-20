@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildDesktopViewModel } from "./desktop-model.mjs";
+import {
+  buildDesktopViewModel,
+  updateRememberedLayoutFromVisibleMonitors,
+} from "./desktop-model.mjs";
 
 test("buildDesktopViewModel returns an offline local-only layout when daemon is unavailable", () => {
   const model = buildDesktopViewModel({ status: null, devices: [] });
@@ -186,6 +189,50 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
   assert.equal(model.layout.monitors.some((monitor) => monitor.deviceId === "offline-1"), false);
   assert.equal(model.layout.monitors[0].resWidth, 1280);
   assert.equal(model.layout.monitors[1].resWidth, 1024);
-  assert.equal(model.layout.monitors[1].x, 234);
+  assert.equal(model.layout.monitors[1].x, 233.6);
   assert.equal(model.layout.remembered.nodes.length, 3);
+});
+
+test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry and preserves offline nodes", () => {
+  const remembered = {
+    version: 1,
+    local_device: "local-1",
+    nodes: [
+      {
+        device_id: "local-1",
+        displays: [{ display_id: "primary", x: 0, y: 0, width: 1280, height: 720, primary: true }],
+      },
+      {
+        device_id: "offline-1",
+        displays: [{ display_id: "primary", x: 1280, y: 0, width: 1920, height: 1080, primary: true }],
+      },
+      {
+        device_id: "remote-1",
+        displays: [{ display_id: "primary", x: 3200, y: 0, width: 1024, height: 768, primary: true }],
+      },
+    ],
+    links: [],
+  };
+
+  const updated = updateRememberedLayoutFromVisibleMonitors(remembered, [
+    {
+      id: "remote-1-primary",
+      deviceId: "remote-1",
+      displayId: "primary",
+      x: 80 + 2048 * 0.12,
+      y: 170 + 96 * 0.12,
+    },
+  ]);
+
+  const remoteDisplay = updated.nodes
+    .find((node) => node.device_id === "remote-1")
+    .displays.find((display) => display.display_id === "primary");
+  const offlineDisplay = updated.nodes
+    .find((node) => node.device_id === "offline-1")
+    .displays.find((display) => display.display_id === "primary");
+
+  assert.equal(remoteDisplay.x, 2048);
+  assert.equal(remoteDisplay.y, 96);
+  assert.equal(offlineDisplay.x, 1280);
+  assert.notEqual(updated, remembered);
 });
