@@ -70,7 +70,13 @@ function buildLayoutMonitor(device, index, kind) {
   };
 }
 
-function buildLayoutFromVisibleGraph(visibleLayout, localDevice, remoteDevices) {
+function findRememberedDisplay(rememberedLayout, deviceId, displayId) {
+  return rememberedLayout?.nodes
+    ?.find((node) => node.device_id === deviceId)
+    ?.displays?.find((display) => (display.display_id ?? "primary") === displayId);
+}
+
+function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices) {
   if (!visibleLayout?.nodes?.length) {
     return null;
   }
@@ -98,10 +104,20 @@ function buildLayoutFromVisibleGraph(visibleLayout, localDevice, remoteDevices) 
       const monitorIndex = layoutMonitors.length;
       const width = Number(display.width ?? 1920);
       const height = Number(display.height ?? 1080);
+      const displayId = display.display_id ?? "primary";
+      const rememberedDisplay = findRememberedDisplay(
+        rememberedLayout,
+        node.device_id,
+        displayId,
+      );
       layoutMonitors.push({
-        id: `${node.device_id}-${display.display_id ?? monitorIndex}`,
+        id: `${node.device_id}-${displayId}`,
         deviceId: node.device_id,
-        displayId: display.display_id ?? "primary",
+        displayId,
+        rememberedX: Number(rememberedDisplay?.x ?? display.x ?? 0),
+        rememberedY: Number(rememberedDisplay?.y ?? display.y ?? 0),
+        visibleX: Number(display.x ?? 0),
+        visibleY: Number(display.y ?? 0),
         label: String.fromCharCode(65 + monitorIndex),
         name:
           device.kind === "local"
@@ -126,6 +142,37 @@ function buildLayoutFromVisibleGraph(visibleLayout, localDevice, remoteDevices) 
   };
 }
 
+function primaryDisplay(node) {
+  return (node.displays ?? []).find((display) => display.primary) ?? node.displays?.[0] ?? null;
+}
+
+function rebuildHorizontalLinks(nodes) {
+  const sorted = [...nodes].sort((left, right) => {
+    const leftDisplay = primaryDisplay(left);
+    const rightDisplay = primaryDisplay(right);
+    return Number(leftDisplay?.x ?? 0) - Number(rightDisplay?.x ?? 0);
+  });
+
+  const links = [];
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const left = sorted[index].device_id;
+    const right = sorted[index + 1].device_id;
+    links.push({
+      from_device: left,
+      from_edge: "Right",
+      to_device: right,
+      to_edge: "Left",
+    });
+    links.push({
+      from_device: right,
+      from_edge: "Left",
+      to_device: left,
+      to_edge: "Right",
+    });
+  }
+  return links;
+}
+
 export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, monitors) {
   if (!rememberedLayout?.nodes) {
     return rememberedLayout;
@@ -138,9 +185,7 @@ export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, moni
     ]),
   );
 
-  return {
-    ...rememberedLayout,
-    nodes: rememberedLayout.nodes.map((node) => ({
+  const nodes = rememberedLayout.nodes.map((node) => ({
       ...node,
       displays: (node.displays ?? []).map((display) => {
         const displayId = display.display_id ?? "primary";
@@ -149,14 +194,31 @@ export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, moni
           return { ...display };
         }
 
+        const rememberedX = Number(monitor.rememberedX ?? display.x ?? 0);
+        const rememberedY = Number(monitor.rememberedY ?? display.y ?? 0);
+        const visibleX = Number(monitor.visibleX ?? rememberedX);
+        const visibleY = Number(monitor.visibleY ?? rememberedY);
+
         return {
           ...display,
-          x: Math.round((Number(monitor.x) - CANVAS_ORIGIN_X) / LAYOUT_SCALE),
-          y: Math.round((Number(monitor.y) - CANVAS_ORIGIN_Y) / LAYOUT_SCALE),
+          x: Math.round(
+            rememberedX +
+              (Number(monitor.x) - (CANVAS_ORIGIN_X + visibleX * LAYOUT_SCALE)) /
+                LAYOUT_SCALE,
+          ),
+          y: Math.round(
+            rememberedY +
+              (Number(monitor.y) - (CANVAS_ORIGIN_Y + visibleY * LAYOUT_SCALE)) /
+                LAYOUT_SCALE,
+          ),
         };
       }),
-    })),
-    links: [...(rememberedLayout.links ?? [])],
+    }));
+
+  return {
+    ...rememberedLayout,
+    nodes,
+    links: rebuildHorizontalLinks(nodes),
   };
 }
 
@@ -185,10 +247,13 @@ export function buildDesktopViewModel(payload) {
   const remoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
   const daemonLayout = buildLayoutFromVisibleGraph(
     payload?.visible_layout,
+    payload?.layout,
     localDevice,
     remoteDevices,
   );
-  const layoutDevices = daemonLayout?.devices ?? [localDevice, ...remoteDevices];
+  const layoutUnavailable = Boolean(payload?.layout_error && status && !payload?.visible_layout);
+  const fallbackDevices = layoutUnavailable ? [localDevice] : [localDevice, ...remoteDevices];
+  const layoutDevices = daemonLayout?.devices ?? fallbackDevices;
   const layoutMonitors =
     daemonLayout?.monitors ??
     layoutDevices.map((device, index) =>

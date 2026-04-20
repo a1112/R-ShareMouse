@@ -219,7 +219,11 @@ test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry a
       id: "remote-1-primary",
       deviceId: "remote-1",
       displayId: "primary",
-      x: 80 + 2048 * 0.12,
+      rememberedX: 3200,
+      rememberedY: 0,
+      visibleX: 1280,
+      visibleY: 0,
+      x: 80 + 1280 * 0.12 + 120,
       y: 170 + 96 * 0.12,
     },
   ]);
@@ -231,8 +235,48 @@ test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry a
     .find((node) => node.device_id === "offline-1")
     .displays.find((display) => display.display_id === "primary");
 
-  assert.equal(remoteDisplay.x, 2048);
+  assert.equal(remoteDisplay.x, 4200);
   assert.equal(remoteDisplay.y, 96);
   assert.equal(offlineDisplay.x, 1280);
+  assert.deepEqual(
+    updated.links.map((link) => [link.from_device, link.from_edge, link.to_device, link.to_edge]),
+    [
+      ["local-1", "Right", "offline-1", "Left"],
+      ["offline-1", "Left", "local-1", "Right"],
+      ["offline-1", "Right", "remote-1", "Left"],
+      ["remote-1", "Left", "offline-1", "Right"],
+    ],
+  );
   assert.notEqual(updated, remembered);
+});
+
+test("buildDesktopViewModel does not synthesize remote layout when daemon layout is unavailable", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "127.0.0.1",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 1,
+      connected_devices: 0,
+      healthy: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote Workstation",
+        hostname: "remote",
+        addresses: ["192.168.1.30"],
+        connected: false,
+        last_seen_secs: 2,
+      },
+    ],
+    layout_error: "layout unavailable",
+  });
+
+  assert.deepEqual(model.layout.devices.map((device) => device.id), ["local-1"]);
+  assert.equal(model.layout.monitors.length, 1);
+  assert.equal(model.service.error, "layout unavailable");
 });

@@ -107,6 +107,14 @@ function getLayoutMonitors(layoutMonitors: Array<Record<string, unknown>>): Moni
     id: String(monitor.id),
     displayId:
       monitor.displayId == null ? undefined : String(monitor.displayId),
+    rememberedX:
+      monitor.rememberedX == null ? undefined : Number(monitor.rememberedX),
+    rememberedY:
+      monitor.rememberedY == null ? undefined : Number(monitor.rememberedY),
+    visibleX:
+      monitor.visibleX == null ? undefined : Number(monitor.visibleX),
+    visibleY:
+      monitor.visibleY == null ? undefined : Number(monitor.visibleY),
     label: String(monitor.label),
     name: String(monitor.name),
     deviceId: String(monitor.deviceId),
@@ -144,7 +152,7 @@ export default function App() {
     try {
       const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
       setPayload(snapshot);
-      setError(null);
+      setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
     } catch (refreshError) {
       setPayload(EMPTY_PAYLOAD);
       setError(String(refreshError));

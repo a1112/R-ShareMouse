@@ -939,6 +939,7 @@ async fn handle_ipc_client(
     write_json_line(&mut stream, &response).await
 }
 
+#[cfg(test)]
 fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
     layout.canonicalize_local_device(state.status.device_id);
     state.layout = layout;

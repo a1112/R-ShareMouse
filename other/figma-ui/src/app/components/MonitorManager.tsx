@@ -32,6 +32,10 @@ import {
 export interface MonitorData {
   id: string;
   displayId?: string;
+  rememberedX?: number;
+  rememberedY?: number;
+  visibleX?: number;
+  visibleY?: number;
   label: string;
   name: string;
   deviceId: string;
