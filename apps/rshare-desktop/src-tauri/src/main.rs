@@ -7,10 +7,17 @@ use rshare_core::{
 };
 use serde::Serialize;
 use std::{future::Future, pin::Pin};
-use tauri::{WebviewWindow, AppHandle, Manager};
-use tauri::path::BaseDirectory;
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, WebviewWindow, Wry,
+};
 
 type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
+const TRAY_ICON_ID: &str = "main-tray";
+const TRAY_MENU_SHOW_ID: &str = "tray-show";
+const TRAY_MENU_HIDE_ID: &str = "tray-hide";
+const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 
 #[derive(Debug, Clone, Serialize)]
 struct DashboardStatePayload {
@@ -42,6 +49,27 @@ struct DesktopAcceptancePayload {
 struct DesktopDaemonStatus {
     status: ServiceStatusSnapshot,
     auto_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRequestAction {
+    PreventAndHide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayAction {
+    None,
+    ShowWindow,
+    HideWindow,
+    QuitApp,
+}
+
+struct TrayRuntimeHandles {
+    _tray: TrayIcon<Wry>,
+    _menu: Menu<Wry>,
+    _show_item: MenuItem<Wry>,
+    _hide_item: MenuItem<Wry>,
+    _quit_item: MenuItem<Wry>,
 }
 
 #[tauri::command]
@@ -111,7 +139,9 @@ fn toggle_maximize_window(window: WebviewWindow) -> Result<(), String> {
 
 #[tauri::command]
 fn close_window(window: WebviewWindow) -> Result<(), String> {
-    window.close().map_err(|err| err.to_string())
+    match close_request_action() {
+        CloseRequestAction::PreventAndHide => window.hide().map_err(|err| err.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -146,9 +176,8 @@ async fn set_layout(layout: LayoutGraph) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn show_tray() -> Result<(), String> {
-    // TODO: Implement system tray via JavaScript frontend API
-    Ok(())
+async fn show_tray(app: AppHandle) -> Result<(), String> {
+    show_main_window(&app)
 }
 
 fn is_ipc_unavailable(err: &anyhow::Error) -> bool {
@@ -312,6 +341,22 @@ fn build_acceptance(
 
 fn main() {
     tauri::Builder::default()
+        .on_menu_event(|app, event| {
+            if let Some(action) = tray_action_from_menu_event(&event) {
+                if let Err(err) = apply_tray_action(app, action) {
+                    eprintln!("tray menu action failed: {err}");
+                }
+            }
+        })
+        .on_tray_icon_event(|app, event| {
+            if event.id().as_ref() != TRAY_ICON_ID {
+                return;
+            }
+            let action = tray_action_from_icon_event(&event);
+            if let Err(err) = apply_tray_action(app, action) {
+                eprintln!("tray icon action failed: {err}");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             dashboard_state,
             start_service,
@@ -336,9 +381,13 @@ fn main() {
             // Handle window close event to minimize to tray
             let app_handle = app.handle().clone();
             app.get_webview_window("main").unwrap().on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    // Hide window instead of closing
-                    let _ = app_handle.get_webview_window("main").unwrap().hide();
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    match close_request_action() {
+                        CloseRequestAction::PreventAndHide => {
+                            api.prevent_close();
+                            let _ = hide_main_window(&app_handle);
+                        }
+                    }
                 }
             });
 
@@ -348,44 +397,96 @@ fn main() {
         .expect("failed to run Tauri desktop app");
 }
 
-/// Setup system tray with icon
-fn setup_system_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    use tray_icon::{Icon, TrayIconBuilder};
+fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    app.get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())
+}
 
-    // Get the icon path from resources
-    let icon_path = app.path().resolve("icons/icon.png", BaseDirectory::Resource)?;
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = main_window(app)?;
+    let _ = window.unminimize();
+    window.show().map_err(|err| err.to_string())?;
+    window.set_focus().map_err(|err| err.to_string())?;
+    Ok(())
+}
 
-    // Load the icon from file and convert to RGBA
-    let image_data = std::fs::read(&icon_path)?;
-    let decoder = png::Decoder::new(std::io::Cursor::new(image_data));
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf)?;
+fn hide_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = main_window(app)?;
+    window.hide().map_err(|err| err.to_string())
+}
 
-    // PNG decoder may output RGBA or RGB, convert to RGBA if needed
-    let rgba = if info.color_type == png::ColorType::Rgba {
-        buf.to_vec()
-    } else {
-        // Convert RGB to RGBA
-        let mut rgba_buf = Vec::with_capacity(buf.len() / 3 * 4);
-        for chunk in buf.chunks(3) {
-            rgba_buf.push(chunk[0]);
-            rgba_buf.push(chunk[1]);
-            rgba_buf.push(chunk[2]);
-            rgba_buf.push(255);
+fn close_request_action() -> CloseRequestAction {
+    CloseRequestAction::PreventAndHide
+}
+
+fn tray_action_from_menu_event(event: &tauri::menu::MenuEvent) -> Option<TrayAction> {
+    let action = tray_action_from_menu_id(event.id().as_ref());
+    (action != TrayAction::None).then_some(action)
+}
+
+fn tray_action_from_menu_id(id: &str) -> TrayAction {
+    match id {
+        TRAY_MENU_SHOW_ID => TrayAction::ShowWindow,
+        TRAY_MENU_HIDE_ID => TrayAction::HideWindow,
+        TRAY_MENU_QUIT_ID => TrayAction::QuitApp,
+        _ => TrayAction::None,
+    }
+}
+
+fn tray_action_from_icon_event(event: &TrayIconEvent) -> TrayAction {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
         }
-        rgba_buf
-    };
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => TrayAction::ShowWindow,
+        _ => TrayAction::None,
+    }
+}
 
-    let icon = Icon::from_rgba(rgba, info.width, info.height)?;
+fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> {
+    match action {
+        TrayAction::None => Ok(()),
+        TrayAction::ShowWindow => show_main_window(app),
+        TrayAction::HideWindow => hide_main_window(app),
+        TrayAction::QuitApp => {
+            app.exit(0);
+            Ok(())
+        }
+    }
+}
 
-    // Create tray icon
-    let _tray = TrayIconBuilder::new()
-        .with_tooltip("R-ShareMouse")
-        .with_icon(icon)
-        .build()?;
+/// Setup system tray with icon and restore actions.
+fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏到托盘", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(app, &[&show_item, &hide_item, &separator, &quit_item])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".to_string()))?;
 
-    println!("System tray initialized");
+    let tray = TrayIconBuilder::with_id(TRAY_ICON_ID)
+        .icon(icon)
+        .tooltip("R-ShareMouse")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .build(app)?;
+
+    app.manage(TrayRuntimeHandles {
+        _tray: tray,
+        _menu: menu,
+        _show_item: show_item,
+        _hide_item: hide_item,
+        _quit_item: quit_item,
+    });
+
     Ok(())
 }
 
@@ -434,6 +535,50 @@ mod tests {
         let mut layout = LayoutGraph::new(local_id);
         layout.add_node(rshare_core::LayoutNode::new(local_id, 0, 0, 1920, 1080));
         layout
+    }
+
+    fn sample_tray_click(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: tauri::tray::TrayIconId::new(TRAY_ICON_ID),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect {
+                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, 0)),
+                size: tauri::Size::Physical(tauri::PhysicalSize::new(16, 16)),
+            },
+            button,
+            button_state,
+        }
+    }
+
+    #[test]
+    fn close_request_is_intercepted_for_hide_to_tray_behavior() {
+        assert_eq!(close_request_action(), CloseRequestAction::PreventAndHide);
+    }
+
+    #[test]
+    fn tray_menu_ids_map_to_restore_hide_and_quit_actions() {
+        assert_eq!(tray_action_from_menu_id(TRAY_MENU_SHOW_ID), TrayAction::ShowWindow);
+        assert_eq!(tray_action_from_menu_id(TRAY_MENU_HIDE_ID), TrayAction::HideWindow);
+        assert_eq!(tray_action_from_menu_id(TRAY_MENU_QUIT_ID), TrayAction::QuitApp);
+        assert_eq!(tray_action_from_menu_id("unknown"), TrayAction::None);
+    }
+
+    #[test]
+    fn left_click_release_restores_main_window_from_tray() {
+        assert_eq!(
+            tray_action_from_icon_event(&sample_tray_click(
+                MouseButton::Left,
+                MouseButtonState::Up,
+            )),
+            TrayAction::ShowWindow
+        );
+        assert_eq!(
+            tray_action_from_icon_event(&sample_tray_click(
+                MouseButton::Right,
+                MouseButtonState::Up,
+            )),
+            TrayAction::None
+        );
     }
 
     #[tokio::test]
