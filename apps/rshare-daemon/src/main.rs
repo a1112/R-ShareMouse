@@ -7,11 +7,11 @@ use rshare_core::{
     default_ipc_addr, read_json_line, write_json_line, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CaptureSessionStateMachine, Config, ControlSessionState,
     DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId, Direction, LayoutGraph,
-    LayoutNode, Message, ResolvedInputMode, ServiceStatusSnapshot,
+    LayoutNode, Message, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
 };
 use rshare_input::{
-    BackendCandidate, BackendSelector, CaptureBackend, DefaultInputListener, InjectBackend,
-    InputEvent, InputListener, PortableCaptureBackend, PortableInjectBackend, RDevInputListener,
+    BackendCandidate, BackendSelector, CaptureBackend, InjectBackend, InputEvent,
+    PortableCaptureBackend, PortableInjectBackend, RDevInputListener,
 };
 use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
 
@@ -51,8 +51,14 @@ impl DaemonState {
     fn new(status: ServiceStatusSnapshot) -> Self {
         let local_id = status.device_id;
         let mut layout = LayoutGraph::new(local_id);
-        // Add local device to layout
-        layout.add_node(LayoutNode::new(local_id, 0, 0, 1920, 1080));
+        let local_screen = current_primary_screen_info();
+        layout.add_node(LayoutNode::new(
+            local_id,
+            0,
+            0,
+            local_screen.width,
+            local_screen.height,
+        ));
 
         let mut backend_state = BackendRuntimeState::new();
         backend_state.available_backends = vec![BackendKind::Portable];
@@ -72,6 +78,7 @@ impl DaemonState {
             .get(&device.id)
             .map(|existing| existing.connected)
             .unwrap_or(false);
+        let screen_info = device.screen_info.clone();
         self.devices.insert(
             device.id,
             TrackedDevice {
@@ -87,6 +94,10 @@ impl DaemonState {
                 last_seen_at: Instant::now(),
             },
         );
+        self.layout.merge_discovered_peers_to_right_with_screens([(
+            device.id,
+            screen_info,
+        )]);
     }
 
     fn remove_device(&mut self, id: &DeviceId) {
@@ -151,6 +162,15 @@ impl DaemonState {
 
         devices.sort_by(|left, right| left.name.cmp(&right.name));
         devices
+    }
+
+    fn reconcile_local_layout_geometry(&mut self) -> bool {
+        let local_screen = current_primary_screen_info();
+        self.layout.update_primary_display_geometry(
+            self.status.device_id,
+            local_screen.width,
+            local_screen.height,
+        )
     }
 
     fn update_backend_state(
@@ -753,6 +773,10 @@ async fn main() -> Result<()> {
         pid,
     ));
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
+    let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
+    if should_save_runtime_layout {
+        save_layout_to_path(&daemon_state.layout, &layout_path)?;
+    }
     let state = Arc::new(RwLock::new(daemon_state));
 
     // Initialize backend state
@@ -787,7 +811,7 @@ async fn main() -> Result<()> {
         ipc_listener,
         state.clone(),
         network_manager.clone(),
-        layout_path,
+        layout_path.clone(),
         shutdown_tx.clone(),
     ));
 
@@ -802,24 +826,38 @@ async fn main() -> Result<()> {
     let event_task = {
         let state = state.clone();
         let inject_backend = inject_backend.clone();
+        let layout_path = layout_path.clone();
         tokio::spawn(async move {
             tracing::info!("Event task: starting to wait for events");
             while let Some(event) = events.recv().await {
-                let mut state = state.write().await;
                 match event {
-                    NetworkEvent::DeviceFound(device) => state.upsert_discovered(device),
-                    NetworkEvent::DeviceConnected(id) => state.mark_connected(&id, true),
+                    NetworkEvent::DeviceFound(device) => {
+                        let layout_to_save = {
+                            let mut state = state.write().await;
+                            state.upsert_discovered(device);
+                            state.layout.clone()
+                        };
+                        if let Err(err) = save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                        {
+                            tracing::warn!("Failed to persist auto-updated layout: {}", err);
+                        }
+                    }
+                    NetworkEvent::DeviceConnected(id) => {
+                        let mut state = state.write().await;
+                        state.mark_connected(&id, true)
+                    }
                     NetworkEvent::DeviceDisconnected(id) => {
+                        let mut state = state.write().await;
                         // Notify session state machine of target disconnection
                         state.session.on_target_disconnect(id);
                         state.remove_device(&id);
                     }
                     NetworkEvent::MessageReceived { from, message } => {
-                        drop(state);
                         inject_remote_message(&inject_backend, from, message).await;
                     }
                     NetworkEvent::ConnectionError { device_id, error } => {
                         tracing::warn!("Connection error to {}: {}", device_id, error);
+                        let mut state = state.write().await;
                         state.mark_connected(&device_id, false);
                     }
                 }
@@ -976,9 +1014,35 @@ fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
     state.layout = layout;
 }
 
+fn current_primary_screen_info() -> ScreenInfo {
+    #[cfg(windows)]
+    {
+        let screen = rshare_platform::WindowsInputListener::get_screen_info();
+        return ScreenInfo::new(0, 0, screen.width, screen.height);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let screen = rshare_platform::get_screen_info();
+        return ScreenInfo::new(0, 0, screen.width, screen.height);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        ScreenInfo::primary()
+    }
+}
+
 fn default_local_only_layout(local_device: DeviceId) -> LayoutGraph {
+    let local_screen = current_primary_screen_info();
     let mut layout = LayoutGraph::new(local_device);
-    layout.add_node(LayoutNode::new(local_device, 0, 0, 1920, 1080));
+    layout.add_node(LayoutNode::new(
+        local_device,
+        0,
+        0,
+        local_screen.width,
+        local_screen.height,
+    ));
     layout
 }
 
@@ -1000,6 +1064,7 @@ fn preserve_invalid_layout_file(path: &Path) {
             error
         );
     }
+
 }
 
 fn load_layout_from_path(local_device: DeviceId, path: impl AsRef<Path>) -> Result<LayoutGraph> {
@@ -1091,6 +1156,40 @@ mod tests {
             }
         ));
         assert!(error.unwrap().contains("No input backend"));
+    }
+
+    #[test]
+    fn discovered_device_updates_in_memory_layout_without_desktop_roundtrip() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "0.0.0.0:27431".to_string(),
+            27432,
+            42,
+        ));
+
+        state.upsert_discovered(DiscoveredDevice {
+            id: remote_id,
+            name: "remote".to_string(),
+            hostname: "remote-host".to_string(),
+            addresses: vec!["192.168.1.241:27431".parse().unwrap()],
+            screen_info: Some(ScreenInfo::new(0, 0, 2560, 1440)),
+            last_seen: Instant::now(),
+        });
+
+        let remote_node = state.layout.get_node(remote_id);
+        assert!(
+            remote_node.is_some(),
+            "daemon discovery should populate layout immediately"
+        );
+        assert!(state.layout.links.iter().any(|link| {
+            link.from_device == local_id
+                && link.to_device == remote_id
+                && link.from_edge == Direction::Right
+        }));
     }
 
     #[test]

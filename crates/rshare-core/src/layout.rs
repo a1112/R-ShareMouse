@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::Direction;
+use crate::{Direction, ScreenInfo};
 
 const DEFAULT_DISPLAY_WIDTH: u32 = 1920;
 const DEFAULT_DISPLAY_HEIGHT: u32 = 1080;
@@ -179,6 +179,31 @@ impl LayoutGraph {
         self.nodes.iter().find(|n| n.device_id == device_id)
     }
 
+    /// Update the primary display geometry for an existing device.
+    pub fn update_primary_display_geometry(
+        &mut self,
+        device_id: Uuid,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.device_id == device_id) {
+            if let Some(primary) = node.displays.iter_mut().find(|display| display.primary) {
+                if primary.width != width || primary.height != height {
+                    primary.width = width;
+                    primary.height = height;
+                    return true;
+                }
+                return false;
+            }
+
+            node.displays
+                .push(DisplayNode::primary(0, 0, width, height));
+            return true;
+        }
+
+        false
+    }
+
     /// Merge newly discovered peers into the remembered graph.
     ///
     /// Existing nodes are left untouched. New peers are appended to the right
@@ -187,6 +212,19 @@ impl LayoutGraph {
     pub fn merge_discovered_peers_to_right<I>(&mut self, discovered_peers: I) -> bool
     where
         I: IntoIterator<Item = Uuid>,
+    {
+        self.merge_discovered_peers_to_right_with_screens(
+            discovered_peers.into_iter().map(|device_id| (device_id, None)),
+        )
+    }
+
+    /// Merge discovered peers into the remembered graph while honoring runtime screen geometry.
+    pub fn merge_discovered_peers_to_right_with_screens<I>(
+        &mut self,
+        discovered_peers: I,
+    ) -> bool
+    where
+        I: IntoIterator<Item = (Uuid, Option<ScreenInfo>)>,
     {
         let mut changed = false;
         if self.get_node(self.local_device).is_none() {
@@ -200,13 +238,25 @@ impl LayoutGraph {
             changed = true;
         }
 
-        let mut missing_peers: Vec<_> = discovered_peers
+        let mut peers: Vec<_> = discovered_peers
             .into_iter()
-            .filter(|peer_id| *peer_id != self.local_device && self.get_node(*peer_id).is_none())
+            .filter(|(peer_id, _)| *peer_id != self.local_device)
             .collect();
-        missing_peers.sort();
+        peers.sort_by_key(|(peer_id, _)| *peer_id);
 
-        for peer_id in missing_peers {
+        for (peer_id, screen_info) in peers {
+            if let Some(screen_info) = screen_info.as_ref() {
+                changed |= self.update_primary_display_geometry(
+                    peer_id,
+                    screen_info.width,
+                    screen_info.height,
+                );
+            }
+
+            if self.get_node(peer_id).is_some() {
+                continue;
+            }
+
             let (neighbor_id, x, y) = self
                 .rightmost_node()
                 .map(|node| {
@@ -215,14 +265,12 @@ impl LayoutGraph {
                     (node.device_id, right, y)
                 })
                 .unwrap_or((self.local_device, 0, 0));
+            let (width, height) = screen_info
+                .as_ref()
+                .map(|screen| (screen.width, screen.height))
+                .unwrap_or((DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT));
 
-            self.add_node(LayoutNode::new(
-                peer_id,
-                x,
-                y,
-                DEFAULT_DISPLAY_WIDTH,
-                DEFAULT_DISPLAY_HEIGHT,
-            ));
+            self.add_node(LayoutNode::new(peer_id, x, y, width, height));
             self.add_bidirectional_neighbor_link(neighbor_id, peer_id);
             changed = true;
         }
@@ -487,5 +535,26 @@ mod tests {
             .links
             .iter()
             .any(|link| link.from_device == current_local && link.to_device == remote_id));
+    }
+
+    #[test]
+    fn merge_discovered_peers_updates_existing_peer_geometry_when_runtime_size_changes() {
+        let local_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(local_id);
+        graph.add_node(LayoutNode::new(local_id, 0, 0, 2560, 1440));
+        graph.add_node(LayoutNode::new(remote_id, 2560, 0, 1920, 1080));
+
+        let changed = graph.merge_discovered_peers_to_right_with_screens([(
+            remote_id,
+            Some(ScreenInfo::new(0, 0, 3840, 2160)),
+        )]);
+
+        assert!(changed);
+        let remote = graph.get_node(remote_id).unwrap();
+        let primary = remote.primary_display().unwrap();
+        assert_eq!(primary.width, 3840);
+        assert_eq!(primary.height, 2160);
+        assert_eq!(primary.x, 2560);
     }
 }

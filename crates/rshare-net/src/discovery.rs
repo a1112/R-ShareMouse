@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant};
 
-use rshare_core::{hello_back_message, hello_message, DeviceId, Message};
+use rshare_core::{hello_back_message, hello_message, DeviceId, Message, ScreenInfo};
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -43,6 +43,7 @@ pub struct DiscoveredDevice {
     pub name: String,
     pub hostname: String,
     pub addresses: Vec<SocketAddr>,
+    pub screen_info: Option<ScreenInfo>,
     pub last_seen: Instant,
 }
 
@@ -54,17 +55,26 @@ impl DiscoveredDevice {
                 device_name,
                 hostname,
                 ..
-            }
-            | Message::HelloBack {
+            } => Some(Self {
+                id: *device_id,
+                name: device_name.clone(),
+                hostname: hostname.clone(),
+                addresses: vec![addr],
+                screen_info: None,
+                last_seen: Instant::now(),
+            }),
+            Message::HelloBack {
                 device_id,
                 device_name,
                 hostname,
+                screen_info,
                 ..
             } => Some(Self {
                 id: *device_id,
                 name: device_name.clone(),
                 hostname: hostname.clone(),
                 addresses: vec![addr],
+                screen_info: Some(screen_info.clone()),
                 last_seen: Instant::now(),
             }),
             _ => None,
@@ -528,6 +538,7 @@ mod tests {
             name: "Test".to_string(),
             hostname: "test".to_string(),
             addresses: vec![],
+            screen_info: None,
             last_seen: Instant::now(),
         };
 
