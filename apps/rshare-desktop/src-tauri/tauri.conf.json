@@ -8,6 +8,11 @@
     "frontendDist": "../../../other/figma-ui/dist",
     "beforeDevCommand": "npm run dev --prefix ../../../other/figma-ui"
   },
+  "plugins": {
+    "singleInstance": {
+      "dbusId": "com.rsharemouse.desktop"
+    }
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [

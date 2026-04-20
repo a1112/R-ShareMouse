@@ -12,6 +12,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, WebviewWindow, Wry,
 };
+use tauri_plugin_single_instance::init;
 
 type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
 const TRAY_ICON_ID: &str = "main-tray";
@@ -341,6 +342,10 @@ fn build_acceptance(
 
 fn main() {
     tauri::Builder::default()
+        .plugin(init(|app, _args, _cwd| {
+            // Focus the existing window when a second instance is launched
+            let _ = show_main_window(app);
+        }))
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_event(&event) {
                 if let Err(err) = apply_tray_action(app, action) {

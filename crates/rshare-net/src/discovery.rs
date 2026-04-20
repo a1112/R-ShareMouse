@@ -17,8 +17,12 @@ use rshare_core::{hello_back_message, hello_message, DeviceId, Message, ScreenIn
 pub struct DiscoveryConfig {
     /// UDP port for discovery broadcasts
     pub port: u16,
-    /// Broadcast interval
+    /// Initial broadcast interval (more aggressive at startup)
+    pub initial_broadcast_interval: Duration,
+    /// Steady-state broadcast interval
     pub broadcast_interval: Duration,
+    /// How many initial broadcasts to send before switching to steady-state
+    pub initial_broadcast_count: usize,
     /// Device timeout (how long until a device is considered offline)
     pub device_timeout: Duration,
     /// Enable mDNS discovery
@@ -29,7 +33,9 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             port: 27432,
+            initial_broadcast_interval: Duration::from_millis(500),
             broadcast_interval: Duration::from_secs(5),
+            initial_broadcast_count: 6, // 3 seconds of aggressive discovery
             device_timeout: Duration::from_secs(30),
             mdns_enabled: true,
         }
@@ -109,6 +115,7 @@ pub struct ServiceDiscovery {
     devices: HashMap<DeviceId, DiscoveredDevice>,
     event_tx: Option<mpsc::Sender<DiscoveryEvent>>,
     running: bool,
+    broadcast_count: usize,
 }
 
 impl ServiceDiscovery {
@@ -126,6 +133,7 @@ impl ServiceDiscovery {
             devices: HashMap::new(),
             event_tx: None,
             running: false,
+            broadcast_count: 0,
         }
     }
 
@@ -168,8 +176,9 @@ impl ServiceDiscovery {
 
         tracing::info!("Service discovery listening on {}", bind_addr);
 
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 8192]; // Increased buffer size
         let mut broadcast_interval = interval(self.config.broadcast_interval);
+        let mut initial_interval = interval(self.config.initial_broadcast_interval);
         let mut cleanup_interval = interval(Duration::from_secs(10));
 
         // Create the hello message once
@@ -183,14 +192,28 @@ impl ServiceDiscovery {
         let mut broadcast_targets = discovery_broadcast_targets(self.config.port);
         tracing::info!("Discovery broadcast targets: {:?}", broadcast_targets);
 
+        // Send immediate broadcast on startup
+        for target in &broadcast_targets {
+            if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                tracing::warn!("Failed to send initial discovery packet to {}: {}", target, e);
+            } else {
+                tracing::debug!("Sent initial discovery broadcast to {}", target);
+            }
+        }
+        self.broadcast_count = 1;
+
         while self.running {
+            // Determine current interval based on initial broadcast phase
+            let use_initial_interval = self.broadcast_count < self.config.initial_broadcast_count;
+
             tokio::select! {
                 // Handle incoming discovery messages
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, addr)) => {
+                            tracing::trace!("Received {} bytes from {}", len, addr);
                             if let Err(e) = self.handle_packet(&buf[..len], addr, &socket).await {
-                                tracing::debug!("Error handling discovery packet: {}", e);
+                                tracing::debug!("Error handling discovery packet from {}: {}", addr, e);
                             }
                         }
                         Err(e) => {
@@ -199,12 +222,34 @@ impl ServiceDiscovery {
                     }
                 }
 
-                // Send periodic broadcasts
-                _ = broadcast_interval.tick() => {
+                // Send initial broadcasts (more aggressive)
+                _ = initial_interval.tick(), if use_initial_interval => {
+                    self.broadcast_count += 1;
+                    tracing::debug!("Sending aggressive broadcast {}/{}", self.broadcast_count, self.config.initial_broadcast_count);
                     broadcast_targets = discovery_broadcast_targets(self.config.port);
                     for target in &broadcast_targets {
                         if let Err(e) = socket.send_to(&hello_bytes, target).await {
                             tracing::warn!("Failed to send discovery packet to {}: {}", target, e);
+                        } else {
+                            tracing::trace!("Sent discovery broadcast to {}", target);
+                        }
+                    }
+
+                    // Switch to steady-state after initial broadcasts
+                    if self.broadcast_count >= self.config.initial_broadcast_count {
+                        tracing::info!("Discovery switching to steady-state interval ({}s)", self.config.broadcast_interval.as_secs());
+                    }
+                }
+
+                // Send periodic steady-state broadcasts
+                _ = broadcast_interval.tick(), if !use_initial_interval => {
+                    tracing::trace!("Sending steady-state discovery broadcast");
+                    broadcast_targets = discovery_broadcast_targets(self.config.port);
+                    for target in &broadcast_targets {
+                        if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                            tracing::warn!("Failed to send discovery packet to {}: {}", target, e);
+                        } else {
+                            tracing::trace!("Sent discovery broadcast to {}", target);
                         }
                     }
                 }
@@ -245,20 +290,24 @@ impl ServiceDiscovery {
 
         if let Some(id) = sender_id {
             if id == self.local_device_id {
+                tracing::trace!("Ignoring discovery packet from self");
                 return Ok(());
             }
         }
 
         match msg {
-            Message::Hello { .. } => {
+            Message::Hello { device_id, ref device_name, .. } => {
                 // Someone is announcing themselves - respond with HelloBack
+                tracing::info!("Received Hello from {} ({}) at {}", device_name, device_id, addr);
+
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
                     let device_id = device.id;
-                    let is_new = !self.devices.contains_key(&device_id);
+                    let was_known = self.devices.contains_key(&device_id);
 
+                    // Update device (refresh last_seen time)
                     self.devices.insert(device_id, device.clone());
 
-                    // Send HelloBack response
+                    // Send HelloBack response immediately
                     let hello_back = hello_back_message(
                         self.local_device_id,
                         self.local_device_name.clone(),
@@ -268,40 +317,49 @@ impl ServiceDiscovery {
                     let bytes = serialize_message(&hello_back)?;
 
                     if let Err(e) = socket.send_to(&bytes, addr).await {
-                        tracing::warn!("Failed to send HelloBack: {}", e);
+                        tracing::warn!("Failed to send HelloBack to {}: {}", addr, e);
+                    } else {
+                        tracing::debug!("Sent HelloBack to {} at {}", device_id, addr);
                     }
 
                     // Notify about the device
                     if let Some(tx) = &self.event_tx {
-                        let event = if is_new {
-                            DiscoveryEvent::DeviceFound(device)
-                        } else {
+                        let event = if was_known {
                             DiscoveryEvent::DeviceUpdated(device)
+                        } else {
+                            DiscoveryEvent::DeviceFound(device)
                         };
-                        let _ = tx.try_send(event);
+                        if tx.try_send(event).is_err() {
+                            tracing::warn!("Failed to send discovery event - channel full");
+                        }
                     }
                 }
             }
-            Message::HelloBack { .. } => {
+            Message::HelloBack { device_id, ref device_name, .. } => {
                 // Response to our Hello - someone acknowledged us
+                tracing::info!("Received HelloBack from {} ({}) at {}", device_name, device_id, addr);
+
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
                     let device_id = device.id;
-                    let is_new = !self.devices.contains_key(&device_id);
+                    let was_known = self.devices.contains_key(&device_id);
 
+                    // Update device (refresh last_seen time)
                     self.devices.insert(device_id, device.clone());
 
                     if let Some(tx) = &self.event_tx {
-                        let event = if is_new {
-                            DiscoveryEvent::DeviceFound(device)
-                        } else {
+                        let event = if was_known {
                             DiscoveryEvent::DeviceUpdated(device)
+                        } else {
+                            DiscoveryEvent::DeviceFound(device)
                         };
-                        let _ = tx.try_send(event);
+                        if tx.try_send(event).is_err() {
+                            tracing::warn!("Failed to send discovery event - channel full");
+                        }
                     }
                 }
             }
             _ => {
-                // Ignore other message types in discovery
+                tracing::trace!("Ignoring non-discovery message type");
             }
         }
 
@@ -314,6 +372,8 @@ impl ServiceDiscovery {
 
         self.devices.retain(|id, device| {
             if device.is_stale(self.config.device_timeout) {
+                tracing::info!("Device {} ({}) went offline (last seen {:.2}s ago)",
+                    device.name, id, device.last_seen.elapsed().as_secs_f32());
                 lost_devices.push(*id);
                 false
             } else {
@@ -324,7 +384,9 @@ impl ServiceDiscovery {
         // Notify about lost devices
         if let Some(tx) = &self.event_tx {
             for id in lost_devices {
-                let _ = tx.try_send(DiscoveryEvent::DeviceLost(id));
+                if tx.try_send(DiscoveryEvent::DeviceLost(id)).is_err() {
+                    tracing::warn!("Failed to send DeviceLost event - channel full");
+                }
             }
         }
     }
@@ -552,7 +614,9 @@ mod tests {
             ServiceDiscovery::new(Uuid::new_v4(), "Test".to_string(), "test-host".to_string())
                 .with_config(DiscoveryConfig {
                     port: 0,
+                    initial_broadcast_interval: Duration::from_secs(60),
                     broadcast_interval: Duration::from_secs(60),
+                    initial_broadcast_count: 1,
                     device_timeout: Duration::from_secs(60),
                     mdns_enabled: false,
                 });

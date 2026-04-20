@@ -28,7 +28,9 @@ pub async fn run_discover_test() -> anyhow::Result<()> {
     // Configure for aggressive discovery
     let config = DiscoveryConfig {
         port: 27432,
+        initial_broadcast_interval: Duration::from_millis(500),
         broadcast_interval: Duration::from_secs(2),
+        initial_broadcast_count: 6,
         device_timeout: Duration::from_secs(30),
         mdns_enabled: false,
     };
@@ -124,7 +126,9 @@ pub async fn run_discover_scan(scan_duration: Duration) -> anyhow::Result<()> {
 
     let config = DiscoveryConfig {
         port: 27432,
-        broadcast_interval: Duration::from_secs(1), // Aggressive
+        initial_broadcast_interval: Duration::from_millis(500),
+        broadcast_interval: Duration::from_secs(1),
+        initial_broadcast_count: 10,
         device_timeout: Duration::from_secs(10),
         mdns_enabled: false,
     };

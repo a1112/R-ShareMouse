@@ -23,3 +23,4 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tauri = { version = "2.2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"

@@ -215,7 +215,9 @@ impl NetworkManager {
 
         let discovery_config = crate::discovery::DiscoveryConfig {
             port: self.config.discovery_port,
+            initial_broadcast_interval: Duration::from_millis(500),
             broadcast_interval: self.config.broadcast_interval,
+            initial_broadcast_count: 6,
             device_timeout: self.config.device_timeout,
             mdns_enabled: false,
         };
