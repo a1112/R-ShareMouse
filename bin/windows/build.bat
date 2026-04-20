@@ -65,6 +65,8 @@ if /i "%BUILD_MODE%"=="release" (
     echo [Building in DEBUG mode...]
 )
 
+call :stop_runtime_before_build
+
 if /i "%TARGET%"=="all" goto build_all
 if /i "%TARGET%"=="daemon" goto build_daemon
 if /i "%TARGET%"=="cli" goto build_cli
@@ -124,6 +126,30 @@ if /i "%BUILD_MODE%"=="release" (
 
 popd >nul
 exit /b 0
+
+:stop_runtime_before_build
+set "DESKTOP_EXE=%REPO_ROOT%\target\debug\rshare-gui.exe"
+set "DAEMON_EXE=%REPO_ROOT%\target\debug\rshare-daemon.exe"
+if /i "%BUILD_MODE%"=="release" (
+    set "DESKTOP_EXE=%REPO_ROOT%\target\release\rshare-gui.exe"
+    set "DAEMON_EXE=%REPO_ROOT%\target\release\rshare-daemon.exe"
+)
+
+set "RUNTIME_STOPPED="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = [IO.Path]::GetFullPath('%DESKTOP_EXE%'); Get-Process -Name 'rshare-gui' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $path) } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction Stop; $_.Id }"`) do (
+    echo [Stopping running rshare-desktop ^(PID %%I^) from %DESKTOP_EXE%...]
+    set "RUNTIME_STOPPED=1"
+)
+
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = [IO.Path]::GetFullPath('%DAEMON_EXE%'); Get-Process -Name 'rshare-daemon' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $path) } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction Stop; $_.Id }"`) do (
+    echo [Stopping running rshare-daemon ^(PID %%I^) from %DAEMON_EXE%...]
+    set "RUNTIME_STOPPED=1"
+)
+
+if defined RUNTIME_STOPPED (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Milliseconds 500" >nul
+)
+goto :eof
 
 :help
 echo Usage: %~nx0 [OPTIONS] [TARGET]

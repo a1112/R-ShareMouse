@@ -131,10 +131,35 @@ if not exist "%BIN_DIR%\rshare-gui.exe" (
         exit /b 1
     )
 )
-start "" "%BIN_DIR%\rshare-gui.exe"
-echo [Desktop app started]
+"%BIN_DIR%\rshare-gui.exe"
+set "EXIT_CODE=%ERRORLEVEL%"
+call :wait_for_daemon_cleanup
 popd >nul
-exit /b 0
+exit /b %EXIT_CODE%
+
+:wait_for_daemon_cleanup
+set "DAEMON_EXE=%BIN_DIR%\rshare-daemon.exe"
+if not exist "%DAEMON_EXE%" goto :eof
+
+set "DAEMON_RUNNING="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = [IO.Path]::GetFullPath('%DAEMON_EXE%'); Get-Process -Name 'rshare-daemon' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $path) } | Select-Object -ExpandProperty Id"`) do (
+    set "DAEMON_RUNNING=1"
+)
+if not defined DAEMON_RUNNING goto :eof
+
+echo [Waiting for rshare-daemon to exit...]
+for /l %%N in (1,1,15) do (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Milliseconds 200" >nul
+    set "DAEMON_RUNNING="
+    for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = [IO.Path]::GetFullPath('%DAEMON_EXE%'); Get-Process -Name 'rshare-daemon' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $path) } | Select-Object -ExpandProperty Id"`) do (
+        set "DAEMON_RUNNING=1"
+    )
+    if not defined DAEMON_RUNNING goto :eof
+)
+
+echo [WARN] rshare-daemon is still running after desktop exit, forcing stop...]
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = [IO.Path]::GetFullPath('%DAEMON_EXE%'); Get-Process -Name 'rshare-daemon' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $path) } | Stop-Process -Force" >nul
+goto :eof
 
 :help
 echo Usage: %~nx0 [OPTIONS] [TARGET] [ARGS...]
@@ -146,7 +171,7 @@ echo Targets:
 echo   daemon       Run rshare-daemon ^(default^)
 echo   cli          Run rshare CLI with args
 echo   gui          Run rshare-gui
-echo   desktop      Run rshare-desktop ^(Tauri^)
+echo   desktop      Run rshare-desktop and wait for daemon cleanup
 echo.
 echo Examples:
 echo   %~nx0

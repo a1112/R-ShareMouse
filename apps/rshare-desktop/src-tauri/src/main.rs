@@ -6,7 +6,7 @@ use rshare_core::{
     DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
@@ -454,10 +454,74 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
         TrayAction::ShowWindow => show_main_window(app),
         TrayAction::HideWindow => hide_main_window(app),
         TrayAction::QuitApp => {
-            app.exit(0);
+            shutdown_daemon_and_exit(app);
             Ok(())
         }
     }
+}
+
+fn shutdown_daemon_and_exit(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = shutdown_daemon_for_exit().await {
+            eprintln!("daemon shutdown before desktop exit failed: {err}");
+        }
+        app.exit(0);
+    });
+}
+
+async fn shutdown_daemon_for_exit() -> AnyhowResult<()> {
+    let manager = Arc::new(rshare_core::service::ServiceManager::new()?);
+    shutdown_daemon_for_exit_with(
+        {
+            let manager = Arc::clone(&manager);
+            move || manager.is_running()
+        },
+        || Box::pin(async { daemon_client::request_shutdown().await }),
+        {
+            let manager = Arc::clone(&manager);
+            move || {
+                let manager = Arc::clone(&manager);
+                Box::pin(async move { manager.stop().await })
+            }
+        },
+        20,
+        Duration::from_millis(200),
+    )
+    .await
+}
+
+async fn shutdown_daemon_for_exit_with<IsRunning, RequestShutdown, ForceStop>(
+    mut is_running: IsRunning,
+    mut request_shutdown: RequestShutdown,
+    mut force_stop: ForceStop,
+    wait_polls: usize,
+    wait_interval: Duration,
+) -> AnyhowResult<()>
+where
+    IsRunning: FnMut() -> bool,
+    RequestShutdown: FnMut() -> BoxFutureResult<'static, ()>,
+    ForceStop: FnMut() -> BoxFutureResult<'static, ()>,
+{
+    if !is_running() {
+        return Ok(());
+    }
+
+    if let Err(err) = request_shutdown().await {
+        eprintln!("graceful daemon shutdown request failed, forcing stop: {err}");
+        force_stop().await?;
+        return Ok(());
+    }
+
+    for _ in 0..wait_polls {
+        tokio::time::sleep(wait_interval).await;
+        if !is_running() {
+            return Ok(());
+        }
+    }
+
+    force_stop().await?;
+    Ok(())
 }
 
 /// Setup system tray with icon and restore actions.
@@ -504,6 +568,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
+    use std::time::Duration;
 
     fn sample_status() -> ServiceStatusSnapshot {
         ServiceStatusSnapshot {
@@ -989,5 +1054,91 @@ mod tests {
             .unwrap()
             .get_node(remote_id)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_requests_graceful_daemon_shutdown_when_running() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_stop_count = Arc::new(AtomicUsize::new(0));
+        let running_checks = Arc::new(AtomicUsize::new(0));
+
+        shutdown_daemon_for_exit_with(
+            {
+                let running_checks = Arc::clone(&running_checks);
+                move || running_checks.fetch_add(1, Ordering::SeqCst) == 0
+            },
+            {
+                let request_count = Arc::clone(&request_count);
+                move || {
+                    Box::pin({
+                        let request_count = Arc::clone(&request_count);
+                        async move {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    })
+                }
+            },
+            {
+                let force_stop_count = Arc::clone(&force_stop_count);
+                move || {
+                    Box::pin({
+                        let force_stop_count = Arc::clone(&force_stop_count);
+                        async move {
+                            force_stop_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    })
+                }
+            },
+            1,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("desktop exit should request daemon shutdown");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(force_stop_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn desktop_exit_falls_back_to_force_stop_when_shutdown_request_fails() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_stop_count = Arc::new(AtomicUsize::new(0));
+
+        shutdown_daemon_for_exit_with(
+            || true,
+            {
+                let request_count = Arc::clone(&request_count);
+                move || {
+                    Box::pin({
+                        let request_count = Arc::clone(&request_count);
+                        async move {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            Err(anyhow!("ipc shutdown failed"))
+                        }
+                    })
+                }
+            },
+            {
+                let force_stop_count = Arc::clone(&force_stop_count);
+                move || {
+                    Box::pin({
+                        let force_stop_count = Arc::clone(&force_stop_count);
+                        async move {
+                            force_stop_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    })
+                }
+            },
+            1,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("desktop exit should fall back to force stop");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(force_stop_count.load(Ordering::SeqCst), 1);
     }
 }
