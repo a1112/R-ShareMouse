@@ -45,8 +45,8 @@ pub use input_mode::{
 
 // Re-exports from runtime
 pub use runtime::{
-    BackendRuntimeState, ConnectionState, ControlSessionState, DiscoveryState,
-    PeerDirectoryEntry, SuspendReason,
+    BackendRuntimeState, BackgroundProcessOwner, BackgroundRunMode, ConnectionState,
+    ControlSessionState, DiscoveryState, PeerDirectoryEntry, SuspendReason, TrayRuntimeState,
 };
 
 // Re-exports from layout

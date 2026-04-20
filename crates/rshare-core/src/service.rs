@@ -197,16 +197,26 @@ impl ServiceManager {
     /// Check if a process with given PID is alive (Windows)
     #[cfg(windows)]
     fn is_process_alive(&self, pid: u32) -> bool {
-        use std::process::Command;
-        // Use tasklist to check if process exists
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output()
-            .map(|o| {
-                let output = String::from_utf8_lossy(&o.stdout);
-                output.contains(&pid.to_string())
-            })
-            .unwrap_or(false)
+        use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+        let Ok(handle) = handle else {
+            return false;
+        };
+
+        if handle.is_invalid() {
+            return false;
+        }
+
+        let mut exit_code = 0u32;
+        let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
+            && exit_code == STILL_ACTIVE.0 as u32;
+
+        let _ = unsafe { CloseHandle(handle) };
+        alive
     }
 
     /// Get the state directory

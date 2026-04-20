@@ -15,6 +15,10 @@ test("buildDesktopViewModel returns an offline local-only layout when daemon is 
   assert.equal(model.layout.monitors.length, 1);
   assert.equal(model.devices.length, 0);
   assert.equal(model.settings.localDevice.name, "本机");
+  assert.equal(model.acceptance.daemonOnline, false);
+  assert.equal(model.acceptance.backgroundReady, false);
+  assert.equal(model.acceptance.dualMachineReady, false);
+  assert.equal(model.acceptance.nextStep, "启动守护进程后进行双机实机验收");
 });
 
 test("buildDesktopViewModel maps daemon devices into layout and device cards", () => {
@@ -279,4 +283,61 @@ test("buildDesktopViewModel does not synthesize remote layout when daemon layout
   assert.deepEqual(model.layout.devices.map((device) => device.id), ["local-1"]);
   assert.equal(model.layout.monitors.length, 1);
   assert.equal(model.service.error, "layout unavailable");
+});
+
+test("buildDesktopViewModel exposes desktop acceptance payload for settings checklist", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "192.168.1.10:24801",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 1,
+      connected_devices: 0,
+      healthy: true,
+      input_mode: "Portable",
+      available_backends: ["Portable"],
+      backend_health: "Healthy",
+      background_owner: "Daemon",
+      background_mode: "BackgroundProcess",
+      tray_owner: "Daemon",
+      tray_state: "Unavailable",
+      started_by_desktop: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote Workstation",
+        hostname: "remote",
+        addresses: ["192.168.1.30"],
+        connected: false,
+        last_seen_secs: 2,
+      },
+    ],
+    acceptance: {
+      daemon_online: true,
+      background_ready: true,
+      tray_owned_by_daemon: true,
+      tray_state: "Unavailable",
+      local_endpoint: "192.168.1.10:24801",
+      discovered_devices: 1,
+      connected_devices: 0,
+      visible_layout_devices: 2,
+      input_ready: true,
+      dual_machine_ready: true,
+      next_step: "打开另一台机器并连接设备，开始边缘切换验收",
+    },
+  });
+
+  assert.equal(model.acceptance.daemonOnline, true);
+  assert.equal(model.acceptance.backgroundReady, true);
+  assert.equal(model.acceptance.trayOwnedByDaemon, true);
+  assert.equal(model.acceptance.trayState, "Unavailable");
+  assert.equal(model.acceptance.dualMachineReady, true);
+  assert.equal(model.acceptance.autoStarted, true);
+  assert.equal(model.acceptance.checks[0].label, "后台服务");
+  assert.equal(model.acceptance.checks[0].state, "pass");
+  assert.equal(model.acceptance.checks.at(-1).label, "双机验收");
 });

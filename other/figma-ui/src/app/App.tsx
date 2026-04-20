@@ -456,6 +456,7 @@ export default function App() {
 
           {page === "settings" ? (
             <SettingsPage
+              acceptance={model.acceptance}
               localDevice={model.settings.localDevice}
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
@@ -612,6 +613,7 @@ function DevicesPage({
 }
 
 function SettingsPage({
+  acceptance,
   localDevice,
   inputMode,
   privilegeState,
@@ -622,6 +624,26 @@ function SettingsPage({
   busy,
   theme,
 }: {
+  acceptance: {
+    daemonOnline: boolean;
+    backgroundReady: boolean;
+    trayOwnedByDaemon: boolean;
+    trayState: string;
+    localEndpoint: string;
+    discoveredDevices: number;
+    connectedDevices: number;
+    visibleLayoutDevices: number;
+    inputReady: boolean;
+    dualMachineReady: boolean;
+    nextStep: string;
+    autoStarted: boolean;
+    checks: Array<{
+      key: string;
+      label: string;
+      state: "pass" | "warn" | "block";
+      detail: string;
+    }>;
+  };
   localDevice: {
     name: string;
     hostname: string;
@@ -826,8 +848,180 @@ function SettingsPage({
             ))}
           </div>
         </section>
+
+        <section
+          className="p-5"
+          style={{
+            background: theme.sidebar,
+            border: `1px solid ${theme.border}`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div className="mb-4 flex items-center gap-3">
+            <div
+              className="flex h-11 w-11 items-center justify-center rounded-md"
+              style={{
+                background: theme.accentSoft,
+                color: theme.accent,
+              }}
+            >
+              <Monitor size={18} />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold">实机验收</h2>
+              <p className="text-sm" style={{ color: theme.textMuted }}>
+                打开另一台机器前，先确认后台、布局和输入主链路都已就绪。
+              </p>
+            </div>
+          </div>
+
+          <div className="mb-4 flex flex-wrap gap-2 text-xs">
+            <AcceptanceBadge
+              label={acceptance.daemonOnline ? "Daemon 在线" : "Daemon 离线"}
+              state={acceptance.daemonOnline ? "pass" : "block"}
+              theme={theme}
+            />
+            <AcceptanceBadge
+              label={acceptance.autoStarted ? "Desktop 已自动拉起" : "未发生自动拉起"}
+              state={acceptance.autoStarted ? "warn" : "pass"}
+              theme={theme}
+            />
+            <AcceptanceBadge
+              label={`托盘 ${acceptance.trayState}`}
+              state={
+                acceptance.trayOwnedByDaemon
+                  ? acceptance.trayState === "Running"
+                    ? "pass"
+                    : "warn"
+                  : "block"
+              }
+              theme={theme}
+            />
+          </div>
+
+          <div className="space-y-3">
+            {acceptance.checks.map((check) => (
+              <div
+                key={check.key}
+                className="flex items-start gap-3 rounded-md px-4 py-3"
+                style={{
+                  border: `1px solid ${theme.border}`,
+                  background: theme.frame,
+                }}
+              >
+                <AcceptanceDot state={check.state} theme={theme} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-medium">{check.label}</div>
+                    <AcceptanceBadge label={acceptanceStateLabel(check.state)} state={check.state} theme={theme} />
+                  </div>
+                  <div className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
+                    {check.detail}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div
+            className="mt-4 rounded-md px-4 py-3 text-sm"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+            }}
+          >
+            <div
+              className="mb-2 text-xs uppercase tracking-[0.16em]"
+              style={{ color: theme.textMuted }}
+            >
+              下一步
+            </div>
+            <div className="font-medium">{acceptance.nextStep}</div>
+          </div>
+        </section>
       </div>
     </div>
+  );
+}
+
+function acceptanceStateLabel(state: "pass" | "warn" | "block") {
+  if (state === "pass") {
+    return "通过";
+  }
+
+  if (state === "warn") {
+    return "待确认";
+  }
+
+  return "阻塞";
+}
+
+function acceptanceStateStyle(
+  state: "pass" | "warn" | "block",
+  theme: typeof FIGMA_DESKTOP_THEME,
+) {
+  if (state === "pass") {
+    return {
+      background: "rgba(73, 179, 92, 0.16)",
+      color: "#8de29d",
+      dot: theme.success,
+    };
+  }
+
+  if (state === "warn") {
+    return {
+      background: "rgba(214, 166, 75, 0.14)",
+      color: "#e5c37a",
+      dot: "#d6a64b",
+    };
+  }
+
+  return {
+    background: "rgba(197, 48, 48, 0.18)",
+    color: "#ffb5c0",
+    dot: theme.danger,
+  };
+}
+
+function AcceptanceBadge({
+  label,
+  state,
+  theme,
+}: {
+  label: string;
+  state: "pass" | "warn" | "block";
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const style = acceptanceStateStyle(state, theme);
+
+  return (
+    <span
+      className="rounded px-2 py-1"
+      style={{
+        background: style.background,
+        color: style.color,
+        border: `1px solid ${theme.border}`,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function AcceptanceDot({
+  state,
+  theme,
+}: {
+  state: "pass" | "warn" | "block";
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const style = acceptanceStateStyle(state, theme);
+
+  return (
+    <div
+      className="mt-1 h-2.5 w-2.5 rounded-full"
+      style={{ background: style.dot }}
+    />
   );
 }
 

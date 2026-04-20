@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    BackendHealth, BackendKind, ControlSessionState, DeviceId, LayoutGraph,
-    PrivilegeState, ResolvedInputMode,
+    BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
+    DeviceId, LayoutGraph, PrivilegeState, ResolvedInputMode, TrayRuntimeState,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -50,6 +50,34 @@ pub struct ServiceStatusSnapshot {
     /// Active control target (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_target: Option<DeviceId>,
+
+    /// Process that owns the background service lifecycle.
+    #[serde(default = "default_background_owner")]
+    pub background_owner: BackgroundProcessOwner,
+    /// Current daemon run mode.
+    #[serde(default = "default_background_mode")]
+    pub background_mode: BackgroundRunMode,
+    /// Process that owns tray integration.
+    #[serde(default = "default_background_owner")]
+    pub tray_owner: BackgroundProcessOwner,
+    /// Current tray runtime state.
+    #[serde(default = "default_tray_state")]
+    pub tray_state: TrayRuntimeState,
+    /// True when this snapshot was returned after desktop auto-started the daemon.
+    #[serde(default)]
+    pub started_by_desktop: bool,
+}
+
+fn default_background_owner() -> BackgroundProcessOwner {
+    BackgroundProcessOwner::Daemon
+}
+
+fn default_background_mode() -> BackgroundRunMode {
+    BackgroundRunMode::BackgroundProcess
+}
+
+fn default_tray_state() -> TrayRuntimeState {
+    TrayRuntimeState::Unavailable
 }
 
 impl ServiceStatusSnapshot {
@@ -79,6 +107,11 @@ impl ServiceStatusSnapshot {
             last_backend_error: None,
             session_state: None,
             active_target: None,
+            background_owner: default_background_owner(),
+            background_mode: default_background_mode(),
+            tray_owner: default_background_owner(),
+            tray_state: default_tray_state(),
+            started_by_desktop: false,
         }
     }
 }

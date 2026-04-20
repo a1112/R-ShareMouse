@@ -89,6 +89,37 @@ pub enum SuspendReason {
     ServiceRestart,
 }
 
+/// Process that owns a product runtime surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundProcessOwner {
+    /// The standalone daemon owns the runtime surface.
+    Daemon,
+    /// The desktop shell owns the runtime surface.
+    Desktop,
+}
+
+/// How the daemon is currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundRunMode {
+    /// Started as a foreground console process.
+    ForegroundProcess,
+    /// Running detached from the desktop control window.
+    BackgroundProcess,
+}
+
+/// Current daemon-owned tray runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrayRuntimeState {
+    /// Native tray runtime has not been wired on this platform/build.
+    Unavailable,
+    /// Tray runtime is being initialized.
+    Starting,
+    /// Tray runtime is active.
+    Running,
+    /// Tray runtime failed and the daemon continues without it.
+    Failed,
+}
+
 /// Control session state owned by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlSessionState {

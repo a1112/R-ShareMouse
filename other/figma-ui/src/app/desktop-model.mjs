@@ -241,6 +241,148 @@ function parseBackendHealth(backendHealth) {
   return { health: "未知", reason: null };
 }
 
+function statusCheck(pass, warn = false) {
+  if (pass) {
+    return "pass";
+  }
+
+  return warn ? "warn" : "block";
+}
+
+function trayStateLabel(state) {
+  switch (state) {
+    case "Running":
+      return "运行中";
+    case "Starting":
+      return "启动中";
+    case "Failed":
+      return "失败";
+    case "Unavailable":
+    default:
+      return "未接入";
+  }
+}
+
+function buildAcceptanceChecks(acceptance, status, inputMode) {
+  return [
+    {
+      key: "background",
+      label: "后台服务",
+      state: statusCheck(acceptance.backgroundReady),
+      detail: acceptance.daemonOnline
+        ? `daemon 后台运行，PID ${status?.pid ?? "未知"}`
+        : "daemon 未运行，desktop 会在 IPC 不可用时尝试拉起",
+    },
+    {
+      key: "tray",
+      label: "托盘归属",
+      state: statusCheck(acceptance.trayOwnedByDaemon && acceptance.trayState === "Running", acceptance.trayOwnedByDaemon),
+      detail: acceptance.trayOwnedByDaemon
+        ? `托盘归属 daemon，当前状态：${trayStateLabel(acceptance.trayState)}`
+        : "托盘归属未声明为 daemon",
+    },
+    {
+      key: "endpoint",
+      label: "本机端点",
+      state: statusCheck(acceptance.daemonOnline && acceptance.localEndpoint !== "不可用"),
+      detail: acceptance.localEndpoint,
+    },
+    {
+      key: "discovery",
+      label: "局域网发现",
+      state: statusCheck(acceptance.discoveredDevices > 0, acceptance.daemonOnline),
+      detail: `已发现 ${acceptance.discoveredDevices} 台，已连接 ${acceptance.connectedDevices} 台`,
+    },
+    {
+      key: "layout",
+      label: "布局接管",
+      state: statusCheck(acceptance.visibleLayoutDevices > 1, acceptance.daemonOnline),
+      detail: `Layout 当前显示 ${acceptance.visibleLayoutDevices} 个在线节点`,
+    },
+    {
+      key: "input",
+      label: "输入后端",
+      state: statusCheck(acceptance.inputReady),
+      detail: `${inputMode.current} · ${inputMode.health}`,
+    },
+    {
+      key: "dual-machine",
+      label: "双机验收",
+      state: statusCheck(acceptance.dualMachineReady, acceptance.daemonOnline),
+      detail: acceptance.nextStep,
+    },
+  ];
+}
+
+function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
+  const daemonOnline = Boolean(status);
+  const backgroundReady =
+    daemonOnline &&
+    (status?.background_owner ?? "Daemon") === "Daemon" &&
+    (status?.background_mode ?? "BackgroundProcess") === "BackgroundProcess";
+  const trayOwnedByDaemon = daemonOnline && (status?.tray_owner ?? "Daemon") === "Daemon";
+  const trayState = status?.tray_state ?? "Unavailable";
+  const visibleLayoutDevices = payload?.visible_layout?.nodes?.length ?? layout.devices.length;
+  const inputReady = daemonOnline && Boolean(status?.input_mode) && inputMode.health === "Healthy";
+  const dualMachineReady =
+    backgroundReady &&
+    inputReady &&
+    remoteDevices.length > 0 &&
+    visibleLayoutDevices > 1 &&
+    !payload?.layout_error;
+
+  let nextStep = "启动守护进程后进行双机实机验收";
+  if (daemonOnline && !inputReady) {
+    nextStep = "检查输入后端权限或降级原因";
+  } else if (daemonOnline && remoteDevices.length === 0) {
+    nextStep = "打开另一台机器并保持同一局域网，等待自动发现";
+  } else if (daemonOnline && !dualMachineReady) {
+    nextStep = "确认设备进入 Layout 并保存布局后开始连接";
+  } else if (dualMachineReady) {
+    nextStep = "打开另一台机器并连接设备，开始边缘切换验收";
+  }
+
+  return {
+    daemonOnline,
+    backgroundReady,
+    trayOwnedByDaemon,
+    trayState,
+    localEndpoint: status?.bind_address ?? "不可用",
+    discoveredDevices: remoteDevices.length,
+    connectedDevices: remoteDevices.filter((device) => device.connected).length,
+    visibleLayoutDevices,
+    inputReady,
+    dualMachineReady,
+    nextStep,
+    autoStarted: Boolean(payload?.auto_started ?? status?.started_by_desktop),
+  };
+}
+
+function buildAcceptance(payload, status, remoteDevices, layout, inputMode) {
+  const raw = payload?.acceptance;
+  const acceptance = raw
+    ? {
+        daemonOnline: Boolean(raw.daemon_online),
+        backgroundReady: Boolean(raw.background_ready),
+        trayOwnedByDaemon: Boolean(raw.tray_owned_by_daemon),
+        trayState: raw.tray_state ?? "Unavailable",
+        localEndpoint: raw.local_endpoint ?? status?.bind_address ?? "不可用",
+        discoveredDevices: Number(raw.discovered_devices ?? remoteDevices.length),
+        connectedDevices: Number(raw.connected_devices ?? 0),
+        visibleLayoutDevices: Number(raw.visible_layout_devices ?? layout.devices.length),
+        inputReady: Boolean(raw.input_ready),
+        dualMachineReady: Boolean(raw.dual_machine_ready),
+        nextStep: raw.next_step ?? "继续完成实机验收",
+        autoStarted: Boolean(payload?.auto_started ?? status?.started_by_desktop),
+      }
+    : fallbackAcceptance(payload, status, remoteDevices, layout, inputMode);
+
+  return {
+    ...acceptance,
+    checks: buildAcceptanceChecks(acceptance, status, inputMode),
+  };
+}
+
 export function buildDesktopViewModel(payload) {
   const status = payload?.status ?? null;
   const localDevice = buildLocalDevice(status);
@@ -260,24 +402,32 @@ export function buildDesktopViewModel(payload) {
       buildLayoutMonitor(device, index, device.kind),
     );
   const backendState = parseBackendHealth(status?.backend_health);
+  const inputMode = {
+    current: status?.input_mode ?? "不可用",
+    available: status?.available_backends ?? [],
+    health: backendState.health,
+    reason: backendState.reason,
+  };
+  const layout = {
+    devices: layoutDevices,
+    monitors: layoutMonitors,
+    remembered: payload?.layout ?? null,
+    visible: payload?.visible_layout ?? null,
+    error: payload?.layout_error ?? null,
+  };
+  const service = {
+    online: Boolean(status),
+    healthy: Boolean(status?.healthy),
+    label: status ? "运行中" : "已停止",
+    error: status?.last_backend_error ?? payload?.layout_error ?? null,
+    discoveredDevices: status?.discovered_devices ?? remoteDevices.length,
+    connectedDevices: status?.connected_devices ?? 0,
+    autoStarted: Boolean(payload?.auto_started ?? status?.started_by_desktop),
+  };
 
   return {
-    service: {
-      online: Boolean(status),
-      healthy: Boolean(status?.healthy),
-      label: status ? "运行中" : "已停止",
-      error: status?.last_backend_error ?? payload?.layout_error ?? null,
-      discoveredDevices: status?.discovered_devices ?? remoteDevices.length,
-      connectedDevices: status?.connected_devices ?? 0,
-      autoStarted: Boolean(payload?.auto_started),
-    },
-    layout: {
-      devices: layoutDevices,
-      monitors: layoutMonitors,
-      remembered: payload?.layout ?? null,
-      visible: payload?.visible_layout ?? null,
-      error: payload?.layout_error ?? null,
-    },
+    service,
+    layout,
     devices: remoteDevices,
     settings: {
       localDevice: {
@@ -288,13 +438,9 @@ export function buildDesktopViewModel(payload) {
         discoveryPort: status?.discovery_port ?? null,
         pid: status?.pid ?? null,
       },
-      inputMode: {
-        current: status?.input_mode ?? "不可用",
-        available: status?.available_backends ?? [],
-        health: backendState.health,
-        reason: backendState.reason,
-      },
+      inputMode,
       privilegeState: status?.privilege_state ?? "不可用",
     },
+    acceptance: buildAcceptance(payload, status, remoteDevices, layout, inputMode),
   };
 }

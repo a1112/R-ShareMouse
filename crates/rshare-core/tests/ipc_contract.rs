@@ -1,8 +1,9 @@
 use rshare_core::{
     ipc::{
-        default_ipc_addr, write_json_line, read_json_line, DaemonDeviceSnapshot,
+        default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot,
         DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
     },
+    BackgroundProcessOwner, BackgroundRunMode, TrayRuntimeState,
     service::{pid_file_path, state_dir},
 };
 use tokio::io::duplex;
@@ -65,6 +66,24 @@ fn default_status_snapshot_starts_empty_and_healthy() {
     assert_eq!(snapshot.connected_devices, 0);
     assert!(snapshot.healthy);
     assert_eq!(snapshot.pid, 42);
+}
+
+#[test]
+fn default_status_snapshot_reports_daemon_owned_background_runtime() {
+    let snapshot = ServiceStatusSnapshot::new(
+        Uuid::nil(),
+        "desktop".to_string(),
+        "desktop-host".to_string(),
+        "0.0.0.0:27431".to_string(),
+        27432,
+        42,
+    );
+
+    assert_eq!(snapshot.background_owner, BackgroundProcessOwner::Daemon);
+    assert_eq!(snapshot.background_mode, BackgroundRunMode::BackgroundProcess);
+    assert_eq!(snapshot.tray_owner, BackgroundProcessOwner::Daemon);
+    assert_eq!(snapshot.tray_state, TrayRuntimeState::Unavailable);
+    assert!(!snapshot.started_by_desktop);
 }
 
 #[test]

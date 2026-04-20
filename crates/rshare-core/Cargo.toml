@@ -23,3 +23,9 @@ tokio = { workspace = true }
 async-trait = "0.1"
 rshare-common = { path = "../rshare-common" }
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

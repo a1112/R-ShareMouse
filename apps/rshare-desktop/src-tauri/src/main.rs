@@ -2,7 +2,8 @@
 
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
-    daemon_client, Config, DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
+    daemon_client, BackgroundProcessOwner, BackgroundRunMode, BackendHealth, Config,
+    DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, pin::Pin};
@@ -17,7 +18,23 @@ struct DashboardStatePayload {
     layout: Option<LayoutGraph>,
     visible_layout: Option<LayoutGraph>,
     layout_error: Option<String>,
+    acceptance: DesktopAcceptancePayload,
     auto_started: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DesktopAcceptancePayload {
+    daemon_online: bool,
+    background_ready: bool,
+    tray_owned_by_daemon: bool,
+    tray_state: String,
+    local_endpoint: String,
+    discovered_devices: usize,
+    connected_devices: usize,
+    visible_layout_devices: usize,
+    input_ready: bool,
+    dual_machine_ready: bool,
+    next_step: String,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +212,8 @@ where
     SaveLayout: FnMut(LayoutGraph) -> BoxFutureResult<'static, ()>,
 {
     let daemon = ensure_status().await.map_err(|err| err.to_string())?;
+    let mut status = daemon.status;
+    status.started_by_desktop = daemon.auto_started;
     let devices = request_devices().await.unwrap_or_default();
     let mut layout_error = None;
     let mut layout = match request_layout().await {
@@ -223,18 +242,71 @@ where
 
     let visible_layout = layout.as_ref().map(|remembered| {
         remembered.compact_online_display_projection(
-            std::iter::once(daemon.status.device_id).chain(devices.iter().map(|device| device.id)),
+            std::iter::once(status.device_id).chain(devices.iter().map(|device| device.id)),
         )
     });
+    let acceptance = build_acceptance(
+        &status,
+        &devices,
+        visible_layout.as_ref(),
+        layout_error.as_deref(),
+    );
 
     Ok(DashboardStatePayload {
-        status: Some(daemon.status),
+        status: Some(status),
         devices,
         layout: layout.take(),
         visible_layout,
         layout_error,
+        acceptance,
         auto_started: daemon.auto_started,
     })
+}
+
+fn build_acceptance(
+    status: &ServiceStatusSnapshot,
+    devices: &[DaemonDeviceSnapshot],
+    visible_layout: Option<&LayoutGraph>,
+    layout_error: Option<&str>,
+) -> DesktopAcceptancePayload {
+    let visible_layout_devices = visible_layout
+        .map(|layout| layout.nodes.len())
+        .unwrap_or_default();
+    let input_ready = status.input_mode.is_some()
+        && matches!(status.backend_health, Some(BackendHealth::Healthy));
+    let background_ready = status.background_owner == BackgroundProcessOwner::Daemon
+        && status.background_mode == BackgroundRunMode::BackgroundProcess;
+    let tray_owned_by_daemon = status.tray_owner == BackgroundProcessOwner::Daemon;
+    let dual_machine_ready = background_ready
+        && input_ready
+        && layout_error.is_none()
+        && !devices.is_empty()
+        && visible_layout_devices > 1;
+    let next_step = if !background_ready {
+        "后台服务未就绪，先启动守护进程"
+    } else if !input_ready {
+        "输入后端未就绪，先检查权限或后端降级"
+    } else if devices.is_empty() {
+        "打开另一台机器并保持同一局域网，等待自动发现"
+    } else if layout_error.is_some() || visible_layout_devices <= 1 {
+        "检查布局持久化，确认发现设备进入布局画布"
+    } else {
+        "打开另一台机器并连接设备，开始边缘切换验收"
+    };
+
+    DesktopAcceptancePayload {
+        daemon_online: true,
+        background_ready,
+        tray_owned_by_daemon,
+        tray_state: format!("{:?}", status.tray_state),
+        local_endpoint: status.bind_address.clone(),
+        discovered_devices: devices.len(),
+        connected_devices: devices.iter().filter(|device| device.connected).count(),
+        visible_layout_devices,
+        input_ready,
+        dual_machine_ready,
+        next_step: next_step.to_string(),
+    }
 }
 
 fn main() {
@@ -286,6 +358,11 @@ mod tests {
             last_backend_error: None,
             session_state: None,
             active_target: None,
+            background_owner: rshare_core::BackgroundProcessOwner::Daemon,
+            background_mode: rshare_core::BackgroundRunMode::BackgroundProcess,
+            tray_owner: rshare_core::BackgroundProcessOwner::Daemon,
+            tray_state: rshare_core::TrayRuntimeState::Unavailable,
+            started_by_desktop: false,
         }
     }
 
@@ -363,6 +440,81 @@ mod tests {
         assert!(result.status.healthy);
         assert!(result.auto_started);
         assert_eq!(spawn_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_marks_status_when_desktop_auto_started_daemon() {
+        let result = dashboard_state_with(
+            || {
+                Box::pin(async {
+                    let mut status = sample_status();
+                    status.input_mode = Some(rshare_core::ResolvedInputMode::Portable);
+                    status.backend_health = Some(rshare_core::BackendHealth::Healthy);
+                    Ok(DesktopDaemonStatus {
+                        status,
+                        auto_started: true,
+                    })
+                })
+            },
+            || Box::pin(async { Ok(Vec::new()) }),
+            || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect("dashboard should annotate desktop auto-start");
+
+        let status = result.status.expect("status should be online");
+        assert!(status.started_by_desktop);
+        assert!(result.auto_started);
+        assert!(result.acceptance.daemon_online);
+        assert!(result.acceptance.background_ready);
+        assert!(result.acceptance.tray_owned_by_daemon);
+        assert_eq!(result.acceptance.tray_state, "Unavailable");
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_reports_dual_machine_acceptance_readiness() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+
+        let result = dashboard_state_with(
+            move || {
+                Box::pin({
+                    let mut status = sample_status();
+                    status.device_id = local_id;
+                    status.input_mode = Some(rshare_core::ResolvedInputMode::Portable);
+                    status.backend_health = Some(rshare_core::BackendHealth::Healthy);
+                    async move {
+                        Ok(DesktopDaemonStatus {
+                            status,
+                            auto_started: false,
+                        })
+                    }
+                })
+            },
+            move || {
+                Box::pin(async move {
+                    Ok(vec![DaemonDeviceSnapshot {
+                        id: remote_id,
+                        name: "Remote".to_string(),
+                        hostname: "remote-host".to_string(),
+                        addresses: vec!["192.168.1.20".to_string()],
+                        connected: false,
+                        last_seen_secs: Some(1),
+                    }])
+                })
+            },
+            move || Box::pin(async move { Ok(sample_layout(local_id)) }),
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect("dashboard should expose acceptance readiness");
+
+        assert!(result.acceptance.input_ready);
+        assert_eq!(result.acceptance.discovered_devices, 1);
+        assert_eq!(result.acceptance.visible_layout_devices, 2);
+        assert!(result.acceptance.dual_machine_ready);
+        assert_eq!(result.acceptance.next_step, "打开另一台机器并连接设备，开始边缘切换验收");
     }
 
     #[tokio::test]
