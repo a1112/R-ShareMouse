@@ -18,7 +18,10 @@ use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerC
 #[cfg(windows)]
 use rshare_platform::firewall;
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -166,7 +169,10 @@ impl DaemonState {
         self.backend_state.update_aggregate_health();
 
         // Notify session machine if backend is degraded
-        if matches!(self.backend_state.aggregate_health, BackendHealth::Degraded { .. }) {
+        if matches!(
+            self.backend_state.aggregate_health,
+            BackendHealth::Degraded { .. }
+        ) {
             self.session.on_backend_degraded();
         }
     }
@@ -444,7 +450,10 @@ fn messages_for_input_event(
     let edge_hits = routing.hit_edges(&event);
 
     match state.session.state() {
-        ControlSessionState::RemoteActive { target, entered_via } => {
+        ControlSessionState::RemoteActive {
+            target,
+            entered_via,
+        } => {
             routing.set_remote_target(target);
             if !is_device_connected(state, target) {
                 state.session.on_target_disconnect(target);
@@ -706,6 +715,7 @@ async fn main() -> Result<()> {
     let device_id = rshare_core::service::load_or_create_local_device_id()?;
     let device_name = format!("{}-R-ShareMouse", hostname);
     let bind_address = format!("{}:{}", config.network.bind_address, config.network.port);
+    let layout_path = rshare_core::service::layout_graph_path()?;
 
     let mut network_manager = NetworkManager::new(device_id, device_name.clone(), hostname.clone())
         .with_config(NetworkManagerConfig {
@@ -734,14 +744,16 @@ async fn main() -> Result<()> {
         available_backends
     );
 
-    let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
+    let mut daemon_state = DaemonState::new(ServiceStatusSnapshot::new(
         device_id,
         device_name.clone(),
         hostname.clone(),
         bind_address.clone(),
         27432,
         pid,
-    ))));
+    ));
+    daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
+    let state = Arc::new(RwLock::new(daemon_state));
 
     // Initialize backend state
     {
@@ -749,8 +761,8 @@ async fn main() -> Result<()> {
         s.update_backend_state(
             input_mode,
             available_backends,
-            backend_health.clone(),  // capture health
-            backend_health,          // inject health
+            backend_health.clone(), // capture health
+            backend_health,         // inject health
             backend_error,
         );
     }
@@ -769,10 +781,13 @@ async fn main() -> Result<()> {
     tracing::info!("Device discovery on port 27432");
     tracing::info!("Local IPC listening on {}", default_ipc_addr());
 
+    let layout_path = Arc::new(layout_path);
+
     let ipc_task = tokio::spawn(run_ipc_server(
         ipc_listener,
         state.clone(),
         network_manager.clone(),
+        layout_path,
         shutdown_tx.clone(),
     ));
 
@@ -840,16 +855,20 @@ async fn run_ipc_server(
     listener: TcpListener,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
+    layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
         let network_manager = network_manager.clone();
+        let layout_path = layout_path.clone();
         let shutdown_tx = shutdown_tx.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_ipc_client(stream, state, network_manager, shutdown_tx).await {
+            if let Err(err) =
+                handle_ipc_client(stream, state, network_manager, layout_path, shutdown_tx).await
+            {
                 tracing::debug!("IPC client error: {}", err);
             }
         });
@@ -860,6 +879,7 @@ async fn handle_ipc_client(
     mut stream: TcpStream,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
+    layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     let request: DaemonRequest = read_json_line(&mut stream).await?;
@@ -920,8 +940,16 @@ async fn handle_ipc_client(
         }
         DaemonRequest::SetLayout { layout } => {
             let mut state = state.write().await;
-            apply_layout_update(&mut state, layout);
-            DaemonResponse::Ack
+            let mut canonical_layout = layout;
+            canonical_layout.canonicalize_local_device(state.status.device_id);
+
+            match save_layout_to_path(&canonical_layout, layout_path.as_ref()) {
+                Ok(()) => {
+                    state.layout = canonical_layout;
+                    DaemonResponse::Ack
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
         }
         DaemonRequest::Shutdown => {
             let _ = shutdown_tx.send(());
@@ -932,9 +960,85 @@ async fn handle_ipc_client(
     write_json_line(&mut stream, &response).await
 }
 
+#[cfg(test)]
 fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
     layout.canonicalize_local_device(state.status.device_id);
     state.layout = layout;
+}
+
+fn default_local_only_layout(local_device: DeviceId) -> LayoutGraph {
+    let mut layout = LayoutGraph::new(local_device);
+    layout.add_node(LayoutNode::new(local_device, 0, 0, 1920, 1080));
+    layout
+}
+
+fn invalid_layout_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.invalid")
+}
+
+fn preserve_invalid_layout_file(path: &Path) {
+    let backup_path = invalid_layout_backup_path(path);
+    if backup_path.exists() {
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    if let Err(error) = fs::rename(path, &backup_path) {
+        tracing::warn!(
+            "Failed to preserve invalid layout file {} as {}: {}",
+            path.display(),
+            backup_path.display(),
+            error
+        );
+    }
+}
+
+fn load_layout_from_path(local_device: DeviceId, path: impl AsRef<Path>) -> Result<LayoutGraph> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(default_local_only_layout(local_device));
+    }
+
+    let loaded = fs::read_to_string(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|content| {
+            serde_json::from_str::<LayoutGraph>(&content).map_err(anyhow::Error::from)
+        });
+
+    match loaded {
+        Ok(mut layout) => {
+            layout.canonicalize_local_device(local_device);
+            Ok(layout)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load persisted layout from {}: {}. Falling back to local-only layout.",
+                path.display(),
+                error
+            );
+            preserve_invalid_layout_file(path);
+            Ok(default_local_only_layout(local_device))
+        }
+    }
+}
+
+fn save_layout_to_path(layout: &LayoutGraph, path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let encoded = serde_json::to_string_pretty(layout)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = path.with_extension(format!("json.tmp-{}", nanos));
+    fs::write(&tmp_path, encoded)?;
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn load_config_with_env_overrides() -> Result<Config> {
@@ -954,6 +1058,7 @@ fn load_config_with_env_overrides() -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn backend_with_missing_capture_is_not_reported_as_available() {
@@ -1113,7 +1218,7 @@ mod tests {
 
     #[test]
     fn right_edge_activates_remote_forwarding() {
-        use rshare_core::{LayoutLink, Direction};
+        use rshare_core::{Direction, LayoutLink};
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut state = DaemonState::new(ServiceStatusSnapshot::new(
@@ -1136,7 +1241,9 @@ mod tests {
             },
         );
         // Add layout link for routing
-        state.layout.add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
         state.layout.add_link(LayoutLink {
             from_device: local_id,
             from_edge: Direction::Right,
@@ -1261,7 +1368,7 @@ mod tests {
 
     #[test]
     fn input_event_forwarding_targets_first_connected_device() {
-        use rshare_core::{LayoutLink, Direction};
+        use rshare_core::{Direction, LayoutLink};
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut state = DaemonState::new(ServiceStatusSnapshot::new(
@@ -1284,7 +1391,9 @@ mod tests {
             },
         );
         // Add layout link for routing
-        state.layout.add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
         state.layout.add_link(LayoutLink {
             from_device: local_id,
             from_edge: Direction::Right,
@@ -1353,7 +1462,7 @@ mod tests {
 
     #[test]
     fn daemon_does_not_forward_to_first_connected_without_layout_link() {
-        use rshare_core::{LayoutGraph, Direction};
+        use rshare_core::{Direction, LayoutGraph};
         use std::collections::HashSet;
 
         let local_id = DeviceId::new_v4();
@@ -1370,7 +1479,7 @@ mod tests {
             remote_id,
             TrackedDevice {
                 id: remote_id,
-                name: "z-remote-last".to_string(),  // Name sorted last, but should not be used
+                name: "z-remote-last".to_string(), // Name sorted last, but should not be used
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
@@ -1389,7 +1498,7 @@ mod tests {
 
     #[test]
     fn daemon_routes_through_layout_graph_not_first_connected() {
-        use rshare_core::{LayoutGraph, LayoutNode, LayoutLink, Direction};
+        use rshare_core::{Direction, LayoutGraph, LayoutLink, LayoutNode};
         use std::collections::HashSet;
 
         let local_id = DeviceId::new_v4();
@@ -1409,7 +1518,7 @@ mod tests {
             remote_a,
             TrackedDevice {
                 id: remote_a,
-                name: "a-device".to_string(),  // Would be first in name sort
+                name: "a-device".to_string(), // Would be first in name sort
                 hostname: "a-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
@@ -1444,20 +1553,35 @@ mod tests {
 
         // Should route to remote_b based on layout, not remote_a (first by name)
         let target = layout.resolve_target(local_id, Direction::Right, &connected_peers);
-        assert_eq!(target, Some(remote_b), "Should route to layout-linked device");
-        assert_ne!(target, Some(remote_a), "Should not route to first-connected device");
+        assert_eq!(
+            target,
+            Some(remote_b),
+            "Should route to layout-linked device"
+        );
+        assert_ne!(
+            target,
+            Some(remote_a),
+            "Should not route to first-connected device"
+        );
     }
 
     #[test]
     fn daemon_disconnect_clears_remote_active_session() {
-        use rshare_core::{CaptureSessionStateMachine, ControlSessionState, Direction, SuspendReason};
+        use rshare_core::{
+            CaptureSessionStateMachine, ControlSessionState, Direction, SuspendReason,
+        };
 
         let remote_id = DeviceId::new_v4();
         let mut machine = CaptureSessionStateMachine::new();
 
         // Enter remote mode
-        machine.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
-        assert!(matches!(machine.state(), ControlSessionState::RemoteActive { .. }));
+        machine
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
+        assert!(matches!(
+            machine.state(),
+            ControlSessionState::RemoteActive { .. }
+        ));
 
         // Disconnect should clear session
         machine.on_target_disconnect(remote_id);
@@ -1471,7 +1595,9 @@ mod tests {
 
     #[test]
     fn daemon_backend_degradation_prevents_forwarding() {
-        use rshare_core::{CaptureSessionStateMachine, ControlSessionState, Direction, SuspendReason};
+        use rshare_core::{
+            CaptureSessionStateMachine, ControlSessionState, Direction, SuspendReason,
+        };
 
         let remote_id = DeviceId::new_v4();
         let mut machine = CaptureSessionStateMachine::new();
@@ -1508,7 +1634,10 @@ mod tests {
 
         // Session state should be accessible
         let snapshot = state.status_snapshot();
-        assert_eq!(snapshot.session_state, Some(ControlSessionState::LocalReady));
+        assert_eq!(
+            snapshot.session_state,
+            Some(ControlSessionState::LocalReady)
+        );
         assert_eq!(snapshot.active_target, None);
     }
 
@@ -1528,9 +1657,15 @@ mod tests {
         ));
 
         // Enter remote mode
-        state.session.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        state
+            .session
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         let snapshot = state.status_snapshot();
-        assert!(matches!(snapshot.session_state, Some(ControlSessionState::RemoteActive { .. })));
+        assert!(matches!(
+            snapshot.session_state,
+            Some(ControlSessionState::RemoteActive { .. })
+        ));
 
         // Disconnect should update session
         state.session.on_target_disconnect(remote_id);
@@ -1559,18 +1694,30 @@ mod tests {
         ));
 
         // Enter and disconnect
-        state.session.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        state
+            .session
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         state.session.on_target_disconnect(remote_id);
 
         // Reset session
         state.session.reset();
         let snapshot = state.status_snapshot();
-        assert_eq!(snapshot.session_state, Some(ControlSessionState::LocalReady));
+        assert_eq!(
+            snapshot.session_state,
+            Some(ControlSessionState::LocalReady)
+        );
 
         // Can enter remote mode again
-        state.session.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        state
+            .session
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         let snapshot = state.status_snapshot();
-        assert!(matches!(snapshot.session_state, Some(ControlSessionState::RemoteActive { .. })));
+        assert!(matches!(
+            snapshot.session_state,
+            Some(ControlSessionState::RemoteActive { .. })
+        ));
     }
 
     #[test]
@@ -1607,5 +1754,103 @@ mod tests {
             .links
             .iter()
             .any(|link| link.from_device == current_local && link.to_device == remote_id));
+    }
+
+    fn test_status(local_id: DeviceId) -> ServiceStatusSnapshot {
+        ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        )
+    }
+
+    fn temp_state_dir() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("rshare-daemon-layout-test-{}", DeviceId::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn remembered_layout(local_id: DeviceId, remote_id: DeviceId) -> LayoutGraph {
+        use rshare_core::{Direction, LayoutLink};
+
+        let mut layout = LayoutGraph::new(local_id);
+        layout.add_node(LayoutNode::new(local_id, 0, 0, 1920, 1080));
+        layout.add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        layout.add_link(LayoutLink::new(
+            local_id,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+        layout
+    }
+
+    #[test]
+    fn daemon_loads_saved_layout_from_state_dir() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let expected = remembered_layout(local_id, remote_id);
+
+        save_layout_to_path(&expected, &layout_path).unwrap();
+
+        let loaded = load_layout_from_path(local_id, &layout_path).unwrap();
+
+        assert_eq!(loaded, expected);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn daemon_falls_back_to_local_only_layout_when_no_saved_layout_exists() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+
+        let loaded = load_layout_from_path(local_id, &layout_path).unwrap();
+
+        let state = DaemonState::new(test_status(local_id));
+        assert_eq!(loaded, state.layout);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn daemon_saved_layout_survives_restart_semantics() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let expected = remembered_layout(local_id, remote_id);
+
+        let mut first_start = DaemonState::new(test_status(local_id));
+        apply_layout_update(&mut first_start, expected.clone());
+        save_layout_to_path(&first_start.layout, &layout_path).unwrap();
+
+        let restarted = load_layout_from_path(local_id, &layout_path).unwrap();
+
+        assert_eq!(restarted, first_start.layout);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn daemon_falls_back_to_local_only_layout_when_saved_layout_is_invalid_json() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+
+        std::fs::write(&layout_path, "{ definitely-not-json").unwrap();
+
+        let loaded = load_layout_from_path(local_id, &layout_path).unwrap();
+
+        assert_eq!(loaded, default_local_only_layout(local_id));
+        assert!(
+            layout_path.with_extension("json.invalid").exists(),
+            "invalid layout should be retained for inspection"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

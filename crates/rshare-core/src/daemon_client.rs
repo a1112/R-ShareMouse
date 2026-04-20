@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 
 use crate::{
     default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot,
-    DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
+    DaemonRequest, DaemonResponse, ServiceStatusSnapshot, LayoutGraph,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -133,4 +133,20 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         daemon_name,
         current_exe.display()
     )
+}
+
+pub async fn request_layout() -> Result<LayoutGraph> {
+    match send_request(DaemonRequest::GetLayout).await? {
+        DaemonResponse::Layout(layout) => Ok(layout),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_set_layout(layout: LayoutGraph) -> Result<()> {
+    match send_request(DaemonRequest::SetLayout { layout }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
 }

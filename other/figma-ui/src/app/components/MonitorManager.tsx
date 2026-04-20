@@ -31,6 +31,11 @@ import {
 /* ---------- Types ---------- */
 export interface MonitorData {
   id: string;
+  displayId?: string;
+  rememberedX?: number;
+  rememberedY?: number;
+  visibleX?: number;
+  visibleY?: number;
   label: string;
   name: string;
   deviceId: string;
@@ -153,6 +158,7 @@ interface MonitorManagerProps {
   isDark?: boolean;
   showThemeToggle?: boolean;
   showFooter?: boolean;
+  onMonitorsCommit?: (monitors: MonitorData[]) => void;
 }
 
 function normalizeDevice(device: DeviceData): DeviceData {
@@ -172,6 +178,7 @@ export default function MonitorManager({
   isDark: externalIsDark,
   showThemeToggle = true,
   showFooter = true,
+  onMonitorsCommit,
 }: MonitorManagerProps) {
   const [monitors, setMonitors] = useState<MonitorData[]>(
     externalMonitors && externalMonitors.length ? externalMonitors : initialMonitors
@@ -383,9 +390,12 @@ export default function MonitorManager({
   );
 
   const handleMouseUp = useCallback(() => {
+    if (dragging) {
+      onMonitorsCommit?.(monitors);
+    }
     setDragging(null);
     setSnapLines([]);
-  }, []);
+  }, [dragging, monitors, onMonitorsCommit]);
 
   useEffect(() => {
     if (dragging) {

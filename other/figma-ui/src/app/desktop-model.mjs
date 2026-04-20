@@ -1,5 +1,8 @@
 const DEVICE_COLORS = ["#5b8bd6", "#49b35c", "#d6a64b", "#9b6ef3", "#e56b6f"];
 const LOCAL_DEVICE_COLOR = "#60a5fa";
+const LAYOUT_SCALE = 0.12;
+const CANVAS_ORIGIN_X = 80;
+const CANVAS_ORIGIN_Y = 170;
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -67,6 +70,158 @@ function buildLayoutMonitor(device, index, kind) {
   };
 }
 
+function findRememberedDisplay(rememberedLayout, deviceId, displayId) {
+  return rememberedLayout?.nodes
+    ?.find((node) => node.device_id === deviceId)
+    ?.displays?.find((display) => (display.display_id ?? "primary") === displayId);
+}
+
+function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices) {
+  if (!visibleLayout?.nodes?.length) {
+    return null;
+  }
+
+  const deviceLookup = new Map([
+    [localDevice.id, localDevice],
+    ...remoteDevices.map((device) => [device.id, device]),
+  ]);
+  const layoutDevices = visibleLayout.nodes
+    .map((node) => deviceLookup.get(node.device_id))
+    .filter(Boolean);
+
+  if (!layoutDevices.length) {
+    return null;
+  }
+
+  const layoutMonitors = [];
+  for (const node of visibleLayout.nodes) {
+    const device = deviceLookup.get(node.device_id);
+    if (!device) {
+      continue;
+    }
+
+    for (const display of node.displays ?? []) {
+      const monitorIndex = layoutMonitors.length;
+      const width = Number(display.width ?? 1920);
+      const height = Number(display.height ?? 1080);
+      const displayId = display.display_id ?? "primary";
+      const rememberedDisplay = findRememberedDisplay(
+        rememberedLayout,
+        node.device_id,
+        displayId,
+      );
+      layoutMonitors.push({
+        id: `${node.device_id}-${displayId}`,
+        deviceId: node.device_id,
+        displayId,
+        rememberedX: Number(rememberedDisplay?.x ?? display.x ?? 0),
+        rememberedY: Number(rememberedDisplay?.y ?? display.y ?? 0),
+        visibleX: Number(display.x ?? 0),
+        visibleY: Number(display.y ?? 0),
+        label: String.fromCharCode(65 + monitorIndex),
+        name:
+          device.kind === "local"
+            ? `${device.name} 显示器`
+            : `${device.name} 屏幕`,
+        resWidth: width,
+        resHeight: height,
+        color: device.color,
+        x: CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE,
+        y: CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE,
+        w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+        h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+        primary: Boolean(display.primary),
+        enabled: true,
+      });
+    }
+  }
+
+  return {
+    devices: layoutDevices,
+    monitors: layoutMonitors,
+  };
+}
+
+function primaryDisplay(node) {
+  return (node.displays ?? []).find((display) => display.primary) ?? node.displays?.[0] ?? null;
+}
+
+function rebuildHorizontalLinks(nodes) {
+  const sorted = [...nodes].sort((left, right) => {
+    const leftDisplay = primaryDisplay(left);
+    const rightDisplay = primaryDisplay(right);
+    return Number(leftDisplay?.x ?? 0) - Number(rightDisplay?.x ?? 0);
+  });
+
+  const links = [];
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const left = sorted[index].device_id;
+    const right = sorted[index + 1].device_id;
+    links.push({
+      from_device: left,
+      from_edge: "Right",
+      to_device: right,
+      to_edge: "Left",
+    });
+    links.push({
+      from_device: right,
+      from_edge: "Left",
+      to_device: left,
+      to_edge: "Right",
+    });
+  }
+  return links;
+}
+
+export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, monitors) {
+  if (!rememberedLayout?.nodes) {
+    return rememberedLayout;
+  }
+
+  const monitorByDisplay = new Map(
+    (monitors ?? []).map((monitor) => [
+      `${monitor.deviceId}:${monitor.displayId ?? monitor.id?.split("-").pop() ?? "primary"}`,
+      monitor,
+    ]),
+  );
+
+  const nodes = rememberedLayout.nodes.map((node) => ({
+      ...node,
+      displays: (node.displays ?? []).map((display) => {
+        const displayId = display.display_id ?? "primary";
+        const monitor = monitorByDisplay.get(`${node.device_id}:${displayId}`);
+        if (!monitor) {
+          return { ...display };
+        }
+
+        const rememberedX = Number(monitor.rememberedX ?? display.x ?? 0);
+        const rememberedY = Number(monitor.rememberedY ?? display.y ?? 0);
+        const visibleX = Number(monitor.visibleX ?? rememberedX);
+        const visibleY = Number(monitor.visibleY ?? rememberedY);
+
+        return {
+          ...display,
+          x: Math.round(
+            rememberedX +
+              (Number(monitor.x) - (CANVAS_ORIGIN_X + visibleX * LAYOUT_SCALE)) /
+                LAYOUT_SCALE,
+          ),
+          y: Math.round(
+            rememberedY +
+              (Number(monitor.y) - (CANVAS_ORIGIN_Y + visibleY * LAYOUT_SCALE)) /
+                LAYOUT_SCALE,
+          ),
+        };
+      }),
+    }));
+
+  return {
+    ...rememberedLayout,
+    nodes,
+    links: rebuildHorizontalLinks(nodes),
+  };
+}
+
 function parseBackendHealth(backendHealth) {
   if (!backendHealth) {
     return { health: "未知", reason: null };
@@ -90,10 +245,20 @@ export function buildDesktopViewModel(payload) {
   const status = payload?.status ?? null;
   const localDevice = buildLocalDevice(status);
   const remoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
-  const layoutDevices = [localDevice, ...remoteDevices];
-  const layoutMonitors = layoutDevices.map((device, index) =>
-    buildLayoutMonitor(device, index, device.kind),
+  const daemonLayout = buildLayoutFromVisibleGraph(
+    payload?.visible_layout,
+    payload?.layout,
+    localDevice,
+    remoteDevices,
   );
+  const layoutUnavailable = Boolean(payload?.layout_error && status && !payload?.visible_layout);
+  const fallbackDevices = layoutUnavailable ? [localDevice] : [localDevice, ...remoteDevices];
+  const layoutDevices = daemonLayout?.devices ?? fallbackDevices;
+  const layoutMonitors =
+    daemonLayout?.monitors ??
+    layoutDevices.map((device, index) =>
+      buildLayoutMonitor(device, index, device.kind),
+    );
   const backendState = parseBackendHealth(status?.backend_health);
 
   return {
@@ -101,13 +266,17 @@ export function buildDesktopViewModel(payload) {
       online: Boolean(status),
       healthy: Boolean(status?.healthy),
       label: status ? "运行中" : "已停止",
-      error: status?.last_backend_error ?? null,
+      error: status?.last_backend_error ?? payload?.layout_error ?? null,
       discoveredDevices: status?.discovered_devices ?? remoteDevices.length,
       connectedDevices: status?.connected_devices ?? 0,
+      autoStarted: Boolean(payload?.auto_started),
     },
     layout: {
       devices: layoutDevices,
       monitors: layoutMonitors,
+      remembered: payload?.layout ?? null,
+      visible: payload?.visible_layout ?? null,
+      error: payload?.layout_error ?? null,
     },
     devices: remoteDevices,
     settings: {

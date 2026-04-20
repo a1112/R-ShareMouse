@@ -16,7 +16,10 @@ import MonitorManager, {
   DeviceData as LayoutDevice,
   MonitorData,
 } from "./components/MonitorManager";
-import { buildDesktopViewModel } from "./desktop-model.mjs";
+import {
+  buildDesktopViewModel,
+  updateRememberedLayoutFromVisibleMonitors,
+} from "./desktop-model.mjs";
 import {
   buildFooterStatus,
   getHeaderMetrics,
@@ -41,6 +44,10 @@ type DashboardPayload = {
     connected: boolean;
     last_seen_secs?: number | null;
   }>;
+  layout?: unknown | null;
+  visible_layout?: unknown | null;
+  layout_error?: string | null;
+  auto_started?: boolean;
 };
 
 type TauriInvoke = <T = unknown>(
@@ -98,6 +105,16 @@ function getLayoutDevices(layoutDevices: Array<Record<string, unknown>>): Layout
 function getLayoutMonitors(layoutMonitors: Array<Record<string, unknown>>): MonitorData[] {
   return layoutMonitors.map((monitor) => ({
     id: String(monitor.id),
+    displayId:
+      monitor.displayId == null ? undefined : String(monitor.displayId),
+    rememberedX:
+      monitor.rememberedX == null ? undefined : Number(monitor.rememberedX),
+    rememberedY:
+      monitor.rememberedY == null ? undefined : Number(monitor.rememberedY),
+    visibleX:
+      monitor.visibleX == null ? undefined : Number(monitor.visibleX),
+    visibleY:
+      monitor.visibleY == null ? undefined : Number(monitor.visibleY),
     label: String(monitor.label),
     name: String(monitor.name),
     deviceId: String(monitor.deviceId),
@@ -135,7 +152,7 @@ export default function App() {
     try {
       const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
       setPayload(snapshot);
-      setError(null);
+      setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
     } catch (refreshError) {
       setPayload(EMPTY_PAYLOAD);
       setError(String(refreshError));
@@ -197,6 +214,38 @@ export default function App() {
       await refreshDashboard();
     } catch (actionError) {
       setError(String(actionError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveLayoutFromMonitors(monitors: MonitorData[]) {
+    const rememberedLayout = model.layout.remembered;
+    if (!rememberedLayout) {
+      return;
+    }
+
+    const nextLayout = updateRememberedLayoutFromVisibleMonitors(
+      rememberedLayout,
+      monitors,
+    );
+    setBusy(true);
+    try {
+      await invokeCommand("set_layout", { layout: nextLayout });
+      setPayload((current) => ({
+        ...current,
+        layout: nextLayout,
+        layout_error: null,
+      }));
+      setError(null);
+      await refreshDashboard();
+    } catch (layoutSaveError) {
+      const message = `布局未保存：${String(layoutSaveError)}`;
+      setPayload((current) => ({
+        ...current,
+        layout_error: message,
+      }));
+      setError(message);
     } finally {
       setBusy(false);
     }
@@ -386,7 +435,12 @@ export default function App() {
               showThemeToggle={false}
               showFooter={false}
               statusText={`布局画布 · ${model.devices.length} 台远端设备`}
-              footerText="拖拽只影响当前界面展示。"
+              onMonitorsCommit={saveLayoutFromMonitors}
+              footerText={
+                model.layout.error
+                  ? `布局未保存：${model.layout.error}`
+                  : "布局来自守护进程记忆；离线设备已隐藏。"
+              }
             />
           ) : null}
 

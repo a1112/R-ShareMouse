@@ -236,6 +236,16 @@ pub fn local_device_id_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("device-id"))
 }
 
+/// Get the state file path for the persisted layout graph.
+pub fn layout_graph_path() -> Result<PathBuf> {
+    Ok(layout_graph_path_in(state_dir()?))
+}
+
+/// Get the persisted layout graph path within a specific state directory.
+pub fn layout_graph_path_in(state_dir: impl AsRef<Path>) -> PathBuf {
+    state_dir.as_ref().join("layout.json")
+}
+
 /// Load the persisted local device identifier, creating one on first launch.
 pub fn load_or_create_local_device_id() -> Result<DeviceId> {
     load_or_create_local_device_id_at(local_device_id_path()?)
@@ -296,8 +306,9 @@ fn get_state_dir() -> Result<PathBuf> {
 fn load_or_create_local_device_id_at(path: impl AsRef<Path>) -> Result<DeviceId> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create device id directory: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create device id directory: {}", parent.display())
+        })?;
     }
 
     if path.exists() {

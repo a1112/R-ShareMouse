@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::Direction;
 
+const DEFAULT_DISPLAY_WIDTH: u32 = 1920;
+const DEFAULT_DISPLAY_HEIGHT: u32 = 1080;
+
 /// Display geometry within a layout node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayNode {
@@ -92,7 +95,12 @@ pub struct LayoutLink {
 
 impl LayoutLink {
     /// Create a new directional link.
-    pub fn new(from_device: Uuid, from_edge: Direction, to_device: Uuid, to_edge: Direction) -> Self {
+    pub fn new(
+        from_device: Uuid,
+        from_edge: Direction,
+        to_device: Uuid,
+        to_edge: Direction,
+    ) -> Self {
         Self {
             from_device,
             from_edge,
@@ -146,16 +154,132 @@ impl LayoutGraph {
         self.links.push(link);
     }
 
+    /// Set the target for a source device edge.
+    ///
+    /// A source edge can only point to one target. Replacing conflicting edge
+    /// mappings keeps routing deterministic because `resolve_target` returns
+    /// the first matching source edge.
+    pub fn upsert_link_for_edge(&mut self, link: LayoutLink) {
+        self.links.retain(|existing| {
+            !(existing.from_device == link.from_device && existing.from_edge == link.from_edge)
+        });
+        self.links.push(link);
+    }
+
     /// Remove a node by device ID.
     pub fn remove_node(&mut self, device_id: Uuid) {
         self.nodes.retain(|n| n.device_id != device_id);
         // Also remove any links involving this device
-        self.links.retain(|l| l.from_device != device_id && l.to_device != device_id);
+        self.links
+            .retain(|l| l.from_device != device_id && l.to_device != device_id);
     }
 
     /// Get a node by device ID.
     pub fn get_node(&self, device_id: Uuid) -> Option<&LayoutNode> {
         self.nodes.iter().find(|n| n.device_id == device_id)
+    }
+
+    /// Merge newly discovered peers into the remembered graph.
+    ///
+    /// Existing nodes are left untouched. New peers are appended to the right
+    /// of the current right-most remembered node and linked bidirectionally to
+    /// their immediate left neighbor.
+    pub fn merge_discovered_peers_to_right<I>(&mut self, discovered_peers: I) -> bool
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
+        let mut changed = false;
+        if self.get_node(self.local_device).is_none() {
+            self.add_node(LayoutNode::new(
+                self.local_device,
+                0,
+                0,
+                DEFAULT_DISPLAY_WIDTH,
+                DEFAULT_DISPLAY_HEIGHT,
+            ));
+            changed = true;
+        }
+
+        let mut missing_peers: Vec<_> = discovered_peers
+            .into_iter()
+            .filter(|peer_id| *peer_id != self.local_device && self.get_node(*peer_id).is_none())
+            .collect();
+        missing_peers.sort();
+
+        for peer_id in missing_peers {
+            let (neighbor_id, x, y) = self
+                .rightmost_node()
+                .map(|node| {
+                    let (_, _, right, _) = node_display_bounds(node);
+                    let y = node.primary_display().map(|display| display.y).unwrap_or(0);
+                    (node.device_id, right, y)
+                })
+                .unwrap_or((self.local_device, 0, 0));
+
+            self.add_node(LayoutNode::new(
+                peer_id,
+                x,
+                y,
+                DEFAULT_DISPLAY_WIDTH,
+                DEFAULT_DISPLAY_HEIGHT,
+            ));
+            self.add_bidirectional_neighbor_link(neighbor_id, peer_id);
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Build an online-only compact projection for display rendering.
+    ///
+    /// The persisted graph is not mutated. Offline nodes are omitted from the
+    /// returned graph, while visible nodes are packed horizontally in remembered
+    /// order so hidden offline nodes do not leave gaps in the canvas. This
+    /// return value is display-only and must not be saved as remembered layout.
+    pub fn compact_online_display_projection<I>(&self, online_devices: I) -> LayoutGraph
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
+        let mut visible_devices: HashSet<Uuid> = online_devices.into_iter().collect();
+        visible_devices.insert(self.local_device);
+
+        let mut visible_nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|node| visible_devices.contains(&node.device_id))
+            .cloned()
+            .collect();
+        visible_nodes.sort_by(|left, right| {
+            let left_bounds = node_display_bounds(left);
+            let right_bounds = node_display_bounds(right);
+            left_bounds
+                .0
+                .cmp(&right_bounds.0)
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+
+        let mut projection = LayoutGraph::new(self.local_device);
+        let mut cursor_x = 0;
+        for mut node in visible_nodes {
+            let (left, _, right, _) = node_display_bounds(&node);
+            let width = right.saturating_sub(left).max(1);
+            for display in &mut node.displays {
+                display.x = display.x - left + cursor_x;
+            }
+            cursor_x += width;
+            projection.add_node(node);
+        }
+
+        projection.links = self
+            .links
+            .iter()
+            .filter(|link| {
+                visible_devices.contains(&link.from_device)
+                    && visible_devices.contains(&link.to_device)
+            })
+            .cloned()
+            .collect();
+        projection
     }
 
     /// Resolve the target device for a given edge hit from a device.
@@ -178,9 +302,10 @@ impl LayoutGraph {
         }
 
         // Find a matching link
-        let link = self.links.iter().find(|l| {
-            l.from_device == from_device && l.from_edge == edge
-        })?;
+        let link = self
+            .links
+            .iter()
+            .find(|l| l.from_device == from_device && l.from_edge == edge)?;
 
         // Check if the target is connected
         if connected_peers.contains(&link.to_device) {
@@ -236,6 +361,50 @@ impl LayoutGraph {
             self.add_node(LayoutNode::new(current_local, 0, 0, 1920, 1080));
         }
     }
+
+    fn rightmost_node(&self) -> Option<&LayoutNode> {
+        self.nodes.iter().max_by(|left, right| {
+            let left_bounds = node_display_bounds(left);
+            let right_bounds = node_display_bounds(right);
+            left_bounds
+                .2
+                .cmp(&right_bounds.2)
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        })
+    }
+
+    fn add_bidirectional_neighbor_link(&mut self, left_device: Uuid, right_device: Uuid) {
+        let forward = LayoutLink::new(left_device, Direction::Right, right_device, Direction::Left);
+        let reverse = forward.reverse();
+        self.upsert_link_for_edge(forward);
+        self.upsert_link_for_edge(reverse);
+    }
+}
+
+fn node_display_bounds(node: &LayoutNode) -> (i32, i32, i32, i32) {
+    let mut displays = node.displays.iter();
+    let Some(first) = displays.next() else {
+        return (
+            0,
+            0,
+            DEFAULT_DISPLAY_WIDTH as i32,
+            DEFAULT_DISPLAY_HEIGHT as i32,
+        );
+    };
+
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first.x + first.width as i32;
+    let mut bottom = first.y + first.height as i32;
+
+    for display in displays {
+        left = left.min(display.x);
+        top = top.min(display.y);
+        right = right.max(display.x + display.width as i32);
+        bottom = bottom.max(display.y + display.height as i32);
+    }
+
+    (left, top, right, bottom)
 }
 
 #[cfg(test)]
