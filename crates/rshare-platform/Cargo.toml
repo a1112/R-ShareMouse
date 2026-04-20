@@ -39,6 +39,6 @@ x11 = { version = "2.21", features = ["xlib", "xtest", "xrandr"], optional = tru
 wayland-client = { version = "0.31", optional = true }
 
 [features]
-default = []
+default = ["x11"]
 x11 = ["dep:x11"]
 wayland = ["dep:wayland-client"]

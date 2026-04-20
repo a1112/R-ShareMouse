@@ -218,19 +218,25 @@ mod macos_impl {
     }
 }
 
-// Linux implementation
+// Linux implementation with X11 DND support
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{FileDragDetector, FileDragEvent};
     use std::sync::mpsc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    #[cfg(feature = "x11")]
+    use x11::xlib;
 
     /// Linux file drag detector
     ///
-    /// Uses X11 DND or Wayland drag-and-drop protocols.
+    /// Monitors X11 selection changes for drag-and-drop operations.
     pub struct LinuxFileDragDetector {
         tx: mpsc::Sender<FileDragEvent>,
         rx: Option<mpsc::Receiver<FileDragEvent>>,
         active: bool,
+        worker: Option<JoinHandle<()>>,
     }
 
     impl LinuxFileDragDetector {
@@ -240,7 +246,155 @@ mod linux_impl {
                 tx,
                 rx: Some(rx),
                 active: false,
+                worker: None,
             }
+        }
+
+        #[cfg(feature = "x11")]
+        fn start_x11_monitor(&mut self) -> anyhow::Result<()> {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+
+            let running = Arc::new(AtomicBool::new(true));
+            let tx = self.tx.clone();
+            let running_clone = running.clone();
+
+            let worker = thread::spawn(move || {
+                // Try to open X11 display
+                let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+                if display.is_null() {
+                    tracing::warn!("Failed to open X11 display for file drag detection");
+                    return;
+                }
+
+                tracing::info!("X11 file drag monitor started");
+
+                // XdndSelection atom
+                let xdnd_selection_atom = unsafe {
+                    xlib::XInternAtom(
+                        display as *mut _,
+                        b"XdndSelection\0".as_ptr() as *const i8,
+                        0,
+                    )
+                };
+
+                let mut last_files = Vec::new();
+
+                while running_clone.load(Ordering::Relaxed) {
+                    // Check for selection owner changes
+                    let owner = unsafe { xlib::XGetSelectionOwner(display as *mut _, xdnd_selection_atom) };
+
+                    if owner != 0 {
+                        // Request selection content
+                        unsafe {
+                            // Convert window - use root window
+                            let screen = xlib::XDefaultScreen(display as *mut _);
+                            let root = xlib::XRootWindow(display as *mut _, screen);
+
+                            // Request the selection as text/uri-list
+                            let utf8_string_atom = xlib::XInternAtom(
+                                display as *mut _,
+                                b"TEXT/URI-LIST\0".as_ptr() as *const i8,
+                                1,  // only_if_exists = false
+                            );
+
+                            xlib::XConvertSelection(
+                                display as *mut _,
+                                xdnd_selection_atom,
+                                utf8_string_atom,
+                                xlib::XA_PRIMARY,
+                                root,
+                                xlib::CurrentTime,
+                            );
+                            xlib::XFlush(display as *mut _);
+                        }
+
+                        // Small delay to let the selection owner respond
+                        thread::sleep(Duration::from_millis(50));
+
+                        // Try to get the selection content
+                        let files = Self::get_selection_content(display);
+                        if let Ok(current_files) = files {
+                            if !current_files.is_empty() && current_files != last_files {
+                                last_files = current_files.clone();
+                                let _ = tx.send(FileDragEvent::FilesDragged(current_files));
+                            } else if current_files.is_empty() && !last_files.is_empty() {
+                                last_files.clear();
+                                let _ = tx.send(FileDragEvent::DragCancelled);
+                            }
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(200));
+                }
+
+                unsafe { xlib::XCloseDisplay(display) };
+            });
+
+            self.worker = Some(worker);
+            Ok(())
+        }
+
+        #[cfg(feature = "x11")]
+        fn get_selection_content(display: *mut xlib::Display) -> anyhow::Result<Vec<String>> {
+            use std::ptr;
+
+            unsafe {
+                let screen = xlib::XDefaultScreen(display);
+                let root = xlib::XRootWindow(display, screen);
+
+                // Try to get the property from PRIMARY selection
+                let mut atom_return: u64 = 0;
+                let mut actual_type: u64 = 0;
+                let mut format: i32 = 0;
+                let mut nitems: u64 = 0;
+                let mut bytes_after: u64 = 0;
+                let mut prop_return: *mut u8 = ptr::null_mut();
+
+                let result = xlib::XGetWindowProperty(
+                    display,
+                    root,
+                    xlib::XA_PRIMARY,
+                    0,
+                    1024,
+                    0,  // delete
+                    xlib::XA_STRING,
+                    &mut actual_type,
+                    &mut format,
+                    &mut nitems,
+                    &mut bytes_after,
+                    &mut prop_return,
+                );
+
+                if result == 0 && !prop_return.is_null() && nitems > 0 {
+                    let slice = std::slice::from_raw_parts(prop_return, nitems as usize);
+                    let content = String::from_utf8_lossy(slice);
+                    xlib::XFree(prop_return as *mut _);
+
+                    // Parse text/uri-list format
+                    let files: Vec<String> = content
+                        .lines()
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(|line| {
+                            // Remove file:// prefix if present
+                            line.trim()
+                                .strip_prefix("file://")
+                                .unwrap_or(line.trim())
+                                .to_string()
+                        })
+                        .collect();
+
+                    Ok(files)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        #[cfg(not(feature = "x11"))]
+        fn start_x11_monitor(&mut self) -> anyhow::Result<()> {
+            tracing::warn!("X11 feature not enabled, file drag detection not available");
+            Ok(())
         }
     }
 
@@ -251,20 +405,33 @@ mod linux_impl {
             }
 
             self.active = true;
-            tracing::info!("Linux file drag detector started");
+            tracing::info!("Linux file drag detector starting");
 
-            // TODO: Implement Linux file drag detection
-            // This requires:
-            // 1. X11: Monitor XdndSelection events
-            // 2. Wayland: Monitor data_device drag events
-            // 3. Parse text/uri-list MIME data
-            // 4. Send events through the channel
+            #[cfg(feature = "x11")]
+            {
+                self.start_x11_monitor()?;
+            }
+
+            #[cfg(not(feature = "x11"))]
+            {
+                tracing::warn!("Linux file drag detection requires x11 feature");
+            }
 
             Ok(())
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+
             self.active = false;
+            if let Some(worker) = self.worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Linux file drag detector thread panicked"))?;
+            }
+
             tracing::info!("Linux file drag detector stopped");
             Ok(())
         }
@@ -277,6 +444,12 @@ mod linux_impl {
     impl Default for LinuxFileDragDetector {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    impl Drop for LinuxFileDragDetector {
+        fn drop(&mut self) {
+            let _ = self.stop();
         }
     }
 }

@@ -158,8 +158,13 @@ impl PortableCaptureBackend {
     }
 
     /// Create a new portable capture backend for testing.
+    ///
+    /// Returns a backend with Healthy status for availability detection.
+    /// The backend must still be started before it will capture events.
     pub fn new_for_test() -> Result<Self> {
-        Ok(Self::new())
+        let mut backend = Self::new();
+        backend.health = BackendHealth::Healthy;
+        Ok(backend)
     }
 }
 
@@ -607,6 +612,7 @@ impl PrivilegeBackend for NoopPrivilegeBackend {
 }
 
 /// Re-export privilege types for convenience
+#[cfg(target_os = "windows")]
 pub use crate::privilege::WindowsPrivilegeBackend as PrivilegeTracker;
 
 #[cfg(not(target_os = "windows"))]

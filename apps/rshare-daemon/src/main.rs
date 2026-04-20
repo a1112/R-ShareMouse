@@ -11,7 +11,7 @@ use rshare_core::{
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, DefaultInputListener, InjectBackend,
-    InputEvent, InputListener, PortableCaptureBackend, PortableInjectBackend,
+    InputEvent, InputListener, PortableCaptureBackend, PortableInjectBackend, RDevInputListener,
 };
 use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
 
@@ -770,11 +770,11 @@ async fn main() -> Result<()> {
 
     let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
-    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-    let mut input_listener = DefaultInputListener::new();
-    input_listener.start(Box::new(move |event| {
-        let _ = input_tx.send(event);
-    }))?;
+
+    // Use RDevInputListener for cross-platform input capture
+    let mut input_listener = RDevInputListener::new();
+    let input_rx = input_listener.receiver();
+    input_listener.start().await?;
 
     tracing::info!("Daemon started as device {} ({})", device_name, device_id);
     tracing::info!("Listening for connections on {}", bind_address);
@@ -803,6 +803,7 @@ async fn main() -> Result<()> {
         let state = state.clone();
         let inject_backend = inject_backend.clone();
         tokio::spawn(async move {
+            tracing::info!("Event task: starting to wait for events");
             while let Some(event) = events.recv().await {
                 let mut state = state.write().await;
                 match event {
@@ -823,28 +824,37 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            tracing::debug!("Event task: events channel closed");
         })
     };
 
+    tracing::info!("Entering tokio::select! loop");
     tokio::select! {
-        _ = signal::ctrl_c() => {
-            tracing::info!("Shutdown signal received");
+        result = signal::ctrl_c() => {
+            match result {
+                Ok(()) => tracing::info!("Shutdown signal received"),
+                Err(e) => tracing::warn!("Ctrl-C handler error: {}", e),
+            }
         }
         _ = shutdown_rx.recv() => {
             tracing::info!("Shutdown requested over IPC");
         }
         result = ipc_task => {
+            tracing::info!("IPC task completed");
             result??;
         }
         result = event_task => {
+            tracing::info!("Event task completed");
             result?;
         }
         result = input_forwarding_task => {
+            tracing::info!("Input forwarding task completed");
             result??;
         }
     }
 
-    input_listener.stop()?;
+    tracing::info!("tokio::select! exited, cleaning up");
+    input_listener.stop().await?;
     network_manager.lock().await.stop().await?;
 
     tracing::info!("R-ShareMouse daemon stopped");

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4A90D9;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#357ABD;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded rectangle -->
+  <rect x="10" y="10" width="108" height="108" rx="20" ry="20" fill="url(#grad1)"/>
+
+  <!-- Mouse icon -->
+  <g transform="translate(64, 64)" fill="white">
+    <!-- Mouse body -->
+    <ellipse cx="0" cy="-5" rx="18" ry="24" fill="white"/>
+
+    <!-- Mouse wheel/line -->
+    <rect x="-2" y="-18" width="4" height="10" rx="2" fill="#4A90D9"/>
+
+    <!-- Mouse buttons line -->
+    <line x1="-15" y1="-8" x2="15" y2="-8" stroke="#4A90D9" stroke-width="1.5" opacity="0.3"/>
+  </g>
+
+  <!-- Share arrows -->
+  <g transform="translate(64, 64)">
+    <!-- Left arrow -->
+    <path d="M -35 5 L -45 0 L -35 -5 M -45 0 L -30 0"
+          stroke="white" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Right arrow -->
+    <path d="M 35 -5 L 45 0 L 35 5 M 45 0 L 30 0"
+          stroke="white" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Connection dots -->
+  <circle cx="25" cy="64" r="4" fill="white" opacity="0.8"/>
+  <circle cx="103" cy="64" r="4" fill="white" opacity="0.8"/>
+</svg>

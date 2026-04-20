@@ -7,7 +7,8 @@ use rshare_core::{
 };
 use serde::Serialize;
 use std::{future::Future, pin::Pin};
-use tauri::WebviewWindow;
+use tauri::{WebviewWindow, AppHandle, Manager};
+use tauri::path::BaseDirectory;
 
 type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
 
@@ -325,10 +326,73 @@ fn main() {
             set_config,
             get_layout,
             set_layout,
-            show_tray
+            show_tray,
+            hide_to_tray
         ])
+        .setup(|app| {
+            // Setup system tray
+            setup_system_tray(app.handle())?;
+
+            // Handle window close event to minimize to tray
+            let app_handle = app.handle().clone();
+            app.get_webview_window("main").unwrap().on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    // Hide window instead of closing
+                    let _ = app_handle.get_webview_window("main").unwrap().hide();
+                }
+            });
+
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("failed to run Tauri desktop app");
+}
+
+/// Setup system tray with icon
+fn setup_system_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tray_icon::{Icon, TrayIconBuilder};
+
+    // Get the icon path from resources
+    let icon_path = app.path().resolve("icons/icon.png", BaseDirectory::Resource)?;
+
+    // Load the icon from file and convert to RGBA
+    let image_data = std::fs::read(&icon_path)?;
+    let decoder = png::Decoder::new(std::io::Cursor::new(image_data));
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+
+    // PNG decoder may output RGBA or RGB, convert to RGBA if needed
+    let rgba = if info.color_type == png::ColorType::Rgba {
+        buf.to_vec()
+    } else {
+        // Convert RGB to RGBA
+        let mut rgba_buf = Vec::with_capacity(buf.len() / 3 * 4);
+        for chunk in buf.chunks(3) {
+            rgba_buf.push(chunk[0]);
+            rgba_buf.push(chunk[1]);
+            rgba_buf.push(chunk[2]);
+            rgba_buf.push(255);
+        }
+        rgba_buf
+    };
+
+    let icon = Icon::from_rgba(rgba, info.width, info.height)?;
+
+    // Create tray icon
+    let _tray = TrayIconBuilder::new()
+        .with_tooltip("R-ShareMouse")
+        .with_icon(icon)
+        .build()?;
+
+    println!("System tray initialized");
+    Ok(())
+}
+
+/// Hide window to tray
+#[tauri::command]
+async fn hide_to_tray(window: WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
