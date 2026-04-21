@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
+  FileText,
   LayoutGrid,
   Maximize2,
   Minus,
@@ -32,7 +33,7 @@ import {
   getDesktopTheme,
 } from "./desktop-theme.mjs";
 
-type DesktopPage = "layout" | "devices" | "settings";
+type DesktopPage = "layout" | "devices" | "logs" | "settings";
 
 type DashboardPayload = {
   status: unknown;
@@ -452,6 +453,10 @@ export default function App() {
               onDisconnect={disconnectDevice}
               theme={theme}
             />
+          ) : null}
+
+          {page === "logs" ? (
+            <LogsPage theme={theme} />
           ) : null}
 
           {page === "settings" ? (
@@ -1098,6 +1103,170 @@ function EmptyPanel({
         <p className="mt-3 text-sm leading-6" style={{ color: theme.textMuted }}>
           {detail}
         </p>
+      </div>
+    </div>
+  );
+}
+
+function LogsPage({ theme }: { theme: typeof FIGMA_DESKTOP_THEME }) {
+  const [logs, setLogs] = useState<Array<{
+    timestamp: string;
+    level: string;
+    target: string;
+    message: string;
+  }>>([]);
+  const [filter, setFilter] = useState<"all" | "error" | "warn" | "info" | "debug">("all");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+
+  const loadLogs = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invokeCommand<{
+        timestamp: string;
+        level: string;
+        target: string;
+        message: string;
+      }[]>("get_logs", { limit: 1000 });
+      setLogs(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const clearLogs = async () => {
+    try {
+      await invokeCommand("clear_logs");
+      setLogs([]);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  useEffect(() => {
+    loadLogs();
+  }, []);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = setInterval(loadLogs, 2000);
+    return () => clearInterval(timer);
+  }, [autoRefresh]);
+
+  const filteredLogs = logs.filter(log => {
+    if (filter === "all") return true;
+    return log.level.toLowerCase() === filter;
+  });
+
+  const getLevelColor = (level: string) => {
+    switch (level.toLowerCase()) {
+      case "error": return "#ffb5c0";
+      case "warn": return "#e5c37a";
+      case "info": return "#8de29d";
+      default: return theme.textMuted;
+    }
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="mb-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-md" style={{ background: theme.accentSoft }}>
+            <FileText size={18} />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">服务日志</h2>
+            <p className="text-sm" style={{ color: theme.textMuted }}>
+              查看守护进程的运行日志
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            className="rounded-md px-3 py-2 text-sm transition"
+            style={{
+              background: autoRefresh ? theme.accentSoft : theme.frame,
+              border: `1px solid ${autoRefresh ? theme.accent : theme.border}`,
+            }}
+            onClick={() => setAutoRefresh(!autoRefresh)}
+          >
+            {autoRefresh ? "停止刷新" : "自动刷新"}
+          </button>
+          <button
+            className="rounded-md px-3 py-2 text-sm transition"
+            style={{ background: theme.accentSoft, border: `1px solid ${theme.border}` }}
+            onClick={loadLogs}
+            disabled={loading}
+          >
+            刷新
+          </button>
+          <button
+            className="rounded-md px-3 py-2 text-sm transition"
+            style={{ background: "rgba(197, 48, 48, 0.18)", border: `1px solid rgba(197, 48, 48, 0.35)` }}
+            onClick={clearLogs}
+          >
+            清空
+          </button>
+        </div>
+      </div>
+
+      <div className="mb-3 flex gap-2">
+        {(["all", "error", "warn", "info"] as const).map(level => (
+          <button
+            key={level}
+            className="rounded-md px-3 py-1.5 text-sm"
+            style={{
+              background: filter === level ? theme.accentSoft : theme.frame,
+              border: `1px solid ${filter === level ? theme.accent : theme.border}`,
+            }}
+            onClick={() => setFilter(level)}
+          >
+            {level === "all" ? "全部" : level.toUpperCase()}
+          </button>
+        ))}
+      </div>
+
+      {error && (
+        <div className="mb-3 rounded-md px-4 py-3 text-sm"
+          style={{ background: "rgba(94, 24, 34, 0.55)", border: "1px solid rgba(197, 48, 48, 0.45)", color: "#ffb8c1" }}>
+          {error}
+        </div>
+      )}
+
+      <div className="flex-1 overflow-auto rounded-md p-4 font-mono text-xs"
+        style={{ background: theme.frame, border: `1px solid ${theme.border}` }}>
+        {filteredLogs.length === 0 ? (
+          <div className="flex h-full items-center justify-center" style={{ color: theme.textMuted }}>
+            {loading ? "加载中..." : "暂无日志"}
+          </div>
+        ) : (
+          <div className="space-y-1">
+            {filteredLogs.map((log, i) => (
+              <div key={i} className="flex gap-3">
+                <span style={{ color: theme.textMuted, minWidth: "140px" }}>
+                  {log.timestamp}
+                </span>
+                <span style={{ color: getLevelColor(log.level), minWidth: "50px" }}>
+                  {log.level.toUpperCase()}
+                </span>
+                <span style={{ color: theme.textMuted, minWidth: "120px" }}>
+                  {log.target}
+                </span>
+                <span style={{ color: theme.text }}>
+                  {log.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-2 text-xs" style={{ color: theme.textMuted }}>
+        显示 {filteredLogs.length} / {logs.length} 条日志
       </div>
     </div>
   );

@@ -6,6 +6,9 @@
 use tokio::sync::mpsc;
 use rshare_core::clipboard::ClipboardContent;
 
+// Re-export anyhow context for display module convenience
+pub use anyhow::Context;
+
 // Platform modules
 #[cfg(windows)]
 pub mod windows;
@@ -86,3 +89,57 @@ pub type PlatformClipboardListener = clipboard::MacosClipboardListener;
 
 #[cfg(target_os = "linux")]
 pub type PlatformClipboardListener = clipboard::LinuxClipboardListener;
+
+/// Platform-specific display settings functions
+#[cfg(windows)]
+pub mod display {
+    pub use super::windows::open_display_settings;
+    pub use super::windows::get_dpi_scaling;
+}
+
+#[cfg(target_os = "macos")]
+pub mod display {
+    /// Open macOS display settings (System Preferences > Displays)
+    pub fn open_display_settings() -> anyhow::Result<()> {
+        use std::process::Command;
+        Command::new("open")
+            .args(["x-apple.systempreferences:com.apple.preference.displays"])
+            .spawn()
+            .context("Failed to open display settings")?;
+        Ok(())
+    }
+
+    /// Get DPI scaling factor (always 1.0 on macOS as it handles scaling differently)
+    pub fn get_dpi_scaling() -> f64 {
+        1.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod display {
+    /// Open Linux display settings (varies by desktop environment)
+    pub fn open_display_settings() -> anyhow::Result<()> {
+        use std::process::Command;
+
+        // Try common desktop environments' display settings commands
+        let commands = [
+            ["gnome-control-center", "display"],
+            ["systemsettings", "5"], // KDE Plasma Display settings
+            ["xfce4-display-settings"],
+            ["lxrandr"],
+        ];
+
+        for cmd in &commands {
+            if Command::new(cmd[0]).args(&cmd[1..]).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("No supported display settings command found")
+    }
+
+    /// Get DPI scaling factor
+    pub fn get_dpi_scaling() -> f64 {
+        1.0
+    }
+}

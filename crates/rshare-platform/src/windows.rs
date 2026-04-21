@@ -102,13 +102,44 @@ mod windows_impl {
                 .map(|runtime| (runtime.mouse_hook != 0, runtime.keyboard_hook != 0))
         }
 
-        /// Get primary screen info
+        /// Get primary screen info (physical resolution, not DPI-scaled)
         pub fn get_screen_info() -> ScreenInfo {
             extern "C" {
                 fn GetSystemMetrics(nIndex: i32) -> i32;
+                fn GetDC(hwnd: isize) -> isize;
+                fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+                fn GetDeviceCaps(hdc: isize, nIndex: i32) -> i32;
             }
 
+            const HORZRES: i32 = 8;
+            const VERTRES: i32 = 10;
+            const DESKTOPVERTRES: i32 = 117;
+            const DESKTOPHORZRES: i32 = 118;
+
             unsafe {
+                // Try to get physical resolution using GetDeviceCaps
+                let hdc = GetDC(0);
+                if hdc != 0 {
+                    let physical_width = GetDeviceCaps(hdc, DESKTOPHORZRES) as u32;
+                    let physical_height = GetDeviceCaps(hdc, DESKTOPVERTRES) as u32;
+                    let logical_width = GetDeviceCaps(hdc, HORZRES) as u32;
+                    let logical_height = GetDeviceCaps(hdc, VERTRES) as u32;
+                    ReleaseDC(0, hdc);
+
+                    // If physical resolution is available and different from logical, use it
+                    if physical_width > 0 && physical_height > 0 {
+                        tracing::debug!("Screen resolution: physical={}x{}, logical={}x{}",
+                            physical_width, physical_height, logical_width, logical_height);
+                        return ScreenInfo {
+                            x: 0,
+                            y: 0,
+                            width: physical_width,
+                            height: physical_height,
+                        };
+                    }
+                }
+
+                // Fallback to GetSystemMetrics (logical resolution)
                 ScreenInfo {
                     x: 0,
                     y: 0,
@@ -818,6 +849,64 @@ mod windows_impl {
     /// Get all screen information (multi-monitor support)
     pub fn get_all_screens() -> Vec<ScreenInfo> {
         vec![WindowsInputListener::get_screen_info()]
+    }
+
+    /// Open Windows display settings dialog
+    pub fn open_display_settings() -> Result<()> {
+        use std::process::Command;
+
+        // Open the Windows Settings app to the Display settings page
+        // This works on Windows 10/11
+        Command::new("cmd")
+            .args(["/c", "start", "ms-settings:display"])
+            .spawn()
+            .context("Failed to open display settings")?;
+
+        tracing::info!("Opened Windows display settings");
+        Ok(())
+    }
+
+    /// Get DPI scaling factor for the primary monitor
+    pub fn get_dpi_scaling() -> f64 {
+        extern "C" {
+            fn GetDC(hwnd: isize) -> isize;
+            fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+            fn GetDeviceCaps(hdc: isize, nIndex: i32) -> i32;
+        }
+
+        const LOGPIXELSX: i32 = 88;
+        const DESKTOPHORZRES: i32 = 118;
+        const HORZRES: i32 = 8;
+
+        unsafe {
+            let hdc = GetDC(0);
+            if hdc == 0 {
+                return 1.0; // Default to 100% if we can't get DPI
+            }
+
+            let dpi = GetDeviceCaps(hdc, LOGPIXELSX) as f64;
+            let physical_width = GetDeviceCaps(hdc, DESKTOPHORZRES) as f64;
+            let logical_width = GetDeviceCaps(hdc, HORZRES) as f64;
+            ReleaseDC(0, hdc);
+
+            // Calculate scaling factor from both methods
+            let dpi_scaling = dpi / 96.0; // 96 DPI is 100%
+            let resolution_scaling = if logical_width > 0.0 {
+                physical_width / logical_width
+            } else {
+                1.0
+            };
+
+            // Use the more accurate method
+            let scaling = if resolution_scaling > 1.0 && (resolution_scaling - dpi_scaling).abs() < 0.1 {
+                resolution_scaling
+            } else {
+                dpi_scaling
+            };
+
+            tracing::trace!("DPI scaling: {:.0}%", scaling * 100.0);
+            scaling
+        }
     }
 
     /// Virtual key codes for Windows

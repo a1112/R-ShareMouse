@@ -2,6 +2,7 @@ export function getPageLabels() {
   return [
     { key: "layout", label: "布局" },
     { key: "devices", label: "设备" },
+    { key: "logs", label: "日志" },
     { key: "settings", label: "设置" },
   ];
 }

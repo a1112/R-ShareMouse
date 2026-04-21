@@ -3,6 +3,7 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 use anyhow::Result;
+use tracing_subscriber::prelude::*;
 use rshare_core::{
     default_ipc_addr, read_json_line, write_json_line, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CaptureSessionStateMachine, Config, ControlSessionState,
@@ -697,16 +698,42 @@ async fn run_input_forwarding_loop(
     Ok(())
 }
 
+fn get_log_file_path() -> PathBuf {
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rshare");
+    let _ = fs::create_dir_all(&config_dir);
+    config_dir.join("rshare-daemon.log")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let log_file = get_log_file_path();
+    let file_appender = tracing_appender::rolling::never(
+        log_file.parent().unwrap(),
+        log_file.file_name().unwrap(),
+    );
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(true),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false)
+                .with_target(true),
+        )
+        .with(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
 
     tracing::info!("R-ShareMouse daemon starting...");
+    tracing::info!("Log file: {}", log_file.display());
 
     // Configure firewall on Windows to allow discovery and service ports
     #[cfg(windows)]

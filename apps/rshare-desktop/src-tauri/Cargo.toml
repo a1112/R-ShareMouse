@@ -17,6 +17,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 rshare-core = { path = "../../../crates/rshare-core" }
+rshare-platform = { path = "../../../crates/rshare-platform" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -24,3 +25,5 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 tauri = { version = "2.2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
+dirs = "5.0"
+regex = "1.10"

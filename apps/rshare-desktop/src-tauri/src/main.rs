@@ -6,7 +6,7 @@ use rshare_core::{
     DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
@@ -18,6 +18,7 @@ type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Sen
 const TRAY_ICON_ID: &str = "main-tray";
 const TRAY_MENU_SHOW_ID: &str = "tray-show";
 const TRAY_MENU_HIDE_ID: &str = "tray-hide";
+const TRAY_MENU_DISPLAY_SETTINGS_ID: &str = "tray-display-settings";
 const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +63,7 @@ enum TrayAction {
     None,
     ShowWindow,
     HideWindow,
+    OpenDisplaySettings,
     QuitApp,
 }
 
@@ -70,6 +72,7 @@ struct TrayRuntimeHandles {
     _menu: Menu<Wry>,
     _show_item: MenuItem<Wry>,
     _hide_item: MenuItem<Wry>,
+    _display_settings_item: MenuItem<Wry>,
     _quit_item: MenuItem<Wry>,
 }
 
@@ -377,7 +380,9 @@ fn main() {
             get_layout,
             set_layout,
             show_tray,
-            hide_to_tray
+            hide_to_tray,
+            get_logs,
+            clear_logs
         ])
         .setup(|app| {
             // Setup system tray
@@ -433,6 +438,7 @@ fn tray_action_from_menu_id(id: &str) -> TrayAction {
     match id {
         TRAY_MENU_SHOW_ID => TrayAction::ShowWindow,
         TRAY_MENU_HIDE_ID => TrayAction::HideWindow,
+        TRAY_MENU_DISPLAY_SETTINGS_ID => TrayAction::OpenDisplaySettings,
         TRAY_MENU_QUIT_ID => TrayAction::QuitApp,
         _ => TrayAction::None,
     }
@@ -458,6 +464,13 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
         TrayAction::None => Ok(()),
         TrayAction::ShowWindow => show_main_window(app),
         TrayAction::HideWindow => hide_main_window(app),
+        TrayAction::OpenDisplaySettings => {
+            if let Err(e) = rshare_platform::display::open_display_settings() {
+                Err(format!("Failed to open display settings: {}", e))
+            } else {
+                Ok(())
+            }
+        }
         TrayAction::QuitApp => {
             shutdown_daemon_and_exit(app);
             Ok(())
@@ -533,9 +546,10 @@ where
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏到托盘", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
+    let display_settings_item = MenuItem::with_id(app, TRAY_MENU_DISPLAY_SETTINGS_ID, "显示设置...", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &hide_item, &separator, &quit_item])?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &hide_item, &display_settings_item, &separator, &quit_item])?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -553,6 +567,7 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
         _menu: menu,
         _show_item: show_item,
         _hide_item: hide_item,
+        _display_settings_item: display_settings_item,
         _quit_item: quit_item,
     });
 
@@ -563,6 +578,94 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
 #[tauri::command]
 async fn hide_to_tray(window: WebviewWindow) -> Result<(), String> {
     window.hide().map_err(|e| e.to_string())
+}
+
+/// Log entry structure
+#[derive(Debug, Clone, Serialize)]
+struct LogEntry {
+    timestamp: String,
+    level: String,
+    target: String,
+    message: String,
+}
+
+/// Get the log file path
+fn get_log_file_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rshare")
+        .join("rshare-daemon.log")
+}
+
+/// Parse a single log line
+fn parse_log_line(line: &str) -> Option<LogEntry> {
+    // Parse tracing default format: TIMESTAMP LEVEL target: message
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    // Skip non-log lines
+    if !line.contains(' ') {
+        return None;
+    }
+
+    // Find the timestamp (ends with 'Z' or contains timezone)
+    let parts: Vec<&str> = line.splitn(4, ' ').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    // Format: "2024-04-20T10:30:45.123456Z INFO rshare_core: message"
+    let timestamp = parts[0].to_string();
+    let level = parts[1].to_string();
+    let rest = &line[parts[0].len() + parts[1].len() + 2..];
+
+    // Find the colon that separates target from message
+    if let Some(colon_pos) = rest.find(':') {
+        let target = rest[..colon_pos].trim().to_string();
+        let message = rest[colon_pos + 1..].trim().to_string();
+        return Some(LogEntry {
+            timestamp,
+            level,
+            target,
+            message,
+        });
+    }
+
+    None
+}
+
+/// Get logs from the daemon log file
+#[tauri::command]
+async fn get_logs(limit: Option<usize>) -> Result<Vec<LogEntry>, String> {
+    let log_file = get_log_file_path();
+    let limit = limit.unwrap_or(1000);
+
+    if !log_file.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(&log_file)
+        .map_err(|e| format!("读取日志文件失败: {}", e))?;
+
+    let entries: Vec<LogEntry> = content
+        .lines()
+        .rev()
+        .filter_map(|line| parse_log_line(line))
+        .take(limit)
+        .collect();
+
+    Ok(entries)
+}
+
+/// Clear the daemon log file
+#[tauri::command]
+async fn clear_logs() -> Result<(), String> {
+    let log_file = get_log_file_path();
+    std::fs::write(&log_file, "")
+        .map_err(|e| format!("清空日志失败: {}", e))?;
+    Ok(())
 }
 
 #[cfg(test)]
