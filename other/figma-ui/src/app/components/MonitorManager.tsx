@@ -160,6 +160,7 @@ interface MonitorManagerProps {
   showThemeToggle?: boolean;
   showFooter?: boolean;
   onMonitorsCommit?: (monitors: MonitorData[]) => void;
+  onMonitorVisibilityChange?: (monitorId: string, enabled: boolean) => void;
 }
 
 function normalizeDevice(device: DeviceData): DeviceData {
@@ -182,6 +183,21 @@ function monitorGeometrySignature(monitors: MonitorData[]): string {
     .join("|");
 }
 
+function preserveMonitorEnabledState(
+  incomingMonitors: MonitorData[],
+  currentMonitors: MonitorData[],
+): MonitorData[] {
+  const enabledById = new Map(
+    currentMonitors.map((monitor) => [monitor.id, monitor.enabled]),
+  );
+
+  return incomingMonitors.map((monitor) =>
+    enabledById.has(monitor.id)
+      ? { ...monitor, enabled: enabledById.get(monitor.id) ?? monitor.enabled }
+      : monitor,
+  );
+}
+
 /* ---------- Component ---------- */
 export default function MonitorManager({
   devices: externalDevices,
@@ -192,6 +208,7 @@ export default function MonitorManager({
   showThemeToggle = true,
   showFooter = true,
   onMonitorsCommit,
+  onMonitorVisibilityChange,
 }: MonitorManagerProps) {
   const [monitors, setMonitors] = useState<MonitorData[]>(
     externalMonitors && externalMonitors.length ? externalMonitors : initialMonitors
@@ -247,7 +264,11 @@ export default function MonitorManager({
       return;
     }
 
-    const incomingSignature = monitorGeometrySignature(externalMonitors);
+    const nextExternalMonitors = preserveMonitorEnabledState(
+      externalMonitors,
+      monitorsRef.current,
+    );
+    const incomingSignature = monitorGeometrySignature(nextExternalMonitors);
     const pendingLocalSignature = pendingLocalSignatureRef.current;
 
     if (draggingRef.current) {
@@ -271,8 +292,8 @@ export default function MonitorManager({
     }
 
     if (incomingSignature !== monitorGeometrySignature(monitorsRef.current)) {
-      monitorsRef.current = externalMonitors;
-      setMonitors(externalMonitors);
+      monitorsRef.current = nextExternalMonitors;
+      setMonitors(nextExternalMonitors);
     }
   }, [externalMonitors]);
 
@@ -574,8 +595,25 @@ export default function MonitorManager({
 
   /* ---- Toggle monitor ---- */
   const toggleMonitor = useCallback((id: string) => {
-    setMonitors((prev) => prev.map((m) => (m.id === id ? { ...m, enabled: !m.enabled } : m)));
-  }, []);
+    setMonitors((prev) => {
+      const nextMonitors = prev.map((monitor) =>
+        monitor.id === id
+          ? { ...monitor, enabled: !monitor.enabled }
+          : monitor,
+      );
+      const updatedMonitor = nextMonitors.find((monitor) => monitor.id === id);
+
+      monitorsRef.current = nextMonitors;
+      pendingLocalSignatureRef.current = monitorGeometrySignature(nextMonitors);
+      pendingLocalSinceRef.current = Date.now();
+
+      if (updatedMonitor) {
+        onMonitorVisibilityChange?.(id, updatedMonitor.enabled);
+      }
+
+      return nextMonitors;
+    });
+  }, [onMonitorVisibilityChange]);
 
   /* ---- Check adjacency ---- */
   const getAdjacentPairs = useMemo(() => {
