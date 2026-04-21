@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 use crate::{
-    default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot,
-    DaemonRequest, DaemonResponse, ServiceStatusSnapshot, LayoutGraph,
+    default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
+    DaemonResponse, LayoutGraph, ServiceStatusSnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -74,10 +74,7 @@ pub async fn wait_until_ready(timeout: Duration) -> Result<ServiceStatusSnapshot
     }
 }
 
-pub async fn spawn_daemon(
-    port: Option<u16>,
-    bind: Option<&str>,
-) -> Result<ServiceStatusSnapshot> {
+pub async fn spawn_daemon(port: Option<u16>, bind: Option<&str>) -> Result<ServiceStatusSnapshot> {
     let daemon_binary = find_daemon_binary()?;
 
     let mut command = tokio::process::Command::new(&daemon_binary);

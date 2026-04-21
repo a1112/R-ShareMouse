@@ -269,8 +269,9 @@ export default function App() {
       }}
     >
       <header
-        className="flex h-12 shrink-0 items-center"
+        className="flex shrink-0 items-center"
         style={{
+          height: headerMetrics.headerHeight,
           borderBottom: `1px solid ${theme.border}`,
           background: theme.toolbar,
           paddingLeft: headerMetrics.headerPaddingX,
@@ -279,30 +280,44 @@ export default function App() {
         data-tauri-drag-region="true"
       >
         <div
-          className="flex min-w-[204px] items-center"
-          style={{ gap: headerMetrics.brandGap }}
-          data-tauri-drag-region="true"
+          className="flex shrink-0 items-center"
+          style={{ gap: headerMetrics.windowGap }}
+          data-tauri-drag-region="false"
         >
-          <div
-            className="flex h-8 w-8 items-center justify-center rounded-md"
-            style={{
-              background: theme.accentSoft,
-              color: theme.accent,
-              border: `1px solid ${theme.border}`,
-            }}
+          <WindowButton
+            onClick={() => handleWindow("close_window")}
+            title="关闭"
+            tone="close"
+            theme={theme}
+            size={headerMetrics.windowButtonSize}
+            hitSize={headerMetrics.windowButtonHitSize}
           >
-            <Monitor size={16} />
-          </div>
-          <div className="leading-tight" data-tauri-drag-region="true">
-            <div className="text-sm font-semibold">R-ShareMouse</div>
-            <div className="text-[11px]" style={{ color: theme.textSub }}>
-              共享桌面控制
-            </div>
-          </div>
+            <X size={8} strokeWidth={3} />
+          </WindowButton>
+          <WindowButton
+            onClick={() => handleWindow("minimize_window")}
+            title="最小化"
+            tone="minimize"
+            theme={theme}
+            size={headerMetrics.windowButtonSize}
+            hitSize={headerMetrics.windowButtonHitSize}
+          >
+            <Minus size={9} strokeWidth={3} />
+          </WindowButton>
+          <WindowButton
+            onClick={() => handleWindow("toggle_maximize_window")}
+            title="最大化"
+            tone="maximize"
+            theme={theme}
+            size={headerMetrics.windowButtonSize}
+            hitSize={headerMetrics.windowButtonHitSize}
+          >
+            <Maximize2 size={8} strokeWidth={3} />
+          </WindowButton>
         </div>
 
         <div
-          className="ml-3 flex items-center"
+          className="ml-4 flex shrink-0 items-center"
           style={{ gap: headerMetrics.navGap }}
           data-tauri-drag-region="false"
         >
@@ -337,8 +352,10 @@ export default function App() {
           ))}
         </div>
 
+        <div className="min-w-6 flex-1 self-stretch" data-tauri-drag-region="true" />
+
         <div
-          className="ml-auto flex items-center"
+          className="flex shrink-0 items-center"
           style={{ gap: headerMetrics.actionGap }}
           data-tauri-drag-region="false"
         >
@@ -390,20 +407,6 @@ export default function App() {
               {model.service.online ? "停止服务" : "启动服务"}
             </span>
           </button>
-          <div
-            className="ml-1 flex items-center"
-            style={{ gap: headerMetrics.windowGap }}
-          >
-            <WindowButton onClick={() => handleWindow("minimize_window")} title="最小化" theme={theme} size={headerMetrics.windowButtonSize}>
-              <Minus size={14} />
-            </WindowButton>
-            <WindowButton onClick={() => handleWindow("toggle_maximize_window")} title="最大化" theme={theme} size={headerMetrics.windowButtonSize}>
-              <Maximize2 size={13} />
-            </WindowButton>
-            <WindowButton danger onClick={() => handleWindow("close_window")} title="关闭" theme={theme} size={headerMetrics.windowButtonSize}>
-              <X size={14} />
-            </WindowButton>
-          </div>
         </div>
       </header>
 
@@ -1034,40 +1037,67 @@ function WindowButton({
   children,
   onClick,
   title,
-  danger = false,
+  tone,
   theme,
   size,
+  hitSize,
 }: {
   children: ReactNode;
   onClick: () => void;
   title: string;
-  danger?: boolean;
+  tone: "close" | "minimize" | "maximize";
   theme: typeof FIGMA_DESKTOP_THEME;
   size: number;
+  hitSize: number;
 }) {
+  const control = {
+    close: {
+      background: "#ff5f57",
+      border: "#e0443e",
+      color: "#5d1613",
+    },
+    minimize: {
+      background: "#ffbd2e",
+      border: "#dea123",
+      color: "#684914",
+    },
+    maximize: {
+      background: "#28c840",
+      border: "#1da433",
+      color: "#0d4f19",
+    },
+  }[tone];
+
   return (
     <button
       type="button"
-      className="flex items-center justify-center rounded-md transition"
+      className="flex items-center justify-center rounded-full transition"
       onClick={onClick}
       title={title}
       style={{
-        color: theme.textSub,
-        width: size,
-        height: size,
+        width: hitSize,
+        height: hitSize,
+        color: control.color,
       }}
       onMouseEnter={(event) => {
-        event.currentTarget.style.backgroundColor = danger
-          ? theme.danger
-          : "rgba(255,255,255,0.04)";
-        event.currentTarget.style.color = danger ? "#ffffff" : theme.text;
+        event.currentTarget.style.backgroundColor = "rgba(255,255,255,0.06)";
       }}
       onMouseLeave={(event) => {
         event.currentTarget.style.backgroundColor = "transparent";
-        event.currentTarget.style.color = theme.textSub;
       }}
     >
-      {children}
+      <span
+        className="flex items-center justify-center rounded-full"
+        style={{
+          width: size,
+          height: size,
+          background: control.background,
+          border: `1px solid ${control.border}`,
+          boxShadow: `0 0 0 1px ${theme.frame}66`,
+        }}
+      >
+        {children}
+      </span>
     </button>
   );
 }

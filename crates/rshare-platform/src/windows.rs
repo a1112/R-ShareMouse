@@ -128,8 +128,13 @@ mod windows_impl {
 
                     // If physical resolution is available and different from logical, use it
                     if physical_width > 0 && physical_height > 0 {
-                        tracing::debug!("Screen resolution: physical={}x{}, logical={}x{}",
-                            physical_width, physical_height, logical_width, logical_height);
+                        tracing::debug!(
+                            "Screen resolution: physical={}x{}, logical={}x{}",
+                            physical_width,
+                            physical_height,
+                            logical_width,
+                            logical_height
+                        );
                         return ScreenInfo {
                             x: 0,
                             y: 0,
@@ -898,11 +903,12 @@ mod windows_impl {
             };
 
             // Use the more accurate method
-            let scaling = if resolution_scaling > 1.0 && (resolution_scaling - dpi_scaling).abs() < 0.1 {
-                resolution_scaling
-            } else {
-                dpi_scaling
-            };
+            let scaling =
+                if resolution_scaling > 1.0 && (resolution_scaling - dpi_scaling).abs() < 0.1 {
+                    resolution_scaling
+                } else {
+                    dpi_scaling
+                };
 
             tracing::trace!("DPI scaling: {:.0}%", scaling * 100.0);
             scaling

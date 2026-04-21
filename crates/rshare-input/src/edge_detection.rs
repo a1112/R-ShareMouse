@@ -242,7 +242,9 @@ impl MultiScreenEdgeDetector {
 
     /// Get a specific screen's detector
     pub fn get_detector(&mut self, screen_index: usize) -> Option<&mut EdgeDetector> {
-        self.screens.get_mut(screen_index).map(|(_, detector)| detector)
+        self.screens
+            .get_mut(screen_index)
+            .map(|(_, detector)| detector)
     }
 }
 

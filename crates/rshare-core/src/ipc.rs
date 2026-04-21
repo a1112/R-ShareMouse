@@ -163,7 +163,10 @@ where
     let mut buf = Vec::new();
     loop {
         let mut byte = [0u8; 1];
-        let read = reader.read(&mut byte).await.context("Failed to read IPC stream")?;
+        let read = reader
+            .read(&mut byte)
+            .await
+            .context("Failed to read IPC stream")?;
         if read == 0 {
             break;
         }
@@ -194,6 +197,9 @@ where
         .write_all(&payload)
         .await
         .context("Failed to write IPC JSON line")?;
-    writer.flush().await.context("Failed to flush IPC JSON line")?;
+    writer
+        .flush()
+        .await
+        .context("Failed to flush IPC JSON line")?;
     Ok(())
 }

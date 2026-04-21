@@ -4,12 +4,12 @@
 //! including device discovery, QUIC transport, message encoding/decoding,
 //! and connection management.
 
+pub mod codec;
 pub mod connection;
 pub mod discovery;
-pub mod transport;
-pub mod codec;
 pub mod encryption;
 pub mod network_manager;
+pub mod transport;
 
 #[cfg(test)]
 pub mod discovery_test;
@@ -17,7 +17,7 @@ pub mod discovery_test;
 pub use network_manager::*;
 
 // Re-exports
-pub use discovery::*;
-pub use transport::*;
 pub use codec::*;
+pub use discovery::*;
 pub use encryption::*;
+pub use transport::*;

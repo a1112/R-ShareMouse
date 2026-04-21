@@ -9,6 +9,12 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+FRONTEND_DIR="$REPO_ROOT/other/figma-ui"
+
+cd "$REPO_ROOT"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -82,12 +88,38 @@ else
     echo -e "${YELLOW}Building in DEBUG mode...${NC}"
 fi
 
+prepare_desktop_frontend() {
+    if [ ! -d "$FRONTEND_DIR" ]; then
+        echo -e "${RED}Frontend directory not found: $FRONTEND_DIR${NC}"
+        exit 1
+    fi
+
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}npm is required to build the desktop frontend.${NC}"
+        echo "Install Node.js, then run this script again."
+        exit 1
+    fi
+
+    if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+        echo -e "${BLUE}Installing desktop frontend dependencies...${NC}"
+        if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
+            npm ci --prefix "$FRONTEND_DIR"
+        else
+            npm install --prefix "$FRONTEND_DIR"
+        fi
+    fi
+
+    echo -e "${BLUE}Building desktop frontend...${NC}"
+    npm run build --prefix "$FRONTEND_DIR"
+}
+
 # Build function
 build_target() {
     local target=$1
     case $target in
         all)
             echo -e "${GREEN}Building all binaries...${NC}"
+            prepare_desktop_frontend
             cargo build $BUILD_FLAG --workspace
             ;;
         daemon)
@@ -104,7 +136,8 @@ build_target() {
             ;;
         desktop)
             echo -e "${GREEN}Building rshare-desktop (Tauri)...${NC}"
-            cargo build $BUILD_FLAG -p rshare-desktop
+            prepare_desktop_frontend
+            cargo build $BUILD_FLAG -p rshare-daemon -p rshare-desktop
             ;;
         *)
             echo -e "${RED}Unknown target: $target${NC}"
@@ -158,8 +191,10 @@ build_app_bundle() {
 </plist>
 EOF
 
-    # Copy executable
+    # Copy executables. The desktop app auto-starts the daemon by looking for
+    # rshare-daemon beside rshare-gui.
     cp "$exe_dir/rshare-gui" "$macos_dir/"
+    cp "$exe_dir/rshare-daemon" "$macos_dir/"
 
     # Copy icon if exists
     if [ -f "apps/rshare-desktop/src-tauri/icons/icon.icns" ]; then

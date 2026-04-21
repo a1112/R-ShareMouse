@@ -81,7 +81,7 @@ impl EnigoInputEmulator {
         Ok(Self {
             config: EmulatorConfig::default(),
             enigo: Arc::new(Mutex::new(enigo)),
-            active: true,  // Auto-activate on creation
+            active: true, // Auto-activate on creation
         })
     }
 
@@ -362,6 +362,14 @@ impl MacosNativeInputEmulator {
             inner: rshare_platform::MacosInputEmulator::new(),
             config: EmulatorConfig::default(),
             active: false,
+        })
+    }
+
+    pub fn new_for_test() -> Result<Self> {
+        Ok(Self {
+            inner: rshare_platform::MacosInputEmulator::new(),
+            config: EmulatorConfig::default(),
+            active: true,
         })
     }
 
@@ -713,11 +721,13 @@ impl InputEmulator for WindowsNativeInputEmulator {
     }
 
     fn press_button(&mut self, button: MouseButton) -> Result<()> {
-        self.inner.send_button(Self::convert_mouse_button(button)?, true)
+        self.inner
+            .send_button(Self::convert_mouse_button(button)?, true)
     }
 
     fn release_button(&mut self, button: MouseButton) -> Result<()> {
-        self.inner.send_button(Self::convert_mouse_button(button)?, false)
+        self.inner
+            .send_button(Self::convert_mouse_button(button)?, false)
     }
 
     fn click_button(&mut self, button: MouseButton) -> Result<()> {
@@ -952,7 +962,10 @@ mod tests {
         let emulator = backend.unwrap();
         // Emulator is now auto-activated on creation
         assert!(InputEmulator::is_active(&emulator));
-        assert_eq!(InjectBackend::kind(&emulator), rshare_core::BackendKind::WindowsNative);
+        assert_eq!(
+            InjectBackend::kind(&emulator),
+            rshare_core::BackendKind::WindowsNative
+        );
     }
 
     #[cfg(target_os = "windows")]

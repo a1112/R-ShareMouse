@@ -86,6 +86,21 @@ else
     BIN_DIR="target/debug"
 fi
 
+ensure_desktop_binaries() {
+    if [ ! -f "$BIN_DIR/rshare-gui" ] || [ ! -f "$BIN_DIR/rshare-daemon" ]; then
+        echo -e "${YELLOW}Desktop binaries not found. Building first...${NC}"
+        "$(dirname "$0")/build.sh" $([ "$BUILD_MODE" = "release" ] && echo "--release") desktop
+    fi
+}
+
+ensure_app_bundle() {
+    if [ ! -x "R-ShareMouse.app/Contents/MacOS/rshare-gui" ] || \
+       [ ! -x "R-ShareMouse.app/Contents/MacOS/rshare-daemon" ]; then
+        echo -e "${YELLOW}.app bundle incomplete. Building first...${NC}"
+        "$(dirname "$0")/build.sh" $([ "$BUILD_MODE" = "release" ] && echo "--release") --app
+    fi
+}
+
 # Run function
 run_target() {
     local target=$1
@@ -117,17 +132,11 @@ run_target() {
         desktop)
             if [ "$USE_APP" = true ]; then
                 echo -e "${GREEN}Starting R-ShareMouse.app...${NC}"
-                if [ ! -d "R-ShareMouse.app" ]; then
-                    echo -e "${YELLOW}.app bundle not found. Building first...${NC}"
-                    "$(dirname "$0")/build.sh" --app
-                fi
+                ensure_app_bundle
                 open "R-ShareMouse.app"
             else
                 echo -e "${GREEN}Starting rshare-desktop...${NC}"
-                if [ ! -f "$BIN_DIR/rshare-gui" ]; then
-                    echo -e "${YELLOW}Desktop app not found. Building first...${NC}"
-                    "$(dirname "$0")/build.sh" $([ "$BUILD_MODE" = "release" ] && echo "--release") desktop
-                fi
+                ensure_desktop_binaries
                 "$BIN_DIR/rshare-gui" &
                 echo -e "${GREEN}Desktop app started in background${NC}"
             fi

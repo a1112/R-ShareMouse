@@ -186,7 +186,11 @@ impl LayoutGraph {
         width: u32,
         height: u32,
     ) -> bool {
-        if let Some(node) = self.nodes.iter_mut().find(|node| node.device_id == device_id) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.device_id == device_id)
+        {
             if let Some(primary) = node.displays.iter_mut().find(|display| display.primary) {
                 if primary.width != width || primary.height != height {
                     primary.width = width;
@@ -214,15 +218,14 @@ impl LayoutGraph {
         I: IntoIterator<Item = Uuid>,
     {
         self.merge_discovered_peers_to_right_with_screens(
-            discovered_peers.into_iter().map(|device_id| (device_id, None)),
+            discovered_peers
+                .into_iter()
+                .map(|device_id| (device_id, None)),
         )
     }
 
     /// Merge discovered peers into the remembered graph while honoring runtime screen geometry.
-    pub fn merge_discovered_peers_to_right_with_screens<I>(
-        &mut self,
-        discovered_peers: I,
-    ) -> bool
+    pub fn merge_discovered_peers_to_right_with_screens<I>(&mut self, discovered_peers: I) -> bool
     where
         I: IntoIterator<Item = (Uuid, Option<ScreenInfo>)>,
     {

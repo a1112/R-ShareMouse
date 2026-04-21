@@ -2,7 +2,7 @@
 
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
-    daemon_client, BackgroundProcessOwner, BackgroundRunMode, BackendHealth, Config,
+    daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode, Config,
     DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
 };
 use serde::Serialize;
@@ -16,9 +16,15 @@ use tauri_plugin_single_instance::init;
 
 type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
 const TRAY_ICON_ID: &str = "main-tray";
+const TRAY_STATUS_REFRESH_MS: u64 = 2_000;
+const TRAY_MENU_STATUS_ID: &str = "tray-status";
 const TRAY_MENU_SHOW_ID: &str = "tray-show";
 const TRAY_MENU_HIDE_ID: &str = "tray-hide";
+const TRAY_MENU_START_SERVICE_ID: &str = "tray-start-service";
+const TRAY_MENU_STOP_SERVICE_ID: &str = "tray-stop-service";
 const TRAY_MENU_DISPLAY_SETTINGS_ID: &str = "tray-display-settings";
+const TRAY_MENU_OPEN_CONFIG_DIR_ID: &str = "tray-open-config-dir";
+const TRAY_MENU_OPEN_LOG_ID: &str = "tray-open-log";
 const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,17 +69,27 @@ enum TrayAction {
     None,
     ShowWindow,
     HideWindow,
+    StartService,
+    StopService,
     OpenDisplaySettings,
+    OpenConfigDir,
+    OpenLogFile,
     QuitApp,
 }
 
 struct TrayRuntimeHandles {
-    _tray: TrayIcon<Wry>,
+    tray: TrayIcon<Wry>,
     _menu: Menu<Wry>,
-    _show_item: MenuItem<Wry>,
-    _hide_item: MenuItem<Wry>,
-    _display_settings_item: MenuItem<Wry>,
-    _quit_item: MenuItem<Wry>,
+    status_item: MenuItem<Wry>,
+    start_service_item: MenuItem<Wry>,
+    stop_service_item: MenuItem<Wry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrayStatusView {
+    status_text: String,
+    tooltip: String,
+    service_running: bool,
 }
 
 #[tauri::command]
@@ -88,21 +104,25 @@ async fn dashboard_state() -> Result<DashboardStatePayload, String> {
 }
 
 #[tauri::command]
-async fn start_service() -> Result<ServiceStatusSnapshot, String> {
+async fn start_service(app: AppHandle) -> Result<ServiceStatusSnapshot, String> {
     let config = rshare_core::Config::load().unwrap_or_default();
-    daemon_client::spawn_daemon(
+    let status = daemon_client::spawn_daemon(
         Some(config.network.port),
         Some(&config.network.bind_address),
     )
     .await
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    refresh_tray_status_once(&app).await;
+    Ok(status)
 }
 
 #[tauri::command]
-async fn stop_service() -> Result<(), String> {
+async fn stop_service(app: AppHandle) -> Result<(), String> {
     daemon_client::request_shutdown()
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    refresh_tray_status_once(&app).await;
+    Ok(())
 }
 
 fn parse_device_id(device_id: &str) -> Result<DeviceId, String> {
@@ -387,19 +407,22 @@ fn main() {
         .setup(|app| {
             // Setup system tray
             setup_system_tray(app.handle())?;
+            start_tray_status_refresh(app.handle().clone());
 
             // Handle window close event to minimize to tray
             let app_handle = app.handle().clone();
-            app.get_webview_window("main").unwrap().on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    match close_request_action() {
-                        CloseRequestAction::PreventAndHide => {
-                            api.prevent_close();
-                            let _ = hide_main_window(&app_handle);
+            app.get_webview_window("main")
+                .unwrap()
+                .on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        match close_request_action() {
+                            CloseRequestAction::PreventAndHide => {
+                                api.prevent_close();
+                                let _ = hide_main_window(&app_handle);
+                            }
                         }
                     }
-                }
-            });
+                });
 
             Ok(())
         })
@@ -436,9 +459,14 @@ fn tray_action_from_menu_event(event: &tauri::menu::MenuEvent) -> Option<TrayAct
 
 fn tray_action_from_menu_id(id: &str) -> TrayAction {
     match id {
+        TRAY_MENU_STATUS_ID => TrayAction::None,
         TRAY_MENU_SHOW_ID => TrayAction::ShowWindow,
         TRAY_MENU_HIDE_ID => TrayAction::HideWindow,
+        TRAY_MENU_START_SERVICE_ID => TrayAction::StartService,
+        TRAY_MENU_STOP_SERVICE_ID => TrayAction::StopService,
         TRAY_MENU_DISPLAY_SETTINGS_ID => TrayAction::OpenDisplaySettings,
+        TRAY_MENU_OPEN_CONFIG_DIR_ID => TrayAction::OpenConfigDir,
+        TRAY_MENU_OPEN_LOG_ID => TrayAction::OpenLogFile,
         TRAY_MENU_QUIT_ID => TrayAction::QuitApp,
         _ => TrayAction::None,
     }
@@ -464,6 +492,14 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
         TrayAction::None => Ok(()),
         TrayAction::ShowWindow => show_main_window(app),
         TrayAction::HideWindow => hide_main_window(app),
+        TrayAction::StartService => {
+            start_daemon_from_tray(app);
+            Ok(())
+        }
+        TrayAction::StopService => {
+            stop_daemon_from_tray(app);
+            Ok(())
+        }
         TrayAction::OpenDisplaySettings => {
             if let Err(e) = rshare_platform::display::open_display_settings() {
                 Err(format!("Failed to open display settings: {}", e))
@@ -471,11 +507,41 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
                 Ok(())
             }
         }
+        TrayAction::OpenConfigDir => rshare_platform::system::open_config_dir()
+            .map_err(|err| format!("Failed to open config directory: {err}")),
+        TrayAction::OpenLogFile => rshare_platform::system::open_log_file()
+            .map_err(|err| format!("Failed to open log file: {err}")),
         TrayAction::QuitApp => {
             shutdown_daemon_and_exit(app);
             Ok(())
         }
     }
+}
+
+fn start_daemon_from_tray(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let config = Config::load().unwrap_or_default();
+        if let Err(err) = daemon_client::spawn_daemon(
+            Some(config.network.port),
+            Some(&config.network.bind_address),
+        )
+        .await
+        {
+            eprintln!("tray failed to start daemon: {err}");
+        }
+        refresh_tray_status_once(&app).await;
+    });
+}
+
+fn stop_daemon_from_tray(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = daemon_client::request_shutdown().await {
+            eprintln!("tray failed to stop daemon: {err}");
+        }
+        refresh_tray_status_once(&app).await;
+    });
 }
 
 fn shutdown_daemon_and_exit(app: &AppHandle) {
@@ -544,12 +610,65 @@ where
 
 /// Setup system tray with icon and restore actions.
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
+    let status_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_STATUS_ID,
+        "状态：后台检测中",
+        false,
+        None::<&str>,
+    )?;
     let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏到托盘", true, None::<&str>)?;
-    let display_settings_item = MenuItem::with_id(app, TRAY_MENU_DISPLAY_SETTINGS_ID, "显示设置...", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
+    let service_separator = PredefinedMenuItem::separator(app)?;
+    let start_service_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_START_SERVICE_ID,
+        "启动后台服务",
+        true,
+        None::<&str>,
+    )?;
+    let stop_service_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_STOP_SERVICE_ID,
+        "停止后台服务",
+        false,
+        None::<&str>,
+    )?;
+    let settings_separator = PredefinedMenuItem::separator(app)?;
+    let display_settings_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_DISPLAY_SETTINGS_ID,
+        "显示设置...",
+        true,
+        None::<&str>,
+    )?;
+    let config_dir_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_OPEN_CONFIG_DIR_ID,
+        "打开配置目录",
+        true,
+        None::<&str>,
+    )?;
+    let log_item = MenuItem::with_id(app, TRAY_MENU_OPEN_LOG_ID, "打开日志", true, None::<&str>)?;
+    let quit_separator = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_item, &hide_item, &display_settings_item, &separator, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &status_item,
+            &show_item,
+            &hide_item,
+            &service_separator,
+            &start_service_item,
+            &stop_service_item,
+            &settings_separator,
+            &display_settings_item,
+            &config_dir_item,
+            &log_item,
+            &quit_separator,
+            &quit_item,
+        ],
+    )?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -563,15 +682,74 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
         .build(app)?;
 
     app.manage(TrayRuntimeHandles {
-        _tray: tray,
+        tray,
         _menu: menu,
-        _show_item: show_item,
-        _hide_item: hide_item,
-        _display_settings_item: display_settings_item,
-        _quit_item: quit_item,
+        status_item,
+        start_service_item,
+        stop_service_item,
     });
 
     Ok(())
+}
+
+fn start_tray_status_refresh(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            refresh_tray_status_once(&app).await;
+            tokio::time::sleep(Duration::from_millis(TRAY_STATUS_REFRESH_MS)).await;
+        }
+    });
+}
+
+async fn refresh_tray_status_once(app: &AppHandle) {
+    let status = daemon_client::request_status().await.ok();
+    apply_tray_status_view(app, tray_status_view(status.as_ref()));
+}
+
+fn apply_tray_status_view(app: &AppHandle, view: TrayStatusView) {
+    let handles = app.state::<TrayRuntimeHandles>();
+    let _ = handles.status_item.set_text(&view.status_text);
+    let _ = handles
+        .start_service_item
+        .set_enabled(!view.service_running);
+    let _ = handles.stop_service_item.set_enabled(view.service_running);
+    let _ = handles.tray.set_tooltip(Some(&view.tooltip));
+}
+
+fn tray_status_view(status: Option<&ServiceStatusSnapshot>) -> TrayStatusView {
+    match status {
+        Some(status) => {
+            let backend = match &status.backend_health {
+                Some(BackendHealth::Healthy) => "输入正常",
+                Some(BackendHealth::Degraded { .. }) => "输入受限",
+                None => "输入未初始化",
+            };
+            let status_text = format!(
+                "状态：后台运行中 · 发现 {} · 已连接 {}",
+                status.discovered_devices, status.connected_devices
+            );
+            let tooltip = format!(
+                "R-ShareMouse ({})\n{}\n{}",
+                rshare_platform::system::platform_name(),
+                status.bind_address,
+                backend
+            );
+
+            TrayStatusView {
+                status_text,
+                tooltip,
+                service_running: true,
+            }
+        }
+        None => TrayStatusView {
+            status_text: "状态：后台未运行".to_string(),
+            tooltip: format!(
+                "R-ShareMouse ({})\n后台服务未运行",
+                rshare_platform::system::platform_name()
+            ),
+            service_running: false,
+        },
+    }
 }
 
 /// Hide window to tray
@@ -591,10 +769,8 @@ struct LogEntry {
 
 /// Get the log file path
 fn get_log_file_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rshare")
-        .join("rshare-daemon.log")
+    rshare_platform::system::log_file_path()
+        .unwrap_or_else(|_| PathBuf::from(".").join("rshare-daemon.log"))
 }
 
 /// Parse a single log line
@@ -646,8 +822,8 @@ async fn get_logs(limit: Option<usize>) -> Result<Vec<LogEntry>, String> {
         return Ok(Vec::new());
     }
 
-    let content = std::fs::read_to_string(&log_file)
-        .map_err(|e| format!("读取日志文件失败: {}", e))?;
+    let content =
+        std::fs::read_to_string(&log_file).map_err(|e| format!("读取日志文件失败: {}", e))?;
 
     let entries: Vec<LogEntry> = content
         .lines()
@@ -663,8 +839,10 @@ async fn get_logs(limit: Option<usize>) -> Result<Vec<LogEntry>, String> {
 #[tauri::command]
 async fn clear_logs() -> Result<(), String> {
     let log_file = get_log_file_path();
-    std::fs::write(&log_file, "")
-        .map_err(|e| format!("清空日志失败: {}", e))?;
+    if let Some(parent) = log_file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    }
+    std::fs::write(&log_file, "").map_err(|e| format!("清空日志失败: {}", e))?;
     Ok(())
 }
 
@@ -730,10 +908,61 @@ mod tests {
 
     #[test]
     fn tray_menu_ids_map_to_restore_hide_and_quit_actions() {
-        assert_eq!(tray_action_from_menu_id(TRAY_MENU_SHOW_ID), TrayAction::ShowWindow);
-        assert_eq!(tray_action_from_menu_id(TRAY_MENU_HIDE_ID), TrayAction::HideWindow);
-        assert_eq!(tray_action_from_menu_id(TRAY_MENU_QUIT_ID), TrayAction::QuitApp);
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_STATUS_ID),
+            TrayAction::None
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_SHOW_ID),
+            TrayAction::ShowWindow
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_HIDE_ID),
+            TrayAction::HideWindow
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_START_SERVICE_ID),
+            TrayAction::StartService
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_STOP_SERVICE_ID),
+            TrayAction::StopService
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_DISPLAY_SETTINGS_ID),
+            TrayAction::OpenDisplaySettings
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_OPEN_CONFIG_DIR_ID),
+            TrayAction::OpenConfigDir
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_OPEN_LOG_ID),
+            TrayAction::OpenLogFile
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_QUIT_ID),
+            TrayAction::QuitApp
+        );
         assert_eq!(tray_action_from_menu_id("unknown"), TrayAction::None);
+    }
+
+    #[test]
+    fn tray_status_view_marks_service_actions_from_daemon_status() {
+        let mut status = sample_status();
+        status.discovered_devices = 2;
+        status.connected_devices = 1;
+        status.backend_health = Some(BackendHealth::Healthy);
+
+        let running = tray_status_view(Some(&status));
+        assert!(running.service_running);
+        assert!(running.status_text.contains("发现 2"));
+        assert!(running.status_text.contains("已连接 1"));
+        assert!(running.tooltip.contains("输入正常"));
+
+        let stopped = tray_status_view(None);
+        assert!(!stopped.service_running);
+        assert!(stopped.status_text.contains("后台未运行"));
     }
 
     #[test]
@@ -896,7 +1125,10 @@ mod tests {
         assert_eq!(result.acceptance.discovered_devices, 1);
         assert_eq!(result.acceptance.visible_layout_devices, 2);
         assert!(result.acceptance.dual_machine_ready);
-        assert_eq!(result.acceptance.next_step, "打开另一台机器并连接设备，开始边缘切换验收");
+        assert_eq!(
+            result.acceptance.next_step,
+            "打开另一台机器并连接设备，开始边缘切换验收"
+        );
     }
 
     #[tokio::test]

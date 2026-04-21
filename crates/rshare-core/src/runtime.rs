@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::{
-    BackendHealth, BackendKind, Direction, PrivilegeState, ResolvedInputMode,
-};
+use crate::{BackendHealth, BackendKind, Direction, PrivilegeState, ResolvedInputMode};
 
 /// Discovery state of a peer device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,23 +124,16 @@ pub enum ControlSessionState {
     /// Local input is captured but not forwarded.
     LocalReady,
     /// Transitioning to remote control after edge hit.
-    TransitioningToRemote {
-        target: Uuid,
-        edge: Direction,
-    },
+    TransitioningToRemote { target: Uuid, edge: Direction },
     /// Actively forwarding input to remote device.
     RemoteActive {
         target: Uuid,
         entered_via: Direction,
     },
     /// Returning to local control after return edge hit.
-    ReturningLocal {
-        from: Uuid,
-    },
+    ReturningLocal { from: Uuid },
     /// Forwarding suspended due to degradation.
-    Suspended {
-        reason: SuspendReason,
-    },
+    Suspended { reason: SuspendReason },
 }
 
 /// Runtime state of the input backend.
@@ -185,7 +176,8 @@ impl BackendRuntimeState {
     pub fn update_aggregate_health(&mut self) {
         self.aggregate_health = match (&self.capture_health, &self.inject_health) {
             (BackendHealth::Healthy, BackendHealth::Healthy) => BackendHealth::Healthy,
-            (BackendHealth::Degraded { reason: r }, _) | (_, BackendHealth::Degraded { reason: r }) => {
+            (BackendHealth::Degraded { reason: r }, _)
+            | (_, BackendHealth::Degraded { reason: r }) => {
                 BackendHealth::Degraded { reason: r.clone() }
             }
         };
@@ -193,8 +185,7 @@ impl BackendRuntimeState {
 
     /// Check if there is a working end-to-end input path.
     pub fn has_end_to_end_path(&self) -> bool {
-        self.selected_mode.is_some()
-            && matches!(self.aggregate_health, BackendHealth::Healthy)
+        self.selected_mode.is_some() && matches!(self.aggregate_health, BackendHealth::Healthy)
     }
 }
 
@@ -227,7 +218,10 @@ mod tests {
         };
         state.update_aggregate_health();
 
-        assert!(matches!(state.aggregate_health, BackendHealth::Degraded { .. }));
+        assert!(matches!(
+            state.aggregate_health,
+            BackendHealth::Degraded { .. }
+        ));
         assert!(!state.has_end_to_end_path());
     }
 
@@ -239,7 +233,10 @@ mod tests {
         };
         state.update_aggregate_health();
 
-        assert!(matches!(state.aggregate_health, BackendHealth::Degraded { .. }));
+        assert!(matches!(
+            state.aggregate_health,
+            BackendHealth::Degraded { .. }
+        ));
         assert!(!state.has_end_to_end_path());
     }
 

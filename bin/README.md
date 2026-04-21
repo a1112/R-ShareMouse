@@ -17,6 +17,7 @@ bin/
 │   └── firewall.sh    # Firewall configuration
 ├── macos/             # macOS-specific scripts
 │   ├── build.sh
+│   ├── build.command  # Double-clickable Finder build launcher
 │   ├── run.sh
 │   ├── install.sh
 │   └── firewall.sh    # Firewall configuration
@@ -156,6 +157,11 @@ The macOS scripts include:
 Build and create macOS app bundle:
 ```bash
 ./bin/macos/build.sh --app
+```
+
+Double-click build from Finder:
+```bash
+open ./bin/macos/build.command
 ```
 
 Run the app bundle:

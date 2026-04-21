@@ -32,10 +32,7 @@ impl BackendCandidate {
     }
 
     /// Create a new unhealthy backend candidate.
-    pub fn unhealthy(
-        kind: BackendKind,
-        reason: BackendFailureReason,
-    ) -> Self {
+    pub fn unhealthy(kind: BackendKind, reason: BackendFailureReason) -> Self {
         Self {
             kind,
             healthy: false,
@@ -145,15 +142,13 @@ impl BackendSelector {
             .into_iter()
             .collect();
 
-        let has_higher_priority_available = available_kinds
-            .iter()
-            .any(|k| {
-                preference_order
-                    .iter()
-                    .position(|x| x == k)
-                    .map(|pos| pos < first_healthy_index.unwrap())
-                    .unwrap_or(false)
-            });
+        let has_higher_priority_available = available_kinds.iter().any(|k| {
+            preference_order
+                .iter()
+                .position(|x| x == k)
+                .map(|pos| pos < first_healthy_index.unwrap())
+                .unwrap_or(false)
+        });
 
         let result = if has_higher_priority_available {
             let first_available = preference_order
@@ -176,15 +171,18 @@ impl BackendSelector {
 
     /// Get the preference order for backends on this platform.
     fn preference_order(&self) -> Vec<BackendKind> {
-        let mut order = vec![BackendKind::Portable];
-
         #[cfg(target_os = "windows")]
         {
+            let mut order = vec![BackendKind::Portable];
             order.insert(0, BackendKind::WindowsNative);
             order.insert(0, BackendKind::VirtualHid);
+            order
         }
 
-        order
+        #[cfg(not(target_os = "windows"))]
+        {
+            vec![BackendKind::Portable]
+        }
     }
 }
 
@@ -192,10 +190,7 @@ impl BackendSelector {
 mod tests {
     use super::*;
 
-    fn candidate(
-        kind: BackendKind,
-        healthy: bool,
-    ) -> BackendCandidate {
+    fn candidate(kind: BackendKind, healthy: bool) -> BackendCandidate {
         if healthy {
             BackendCandidate::healthy(kind)
         } else {
@@ -203,6 +198,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn virtual_hid_candidate(healthy: bool, reason: Option<&str>) -> BackendCandidate {
         if healthy {
             BackendCandidate::healthy(BackendKind::VirtualHid)
@@ -220,6 +216,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn windows_native_candidate(healthy: bool) -> BackendCandidate {
         candidate(BackendKind::WindowsNative, healthy)
     }
@@ -241,10 +238,7 @@ mod tests {
     #[test]
     fn selector_skips_unhealthy_backends() {
         let selector = BackendSelector::new();
-        let candidates = vec![
-            portable_candidate(false),
-            portable_candidate(true),
-        ];
+        let candidates = vec![portable_candidate(false), portable_candidate(true)];
 
         let selected = selector.select(&candidates).unwrap();
         assert_eq!(selected.kind, BackendKind::Portable);
@@ -253,10 +247,7 @@ mod tests {
     #[test]
     fn selector_returns_none_when_all_unhealthy() {
         let selector = BackendSelector::new();
-        let candidates = vec![
-            portable_candidate(false),
-            portable_candidate(false),
-        ];
+        let candidates = vec![portable_candidate(false), portable_candidate(false)];
 
         assert!(selector.select(&candidates).is_none());
     }
@@ -310,10 +301,7 @@ mod tests {
         let selected = selector.select(&candidates).unwrap();
         assert_eq!(selected.kind, BackendKind::WindowsNative);
         assert!(selected.degraded);
-        assert!(selected
-            .degradation_reason
-            .unwrap()
-            .contains("VirtualHid"));
+        assert!(selected.degradation_reason.unwrap().contains("VirtualHid"));
     }
 
     #[cfg(target_os = "windows")]

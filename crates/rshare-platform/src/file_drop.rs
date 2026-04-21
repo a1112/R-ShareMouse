@@ -282,7 +282,8 @@ mod linux_impl {
 
                 while running_clone.load(Ordering::Relaxed) {
                     // Check for selection owner changes
-                    let owner = unsafe { xlib::XGetSelectionOwner(display as *mut _, xdnd_selection_atom) };
+                    let owner =
+                        unsafe { xlib::XGetSelectionOwner(display as *mut _, xdnd_selection_atom) };
 
                     if owner != 0 {
                         // Request selection content
@@ -295,7 +296,7 @@ mod linux_impl {
                             let utf8_string_atom = xlib::XInternAtom(
                                 display as *mut _,
                                 b"TEXT/URI-LIST\0".as_ptr() as *const i8,
-                                1,  // only_if_exists = false
+                                1, // only_if_exists = false
                             );
 
                             xlib::XConvertSelection(
@@ -357,7 +358,7 @@ mod linux_impl {
                     xlib::XA_PRIMARY,
                     0,
                     1024,
-                    0,  // delete
+                    0, // delete
                     xlib::XA_STRING,
                     &mut actual_type,
                     &mut format,

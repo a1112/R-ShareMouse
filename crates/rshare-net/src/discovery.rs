@@ -195,7 +195,11 @@ impl ServiceDiscovery {
         // Send immediate broadcast on startup
         for target in &broadcast_targets {
             if let Err(e) = socket.send_to(&hello_bytes, target).await {
-                tracing::warn!("Failed to send initial discovery packet to {}: {}", target, e);
+                tracing::warn!(
+                    "Failed to send initial discovery packet to {}: {}",
+                    target,
+                    e
+                );
             } else {
                 tracing::debug!("Sent initial discovery broadcast to {}", target);
             }
@@ -285,6 +289,7 @@ impl ServiceDiscovery {
         let sender_id = match &msg {
             Message::Hello { device_id, .. } => Some(*device_id),
             Message::HelloBack { device_id, .. } => Some(*device_id),
+            Message::Goodbye { device_id, .. } => Some(*device_id),
             _ => None,
         };
 
@@ -296,9 +301,18 @@ impl ServiceDiscovery {
         }
 
         match msg {
-            Message::Hello { device_id, ref device_name, .. } => {
+            Message::Hello {
+                device_id,
+                ref device_name,
+                ..
+            } => {
                 // Someone is announcing themselves - respond with HelloBack
-                tracing::info!("Received Hello from {} ({}) at {}", device_name, device_id, addr);
+                tracing::info!(
+                    "Received Hello from {} ({}) at {}",
+                    device_name,
+                    device_id,
+                    addr
+                );
 
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
                     let device_id = device.id;
@@ -335,9 +349,18 @@ impl ServiceDiscovery {
                     }
                 }
             }
-            Message::HelloBack { device_id, ref device_name, .. } => {
+            Message::HelloBack {
+                device_id,
+                ref device_name,
+                ..
+            } => {
                 // Response to our Hello - someone acknowledged us
-                tracing::info!("Received HelloBack from {} ({}) at {}", device_name, device_id, addr);
+                tracing::info!(
+                    "Received HelloBack from {} ({}) at {}",
+                    device_name,
+                    device_id,
+                    addr
+                );
 
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
                     let device_id = device.id;
@@ -358,8 +381,47 @@ impl ServiceDiscovery {
                     }
                 }
             }
+            Message::Goodbye { device_id, reason } => {
+                tracing::info!(
+                    "Received Goodbye from {} at {}: {}",
+                    device_id,
+                    addr,
+                    reason
+                );
+                self.devices.remove(&device_id);
+                if let Some(tx) = &self.event_tx {
+                    if tx.try_send(DiscoveryEvent::DeviceLost(device_id)).is_err() {
+                        tracing::warn!("Failed to send DeviceLost event - channel full");
+                    }
+                }
+            }
             _ => {
                 tracing::trace!("Ignoring non-discovery message type");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Broadcast a best-effort leave announcement so peers can remove this
+    /// device immediately instead of waiting for discovery timeout.
+    pub async fn broadcast_goodbye(
+        local_device_id: DeviceId,
+        port: u16,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.set_broadcast(true)?;
+
+        let msg = Message::Goodbye {
+            device_id: local_device_id,
+            reason: reason.into(),
+        };
+        let bytes = serialize_message(&msg)?;
+
+        for target in discovery_broadcast_targets(port) {
+            if let Err(error) = socket.send_to(&bytes, target).await {
+                tracing::warn!("Failed to send Goodbye packet to {}: {}", target, error);
             }
         }
 
@@ -372,8 +434,12 @@ impl ServiceDiscovery {
 
         self.devices.retain(|id, device| {
             if device.is_stale(self.config.device_timeout) {
-                tracing::info!("Device {} ({}) went offline (last seen {:.2}s ago)",
-                    device.name, id, device.last_seen.elapsed().as_secs_f32());
+                tracing::info!(
+                    "Device {} ({}) went offline (last seen {:.2}s ago)",
+                    device.name,
+                    id,
+                    device.last_seen.elapsed().as_secs_f32()
+                );
                 lost_devices.push(*id);
                 false
             } else {
@@ -519,8 +585,21 @@ fn is_candidate_ipv4(ip: Ipv4Addr) -> bool {
 fn is_ignored_interface_name(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     const IGNORED_MARKERS: &[&str] = &[
-        "vmware", "virtual", "vbox", "hyper-v", "wintun", "wireguard", "tailscale", "zerotier",
-        "docker", "podman", "vnic", "loopback", "npcap", "tap", "tun",
+        "vmware",
+        "virtual",
+        "vbox",
+        "hyper-v",
+        "wintun",
+        "wireguard",
+        "tailscale",
+        "zerotier",
+        "docker",
+        "podman",
+        "vnic",
+        "loopback",
+        "npcap",
+        "tap",
+        "tun",
     ];
 
     IGNORED_MARKERS
@@ -606,6 +685,44 @@ mod tests {
 
         assert!(!device.is_stale(Duration::from_secs(10)));
         assert!(device.is_stale(Duration::from_secs(0)));
+    }
+
+    #[tokio::test]
+    async fn goodbye_removes_device_immediately() {
+        let local_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut discovery =
+            ServiceDiscovery::new(local_id, "Test".to_string(), "test-host".to_string());
+        let (tx, mut rx) = mpsc::channel(4);
+        discovery.event_tx = Some(tx);
+        discovery.devices.insert(
+            remote_id,
+            DiscoveredDevice {
+                id: remote_id,
+                name: "Remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27432".parse().unwrap()],
+                screen_info: None,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let goodbye = Message::Goodbye {
+            device_id: remote_id,
+            reason: "service stopped".to_string(),
+        };
+        let bytes = serialize_message(&goodbye).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        discovery
+            .handle_packet(&bytes, "127.0.0.1:27432".parse().unwrap(), &socket)
+            .await
+            .unwrap();
+
+        assert!(discovery.get_device(&remote_id).is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Some(DiscoveryEvent::DeviceLost(id)) if id == remote_id
+        ));
     }
 
     #[tokio::test]

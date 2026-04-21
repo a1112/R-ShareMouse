@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::protocol::{DeviceId, ScreenInfo, Direction};
+use crate::protocol::{DeviceId, Direction, ScreenInfo};
 
 /// Device status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,9 +62,8 @@ impl Device {
     /// Check if device is considered stale (not seen for a while)
     pub fn is_stale(&self, timeout: Duration) -> bool {
         if let Some(seen) = self.last_seen {
-            let elapsed = Duration::from_millis(
-                super::protocol::timestamp_ms().saturating_sub(seen)
-            );
+            let elapsed =
+                Duration::from_millis(super::protocol::timestamp_ms().saturating_sub(seen));
             elapsed > timeout
         } else {
             true
@@ -156,28 +155,36 @@ impl ScreenLayout {
         let from_pos = self.devices.iter().find(|d| &d.device_id == from_device)?;
 
         match direction {
-            Direction::Left => self.devices.iter()
+            Direction::Left => self
+                .devices
+                .iter()
                 .find(|d| {
                     d.x + d.screen.width as i32 == from_pos.x
                         && d.y < from_pos.y + from_pos.screen.height as i32
                         && d.y + d.screen.height as i32 > from_pos.y
                 })
                 .map(|d| d.device_id),
-            Direction::Right => self.devices.iter()
+            Direction::Right => self
+                .devices
+                .iter()
                 .find(|d| {
                     d.x == from_pos.x + from_pos.screen.width as i32
                         && d.y < from_pos.y + from_pos.screen.height as i32
                         && d.y + d.screen.height as i32 > from_pos.y
                 })
                 .map(|d| d.device_id),
-            Direction::Top => self.devices.iter()
+            Direction::Top => self
+                .devices
+                .iter()
                 .find(|d| {
                     d.y + d.screen.height as i32 == from_pos.y
                         && d.x < from_pos.x + from_pos.screen.width as i32
                         && d.x + d.screen.width as i32 > from_pos.x
                 })
                 .map(|d| d.device_id),
-            Direction::Bottom => self.devices.iter()
+            Direction::Bottom => self
+                .devices
+                .iter()
                 .find(|d| {
                     d.y == from_pos.y + from_pos.screen.height as i32
                         && d.x < from_pos.x + from_pos.screen.width as i32
@@ -279,7 +286,8 @@ impl DeviceRegistry {
 
     /// Clean up stale devices
     pub fn cleanup_stale(&mut self, timeout: Duration) -> Vec<DeviceId> {
-        let stale: Vec<DeviceId> = self.devices
+        let stale: Vec<DeviceId> = self
+            .devices
             .iter()
             .filter(|(_, d)| d.id != self.local_device_id && d.is_stale(timeout))
             .map(|(id, _)| *id)

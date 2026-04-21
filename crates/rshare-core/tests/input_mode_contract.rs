@@ -92,10 +92,8 @@ fn resolved_input_mode_serializes_correctly() {
 fn daemon_status_round_trips_input_backend_fields() {
     let mut status = sample_status();
     status["input_mode"] = serde_json::to_value(ResolvedInputMode::WindowsNative).unwrap();
-    status["available_backends"] = serde_json::to_value(vec![
-        BackendKind::Portable,
-        BackendKind::WindowsNative,
-    ]).unwrap();
+    status["available_backends"] =
+        serde_json::to_value(vec![BackendKind::Portable, BackendKind::WindowsNative]).unwrap();
     status["backend_health"] = serde_json::to_value(BackendHealth::Healthy).unwrap();
     status["privilege_state"] = serde_json::to_value(PrivilegeState::UnlockedDesktop).unwrap();
 
@@ -106,7 +104,10 @@ fn daemon_status_round_trips_input_backend_fields() {
         deserialized["input_mode"],
         serde_json::to_value(ResolvedInputMode::WindowsNative).unwrap()
     );
-    assert_eq!(deserialized["available_backends"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        deserialized["available_backends"].as_array().unwrap().len(),
+        2
+    );
 }
 
 #[test]
@@ -132,7 +133,8 @@ fn daemon_status_marks_degraded_after_backend_failure() {
     status["input_mode"] = serde_json::to_value(ResolvedInputMode::Portable).unwrap();
     status["backend_health"] = serde_json::to_value(BackendHealth::Degraded {
         reason: BackendFailureReason::Unavailable,
-    }).unwrap();
+    })
+    .unwrap();
     status["last_backend_error"] = serde_json::to_value("Preferred backend unavailable").unwrap();
 
     let serialized = serde_json::to_string(&status).unwrap();
@@ -146,7 +148,10 @@ fn daemon_status_marks_degraded_after_backend_failure() {
     let health = &deserialized["backend_health"];
     assert!(health.is_object());
     assert_eq!(health["Degraded"]["reason"], "Unavailable");
-    assert_eq!(deserialized["last_backend_error"], "Preferred backend unavailable");
+    assert_eq!(
+        deserialized["last_backend_error"],
+        "Preferred backend unavailable"
+    );
 }
 
 #[test]

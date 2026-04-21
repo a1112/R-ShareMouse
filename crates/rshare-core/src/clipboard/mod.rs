@@ -26,7 +26,10 @@ pub enum ContentType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClipboardContent {
     Text(String),
-    Html { html: String, text: String },
+    Html {
+        html: String,
+        text: String,
+    },
     Image {
         format: ImageFormat,
         data: Vec<u8>,
@@ -34,7 +37,10 @@ pub enum ClipboardContent {
         height: u32,
     },
     FileList(Vec<String>),
-    Other { mime: String, data: Vec<u8> },
+    Other {
+        mime: String,
+        data: Vec<u8>,
+    },
     Empty,
 }
 
@@ -94,7 +100,9 @@ impl ClipboardContent {
             ClipboardContent::Text(s) => s.len(),
             ClipboardContent::Html { html, text } => html.len() + text.len(),
             ClipboardContent::Image { data, .. } => data.len(),
-            ClipboardContent::FileList(files) => files.iter().map(|f| f.len()).sum::<usize>() + files.len(),
+            ClipboardContent::FileList(files) => {
+                files.iter().map(|f| f.len()).sum::<usize>() + files.len()
+            }
             ClipboardContent::Other { data, .. } => data.len(),
             ClipboardContent::Empty => 0,
         }
@@ -124,7 +132,9 @@ impl ClipboardContent {
         match self {
             ClipboardContent::Text(_) | ClipboardContent::Html { .. } => ContentType::Text,
             ClipboardContent::Image { .. } => ContentType::Image,
-            ClipboardContent::FileList(_) | ClipboardContent::Other { .. } | ClipboardContent::Empty => ContentType::Other,
+            ClipboardContent::FileList(_)
+            | ClipboardContent::Other { .. }
+            | ClipboardContent::Empty => ContentType::Other,
         }
     }
 
@@ -205,7 +215,10 @@ impl ClipboardContent {
                     .collect();
                 ClipboardContent::FileList(files)
             }
-            _ => ClipboardContent::Other { mime: mime_type, data },
+            _ => ClipboardContent::Other {
+                mime: mime_type,
+                data,
+            },
         }
     }
 }
@@ -346,7 +359,10 @@ mod tests {
     #[test]
     fn test_image_format() {
         assert_eq!(ImageFormat::Png.mime_type(), mime::IMAGE_PNG);
-        assert_eq!(ImageFormat::from_mime(mime::IMAGE_JPEG), Some(ImageFormat::Jpeg));
+        assert_eq!(
+            ImageFormat::from_mime(mime::IMAGE_JPEG),
+            Some(ImageFormat::Jpeg)
+        );
         assert_eq!(ImageFormat::from_mime("unknown"), None);
     }
 
@@ -361,8 +377,12 @@ mod tests {
     fn test_clipboard_history() {
         let mut history = ClipboardHistory::new(10);
 
-        history.push(ClipboardEntry::new(ClipboardContent::from_text("First".to_string())));
-        history.push(ClipboardEntry::new(ClipboardContent::from_text("Second".to_string())));
+        history.push(ClipboardEntry::new(ClipboardContent::from_text(
+            "First".to_string(),
+        )));
+        history.push(ClipboardEntry::new(ClipboardContent::from_text(
+            "Second".to_string(),
+        )));
 
         assert_eq!(history.entries().len(), 2);
         assert_eq!(history.latest().unwrap().content.as_text(), Some("Second"));
@@ -378,7 +398,9 @@ mod tests {
         // Use different lengths to avoid deduplication
         let texts = vec!["A", "BB", "CCC", "DDDD", "EEEEE"];
         for text in texts {
-            history.push(ClipboardEntry::new(ClipboardContent::from_text(text.to_string())));
+            history.push(ClipboardEntry::new(ClipboardContent::from_text(
+                text.to_string(),
+            )));
         }
 
         assert_eq!(history.entries().len(), 3);

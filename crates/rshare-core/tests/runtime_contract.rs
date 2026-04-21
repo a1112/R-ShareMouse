@@ -4,8 +4,8 @@
 //! contracts across serialization, state transitions, and aggregation.
 
 use rshare_core::{
-    BackendHealth, BackendKind, Direction, PeerDirectoryEntry, PrivilegeState,
-    ResolvedInputMode, ControlSessionState, BackendRuntimeState, SuspendReason,
+    BackendHealth, BackendKind, BackendRuntimeState, ControlSessionState, Direction,
+    PeerDirectoryEntry, PrivilegeState, ResolvedInputMode, SuspendReason,
 };
 use serde_json;
 use uuid::Uuid;
@@ -52,16 +52,28 @@ fn backend_runtime_state_preserves_all_fields() {
     };
 
     // Verify aggregate health is degraded when inject is degraded
-    assert!(matches!(state.aggregate_health, BackendHealth::Degraded { .. }));
+    assert!(matches!(
+        state.aggregate_health,
+        BackendHealth::Degraded { .. }
+    ));
 
     // Serialize and deserialize
     let serialized = serde_json::to_string(&state).unwrap();
     let deserialized: BackendRuntimeState = serde_json::from_str(&serialized).unwrap();
 
-    assert_eq!(deserialized.selected_mode, Some(ResolvedInputMode::Portable));
+    assert_eq!(
+        deserialized.selected_mode,
+        Some(ResolvedInputMode::Portable)
+    );
     assert_eq!(deserialized.available_backends.len(), 1);
-    assert!(matches!(deserialized.inject_health, BackendHealth::Degraded { .. }));
-    assert_eq!(deserialized.last_error, Some("Injection backend failed".to_string()));
+    assert!(matches!(
+        deserialized.inject_health,
+        BackendHealth::Degraded { .. }
+    ));
+    assert_eq!(
+        deserialized.last_error,
+        Some("Injection backend failed".to_string())
+    );
 }
 
 #[test]
@@ -77,7 +89,10 @@ fn control_session_state_roundtrips_active_target() {
     let deserialized: ControlSessionState = serde_json::from_str(&serialized).unwrap();
 
     match deserialized {
-        ControlSessionState::RemoteActive { target, entered_via } => {
+        ControlSessionState::RemoteActive {
+            target,
+            entered_via,
+        } => {
             assert_eq!(target, remote_id);
             assert_eq!(entered_via, Direction::Right);
         }
@@ -132,5 +147,8 @@ fn backend_runtime_state_no_mode_means_no_end_to_end_path() {
 
     // When no mode is selected, there's no end-to-end path
     assert_eq!(state.selected_mode, None);
-    assert!(matches!(state.aggregate_health, BackendHealth::Degraded { .. }));
+    assert!(matches!(
+        state.aggregate_health,
+        BackendHealth::Degraded { .. }
+    ));
 }

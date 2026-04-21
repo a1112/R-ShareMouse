@@ -122,9 +122,9 @@ impl ModifierState {
     /// Update modifier state based on key code
     pub fn update(&mut self, key_code: u32, pressed: bool) {
         match key_code {
-            0x11 => self.ctrl_pressed = pressed,  // VK_CONTROL
-            0x12 => self.alt_pressed = pressed,   // VK_MENU
-            0x10 => self.shift_pressed = pressed, // VK_SHIFT
+            0x11 => self.ctrl_pressed = pressed,         // VK_CONTROL
+            0x12 => self.alt_pressed = pressed,          // VK_MENU
+            0x10 => self.shift_pressed = pressed,        // VK_SHIFT
             0x5B | 0x5C => self.super_pressed = pressed, // VK_LWIN/RWIN
             _ => {}
         }
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_hotkey_combinations() {
         assert!(Hotkey::ctrl_key(0x53).ctrl); // 'S'
-        assert!(Hotkey::alt_key(0x54).alt);   // 'T'
+        assert!(Hotkey::alt_key(0x54).alt); // 'T'
         assert!(Hotkey::shift_key(0x44).shift); // 'D'
         assert!(Hotkey::ctrl_alt(0x44).ctrl);
         assert!(Hotkey::ctrl_alt(0x44).alt);

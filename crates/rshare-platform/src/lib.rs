@@ -3,8 +3,8 @@
 //! This crate provides platform-specific implementations for input handling
 //! on Windows, macOS, and Linux.
 
-use tokio::sync::mpsc;
 use rshare_core::clipboard::ClipboardContent;
+use tokio::sync::mpsc;
 
 // Re-export anyhow context for display module convenience
 pub use anyhow::Context;
@@ -28,6 +28,9 @@ pub mod clipboard;
 // Firewall configuration module
 pub mod firewall;
 
+// Cross-platform system integration helpers
+pub mod system;
+
 // Re-exports
 #[cfg(windows)]
 pub use windows::*;
@@ -38,9 +41,10 @@ pub use macos::*;
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
-pub use file_drop::*;
 pub use clipboard::*;
+pub use file_drop::*;
 pub use firewall::*;
+pub use system::*;
 
 /// Clipboard listener configuration
 #[derive(Debug, Clone)]
@@ -93,12 +97,14 @@ pub type PlatformClipboardListener = clipboard::LinuxClipboardListener;
 /// Platform-specific display settings functions
 #[cfg(windows)]
 pub mod display {
-    pub use super::windows::open_display_settings;
     pub use super::windows::get_dpi_scaling;
+    pub use super::windows::open_display_settings;
 }
 
 #[cfg(target_os = "macos")]
 pub mod display {
+    use anyhow::Context;
+
     /// Open macOS display settings (System Preferences > Displays)
     pub fn open_display_settings() -> anyhow::Result<()> {
         use std::process::Command;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use crate::{DeviceId, Message, MouseButton, ButtonState, KeyState};
+use crate::{ButtonState, DeviceId, KeyState, Message, MouseButton};
 
 /// Forwarding mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +215,11 @@ impl ForwardingEngine {
             let button = convert_button_code(*button);
             messages.push(Message::MouseButton {
                 button,
-                state: if *pressed { ButtonState::Pressed } else { ButtonState::Released },
+                state: if *pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                },
             });
             self.stats.events_sent += 1;
         }
@@ -230,7 +234,11 @@ impl ForwardingEngine {
         for (keycode, pressed) in &self.current_batch.keys {
             messages.push(Message::Key {
                 keycode: *keycode,
-                state: if *pressed { KeyState::Pressed } else { KeyState::Released },
+                state: if *pressed {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
             });
             self.stats.events_sent += 1;
         }
@@ -342,7 +350,10 @@ mod tests {
         assert!(engine.process_event(event).is_empty());
 
         // Add button press should flush
-        let event = RawInputEvent::MouseButton { button: 1, pressed: true };
+        let event = RawInputEvent::MouseButton {
+            button: 1,
+            pressed: true,
+        };
         let messages = engine.process_event(event);
 
         assert_eq!(messages.len(), 2); // MouseMove + MouseButton

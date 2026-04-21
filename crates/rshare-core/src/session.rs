@@ -172,7 +172,9 @@ mod tests {
         let mut machine = CaptureSessionStateMachine::new();
         let remote_id = Uuid::new_v4();
 
-        machine.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        machine
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         assert!(machine.is_remote_active());
         assert_eq!(machine.active_target(), Some(remote_id));
     }
@@ -204,7 +206,9 @@ mod tests {
         let mut machine = CaptureSessionStateMachine::new();
         let remote_id = Uuid::new_v4();
 
-        machine.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        machine
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         assert!(machine.is_remote_active());
 
         machine.on_return_edge_hit(Direction::Left).unwrap();
@@ -216,7 +220,9 @@ mod tests {
         let mut machine = CaptureSessionStateMachine::new();
         let remote_id = Uuid::new_v4();
 
-        machine.on_edge_hit(Direction::Right, Some(remote_id)).unwrap();
+        machine
+            .on_edge_hit(Direction::Right, Some(remote_id))
+            .unwrap();
         assert!(machine.is_remote_active());
 
         machine.on_target_disconnect(remote_id);

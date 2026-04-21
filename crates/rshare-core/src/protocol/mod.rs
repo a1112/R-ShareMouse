@@ -116,7 +116,12 @@ pub struct ScreenInfo {
 
 impl ScreenInfo {
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Create a primary screen info (typical values)
@@ -192,10 +197,7 @@ pub enum Message {
         screen_info: ScreenInfo,
     },
     /// Device is leaving
-    Goodbye {
-        device_id: DeviceId,
-        reason: String,
-    },
+    Goodbye { device_id: DeviceId, reason: String },
 
     // === Input Events ===
     /// Mouse movement (high frequency)
@@ -206,15 +208,9 @@ pub enum Message {
         state: ButtonState,
     },
     /// Mouse wheel scroll
-    MouseWheel {
-        delta_x: i32,
-        delta_y: i32,
-    },
+    MouseWheel { delta_x: i32, delta_y: i32 },
     /// Key event
-    Key {
-        keycode: u32,
-        state: KeyState,
-    },
+    Key { keycode: u32, state: KeyState },
     /// Key event with modifiers
     KeyExtended {
         keycode: u32,
@@ -227,10 +223,7 @@ pub enum Message {
 
     // === Clipboard ===
     /// Clipboard data (text only for now)
-    ClipboardData {
-        mime_type: String,
-        data: Vec<u8>,
-    },
+    ClipboardData { mime_type: String, data: Vec<u8> },
     /// Request clipboard data
     ClipboardRequest,
     /// Clipboard data response
@@ -252,19 +245,11 @@ pub enum Message {
 
     // === Synchronization ===
     /// Heartbeat / keepalive
-    Heartbeat {
-        sequence: u64,
-        timestamp: u64,
-    },
+    Heartbeat { sequence: u64, timestamp: u64 },
     /// Acknowledgment for reliable delivery
-    Ack {
-        sequence: u64,
-    },
+    Ack { sequence: u64 },
     /// Error message
-    Error {
-        code: u32,
-        message: String,
-    },
+    Error { code: u32, message: String },
 }
 
 impl Message {
@@ -279,9 +264,9 @@ impl Message {
             | Message::ScreenLeave { .. } => Priority::Critical,
 
             // High: immediate input feedback
-            Message::MouseButton { .. }
-            | Message::Key { .. }
-            | Message::KeyExtended { .. } => Priority::High,
+            Message::MouseButton { .. } | Message::Key { .. } | Message::KeyExtended { .. } => {
+                Priority::High
+            }
 
             // Normal: continuous updates
             Message::MouseMove { .. }
@@ -314,11 +299,7 @@ impl Message {
 }
 
 /// Helper to create a Hello message
-pub fn hello_message(
-    device_id: DeviceId,
-    device_name: String,
-    hostname: String,
-) -> Message {
+pub fn hello_message(device_id: DeviceId, device_name: String, hostname: String) -> Message {
     Message::Hello {
         device_id,
         device_name,

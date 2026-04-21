@@ -24,3 +24,6 @@ config/
 # Frontend
 node_modules/
 dist/
+
+# macOS build output
+/R-ShareMouse.app/

@@ -243,9 +243,9 @@ mod linux_impl {
                 use x11::xtest;
                 unsafe {
                     let x11_button = match button {
-                        1 => 1,  // Left
-                        2 => 3,  // Right
-                        3 => 2,  // Middle
+                        1 => 1, // Left
+                        2 => 3, // Right
+                        3 => 2, // Middle
                         _ => button,
                     };
                     if press {
@@ -258,7 +258,11 @@ mod linux_impl {
                 return Ok(());
             }
 
-            tracing::debug!("Mouse button {} {} - using fallback", button, if press { "press" } else { "release" });
+            tracing::debug!(
+                "Mouse button {} {} - using fallback",
+                button,
+                if press { "press" } else { "release" }
+            );
             Ok(())
         }
 
@@ -277,7 +281,11 @@ mod linux_impl {
                 return Ok(());
             }
 
-            tracing::debug!("Key {} {} - using fallback", keycode, if press { "press" } else { "release" });
+            tracing::debug!(
+                "Key {} {} - using fallback",
+                keycode,
+                if press { "press" } else { "release" }
+            );
             Ok(())
         }
 

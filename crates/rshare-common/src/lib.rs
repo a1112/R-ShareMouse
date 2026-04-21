@@ -53,14 +53,19 @@ impl ScreenInfo {
     /// Create from dimensions
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
         Self {
-            x, y, width, height,
+            x,
+            y,
+            width,
+            height,
         }
     }
 
     /// Check if a point is within this screen
     pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x && x < (self.x + self.width as i32)
-            && y >= self.y && y < (self.y + self.height as i32)
+        x >= self.x
+            && x < (self.x + self.width as i32)
+            && y >= self.y
+            && y < (self.y + self.height as i32)
     }
 
     /// Get the right edge x coordinate

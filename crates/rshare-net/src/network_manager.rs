@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
+use tokio::task::JoinHandle;
 
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
@@ -69,6 +70,7 @@ pub struct NetworkManager {
 
     discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
     running: bool,
+    discovery_task: Option<JoinHandle<()>>,
 }
 
 fn spawn_connection_event_forwarder(
@@ -126,6 +128,7 @@ impl NetworkManager {
             event_rx: Some(event_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             running: false,
+            discovery_task: None,
         }
     }
 
@@ -224,14 +227,16 @@ impl NetworkManager {
 
         discovery = discovery.with_config(discovery_config);
 
-        // Spawn discovery task
-        tokio::spawn(async move {
+        // Spawn discovery and consume its events independently. ServiceDiscovery::start
+        // is the long-running receive loop, so awaiting it before reading rx would
+        // prevent DeviceFound/DeviceUpdated from ever reaching NetworkManager.
+        self.discovery_task = Some(tokio::spawn(async move {
             let (tx, mut rx) = mpsc::channel(100);
-
-            if let Err(e) = discovery.start_with_channel(tx).await {
-                tracing::error!("Discovery failed to start: {}", e);
-                return;
-            }
+            let discovery_task = tokio::spawn(async move {
+                if let Err(e) = discovery.start_with_channel(tx).await {
+                    tracing::error!("Discovery failed to start: {}", e);
+                }
+            });
 
             while let Some(event) = rx.recv().await {
                 match event {
@@ -268,7 +273,9 @@ impl NetworkManager {
                     }
                 }
             }
-        });
+
+            discovery_task.abort();
+        }));
 
         tracing::info!("Network manager started");
         Ok(())
@@ -281,6 +288,19 @@ impl NetworkManager {
         }
 
         self.running = false;
+        if let Err(error) = ServiceDiscovery::broadcast_goodbye(
+            self.local_device_id,
+            self.config.discovery_port,
+            "service stopped",
+        )
+        .await
+        {
+            tracing::warn!("Failed to broadcast Goodbye during network stop: {}", error);
+        }
+        if let Some(task) = self.discovery_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         self.discovery.stop().await?;
         tracing::info!("Network manager stopped");
         Ok(())

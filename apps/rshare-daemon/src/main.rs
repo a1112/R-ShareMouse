@@ -3,7 +3,6 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 use anyhow::Result;
-use tracing_subscriber::prelude::*;
 use rshare_core::{
     default_ipc_addr, read_json_line, write_json_line, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CaptureSessionStateMachine, Config, ControlSessionState,
@@ -15,6 +14,7 @@ use rshare_input::{
     PortableCaptureBackend, PortableInjectBackend, RDevInputListener,
 };
 use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
+use tracing_subscriber::prelude::*;
 
 #[cfg(windows)]
 use rshare_platform::firewall;
@@ -95,10 +95,8 @@ impl DaemonState {
                 last_seen_at: Instant::now(),
             },
         );
-        self.layout.merge_discovered_peers_to_right_with_screens([(
-            device.id,
-            screen_info,
-        )]);
+        self.layout
+            .merge_discovered_peers_to_right_with_screens([(device.id, screen_info)]);
     }
 
     fn remove_device(&mut self, id: &DeviceId) {
@@ -591,6 +589,9 @@ fn input_key_state(state: rshare_core::KeyState) -> rshare_input::ButtonState {
 }
 
 fn create_inject_backend(mode: Option<ResolvedInputMode>) -> Result<Box<dyn InjectBackend>> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = mode;
+
     #[cfg(target_os = "windows")]
     if matches!(mode, Some(ResolvedInputMode::WindowsNative)) {
         use rshare_input::backend::WindowsNativeInjectBackend;
@@ -598,6 +599,86 @@ fn create_inject_backend(mode: Option<ResolvedInputMode>) -> Result<Box<dyn Inje
     }
 
     Ok(Box::new(PortableInjectBackend::new()?))
+}
+
+#[derive(Debug)]
+struct UnavailableInjectBackend {
+    kind: BackendKind,
+    health: BackendHealth,
+    error: String,
+}
+
+impl UnavailableInjectBackend {
+    fn new(kind: BackendKind, health: BackendHealth, error: String) -> Self {
+        Self {
+            kind,
+            health,
+            error,
+        }
+    }
+}
+
+impl InjectBackend for UnavailableInjectBackend {
+    fn kind(&self) -> BackendKind {
+        self.kind
+    }
+
+    fn health(&self) -> BackendHealth {
+        self.health.clone()
+    }
+
+    fn inject(&mut self, _event: InputEvent) -> Result<()> {
+        anyhow::bail!("Input injection backend unavailable: {}", self.error)
+    }
+
+    fn is_active(&self) -> bool {
+        false
+    }
+}
+
+fn backend_kind_for_mode(mode: Option<ResolvedInputMode>) -> BackendKind {
+    match mode {
+        #[cfg(target_os = "windows")]
+        Some(ResolvedInputMode::WindowsNative) => BackendKind::WindowsNative,
+        #[cfg(target_os = "windows")]
+        Some(ResolvedInputMode::VirtualHid) => BackendKind::VirtualHid,
+        Some(ResolvedInputMode::Portable) | None => BackendKind::Portable,
+    }
+}
+
+fn inject_backend_failure_reason(error: &anyhow::Error) -> BackendFailureReason {
+    let error_text = error.to_string().to_lowercase();
+    if error_text.contains("permission") || error_text.contains("accessibility") {
+        BackendFailureReason::PermissionDenied
+    } else {
+        BackendFailureReason::InitializationFailed
+    }
+}
+
+fn build_inject_backend(
+    mode: Option<ResolvedInputMode>,
+) -> (Box<dyn InjectBackend>, BackendHealth, Option<String>) {
+    match create_inject_backend(mode) {
+        Ok(backend) => {
+            let health = backend.health();
+            (backend, health, None)
+        }
+        Err(error) => {
+            let reason = inject_backend_failure_reason(&error);
+            let health = BackendHealth::Degraded { reason };
+            let error = error.to_string();
+            tracing::warn!("Input injection backend unavailable: {}", error);
+            (
+                Box::new(UnavailableInjectBackend::new(
+                    backend_kind_for_mode(mode),
+                    health.clone(),
+                    error.clone(),
+                )),
+                health,
+                Some(error),
+            )
+        }
+    }
 }
 
 async fn inject_remote_message(
@@ -709,10 +790,8 @@ fn get_log_file_path() -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_file = get_log_file_path();
-    let file_appender = tracing_appender::rolling::never(
-        log_file.parent().unwrap(),
-        log_file.file_name().unwrap(),
-    );
+    let file_appender =
+        tracing_appender::rolling::never(log_file.parent().unwrap(), log_file.file_name().unwrap());
 
     tracing_subscriber::registry()
         .with(
@@ -806,6 +885,9 @@ async fn main() -> Result<()> {
     }
     let state = Arc::new(RwLock::new(daemon_state));
 
+    let (inject_backend, inject_health, inject_error) = build_inject_backend(input_mode);
+    let last_backend_error = inject_error.or(backend_error);
+
     // Initialize backend state
     {
         let mut s = state.write().await;
@@ -813,11 +895,11 @@ async fn main() -> Result<()> {
             input_mode,
             available_backends,
             backend_health.clone(), // capture health
-            backend_health,         // inject health
-            backend_error,
+            inject_health,
+            last_backend_error,
         );
     }
-    let inject_backend = Arc::new(Mutex::new(create_inject_backend(input_mode)?));
+    let inject_backend = Arc::new(Mutex::new(inject_backend));
 
     let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
@@ -923,7 +1005,7 @@ async fn main() -> Result<()> {
     network_manager.lock().await.stop().await?;
 
     tracing::info!("R-ShareMouse daemon stopped");
-    Ok(())
+    std::process::exit(0);
 }
 
 async fn run_ipc_server(
@@ -1091,7 +1173,6 @@ fn preserve_invalid_layout_file(path: &Path) {
             error
         );
     }
-
 }
 
 fn load_layout_from_path(local_device: DeviceId, path: impl AsRef<Path>) -> Result<LayoutGraph> {
@@ -1219,6 +1300,7 @@ mod tests {
         }));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn healthy_candidates_remain_visible_after_selection() {
         let candidates = vec![

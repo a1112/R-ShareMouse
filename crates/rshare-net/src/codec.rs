@@ -1,8 +1,8 @@
 //! Message encoding and decoding
 
-use rshare_core::Message;
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
+use rshare_core::Message;
 
 /// Message frame format
 ///
@@ -56,7 +56,11 @@ impl MessageCodec {
         // Read length
         let frame_len = frame.get_u32() as usize;
         if frame_len != data.len() - 4 {
-            anyhow::bail!("Frame length mismatch: expected {}, got {}", frame_len, data.len() - 4);
+            anyhow::bail!(
+                "Frame length mismatch: expected {}, got {}",
+                frame_len,
+                data.len() - 4
+            );
         }
 
         // Read and verify type tag
@@ -65,20 +69,17 @@ impl MessageCodec {
 
         // Read and decode payload
         let payload = &data[FRAME_HEADER_SIZE..];
-        serde_json::from_slice(payload)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
+        serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
     }
 
     /// Encode a message without frame header
     pub fn encode_raw(message: &Message) -> Result<Vec<u8>> {
-        serde_json::to_vec(message)
-            .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))
+        serde_json::to_vec(message).map_err(|e| anyhow::anyhow!("Serialization error: {}", e))
     }
 
     /// Decode a message without frame header
     pub fn decode_raw(data: &[u8]) -> Result<Message> {
-        serde_json::from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
+        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
     }
 
     /// Get the type tag for a message
@@ -159,7 +160,12 @@ impl MessageDecoder {
         }
 
         // Peek at the length
-        let len = u32::from_be_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]]) as usize;
+        let len = u32::from_be_bytes([
+            self.buffer[0],
+            self.buffer[1],
+            self.buffer[2],
+            self.buffer[3],
+        ]) as usize;
 
         // Validate length
         if len > self.max_message_size {
@@ -276,15 +282,21 @@ mod tests {
 
     #[test]
     fn test_message_type_tags() {
-        assert_eq!(MessageCodec::message_type_tag(&Message::Hello {
-            device_id: DeviceId::new_v4(),
-            device_name: String::new(),
-            hostname: String::new(),
-            protocol_version: 1,
-            capabilities: Default::default(),
-        }), 0);
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::Hello {
+                device_id: DeviceId::new_v4(),
+                device_name: String::new(),
+                hostname: String::new(),
+                protocol_version: 1,
+                capabilities: Default::default(),
+            }),
+            0
+        );
 
-        assert_eq!(MessageCodec::message_type_tag(&Message::MouseMove { x: 0, y: 0 }), 10);
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::MouseMove { x: 0, y: 0 }),
+            10
+        );
     }
 
     #[test]

@@ -3,8 +3,11 @@
 //! This module provides backends for tracking desktop session state,
 //! such as locked/unlocked desktop, secure desktop (UAC), and session availability.
 
+#[cfg(target_os = "windows")]
 use crate::backend::PrivilegeBackend;
+#[cfg(target_os = "windows")]
 use anyhow::Result;
+#[cfg(target_os = "windows")]
 use std::fmt::Debug;
 
 /// Windows privilege state tracker.
@@ -58,7 +61,7 @@ impl PrivilegeBackend for WindowsPrivilegeBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::backend::PrivilegeBackend;
 
     #[test]
     fn noop_privilege_backend_reports_unrestricted_state() {

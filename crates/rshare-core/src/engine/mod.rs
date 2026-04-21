@@ -6,19 +6,16 @@
 //! - Clipboard synchronization
 //! - Connection management
 
-pub mod state_machine;
-pub mod forwarding;
 pub mod clipboard;
+pub mod forwarding;
 pub mod hotkey;
+pub mod state_machine;
 
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::{
-    DeviceId, Device, ScreenInfo, Message,
-    config::Config,
-};
+use crate::{config::Config, Device, DeviceId, Message, ScreenInfo};
 
 /// Discovery event types
 #[derive(Debug, Clone)]
@@ -40,10 +37,10 @@ pub trait ConnectionManager: Send + Sync {
     async fn broadcast(&mut self, message: Message) -> Result<()>;
 }
 
-pub use state_machine::*;
-pub use forwarding::*;
 pub use clipboard::*;
+pub use forwarding::*;
 pub use hotkey::*;
+pub use state_machine::*;
 
 /// Trait for input listener (abstracted from rshare-input)
 pub trait InputListener: Send + Sync {
@@ -172,8 +169,7 @@ impl RShareEngine {
         if let Some(mgr) = &self.connection_manager {
             let bind_addr = format!(
                 "{}:{}",
-                self.config.app_config.network.bind_address,
-                self.config.app_config.network.port
+                self.config.app_config.network.bind_address, self.config.app_config.network.port
             );
 
             let mut mgr_ref = mgr.write().await;

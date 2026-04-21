@@ -1,10 +1,10 @@
 use rshare_core::{
     ipc::{
-        default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot,
-        DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
+        default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
+        DaemonResponse, ServiceStatusSnapshot,
     },
-    BackgroundProcessOwner, BackgroundRunMode, TrayRuntimeState,
     service::{pid_file_path, state_dir},
+    BackgroundProcessOwner, BackgroundRunMode, TrayRuntimeState,
 };
 use tokio::io::duplex;
 use uuid::Uuid;
@@ -80,7 +80,10 @@ fn default_status_snapshot_reports_daemon_owned_background_runtime() {
     );
 
     assert_eq!(snapshot.background_owner, BackgroundProcessOwner::Daemon);
-    assert_eq!(snapshot.background_mode, BackgroundRunMode::BackgroundProcess);
+    assert_eq!(
+        snapshot.background_mode,
+        BackgroundRunMode::BackgroundProcess
+    );
     assert_eq!(snapshot.tray_owner, BackgroundProcessOwner::Daemon);
     assert_eq!(snapshot.tray_state, TrayRuntimeState::Unavailable);
     assert!(!snapshot.started_by_desktop);

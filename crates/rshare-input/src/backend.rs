@@ -9,6 +9,12 @@ use crate::listener::RDevInputListener;
 use anyhow::Result;
 use std::fmt::{self, Debug};
 
+#[cfg(target_os = "macos")]
+type PortableInputEmulator = crate::emulator::MacosNativeInputEmulator;
+
+#[cfg(not(target_os = "macos"))]
+type PortableInputEmulator = crate::emulator::EnigoInputEmulator;
+
 /// The kind of backend.
 pub type BackendKind = rshare_core::BackendKind;
 
@@ -217,16 +223,16 @@ impl CaptureBackend for PortableCaptureBackend {
     }
 }
 
-/// Portable injection backend using enigo.
+/// Portable injection backend.
 pub struct PortableInjectBackend {
-    emulator: crate::emulator::EnigoInputEmulator,
+    emulator: PortableInputEmulator,
     health: BackendHealth,
 }
 
 impl PortableInjectBackend {
     /// Create a new portable injection backend.
     pub fn new() -> Result<Self> {
-        let mut emulator = crate::emulator::EnigoInputEmulator::new()?;
+        let mut emulator = PortableInputEmulator::new()?;
         emulator.activate()?;
 
         Ok(Self {
@@ -237,6 +243,15 @@ impl PortableInjectBackend {
 
     /// Create a new portable injection backend for testing.
     pub fn new_for_test() -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(Self {
+                emulator: PortableInputEmulator::new_for_test()?,
+                health: BackendHealth::Healthy,
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
         Self::new()
     }
 
@@ -753,23 +768,6 @@ mod tests {
     impl CaptureDriver for FailingCaptureDriver {
         fn start(&mut self) -> Result<()> {
             anyhow::bail!("capture driver failed to start")
-        }
-
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        fn is_running(&self) -> bool {
-            false
-        }
-    }
-
-    #[derive(Debug)]
-    struct NonRunningCaptureDriver;
-
-    impl CaptureDriver for NonRunningCaptureDriver {
-        fn start(&mut self) -> Result<()> {
-            Ok(())
         }
 
         fn stop(&mut self) -> Result<()> {

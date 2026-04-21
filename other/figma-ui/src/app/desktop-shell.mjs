@@ -17,16 +17,17 @@ export function getThemeModeOptions() {
 
 export function getHeaderMetrics() {
   return {
-    headerPaddingX: 12,
-    brandGap: 8,
+    headerHeight: 40,
+    headerPaddingX: 10,
     navGap: 4,
     navButtonPaddingX: 10,
-    navButtonPaddingY: 4,
+    navButtonPaddingY: 3,
     actionGap: 6,
     actionButtonPaddingX: 10,
-    actionButtonPaddingY: 4,
-    windowGap: 0,
-    windowButtonSize: 32,
+    actionButtonPaddingY: 3,
+    windowGap: 6,
+    windowButtonSize: 12,
+    windowButtonHitSize: 24,
   };
 }
 

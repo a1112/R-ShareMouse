@@ -124,6 +124,7 @@ const lightTheme: Theme = {
 /* ---------- Constants ---------- */
 const SNAP_DISTANCE = 12;
 const SCALE_FACTOR = 0.12;
+const EXTERNAL_LAYOUT_SETTLE_MS = 8000;
 
 function resW(r: number) { return Math.round(r * SCALE_FACTOR); }
 function resH(r: number) { return Math.round(r * SCALE_FACTOR); }
@@ -169,6 +170,18 @@ function normalizeDevice(device: DeviceData): DeviceData {
   };
 }
 
+function monitorGeometrySignature(monitors: MonitorData[]): string {
+  return monitors
+    .map((monitor) => [
+      monitor.id,
+      Math.round(monitor.x * 100) / 100,
+      Math.round(monitor.y * 100) / 100,
+      monitor.enabled ? 1 : 0,
+    ].join(":"))
+    .sort()
+    .join("|");
+}
+
 /* ---------- Component ---------- */
 export default function MonitorManager({
   devices: externalDevices,
@@ -189,7 +202,6 @@ export default function MonitorManager({
       : initialDevices
   );
   const [dragging, setDragging] = useState<string | null>(null);
-  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [selected, setSelected] = useState<string | null>(
     (externalMonitors && externalMonitors[0]?.id) ?? "m1"
   );
@@ -203,16 +215,65 @@ export default function MonitorManager({
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const monitorsRef = useRef(monitors);
+  const draggingRef = useRef<string | null>(null);
+  const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const panOffsetRef = useRef(panOffset);
+  const zoomRef = useRef(zoom);
+  const pendingLocalSignatureRef = useRef<string | null>(null);
+  const pendingLocalSinceRef = useRef(0);
 
   const isDark = externalIsDark ?? internalIsDark;
   const t = isDark ? darkTheme : lightTheme;
+
+  useEffect(() => {
+    monitorsRef.current = monitors;
+  }, [monitors]);
+
+  useEffect(() => {
+    draggingRef.current = dragging;
+  }, [dragging]);
+
+  useEffect(() => {
+    panOffsetRef.current = panOffset;
+  }, [panOffset]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
 
   useEffect(() => {
     if (!externalMonitors || externalMonitors.length === 0) {
       return;
     }
 
-    setMonitors(externalMonitors);
+    const incomingSignature = monitorGeometrySignature(externalMonitors);
+    const pendingLocalSignature = pendingLocalSignatureRef.current;
+
+    if (draggingRef.current) {
+      return;
+    }
+
+    if (
+      pendingLocalSignature &&
+      incomingSignature !== pendingLocalSignature &&
+      Date.now() - pendingLocalSinceRef.current < EXTERNAL_LAYOUT_SETTLE_MS
+    ) {
+      return;
+    }
+
+    if (pendingLocalSignature && incomingSignature === pendingLocalSignature) {
+      pendingLocalSignatureRef.current = null;
+      pendingLocalSinceRef.current = 0;
+    } else if (pendingLocalSignature) {
+      pendingLocalSignatureRef.current = null;
+      pendingLocalSinceRef.current = 0;
+    }
+
+    if (incomingSignature !== monitorGeometrySignature(monitorsRef.current)) {
+      monitorsRef.current = externalMonitors;
+      setMonitors(externalMonitors);
+    }
   }, [externalMonitors]);
 
   useEffect(() => {
@@ -242,11 +303,11 @@ export default function MonitorManager({
 
   /* ---- Snap logic ---- */
   const computeSnap = useCallback(
-    (dragId: string, rawX: number, rawY: number, w: number, h: number) => {
+    (sourceMonitors: MonitorData[], dragId: string, rawX: number, rawY: number, w: number, h: number) => {
       let bestX = rawX;
       let bestY = rawY;
       const lines: SnapLine[] = [];
-      const others = monitors.filter((m) => m.id !== dragId && m.enabled);
+      const others = sourceMonitors.filter((m) => m.id !== dragId && m.enabled);
 
       const dragEdges = {
         left: rawX, right: rawX + w, top: rawY, bottom: rawY + h,
@@ -292,13 +353,13 @@ export default function MonitorManager({
       }
       return { x: bestX, y: bestY, lines };
     },
-    [monitors]
+    []
   );
 
   /* ---- Collision resolution ---- */
   const resolveCollision = useCallback(
-    (dragId: string, x: number, y: number, w: number, h: number, rawX: number, rawY: number) => {
-      const others = monitors.filter((m) => m.id !== dragId && m.enabled);
+    (sourceMonitors: MonitorData[], dragId: string, x: number, y: number, w: number, h: number, rawX: number, rawY: number) => {
+      const others = sourceMonitors.filter((m) => m.id !== dragId && m.enabled);
 
       const overlaps = (px: number, py: number) =>
         others.some(
@@ -352,7 +413,7 @@ export default function MonitorManager({
 
       return bestPos;
     },
-    [monitors]
+    []
   );
 
   /* ---- Drag handlers ---- */
@@ -361,41 +422,59 @@ export default function MonitorManager({
       e.preventDefault();
       e.stopPropagation();
       setSelected(id);
-      const mon = monitors.find((m) => m.id === id);
+      const mon = monitorsRef.current.find((m) => m.id === id);
       if (!mon || !canvasRef.current) return;
       const rect = canvasRef.current.getBoundingClientRect();
-      setDragOffset({
-        x: (e.clientX - rect.left) / zoom - panOffset.x - mon.x,
-        y: (e.clientY - rect.top) / zoom - panOffset.y - mon.y,
-      });
+      const currentZoom = zoomRef.current;
+      const currentPan = panOffsetRef.current;
+      dragOffsetRef.current = {
+        x: (e.clientX - rect.left) / currentZoom - currentPan.x - mon.x,
+        y: (e.clientY - rect.top) / currentZoom - currentPan.y - mon.y,
+      };
+      draggingRef.current = id;
       setDragging(id);
     },
-    [monitors, zoom, panOffset]
+    []
   );
 
   const handleMouseMove = useCallback(
     (e: MouseEvent) => {
-      if (!dragging || !canvasRef.current) return;
+      const dragId = draggingRef.current;
+      if (!dragId || !canvasRef.current) return;
       const rect = canvasRef.current.getBoundingClientRect();
-      const mon = monitors.find((m) => m.id === dragging);
+      const currentMonitors = monitorsRef.current;
+      const mon = currentMonitors.find((m) => m.id === dragId);
       if (!mon) return;
-      const rawX = (e.clientX - rect.left) / zoom - panOffset.x - dragOffset.x;
-      const rawY = (e.clientY - rect.top) / zoom - panOffset.y - dragOffset.y;
-      const { x, y, lines } = computeSnap(dragging, rawX, rawY, mon.w, mon.h);
-      const resolved = resolveCollision(dragging, x, y, mon.w, mon.h, rawX, rawY);
+      const currentZoom = zoomRef.current;
+      const currentPan = panOffsetRef.current;
+      const currentOffset = dragOffsetRef.current;
+      const rawX = (e.clientX - rect.left) / currentZoom - currentPan.x - currentOffset.x;
+      const rawY = (e.clientY - rect.top) / currentZoom - currentPan.y - currentOffset.y;
+      const { x, y, lines } = computeSnap(currentMonitors, dragId, rawX, rawY, mon.w, mon.h);
+      const resolved = resolveCollision(currentMonitors, dragId, x, y, mon.w, mon.h, rawX, rawY);
+      const nextMonitors = currentMonitors.map((m) =>
+        m.id === dragId ? { ...m, x: resolved.x, y: resolved.y } : m
+      );
+      monitorsRef.current = nextMonitors;
+      pendingLocalSignatureRef.current = monitorGeometrySignature(nextMonitors);
       setSnapLines(resolved.x === x && resolved.y === y ? lines : []);
-      setMonitors((prev) => prev.map((m) => (m.id === dragging ? { ...m, x: resolved.x, y: resolved.y } : m)));
+      setMonitors(nextMonitors);
     },
-    [dragging, dragOffset, zoom, panOffset, computeSnap, resolveCollision, monitors]
+    [computeSnap, resolveCollision]
   );
 
   const handleMouseUp = useCallback(() => {
-    if (dragging) {
-      onMonitorsCommit?.(monitors);
+    const dragId = draggingRef.current;
+    if (dragId) {
+      const committedMonitors = monitorsRef.current;
+      pendingLocalSignatureRef.current = monitorGeometrySignature(committedMonitors);
+      pendingLocalSinceRef.current = Date.now();
+      onMonitorsCommit?.(committedMonitors);
     }
+    draggingRef.current = null;
     setDragging(null);
     setSnapLines([]);
-  }, [dragging, monitors, onMonitorsCommit]);
+  }, [onMonitorsCommit]);
 
   useEffect(() => {
     if (dragging) {
