@@ -19,7 +19,8 @@ pub mod session;
 // Re-exports from protocol
 pub use protocol::{
     heartbeat_message, hello_back_message, hello_message, timestamp_ms, ButtonState,
-    DeviceCapabilities, DeviceId, Direction, KeyState, Message, MouseButton, Priority, ScreenInfo,
+    DeviceCapabilities, DeviceId, Direction, GamepadButton, GamepadButtonState, GamepadDeviceInfo,
+    GamepadState, KeyState, Message, MouseButton, Priority, ScreenInfo,
 };
 
 // Re-exports from device
@@ -27,6 +28,7 @@ pub use device::{Device, DevicePosition, DeviceRegistry, DeviceStatus, ScreenLay
 
 // Re-exports from config
 pub use config::Config;
+pub use config::{GamepadConfig, GamepadRoutingMode};
 
 // Re-exports from clipboard
 pub use clipboard::ClipboardContent;

@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub input: InputConfig,
     #[serde(default)]
+    pub gamepad: GamepadConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     /// Known device hostnames
     #[serde(default)]
@@ -55,6 +57,29 @@ pub struct InputConfig {
     pub mouse_wheel_sync: bool,
     /// Key delay in milliseconds (for macro protection)
     pub key_delay_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GamepadConfig {
+    /// Enable gamepad sharing.
+    pub enabled: bool,
+    /// How gamepad input is routed.
+    #[serde(default)]
+    pub routing_mode: GamepadRoutingMode,
+    /// Deadzone in basis points. 800 = 8%.
+    pub deadzone_basis_points: u16,
+    /// Maximum state snapshot rate.
+    pub max_update_hz: u16,
+    /// Enable future vibration passthrough when supported.
+    pub vibration: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GamepadRoutingMode {
+    Disabled,
+    LocalOnly,
+    FixedTarget { device_id: DeviceId },
+    FollowActiveKeyboardMouseTarget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +128,24 @@ impl Default for InputConfig {
     }
 }
 
+impl Default for GamepadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            routing_mode: GamepadRoutingMode::Disabled,
+            deadzone_basis_points: 800,
+            max_update_hz: 120,
+            vibration: false,
+        }
+    }
+}
+
+impl Default for GamepadRoutingMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -121,6 +164,7 @@ impl Default for Config {
             network: NetworkConfig::default(),
             gui: GuiConfig::default(),
             input: InputConfig::default(),
+            gamepad: GamepadConfig::default(),
             security: SecurityConfig::default(),
             known_devices: Vec::new(),
         }
@@ -272,6 +316,11 @@ mod tests {
         assert!(config.input.clipboard_sync);
         assert_eq!(config.input.edge_threshold, 10);
         assert!(config.input.mouse_wheel_sync);
+        assert!(!config.gamepad.enabled);
+        assert_eq!(config.gamepad.routing_mode, GamepadRoutingMode::Disabled);
+        assert_eq!(config.gamepad.deadzone_basis_points, 800);
+        assert_eq!(config.gamepad.max_update_hz, 120);
+        assert!(!config.gamepad.vibration);
         assert!(!config.security.password_required);
         assert!(config.security.encryption);
         assert!(config.security.lan_only);
@@ -293,6 +342,10 @@ mod tests {
         config.network.port = 4242;
         config.gui.start_minimized = true;
         config.input.edge_threshold = 24;
+        config.gamepad.enabled = true;
+        config.gamepad.routing_mode = GamepadRoutingMode::FixedTarget {
+            device_id: DeviceId::new_v4(),
+        };
         config.security.password_required = true;
         config.gui.screen_layout.push(ScreenLayoutEntry {
             device_id: DeviceId::new_v4(),

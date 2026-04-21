@@ -189,6 +189,11 @@ impl InputEmulator for EnigoInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
+            InputEvent::GamepadConnected { .. }
+            | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadState { .. } => {
+                anyhow::bail!("Gamepad injection is not supported by this input emulator");
+            }
         }
 
         // Apply event delay if configured
@@ -440,6 +445,11 @@ impl InputEmulator for MacosNativeInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
+            InputEvent::GamepadConnected { .. }
+            | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadState { .. } => {
+                anyhow::bail!("Gamepad injection is not supported by this input emulator");
+            }
         }
 
         if self.config.event_delay.as_millis() > 0 {
@@ -701,6 +711,11 @@ impl InputEmulator for WindowsNativeInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
+            InputEvent::GamepadConnected { .. }
+            | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadState { .. } => {
+                anyhow::bail!("Gamepad injection is not supported by this input emulator");
+            }
         }
 
         if self.config.event_delay.as_millis() > 0 {

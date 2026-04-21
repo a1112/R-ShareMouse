@@ -59,6 +59,7 @@ type TauriInvoke = <T = unknown>(
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
+const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 
 const EMPTY_PAYLOAD: DashboardPayload = {
   status: null,
@@ -91,6 +92,31 @@ async function invokeCommand<T = unknown>(
   return invoke<T>(command, args);
 }
 
+function loadHiddenMonitorIds(): Set<string> {
+  try {
+    const rawValue = window.localStorage.getItem(HIDDEN_MONITOR_IDS_STORAGE_KEY);
+    const parsed = rawValue ? JSON.parse(rawValue) : [];
+    return new Set(
+      Array.isArray(parsed)
+        ? parsed.filter((id): id is string => typeof id === "string")
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function saveHiddenMonitorIds(hiddenMonitorIds: ReadonlySet<string>) {
+  try {
+    window.localStorage.setItem(
+      HIDDEN_MONITOR_IDS_STORAGE_KEY,
+      JSON.stringify([...hiddenMonitorIds]),
+    );
+  } catch {
+    // Visibility is still preserved in memory when storage is unavailable.
+  }
+}
+
 function getLayoutDevices(layoutDevices: Array<Record<string, unknown>>): LayoutDevice[] {
   return layoutDevices.map((device) => ({
     id: String(device.id),
@@ -103,7 +129,10 @@ function getLayoutDevices(layoutDevices: Array<Record<string, unknown>>): Layout
   }));
 }
 
-function getLayoutMonitors(layoutMonitors: Array<Record<string, unknown>>): MonitorData[] {
+function getLayoutMonitors(
+  layoutMonitors: Array<Record<string, unknown>>,
+  hiddenMonitorIds: ReadonlySet<string> = new Set(),
+): MonitorData[] {
   return layoutMonitors.map((monitor) => ({
     id: String(monitor.id),
     displayId:
@@ -127,7 +156,7 @@ function getLayoutMonitors(layoutMonitors: Array<Record<string, unknown>>): Moni
     w: Number(monitor.w),
     h: Number(monitor.h),
     primary: Boolean(monitor.primary),
-    enabled: Boolean(monitor.enabled),
+    enabled: Boolean(monitor.enabled) && !hiddenMonitorIds.has(String(monitor.id)),
   }));
 }
 
@@ -139,10 +168,13 @@ export default function App() {
   const [systemPrefersDark, setSystemPrefersDark] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
+    loadHiddenMonitorIds,
+  );
 
   const model = buildDesktopViewModel(payload);
   const layoutDevices = getLayoutDevices(model.layout.devices);
-  const layoutMonitors = getLayoutMonitors(model.layout.monitors);
+  const layoutMonitors = getLayoutMonitors(model.layout.monitors, hiddenMonitorIds);
   const isDark = themeMode === "system" ? systemPrefersDark : themeMode === "dark";
   const theme = getDesktopTheme(isDark);
   const chrome = buildPageChrome(page, theme);
@@ -179,6 +211,10 @@ export default function App() {
 
     return () => media.removeEventListener("change", applyPreference);
   }, []);
+
+  useEffect(() => {
+    saveHiddenMonitorIds(hiddenMonitorIds);
+  }, [hiddenMonitorIds]);
 
   async function runServiceAction(action: "start" | "stop") {
     setBusy(true);
@@ -250,6 +286,18 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleMonitorVisibilityChange(monitorId: string, enabled: boolean) {
+    setHiddenMonitorIds((current) => {
+      const next = new Set(current);
+      if (enabled) {
+        next.delete(monitorId);
+      } else {
+        next.add(monitorId);
+      }
+      return next;
+    });
   }
 
   async function handleWindow(command: "minimize_window" | "toggle_maximize_window" | "close_window") {
@@ -440,6 +488,7 @@ export default function App() {
               showFooter={false}
               statusText={`布局画布 · ${model.devices.length} 台远端设备`}
               onMonitorsCommit={saveLayoutFromMonitors}
+              onMonitorVisibilityChange={handleMonitorVisibilityChange}
               footerText={
                 model.layout.error
                   ? `布局未保存：${model.layout.error}`

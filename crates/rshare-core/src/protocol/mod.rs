@@ -160,9 +160,26 @@ impl ScreenInfo {
 /// Device capabilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
+    #[serde(default = "default_true")]
     pub supports_clipboard: bool,
+    #[serde(default = "default_true")]
     pub supports_hotkeys: bool,
+    #[serde(default)]
+    pub supports_gamepad_capture: bool,
+    #[serde(default)]
+    pub supports_gamepad_inject: bool,
+    #[serde(default)]
+    pub max_gamepads: u8,
+    #[serde(default = "default_max_devices")]
     pub max_devices: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_devices() -> u32 {
+    16
 }
 
 impl Default for DeviceCapabilities {
@@ -170,7 +187,80 @@ impl Default for DeviceCapabilities {
         Self {
             supports_clipboard: true,
             supports_hotkeys: true,
+            supports_gamepad_capture: false,
+            supports_gamepad_inject: false,
+            max_gamepads: 0,
             max_devices: 16,
+        }
+    }
+}
+
+/// Canonical gamepad button names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadButton {
+    South,
+    East,
+    West,
+    North,
+    LeftBumper,
+    RightBumper,
+    Select,
+    Start,
+    Guide,
+    LeftStick,
+    RightStick,
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    Other(u16),
+}
+
+/// Pressed state for a single gamepad button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamepadButtonState {
+    pub button: GamepadButton,
+    pub pressed: bool,
+}
+
+/// Device metadata for a locally detected or remotely virtualized gamepad.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamepadDeviceInfo {
+    pub gamepad_id: u8,
+    pub name: String,
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+}
+
+/// Full gamepad state snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamepadState {
+    pub gamepad_id: u8,
+    pub sequence: u64,
+    pub buttons: Vec<GamepadButtonState>,
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
+    pub left_trigger: u16,
+    pub right_trigger: u16,
+    pub timestamp_ms: u64,
+}
+
+impl GamepadState {
+    /// Create a neutral state snapshot with all axes centered and triggers released.
+    pub fn neutral(gamepad_id: u8, sequence: u64, timestamp_ms: u64) -> Self {
+        Self {
+            gamepad_id,
+            sequence,
+            buttons: Vec::new(),
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            timestamp_ms,
         }
     }
 }
@@ -220,6 +310,12 @@ pub enum Message {
         alt: bool,
         meta: bool,
     },
+    /// Gamepad became available on the sender.
+    GamepadConnected { info: GamepadDeviceInfo },
+    /// Gamepad is no longer available on the sender.
+    GamepadDisconnected { gamepad_id: u8 },
+    /// Full gamepad state snapshot.
+    GamepadState { state: GamepadState },
 
     // === Clipboard ===
     /// Clipboard data (text only for now)
@@ -264,13 +360,16 @@ impl Message {
             | Message::ScreenLeave { .. } => Priority::Critical,
 
             // High: immediate input feedback
-            Message::MouseButton { .. } | Message::Key { .. } | Message::KeyExtended { .. } => {
-                Priority::High
-            }
+            Message::MouseButton { .. }
+            | Message::Key { .. }
+            | Message::KeyExtended { .. }
+            | Message::GamepadConnected { .. }
+            | Message::GamepadDisconnected { .. } => Priority::High,
 
             // Normal: continuous updates
             Message::MouseMove { .. }
             | Message::MouseWheel { .. }
+            | Message::GamepadState { .. }
             | Message::ScreenUpdate { .. } => Priority::Normal,
 
             // Low: background operations
@@ -417,5 +516,68 @@ mod tests {
 
         let normal = Message::MouseMove { x: 100, y: 200 };
         assert_eq!(normal.priority(), Priority::Normal);
+
+        let gamepad_connect = Message::GamepadConnected {
+            info: GamepadDeviceInfo {
+                gamepad_id: 0,
+                name: "Xbox Wireless Controller".to_string(),
+                vendor_id: Some(0x045e),
+                product_id: Some(0x02fd),
+            },
+        };
+        assert_eq!(gamepad_connect.priority(), Priority::High);
+
+        let gamepad_state = Message::GamepadState {
+            state: GamepadState::neutral(0, 1, 123),
+        };
+        assert_eq!(gamepad_state.priority(), Priority::Normal);
+        assert!(!gamepad_state.requires_ack());
+    }
+
+    #[test]
+    fn test_gamepad_message_serialization() {
+        let msg = Message::GamepadState {
+            state: GamepadState {
+                gamepad_id: 1,
+                sequence: 42,
+                buttons: vec![GamepadButtonState {
+                    button: GamepadButton::South,
+                    pressed: true,
+                }],
+                left_stick_x: -1200,
+                left_stick_y: 3200,
+                right_stick_x: 0,
+                right_stick_y: 1024,
+                left_trigger: 0,
+                right_trigger: 65535,
+                timestamp_ms: 999,
+            },
+        };
+
+        let serialized = serde_json::to_string(&msg).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            Message::GamepadState {
+                state: GamepadState {
+                    gamepad_id: 1,
+                    sequence: 42,
+                    right_trigger: 65535,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn device_capabilities_default_missing_gamepad_fields_to_disabled() {
+        let serialized = r#"{"supports_clipboard":true,"supports_hotkeys":true,"max_devices":16}"#;
+        let capabilities: DeviceCapabilities = serde_json::from_str(serialized).unwrap();
+
+        assert!(capabilities.supports_clipboard);
+        assert!(capabilities.supports_hotkeys);
+        assert!(!capabilities.supports_gamepad_capture);
+        assert!(!capabilities.supports_gamepad_inject);
+        assert_eq!(capabilities.max_gamepads, 0);
     }
 }

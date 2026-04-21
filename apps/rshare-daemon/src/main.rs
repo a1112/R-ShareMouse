@@ -449,6 +449,9 @@ fn input_event_to_raw_event(
                 pressed: state.is_pressed(),
             })
         }
+        rshare_input::InputEvent::GamepadConnected { .. }
+        | rshare_input::InputEvent::GamepadDisconnected { .. }
+        | rshare_input::InputEvent::GamepadState { .. } => None,
     }
 }
 
@@ -570,6 +573,11 @@ fn message_to_input_event(message: Message) -> Option<InputEvent> {
             alt,
             meta,
         )),
+        Message::GamepadConnected { info } => Some(InputEvent::gamepad_connected(info)),
+        Message::GamepadDisconnected { gamepad_id } => {
+            Some(InputEvent::gamepad_disconnected(gamepad_id))
+        }
+        Message::GamepadState { state } => Some(InputEvent::gamepad_state(state)),
         _ => None,
     }
 }
@@ -1349,6 +1357,15 @@ mod tests {
     }
 
     #[test]
+    fn gamepad_input_event_does_not_enter_mouse_keyboard_forwarder() {
+        let raw = input_event_to_raw_event(rshare_input::InputEvent::gamepad_state(
+            rshare_core::GamepadState::neutral(0, 1, 123),
+        ));
+
+        assert!(raw.is_none());
+    }
+
+    #[test]
     fn mark_connected_tracks_unknown_inbound_device() {
         let remote_id = DeviceId::new_v4();
         let mut state = DaemonState::new(ServiceStatusSnapshot::new(
@@ -1660,6 +1677,23 @@ mod tests {
             rshare_input::InputEvent::MouseButton { button, state } => {
                 assert_eq!(button, rshare_input::MouseButton::Forward);
                 assert_eq!(state, rshare_input::ButtonState::Released);
+            }
+            _ => panic!("Wrong input event"),
+        }
+    }
+
+    #[test]
+    fn remote_gamepad_message_maps_to_input_event() {
+        let event = message_to_input_event(rshare_core::Message::GamepadState {
+            state: rshare_core::GamepadState::neutral(0, 9, 456),
+        })
+        .unwrap();
+
+        match event {
+            rshare_input::InputEvent::GamepadState { state } => {
+                assert_eq!(state.gamepad_id, 0);
+                assert_eq!(state.sequence, 9);
+                assert_eq!(state.timestamp_ms, 456);
             }
             _ => panic!("Wrong input event"),
         }
