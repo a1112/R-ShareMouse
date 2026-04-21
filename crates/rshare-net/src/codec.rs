@@ -96,6 +96,9 @@ impl MessageCodec {
             Message::MouseWheel { .. } => 12,
             Message::Key { .. } => 13,
             Message::KeyExtended { .. } => 14,
+            Message::GamepadConnected { .. } => 15,
+            Message::GamepadDisconnected { .. } => 16,
+            Message::GamepadState { .. } => 17,
 
             // Clipboard (20-29)
             Message::ClipboardData { .. } => 20,
@@ -206,7 +209,7 @@ impl Default for MessageDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rshare_core::{hello_message, DeviceId};
+    use rshare_core::{hello_message, DeviceId, GamepadState};
 
     #[test]
     fn test_encode_decode() {
@@ -297,6 +300,35 @@ mod tests {
             MessageCodec::message_type_tag(&Message::MouseMove { x: 0, y: 0 }),
             10
         );
+
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::GamepadState {
+                state: GamepadState::neutral(0, 1, 123),
+            }),
+            17
+        );
+    }
+
+    #[test]
+    fn test_gamepad_state_raw_encode_decode() {
+        let msg = Message::GamepadState {
+            state: GamepadState::neutral(0, 7, 456),
+        };
+
+        let encoded = MessageCodec::encode_raw(&msg).unwrap();
+        let decoded = MessageCodec::decode_raw(&encoded).unwrap();
+
+        assert!(matches!(
+            decoded,
+            Message::GamepadState {
+                state: GamepadState {
+                    gamepad_id: 0,
+                    sequence: 7,
+                    timestamp_ms: 456,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

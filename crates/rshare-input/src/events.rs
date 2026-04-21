@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use rshare_core::{GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState};
+
 /// Input event that can be sent between devices
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
@@ -28,6 +30,15 @@ pub enum InputEvent {
         ctrl: bool,
         alt: bool,
         meta: bool,
+    },
+    GamepadConnected {
+        info: GamepadDeviceInfo,
+    },
+    GamepadDisconnected {
+        gamepad_id: u8,
+    },
+    GamepadState {
+        state: GamepadState,
     },
 }
 
@@ -247,6 +258,18 @@ impl InputEvent {
         }
     }
 
+    pub fn gamepad_connected(info: GamepadDeviceInfo) -> Self {
+        Self::GamepadConnected { info }
+    }
+
+    pub fn gamepad_disconnected(gamepad_id: u8) -> Self {
+        Self::GamepadDisconnected { gamepad_id }
+    }
+
+    pub fn gamepad_state(state: GamepadState) -> Self {
+        Self::GamepadState { state }
+    }
+
     /// Get the event type as a string for logging
     pub fn event_type(&self) -> &'static str {
         match self {
@@ -255,6 +278,9 @@ impl InputEvent {
             InputEvent::MouseWheel { .. } => "MouseWheel",
             InputEvent::Key { .. } => "Key",
             InputEvent::KeyExtended { .. } => "KeyExtended",
+            InputEvent::GamepadConnected { .. } => "GamepadConnected",
+            InputEvent::GamepadDisconnected { .. } => "GamepadDisconnected",
+            InputEvent::GamepadState { .. } => "GamepadState",
         }
     }
 
@@ -267,6 +293,9 @@ impl InputEvent {
                 | InputEvent::MouseWheel { .. }
                 | InputEvent::Key { .. }
                 | InputEvent::KeyExtended { .. }
+                | InputEvent::GamepadConnected { .. }
+                | InputEvent::GamepadDisconnected { .. }
+                | InputEvent::GamepadState { .. }
         )
     }
 
@@ -399,6 +428,40 @@ mod tests {
     }
 
     #[test]
+    fn test_gamepad_event_serialization() {
+        let event = InputEvent::gamepad_state(GamepadState {
+            gamepad_id: 0,
+            sequence: 9,
+            buttons: vec![GamepadButtonState {
+                button: GamepadButton::South,
+                pressed: true,
+            }],
+            left_stick_x: -100,
+            left_stick_y: 200,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: 128,
+            right_trigger: 1024,
+            timestamp_ms: 555,
+        });
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: InputEvent = serde_json::from_str(&serialized).unwrap();
+
+        assert!(matches!(
+            deserialized,
+            InputEvent::GamepadState {
+                state: GamepadState {
+                    gamepad_id: 0,
+                    sequence: 9,
+                    right_trigger: 1024,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn test_keycode_raw() {
         assert_eq!(KeyCode::Space.to_raw(), 0x20);
         assert_eq!(KeyCode::Raw(123).to_raw(), 123);
@@ -408,6 +471,7 @@ mod tests {
     fn test_should_forward() {
         assert!(InputEvent::mouse_move(0, 0).should_forward());
         assert!(InputEvent::key(KeyCode::Space, ButtonState::Pressed).should_forward());
+        assert!(InputEvent::gamepad_state(GamepadState::neutral(0, 1, 123)).should_forward());
     }
 
     #[cfg(target_os = "windows")]
