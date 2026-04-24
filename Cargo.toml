@@ -44,8 +44,8 @@ bytes = "1.10"
 rdev = "0.5"
 enigo = "0.6"
 
-# Clipboard - arboard 4.0 需要更新 API
-arboard = "4.0"
+# Clipboard - arboard 3.6 是当前最新稳定版
+arboard = "3.6"
 
 # Configuration
 config = "0.15"
@@ -54,7 +54,7 @@ toml = "0.8"
 
 # Utils
 uuid = { version = "1.15", features = ["v4", "serde"] }
-hostname = "0.5"
+hostname = "0.4"
 cfg-if = "1.0"
 
 # GUI - egui 0.30 有一些新特性和变更
