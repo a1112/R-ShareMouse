@@ -4,8 +4,11 @@ use rshare_core::{
         DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
-    BackgroundProcessOwner, BackgroundRunMode, TrayRuntimeState,
+    BackgroundProcessOwner, BackgroundRunMode, LocalControlDeviceSnapshot, LocalInputDeviceKind,
+    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
+    TrayRuntimeState,
 };
+use std::collections::BTreeMap;
 use tokio::io::duplex;
 use uuid::Uuid;
 
@@ -34,6 +37,21 @@ async fn daemon_connect_request_round_trips_target_device() {
 }
 
 #[tokio::test]
+async fn local_control_requests_round_trip_over_json_lines() {
+    let (mut writer, mut reader) = duplex(1024);
+    let request = DaemonRequest::RunLocalInputTest {
+        test: LocalInputTestRequest {
+            kind: LocalInputTestKind::KeyboardShift,
+        },
+    };
+
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+}
+
+#[tokio::test]
 async fn daemon_responses_round_trip_device_payloads() {
     let (mut writer, mut reader) = duplex(4096);
     let response = DaemonResponse::Devices(vec![DaemonDeviceSnapshot {
@@ -49,6 +67,55 @@ async fn daemon_responses_round_trip_device_payloads() {
     let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
+}
+
+#[tokio::test]
+async fn local_control_response_round_trips_snapshot_payload() {
+    let (mut writer, mut reader) = duplex(4096);
+    let mut snapshot = LocalControlDeviceSnapshot::default();
+    snapshot.keyboard.detected = true;
+    snapshot.keyboard.last_key = Some("ShiftLeft".to_string());
+    let response = DaemonResponse::LocalControls(snapshot.clone());
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn local_control_snapshot_defaults_missing_fields_to_safe_values() {
+    let snapshot: LocalControlDeviceSnapshot = serde_json::from_str("{}").unwrap();
+
+    assert_eq!(snapshot.sequence, 0);
+    assert!(!snapshot.keyboard.detected);
+    assert!(!snapshot.mouse.detected);
+    assert!(snapshot.gamepads.is_empty());
+    assert_eq!(snapshot.virtual_gamepad.status, "not_implemented");
+    assert_eq!(snapshot.driver.status, "unavailable");
+    assert!(snapshot.driver.device_path.is_none());
+    assert!(snapshot.keyboard_devices.is_empty());
+}
+
+#[test]
+fn local_input_event_round_trips_driver_metadata() {
+    let event = LocalInputDiagnosticEvent {
+        sequence: 7,
+        timestamp_ms: 42,
+        device_kind: LocalInputDeviceKind::Keyboard,
+        event_kind: "key".to_string(),
+        summary: "driver key packet".to_string(),
+        device_id: Some("driver:keyboard:001".to_string()),
+        device_instance_id: Some("HID\\VID_0001&PID_0002".to_string()),
+        capture_path: Some("rshare-filter".to_string()),
+        source: LocalInputEventSource::DriverTest,
+        payload: BTreeMap::new(),
+    };
+
+    let encoded = serde_json::to_string(&event).unwrap();
+    let decoded: LocalInputDiagnosticEvent = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, event);
 }
 
 #[test]

@@ -249,6 +249,149 @@ function statusCheck(pass, warn = false) {
   return warn ? "warn" : "block";
 }
 
+function backendDiagnosticLabel(backend) {
+  if (!backend || typeof backend !== "object") {
+    return "unknown unknown";
+  }
+
+  const mode = typeof backend.mode === "string" ? backend.mode : "unknown";
+  const health = typeof backend.health === "string" ? backend.health : "unknown";
+  return `${mode} ${health}`;
+}
+
+export function buildLocalControlsViewModel(snapshot, options = {}) {
+  const error = options.error ?? null;
+  const confirmingInputTest = options.confirmingInputTest ?? null;
+  const keyboard = snapshot?.keyboard ?? {};
+  const mouse = snapshot?.mouse ?? {};
+  const display = snapshot?.display ?? {};
+  const gamepads = snapshot?.gamepads ?? [];
+  const gamepad = gamepads.find((item) => item.connected) ?? gamepads[0] ?? null;
+  const recentEvents = snapshot?.recent_events ?? [];
+  const latestEvent = recentEvents.length ? recentEvents[recentEvents.length - 1] : null;
+
+  return {
+    available: Boolean(snapshot && !error),
+    error,
+    keyboard: {
+      status: keyboard.detected ? "capturing" : "missing",
+      lastKey: keyboard.last_key ?? null,
+      pressedKeys: keyboard.pressed_keys ?? [],
+      eventCount: Number(keyboard.event_count ?? 0),
+      captureSource: keyboard.capture_source ?? "unknown",
+      testLabel:
+        confirmingInputTest === "keyboard"
+          ? "confirm keyboard injection"
+          : "keyboard injection test",
+    },
+    mouse: {
+      status: mouse.detected ? "capturing" : "missing",
+      position: {
+        x: Number(mouse.x ?? 0),
+        y: Number(mouse.y ?? 0),
+      },
+      pressedButtons: mouse.pressed_buttons ?? [],
+      wheel: {
+        x: Number(mouse.wheel_delta_x ?? 0),
+        y: Number(mouse.wheel_delta_y ?? 0),
+        totalX: Number(mouse.wheel_total_x ?? 0),
+        totalY: Number(mouse.wheel_total_y ?? 0),
+        events: Number(mouse.wheel_event_count ?? 0),
+      },
+      eventCount: Number(mouse.event_count ?? 0),
+      stats: {
+        moves: Number(mouse.move_count ?? 0),
+        buttonEvents: Number(mouse.button_event_count ?? 0),
+        buttonPresses: Number(mouse.button_press_count ?? 0),
+        buttonReleases: Number(mouse.button_release_count ?? 0),
+      },
+      display: {
+        id: mouse.current_display_id ?? null,
+        index:
+          mouse.current_display_index === undefined
+            ? null
+            : mouse.current_display_index,
+        relativeX: Number(mouse.display_relative_x ?? mouse.x ?? 0),
+        relativeY: Number(mouse.display_relative_y ?? mouse.y ?? 0),
+      },
+      testLabel:
+        confirmingInputTest === "mouse"
+          ? "confirm mouse injection"
+          : "mouse injection test",
+    },
+    gamepad: {
+      status: gamepad?.connected ? "gilrs-connected" : "waiting",
+      name: gamepad?.name ?? "unavailable",
+      pressedButtons:
+        gamepad?.pressed_buttons ??
+        (gamepad?.buttons ?? [])
+          .filter((button) => button.pressed)
+          .map((button) =>
+            typeof button.button === "string"
+              ? button.button
+              : Object.keys(button.button ?? {})[0] ?? "Unknown",
+          ),
+      sticks: {
+        left: {
+          x: Number(gamepad?.left_stick_x ?? 0),
+          y: Number(gamepad?.left_stick_y ?? 0),
+        },
+        right: {
+          x: Number(gamepad?.right_stick_x ?? 0),
+          y: Number(gamepad?.right_stick_y ?? 0),
+        },
+      },
+      triggers: {
+        left: Number(gamepad?.left_trigger ?? 0),
+        right: Number(gamepad?.right_trigger ?? 0),
+      },
+      stats: {
+        events: Number(gamepad?.event_count ?? 0),
+        buttonEvents: Number(gamepad?.button_event_count ?? 0),
+        buttonPresses: Number(gamepad?.button_press_count ?? 0),
+        buttonReleases: Number(gamepad?.button_release_count ?? 0),
+        stickEvents: Number(gamepad?.axis_event_count ?? 0),
+        triggerEvents: Number(gamepad?.trigger_event_count ?? 0),
+      },
+      lastButton: gamepad?.last_button ?? null,
+      lastAxis: gamepad?.last_axis ?? null,
+      virtualStatus: snapshot?.virtual_gamepad?.status ?? "not_implemented",
+      virtualDetail:
+        snapshot?.virtual_gamepad?.detail ?? "Virtual HID not implemented",
+    },
+    display: {
+      count: Number(display.display_count ?? 0),
+      primary: {
+        width: Number(display.primary_width ?? 0),
+        height: Number(display.primary_height ?? 0),
+      },
+      layout: {
+        width: Number(display.layout_width ?? 0),
+        height: Number(display.layout_height ?? 0),
+      },
+      virtualOrigin: {
+        x: Number(display.virtual_x ?? 0),
+        y: Number(display.virtual_y ?? 0),
+      },
+      displays: display.displays ?? [],
+    },
+    backend: {
+      capture: backendDiagnosticLabel(snapshot?.capture_backend),
+      inject: backendDiagnosticLabel(snapshot?.inject_backend),
+      privilegeState: snapshot?.privilege_state ?? "unknown",
+    },
+    latestEvent: latestEvent
+      ? {
+          deviceKind: latestEvent.device_kind,
+          summary: latestEvent.summary,
+          injectedLoopback: ["Injected", "InjectedLoopback", "VirtualDevice"].includes(
+            latestEvent.source,
+          ),
+        }
+      : null,
+  };
+}
+
 function trayStateLabel(state) {
   switch (state) {
     case "Running":

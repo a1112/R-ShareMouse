@@ -25,5 +25,11 @@ config/
 node_modules/
 dist/
 
+# Windows driver build output
+/drivers/windows/**/x64/
+/drivers/windows/**/*.cat
+/drivers/windows/**/*.obj
+/drivers/windows/**/*.sys
+
 # macOS build output
 /R-ShareMouse.app/

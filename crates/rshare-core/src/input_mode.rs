@@ -16,6 +16,12 @@ pub enum BackendKind {
     /// Virtual HID driver backend (Windows-only, optional)
     #[cfg(target_os = "windows")]
     VirtualHid,
+    /// Linux evdev backend for kernel-level input capture
+    #[cfg(target_os = "linux")]
+    Evdev,
+    /// Linux uinput backend for kernel-level input injection
+    #[cfg(target_os = "linux")]
+    UInput,
 }
 
 /// Health status of a backend.
@@ -53,6 +59,12 @@ pub enum ResolvedInputMode {
     /// Using virtual HID driver backend.
     #[cfg(target_os = "windows")]
     VirtualHid,
+    /// Using Linux evdev backend for kernel-level capture.
+    #[cfg(target_os = "linux")]
+    Evdev,
+    /// Using Linux uinput backend for kernel-level injection.
+    #[cfg(target_os = "linux")]
+    UInput,
 }
 
 /// Current privilege/state of the desktop session.

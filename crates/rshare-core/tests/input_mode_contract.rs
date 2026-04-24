@@ -24,12 +24,29 @@ fn sample_status() -> serde_json::Value {
 }
 
 #[test]
-fn backend_kind_serializes_correctly() {
-    let kinds = vec![
-        BackendKind::Portable,
-        BackendKind::WindowsNative,
-        BackendKind::VirtualHid,
-    ];
+fn backend_kind_portable_serializes_correctly() {
+    let kind = BackendKind::Portable;
+    let serialized = serde_json::to_string(&kind).unwrap();
+    let deserialized: BackendKind = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(kind, deserialized);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn backend_kind_windows_serializes_correctly() {
+    let kinds = vec![BackendKind::WindowsNative, BackendKind::VirtualHid];
+
+    for kind in kinds {
+        let serialized = serde_json::to_string(&kind).unwrap();
+        let deserialized: BackendKind = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(kind, deserialized);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backend_kind_linux_serializes_correctly() {
+    let kinds = vec![BackendKind::Evdev, BackendKind::UInput];
 
     for kind in kinds {
         let serialized = serde_json::to_string(&kind).unwrap();
@@ -74,9 +91,17 @@ fn privilege_state_serializes_correctly() {
 }
 
 #[test]
-fn resolved_input_mode_serializes_correctly() {
+fn resolved_input_mode_portable_serializes_correctly() {
+    let mode = ResolvedInputMode::Portable;
+    let serialized = serde_json::to_string(&mode).unwrap();
+    let deserialized: ResolvedInputMode = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(mode, deserialized);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn resolved_input_mode_windows_serializes_correctly() {
     let modes = vec![
-        ResolvedInputMode::Portable,
         ResolvedInputMode::WindowsNative,
         ResolvedInputMode::VirtualHid,
     ];
@@ -88,8 +113,42 @@ fn resolved_input_mode_serializes_correctly() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn resolved_input_mode_linux_serializes_correctly() {
+    let modes = vec![ResolvedInputMode::Evdev, ResolvedInputMode::UInput];
+
+    for mode in modes {
+        let serialized = serde_json::to_string(&mode).unwrap();
+        let deserialized: ResolvedInputMode = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(mode, deserialized);
+    }
+}
+
 #[test]
 fn daemon_status_round_trips_input_backend_fields() {
+    let mut status = sample_status();
+    status["input_mode"] = serde_json::to_value(ResolvedInputMode::Portable).unwrap();
+    status["available_backends"] = serde_json::to_value(vec![BackendKind::Portable]).unwrap();
+    status["backend_health"] = serde_json::to_value(BackendHealth::Healthy).unwrap();
+    status["privilege_state"] = serde_json::to_value(PrivilegeState::UnlockedDesktop).unwrap();
+
+    let serialized = serde_json::to_string(&status).unwrap();
+    let deserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(
+        deserialized["input_mode"],
+        serde_json::to_value(ResolvedInputMode::Portable).unwrap()
+    );
+    assert_eq!(
+        deserialized["available_backends"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn daemon_status_round_trips_windows_backends() {
     let mut status = sample_status();
     status["input_mode"] = serde_json::to_value(ResolvedInputMode::WindowsNative).unwrap();
     status["available_backends"] =
@@ -103,6 +162,29 @@ fn daemon_status_round_trips_input_backend_fields() {
     assert_eq!(
         deserialized["input_mode"],
         serde_json::to_value(ResolvedInputMode::WindowsNative).unwrap()
+    );
+    assert_eq!(
+        deserialized["available_backends"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_status_round_trips_linux_backends() {
+    let mut status = sample_status();
+    status["input_mode"] = serde_json::to_value(ResolvedInputMode::Evdev).unwrap();
+    status["available_backends"] =
+        serde_json::to_value(vec![BackendKind::Portable, BackendKind::Evdev]).unwrap();
+    status["backend_health"] = serde_json::to_value(BackendHealth::Healthy).unwrap();
+    status["privilege_state"] = serde_json::to_value(PrivilegeState::UnlockedDesktop).unwrap();
+
+    let serialized = serde_json::to_string(&status).unwrap();
+    let deserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(
+        deserialized["input_mode"],
+        serde_json::to_value(ResolvedInputMode::Evdev).unwrap()
     );
     assert_eq!(
         deserialized["available_backends"].as_array().unwrap().len(),
@@ -157,7 +239,7 @@ fn daemon_status_marks_degraded_after_backend_failure() {
 #[test]
 fn daemon_status_preserves_healthy_when_backend_fine() {
     let mut status = sample_status();
-    status["input_mode"] = serde_json::to_value(ResolvedInputMode::WindowsNative).unwrap();
+    status["input_mode"] = serde_json::to_value(ResolvedInputMode::Portable).unwrap();
     status["backend_health"] = serde_json::to_value(BackendHealth::Healthy).unwrap();
     status["privilege_state"] = serde_json::to_value(PrivilegeState::UnlockedDesktop).unwrap();
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildDesktopViewModel,
+  buildLocalControlsViewModel,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 
@@ -19,6 +20,105 @@ test("buildDesktopViewModel returns an offline local-only layout when daemon is 
   assert.equal(model.acceptance.backgroundReady, false);
   assert.equal(model.acceptance.dualMachineReady, false);
   assert.equal(model.acceptance.nextStep, "启动守护进程后进行双机实机验收");
+});
+
+test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {
+  const model = buildLocalControlsViewModel(
+    {
+      keyboard: {
+        detected: true,
+        pressed_keys: ["ShiftLeft"],
+        last_key: "ShiftLeft",
+        event_count: 3,
+        capture_source: "RDev",
+      },
+      mouse: {
+        detected: true,
+        x: 40,
+        y: 80,
+        pressed_buttons: ["Left"],
+        wheel_delta_x: 0,
+        wheel_delta_y: -1,
+        event_count: 9,
+      },
+      gamepads: [
+        {
+          gamepad_id: 0,
+          name: "Xbox Controller",
+          connected: true,
+          buttons: [{ button: "South", pressed: true }],
+          pressed_buttons: ["South"],
+          last_button: "South pressed",
+          left_stick_x: 1200,
+          left_stick_y: -2400,
+          right_stick_x: 0,
+          right_stick_y: 0,
+          left_trigger: 123,
+          right_trigger: 456,
+          event_count: 7,
+          button_event_count: 2,
+          button_press_count: 2,
+          button_release_count: 0,
+          axis_event_count: 1,
+          trigger_event_count: 1,
+          last_axis: "left_stick",
+        },
+      ],
+      display: {
+        display_count: 2,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 4480,
+        layout_height: 1440,
+      },
+      capture_backend: { mode: "WindowsNative", health: "Healthy" },
+      inject_backend: { mode: "WindowsNative", health: "Healthy" },
+      privilege_state: "UnlockedDesktop",
+      virtual_gamepad: {
+        status: "not_implemented",
+        detail: "Virtual HID not implemented",
+      },
+      recent_events: [
+        {
+          device_kind: "Mouse",
+          summary: "Mouse move 1, 1",
+          source: "Hardware",
+        },
+        {
+          device_kind: "Keyboard",
+          summary: "Injected ShiftLeft release",
+          source: "InjectedLoopback",
+        },
+      ],
+    },
+    { confirmingInputTest: "keyboard" },
+  );
+
+  assert.equal(model.available, true);
+  assert.equal(model.keyboard.status, "capturing");
+  assert.equal(model.keyboard.testLabel, "confirm keyboard injection");
+  assert.deepEqual(model.mouse.position, { x: 40, y: 80 });
+  assert.equal(model.gamepad.status, "gilrs-connected");
+  assert.equal(model.gamepad.virtualDetail, "Virtual HID not implemented");
+  assert.deepEqual(model.gamepad.pressedButtons, ["South"]);
+  assert.equal(model.gamepad.stats.buttonPresses, 2);
+  assert.equal(model.gamepad.sticks.left.x, 1200);
+  assert.equal(model.gamepad.triggers.right, 456);
+  assert.equal(model.display.count, 2);
+  assert.equal(model.backend.capture, "WindowsNative Healthy");
+  assert.equal(model.latestEvent.deviceKind, "Keyboard");
+  assert.equal(model.latestEvent.injectedLoopback, true);
+});
+
+test("buildLocalControlsViewModel reports old daemon or unavailable daemon safely", () => {
+  const unavailable = buildLocalControlsViewModel(null, { error: "unsupported request" });
+  assert.equal(unavailable.available, false);
+  assert.equal(unavailable.error, "unsupported request");
+  assert.equal(unavailable.keyboard.status, "missing");
+  assert.equal(unavailable.mouse.testLabel, "mouse injection test");
+  assert.equal(unavailable.gamepad.virtualStatus, "not_implemented");
+  assert.equal(unavailable.display.primary.width, 0);
+  assert.equal(unavailable.latestEvent, null);
 });
 
 test("buildDesktopViewModel maps daemon devices into layout and device cards", () => {

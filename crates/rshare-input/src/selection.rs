@@ -86,6 +86,10 @@ impl SelectionResult {
             BackendKind::WindowsNative => Some(ResolvedInputMode::WindowsNative),
             #[cfg(target_os = "windows")]
             BackendKind::VirtualHid => Some(ResolvedInputMode::VirtualHid),
+            #[cfg(target_os = "linux")]
+            BackendKind::Evdev => Some(ResolvedInputMode::Evdev),
+            #[cfg(target_os = "linux")]
+            BackendKind::UInput => Some(ResolvedInputMode::UInput),
         }
     }
 }
@@ -179,7 +183,15 @@ impl BackendSelector {
             order
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        {
+            // Prefer Evdev (driver-level) over Portable (user-space fallback)
+            let mut order = vec![BackendKind::Portable];
+            order.insert(0, BackendKind::Evdev);
+            order
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             vec![BackendKind::Portable]
         }
@@ -311,6 +323,47 @@ mod tests {
         let candidates = vec![
             virtual_hid_candidate(false, Some("unavailable")),
             windows_native_candidate(false),
+            portable_candidate(true),
+        ];
+
+        let selected = selector.select(&candidates).unwrap();
+        assert_eq!(selected.kind, BackendKind::Portable);
+        assert!(selected.degraded);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn evdev_candidate(healthy: bool) -> BackendCandidate {
+        candidate(BackendKind::Evdev, healthy)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selector_prefers_evdev_over_portable() {
+        let selector = BackendSelector::new();
+        let candidates = vec![evdev_candidate(true), portable_candidate(true)];
+
+        let selected = selector.select(&candidates).unwrap();
+        assert_eq!(selected.kind, BackendKind::Evdev);
+        assert!(!selected.degraded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selector_falls_back_to_portable_when_evdev_unavailable() {
+        let selector = BackendSelector::new();
+        let candidates = vec![evdev_candidate(false), portable_candidate(true)];
+
+        let selected = selector.select(&candidates).unwrap();
+        assert_eq!(selected.kind, BackendKind::Portable);
+        assert!(selected.degraded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selector_degrades_when_evdev_permission_denied() {
+        let selector = BackendSelector::new();
+        let candidates = vec![
+            BackendCandidate::unhealthy(BackendKind::Evdev, BackendFailureReason::PermissionDenied),
             portable_candidate(true),
         ];
 

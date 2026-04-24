@@ -3,14 +3,15 @@
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode, Config,
-    DaemonDeviceSnapshot, DeviceId, LayoutGraph, ServiceStatusSnapshot,
+    DaemonDeviceSnapshot, DaemonResponse, DeviceId, LayoutGraph, LocalControlDeviceSnapshot,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, WebviewWindow, Wry,
+    AppHandle, Emitter, Manager, WebviewWindow, Wry,
 };
 use tauri_plugin_single_instance::init;
 
@@ -85,6 +86,11 @@ struct TrayRuntimeHandles {
     stop_service_item: MenuItem<Wry>,
 }
 
+#[derive(Default)]
+struct LocalControlStreamState {
+    task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrayStatusView {
     status_text: String,
@@ -145,6 +151,93 @@ async fn disconnect_device(device_id: String) -> Result<(), String> {
     daemon_client::request_disconnect(device_id)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
+    daemon_client::request_local_controls()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn local_input_test_kind_from_str(kind: &str) -> Result<LocalInputTestKind, String> {
+    match kind {
+        "keyboard" | "keyboard_shift" | "KeyboardShift" => Ok(LocalInputTestKind::KeyboardShift),
+        "mouse" | "mouse_move" | "MouseMove" => Ok(LocalInputTestKind::MouseMove),
+        "virtual_gamepad_status" | "VirtualGamepadStatus" => {
+            Ok(LocalInputTestKind::VirtualGamepadStatus)
+        }
+        other => Err(format!("Unknown local input test kind: {other}")),
+    }
+}
+
+#[tauri::command]
+async fn run_local_input_test(kind: String) -> Result<LocalInputTestResult, String> {
+    let kind = local_input_test_kind_from_str(&kind)?;
+    daemon_client::request_local_input_test(LocalInputTestRequest { kind })
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<LocalControlStreamState>();
+    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+        task.abort();
+    }
+
+    let app_for_task = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        if let Ok(mut websocket) = daemon_client::subscribe_local_controls_ws().await {
+            loop {
+                match daemon_client::read_local_control_ws_event(&mut websocket).await {
+                    Ok(response @ DaemonResponse::LocalControls(_))
+                    | Ok(response @ DaemonResponse::LocalControlEvent(_)) => {
+                        let _ = app_for_task.emit("local-control-event", response);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = app_for_task.emit("local-control-event", format!("error:{err}"));
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        let mut stream = match daemon_client::subscribe_local_controls().await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = app_for_task.emit("local-control-event", format!("error:{err}"));
+                return;
+            }
+        };
+
+        loop {
+            match daemon_client::read_local_control_event(&mut stream).await {
+                Ok(response @ DaemonResponse::LocalControls(_))
+                | Ok(response @ DaemonResponse::LocalControlEvent(_)) => {
+                    let _ = app_for_task.emit("local-control-event", response);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let _ = app_for_task.emit("local-control-event", format!("error:{err}"));
+                    break;
+                }
+            }
+        }
+    });
+    *state.task.lock().map_err(|err| err.to_string())? = Some(task);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_local_controls_stream(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<LocalControlStreamState>();
+    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+        task.abort();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -369,6 +462,7 @@ fn main() {
             // Focus the existing window when a second instance is launched
             let _ = show_main_window(app);
         }))
+        .manage(LocalControlStreamState::default())
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_event(&event) {
                 if let Err(err) = apply_tray_action(app, action) {
@@ -391,6 +485,10 @@ fn main() {
             stop_service,
             connect_device,
             disconnect_device,
+            local_controls_state,
+            start_local_controls_stream,
+            stop_local_controls_stream,
+            run_local_input_test,
             minimize_window,
             toggle_maximize_window,
             close_window,
@@ -899,6 +997,27 @@ mod tests {
             button,
             button_state,
         }
+    }
+
+    #[test]
+    fn local_input_test_kind_parser_accepts_ui_keys() {
+        assert_eq!(
+            local_input_test_kind_from_str("keyboard").unwrap(),
+            LocalInputTestKind::KeyboardShift
+        );
+        assert_eq!(
+            local_input_test_kind_from_str("keyboard_shift").unwrap(),
+            LocalInputTestKind::KeyboardShift
+        );
+        assert_eq!(
+            local_input_test_kind_from_str("mouse").unwrap(),
+            LocalInputTestKind::MouseMove
+        );
+        assert_eq!(
+            local_input_test_kind_from_str("mouse_move").unwrap(),
+            LocalInputTestKind::MouseMove
+        );
+        assert!(local_input_test_kind_from_str("unknown").is_err());
     }
 
     #[test]

@@ -310,7 +310,35 @@ fn get_state_dir() -> Result<PathBuf> {
         .map(|p| p.join("rshare"))
         .unwrap_or_else(|| PathBuf::from(".rshare"));
 
-    Ok(state_dir)
+    if state_dir_is_writable(&state_dir) {
+        return Ok(state_dir);
+    }
+
+    let fallback_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("target")
+        .join("rshare-state");
+    fs::create_dir_all(&fallback_dir).with_context(|| {
+        format!(
+            "Failed to create fallback state directory: {}",
+            fallback_dir.display()
+        )
+    })?;
+    Ok(fallback_dir)
+}
+
+fn state_dir_is_writable(path: &Path) -> bool {
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(".rshare-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn load_or_create_local_device_id_at(path: impl AsRef<Path>) -> Result<DeviceId> {

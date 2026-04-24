@@ -11,6 +11,7 @@ pub mod engine;
 pub mod input_mode;
 pub mod ipc;
 pub mod layout;
+pub mod local_controls;
 pub mod protocol;
 pub mod runtime;
 pub mod service;
@@ -35,8 +36,18 @@ pub use clipboard::ClipboardContent;
 
 // Re-exports from local daemon IPC
 pub use ipc::{
-    default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, ServiceStatusSnapshot,
+    default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
+    read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
+    ServiceStatusSnapshot,
+};
+
+// Re-exports from local control diagnostics
+pub use local_controls::{
+    LocalBackendDiagnosticState, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
+    LocalDriverDiagnosticState, LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind,
+    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
+    LocalInputTestResult, LocalInputTestStatus, LocalKeyboardState, LocalMouseState,
+    LocalVirtualGamepadState,
 };
 
 // Re-exports from input_mode

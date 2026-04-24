@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo 'export GTK_IM_MODULE=fcitx5')",
+      "Bash(echo 'export QT_IM_MODULE=fcitx5')",
+      "Bash(echo 'export XMODIFIERS=@im=fcitx5')"
+    ]
+  }
+}

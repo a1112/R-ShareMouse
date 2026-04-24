@@ -7,11 +7,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
-    DeviceId, LayoutGraph, PrivilegeState, ResolvedInputMode, TrayRuntimeState,
+    DeviceId, LayoutGraph, LocalControlDeviceSnapshot, LocalInputDiagnosticEvent,
+    LocalInputTestRequest, LocalInputTestResult, PrivilegeState, ResolvedInputMode,
+    TrayRuntimeState,
 };
 
 /// Default TCP port for localhost daemon IPC.
 pub const DEFAULT_IPC_PORT: u16 = 27435;
+pub const DEFAULT_LOCAL_CONTROLS_WS_PORT: u16 = 27436;
 
 /// Current daemon status snapshot returned to local clients.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +139,9 @@ pub enum DaemonRequest {
     Disconnect { device_id: DeviceId },
     GetLayout,
     SetLayout { layout: LayoutGraph },
+    LocalControls,
+    SubscribeLocalControls,
+    RunLocalInputTest { test: LocalInputTestRequest },
     Shutdown,
 }
 
@@ -145,6 +151,9 @@ pub enum DaemonResponse {
     Status(ServiceStatusSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),
     Layout(LayoutGraph),
+    LocalControls(LocalControlDeviceSnapshot),
+    LocalControlEvent(LocalInputDiagnosticEvent),
+    LocalInputTest(LocalInputTestResult),
     Ack,
     Error(String),
 }
@@ -152,6 +161,17 @@ pub enum DaemonResponse {
 /// Get the default localhost IPC socket address.
 pub fn default_ipc_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_IPC_PORT)
+}
+
+pub fn default_local_controls_ws_addr() -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        DEFAULT_LOCAL_CONTROLS_WS_PORT,
+    )
+}
+
+pub fn default_local_controls_ws_url() -> String {
+    format!("ws://{}/local-controls", default_local_controls_ws_addr())
 }
 
 /// Read a single newline-delimited JSON value from a stream.

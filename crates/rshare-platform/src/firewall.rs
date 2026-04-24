@@ -142,18 +142,23 @@ mod windows_impl {
 
     /// Add a firewall rule using netsh
     fn add_firewall_rule(name: &str, port: &str, protocol: &str) -> Result<bool> {
+        if check_rule_exists(name) {
+            tracing::debug!("Firewall rule '{}' already exists", name);
+            return Ok(true);
+        }
+
         let output = Command::new("netsh")
             .args([
                 "advfirewall",
                 "firewall",
                 "add",
                 "rule",
-                &format!("name=\"{}\"", name),
+                &firewall_rule_name_arg(name),
                 "dir=in",
                 "action=allow",
                 &format!("protocol={}", protocol),
                 &format!("localport={}", port),
-                "profile=domain,private,public",
+                "profile=any",
             ])
             .output()
             .context("Failed to execute netsh command")?;
@@ -193,7 +198,7 @@ mod windows_impl {
                 "firewall",
                 "show",
                 "rule",
-                &format!("name=\"{}\"", name),
+                &firewall_rule_name_arg(name),
             ])
             .output()
         {
@@ -213,7 +218,7 @@ mod windows_impl {
                 "firewall",
                 "delete",
                 "rule",
-                &format!("name=\"{}\"", name),
+                &firewall_rule_name_arg(name),
             ])
             .output()
             .context("Failed to execute netsh delete command")?;
@@ -261,16 +266,21 @@ mod windows_impl {
         }
     }
 
+    fn firewall_rule_name_arg(name: &str) -> String {
+        format!("name={}", name)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
         #[test]
         fn test_firewall_rule_name_formatting() {
-            // Verify that rule names don't have unescaped quotes
             let name = "R-ShareMouse Discovery (UDP-In)";
-            let formatted = format!("name=\"{}\"", name);
-            assert_eq!(formatted, "name=\"R-ShareMouse Discovery (UDP-In)\"");
+            assert_eq!(
+                firewall_rule_name_arg(name),
+                "name=R-ShareMouse Discovery (UDP-In)"
+            );
         }
 
         #[test]

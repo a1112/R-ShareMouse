@@ -62,6 +62,8 @@ impl PrivilegeBackend for WindowsPrivilegeBackend {
 #[cfg(test)]
 mod tests {
     use crate::backend::PrivilegeBackend;
+    #[cfg(target_os = "windows")]
+    use crate::privilege::WindowsPrivilegeBackend;
 
     #[test]
     fn noop_privilege_backend_reports_unrestricted_state() {

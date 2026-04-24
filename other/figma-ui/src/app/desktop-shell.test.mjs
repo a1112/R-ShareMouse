@@ -75,8 +75,8 @@ test("getHeaderMetrics tightens titlebar padding and button density", () => {
     actionGap: 6,
     actionButtonPaddingX: 10,
     actionButtonPaddingY: 3,
-    windowGap: 6,
-    windowButtonSize: 12,
-    windowButtonHitSize: 24,
+    windowGap: 0,
+    windowButtonSize: 16,
+    windowButtonHitSize: 46,
   });
 });

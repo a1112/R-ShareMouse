@@ -1,14 +1,19 @@
 //! Local daemon control helpers shared by CLI and GUI.
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::{
-    default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, LayoutGraph, ServiceStatusSnapshot,
+    default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
+    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, LayoutGraph, LocalControlDeviceSnapshot,
+    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -146,4 +151,69 @@ pub async fn request_set_layout(layout: LayoutGraph) -> Result<()> {
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }
+}
+
+pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
+    match send_request(DaemonRequest::LocalControls).await? {
+        DaemonResponse::LocalControls(snapshot) => Ok(snapshot),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_local_input_test(test: LocalInputTestRequest) -> Result<LocalInputTestResult> {
+    match send_request(DaemonRequest::RunLocalInputTest { test }).await? {
+        DaemonResponse::LocalInputTest(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn subscribe_local_controls() -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(default_ipc_addr())
+        .await
+        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    write_json_line(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
+    Ok(stream)
+}
+
+pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonResponse> {
+    let response: DaemonResponse = read_json_line(stream).await?;
+    match response {
+        DaemonResponse::LocalControls(_) | DaemonResponse::LocalControlEvent(_) => Ok(response),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub type LocalControlsWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub async fn subscribe_local_controls_ws() -> Result<LocalControlsWsStream> {
+    let url = default_local_controls_ws_url();
+    let (stream, _) = connect_async(url.as_str())
+        .await
+        .with_context(|| format!("Failed to connect to {url}"))?;
+    Ok(stream)
+}
+
+pub async fn read_local_control_ws_event(
+    stream: &mut LocalControlsWsStream,
+) -> Result<DaemonResponse> {
+    while let Some(message) = stream.next().await {
+        match message? {
+            WsMessage::Text(text) => {
+                let response: DaemonResponse = serde_json::from_str(&text)?;
+                return match response {
+                    DaemonResponse::LocalControls(_) | DaemonResponse::LocalControlEvent(_) => {
+                        Ok(response)
+                    }
+                    DaemonResponse::Error(message) => anyhow::bail!(message),
+                    other => anyhow::bail!("Unexpected daemon websocket response: {:?}", other),
+                };
+            }
+            WsMessage::Close(_) => anyhow::bail!("Local controls websocket closed"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("Local controls websocket ended")
 }

@@ -19,6 +19,12 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(all(target_os = "linux", feature = "x11"))]
+pub mod linux_uinput;
+
+#[cfg(all(target_os = "linux", feature = "x11"))]
+pub mod linux_evdev;
+
 // Cross-platform modules
 pub mod file_drop;
 
@@ -40,6 +46,9 @@ pub use macos::*;
 
 #[cfg(target_os = "linux")]
 pub use linux::*;
+
+#[cfg(target_os = "linux")]
+pub use linux_evdev::{EvdevDriverEvent, EvdevInputListener, UInputInjector};
 
 pub use clipboard::*;
 pub use file_drop::*;
@@ -128,14 +137,14 @@ pub mod display {
         use std::process::Command;
 
         // Try common desktop environments' display settings commands
-        let commands = [
-            ["gnome-control-center", "display"],
-            ["systemsettings", "5"], // KDE Plasma Display settings
-            ["xfce4-display-settings"],
-            ["lxrandr"],
+        let commands: &[&[&str]] = &[
+            &["gnome-control-center", "display"],
+            &["systemsettings", "5"], // KDE Plasma Display settings
+            &["xfce4-display-settings"],
+            &["lxrandr"],
         ];
 
-        for cmd in &commands {
+        for cmd in commands {
             if Command::new(cmd[0]).args(&cmd[1..]).spawn().is_ok() {
                 return Ok(());
             }

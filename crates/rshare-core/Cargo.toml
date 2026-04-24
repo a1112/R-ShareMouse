@@ -20,6 +20,8 @@ directories = { workspace = true }
 dirs = "5"
 toml = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 async-trait = "0.1"
 rshare-common = { path = "../rshare-common" }
 libc = "0.2"

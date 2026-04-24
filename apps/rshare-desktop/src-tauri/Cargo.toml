@@ -22,6 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 uuid = { workspace = true }
 tauri = { version = "2.2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"

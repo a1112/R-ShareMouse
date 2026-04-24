@@ -427,6 +427,56 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
         Key::PageDown => KeyCode::PageDown,
         Key::Insert => KeyCode::Insert,
         Key::Delete => KeyCode::Delete,
+        Key::PrintScreen => KeyCode::Raw(0x2C),
+        Key::ScrollLock => KeyCode::Raw(0x91),
+        Key::Pause => KeyCode::Raw(0x13),
+        Key::BackQuote => KeyCode::Raw(0xC0),
+        Key::Num1 => KeyCode::Char(b'1'),
+        Key::Num2 => KeyCode::Char(b'2'),
+        Key::Num3 => KeyCode::Char(b'3'),
+        Key::Num4 => KeyCode::Char(b'4'),
+        Key::Num5 => KeyCode::Char(b'5'),
+        Key::Num6 => KeyCode::Char(b'6'),
+        Key::Num7 => KeyCode::Char(b'7'),
+        Key::Num8 => KeyCode::Char(b'8'),
+        Key::Num9 => KeyCode::Char(b'9'),
+        Key::Num0 => KeyCode::Char(b'0'),
+        Key::Minus => KeyCode::Raw(0xBD),
+        Key::Equal => KeyCode::Raw(0xBB),
+        Key::KeyQ => KeyCode::Char(b'Q'),
+        Key::KeyW => KeyCode::Char(b'W'),
+        Key::KeyE => KeyCode::Char(b'E'),
+        Key::KeyR => KeyCode::Char(b'R'),
+        Key::KeyT => KeyCode::Char(b'T'),
+        Key::KeyY => KeyCode::Char(b'Y'),
+        Key::KeyU => KeyCode::Char(b'U'),
+        Key::KeyI => KeyCode::Char(b'I'),
+        Key::KeyO => KeyCode::Char(b'O'),
+        Key::KeyP => KeyCode::Char(b'P'),
+        Key::LeftBracket => KeyCode::Raw(0xDB),
+        Key::RightBracket => KeyCode::Raw(0xDD),
+        Key::KeyA => KeyCode::Char(b'A'),
+        Key::KeyS => KeyCode::Char(b'S'),
+        Key::KeyD => KeyCode::Char(b'D'),
+        Key::KeyF => KeyCode::Char(b'F'),
+        Key::KeyG => KeyCode::Char(b'G'),
+        Key::KeyH => KeyCode::Char(b'H'),
+        Key::KeyJ => KeyCode::Char(b'J'),
+        Key::KeyK => KeyCode::Char(b'K'),
+        Key::KeyL => KeyCode::Char(b'L'),
+        Key::SemiColon => KeyCode::Raw(0xBA),
+        Key::Quote => KeyCode::Raw(0xDE),
+        Key::BackSlash | Key::IntlBackslash => KeyCode::Raw(0xDC),
+        Key::KeyZ => KeyCode::Char(b'Z'),
+        Key::KeyX => KeyCode::Char(b'X'),
+        Key::KeyC => KeyCode::Char(b'C'),
+        Key::KeyV => KeyCode::Char(b'V'),
+        Key::KeyB => KeyCode::Char(b'B'),
+        Key::KeyN => KeyCode::Char(b'N'),
+        Key::KeyM => KeyCode::Char(b'M'),
+        Key::Comma => KeyCode::Raw(0xBC),
+        Key::Dot => KeyCode::Raw(0xBE),
+        Key::Slash => KeyCode::Raw(0xBF),
         Key::Kp0 => KeyCode::Keypad0,
         Key::Kp1 => KeyCode::Keypad1,
         Key::Kp2 => KeyCode::Keypad2,
@@ -438,6 +488,11 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
         Key::Kp8 => KeyCode::Keypad8,
         Key::Kp9 => KeyCode::Keypad9,
         Key::KpMultiply => KeyCode::KeypadMultiply,
+        Key::KpReturn => KeyCode::KeypadEnter,
+        Key::KpMinus => KeyCode::KeypadSubtract,
+        Key::KpPlus => KeyCode::KeypadAdd,
+        Key::KpDivide => KeyCode::KeypadDivide,
+        Key::KpDelete => KeyCode::KeypadDecimal,
         Key::Unknown(code) => KeyCode::Raw(code),
         _ => return None,
     })
@@ -564,6 +619,50 @@ impl InputListener for DefaultInputListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdev_listener_maps_alphanumeric_keys() {
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::KeyA),
+            Some(KeyCode::Char(b'A'))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::KeyZ),
+            Some(KeyCode::Char(b'Z'))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::Num1),
+            Some(KeyCode::Char(b'1'))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::Num0),
+            Some(KeyCode::Char(b'0'))
+        );
+    }
+
+    #[test]
+    fn rdev_listener_maps_keyboard_punctuation_and_keypad() {
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::BackQuote),
+            Some(KeyCode::Raw(0xC0))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::Minus),
+            Some(KeyCode::Raw(0xBD))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::Equal),
+            Some(KeyCode::Raw(0xBB))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::KpReturn),
+            Some(KeyCode::KeypadEnter)
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::KpDelete),
+            Some(KeyCode::KeypadDecimal)
+        );
+    }
 
     #[test]
     fn test_listener_config_default() {

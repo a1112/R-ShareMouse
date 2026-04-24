@@ -20,3 +20,30 @@ textarea,
 select {
   font: inherit;
 }
+
+.rshare-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(110, 124, 145, 0.55) transparent;
+  overscroll-behavior: contain;
+}
+
+.rshare-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.rshare-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.rshare-scroll::-webkit-scrollbar-thumb {
+  background: rgba(110, 124, 145, 0.42);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+}
+
+.rshare-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(110, 124, 145, 0.68);
+  background-clip: content-box;
+}

@@ -1,0 +1,51 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
+Provider=%ManufacturerName%
+DriverVer=04/22/2026,0.1.0.0
+CatalogFile=rshare-vhid.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%RShareVhid.DeviceDesc%=RShareVhid_Install,ROOT\RSHAREVHID
+
+[RShareVhid_Install]
+CopyFiles=Drivers_Dir
+
+[RShareVhid_Install.HW]
+AddReg=RShareVhid_Install_HW_AddReg
+
+[RShareVhid_Install_HW_AddReg]
+HKR,,"LowerFilters",0x00010000,"vhf"
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+rshare-vhid.sys=1
+
+[Drivers_Dir]
+rshare-vhid.sys
+
+[RShareVhid_Install.Services]
+AddService=rshare-vhid,0x00000002,RShareVhid_Service
+
+[RShareVhid_Service]
+DisplayName=%RShareVhid.SvcDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\rshare-vhid.sys
+
+[Strings]
+ManufacturerName="R-ShareMouse"
+DiskName="R-ShareMouse driver disk"
+RShareVhid.DeviceDesc="R-ShareMouse Virtual HID Device"
+RShareVhid.SvcDesc="R-ShareMouse virtual HID driver"

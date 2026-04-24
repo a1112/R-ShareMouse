@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use crate::{ButtonState, DeviceId, KeyState, Message, MouseButton};
+use crate::{
+    ButtonState, DeviceId, GamepadDeviceInfo, GamepadState, KeyState, Message, MouseButton,
+};
 
 /// Forwarding mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,9 @@ pub enum RawInputEvent {
     MouseButton { button: u8, pressed: bool },
     MouseWheel { delta_x: i32, delta_y: i32 },
     Key { keycode: u32, pressed: bool },
+    GamepadConnected { info: GamepadDeviceInfo },
+    GamepadDisconnected { gamepad_id: u8 },
+    GamepadState { state: GamepadState },
 }
 
 /// Event batch for efficient transmission
@@ -190,6 +195,24 @@ impl ForwardingEngine {
             RawInputEvent::Key { keycode, pressed } => {
                 self.current_batch.add_key(keycode, pressed);
                 messages.extend(self.flush_batch());
+            }
+            RawInputEvent::GamepadConnected { info } => {
+                messages.extend(self.flush_batch());
+                messages.push(Message::GamepadConnected { info });
+                self.stats.events_sent += 1;
+                self.stats.last_send = Some(Instant::now());
+            }
+            RawInputEvent::GamepadDisconnected { gamepad_id } => {
+                messages.extend(self.flush_batch());
+                messages.push(Message::GamepadDisconnected { gamepad_id });
+                self.stats.events_sent += 1;
+                self.stats.last_send = Some(Instant::now());
+            }
+            RawInputEvent::GamepadState { state } => {
+                messages.extend(self.flush_batch());
+                messages.push(Message::GamepadState { state });
+                self.stats.events_sent += 1;
+                self.stats.last_send = Some(Instant::now());
             }
         }
 
@@ -365,5 +388,23 @@ mod tests {
         assert_eq!(convert_button_code(2), MouseButton::Middle);
         assert_eq!(convert_button_code(3), MouseButton::Right);
         assert_eq!(convert_button_code(99), MouseButton::Other(99));
+    }
+
+    #[test]
+    fn gamepad_events_flush_pending_mouse_batch_and_forward_snapshot() {
+        let mut engine = ForwardingEngine::new();
+        engine.set_target(DeviceId::new_v4());
+
+        assert!(engine
+            .process_event(RawInputEvent::MouseMove { x: 10, y: 20 })
+            .is_empty());
+
+        let messages = engine.process_event(RawInputEvent::GamepadState {
+            state: GamepadState::neutral(0, 1, 123),
+        });
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0], Message::MouseMove { x: 10, y: 20 }));
+        assert!(matches!(messages[1], Message::GamepadState { .. }));
     }
 }

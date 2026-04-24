@@ -22,3 +22,4 @@ uuid = { workspace = true }
 # Input event types (for common types)
 rdev = { workspace = true }
 enigo = "0.3"
+gilrs = { workspace = true }

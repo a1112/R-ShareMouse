@@ -8,6 +8,7 @@ pub mod backend;
 pub mod edge_detection;
 pub mod emulator;
 pub mod events;
+pub mod gamepad;
 pub mod listener;
 pub mod privilege;
 pub mod selection;
@@ -16,6 +17,7 @@ pub mod selection;
 pub use edge_detection::*;
 pub use emulator::*;
 pub use events::*;
+pub use gamepad::*;
 pub use listener::*;
 
 // Backend re-exports
@@ -23,4 +25,6 @@ pub use backend::{
     CaptureBackend, InjectBackend, NoopPrivilegeBackend, PortableCaptureBackend,
     PortableInjectBackend, PrivilegeBackend,
 };
+#[cfg(target_os = "linux")]
+pub use backend::{EvdevCaptureBackend, UInputInjectBackend};
 pub use selection::{BackendCandidate, BackendSelector, SelectionResult};
