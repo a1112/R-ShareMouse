@@ -1,0 +1,127 @@
+name: Rust Dependency Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # 每周一 UTC 00:00 运行
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 使用 cargo-audit 检查已知漏洞
+    - name: Run cargo audit
+      uses: actions-rs/audit-check@v1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    # 使用 cargo-outdated 检查过时的依赖
+    - name: Check for outdated dependencies
+      run: |
+        cargo install cargo-outdated
+        cargo outdated --workspace --exit-code 1 || true
+      continue-on-error: true
+
+    # 使用 cargo-deny 检查依赖合规性和安全性
+    - name: Run cargo-deny
+      uses: EmbarkStudios/cargo-deny-action@v1
+      with:
+        command: check
+        arguments: --all-features
+
+    # 使用 CodeQL 进行静态分析
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: rust
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+
+    # 创建 cargo-deny 配置（如果不存在）
+    - name: Setup cargo-deny config
+      run: |
+        if [ ! -f deny.toml ]; then
+          cat > deny.toml << 'DENY_EOF'
+          # advisories = "warn"
+          # The graph of crates
+          [graph]
+          # 清理未使用的依赖
+          # feature = "allow" # 检测特性特性
+
+          [output]
+          # 输出格式
+          # feature-depth = 1
+
+          # 许可证配置
+          [licenses]
+          # 许可证白名单
+          allow = [
+              "MIT",
+              "Apache-2.0",
+              "Apache-2.0 WITH LLVM-exception",
+              "BSD-2-Clause",
+              "BSD-3-Clause",
+              "ISC",
+              "Unicode-DFS-2016",
+          ]
+          confidence-threshold = 0.8
+          exceptions = [
+              { allow = ["OpenSSL"], name = "ring", version = "*" },
+          ]
+
+          # 私有源配置
+          [sources]
+          # 允许的私有源
+          unknown-registry = "warn"
+          unknown-git = "warn"
+
+          # 禁止特定版本的包
+          [bans]
+          # 禁止多个版本的同一个包
+          multiple-versions = "warn"
+          # 禁止特定的 wildcard 依赖
+          wildcards = "allow"
+          highlight = "all"
+          workspace-duplicates = "warn"
+          DENY_EOF
+        fi
+
+  # Clippy 检查代码质量问题
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run Clippy
+      run: |
+        cargo clippy --all-targets --all-features -- -D warnings
+      continue-on-error: true
+
+  # 格式检查
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+      continue-on-error: true
