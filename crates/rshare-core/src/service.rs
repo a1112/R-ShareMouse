@@ -137,6 +137,20 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Check whether a known process identifier is still alive.
+    pub fn is_pid_alive(&self, pid: u32) -> bool {
+        self.is_process_alive(pid)
+    }
+
+    /// Force-stop a specific process identifier and clean up the local PID file.
+    pub fn stop_pid(&self, pid: u32) -> Result<()> {
+        if self.is_process_alive(pid) {
+            self.force_kill(pid)?;
+        }
+        self.remove_pid_file()?;
+        Ok(())
+    }
+
     /// Force kill the service
     fn force_kill(&self, pid: u32) -> Result<()> {
         #[cfg(unix)]
