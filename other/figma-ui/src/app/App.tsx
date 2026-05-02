@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  ChevronDown,
+  ChevronRight,
   FileText,
   Gamepad2,
   HardDrive,
@@ -24,6 +26,8 @@ import MonitorManager, {
 } from "./components/MonitorManager";
 import {
   buildDesktopViewModel,
+  buildDeviceGalleryItems,
+  buildDeviceTypeSummaries,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 import {
@@ -1895,7 +1899,7 @@ function LocalControlTypeButton({
       type="button"
       role="tab"
       aria-selected={active}
-      className="flex h-9 shrink-0 items-center gap-2 rounded-md px-2.5 text-left text-xs transition"
+      className="flex h-8 w-full shrink-0 items-center gap-1.5 rounded-md px-2.5 text-left text-xs transition"
       style={{
         border: `1px solid ${active ? theme.accent : theme.border}`,
         background: active ? theme.accentSoft : theme.frame,
@@ -1909,9 +1913,58 @@ function LocalControlTypeButton({
       >
         {icon}
       </span>
-      <span className="flex min-w-0 flex-col leading-tight">
+      <span className="flex min-w-0 items-baseline gap-1.5 leading-none">
         <span className="truncate font-medium">{title}</span>
         <span className="truncate text-[11px]" style={{ color: theme.textMuted }}>
+          {detail}
+        </span>
+      </span>
+      <span
+        className="h-1.5 w-1.5 shrink-0 rounded-full"
+        style={{ background: live ? theme.success : theme.textMuted, opacity: live ? 1 : 0.45 }}
+      />
+    </button>
+  );
+}
+
+function DeviceTreeNodeButton({
+  active,
+  icon,
+  title,
+  detail,
+  live,
+  onClick,
+  theme,
+}: {
+  active: boolean;
+  icon: ReactNode;
+  title: string;
+  detail: string;
+  live: boolean;
+  onClick: () => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <button
+      type="button"
+      className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-xs transition"
+      style={{
+        border: `1px solid ${active ? theme.accent : theme.border}`,
+        background: active ? theme.accentSoft : theme.frame,
+        color: active ? theme.text : theme.textSub,
+      }}
+      onClick={onClick}
+      title={`${title} · ${detail}`}
+    >
+      <span
+        className="flex h-6 w-6 shrink-0 items-center justify-center"
+        style={{ color: active ? theme.accent : theme.textMuted }}
+      >
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium">{title}</span>
+        <span className="block truncate text-[10px]" style={{ color: theme.textMuted }}>
           {detail}
         </span>
       </span>
@@ -1965,6 +2018,8 @@ function DevicesPageWithLocalControls({
   const [selectedPage, setSelectedPage] = useState<LocalDevicePageKind>("all");
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<Record<string, string>>({});
   const [selectedMonitorDeviceId, setSelectedMonitorDeviceId] = useState("local");
+  const [expandedDeviceKinds, setExpandedDeviceKinds] = useState<Record<string, boolean>>({});
+  const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
 
   useEffect(() => {
@@ -2004,25 +2059,31 @@ function DevicesPageWithLocalControls({
     localControls?.audio_outputs?.length ? localControls.audio_outputs : browserAudioOutputs;
   const audioInputs = localControls?.audio_inputs ?? [];
   const safeDevices = safeArray(devices);
-  const connectedDevices = safeDevices.filter((device) => device.connected);
   const selectedRemoteDevice =
     selectedMonitorDeviceId === "local"
       ? null
-      : connectedDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
-  const connectedDeviceIds = new Set(connectedDevices.map((device) => device.id));
+      : safeDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
+  const remoteDeviceIds = new Set(safeDevices.map((device) => device.id));
   const monitorSnapshot = selectedRemoteDevice
     ? buildRemoteMonitorSnapshot(localControls, selectedRemoteDevice.id)
-    : buildLocalMonitorSnapshot(localControls, connectedDeviceIds);
+    : buildLocalMonitorSnapshot(localControls, remoteDeviceIds);
   const monitorError = selectedRemoteDevice ? null : localControlsError;
+  const handleMonitorDeviceChange = (deviceId: string) => {
+    setSelectedMonitorDeviceId(deviceId);
+    const selected = safeDevices.find((device) => device.id === deviceId);
+    if (selected && !selected.connected && !busy) {
+      onConnect(selected.id);
+    }
+  };
 
   useEffect(() => {
     if (
       selectedMonitorDeviceId !== "local" &&
-      !connectedDevices.some((device) => device.id === selectedMonitorDeviceId)
+      !safeDevices.some((device) => device.id === selectedMonitorDeviceId)
     ) {
       setSelectedMonitorDeviceId("local");
     }
-  }, [connectedDevices, selectedMonitorDeviceId]);
+  }, [safeDevices, selectedMonitorDeviceId]);
 
   const selectedDeviceId =
     selectedPage === "all" || selectedPage === "remote"
@@ -2043,129 +2104,196 @@ function DevicesPageWithLocalControls({
     audio: Math.max(1, audioInputs.length + audioOutputs.length),
     remote: safeDevices.length,
   };
+  const deviceTypeTabs = buildDeviceTypeSummaries(counts);
+  const tabIcons: Record<LocalDevicePageKind, ReactNode> = {
+    all: <LayoutGrid size={16} />,
+    keyboard: <Keyboard size={16} />,
+    mouse: <MousePointer2 size={16} />,
+    gamepad: <Gamepad2 size={16} />,
+    display: <HardDrive size={16} />,
+    audio: <Volume2 size={16} />,
+    remote: <Monitor size={16} />,
+  };
+  const tabLive: Record<LocalDevicePageKind, boolean> = {
+    all: counts.all,
+    keyboard: Boolean(localControls?.keyboard.detected),
+    mouse: Boolean(localControls?.mouse.detected),
+    gamepad: Boolean(localControls?.gamepads?.some((item) => item.connected)),
+    display: (localControls?.display.display_count ?? 0) > 0,
+    audio: audioInputs.length > 0 || audioOutputs.length > 0,
+    remote: safeDevices.some((device) => device.connected),
+  };
+  const toggleDeviceKind = (kind: LocalDevicePageKind) => {
+    setExpandedDeviceKinds((current) => ({
+      ...current,
+      [kind]: !current[kind],
+    }));
+  };
+  const localDeviceTabs = deviceTypeTabs.filter(
+    (tab) => tab.kind !== "all" && tab.kind !== "remote",
+  );
+  const selectLocalRoot = () => {
+    setSelectedMonitorDeviceId("local");
+    setSelectedPage("all");
+  };
+  const selectLocalKind = (kind: LocalDevicePageKind) => {
+    setSelectedMonitorDeviceId("local");
+    setSelectedPage(kind);
+    if (kind !== "all" && kind !== "remote") {
+      const aggregate = localDeviceItems(monitorSnapshot, kind as LocalControlKind, audioOutputs)[0];
+      if (aggregate) {
+        setSelectedDeviceId(kind as LocalControlKind, aggregate.id);
+      }
+    }
+  };
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    <div className="flex h-full min-h-0 overflow-hidden">
       <div
-        className="shrink-0 overflow-hidden"
+        className="flex w-[250px] shrink-0 flex-col overflow-hidden"
         style={{
-          border: `1px solid ${theme.border}`,
-          background: theme.toolbar,
+          borderRight: `1px solid ${theme.border}`,
+          background: theme.sidebar,
         }}
       >
         <div
-          className="rshare-scroll flex min-h-10 items-center gap-2 overflow-x-auto px-2 py-1"
-          role="tablist"
-          aria-label="设备类型"
+          className="rshare-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3"
+          role="tree"
+          aria-label="设备树"
         >
-        <LocalControlTypeButton
-          kind="all"
-          active={selectedPage === "all"}
-          icon={<LayoutGrid size={18} />}
-          title="全部设备"
-          detail="总览"
-          live={counts.all}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="keyboard"
-          active={selectedPage === "keyboard"}
-          icon={<Keyboard size={18} />}
-          title="键盘"
-          detail={`${counts.keyboard} 个`}
-          live={Boolean(localControls?.keyboard.detected)}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="mouse"
-          active={selectedPage === "mouse"}
-          icon={<MousePointer2 size={18} />}
-          title="鼠标"
-          detail={`${counts.mouse} 个`}
-          live={Boolean(localControls?.mouse.detected)}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="gamepad"
-          active={selectedPage === "gamepad"}
-          icon={<Gamepad2 size={18} />}
-          title="手柄"
-          detail={`${counts.gamepad} 个`}
-          live={Boolean(localControls?.gamepads?.some((item) => item.connected))}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="display"
-          active={selectedPage === "display"}
-          icon={<HardDrive size={18} />}
-          title="显示设备"
-          detail={`${counts.display} 个`}
-          live={(localControls?.display.display_count ?? 0) > 0}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="audio"
-          active={selectedPage === "audio"}
-          icon={<Volume2 size={18} />}
-          title="音频设备"
-          detail={`${counts.audio} 个`}
-          live={audioInputs.length > 0 || audioOutputs.length > 0}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="remote"
-          active={selectedPage === "remote"}
-          icon={<Monitor size={18} />}
-          title="远端设备"
-          detail={`${counts.remote} 台`}
-           live={safeDevices.some((device) => device.connected)}
-          onClick={setSelectedPage}
-          theme={theme}
-        />
-          <div className="ml-auto flex shrink-0 items-center gap-2 pl-2">
-            <span className="text-xs" style={{ color: theme.textMuted }}>
-              监听
-            </span>
-            <select
-              className="h-8 max-w-[220px] rounded-md px-2 text-xs outline-none"
-              style={{
-                border: `1px solid ${theme.border}`,
-                background: theme.frame,
-                color: theme.text,
-              }}
-              value={selectedMonitorDeviceId}
-              onChange={(event) => setSelectedMonitorDeviceId(event.currentTarget.value)}
-              title="选择要监听和测试延迟的设备"
-            >
-              <option value="local">
-                本机 · {localDevice.name}
-              </option>
-              {connectedDevices.map((device) => (
-                <option key={device.id} value={device.id}>
-                  {device.name} · {device.hostname}
-                </option>
-              ))}
-            </select>
+          <div className="mb-1 px-1">
+            <div className="text-[11px] uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
+              Device Console
+            </div>
+            <div className="mt-1 text-sm font-semibold">设备控制</div>
           </div>
+
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                className="flex h-8 w-6 shrink-0 items-center justify-center rounded"
+                style={{ color: theme.textMuted }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setLocalTreeExpanded((value) => !value);
+                }}
+                title={localTreeExpanded ? "收起本机" : "展开本机"}
+              >
+                {localTreeExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              </button>
+              <DeviceTreeNodeButton
+                active={selectedMonitorDeviceId === "local" && selectedPage === "all"}
+                icon={<Monitor size={16} />}
+                title={localDevice.name}
+                detail={localDevice.hostname || "本机"}
+                live={Boolean(monitorSnapshot)}
+                onClick={selectLocalRoot}
+                theme={theme}
+              />
+            </div>
+            {localTreeExpanded ? (
+              <div className="ml-3 flex flex-col gap-1">
+                {localDeviceTabs.map((tab) => {
+            const kind = tab.kind as LocalDevicePageKind;
+            const expanded = Boolean(expandedDeviceKinds[kind]);
+            const children =
+              localDeviceItems(monitorSnapshot, kind as LocalControlKind, audioOutputs)
+                .filter((device) => device.live)
+                .slice(1);
+            return (
+              <div key={kind} className="flex flex-col gap-1">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    className="flex h-8 w-6 shrink-0 items-center justify-center rounded"
+                    style={{
+                      color: children.length ? theme.textMuted : "transparent",
+                    }}
+                    disabled={!children.length}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleDeviceKind(kind);
+                    }}
+                    title={expanded ? "收起" : "展开"}
+                  >
+                    {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
+                  <LocalControlTypeButton
+                    kind={kind}
+                    active={selectedPage === kind}
+                    icon={tabIcons[kind]}
+                    title={tab.title}
+                    detail={tab.detail}
+                    live={tabLive[kind]}
+                    onClick={selectLocalKind}
+                    theme={theme}
+                  />
+                </div>
+                {expanded && children.length ? (
+                  <div className="ml-4 flex flex-col gap-1">
+                    {children.map((device) => (
+                      <button
+                        key={device.id}
+                        type="button"
+                        className="truncate rounded-md px-2 py-1.5 text-left text-xs"
+                        style={{
+                          border: `1px solid ${
+                            (kind === "remote"
+                              ? selectedMonitorDeviceId === device.id
+                              : selectedDeviceIds[kind] === device.id)
+                              ? theme.accent
+                              : theme.border
+                          }`,
+                          background:
+                            (kind === "remote"
+                              ? selectedMonitorDeviceId === device.id
+                              : selectedDeviceIds[kind] === device.id)
+                              ? theme.accentSoft
+                              : "rgba(255,255,255,0.035)",
+                          color: theme.textSub,
+                        }}
+                        onClick={() => {
+                          setSelectedMonitorDeviceId("local");
+                          setSelectedPage(kind);
+                          setSelectedDeviceId(kind as LocalControlKind, device.id);
+                        }}
+                        title={device.detail}
+                      >
+                        <span
+                          className="mr-2 inline-block h-2 w-2 rounded-full"
+                          style={{ background: device.live ? theme.success : theme.textMuted }}
+                        />
+                        {device.name}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          {safeDevices.map((device) => (
+            <div key={device.id} className="flex items-center gap-1">
+              <span className="h-8 w-3 shrink-0" />
+              <DeviceTreeNodeButton
+                active={selectedMonitorDeviceId === device.id}
+                icon={<Monitor size={16} />}
+                title={device.name}
+                detail={device.connected ? "已连接" : device.hostname || "已发现"}
+                live={device.connected}
+                onClick={() => {
+                  handleMonitorDeviceChange(device.id);
+                  setSelectedPage("all");
+                }}
+                theme={theme}
+              />
+            </div>
+          ))}
         </div>
-        {selectedPage !== "all" && !selectedRemoteDevice ? (
-          <DeviceDriverStrip
-            kind={selectedPage}
-            snapshot={monitorSnapshot}
-            audioOutputs={audioOutputs}
-            selectedDeviceId={selectedDeviceId}
-            onSelectedDeviceIdChange={(deviceId) =>
-              setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
-            }
-            theme={theme}
-          />
-        ) : null}
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
@@ -2173,17 +2301,8 @@ function DevicesPageWithLocalControls({
           <AllDevicesOverview
             snapshot={monitorSnapshot}
             audioOutputs={audioOutputs}
-            selectedDeviceIds={selectedDeviceIds}
-            onSelectedDeviceIdChange={setSelectedDeviceId}
+            remoteDevices={safeDevices}
             error={monitorError}
-            theme={theme}
-          />
-        ) : selectedPage === "remote" ? (
-          <RemoteDevicesPanel
-            devices={safeDevices}
-            onConnect={onConnect}
-            onDisconnect={onDisconnect}
-            busy={busy}
             theme={theme}
           />
         ) : (
@@ -2324,84 +2443,154 @@ function DevicesPageWithLocalControls({
 function AllDevicesOverview({
   snapshot,
   audioOutputs,
-  selectedDeviceIds,
-  onSelectedDeviceIdChange,
+  remoteDevices,
   error,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
   audioOutputs: AudioOutputDevice[];
-  selectedDeviceIds: Record<string, string>;
-  onSelectedDeviceIdChange: (kind: LocalControlKind, deviceId: string) => void;
+  remoteDevices: Array<{
+    id: string;
+    name: string;
+    hostname: string;
+    address: string;
+    connected: boolean;
+    online: boolean;
+    lastSeenLabel: string;
+  }>;
   error: string | null;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  const keyboardSelectedId = selectedLocalDeviceId(snapshot, "keyboard", selectedDeviceIds.keyboard);
-  const mouseSelectedId = selectedLocalDeviceId(snapshot, "mouse", selectedDeviceIds.mouse);
-  const gamepadSelectedId = selectedLocalDeviceId(snapshot, "gamepad", selectedDeviceIds.gamepad);
-  const keyboardEvents = selectedControlEvents(snapshot, "keyboard", keyboardSelectedId);
-  const mouseEvents = selectedControlEvents(snapshot, "mouse", mouseSelectedId);
-  const gamepadEvents = selectedControlEvents(snapshot, "gamepad", gamepadSelectedId);
-  const keyboardState = keyboardMonitorState(snapshot, keyboardSelectedId, keyboardEvents);
-  const mouseState = mouseMonitorState(snapshot, mouseSelectedId, mouseEvents);
-  const gamepad = selectedGamepad(snapshot, gamepadSelectedId);
-  const keyboardEvent = latestEvent(keyboardEvents);
-  const mouseEvent = latestEvent(mouseEvents);
-  const gamepadEvent = latestEvent(gamepadEvents);
-  const displayEvent = latestLocalControlEvent(snapshot, "Display") ?? mouseEvent;
-  const audioEvent = latestLocalControlEvent(snapshot, "Audio");
-  const keyboardSelector = (
-    <DeviceSelector
-      compact
-      items={localDeviceItems(snapshot, "keyboard")}
-      selectedId={keyboardSelectedId}
-      onChange={(deviceId) => onSelectedDeviceIdChange("keyboard", deviceId)}
-      theme={theme}
-    />
-  );
-  const mouseSelector = (
-    <DeviceSelector
-      compact
-      items={localDeviceItems(snapshot, "mouse")}
-      selectedId={mouseSelectedId}
-      onChange={(deviceId) => onSelectedDeviceIdChange("mouse", deviceId)}
-      theme={theme}
-    />
-  );
-  const gamepadSelector = (
-    <DeviceSelector
-      compact
-      items={localDeviceItems(snapshot, "gamepad")}
-      selectedId={gamepadSelectedId}
-      onChange={(deviceId) => onSelectedDeviceIdChange("gamepad", deviceId)}
-      theme={theme}
-    />
-  );
-  const displaySelector = (
-    <DeviceSelector
-      compact
-      items={localDeviceItems(snapshot, "display")}
-      selectedId={selectedDeviceIds.display}
-      onChange={(deviceId) => onSelectedDeviceIdChange("display", deviceId)}
-      theme={theme}
-    />
-  );
-  const audioSelector = (
-    <DeviceSelector
-      compact
-      items={localDeviceItems(snapshot, "audio", audioOutputs)}
-      selectedId={selectedDeviceIds.audio}
-      onChange={(deviceId) => onSelectedDeviceIdChange("audio", deviceId)}
-      theme={theme}
-    />
-  );
+  const galleryItems = buildDeviceGalleryItems(snapshot, audioOutputs, remoteDevices);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const [zoom, setZoom] = useState(0.92);
+  const [panOffset, setPanOffset] = useState({ x: 24, y: -8 });
+  const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [draggingNode, setDraggingNode] = useState<{
+    id: string;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const [panning, setPanning] = useState<{
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const gallerySignature = galleryItems
+    .map((item) => `${item.id}:${item.x}:${item.y}`)
+    .join("|");
+  const latestInputEvent =
+    latestLocalControlEvent(snapshot, "Keyboard") ??
+    latestLocalControlEvent(snapshot, "Mouse") ??
+    latestLocalControlEvent(snapshot, "Gamepad") ??
+    latestLocalControlEvent(snapshot, "Audio");
+  const positionedItems = galleryItems.map((item) => ({
+    ...item,
+    ...(nodePositions[item.id] ?? { x: item.x, y: item.y }),
+  }));
+
+  useEffect(() => {
+    setNodePositions((previous) => {
+      const next: Record<string, { x: number; y: number }> = {};
+      for (const item of galleryItems) {
+        next[item.id] = previous[item.id] ?? { x: item.x, y: item.y };
+      }
+      return next;
+    });
+  }, [gallerySignature]);
+
+  useEffect(() => {
+    if (!draggingNode && !panning) {
+      return undefined;
+    }
+
+    const handleMove = (event: MouseEvent) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+      if (draggingNode) {
+        const x = (event.clientX - rect.left) / zoom - panOffset.x - draggingNode.offsetX;
+        const y = (event.clientY - rect.top) / zoom - panOffset.y - draggingNode.offsetY;
+        setNodePositions((previous) => ({
+          ...previous,
+          [draggingNode.id]: { x, y },
+        }));
+        return;
+      }
+      if (panning) {
+        setPanOffset({
+          x: panning.originX + (event.clientX - panning.startX) / zoom,
+          y: panning.originY + (event.clientY - panning.startY) / zoom,
+        });
+      }
+    };
+    const handleUp = () => {
+      setDraggingNode(null);
+      setPanning(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [draggingNode, panOffset, panning, zoom]);
+
+  const beginNodeDrag = (
+    event: React.MouseEvent,
+    item: { id: string; x: number; y: number },
+  ) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setDraggingNode({
+      id: item.id,
+      offsetX: (event.clientX - rect.left) / zoom - panOffset.x - item.x,
+      offsetY: (event.clientY - rect.top) / zoom - panOffset.y - item.y,
+    });
+  };
+
+  const beginCanvasPan = (event: React.MouseEvent) => {
+    if (event.button !== 0 && event.button !== 1 && event.button !== 2) {
+      return;
+    }
+    event.preventDefault();
+    setPanning({
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: panOffset.x,
+      originY: panOffset.y,
+    });
+  };
+
+  const handleWheelZoom = (event: React.WheelEvent) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) {
+      return;
+    }
+    event.preventDefault();
+    const nextZoom = clamp(zoom * (event.deltaY > 0 ? 0.9 : 1.1), 0.55, 1.75);
+    const worldX = (event.clientX - rect.left) / zoom - panOffset.x;
+    const worldY = (event.clientY - rect.top) / zoom - panOffset.y;
+    setZoom(nextZoom);
+    setPanOffset({
+      x: (event.clientX - rect.left) / nextZoom - worldX,
+      y: (event.clientY - rect.top) / nextZoom - worldY,
+    });
+  };
 
   return (
     <section
-      className="relative grid h-full min-h-0 grid-cols-1 gap-2 overflow-hidden p-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(220px,0.42fr)] xl:grid-rows-[minmax(0,1fr)_minmax(0,0.9fr)]"
+      className="relative h-full min-h-0 overflow-hidden"
       style={{
         border: `1px solid ${theme.border}`,
-        background: theme.frame,
+        background: theme.canvas,
       }}
     >
       {error ? (
@@ -2416,96 +2605,592 @@ function AllDevicesOverview({
           本机捕获不可用：{error}
         </div>
       ) : null}
+      <div
+        ref={canvasRef}
+        className="relative h-full min-h-[640px] overflow-hidden"
+        style={{
+          cursor: panning ? "grabbing" : "grab",
+          backgroundImage: `radial-gradient(circle, ${theme.gridDot} 1px, transparent 1px)`,
+          backgroundSize: `${28 * zoom}px ${28 * zoom}px`,
+          backgroundPosition: `${panOffset.x * zoom}px ${panOffset.y * zoom}px`,
+        }}
+        onContextMenu={(event) => event.preventDefault()}
+        onMouseDown={beginCanvasPan}
+        onWheel={handleWheelZoom}
+      >
+        <div className="absolute left-6 top-5 z-10">
+          <div className="text-xs uppercase tracking-[0.18em]" style={{ color: theme.textMuted }}>
+            Device Simulator
+          </div>
+          <div className="mt-1 text-xl font-semibold">设备模拟台</div>
+          <div className="mt-1 max-w-[520px] text-xs" style={{ color: theme.textMuted }}>
+            以主显示器为中心模拟真实键盘、鼠标、音频与远端设备；滚轮缩放，拖拽空白处平移，拖拽设备调整位置。
+          </div>
+        </div>
 
-      <OverviewAnimationCard
-        icon={<Keyboard size={16} />}
-        title="键盘"
-        live={Boolean(snapshot?.keyboard.detected)}
-        event={keyboardEvent}
-        selector={keyboardSelector}
-        theme={theme}
-        className="xl:col-span-2"
-      >
-        <SimulatedKeyboard
-          compact
-          pressedKeys={keyboardState.pressedKeys}
-          lastKey={keyboardState.lastKey}
-          recentEvents={keyboardEvents}
-          eventCount={keyboardState.eventCount}
-          theme={theme}
-        />
-      </OverviewAnimationCard>
+        <div
+          className="absolute right-6 top-5 z-10 rounded-md px-3 py-2 text-xs"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.toolbar,
+            color: theme.textMuted,
+          }}
+        >
+          <span>缩放 {Math.round(zoom * 100)}%</span>
+          <span className="mx-2 opacity-50">·</span>
+          <span>最新事件：{latestInputEvent?.summary ?? "等待输入"}</span>
+        </div>
 
-      <OverviewAnimationCard
-        icon={<MousePointer2 size={16} />}
-        title="鼠标"
-        live={Boolean(snapshot?.mouse.detected)}
-        event={mouseEvent}
-        selector={mouseSelector}
-        theme={theme}
-      >
-        <SimulatedMouse
-          compact
-          x={mouseState.x}
-          y={mouseState.y}
-          pressedButtons={mouseState.pressedButtons}
-          recentEvents={mouseEvents}
-          wheelDeltaX={mouseState.wheelDeltaX}
-          wheelDeltaY={mouseState.wheelDeltaY}
-          wheelTotalX={mouseState.wheelTotalX}
-          wheelTotalY={mouseState.wheelTotalY}
-          eventCount={mouseState.eventCount}
-          moveCount={mouseState.moveCount}
-          buttonPressCount={mouseState.buttonPressCount}
-          buttonReleaseCount={mouseState.buttonReleaseCount}
-          wheelEventCount={mouseState.wheelEventCount}
-          displayRelativeX={mouseState.displayRelativeX}
-          displayRelativeY={mouseState.displayRelativeY}
-          currentDisplayIndex={mouseState.currentDisplayIndex}
-          currentDisplayId={mouseState.currentDisplayId}
-          displays={snapshot?.display.displays ?? []}
-          theme={theme}
-        />
-      </OverviewAnimationCard>
+        <div
+          className="absolute inset-0"
+          style={{
+            transform: `scale(${zoom}) translate(${panOffset.x}px, ${panOffset.y}px)`,
+            transformOrigin: "0 0",
+          }}
+        >
+          {positionedItems.length ? (
+            positionedItems.map((item) => (
+              <DeviceGalleryNode
+                key={item.id}
+                item={item}
+                dragging={draggingNode?.id === item.id}
+                onMouseDown={(event) => beginNodeDrag(event, item)}
+                theme={theme}
+              />
+            ))
+          ) : (
+            <div
+              className="absolute left-1/2 top-1/2 rounded-lg px-6 py-5 text-sm"
+              style={{
+                transform: "translate(-50%, -50%)",
+                border: `1px solid ${theme.border}`,
+                background: theme.sidebar,
+                color: theme.textMuted,
+              }}
+            >
+              暂无可展示设备，等待 daemon 返回本机控制快照。
+            </div>
+          )}
+        </div>
 
-      <OverviewAnimationCard
-        icon={<Gamepad2 size={16} />}
-        title="手柄"
-        live={Boolean(gamepad?.connected)}
-        event={gamepadEvent}
-        selector={gamepadSelector}
-        theme={theme}
-      >
-        <SimulatedGamepad
-          compact
-          gamepad={gamepad}
-          virtualDetail={snapshot?.virtual_gamepad.detail ?? "Virtual HID not implemented"}
-          theme={theme}
-        />
-      </OverviewAnimationCard>
-
-      <OverviewAnimationCard
-        icon={<HardDrive size={16} />}
-        title="显示设备"
-        live={(snapshot?.display.display_count ?? 0) > 0}
-        event={displayEvent}
-        selector={displaySelector}
-        theme={theme}
-      >
-        <DisplayActivityPreview snapshot={snapshot} theme={theme} />
-      </OverviewAnimationCard>
-      <OverviewAnimationCard
-        icon={<Volume2 size={16} />}
-        title="音频设备"
-        live={Boolean((snapshot?.audio_inputs?.length ?? 0) + audioOutputs.length)}
-        event={audioEvent}
-        selector={audioSelector}
-        theme={theme}
-      >
-        <AudioActivityPreview snapshot={snapshot} outputs={audioOutputs} theme={theme} />
-      </OverviewAnimationCard>
+        <div
+          className="absolute bottom-3 left-4 z-10 rounded-md px-3 py-1.5 text-[11px]"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.toolbar,
+            color: theme.textMuted,
+          }}
+        >
+          拖拽设备 · 空白处拖拽平移 · 滚轮缩放
+        </div>
+      </div>
     </section>
   );
+}
+
+function DeviceGalleryNode({
+  item,
+  dragging,
+  onMouseDown,
+  theme,
+}: {
+  item: {
+    id: string;
+    kind: string;
+    shape?: string;
+    title: string;
+    detail: string;
+    metric: string;
+    live: boolean;
+    activity?: Record<string, unknown>;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
+  dragging: boolean;
+  onMouseDown: (event: React.MouseEvent) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const accent =
+    item.kind === "remote" && !item.live
+      ? theme.textMuted
+      : item.kind === "audio"
+        ? "#49b35c"
+        : item.kind === "display"
+          ? "#d6a64b"
+          : theme.accent;
+  return (
+    <article
+      className="absolute select-none transition-shadow"
+      onMouseDown={onMouseDown}
+      style={{
+        left: item.x,
+        top: item.y,
+        width: item.w,
+        height: item.h,
+        cursor: dragging ? "grabbing" : "grab",
+        zIndex: dragging ? 20 : item.kind === "display" ? 8 : 10,
+        filter: dragging ? "drop-shadow(0 20px 34px rgba(0,0,0,0.35))" : "none",
+      }}
+      title={`${item.title} · ${item.detail}`}
+    >
+      <PhysicalDeviceShape item={item} accent={accent} theme={theme} />
+    </article>
+  );
+}
+
+function PhysicalDeviceShape({
+  item,
+  accent,
+  theme,
+}: {
+  item: {
+    kind: string;
+    shape?: string;
+    title: string;
+    detail: string;
+    metric: string;
+    live: boolean;
+    activity?: Record<string, unknown>;
+  };
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const label = (
+    <div className="pointer-events-none absolute left-4 top-3 z-10">
+      <div className="text-sm font-semibold" style={{ color: theme.text }}>
+        {item.title}
+      </div>
+      <div className="mt-0.5 text-[11px]" style={{ color: theme.textMuted }}>
+        {item.detail}
+      </div>
+    </div>
+  );
+  const liveDot = (
+    <span
+      className="absolute right-4 top-4 z-10 h-2.5 w-2.5 rounded-full"
+      style={{ background: item.live ? theme.success : theme.textMuted }}
+    />
+  );
+
+  if (item.shape === "monitor") {
+    const activity = item.activity ?? {};
+    const pointerVisible = Boolean(activity.pointerVisible);
+    const screenWidth = Number(activity.width ?? 1) || 1;
+    const screenHeight = Number(activity.height ?? 1) || 1;
+    const pointerLeft = clamp((Number(activity.pointerX ?? 0) / screenWidth) * 100, 2, 98);
+    const pointerTop = clamp((Number(activity.pointerY ?? 0) / screenHeight) * 100, 2, 98);
+    return (
+      <div className="relative h-full w-full">
+        <div
+          className="absolute inset-x-0 top-0 h-[78%] rounded-xl border-2"
+          style={{
+            borderColor: accent,
+            background: `linear-gradient(160deg, ${theme.sidebar}, ${theme.frame})`,
+            boxShadow: `0 0 0 1px ${accent}22, ${theme.panelShadow}`,
+          }}
+        >
+          {label}
+          {liveDot}
+          <div
+            className="absolute inset-8 top-14 rounded-md"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background:
+                "linear-gradient(135deg, rgba(91,139,214,0.18), rgba(255,255,255,0.04))",
+            }}
+          >
+            <div
+              className="absolute inset-0 rounded-md opacity-70"
+              style={{
+                backgroundImage:
+                  "linear-gradient(rgba(255,255,255,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.055) 1px, transparent 1px)",
+                backgroundSize: "26px 26px",
+              }}
+            />
+            {pointerVisible ? (
+              <span
+                className="absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
+                style={{
+                  left: `${pointerLeft}%`,
+                  top: `${pointerTop}%`,
+                  background: accent,
+                  boxShadow: `0 0 0 5px ${accent}28, 0 0 18px ${accent}`,
+                }}
+              />
+            ) : null}
+            <div className="absolute bottom-4 left-5 text-lg font-semibold" style={{ color: accent }}>
+              {item.detail}
+            </div>
+            <div className="absolute right-5 top-4 text-[11px]" style={{ color: theme.textMuted }}>
+              {pointerVisible
+                ? `Pointer ${Math.round(Number(activity.pointerX ?? 0))}, ${Math.round(Number(activity.pointerY ?? 0))}`
+                : "Pointer idle"}
+            </div>
+          </div>
+        </div>
+        <div
+          className="absolute bottom-8 left-1/2 h-10 w-16 -translate-x-1/2 rounded-b-lg"
+          style={{ background: theme.border }}
+        />
+        <div
+          className="absolute bottom-4 left-1/2 h-4 w-44 -translate-x-1/2 rounded-full"
+          style={{ background: theme.sidebar, border: `1px solid ${theme.border}` }}
+        />
+      </div>
+    );
+  }
+
+  if (item.shape === "keyboard") {
+    const activity = item.activity ?? {};
+    const pressedKeys = Array.isArray(activity.pressedKeys) ? activity.pressedKeys : [];
+    const lastKey = typeof activity.lastKey === "string" ? activity.lastKey : null;
+    const rows = [
+      ["Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Del"],
+      ["Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
+      ["Caps", "A", "S", "D", "F", "G", "H", "J", "K", "L"],
+      ["Shift", "Z", "X", "C", "V", "B", "N", "M", "Enter"],
+      ["Ctrl", "Win", "Alt", "Space", "Alt", "Fn"],
+    ];
+    return (
+      <div
+        className="relative h-full w-full rounded-2xl border p-4 pt-12"
+        style={{
+          borderColor: item.live ? accent : theme.border,
+          background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
+          boxShadow: theme.panelShadow,
+        }}
+      >
+        {label}
+        {liveDot}
+        <div className="grid gap-1.5">
+          {rows.map((row, rowIndex) => (
+            <div key={rowIndex} className="flex justify-center gap-1.5">
+              {row.map((key) => (
+                (() => {
+                  const active = galleryKeyboardKeyActive(key, pressedKeys, lastKey);
+                  return (
+                    <span
+                      key={`${rowIndex}-${key}`}
+                      className="flex h-5 items-center justify-center rounded text-[9px] transition"
+                      style={{
+                        width: key === "Space" ? 118 : key.length > 4 ? 52 : 34,
+                        background: active
+                          ? accent
+                          : key === "Space"
+                            ? `${accent}22`
+                            : "rgba(255,255,255,0.06)",
+                        border: `1px solid ${active ? accent : theme.border}`,
+                        color: active ? "#ffffff" : theme.textSub,
+                        boxShadow: active ? `0 0 10px ${accent}66` : "none",
+                        transform: active ? "translateY(1px)" : "translateY(0)",
+                      }}
+                    >
+                      {key}
+                    </span>
+                  );
+                })()
+              ))}
+            </div>
+          ))}
+        </div>
+        <div
+          className="absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: "rgba(255,255,255,0.05)",
+            color: theme.textSub,
+          }}
+        >
+          最后按键 <span style={{ color: accent }}>{lastKey ?? "等待输入"}</span>
+        </div>
+        <div className="absolute bottom-3 right-5 text-sm font-semibold" style={{ color: accent }}>
+          {item.metric}
+        </div>
+      </div>
+    );
+  }
+
+  if (item.shape === "mouse") {
+    const activity = item.activity ?? {};
+    const pressedButtons = Array.isArray(activity.pressedButtons)
+      ? activity.pressedButtons.map((value) => normalizeGamepadButtonToken(String(value)))
+      : [];
+    const leftPressed = pressedButtons.includes("left") || pressedButtons.includes("l");
+    const rightPressed = pressedButtons.includes("right") || pressedButtons.includes("r");
+    const wheelDeltaY = Number(activity.wheelDeltaY ?? 0);
+    const wheelDeltaX = Number(activity.wheelDeltaX ?? 0);
+    const pointerX = Math.round(Number(activity.x ?? 0));
+    const pointerY = Math.round(Number(activity.y ?? 0));
+    return (
+      <div className="relative h-full w-full">
+        <div
+          className="absolute left-1/2 top-5 h-[82%] w-[62%] -translate-x-1/2 rounded-[46%] border-2"
+          style={{
+            borderColor: item.live ? accent : theme.border,
+            background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          <div
+            className="absolute left-1/2 top-7 h-10 w-2 -translate-x-1/2 rounded-full"
+            style={{
+              background: wheelDeltaY ? accent : theme.border,
+              boxShadow: wheelDeltaY ? `0 0 12px ${accent}` : "none",
+            }}
+          />
+          <div className="absolute left-1/2 top-0 h-24 w-px -translate-x-1/2" style={{ background: theme.border }} />
+          <div
+            className="absolute left-3 top-8 flex h-14 w-10 items-center justify-center rounded-tl-[32px] text-[10px]"
+            style={{
+              color: leftPressed ? "#ffffff" : theme.textMuted,
+              background: leftPressed ? accent : "transparent",
+            }}
+          >
+            L
+          </div>
+          <div
+            className="absolute right-3 top-8 flex h-14 w-10 items-center justify-center rounded-tr-[32px] text-[10px]"
+            style={{
+              color: rightPressed ? "#ffffff" : theme.textMuted,
+              background: rightPressed ? accent : "transparent",
+            }}
+          >
+            R
+          </div>
+        </div>
+        <div className="absolute left-0 top-3">
+          {label}
+        </div>
+        {liveDot}
+        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-sm font-semibold" style={{ color: accent }}>
+          {item.metric}
+        </div>
+        <div
+          className="absolute bottom-8 left-1/2 -translate-x-1/2 rounded-md px-2 py-1 text-center text-[10px]"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: "rgba(255,255,255,0.05)",
+            color: theme.textSub,
+          }}
+        >
+          <div>
+            X {pointerX} · Y {pointerY}
+          </div>
+          <div style={{ color: wheelDeltaX || wheelDeltaY ? accent : theme.textMuted }}>
+            Wheel {wheelDeltaX}, {wheelDeltaY}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.shape === "gamepad") {
+    const activity = item.activity ?? {};
+    const pressedButtons = Array.isArray(activity.pressedButtons)
+      ? activity.pressedButtons.map((value) => normalizeKeyToken(String(value)))
+      : [];
+    const leftX = clamp(Number(activity.leftStickX ?? 0) / 32767, -1, 1);
+    const leftY = clamp(Number(activity.leftStickY ?? 0) / 32767, -1, 1);
+    const leftTrigger = clamp(Number(activity.leftTrigger ?? 0) / 1023, 0, 1);
+    const rightTrigger = clamp(Number(activity.rightTrigger ?? 0) / 1023, 0, 1);
+    return (
+      <div className="relative h-full w-full">
+        <div
+          className="absolute inset-x-4 bottom-3 top-12 rounded-[48px] border"
+          style={{
+            borderColor: item.live ? accent : theme.border,
+            background: `linear-gradient(145deg, ${theme.sidebar}, ${theme.frame})`,
+            boxShadow: theme.panelShadow,
+          }}
+        />
+        {label}
+        {liveDot}
+        <div
+          className="absolute left-16 top-28 h-14 w-14 rounded-full border"
+          style={{ borderColor: accent, background: `${accent}10` }}
+        >
+          <span
+            className="absolute left-1/2 top-1/2 h-4 w-4 rounded-full"
+            style={{
+              background: accent,
+              transform: `translate(calc(-50% + ${leftX * 15}px), calc(-50% + ${leftY * 15}px))`,
+              boxShadow: `0 0 10px ${accent}66`,
+            }}
+          />
+        </div>
+        <div className="absolute right-16 top-24 grid grid-cols-2 gap-2">
+          {["Y", "B", "X", "A"].map((key) => (
+            <span
+              key={key}
+              className="flex h-8 w-8 items-center justify-center rounded-full text-xs font-semibold"
+              style={{
+                background: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? accent : `${accent}22`,
+                color: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? "#ffffff" : accent,
+                boxShadow: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? `0 0 12px ${accent}66` : "none",
+              }}
+            >
+              {key}
+            </span>
+          ))}
+        </div>
+        <div className="absolute left-14 top-20 flex gap-2 text-[10px]" style={{ color: theme.textSub }}>
+          <span
+            className="rounded px-3 py-1"
+            style={{ border: `1px solid ${theme.border}`, background: `${accent}${leftTrigger ? "33" : "12"}` }}
+          >
+            LT {Math.round(leftTrigger * 100)}%
+          </span>
+          <span
+            className="rounded px-3 py-1"
+            style={{ border: `1px solid ${theme.border}`, background: `${accent}${rightTrigger ? "33" : "12"}` }}
+          >
+            RT {Math.round(rightTrigger * 100)}%
+          </span>
+        </div>
+        <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-sm font-semibold" style={{ color: accent }}>
+          {item.metric}
+        </div>
+      </div>
+    );
+  }
+
+  if (item.shape === "speaker") {
+    const activity = item.activity ?? {};
+    const inputs = Math.max(0, Number(activity.inputs ?? 0));
+    const outputs = Math.max(0, Number(activity.outputs ?? 0));
+    return (
+      <div className="relative h-full w-full">
+        <div
+          className="absolute inset-3 rounded-3xl border"
+          style={{
+            borderColor: item.live ? accent : theme.border,
+            background: `linear-gradient(145deg, ${theme.sidebar}, ${theme.frame})`,
+            boxShadow: theme.panelShadow,
+          }}
+        >
+          {label}
+          {liveDot}
+          <div className="absolute bottom-8 left-1/2 flex -translate-x-1/2 items-center gap-4">
+            {[72, 50].map((size) => (
+              <span
+                key={size}
+                className="rounded-full border-4"
+                style={{
+                  width: size,
+                  height: size,
+                  borderColor: `${accent}88`,
+                  boxShadow: `inset 0 0 0 10px ${accent}18`,
+                }}
+              />
+            ))}
+          </div>
+          <div className="absolute bottom-24 left-5 right-5 grid gap-2">
+            {[
+              ["输入", inputs, theme.accent],
+              ["输出", outputs, accent],
+            ].map(([labelText, count, color]) => (
+              <div key={String(labelText)} className="grid grid-cols-[32px_1fr_28px] items-center gap-2 text-[10px]">
+                <span style={{ color: theme.textMuted }}>{labelText}</span>
+                <span className="h-2 overflow-hidden rounded-full" style={{ background: "rgba(255,255,255,0.08)" }}>
+                  <span
+                    className="block h-full rounded-full"
+                    style={{
+                      width: `${clamp(Number(count) * 7, 8, 100)}%`,
+                      background: String(color),
+                      boxShadow: `0 0 10px ${String(color)}55`,
+                    }}
+                  />
+                </span>
+                <span style={{ color: theme.textSub }}>{String(count)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="absolute bottom-5 left-5 text-sm font-semibold" style={{ color: accent }}>
+            {item.metric}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="relative h-full w-full rounded-2xl border"
+      style={{
+        borderColor: item.live ? accent : theme.border,
+        background: `linear-gradient(145deg, ${theme.sidebar}, ${theme.frame})`,
+        boxShadow: theme.panelShadow,
+      }}
+    >
+      {label}
+      {liveDot}
+      <div
+        className="absolute bottom-10 left-1/2 h-20 w-32 -translate-x-1/2 rounded-lg border"
+        style={{
+          borderColor: accent,
+          background: `${accent}16`,
+        }}
+      >
+        <Monitor className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" size={28} style={{ color: accent }} />
+      </div>
+      <div className="absolute bottom-4 left-5 text-sm font-semibold" style={{ color: accent }}>
+        {item.metric || (item.live ? "在线" : "待连接")}
+      </div>
+    </div>
+  );
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function galleryKeyboardKeyActive(
+  key: string,
+  pressedKeys: unknown[],
+  lastKey: string | null,
+) {
+  const candidates = galleryKeyboardKeyCandidates(key);
+  const normalizedCandidates = new Set(candidates.map((value) => normalizeKeyToken(value)));
+  return [...pressedKeys, lastKey]
+    .filter((value): value is string => typeof value === "string")
+    .some((value) => normalizedCandidates.has(normalizeKeyToken(value)));
+}
+
+function galleryKeyboardKeyCandidates(key: string) {
+  const aliasMap: Record<string, string[]> = {
+    Esc: ["Escape"],
+    Del: ["Delete"],
+    Ins: ["Insert"],
+    PgUp: ["PageUp"],
+    PgDn: ["PageDown"],
+    Caps: ["CapsLock"],
+    Ctrl: ["Control", "ControlLeft", "ControlRight"],
+    Win: ["Meta", "Super", "OS", "WinLeft", "WinRight"],
+    Space: ["Char(32)", "Spacebar"],
+    Enter: ["Return"],
+    Shift: ["ShiftLeft", "ShiftRight"],
+    Alt: ["AltLeft", "AltRight"],
+  };
+  const candidates = [key, ...(aliasMap[key] ?? [])];
+  if (key.length === 1) {
+    candidates.push(`Char(${key.charCodeAt(0)})`);
+    candidates.push(`Char(${key.toUpperCase().charCodeAt(0)})`);
+    candidates.push(key.toLowerCase(), key.toUpperCase());
+  }
+  return candidates;
+}
+
+function normalizeGamepadButtonToken(value: string) {
+  const normalized = normalizeKeyToken(value);
+  const aliasMap: Record<string, string> = {
+    south: "a",
+    east: "b",
+    west: "x",
+    north: "y",
+  };
+  return aliasMap[normalized] ?? normalized;
 }
 
 function latestLocalControlEvent(
@@ -2873,42 +3558,58 @@ function localDeviceItems(
 ): LocalDeviceSelectItem[] {
   if (kind === "keyboard") {
     const devices = safeArray(snapshot?.keyboard_devices);
-    if (devices.length) {
-      return devices.map((device, index) => ({
-        id: device.id || `keyboard-${index}`,
-        name: device.name || `键盘 ${index + 1}`,
-        detail: device.driver_detail ?? device.capture_path ?? device.source ?? "keyboard",
-        live: device.connected !== false,
-        active: index === 0,
-      }));
-    }
-    return [{
+    const aggregateLive =
+      Boolean(snapshot?.keyboard.detected) || devices.some((device) => device.connected !== false);
+    const aggregateItem = {
       id: "keyboard-default",
-      name: "默认键盘",
-      detail: snapshot?.keyboard.capture_source ?? "等待输入事件",
-      live: Boolean(snapshot?.keyboard.detected),
+      name: "综合键盘",
+      detail: devices.length
+        ? `${devices.length} 个键盘合并输出`
+        : snapshot?.keyboard.capture_source ?? "等待输入事件",
+      live: aggregateLive,
       active: true,
-    }];
+    };
+    if (devices.length) {
+      return [
+        aggregateItem,
+        ...devices.map((device, index) => ({
+          id: device.id || `keyboard-${index}`,
+          name: device.name || `键盘 ${index + 1}`,
+          detail: device.driver_detail ?? device.capture_path ?? device.source ?? "keyboard",
+          live: device.connected !== false,
+          active: false,
+        })),
+      ];
+    }
+    return [aggregateItem];
   }
 
   if (kind === "mouse") {
     const devices = safeArray(snapshot?.mouse_devices);
-    if (devices.length) {
-      return devices.map((device, index) => ({
-        id: device.id || `mouse-${index}`,
-        name: device.name || `鼠标 ${index + 1}`,
-        detail: device.driver_detail ?? device.capture_path ?? device.source ?? "mouse",
-        live: device.connected !== false,
-        active: index === 0,
-      }));
-    }
-    return [{
+    const aggregateLive =
+      Boolean(snapshot?.mouse.detected) || devices.some((device) => device.connected !== false);
+    const aggregateItem = {
       id: "mouse-default",
-      name: "默认鼠标",
-      detail: snapshot?.mouse.capture_source ?? "等待输入事件",
-      live: Boolean(snapshot?.mouse.detected),
+      name: "综合鼠标",
+      detail: devices.length
+        ? `${devices.length} 个鼠标合并输出`
+        : snapshot?.mouse.capture_source ?? "等待输入事件",
+      live: aggregateLive,
       active: true,
-    }];
+    };
+    if (devices.length) {
+      return [
+        aggregateItem,
+        ...devices.map((device, index) => ({
+          id: device.id || `mouse-${index}`,
+          name: device.name || `鼠标 ${index + 1}`,
+          detail: device.driver_detail ?? device.capture_path ?? device.source ?? "mouse",
+          live: device.connected !== false,
+          active: false,
+        })),
+      ];
+    }
+    return [aggregateItem];
   }
 
   if (kind === "gamepad") {
@@ -3477,6 +4178,7 @@ function DeviceDriverStrip({
   selectedDeviceId,
   onSelectedDeviceIdChange,
   theme,
+  vertical = false,
 }: {
   kind: LocalDevicePageKind;
   snapshot: LocalControlsSnapshot | null;
@@ -3484,6 +4186,7 @@ function DeviceDriverStrip({
   selectedDeviceId?: string;
   onSelectedDeviceIdChange?: (deviceId: string) => void;
   theme: typeof FIGMA_DESKTOP_THEME;
+  vertical?: boolean;
 }) {
   if (kind === "all" || kind === "remote") {
     return null;
@@ -3493,12 +4196,23 @@ function DeviceDriverStrip({
     return null;
   }
   return (
-    <div className="rshare-scroll flex shrink-0 gap-2 overflow-x-auto px-3 py-2" style={{ borderBottom: `1px solid ${theme.border}`, background: theme.frame }}>
+    <div
+      className={`rshare-scroll flex shrink-0 gap-2 ${
+        vertical ? "max-h-[170px] flex-col overflow-y-auto" : "overflow-x-auto px-3 py-2"
+      }`}
+      style={
+        vertical
+          ? { background: "transparent" }
+          : { borderBottom: `1px solid ${theme.border}`, background: theme.frame }
+      }
+    >
       {devices.map((device) => (
         <button
           key={device.id}
           type="button"
-          className="max-w-[260px] shrink-0 truncate rounded-md px-3 py-1.5 text-sm"
+          className={`shrink-0 truncate rounded-md px-3 py-1.5 text-left text-sm ${
+            vertical ? "w-full" : "max-w-[260px]"
+          }`}
           style={{
             border: `1px solid ${selectedDeviceId === device.id || (!selectedDeviceId && device.active) ? theme.accent : theme.border}`,
             background: selectedDeviceId === device.id || (!selectedDeviceId && device.active) ? theme.accentSoft : "rgba(255,255,255,0.04)",

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   buildDesktopViewModel,
+  buildDeviceGalleryItems,
+  buildDeviceTypeSummaries,
   buildLocalControlsViewModel,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
@@ -108,6 +110,9 @@ test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels
   assert.equal(model.backend.capture, "WindowsNative Healthy");
   assert.equal(model.latestEvent.deviceKind, "Keyboard");
   assert.equal(model.latestEvent.injectedLoopback, true);
+  assert.equal(model.composite.label, "综合");
+  assert.equal(model.composite.eventCount, 19);
+  assert.equal(model.composite.live, true);
 });
 
 test("buildLocalControlsViewModel reports old daemon or unavailable daemon safely", () => {
@@ -119,6 +124,155 @@ test("buildLocalControlsViewModel reports old daemon or unavailable daemon safel
   assert.equal(unavailable.gamepad.virtualStatus, "not_implemented");
   assert.equal(unavailable.display.primary.width, 0);
   assert.equal(unavailable.latestEvent, null);
+});
+
+test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {
+  const tabs = buildDeviceTypeSummaries({
+    all: true,
+    keyboard: 7,
+    mouse: 4,
+    gamepad: 1,
+    display: 1,
+    audio: 15,
+    remote: 2,
+  });
+
+  assert.deepEqual(
+    tabs.map((tab) => [tab.kind, tab.title, tab.detail]),
+    [
+      ["all", "综合", "合并输出"],
+      ["keyboard", "键盘", "7"],
+      ["mouse", "鼠标", "4"],
+      ["gamepad", "手柄", "1"],
+      ["display", "显示", "1"],
+      ["audio", "音频", "15"],
+      ["remote", "远端", "2"],
+    ],
+  );
+});
+
+test("buildDeviceGalleryItems lays local and remote devices onto a free canvas", () => {
+  const items = buildDeviceGalleryItems(
+    {
+      keyboard: { detected: true, event_count: 12 },
+      mouse: { detected: true, event_count: 20 },
+      keyboard_devices: [
+        { id: "kbd-1", name: "Keyboard A", connected: true },
+        { id: "kbd-2", name: "Keyboard B", connected: true },
+      ],
+      mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+      gamepads: [{ gamepad_id: 0, name: "Pad", connected: true, event_count: 5 }],
+      display: {
+        display_count: 1,
+        primary_width: 2560,
+        primary_height: 1440,
+        displays: [{ display_id: "primary", width: 2560, height: 1440, primary: true }],
+      },
+      audio_inputs: [{ id: "mic", name: "Mic", connected: true }],
+      audio_outputs: [],
+      recent_events: [],
+    },
+    [{ id: "speaker", name: "Speaker", connected: true }],
+    [
+      { id: "remote-1", name: "Remote PC", hostname: "remote", connected: false },
+      { id: "remote-2", name: "Desk PC", hostname: "desk", connected: true },
+    ],
+  );
+
+  assert.deepEqual(
+    items.map((item) => [item.kind, item.title, item.detail]),
+    [
+      ["keyboard", "综合键盘", "2 台键盘"],
+      ["mouse", "综合鼠标", "1 台鼠标"],
+      ["gamepad", "Pad", "手柄"],
+      ["display", "主显示", "2560 x 1440"],
+      ["audio", "音频矩阵", "2 个端点"],
+      ["remote", "Remote PC", "已发现"],
+      ["remote", "Desk PC", "已连接"],
+    ],
+  );
+  assert.equal(items[0].x < items[1].x, true);
+  assert.equal(items[3].w > items[2].w, true);
+});
+
+test("buildDeviceGalleryItems centers the physical device layout around the display", () => {
+  const items = buildDeviceGalleryItems({
+    keyboard: { detected: true, event_count: 12 },
+    mouse: { detected: true, event_count: 20 },
+    keyboard_devices: [{ id: "kbd-1", name: "Keyboard A", connected: true }],
+    mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+    gamepads: [{ gamepad_id: 0, name: "Pad", connected: true, event_count: 5 }],
+    display: {
+      display_count: 1,
+      primary_width: 2560,
+      primary_height: 1440,
+      displays: [{ display_id: "primary", width: 2560, height: 1440, primary: true }],
+    },
+    audio_inputs: [{ id: "mic", name: "Mic", connected: true }],
+    audio_outputs: [],
+    recent_events: [],
+  });
+
+  const display = items.find((item) => item.kind === "display");
+  const keyboard = items.find((item) => item.kind === "keyboard");
+  const mouse = items.find((item) => item.kind === "mouse");
+  const gamepad = items.find((item) => item.kind === "gamepad");
+  const audio = items.find((item) => item.kind === "audio");
+
+  assert.equal(display.shape, "monitor");
+  assert.equal(keyboard.shape, "keyboard");
+  assert.equal(mouse.shape, "mouse");
+  assert.equal(gamepad.shape, "gamepad");
+  assert.equal(audio.shape, "speaker");
+  assert.equal(display.x, 620);
+  assert.equal(display.y, 260);
+  assert.equal(keyboard.y > display.y + display.h, true);
+  assert.equal(mouse.x > display.x + display.w, true);
+  assert.equal(gamepad.x < display.x, true);
+});
+
+test("buildDeviceGalleryItems carries live input activity for physical simulators", () => {
+  const items = buildDeviceGalleryItems({
+    keyboard: {
+      detected: true,
+      event_count: 12,
+      pressed_keys: ["A", "Char(73)"],
+      last_key: "Enter",
+    },
+    mouse: {
+      detected: true,
+      event_count: 20,
+      pressed_buttons: ["Left"],
+      x: 420,
+      y: 240,
+      display_relative_x: 320,
+      display_relative_y: 180,
+      wheel_delta_y: -1,
+    },
+    keyboard_devices: [{ id: "kbd-1", name: "Keyboard A", connected: true }],
+    mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+    gamepads: [],
+    display: {
+      display_count: 1,
+      primary_width: 2560,
+      primary_height: 1440,
+      displays: [{ display_id: "primary", width: 2560, height: 1440, primary: true }],
+    },
+    recent_events: [],
+  });
+
+  const keyboard = items.find((item) => item.kind === "keyboard");
+  const mouse = items.find((item) => item.kind === "mouse");
+  const display = items.find((item) => item.kind === "display");
+
+  assert.deepEqual(keyboard.activity.pressedKeys, ["A", "Char(73)"]);
+  assert.equal(keyboard.activity.lastKey, "Enter");
+  assert.deepEqual(mouse.activity.pressedButtons, ["Left"]);
+  assert.equal(mouse.activity.x, 420);
+  assert.equal(mouse.activity.wheelDeltaY, -1);
+  assert.equal(display.activity.pointerVisible, true);
+  assert.equal(display.activity.pointerX, 320);
+  assert.equal(display.activity.pointerY, 180);
 });
 
 test("buildDesktopViewModel maps daemon devices into layout and device cards", () => {

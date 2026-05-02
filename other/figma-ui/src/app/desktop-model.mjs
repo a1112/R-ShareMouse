@@ -259,6 +259,182 @@ function backendDiagnosticLabel(backend) {
   return `${mode} ${health}`;
 }
 
+export function buildDeviceTypeSummaries(counts = {}) {
+  return [
+    { kind: "all", title: "综合", detail: "合并输出" },
+    { kind: "keyboard", title: "键盘", detail: String(counts.keyboard ?? 0) },
+    { kind: "mouse", title: "鼠标", detail: String(counts.mouse ?? 0) },
+    { kind: "gamepad", title: "手柄", detail: String(counts.gamepad ?? 0) },
+    { kind: "display", title: "显示", detail: String(counts.display ?? 0) },
+    { kind: "audio", title: "音频", detail: String(counts.audio ?? 0) },
+    { kind: "remote", title: "远端", detail: String(counts.remote ?? 0) },
+  ];
+}
+
+function galleryNode(index, item) {
+  const physicalSlots = {
+    display: { x: 620, y: 260, w: 460, h: 270, shape: "monitor" },
+    keyboard: { x: 520, y: 575, w: 560, h: 170, shape: "keyboard" },
+    mouse: { x: 1135, y: 300, w: 220, h: 260, shape: "mouse" },
+    gamepad: { x: 250, y: 350, w: 300, h: 220, shape: "gamepad" },
+    audio: { x: 1110, y: 60, w: 300, h: 190, shape: "speaker" },
+    remote: { x: 80, y: 90, w: 310, h: 210, shape: "computer" },
+  };
+  const fallbackSlots = [
+    { x: 90, y: 790 },
+    { x: 450, y: 810 },
+    { x: 820, y: 800 },
+    { x: 1190, y: 790 },
+  ];
+  const slot = physicalSlots[item.kind];
+  const fallback = fallbackSlots[index % fallbackSlots.length];
+  const row = Math.floor(index / fallbackSlots.length);
+  const point = slot ?? {
+    x: fallback.x,
+    y: fallback.y + row * 260,
+    w: 280,
+    h: 170,
+    shape: "device",
+  };
+  return {
+    x: point.x,
+    y: point.y,
+    w: point.w,
+    h: point.h,
+    shape: point.shape,
+    ...item,
+  };
+}
+
+export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevices = []) {
+  const keyboardDevices = snapshot?.keyboard_devices ?? [];
+  const mouseDevices = snapshot?.mouse_devices ?? [];
+  const gamepads = snapshot?.gamepads ?? [];
+  const displays = snapshot?.display?.displays?.length
+    ? snapshot.display.displays
+    : snapshot?.display?.display_count
+      ? [
+          {
+            display_id: "primary",
+            width: snapshot.display.primary_width ?? 1920,
+            height: snapshot.display.primary_height ?? 1080,
+            primary: true,
+          },
+        ]
+      : [];
+  const audioInputs = snapshot?.audio_inputs ?? [];
+  const allAudioOutputs = snapshot?.audio_outputs?.length ? snapshot.audio_outputs : audioOutputs;
+  const items = [];
+
+  if (keyboardDevices.length || snapshot?.keyboard?.detected) {
+    items.push({
+      id: "gallery-keyboard",
+      kind: "keyboard",
+      title: "综合键盘",
+      detail: keyboardDevices.length
+        ? `${keyboardDevices.length} 台键盘`
+        : "默认键盘",
+      metric: `${Number(snapshot?.keyboard?.event_count ?? 0)} 次`,
+      activity: {
+        pressedKeys: snapshot?.keyboard?.pressed_keys ?? [],
+        lastKey: snapshot?.keyboard?.last_key ?? null,
+      },
+      live: Boolean(snapshot?.keyboard?.detected || keyboardDevices.some((device) => device.connected !== false)),
+    });
+  }
+
+  if (mouseDevices.length || snapshot?.mouse?.detected) {
+    items.push({
+      id: "gallery-mouse",
+      kind: "mouse",
+      title: "综合鼠标",
+      detail: mouseDevices.length ? `${mouseDevices.length} 台鼠标` : "默认鼠标",
+      metric: `${Number(snapshot?.mouse?.event_count ?? 0)} 次`,
+      activity: {
+        pressedButtons: snapshot?.mouse?.pressed_buttons ?? [],
+        x: Number(snapshot?.mouse?.x ?? 0),
+        y: Number(snapshot?.mouse?.y ?? 0),
+        wheelDeltaX: Number(snapshot?.mouse?.wheel_delta_x ?? 0),
+        wheelDeltaY: Number(snapshot?.mouse?.wheel_delta_y ?? 0),
+      },
+      live: Boolean(snapshot?.mouse?.detected || mouseDevices.some((device) => device.connected !== false)),
+    });
+  }
+
+  for (const gamepad of gamepads) {
+    items.push({
+      id: `gallery-gamepad-${gamepad.gamepad_id}`,
+      kind: "gamepad",
+      title: gamepad.name || `手柄 ${gamepad.gamepad_id}`,
+      detail: "手柄",
+      metric: `${Number(gamepad.event_count ?? 0)} 次`,
+      activity: {
+        pressedButtons: gamepad.pressed_buttons ?? [],
+        leftStickX: Number(gamepad.left_stick_x ?? 0),
+        leftStickY: Number(gamepad.left_stick_y ?? 0),
+        rightStickX: Number(gamepad.right_stick_x ?? 0),
+        rightStickY: Number(gamepad.right_stick_y ?? 0),
+        leftTrigger: Number(gamepad.left_trigger ?? 0),
+        rightTrigger: Number(gamepad.right_trigger ?? 0),
+      },
+      live: Boolean(gamepad.connected),
+    });
+  }
+
+  for (const display of displays) {
+    const width = Number(display.width ?? snapshot?.display?.primary_width ?? 1920);
+    const height = Number(display.height ?? snapshot?.display?.primary_height ?? 1080);
+    const currentDisplayIndex = Number(snapshot?.mouse?.current_display_index ?? 0);
+    const displayIndex = displays.indexOf(display);
+    const pointerOnDisplay =
+      snapshot?.mouse?.detected && (currentDisplayIndex === displayIndex || display.primary);
+    items.push({
+      id: `gallery-display-${display.display_id ?? "primary"}`,
+      kind: "display",
+      title: display.primary ? "主显示" : "显示",
+      detail: `${width} x ${height}`,
+      metric: display.primary ? "Primary" : "Display",
+      activity: {
+        pointerVisible: Boolean(pointerOnDisplay),
+        pointerX: Number(snapshot?.mouse?.display_relative_x ?? snapshot?.mouse?.x ?? 0),
+        pointerY: Number(snapshot?.mouse?.display_relative_y ?? snapshot?.mouse?.y ?? 0),
+        width,
+        height,
+      },
+      live: true,
+    });
+  }
+
+  const audioCount = audioInputs.length + allAudioOutputs.length;
+  if (audioCount) {
+    items.push({
+      id: "gallery-audio",
+      kind: "audio",
+      title: "音频矩阵",
+      detail: `${audioCount} 个端点`,
+      metric: `${audioInputs.length} in / ${allAudioOutputs.length} out`,
+      activity: {
+        inputs: audioInputs.length,
+        outputs: allAudioOutputs.length,
+      },
+      live: true,
+    });
+  }
+
+  for (const device of remoteDevices) {
+    items.push({
+      id: `gallery-remote-${device.id}`,
+      kind: "remote",
+      title: device.name,
+      detail: device.connected ? "已连接" : "已发现",
+      metric: device.hostname ?? device.address ?? "",
+      live: Boolean(device.connected),
+    });
+  }
+
+  return items.map((item, index) => galleryNode(index, item));
+}
+
 export function buildLocalControlsViewModel(snapshot, options = {}) {
   const error = options.error ?? null;
   const confirmingInputTest = options.confirmingInputTest ?? null;
@@ -269,15 +445,41 @@ export function buildLocalControlsViewModel(snapshot, options = {}) {
   const gamepad = gamepads.find((item) => item.connected) ?? gamepads[0] ?? null;
   const recentEvents = snapshot?.recent_events ?? [];
   const latestEvent = recentEvents.length ? recentEvents[recentEvents.length - 1] : null;
+  const keyboardEventCount = Number(keyboard.event_count ?? 0);
+  const mouseEventCount = Number(mouse.event_count ?? 0);
+  const gamepadEventCount = gamepads.reduce(
+    (sum, item) => sum + Number(item?.event_count ?? 0),
+    0,
+  );
+  const displayCount = Number(display.display_count ?? 0);
+  const audioDeviceCount =
+    (snapshot?.audio_inputs?.length ?? 0) + (snapshot?.audio_outputs?.length ?? 0);
 
   return {
     available: Boolean(snapshot && !error),
     error,
+    composite: {
+      label: "综合",
+      live: Boolean(
+        keyboard.detected ||
+          mouse.detected ||
+          gamepads.some((item) => item.connected) ||
+          displayCount > 0 ||
+          audioDeviceCount > 0,
+      ),
+      eventCount: keyboardEventCount + mouseEventCount + gamepadEventCount,
+      deviceCount:
+        (snapshot?.keyboard_devices?.length ?? (keyboard.detected ? 1 : 0)) +
+        (snapshot?.mouse_devices?.length ?? (mouse.detected ? 1 : 0)) +
+        gamepads.length +
+        displayCount +
+        audioDeviceCount,
+    },
     keyboard: {
       status: keyboard.detected ? "capturing" : "missing",
       lastKey: keyboard.last_key ?? null,
       pressedKeys: keyboard.pressed_keys ?? [],
-      eventCount: Number(keyboard.event_count ?? 0),
+      eventCount: keyboardEventCount,
       captureSource: keyboard.capture_source ?? "unknown",
       testLabel:
         confirmingInputTest === "keyboard"
@@ -298,7 +500,7 @@ export function buildLocalControlsViewModel(snapshot, options = {}) {
         totalY: Number(mouse.wheel_total_y ?? 0),
         events: Number(mouse.wheel_event_count ?? 0),
       },
-      eventCount: Number(mouse.event_count ?? 0),
+      eventCount: mouseEventCount,
       stats: {
         moves: Number(mouse.move_count ?? 0),
         buttonEvents: Number(mouse.button_event_count ?? 0),
@@ -360,7 +562,7 @@ export function buildLocalControlsViewModel(snapshot, options = {}) {
         snapshot?.virtual_gamepad?.detail ?? "Virtual HID not implemented",
     },
     display: {
-      count: Number(display.display_count ?? 0),
+      count: displayCount,
       primary: {
         width: Number(display.primary_width ?? 0),
         height: Number(display.primary_height ?? 0),
