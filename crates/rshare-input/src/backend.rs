@@ -535,6 +535,25 @@ impl Debug for VirtualHidInjectBackend {
 }
 
 #[cfg(target_os = "windows")]
+fn driver_error_health(error: &str) -> BackendHealth {
+    let error = error.to_ascii_lowercase();
+    let reason =
+        if error.contains("access") || error.contains("denied") || error.contains("permission") {
+            BackendFailureReason::PermissionDenied
+        } else if error.contains("abi") || error.contains("version") {
+            BackendFailureReason::VersionMismatch
+        } else if error.contains("unavailable")
+            || error.contains("not found")
+            || error.contains("cannot find")
+        {
+            BackendFailureReason::Unavailable
+        } else {
+            BackendFailureReason::InitializationFailed
+        };
+    BackendHealth::Degraded { reason }
+}
+
+#[cfg(target_os = "windows")]
 impl InjectBackend for VirtualHidInjectBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::VirtualHid
@@ -588,9 +607,7 @@ impl VirtualHidCaptureBackend {
     pub fn new() -> Self {
         Self {
             driver: Box::new(VirtualHidCaptureDriver::new()),
-            health: BackendHealth::Degraded {
-                reason: BackendFailureReason::Unavailable,
-            },
+            health: Self::probe_health(),
         }
     }
 
@@ -607,6 +624,23 @@ impl VirtualHidCaptureBackend {
     /// Create a new Virtual HID capture backend for testing.
     pub fn new_for_test() -> Result<Self> {
         Ok(Self::new())
+    }
+
+    fn probe_health() -> BackendHealth {
+        let client = match rshare_platform::windows::WindowsDriverClient::open_filter() {
+            Ok(client) => client,
+            Err(error) => {
+                return driver_error_health(&error.to_string());
+            }
+        };
+
+        match client.query_capabilities() {
+            Ok(capabilities) if capabilities.filter_events => BackendHealth::Healthy,
+            Ok(_) => BackendHealth::Degraded {
+                reason: BackendFailureReason::Unavailable,
+            },
+            Err(error) => driver_error_health(&error.to_string()),
+        }
     }
 }
 
@@ -1241,9 +1275,8 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn virtual_hid_capture_backend_starts_degraded() {
+    fn virtual_hid_capture_backend_starts_stopped() {
         let backend = VirtualHidCaptureBackend::new();
-        assert!(matches!(backend.health(), BackendHealth::Degraded { .. }));
         assert!(!backend.is_running());
     }
 

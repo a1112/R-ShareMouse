@@ -12,6 +12,7 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RShareVhidEvtControlIoDeviceControl;
 
 static FAST_MUTEX g_RShareVhidLock;
 static VHFHANDLE g_RShareVhidHandle;
+static UCHAR g_RShareMouseButtons;
 
 static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
     0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
@@ -25,8 +26,9 @@ static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
     0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05,
     0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03,
     0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
-    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02,
-    0x81, 0x06, 0xC0, 0xC0
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
+    0x95, 0x03, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38,
+    0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0
 };
 
 typedef struct _RSHARE_VHID_CONTEXT {
@@ -44,6 +46,24 @@ static LONG RShareClampMouseDelta(LONG value)
         return -127;
     }
     return value;
+}
+
+static UCHAR RShareMouseButtonMask(LONG button)
+{
+    switch (button) {
+    case 1:
+        return 0x01;
+    case 2:
+        return 0x04;
+    case 3:
+        return 0x02;
+    case 4:
+        return 0x08;
+    case 5:
+        return 0x10;
+    default:
+        return 0;
+    }
 }
 
 static UCHAR RShareVkToModifier(LONG vk)
@@ -124,15 +144,17 @@ static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pr
     return VhfReadReportSubmit(handle, &packet);
 }
 
-static NTSTATUS RShareSubmitMouseMoveReport(VHFHANDLE handle, LONG dx, LONG dy)
+static NTSTATUS RShareSubmitMouseReport(VHFHANDLE handle, UCHAR buttons, LONG dx, LONG dy, LONG wheel, LONG horizontalWheel)
 {
-    UCHAR report[4] = {0};
+    UCHAR report[6] = {0};
     HID_XFER_PACKET packet;
 
     report[0] = 0x02;
-    report[1] = 0;
+    report[1] = buttons & 0x1F;
     report[2] = (UCHAR)(CHAR)RShareClampMouseDelta(dx);
     report[3] = (UCHAR)(CHAR)RShareClampMouseDelta(dy);
+    report[4] = (UCHAR)(CHAR)RShareClampMouseDelta(wheel);
+    report[5] = (UCHAR)(CHAR)RShareClampMouseDelta(horizontalWheel);
 
     RtlZeroMemory(&packet, sizeof(packet));
     packet.reportBuffer = report;
@@ -144,6 +166,7 @@ static NTSTATUS RShareSubmitMouseMoveReport(VHFHANDLE handle, LONG dx, LONG dy)
 static NTSTATUS RShareSubmitInjectReport(PRSHARE_INJECT_REPORT report)
 {
     NTSTATUS status;
+    UCHAR buttonMask;
 
     ExAcquireFastMutex(&g_RShareVhidLock);
     if (g_RShareVhidHandle == NULL) {
@@ -151,7 +174,21 @@ static NTSTATUS RShareSubmitInjectReport(PRSHARE_INJECT_REPORT report)
     } else if (report->ReportKind == RSHARE_REPORT_KEYBOARD) {
         status = RShareSubmitKeyboardReport(g_RShareVhidHandle, report->Value0, report->Value1 != 0);
     } else if (report->ReportKind == RSHARE_REPORT_MOUSE_MOVE) {
-        status = RShareSubmitMouseMoveReport(g_RShareVhidHandle, report->Value0, report->Value1);
+        status = RShareSubmitMouseReport(g_RShareVhidHandle, g_RShareMouseButtons, report->Value0, report->Value1, 0, 0);
+    } else if (report->ReportKind == RSHARE_REPORT_MOUSE_BUTTON) {
+        buttonMask = RShareMouseButtonMask(report->Value0);
+        if (buttonMask == 0) {
+            status = STATUS_NOT_SUPPORTED;
+        } else {
+            if (report->Value1 != 0) {
+                g_RShareMouseButtons |= buttonMask;
+            } else {
+                g_RShareMouseButtons &= (UCHAR)~buttonMask;
+            }
+            status = RShareSubmitMouseReport(g_RShareVhidHandle, g_RShareMouseButtons, 0, 0, 0, 0);
+        }
+    } else if (report->ReportKind == RSHARE_REPORT_MOUSE_WHEEL) {
+        status = RShareSubmitMouseReport(g_RShareVhidHandle, g_RShareMouseButtons, 0, 0, report->Value1, report->Value0);
     } else {
         status = STATUS_INVALID_DEVICE_REQUEST;
     }
@@ -216,6 +253,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS status;
 
     ExInitializeFastMutex(&g_RShareVhidLock);
+    g_RShareMouseButtons = 0;
     WDF_DRIVER_CONFIG_INIT(&config, RShareVhidEvtDeviceAdd);
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     status = WdfDriverCreate(DriverObject, RegistryPath, &attributes, &config, &driver);
@@ -272,6 +310,7 @@ VOID RShareVhidEvtCleanup(WDFOBJECT DeviceObject)
         ExAcquireFastMutex(&g_RShareVhidLock);
         if (g_RShareVhidHandle == context->VhfHandle) {
             g_RShareVhidHandle = NULL;
+            g_RShareMouseButtons = 0;
         }
         ExReleaseFastMutex(&g_RShareVhidLock);
 
