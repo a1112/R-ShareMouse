@@ -121,6 +121,13 @@ impl MessageCodec {
             Message::Heartbeat { .. } => 40,
             Message::Ack { .. } => 41,
             Message::Error { .. } => 42,
+
+            // Experimental USB forwarding (50-59)
+            Message::UsbDeviceAttached { .. } => 50,
+            Message::UsbDeviceDetached { .. } => 51,
+            Message::UsbTransfer { .. } => 52,
+            Message::UsbTransferComplete { .. } => 53,
+            Message::UsbForwardingError { .. } => 54,
         }
     }
 
@@ -216,7 +223,10 @@ impl Default for MessageDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rshare_core::{hello_message, DeviceId, GamepadState};
+    use rshare_core::{
+        hello_message, DeviceId, GamepadState, UsbTransferDirection, UsbTransferKind,
+        UsbTransferPayload,
+    };
 
     #[test]
     fn test_encode_decode() {
@@ -314,6 +324,22 @@ mod tests {
                 state: GamepadState::neutral(0, 1, 123),
             }),
             17
+        );
+
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::UsbTransfer {
+                transfer: UsbTransferPayload {
+                    transfer_id: 1,
+                    bus_id: "usb:1-2".to_string(),
+                    endpoint_address: 0x81,
+                    transfer_kind: UsbTransferKind::Interrupt,
+                    direction: UsbTransferDirection::In,
+                    setup_packet: None,
+                    data: Vec::new(),
+                    timeout_ms: 100,
+                },
+            }),
+            52
         );
     }
 

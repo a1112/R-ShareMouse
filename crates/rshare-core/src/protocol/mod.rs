@@ -180,6 +180,8 @@ pub struct DeviceCapabilities {
     #[serde(default)]
     pub supports_audio_forwarding: bool,
     #[serde(default)]
+    pub supports_usb_forwarding_experimental: bool,
+    #[serde(default)]
     pub audio_formats: Vec<AudioFormat>,
     #[serde(default)]
     pub max_gamepads: u8,
@@ -205,6 +207,7 @@ impl Default for DeviceCapabilities {
             supports_audio_capture: false,
             supports_audio_output_control: false,
             supports_audio_forwarding: false,
+            supports_usb_forwarding_experimental: false,
             audio_formats: Vec::new(),
             max_gamepads: 0,
             max_devices: 16,
@@ -243,6 +246,60 @@ pub struct AudioFramePayload {
     pub timestamp_ms: u64,
     pub format: AudioFormat,
     pub data: Vec<u8>,
+}
+
+/// USB transfer category for the experimental USB forwarding path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbTransferKind {
+    Control,
+    Bulk,
+    Interrupt,
+    Isochronous,
+}
+
+/// USB transfer direction for the experimental USB forwarding path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbTransferDirection {
+    In,
+    Out,
+}
+
+/// Endpoint metadata advertised by a USB device forwarding host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbEndpointDescriptor {
+    pub address: u8,
+    pub transfer_kind: UsbTransferKind,
+    pub direction: UsbTransferDirection,
+    pub max_packet_size: u16,
+    pub interval_ms: Option<u8>,
+}
+
+/// Device metadata for experimental generic USB forwarding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDeviceDescriptor {
+    pub bus_id: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub class_code: u8,
+    pub subclass_code: u8,
+    pub protocol_code: u8,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial_number: Option<String>,
+    pub endpoints: Vec<UsbEndpointDescriptor>,
+}
+
+/// A single experimental USB transfer payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbTransferPayload {
+    pub transfer_id: u64,
+    pub bus_id: String,
+    pub endpoint_address: u8,
+    pub transfer_kind: UsbTransferKind,
+    pub direction: UsbTransferDirection,
+    pub setup_packet: Option<[u8; 8]>,
+    pub data: Vec<u8>,
+    pub timeout_ms: u32,
 }
 
 /// Canonical gamepad button names.
@@ -411,6 +468,26 @@ pub enum Message {
     /// Report a non-fatal audio stream error.
     AudioStreamError { stream_id: Uuid, message: String },
 
+    // === Experimental USB Forwarding ===
+    /// USB device metadata advertised by a forwarding host.
+    UsbDeviceAttached { device: UsbDeviceDescriptor },
+    /// USB device no longer available for forwarding.
+    UsbDeviceDetached { bus_id: String, reason: String },
+    /// USB transfer request between a host and virtual USB endpoint.
+    UsbTransfer { transfer: UsbTransferPayload },
+    /// Completion for an experimental USB transfer.
+    UsbTransferComplete {
+        transfer_id: u64,
+        bus_id: String,
+        status: i32,
+        data: Vec<u8>,
+    },
+    /// Non-fatal experimental USB forwarding error.
+    UsbForwardingError {
+        bus_id: Option<String>,
+        message: String,
+    },
+
     // === Clipboard ===
     /// Clipboard data (text only for now)
     ClipboardData { mime_type: String, data: Vec<u8> },
@@ -471,6 +548,10 @@ impl Message {
             | Message::AudioFrame { .. }
             | Message::AudioStreamStop { .. }
             | Message::AudioStreamError { .. }
+            | Message::UsbDeviceAttached { .. }
+            | Message::UsbDeviceDetached { .. }
+            | Message::UsbTransfer { .. }
+            | Message::UsbTransferComplete { .. }
             | Message::ScreenUpdate { .. } => Priority::Normal,
 
             // Low: background operations
@@ -479,6 +560,7 @@ impl Message {
             | Message::ClipboardResponse { .. }
             | Message::Heartbeat { .. }
             | Message::Ack { .. }
+            | Message::UsbForwardingError { .. }
             | Message::Error { .. } => Priority::Low,
         }
     }
@@ -494,6 +576,11 @@ impl Message {
                 | Message::ScreenUpdate { .. }
                 | Message::ClipboardRequest
                 | Message::ClipboardResponse { .. }
+                | Message::UsbDeviceAttached { .. }
+                | Message::UsbDeviceDetached { .. }
+                | Message::UsbTransfer { .. }
+                | Message::UsbTransferComplete { .. }
+                | Message::UsbForwardingError { .. }
         )
     }
 }
@@ -701,6 +788,59 @@ mod tests {
     }
 
     #[test]
+    fn usb_forwarding_messages_round_trip() {
+        let device = UsbDeviceDescriptor {
+            bus_id: "usb:1-2".to_string(),
+            vendor_id: 0x045e,
+            product_id: 0x028e,
+            class_code: 0xff,
+            subclass_code: 0x5d,
+            protocol_code: 0x01,
+            manufacturer: Some("Vendor".to_string()),
+            product: Some("Controller".to_string()),
+            serial_number: None,
+            endpoints: vec![UsbEndpointDescriptor {
+                address: 0x81,
+                transfer_kind: UsbTransferKind::Interrupt,
+                direction: UsbTransferDirection::In,
+                max_packet_size: 64,
+                interval_ms: Some(4),
+            }],
+        };
+        let attached = Message::UsbDeviceAttached {
+            device: device.clone(),
+        };
+        let serialized = serde_json::to_string(&attached).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        match deserialized {
+            Message::UsbDeviceAttached { device: decoded } => assert_eq!(decoded, device),
+            _ => panic!("Wrong message type"),
+        }
+
+        let transfer = UsbTransferPayload {
+            transfer_id: 42,
+            bus_id: "usb:1-2".to_string(),
+            endpoint_address: 0x00,
+            transfer_kind: UsbTransferKind::Control,
+            direction: UsbTransferDirection::Out,
+            setup_packet: Some([0, 9, 1, 0, 0, 0, 0, 0]),
+            data: vec![1, 2, 3],
+            timeout_ms: 1000,
+        };
+        let msg = Message::UsbTransfer {
+            transfer: transfer.clone(),
+        };
+        let serialized = serde_json::to_string(&msg).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        match deserialized {
+            Message::UsbTransfer { transfer: decoded } => assert_eq!(decoded, transfer),
+            _ => panic!("Wrong message type"),
+        }
+        assert!(msg.requires_ack());
+        assert_eq!(msg.priority(), Priority::Normal);
+    }
+
+    #[test]
     fn latency_probe_defaults_endpoint_switch_fields() {
         let probe_json = r#"{"LatencyProbe":{"sequence":7,"timestamp_ms":42}}"#;
         let probe: Message = serde_json::from_str(probe_json).unwrap();
@@ -740,6 +880,7 @@ mod tests {
         assert!(!capabilities.supports_audio_capture);
         assert!(!capabilities.supports_audio_output_control);
         assert!(!capabilities.supports_audio_forwarding);
+        assert!(!capabilities.supports_usb_forwarding_experimental);
         assert!(capabilities.audio_formats.is_empty());
         assert_eq!(capabilities.max_gamepads, 0);
     }

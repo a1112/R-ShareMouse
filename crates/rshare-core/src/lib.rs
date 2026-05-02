@@ -22,7 +22,8 @@ pub use protocol::{
     heartbeat_message, hello_back_message, hello_message, timestamp_ms, AudioFormat,
     AudioFramePayload, AudioSampleFormat, ButtonState, DeviceCapabilities, DeviceId, Direction,
     GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, KeyState, Message,
-    MouseButton, Priority, ScreenInfo, DISCOVERY_APP_ID,
+    MouseButton, Priority, ScreenInfo, UsbDeviceDescriptor, UsbEndpointDescriptor,
+    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, DISCOVERY_APP_ID,
 };
 
 // Re-exports from device

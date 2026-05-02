@@ -394,8 +394,13 @@ impl InputEvent {
                 } else {
                     ButtonState::Released
                 };
+                let flags = if event.flags != 0 {
+                    event.flags
+                } else {
+                    event.value2 as u32
+                };
                 Some(InputEvent::key(
-                    key_code_from_windows_vk(event.value0 as u32),
+                    key_code_from_windows_scan_code(event.value0 as u32, flags),
                     state,
                 ))
             }
@@ -508,6 +513,105 @@ fn key_code_from_windows_vk(vk: u32) -> KeyCode {
         0x7B => KeyCode::F12,
         0x90 => KeyCode::NumLock,
         _ => KeyCode::Raw(vk),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn key_code_from_windows_scan_code(scan_code: u32, flags: u32) -> KeyCode {
+    const KEY_E0: u32 = 0x02;
+    let extended = (flags & KEY_E0) != 0;
+
+    match (scan_code, extended) {
+        (0x01, _) => KeyCode::Escape,
+        (0x02, _) => KeyCode::Char(b'1'),
+        (0x03, _) => KeyCode::Char(b'2'),
+        (0x04, _) => KeyCode::Char(b'3'),
+        (0x05, _) => KeyCode::Char(b'4'),
+        (0x06, _) => KeyCode::Char(b'5'),
+        (0x07, _) => KeyCode::Char(b'6'),
+        (0x08, _) => KeyCode::Char(b'7'),
+        (0x09, _) => KeyCode::Char(b'8'),
+        (0x0A, _) => KeyCode::Char(b'9'),
+        (0x0B, _) => KeyCode::Char(b'0'),
+        (0x0E, _) => KeyCode::Backspace,
+        (0x0F, _) => KeyCode::Tab,
+        (0x10, _) => KeyCode::Char(b'Q'),
+        (0x11, _) => KeyCode::Char(b'W'),
+        (0x12, _) => KeyCode::Char(b'E'),
+        (0x13, _) => KeyCode::Char(b'R'),
+        (0x14, _) => KeyCode::Char(b'T'),
+        (0x15, _) => KeyCode::Char(b'Y'),
+        (0x16, _) => KeyCode::Char(b'U'),
+        (0x17, _) => KeyCode::Char(b'I'),
+        (0x18, _) => KeyCode::Char(b'O'),
+        (0x19, _) => KeyCode::Char(b'P'),
+        (0x1C, false) => KeyCode::Enter,
+        (0x1C, true) => KeyCode::KeypadEnter,
+        (0x1D, false) => KeyCode::ControlLeft,
+        (0x1D, true) => KeyCode::ControlRight,
+        (0x1E, _) => KeyCode::Char(b'A'),
+        (0x1F, _) => KeyCode::Char(b'S'),
+        (0x20, _) => KeyCode::Char(b'D'),
+        (0x21, _) => KeyCode::Char(b'F'),
+        (0x22, _) => KeyCode::Char(b'G'),
+        (0x23, _) => KeyCode::Char(b'H'),
+        (0x24, _) => KeyCode::Char(b'J'),
+        (0x25, _) => KeyCode::Char(b'K'),
+        (0x26, _) => KeyCode::Char(b'L'),
+        (0x2A, _) => KeyCode::ShiftLeft,
+        (0x2C, _) => KeyCode::Char(b'Z'),
+        (0x2D, _) => KeyCode::Char(b'X'),
+        (0x2E, _) => KeyCode::Char(b'C'),
+        (0x2F, _) => KeyCode::Char(b'V'),
+        (0x30, _) => KeyCode::Char(b'B'),
+        (0x31, _) => KeyCode::Char(b'N'),
+        (0x32, _) => KeyCode::Char(b'M'),
+        (0x35, true) => KeyCode::KeypadDivide,
+        (0x36, _) => KeyCode::ShiftRight,
+        (0x37, false) => KeyCode::KeypadMultiply,
+        (0x38, false) => KeyCode::AltLeft,
+        (0x38, true) => KeyCode::AltRight,
+        (0x39, _) => KeyCode::Space,
+        (0x3A, _) => KeyCode::CapsLock,
+        (0x3B, _) => KeyCode::F1,
+        (0x3C, _) => KeyCode::F2,
+        (0x3D, _) => KeyCode::F3,
+        (0x3E, _) => KeyCode::F4,
+        (0x3F, _) => KeyCode::F5,
+        (0x40, _) => KeyCode::F6,
+        (0x41, _) => KeyCode::F7,
+        (0x42, _) => KeyCode::F8,
+        (0x43, _) => KeyCode::F9,
+        (0x44, _) => KeyCode::F10,
+        (0x45, _) => KeyCode::NumLock,
+        (0x47, false) => KeyCode::Keypad7,
+        (0x47, true) => KeyCode::Home,
+        (0x48, false) => KeyCode::Keypad8,
+        (0x48, true) => KeyCode::Up,
+        (0x49, false) => KeyCode::Keypad9,
+        (0x49, true) => KeyCode::PageUp,
+        (0x4A, false) => KeyCode::KeypadSubtract,
+        (0x4B, false) => KeyCode::Keypad4,
+        (0x4B, true) => KeyCode::Left,
+        (0x4C, false) => KeyCode::Keypad5,
+        (0x4D, false) => KeyCode::Keypad6,
+        (0x4D, true) => KeyCode::Right,
+        (0x4E, false) => KeyCode::KeypadAdd,
+        (0x4F, false) => KeyCode::Keypad1,
+        (0x4F, true) => KeyCode::End,
+        (0x50, false) => KeyCode::Keypad2,
+        (0x50, true) => KeyCode::Down,
+        (0x51, false) => KeyCode::Keypad3,
+        (0x51, true) => KeyCode::PageDown,
+        (0x52, false) => KeyCode::Keypad0,
+        (0x52, true) => KeyCode::Insert,
+        (0x53, false) => KeyCode::KeypadDecimal,
+        (0x53, true) => KeyCode::Delete,
+        (0x57, _) => KeyCode::F11,
+        (0x58, _) => KeyCode::F12,
+        (0x5B, true) => KeyCode::SuperLeft,
+        (0x5C, true) => KeyCode::SuperRight,
+        _ => KeyCode::Raw(scan_code),
     }
 }
 
@@ -642,6 +746,36 @@ mod tests {
         assert_eq!(key_code_from_windows_vk(0x70), KeyCode::F1);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_scan_codes_are_normalized_for_driver_capture() {
+        assert_eq!(
+            key_code_from_windows_scan_code(0x1E, 0),
+            KeyCode::Char(b'A')
+        );
+        assert_eq!(
+            key_code_from_windows_scan_code(0x30, 0),
+            KeyCode::Char(b'B')
+        );
+        assert_eq!(
+            key_code_from_windows_scan_code(0x02, 0),
+            KeyCode::Char(b'1')
+        );
+        assert_eq!(
+            key_code_from_windows_scan_code(0x1D, 0),
+            KeyCode::ControlLeft
+        );
+        assert_eq!(
+            key_code_from_windows_scan_code(0x1D, 0x02),
+            KeyCode::ControlRight
+        );
+        assert_eq!(key_code_from_windows_scan_code(0x48, 0x02), KeyCode::Up);
+        assert_eq!(
+            key_code_from_windows_scan_code(0x5B, 0x02),
+            KeyCode::SuperLeft
+        );
+    }
+
     #[test]
     fn test_should_forward() {
         assert!(InputEvent::mouse_move(0, 0).should_forward());
@@ -679,7 +813,7 @@ mod tests {
             event_kind: WindowsDriverEventKind::Key,
             device_id: "test-keyboard".to_string(),
             device_instance_id: "test-instance".to_string(),
-            value0: 0x41, // A key
+            value0: 0x1E, // A key set-1 scan code
             value1: 1,    // pressed
             value2: 0,
             flags: 0,

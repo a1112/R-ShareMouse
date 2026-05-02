@@ -2432,6 +2432,53 @@ async fn handle_network_message(
             };
             let _ = local_events_tx.send(event);
         }
+        Message::UsbDeviceAttached { device } => {
+            tracing::debug!(
+                "Received experimental USB device attach from {} for {} ({:04x}:{:04x}); no USB runtime is bound yet",
+                from,
+                device.bus_id,
+                device.vendor_id,
+                device.product_id
+            );
+        }
+        Message::UsbDeviceDetached { bus_id, reason } => {
+            tracing::debug!(
+                "Received experimental USB device detach from {} for {}: {}",
+                from,
+                bus_id,
+                reason
+            );
+        }
+        Message::UsbTransfer { transfer } => {
+            tracing::debug!(
+                "Received experimental USB transfer {} from {} for {}; no USB runtime is bound yet",
+                transfer.transfer_id,
+                from,
+                transfer.bus_id
+            );
+        }
+        Message::UsbTransferComplete {
+            transfer_id,
+            bus_id,
+            status,
+            ..
+        } => {
+            tracing::debug!(
+                "Received experimental USB transfer completion {} from {} for {} with status {}",
+                transfer_id,
+                from,
+                bus_id,
+                status
+            );
+        }
+        Message::UsbForwardingError { bus_id, message } => {
+            tracing::debug!(
+                "Received experimental USB forwarding error from {} for {:?}: {}",
+                from,
+                bus_id,
+                message
+            );
+        }
         other => {
             inject_remote_message(inject_backend, from, other).await;
         }
