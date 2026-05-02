@@ -27,3 +27,4 @@ futures-util = { workspace = true }
 hostname = { workspace = true }
 tracing-appender = "0.2"
 dirs = "5.0"
+cpal = "0.15"
