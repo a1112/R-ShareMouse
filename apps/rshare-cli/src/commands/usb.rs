@@ -37,9 +37,14 @@ async fn list_usb_devices() -> Result<()> {
     if snapshot.usb_devices.is_empty() {
         warning("No local WinUSB-compatible USB device interfaces reported");
     } else {
-        table_header(&["VID:PID", "BUS ID"]);
+        table_header(&["VID:PID", "CFG", "EP", "BUS ID"]);
         for device in &snapshot.usb_devices {
-            table_row(&[&format_usb_vid_pid(device), &device.bus_id]);
+            table_row(&[
+                &format_usb_vid_pid(device),
+                &device.configurations.len().to_string(),
+                &device.endpoints.len().to_string(),
+                &device.bus_id,
+            ]);
         }
     }
 
@@ -48,7 +53,7 @@ async fn list_usb_devices() -> Result<()> {
     if snapshot.remote_usb_devices.is_empty() {
         warning("No remote USB devices advertised by connected peers");
     } else {
-        table_header(&["DEVICE", "STATUS", "VID:PID", "BUS ID"]);
+        table_header(&["DEVICE", "STATUS", "VID:PID", "CFG", "EP", "BUS ID"]);
         for remote in &snapshot.remote_usb_devices {
             let name = remote
                 .device_name
@@ -63,6 +68,8 @@ async fn list_usb_devices() -> Result<()> {
                 &name,
                 status,
                 &format_usb_vid_pid(&remote.device),
+                &remote.device.configurations.len().to_string(),
+                &remote.device.endpoints.len().to_string(),
                 &remote.device.bus_id,
             ]);
         }

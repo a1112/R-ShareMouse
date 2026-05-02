@@ -73,6 +73,13 @@ The daemon now binds this protocol to a real Windows host-side runtime for WinUS
 4. `UsbTransfer` executes synchronous control, bulk, and interrupt transfers with WinUSB
 5. `UsbTransferComplete`, `UsbForwardingError`, `UsbFlowControl`, reset, cancel, and release are wired through the daemon
 
+USB host enumeration now attempts to enrich each WinUSB-compatible device with real standard descriptors:
+
+- device descriptor fields: VID/PID, class/subclass/protocol, USB BCD, device BCD
+- string descriptors: manufacturer/product/serial when readable
+- configuration, interface, and endpoint descriptors, including endpoint direction/type/packet size/interval
+- active configuration when the device answers `GET_CONFIGURATION`
+
 The first transfer-level two-machine probe is also wired:
 
 ```text

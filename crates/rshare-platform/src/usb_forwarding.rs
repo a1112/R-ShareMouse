@@ -7,9 +7,10 @@
 
 use anyhow::{Context, Result};
 use rshare_core::{
-    UsbDeviceClaimRequest, UsbDeviceClaimResponse, UsbDeviceDescriptor, UsbDeviceResetKind,
-    UsbDeviceSpeed, UsbEndpointDescriptor, UsbFlowControl, UsbForwardingCapabilities,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    UsbConfigurationDescriptor, UsbDeviceClaimRequest, UsbDeviceClaimResponse, UsbDeviceDescriptor,
+    UsbDeviceResetKind, UsbDeviceSpeed, UsbEndpointDescriptor, UsbFlowControl,
+    UsbForwardingCapabilities, UsbInterfaceDescriptor, UsbTransferDirection, UsbTransferKind,
+    UsbTransferPayload, UsbTransferStatus,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -111,6 +112,16 @@ mod platform {
     const PIPE_TYPE_ISOCHRONOUS: u32 = 1;
     const PIPE_TYPE_BULK: u32 = 2;
     const PIPE_TYPE_INTERRUPT: u32 = 3;
+
+    const USB_REQUEST_GET_DESCRIPTOR: u8 = 0x06;
+    const USB_REQUEST_GET_CONFIGURATION: u8 = 0x08;
+    const USB_DESCRIPTOR_TYPE_DEVICE: u8 = 0x01;
+    const USB_DESCRIPTOR_TYPE_CONFIGURATION: u8 = 0x02;
+    const USB_DESCRIPTOR_TYPE_STRING: u8 = 0x03;
+    const USB_DESCRIPTOR_TYPE_INTERFACE: u8 = 0x04;
+    const USB_DESCRIPTOR_TYPE_ENDPOINT: u8 = 0x05;
+    const USB_DESCRIPTOR_TYPE_SS_ENDPOINT_COMPANION: u8 = 0x30;
+    const USB_DEFAULT_LANG_ID: u16 = 0x0409;
 
     const GUID_DEVINTERFACE_USB_DEVICE: Guid = Guid {
         data1: 0xa5dcbf10,
@@ -294,7 +305,7 @@ mod platform {
                 }
 
                 match device_path_for_interface(set, &mut interface_data) {
-                    Ok(device_path) => devices.push(descriptor_from_device_path(device_path)),
+                    Ok(device_path) => devices.push(descriptor_from_device_path(&device_path)),
                     Err(error) => tracing::debug!("Failed to read USB interface detail: {error}"),
                 }
                 index = index.saturating_add(1);
@@ -304,10 +315,32 @@ mod platform {
         }
     }
 
-    fn descriptor_from_device_path(device_path: String) -> UsbDeviceDescriptor {
+    fn descriptor_from_device_path(device_path: &str) -> UsbDeviceDescriptor {
+        let mut descriptor = fallback_descriptor_from_device_path(device_path);
+        match WindowsUsbSession::open(device_path, false) {
+            Ok(mut session) => match session.enriched_device_descriptor(&descriptor) {
+                Ok(enriched) => descriptor = enriched,
+                Err(error) => {
+                    tracing::debug!(
+                        "Failed to enrich USB descriptor for {}: {}",
+                        device_path,
+                        error
+                    )
+                }
+            },
+            Err(error) => tracing::debug!(
+                "USB device {} is not WinUSB-claimable: {}",
+                device_path,
+                error
+            ),
+        }
+        descriptor
+    }
+
+    fn fallback_descriptor_from_device_path(device_path: &str) -> UsbDeviceDescriptor {
         let (vendor_id, product_id) = parse_vid_pid(&device_path).unwrap_or((0, 0));
         UsbDeviceDescriptor {
-            bus_id: device_path.clone(),
+            bus_id: device_path.to_string(),
             vendor_id,
             product_id,
             class_code: 0,
@@ -325,6 +358,21 @@ mod platform {
             configurations: Vec::new(),
             endpoints: Vec::new(),
         }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ParsedDeviceDescriptor {
+        usb_version_bcd: u16,
+        class_code: u8,
+        subclass_code: u8,
+        protocol_code: u8,
+        vendor_id: u16,
+        product_id: u16,
+        device_version_bcd: u16,
+        manufacturer_index: u8,
+        product_index: u8,
+        serial_index: u8,
+        configuration_count: u8,
     }
 
     struct WindowsUsbSession {
@@ -404,6 +452,171 @@ mod platform {
                 self.endpoints = endpoints;
                 Ok(())
             }
+        }
+
+        fn enriched_device_descriptor(
+            &mut self,
+            fallback: &UsbDeviceDescriptor,
+        ) -> Result<UsbDeviceDescriptor> {
+            let raw_device = self.read_descriptor(USB_DESCRIPTOR_TYPE_DEVICE, 0, 0, 18)?;
+            let parsed = parse_device_descriptor(&raw_device)
+                .ok_or_else(|| anyhow::anyhow!("Invalid USB device descriptor"))?;
+            let lang_id = self
+                .read_first_string_lang_id()
+                .unwrap_or(USB_DEFAULT_LANG_ID);
+
+            let mut configurations = Vec::new();
+            for configuration_index in 0..parsed.configuration_count {
+                match self.read_configuration_descriptor(configuration_index, lang_id) {
+                    Ok(configuration) => configurations.push(configuration),
+                    Err(error) => tracing::debug!(
+                        "Failed to read USB configuration {} for {}: {}",
+                        configuration_index,
+                        self.bus_id,
+                        error
+                    ),
+                }
+            }
+
+            let endpoints: Vec<UsbEndpointDescriptor> = configurations
+                .iter()
+                .flat_map(|configuration| {
+                    configuration
+                        .interfaces
+                        .iter()
+                        .flat_map(|interface| interface.endpoints.iter().cloned())
+                })
+                .collect();
+            let active_configuration = self.read_active_configuration().unwrap_or(None);
+
+            Ok(UsbDeviceDescriptor {
+                bus_id: fallback.bus_id.clone(),
+                vendor_id: parsed.vendor_id,
+                product_id: parsed.product_id,
+                class_code: parsed.class_code,
+                subclass_code: parsed.subclass_code,
+                protocol_code: parsed.protocol_code,
+                manufacturer: self.read_string_descriptor(parsed.manufacturer_index, lang_id),
+                product: self
+                    .read_string_descriptor(parsed.product_index, lang_id)
+                    .or_else(|| fallback.product.clone()),
+                serial_number: self
+                    .read_string_descriptor(parsed.serial_index, lang_id)
+                    .or_else(|| fallback.serial_number.clone()),
+                usb_version_bcd: parsed.usb_version_bcd,
+                device_version_bcd: parsed.device_version_bcd,
+                speed: UsbDeviceSpeed::Unknown,
+                active_configuration,
+                container_id: fallback.container_id.clone(),
+                capture_exclusive_required: true,
+                configurations,
+                endpoints,
+            })
+        }
+
+        fn read_configuration_descriptor(
+            &mut self,
+            configuration_index: u8,
+            lang_id: u16,
+        ) -> Result<UsbConfigurationDescriptor> {
+            let header =
+                self.read_descriptor(USB_DESCRIPTOR_TYPE_CONFIGURATION, configuration_index, 0, 9)?;
+            let total_length = configuration_total_length(&header)
+                .ok_or_else(|| anyhow::anyhow!("Invalid USB configuration descriptor header"))?;
+            let raw = self.read_descriptor(
+                USB_DESCRIPTOR_TYPE_CONFIGURATION,
+                configuration_index,
+                0,
+                total_length,
+            )?;
+            parse_configuration_descriptor(&raw, lang_id, |index, lang_id| {
+                self.read_string_descriptor(index, lang_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Invalid USB configuration descriptor"))
+        }
+
+        fn read_descriptor(
+            &mut self,
+            descriptor_type: u8,
+            descriptor_index: u8,
+            lang_id: u16,
+            length: u16,
+        ) -> Result<Vec<u8>> {
+            self.control_transfer_raw(
+                UsbSetupPacketRaw {
+                    request_type: 0x80,
+                    request: USB_REQUEST_GET_DESCRIPTOR,
+                    value: ((descriptor_type as u16) << 8) | descriptor_index as u16,
+                    index: lang_id,
+                    length,
+                },
+                length as u32,
+            )
+        }
+
+        fn read_active_configuration(&mut self) -> Result<Option<u8>> {
+            let data = self.control_transfer_raw(
+                UsbSetupPacketRaw {
+                    request_type: 0x80,
+                    request: USB_REQUEST_GET_CONFIGURATION,
+                    value: 0,
+                    index: 0,
+                    length: 1,
+                },
+                1,
+            )?;
+            Ok(data.first().copied().filter(|value| *value != 0))
+        }
+
+        fn read_first_string_lang_id(&mut self) -> Result<u16> {
+            let data = self.read_descriptor(USB_DESCRIPTOR_TYPE_STRING, 0, 0, 4)?;
+            if data.len() >= 4 && data[1] == USB_DESCRIPTOR_TYPE_STRING {
+                Ok(u16::from_le_bytes([data[2], data[3]]))
+            } else {
+                anyhow::bail!("USB string language descriptor is invalid")
+            }
+        }
+
+        fn read_string_descriptor(&mut self, index: u8, lang_id: u16) -> Option<String> {
+            if index == 0 {
+                return None;
+            }
+            let header = self
+                .read_descriptor(USB_DESCRIPTOR_TYPE_STRING, index, lang_id, 2)
+                .ok()?;
+            let length = *header.first()? as u16;
+            if length < 2 {
+                return None;
+            }
+            let data = self
+                .read_descriptor(USB_DESCRIPTOR_TYPE_STRING, index, lang_id, length)
+                .ok()?;
+            parse_string_descriptor(&data)
+        }
+
+        fn control_transfer_raw(
+            &mut self,
+            setup: UsbSetupPacketRaw,
+            expected_len: u32,
+        ) -> Result<Vec<u8>> {
+            let mut data = vec![0u8; expected_len as usize];
+            let mut transferred = 0u32;
+            unsafe {
+                if WinUsb_ControlTransfer(
+                    self.interface_handle(),
+                    setup,
+                    data.as_mut_ptr(),
+                    data.len() as u32,
+                    &mut transferred,
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    return Err(std::io::Error::last_os_error())
+                        .context("WinUsb_ControlTransfer failed");
+                }
+            }
+            data.truncate(transferred as usize);
+            Ok(data)
         }
 
         fn submit_transfer(
@@ -626,6 +839,158 @@ mod platform {
             max_burst: None,
             max_streams: None,
         })
+    }
+
+    fn parse_device_descriptor(bytes: &[u8]) -> Option<ParsedDeviceDescriptor> {
+        if bytes.len() < 18 || bytes[0] < 18 || bytes[1] != USB_DESCRIPTOR_TYPE_DEVICE {
+            return None;
+        }
+        Some(ParsedDeviceDescriptor {
+            usb_version_bcd: u16::from_le_bytes([bytes[2], bytes[3]]),
+            class_code: bytes[4],
+            subclass_code: bytes[5],
+            protocol_code: bytes[6],
+            vendor_id: u16::from_le_bytes([bytes[8], bytes[9]]),
+            product_id: u16::from_le_bytes([bytes[10], bytes[11]]),
+            device_version_bcd: u16::from_le_bytes([bytes[12], bytes[13]]),
+            manufacturer_index: bytes[14],
+            product_index: bytes[15],
+            serial_index: bytes[16],
+            configuration_count: bytes[17],
+        })
+    }
+
+    fn configuration_total_length(bytes: &[u8]) -> Option<u16> {
+        if bytes.len() < 4 || bytes[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION {
+            return None;
+        }
+        Some(u16::from_le_bytes([bytes[2], bytes[3]]).max(9))
+    }
+
+    fn parse_configuration_descriptor<F>(
+        bytes: &[u8],
+        lang_id: u16,
+        mut string_reader: F,
+    ) -> Option<UsbConfigurationDescriptor>
+    where
+        F: FnMut(u8, u16) -> Option<String>,
+    {
+        if bytes.len() < 9 || bytes[0] < 9 || bytes[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION {
+            return None;
+        }
+
+        let mut configuration = UsbConfigurationDescriptor {
+            configuration_value: bytes[5],
+            description: string_reader(bytes[6], lang_id),
+            attributes: bytes[7],
+            max_power_ma: (bytes[8] as u16).saturating_mul(2),
+            interfaces: Vec::new(),
+        };
+
+        let mut current_interface: Option<UsbInterfaceDescriptor> = None;
+        let mut offset = bytes[0] as usize;
+        while offset + 2 <= bytes.len() {
+            let length = bytes[offset] as usize;
+            let descriptor_type = bytes[offset + 1];
+            if length < 2 || offset + length > bytes.len() {
+                break;
+            }
+            let descriptor = &bytes[offset..offset + length];
+            match descriptor_type {
+                USB_DESCRIPTOR_TYPE_INTERFACE if descriptor.len() >= 9 => {
+                    if let Some(interface) = current_interface.take() {
+                        configuration.interfaces.push(interface);
+                    }
+                    current_interface = Some(UsbInterfaceDescriptor {
+                        interface_number: descriptor[2],
+                        alternate_setting: descriptor[3],
+                        class_code: descriptor[5],
+                        subclass_code: descriptor[6],
+                        protocol_code: descriptor[7],
+                        description: string_reader(descriptor[8], lang_id),
+                        endpoints: Vec::new(),
+                    });
+                }
+                USB_DESCRIPTOR_TYPE_ENDPOINT if descriptor.len() >= 7 => {
+                    if let Some(interface) = current_interface.as_mut() {
+                        interface.endpoints.push(endpoint_from_descriptor(
+                            interface.interface_number,
+                            interface.alternate_setting,
+                            descriptor,
+                        ));
+                    }
+                }
+                USB_DESCRIPTOR_TYPE_SS_ENDPOINT_COMPANION if descriptor.len() >= 6 => {
+                    if let Some(endpoint) = current_interface
+                        .as_mut()
+                        .and_then(|interface| interface.endpoints.last_mut())
+                    {
+                        endpoint.max_burst = Some(descriptor[2]);
+                        if matches!(endpoint.transfer_kind, UsbTransferKind::Bulk) {
+                            let streams_exponent = descriptor[3] & 0x1f;
+                            if streams_exponent > 0 && streams_exponent < 16 {
+                                endpoint.max_streams = Some(1u16 << streams_exponent);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            offset += length;
+        }
+
+        if let Some(interface) = current_interface {
+            configuration.interfaces.push(interface);
+        }
+        Some(configuration)
+    }
+
+    fn endpoint_from_descriptor(
+        interface_number: u8,
+        alternate_setting: u8,
+        descriptor: &[u8],
+    ) -> UsbEndpointDescriptor {
+        let attributes = descriptor[3];
+        let transfer_kind = match attributes & 0x03 {
+            1 => UsbTransferKind::Isochronous,
+            2 => UsbTransferKind::Bulk,
+            3 => UsbTransferKind::Interrupt,
+            _ => UsbTransferKind::Control,
+        };
+        let direction = if (descriptor[2] & 0x80) != 0 {
+            UsbTransferDirection::In
+        } else {
+            UsbTransferDirection::Out
+        };
+        UsbEndpointDescriptor {
+            address: descriptor[2],
+            interface_number,
+            alternate_setting,
+            transfer_kind,
+            direction,
+            max_packet_size: u16::from_le_bytes([descriptor[4], descriptor[5]]),
+            interval_ms: Some(descriptor[6]),
+            attributes,
+            max_burst: None,
+            max_streams: None,
+        }
+    }
+
+    fn parse_string_descriptor(bytes: &[u8]) -> Option<String> {
+        if bytes.len() < 2 || bytes[1] != USB_DESCRIPTOR_TYPE_STRING {
+            return None;
+        }
+        let descriptor_len = (bytes[0] as usize).min(bytes.len());
+        if descriptor_len <= 2 {
+            return None;
+        }
+        let utf16: Vec<u16> = bytes[2..descriptor_len]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        String::from_utf16(&utf16)
+            .ok()
+            .filter(|value| !value.is_empty())
     }
 
     unsafe fn device_path_for_interface(
@@ -881,6 +1246,68 @@ mod platform {
             assert_eq!(
                 parse_serial_from_device_path(path),
                 Some("123456".to_string())
+            );
+        }
+
+        #[test]
+        fn parses_usb_device_descriptor_bytes() {
+            let bytes = [
+                18, 1, 0x10, 0x02, 0xff, 0x01, 0x02, 64, 0x5e, 0x04, 0x8e, 0x02, 0x00, 0x01, 1, 2,
+                3, 1,
+            ];
+            let descriptor = parse_device_descriptor(&bytes).unwrap();
+
+            assert_eq!(descriptor.usb_version_bcd, 0x0210);
+            assert_eq!(descriptor.class_code, 0xff);
+            assert_eq!(descriptor.subclass_code, 0x01);
+            assert_eq!(descriptor.protocol_code, 0x02);
+            assert_eq!(descriptor.vendor_id, 0x045e);
+            assert_eq!(descriptor.product_id, 0x028e);
+            assert_eq!(descriptor.device_version_bcd, 0x0100);
+            assert_eq!(descriptor.manufacturer_index, 1);
+            assert_eq!(descriptor.product_index, 2);
+            assert_eq!(descriptor.serial_index, 3);
+            assert_eq!(descriptor.configuration_count, 1);
+        }
+
+        #[test]
+        fn parses_usb_configuration_tree() {
+            let bytes = [
+                9, 2, 32, 0, 1, 1, 4, 0x80, 50, 9, 4, 1, 0, 2, 0xff, 0x01, 0x02, 5, 7, 5, 0x81, 2,
+                64, 0, 0, 7, 5, 0x02, 3, 8, 0, 10,
+            ];
+            let configuration =
+                parse_configuration_descriptor(&bytes, USB_DEFAULT_LANG_ID, |index, _| {
+                    Some(format!("string-{index}"))
+                })
+                .unwrap();
+
+            assert_eq!(configuration.configuration_value, 1);
+            assert_eq!(configuration.description.as_deref(), Some("string-4"));
+            assert_eq!(configuration.max_power_ma, 100);
+            assert_eq!(configuration.interfaces.len(), 1);
+            let interface = &configuration.interfaces[0];
+            assert_eq!(interface.interface_number, 1);
+            assert_eq!(interface.description.as_deref(), Some("string-5"));
+            assert_eq!(interface.endpoints.len(), 2);
+            assert_eq!(interface.endpoints[0].address, 0x81);
+            assert_eq!(interface.endpoints[0].transfer_kind, UsbTransferKind::Bulk);
+            assert_eq!(interface.endpoints[0].direction, UsbTransferDirection::In);
+            assert_eq!(interface.endpoints[1].address, 0x02);
+            assert_eq!(
+                interface.endpoints[1].transfer_kind,
+                UsbTransferKind::Interrupt
+            );
+            assert_eq!(interface.endpoints[1].direction, UsbTransferDirection::Out);
+        }
+
+        #[test]
+        fn parses_utf16_usb_string_descriptor() {
+            let descriptor = [10, 3, b'T', 0, b'e', 0, b's', 0, b't', 0];
+
+            assert_eq!(
+                parse_string_descriptor(&descriptor),
+                Some("Test".to_string())
             );
         }
     }
