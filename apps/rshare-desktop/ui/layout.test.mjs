@@ -9,7 +9,12 @@ test('buildScreenLayout keeps the local screen first and places discovered devic
       { id: 'b', name: 'MacBook', connected: false, hostname: 'macbook.local', last_seen_secs: 6 },
       { id: 'a', name: 'Studio PC', connected: true, hostname: 'studio.local', last_seen_secs: 1 },
     ],
-    { device_id: 'local', device_name: 'This PC', bind_address: '0.0.0.0:27431', discovery_port: 27432 },
+    {
+      device_id: 'local',
+      device_name: 'This PC',
+      bind_address: '0.0.0.0:27431',
+      discovery_port: 27432,
+    },
   );
 
   assert.equal(layout.length, 3);
@@ -35,8 +40,8 @@ test('buildStatusBanner prefers daemon details when available', () => {
   );
 
   assert.deepEqual(banner, {
-    title: 'Desktop · 1 connected / 2 discovered',
-    detail: 'Listening on 0.0.0.0:27431 · discovery UDP 27432',
+    title: 'Desktop - 1 connected / 2 discovered',
+    detail: 'Listening on 0.0.0.0:27431 - discovery UDP 27432',
     actionLabel: 'Stop Service',
   });
 });
@@ -49,4 +54,15 @@ test('buildStatusBanner falls back to offline copy when the daemon is unavailabl
     detail: 'Start the service to discover devices and simulate their screen positions.',
     actionLabel: 'Start Service',
   });
+});
+
+test('builders tolerate null device lists from older daemon responses', () => {
+  const layout = buildScreenLayout(null, null);
+  const banner = buildStatusBanner(
+    { device_name: 'Desktop', bind_address: '0.0.0.0:27431', discovery_port: 27432 },
+    null,
+  );
+
+  assert.equal(layout.length, 1);
+  assert.equal(banner.title, 'Desktop - 0 connected / 0 discovered');
 });

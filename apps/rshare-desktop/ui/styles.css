@@ -141,6 +141,7 @@ button {
   gap: 14px;
   padding: 18px;
   overflow: hidden;
+  position: relative;
 }
 
 .workspace-head,
@@ -150,6 +151,14 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .workspace-head h1 {
@@ -352,6 +361,147 @@ button {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   margin-bottom: 4px;
+}
+
+.settings-panel {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  bottom: 18px;
+  width: min(380px, calc(100% - 36px));
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid rgba(128, 155, 201, 0.22);
+  border-radius: var(--radius);
+  background: rgba(11, 18, 30, 0.98);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+  transform: translateX(calc(100% + 28px));
+  transition: transform 160ms ease;
+  z-index: 5;
+  overflow: hidden;
+}
+
+.settings-panel.open {
+  transform: translateX(0);
+}
+
+.settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-head h2 {
+  margin: 4px 0 0;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.settings-status {
+  margin: 0;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-status[data-tone="ok"] {
+  color: var(--success);
+}
+
+.settings-status[data-tone="error"] {
+  color: var(--danger);
+}
+
+.settings-switches {
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.settings-group {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.settings-group h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.setting-row {
+  min-height: 46px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid rgba(128, 155, 201, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.setting-row span:first-child {
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.switch {
+  flex: 0 0 auto;
+  position: relative;
+  width: 42px;
+  height: 24px;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  margin: 0;
+}
+
+.switch-track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  transition: transform 140ms ease;
+}
+
+.switch input:checked + .switch-track {
+  background: linear-gradient(135deg, #3f82ff, #58b9ff);
+}
+
+.switch input:checked + .switch-track::after {
+  transform: translateX(18px);
+}
+
+.switch input:focus-visible + .switch-track {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
 }
 
 @media (max-width: 1100px) {

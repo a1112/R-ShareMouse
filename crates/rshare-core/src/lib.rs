@@ -34,7 +34,7 @@ pub use device::{Device, DevicePosition, DeviceRegistry, DeviceStatus, ScreenLay
 
 // Re-exports from config
 pub use config::Config;
-pub use config::{GamepadConfig, GamepadRoutingMode};
+pub use config::{FeatureConfig, GamepadConfig, GamepadRoutingMode};
 
 // Re-exports from clipboard
 pub use clipboard::ClipboardContent;

@@ -29,6 +29,7 @@ function normalizeDevice(device, index) {
 }
 
 export function buildScreenLayout(devices = [], status = null) {
+  const deviceList = Array.isArray(devices) ? devices : [];
   const localScreen = {
     id: status?.device_id ? String(status.device_id) : 'local',
     label: status?.device_name || 'This PC',
@@ -43,7 +44,7 @@ export function buildScreenLayout(devices = [], status = null) {
     lastSeen: 'now',
   };
 
-  const remoteScreens = [...devices]
+  const remoteScreens = [...deviceList]
     .sort((left, right) => {
       if (left.connected !== right.connected) {
         return left.connected ? -1 : 1;
@@ -56,6 +57,7 @@ export function buildScreenLayout(devices = [], status = null) {
 }
 
 export function buildStatusBanner(status, devices = []) {
+  const deviceList = Array.isArray(devices) ? devices : [];
   if (!status) {
     return {
       title: 'Daemon offline',
@@ -64,10 +66,10 @@ export function buildStatusBanner(status, devices = []) {
     };
   }
 
-  const connectedCount = devices.filter((device) => device.connected).length;
+  const connectedCount = deviceList.filter((device) => device.connected).length;
   return {
-    title: `${status.device_name} · ${connectedCount} connected / ${devices.length} discovered`,
-    detail: `Listening on ${status.bind_address} · discovery UDP ${status.discovery_port}`,
+    title: `${status.device_name} - ${connectedCount} connected / ${deviceList.length} discovered`,
+    detail: `Listening on ${status.bind_address} - discovery UDP ${status.discovery_port}`,
     actionLabel: 'Stop Service',
   };
 }

@@ -17,9 +17,9 @@
           <button id="serviceToggleBtn" class="toolbar-btn primary">Start Service</button>
         </div>
         <div class="titlebar-actions">
-          <button id="minimizeBtn" class="window-btn ghost" aria-label="Minimize">−</button>
-          <button id="maximizeBtn" class="window-btn ghost" aria-label="Toggle Maximize">□</button>
-          <button id="closeBtn" class="window-btn danger" aria-label="Close">×</button>
+          <button id="minimizeBtn" class="window-btn ghost" aria-label="Minimize">-</button>
+          <button id="maximizeBtn" class="window-btn ghost" aria-label="Toggle Maximize">[]</button>
+          <button id="closeBtn" class="window-btn danger" aria-label="Close">x</button>
         </div>
       </header>
 
@@ -30,6 +30,7 @@
             <h1>Discovered Screens</h1>
           </div>
           <div class="workspace-actions">
+            <button id="settingsToggleBtn" class="toolbar-btn">Settings</button>
             <button id="refreshDevicesBtn" class="toolbar-btn">Refresh</button>
           </div>
         </section>
@@ -66,6 +67,18 @@
             <strong id="devicesDetail">Only the local screen is visible right now</strong>
           </div>
         </section>
+
+        <aside id="settingsPanel" class="settings-panel" aria-hidden="true">
+          <div class="settings-head">
+            <div>
+              <p class="eyebrow">Settings</p>
+              <h2>Runtime Switches</h2>
+            </div>
+            <button id="settingsCloseBtn" class="toolbar-btn">Close</button>
+          </div>
+          <p id="settingsSaveStatus" class="settings-status">Loading config...</p>
+          <div id="settingsSwitches" class="settings-switches"></div>
+        </aside>
       </main>
     </div>
 

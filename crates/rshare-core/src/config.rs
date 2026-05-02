@@ -19,6 +19,8 @@ pub struct Config {
     #[serde(default)]
     pub gamepad: GamepadConfig,
     #[serde(default)]
+    pub features: FeatureConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     /// Known device hostnames
     #[serde(default)]
@@ -72,6 +74,31 @@ pub struct GamepadConfig {
     pub max_update_hz: u16,
     /// Enable future vibration passthrough when supported.
     pub vibration: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeatureConfig {
+    /// Suppress local OS shortcuts while this machine is controlling a remote target.
+    #[serde(default = "default_true")]
+    pub suppress_local_shortcuts_when_remote: bool,
+    /// Ask the remote endpoint to run the reverse latency probe automatically.
+    #[serde(default = "default_true")]
+    pub auto_endpoint_latency_probe: bool,
+    /// Allow local audio capture for diagnostics.
+    #[serde(default = "default_true")]
+    pub audio_capture: bool,
+    /// Allow audio forwarding to a remote active target.
+    #[serde(default = "default_true")]
+    pub audio_forwarding: bool,
+    /// Enable the experimental USB forwarding host path.
+    #[serde(default)]
+    pub usb_forwarding_experimental: bool,
+    /// Advertise local USB devices to connected peers when USB forwarding is enabled.
+    #[serde(default = "default_true")]
+    pub usb_device_advertising: bool,
+    /// Allow descriptor probes against USB devices advertised by remote peers.
+    #[serde(default = "default_true")]
+    pub usb_descriptor_probe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +167,20 @@ impl Default for GamepadConfig {
     }
 }
 
+impl Default for FeatureConfig {
+    fn default() -> Self {
+        Self {
+            suppress_local_shortcuts_when_remote: true,
+            auto_endpoint_latency_probe: true,
+            audio_capture: true,
+            audio_forwarding: true,
+            usb_forwarding_experimental: false,
+            usb_device_advertising: true,
+            usb_descriptor_probe: true,
+        }
+    }
+}
+
 impl Default for GamepadRoutingMode {
     fn default() -> Self {
         Self::Disabled
@@ -165,10 +206,15 @@ impl Default for Config {
             gui: GuiConfig::default(),
             input: InputConfig::default(),
             gamepad: GamepadConfig::default(),
+            features: FeatureConfig::default(),
             security: SecurityConfig::default(),
             known_devices: Vec::new(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -321,6 +367,13 @@ mod tests {
         assert_eq!(config.gamepad.deadzone_basis_points, 800);
         assert_eq!(config.gamepad.max_update_hz, 120);
         assert!(!config.gamepad.vibration);
+        assert!(config.features.suppress_local_shortcuts_when_remote);
+        assert!(config.features.auto_endpoint_latency_probe);
+        assert!(config.features.audio_capture);
+        assert!(config.features.audio_forwarding);
+        assert!(!config.features.usb_forwarding_experimental);
+        assert!(config.features.usb_device_advertising);
+        assert!(config.features.usb_descriptor_probe);
         assert!(!config.security.password_required);
         assert!(config.security.encryption);
         assert!(config.security.lan_only);
@@ -346,6 +399,8 @@ mod tests {
         config.gamepad.routing_mode = GamepadRoutingMode::FixedTarget {
             device_id: DeviceId::new_v4(),
         };
+        config.features.usb_forwarding_experimental = true;
+        config.features.audio_forwarding = false;
         config.security.password_required = true;
         config.gui.screen_layout.push(ScreenLayoutEntry {
             device_id: DeviceId::new_v4(),
@@ -357,6 +412,20 @@ mod tests {
 
         assert_eq!(loaded, config);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn feature_config_defaults_when_section_is_missing_or_partial() {
+        let loaded: Config = toml::from_str("known_devices = []").unwrap();
+        assert_eq!(loaded.features, FeatureConfig::default());
+
+        let partial: Config =
+            toml::from_str("[features]\nusb_forwarding_experimental = true\n").unwrap();
+        assert!(partial.features.usb_forwarding_experimental);
+        assert!(partial.features.audio_capture);
+        assert!(partial.features.audio_forwarding);
+        assert!(partial.features.usb_device_advertising);
+        assert!(partial.features.usb_descriptor_probe);
     }
 
     #[test]

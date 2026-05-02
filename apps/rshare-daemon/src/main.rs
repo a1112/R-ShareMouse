@@ -93,6 +93,43 @@ struct PendingUsbTransfer {
     result_tx: oneshot::Sender<UsbDescriptorProbeResult>,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeFeatureConfig {
+    suppress_local_shortcuts_when_remote: bool,
+    auto_endpoint_latency_probe: bool,
+    audio_capture: bool,
+    audio_forwarding: bool,
+    usb_forwarding_experimental: bool,
+    usb_device_advertising: bool,
+    usb_descriptor_probe: bool,
+}
+
+impl RuntimeFeatureConfig {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            suppress_local_shortcuts_when_remote: config
+                .features
+                .suppress_local_shortcuts_when_remote,
+            auto_endpoint_latency_probe: config.features.auto_endpoint_latency_probe,
+            audio_capture: config.features.audio_capture,
+            audio_forwarding: config.features.audio_forwarding,
+            usb_forwarding_experimental: config.features.usb_forwarding_experimental,
+            usb_device_advertising: config.features.usb_device_advertising,
+            usb_descriptor_probe: config.features.usb_descriptor_probe,
+        }
+    }
+
+    fn usb_advertising_enabled(&self) -> bool {
+        self.usb_forwarding_experimental && self.usb_device_advertising
+    }
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self::from_config(&Config::default())
+    }
+}
+
 struct DaemonState {
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
@@ -101,6 +138,7 @@ struct DaemonState {
     session: CaptureSessionStateMachine,
     // Backend state with separate capture/inject health
     backend_state: BackendRuntimeState,
+    features: RuntimeFeatureConfig,
     local_controls: LocalControlDeviceSnapshot,
     pending_keyboard_loopback_until_ms: u64,
     pending_keyboard_loopback_events: u8,
@@ -126,8 +164,9 @@ impl DaemonState {
 
         let mut backend_state = BackendRuntimeState::new();
         backend_state.available_backends = vec![BackendKind::Portable];
+        let features = RuntimeFeatureConfig::default();
         let local_controls =
-            default_local_control_snapshot(local_screen.width, local_screen.height);
+            default_local_control_snapshot(local_screen.width, local_screen.height, &features);
 
         Self {
             status,
@@ -135,6 +174,7 @@ impl DaemonState {
             layout,
             session: CaptureSessionStateMachine::new(),
             backend_state,
+            features,
             local_controls,
             pending_keyboard_loopback_until_ms: 0,
             pending_keyboard_loopback_events: 0,
@@ -290,6 +330,11 @@ impl DaemonState {
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
         self.local_controls.clone()
+    }
+
+    fn refresh_local_controls_platform(&mut self) {
+        let features = self.features.clone();
+        refresh_platform_local_controls(&mut self.local_controls, &features);
     }
 
     fn arm_injected_loopback(&mut self, device_kind: LocalInputDeviceKind, timestamp_ms: u64) {
@@ -570,14 +615,21 @@ const INJECTION_LOOPBACK_WINDOW_MS: u64 = 750;
 
 type UsbHostRuntime = Arc<Mutex<rshare_platform::ExperimentalUsbHostRuntime>>;
 
-fn default_local_control_snapshot(width: u32, height: u32) -> LocalControlDeviceSnapshot {
+fn default_local_control_snapshot(
+    width: u32,
+    height: u32,
+    features: &RuntimeFeatureConfig,
+) -> LocalControlDeviceSnapshot {
     let mut snapshot = LocalControlDeviceSnapshot::default();
     snapshot.display = fallback_display_state(width, height);
-    refresh_platform_local_controls(&mut snapshot);
+    refresh_platform_local_controls(&mut snapshot, features);
     snapshot
 }
 
-fn refresh_platform_local_controls(snapshot: &mut LocalControlDeviceSnapshot) {
+fn refresh_platform_local_controls(
+    snapshot: &mut LocalControlDeviceSnapshot,
+    features: &RuntimeFeatureConfig,
+) {
     #[cfg(windows)]
     {
         let screens = rshare_platform::windows::get_all_screens();
@@ -626,15 +678,20 @@ fn refresh_platform_local_controls(snapshot: &mut LocalControlDeviceSnapshot) {
             snapshot.last_error = Some(format!("Core Audio input enumeration failed: {error}"));
         }
     }
-    #[cfg(windows)]
-    match rshare_platform::ExperimentalUsbHostRuntime::new().enumerate_devices() {
-        Ok(devices) => {
-            snapshot.usb_devices = devices;
+    if features.usb_forwarding_experimental {
+        #[cfg(windows)]
+        match rshare_platform::ExperimentalUsbHostRuntime::new().enumerate_devices() {
+            Ok(devices) => {
+                snapshot.usb_devices = devices;
+            }
+            Err(error) => {
+                snapshot.usb_devices.clear();
+                snapshot.last_error = Some(format!("USB enumeration failed: {error}"));
+            }
         }
-        Err(error) => {
-            snapshot.usb_devices.clear();
-            snapshot.last_error = Some(format!("USB enumeration failed: {error}"));
-        }
+    } else {
+        snapshot.usb_devices.clear();
+        snapshot.remote_usb_devices.clear();
     }
 }
 
@@ -1687,10 +1744,12 @@ fn set_local_shortcut_suppression(enabled: bool) {
 fn set_local_shortcut_suppression(_enabled: bool) {}
 
 fn sync_local_shortcut_suppression(state: &DaemonState) {
-    set_local_shortcut_suppression(matches!(
-        state.session.state(),
-        ControlSessionState::RemoteActive { .. }
-    ));
+    let should_suppress = state.features.suppress_local_shortcuts_when_remote
+        && matches!(
+            state.session.state(),
+            ControlSessionState::RemoteActive { .. }
+        );
+    set_local_shortcut_suppression(should_suppress);
 }
 
 #[derive(Debug, Clone)]
@@ -2180,7 +2239,7 @@ async fn run_remote_latency_test(
     device_id: DeviceId,
 ) -> LocalInputTestResult {
     let now = timestamp_ms_now();
-    let event = {
+    let (event, endpoint_switch) = {
         let mut state = state.write().await;
         if !is_device_connected(&state, device_id) {
             return LocalInputTestResult::failed(
@@ -2189,6 +2248,7 @@ async fn run_remote_latency_test(
             );
         }
 
+        let endpoint_switch = state.features.auto_endpoint_latency_probe;
         let sequence = state.local_controls.sequence.saturating_add(1);
         state.local_controls.sequence = sequence;
         state.pending_latency_probes.insert(
@@ -2203,17 +2263,25 @@ async fn run_remote_latency_test(
         let mut payload = BTreeMap::new();
         payload.insert("probe_sequence".to_string(), sequence.to_string());
         payload.insert("sent_timestamp_ms".to_string(), now.to_string());
-        payload.insert("endpoint_switch".to_string(), "true".to_string());
+        payload.insert("endpoint_switch".to_string(), endpoint_switch.to_string());
         payload.insert("direction".to_string(), "local_to_remote".to_string());
         let event = LocalInputDiagnosticEvent {
             sequence,
             timestamp_ms: now,
             device_kind: LocalInputDeviceKind::Backend,
-            event_kind: "latency_endpoint_probe_sent".to_string(),
-            summary: format!(
-                "Dual-end latency probe sent to {}",
-                short_device_id(device_id)
-            ),
+            event_kind: if endpoint_switch {
+                "latency_endpoint_probe_sent".to_string()
+            } else {
+                "latency_probe_sent".to_string()
+            },
+            summary: if endpoint_switch {
+                format!(
+                    "Dual-end latency probe sent to {}",
+                    short_device_id(device_id)
+                )
+            } else {
+                format!("Latency probe sent to {}", short_device_id(device_id))
+            },
             device_id: Some(device_id.to_string()),
             device_instance_id: None,
             capture_path: Some("rshare-net".to_string()),
@@ -2221,7 +2289,7 @@ async fn run_remote_latency_test(
             payload,
         };
         push_recent_local_event(&mut state.local_controls, event.clone());
-        event
+        (event, endpoint_switch)
     };
     let sequence = event.sequence;
     let _ = local_events_tx.send(event);
@@ -2234,7 +2302,7 @@ async fn run_remote_latency_test(
                 Message::LatencyProbe {
                     sequence,
                     timestamp_ms: now,
-                    endpoint_switch: true,
+                    endpoint_switch,
                     origin_sequence: None,
                 },
             )
@@ -2242,8 +2310,12 @@ async fn run_remote_latency_test(
     };
 
     match result {
-        Ok(()) => LocalInputTestResult::success(format!(
+        Ok(()) if endpoint_switch => LocalInputTestResult::success(format!(
             "Dual-end latency probe sent to {}.",
+            short_device_id(device_id)
+        )),
+        Ok(()) => LocalInputTestResult::success(format!(
+            "Latency probe sent to {}.",
             short_device_id(device_id)
         )),
         Err(error) => {
@@ -2261,6 +2333,38 @@ async fn run_remote_usb_descriptor_probe(
     bus_id: String,
 ) -> UsbDescriptorProbeResult {
     let started_at_ms = timestamp_ms_now();
+    let features = {
+        let state = state.read().await;
+        state.features.clone()
+    };
+    if !features.usb_forwarding_experimental {
+        return usb_probe_result(
+            UsbDescriptorProbeStatus::Failed,
+            "Experimental USB forwarding is disabled in settings.".to_string(),
+            device_id,
+            bus_id,
+            0,
+            0,
+            None,
+            started_at_ms,
+            Vec::new(),
+            None,
+        );
+    }
+    if !features.usb_descriptor_probe {
+        return usb_probe_result(
+            UsbDescriptorProbeStatus::Failed,
+            "USB descriptor probes are disabled in settings.".to_string(),
+            device_id,
+            bus_id,
+            0,
+            0,
+            None,
+            started_at_ms,
+            Vec::new(),
+            None,
+        );
+    }
     let (request_id, transfer_id, result_rx, event) = {
         let mut state = state.write().await;
         if !is_device_connected(&state, device_id) {
@@ -2610,7 +2714,11 @@ async fn handle_network_message(
             if let Err(error) = result {
                 tracing::debug!("Failed to answer latency probe from {}: {}", from, error);
             }
-            if endpoint_switch {
+            let allow_endpoint_switch = {
+                let state = state.read().await;
+                state.features.auto_endpoint_latency_probe
+            };
+            if endpoint_switch && allow_endpoint_switch {
                 start_endpoint_switch_latency_probe(
                     network_manager,
                     state,
@@ -2710,6 +2818,34 @@ async fn handle_network_message(
             source_device_id,
             format,
         } => {
+            let audio_forwarding_enabled = {
+                let state = state.read().await;
+                state.features.audio_forwarding
+            };
+            if !audio_forwarding_enabled {
+                let message = "Audio forwarding is disabled in settings.".to_string();
+                let event = {
+                    let mut state = state.write().await;
+                    state.local_controls.audio_stream_state.active = false;
+                    state.local_controls.audio_stream_state.last_error = Some(message.clone());
+                    let mut payload = BTreeMap::new();
+                    payload.insert("stream_id".to_string(), stream_id.to_string());
+                    payload.insert("source_device_id".to_string(), source_device_id.to_string());
+                    record_audio_diagnostic_event(
+                        &mut state,
+                        "render_disabled",
+                        message.clone(),
+                        payload,
+                    )
+                };
+                let _ = local_events_tx.send(event);
+                let _ = network_manager
+                    .lock()
+                    .await
+                    .send_to(&from, Message::AudioStreamError { stream_id, message })
+                    .await;
+                return;
+            }
             let render_result = audio_runtime.start_render(stream_id, format.clone());
             let event = {
                 let mut state = state.write().await;
@@ -2763,6 +2899,13 @@ async fn handle_network_message(
             let _ = local_events_tx.send(event);
         }
         Message::AudioFrame { frame } => {
+            let audio_forwarding_enabled = {
+                let state = state.read().await;
+                state.features.audio_forwarding
+            };
+            if !audio_forwarding_enabled {
+                return;
+            }
             let render_result = audio_runtime.push_frame(&frame);
             let event = {
                 let mut state = state.write().await;
@@ -2856,6 +2999,13 @@ async fn handle_network_message(
             let _ = local_events_tx.send(event);
         }
         Message::UsbDeviceAttached { device } => {
+            let accept_usb_advertisements = {
+                let state = state.read().await;
+                state.features.usb_advertising_enabled()
+            };
+            if !accept_usb_advertisements {
+                return;
+            }
             let event = {
                 let mut state = state.write().await;
                 upsert_remote_usb_device(&mut state, from, device)
@@ -2863,6 +3013,13 @@ async fn handle_network_message(
             let _ = local_events_tx.send(event);
         }
         Message::UsbDeviceDetached { bus_id, reason } => {
+            let accept_usb_advertisements = {
+                let state = state.read().await;
+                state.features.usb_advertising_enabled()
+            };
+            if !accept_usb_advertisements {
+                return;
+            }
             let event = {
                 let mut state = state.write().await;
                 remove_remote_usb_device(&mut state, from, &bus_id, &reason)
@@ -2870,6 +3027,20 @@ async fn handle_network_message(
             let _ = local_events_tx.send(event);
         }
         Message::UsbTransfer { transfer } => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                send_usb_error(
+                    network_manager,
+                    from,
+                    Some(transfer.bus_id),
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+                .await;
+                return;
+            }
             let result = {
                 let mut runtime = usb_runtime.lock().await;
                 runtime.submit_transfer(&transfer)
@@ -2969,6 +3140,20 @@ async fn handle_network_message(
             complete_pending_usb_error(state, local_events_tx, from, bus_id, message).await;
         }
         Message::UsbDeviceClaimRequest { request } => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                send_usb_error(
+                    network_manager,
+                    from,
+                    Some(request.bus_id),
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+                .await;
+                return;
+            }
             let response = {
                 let mut runtime = usb_runtime.lock().await;
                 runtime.claim_device(request)
@@ -3112,6 +3297,20 @@ async fn handle_network_message(
             bus_id,
             reason,
         } => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                send_usb_error(
+                    network_manager,
+                    from,
+                    Some(bus_id),
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+                .await;
+                return;
+            }
             let result = {
                 let mut runtime = usb_runtime.lock().await;
                 runtime.release_device(session_id)
@@ -3134,6 +3333,20 @@ async fn handle_network_message(
             bus_id,
             reset_kind,
         } => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                send_usb_error(
+                    network_manager,
+                    from,
+                    Some(bus_id),
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+                .await;
+                return;
+            }
             let result = {
                 let mut runtime = usb_runtime.lock().await;
                 runtime.reset_device(session_id, &bus_id, reset_kind)
@@ -3147,6 +3360,20 @@ async fn handle_network_message(
             bus_id,
             reason,
         } => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                send_usb_error(
+                    network_manager,
+                    from,
+                    Some(bus_id),
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+                .await;
+                return;
+            }
             let result = {
                 let mut runtime = usb_runtime.lock().await;
                 runtime.cancel_transfer(transfer_id, &bus_id)
@@ -3374,7 +3601,7 @@ async fn set_audio_output_volume(
         Ok(()) => {
             let event = {
                 let mut state = state.write().await;
-                refresh_platform_local_controls(&mut state.local_controls);
+                state.refresh_local_controls_platform();
                 let mut payload = BTreeMap::new();
                 payload.insert("endpoint_id".to_string(), endpoint_id);
                 payload.insert(
@@ -3412,7 +3639,7 @@ async fn set_audio_output_mute(
         Ok(()) => {
             let event = {
                 let mut state = state.write().await;
-                refresh_platform_local_controls(&mut state.local_controls);
+                state.refresh_local_controls_platform();
                 let mut payload = BTreeMap::new();
                 payload.insert("endpoint_id".to_string(), endpoint_id);
                 payload.insert("muted".to_string(), muted.to_string());
@@ -3446,7 +3673,7 @@ async fn set_default_audio_output(
         Ok(()) => {
             let event = {
                 let mut state = state.write().await;
-                refresh_platform_local_controls(&mut state.local_controls);
+                state.refresh_local_controls_platform();
                 let mut payload = BTreeMap::new();
                 payload.insert("endpoint_id".to_string(), endpoint_id);
                 record_audio_diagnostic_event(
@@ -3606,6 +3833,14 @@ async fn start_audio_capture(
     source: LocalAudioCaptureSource,
     endpoint_id: Option<String>,
 ) -> DaemonResponse {
+    let audio_capture_enabled = {
+        let state = state.read().await;
+        state.features.audio_capture
+    };
+    if !audio_capture_enabled {
+        return DaemonResponse::Error("Audio capture is disabled in settings.".to_string());
+    }
+
     let stream_id = DeviceId::new_v4();
     let endpoint_name = {
         let state = state.read().await;
@@ -3704,6 +3939,17 @@ async fn start_audio_forwarding(
     source: LocalAudioCaptureSource,
     endpoint_id: Option<String>,
 ) -> DaemonResponse {
+    let features = {
+        let state = state.read().await;
+        state.features.clone()
+    };
+    if !features.audio_capture {
+        return DaemonResponse::Error("Audio capture is disabled in settings.".to_string());
+    }
+    if !features.audio_forwarding {
+        return DaemonResponse::Error("Audio forwarding is disabled in settings.".to_string());
+    }
+
     let (target, source_device_id) = {
         let state = state.read().await;
         (
@@ -3901,7 +4147,13 @@ async fn stop_audio_forwarding(
 async fn run_audio_test(state: &Arc<RwLock<DaemonState>>) -> LocalAudioTestResult {
     let (input_count, output_count) = {
         let mut state = state.write().await;
-        refresh_platform_local_controls(&mut state.local_controls);
+        if !state.features.audio_capture && !state.features.audio_forwarding {
+            return LocalAudioTestResult::failed(
+                LocalAudioTestStatus::DeviceUnavailable,
+                "Audio capture and forwarding are disabled in settings.",
+            );
+        }
+        state.refresh_local_controls_platform();
         (
             state.local_controls.audio_inputs.len(),
             state.local_controls.audio_outputs.len(),
@@ -4440,6 +4692,8 @@ async fn main() -> Result<()> {
         27432,
         pid,
     ));
+    daemon_state.features = RuntimeFeatureConfig::from_config(&config);
+    daemon_state.refresh_local_controls_platform();
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
     let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
     if should_save_runtime_layout {
@@ -4617,11 +4871,14 @@ async fn main() -> Result<()> {
                         }
                     }
                     NetworkEvent::DeviceConnected(id) => {
-                        {
+                        let should_advertise_usb = {
                             let mut state = state.write().await;
                             state.mark_connected(&id, true);
+                            state.features.usb_advertising_enabled()
+                        };
+                        if should_advertise_usb {
+                            advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
-                        advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                     }
                     NetworkEvent::DeviceDisconnected(id) => {
                         let mut state = state.write().await;
@@ -4787,7 +5044,7 @@ async fn handle_local_controls_ws_client(
     let mut websocket = accept_async(stream).await?;
     let snapshot = {
         let mut state = state.write().await;
-        refresh_platform_local_controls(&mut state.local_controls);
+        state.refresh_local_controls_platform();
         state.local_control_snapshot()
     };
     websocket
@@ -4909,13 +5166,25 @@ async fn handle_ipc_client(
                 Err(err) => DaemonResponse::Error(err.to_string()),
             }
         }
-        DaemonRequest::ListUsbDevices => match usb_runtime.lock().await.enumerate_devices() {
-            Ok(devices) => DaemonResponse::UsbDevices(devices),
-            Err(error) => DaemonResponse::Error(error.to_string()),
-        },
+        DaemonRequest::ListUsbDevices => {
+            let usb_enabled = {
+                let state = state.read().await;
+                state.features.usb_forwarding_experimental
+            };
+            if !usb_enabled {
+                DaemonResponse::Error(
+                    "Experimental USB forwarding is disabled in settings.".to_string(),
+                )
+            } else {
+                match usb_runtime.lock().await.enumerate_devices() {
+                    Ok(devices) => DaemonResponse::UsbDevices(devices),
+                    Err(error) => DaemonResponse::Error(error.to_string()),
+                }
+            }
+        }
         DaemonRequest::LocalControls => {
             let mut state = state.write().await;
-            refresh_platform_local_controls(&mut state.local_controls);
+            state.refresh_local_controls_platform();
             DaemonResponse::LocalControls(state.local_control_snapshot())
         }
         DaemonRequest::RunLocalInputTest { test } => {
