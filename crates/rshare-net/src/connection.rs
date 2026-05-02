@@ -101,6 +101,8 @@ fn spawn_message_reader(
                 break;
             }
         }
+
+        let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
     });
 }
 
@@ -203,17 +205,20 @@ impl ConnectionManager {
 
                 self.pool.insert(device_id, conn).await;
 
-                let _ = self.event_tx.send(ManagerEvent::Connected(device_id));
+                let _ = self.event_tx.send(ManagerEvent::Connected(device_id)).await;
 
                 Ok(())
             }
             Err(e) => {
                 self.update_connection_state(device_id, ConnectionState::Error);
                 self.connections.remove(&device_id);
-                let _ = self.event_tx.send(ManagerEvent::Error {
-                    device_id,
-                    error: e.to_string(),
-                });
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        device_id,
+                        error: e.to_string(),
+                    })
+                    .await;
                 Err(e)
             }
         }
@@ -222,7 +227,10 @@ impl ConnectionManager {
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
         if self.connections.remove(device_id).is_some() {
             self.pool.remove(device_id).await;
-            let _ = self.event_tx.send(ManagerEvent::Disconnected(*device_id));
+            let _ = self
+                .event_tx
+                .send(ManagerEvent::Disconnected(*device_id))
+                .await;
         }
         Ok(())
     }
@@ -308,12 +316,15 @@ async fn receive_incoming_handshake(
 ) -> Result<(DeviceId, Option<Message>)> {
     match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
         Ok(Ok(Message::Hello {
+            app_id,
             device_id,
             device_name: _,
             hostname: _,
             protocol_version,
             ..
-        })) if protocol_version == PROTOCOL_VERSION => {
+        })) if protocol_version == PROTOCOL_VERSION
+            && app_id.eq_ignore_ascii_case(rshare_core::DISCOVERY_APP_ID) =>
+        {
             conn.send_message(&hello_back_message(
                 local_device_id,
                 "R-ShareMouse".to_string(),
@@ -352,10 +363,15 @@ async fn perform_outbound_handshake(
 
     match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
         Ok(Ok(Message::HelloBack {
+            app_id,
             device_id,
             protocol_version,
             ..
-        })) if protocol_version == PROTOCOL_VERSION => OutboundHandshake::HelloBack { device_id },
+        })) if protocol_version == PROTOCOL_VERSION
+            && app_id.eq_ignore_ascii_case(rshare_core::DISCOVERY_APP_ID) =>
+        {
+            OutboundHandshake::HelloBack { device_id }
+        }
         Ok(Ok(message)) => OutboundHandshake::Prefetched(message),
         Ok(Err(error)) => OutboundHandshake::Unavailable(error),
         Err(_) => OutboundHandshake::Unavailable(anyhow::anyhow!("Handshake timed out")),
@@ -382,6 +398,81 @@ mod tests {
     async fn test_manager_new() {
         let manager = ConnectionManager::new(DeviceId::new_v4());
         assert_eq!(manager.connected_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn message_reader_emits_disconnected_when_channel_closes() {
+        let device_id = DeviceId::new_v4();
+        let (_message_tx, message_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        spawn_message_reader(device_id, message_rx, None, event_tx);
+        drop(_message_tx);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(event, ManagerEvent::Disconnected(id) if id == device_id));
+    }
+
+    #[tokio::test]
+    async fn outbound_connect_failure_emits_error_event() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+
+        assert!(manager
+            .connect(remote_id, &address.to_string())
+            .await
+            .is_err());
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event,
+            ManagerEvent::Error {
+                device_id,
+                error: _
+            } if device_id == remote_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_emits_disconnected_event() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut manager = ConnectionManager::new(local_id);
+        manager.connections.insert(
+            remote_id,
+            ConnectionInfo {
+                device_id: remote_id,
+                address: "127.0.0.1:27431".to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+            },
+        );
+        let mut events = manager.events().unwrap();
+
+        manager.disconnect(&remote_id).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(event, ManagerEvent::Disconnected(id) if id == remote_id));
     }
 
     #[tokio::test]
@@ -518,11 +609,23 @@ mod tests {
         });
 
         let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
         manager
             .connect(remote_id, &address.to_string())
             .await
             .unwrap();
 
+        let connected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ManagerEvent::Connected(device_id) = events.recv().await.unwrap() {
+                    break device_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(connected, remote_id);
         assert!(manager.is_connected(&remote_id));
     }
 }

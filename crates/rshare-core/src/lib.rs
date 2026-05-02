@@ -19,9 +19,10 @@ pub mod session;
 
 // Re-exports from protocol
 pub use protocol::{
-    heartbeat_message, hello_back_message, hello_message, timestamp_ms, ButtonState,
-    DeviceCapabilities, DeviceId, Direction, GamepadButton, GamepadButtonState, GamepadDeviceInfo,
-    GamepadState, KeyState, Message, MouseButton, Priority, ScreenInfo,
+    heartbeat_message, hello_back_message, hello_message, timestamp_ms, AudioFormat,
+    AudioFramePayload, AudioSampleFormat, ButtonState, DeviceCapabilities, DeviceId, Direction,
+    GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, KeyState, Message,
+    MouseButton, Priority, ScreenInfo, DISCOVERY_APP_ID,
 };
 
 // Re-exports from device
@@ -43,11 +44,13 @@ pub use ipc::{
 
 // Re-exports from local control diagnostics
 pub use local_controls::{
-    LocalBackendDiagnosticState, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
-    LocalDriverDiagnosticState, LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind,
-    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, LocalInputTestStatus, LocalKeyboardState, LocalMouseState,
-    LocalVirtualGamepadState,
+    LocalAudioCaptureSource, LocalAudioCaptureState, LocalAudioCaptureStatus,
+    LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioStreamState,
+    LocalAudioTestRequest, LocalAudioTestResult, LocalAudioTestStatus, LocalBackendDiagnosticState,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalDriverDiagnosticState,
+    LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    LocalInputTestStatus, LocalKeyboardState, LocalMouseState, LocalVirtualGamepadState,
 };
 
 // Re-exports from input_mode

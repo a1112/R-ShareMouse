@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant};
 
-use rshare_core::{hello_back_message, hello_message, DeviceId, Message, ScreenInfo};
+use rshare_core::{
+    hello_back_message, hello_message, DeviceId, Message, ScreenInfo, DISCOVERY_APP_ID,
+};
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -57,11 +59,12 @@ impl DiscoveredDevice {
     fn from_message(addr: SocketAddr, msg: &Message) -> Option<Self> {
         match msg {
             Message::Hello {
+                app_id,
                 device_id,
                 device_name,
                 hostname,
                 ..
-            } => Some(Self {
+            } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
                 name: device_name.clone(),
                 hostname: hostname.clone(),
@@ -70,12 +73,13 @@ impl DiscoveredDevice {
                 last_seen: Instant::now(),
             }),
             Message::HelloBack {
+                app_id,
                 device_id,
                 device_name,
                 hostname,
                 screen_info,
                 ..
-            } => Some(Self {
+            } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
                 name: device_name.clone(),
                 hostname: hostname.clone(),
@@ -284,6 +288,10 @@ impl ServiceDiscovery {
     ) -> Result<()> {
         // Parse the incoming message
         let msg = deserialize_message(data)?;
+        if !is_rshare_discovery_packet(&msg) {
+            tracing::trace!("Ignoring discovery packet for another application namespace");
+            return Ok(());
+        }
 
         // Ignore messages from ourselves
         let sender_id = match &msg {
@@ -517,6 +525,20 @@ fn deserialize_message(data: &[u8]) -> Result<Message> {
     serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
 }
 
+fn is_rshare_discovery_packet(msg: &Message) -> bool {
+    match msg {
+        Message::Hello { app_id, .. } | Message::HelloBack { app_id, .. } => {
+            is_rshare_discovery_app(app_id)
+        }
+        Message::Goodbye { .. } => true,
+        _ => true,
+    }
+}
+
+fn is_rshare_discovery_app(app_id: &str) -> bool {
+    app_id.eq_ignore_ascii_case(DISCOVERY_APP_ID)
+}
+
 /// Create a broadcast address for discovery
 pub fn broadcast_address(port: u16) -> SocketAddr {
     format!("255.255.255.255:{}", port)
@@ -665,7 +687,12 @@ mod tests {
 
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            Message::Hello { device_name, .. } => {
+            Message::Hello {
+                app_id,
+                device_name,
+                ..
+            } => {
+                assert_eq!(app_id, DISCOVERY_APP_ID);
                 assert_eq!(device_name, "Test");
             }
             _ => panic!("Wrong message type"),
@@ -723,6 +750,34 @@ mod tests {
             rx.recv().await,
             Some(DiscoveryEvent::DeviceLost(id)) if id == remote_id
         ));
+    }
+
+    #[tokio::test]
+    async fn ignores_packets_for_other_app_namespace() {
+        let local_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut discovery =
+            ServiceDiscovery::new(local_id, "Test".to_string(), "test-host".to_string());
+        let (tx, mut rx) = mpsc::channel(4);
+        discovery.event_tx = Some(tx);
+
+        let hello = Message::Hello {
+            app_id: "another-app".to_string(),
+            device_id: remote_id,
+            device_name: "Remote".to_string(),
+            hostname: "remote-host".to_string(),
+            protocol_version: 1,
+            capabilities: Default::default(),
+        };
+        let bytes = serialize_message(&hello).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        discovery
+            .handle_packet(&bytes, "127.0.0.1:27432".parse().unwrap(), &socket)
+            .await
+            .unwrap();
+
+        assert!(discovery.get_device(&remote_id).is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

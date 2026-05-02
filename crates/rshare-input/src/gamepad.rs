@@ -286,6 +286,8 @@ fn map_button(button: Button) -> Option<GamepadButton> {
         Button::North => GamepadButton::North,
         Button::LeftTrigger => GamepadButton::LeftBumper,
         Button::RightTrigger => GamepadButton::RightBumper,
+        Button::LeftTrigger2 => GamepadButton::LeftTrigger,
+        Button::RightTrigger2 => GamepadButton::RightTrigger,
         Button::Select => GamepadButton::Select,
         Button::Start => GamepadButton::Start,
         Button::Mode => GamepadButton::Guide,
@@ -343,6 +345,14 @@ mod tests {
         assert_eq!(
             map_button(Button::LeftTrigger),
             Some(GamepadButton::LeftBumper)
+        );
+        assert_eq!(
+            map_button(Button::LeftTrigger2),
+            Some(GamepadButton::LeftTrigger)
+        );
+        assert_eq!(
+            map_button(Button::RightTrigger2),
+            Some(GamepadButton::RightTrigger)
         );
         assert_eq!(
             map_button(Button::DPadRight),

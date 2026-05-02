@@ -169,6 +169,16 @@ pub async fn request_local_input_test(test: LocalInputTestRequest) -> Result<Loc
     }
 }
 
+pub async fn request_remote_latency_test(
+    device_id: crate::DeviceId,
+) -> Result<LocalInputTestResult> {
+    match send_request(DaemonRequest::RunRemoteLatencyTest { device_id }).await? {
+        DaemonResponse::LocalInputTest(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
 pub async fn subscribe_local_controls() -> Result<TcpStream> {
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await

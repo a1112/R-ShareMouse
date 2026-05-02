@@ -180,6 +180,14 @@ async fn run_local_input_test(kind: String) -> Result<LocalInputTestResult, Stri
 }
 
 #[tauri::command]
+async fn run_remote_latency_test(device_id: String) -> Result<LocalInputTestResult, String> {
+    let device_id = parse_device_id(&device_id)?;
+    daemon_client::request_remote_latency_test(device_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
     let state = app.state::<LocalControlStreamState>();
     if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
@@ -489,6 +497,7 @@ fn main() {
             start_local_controls_stream,
             stop_local_controls_stream,
             run_local_input_test,
+            run_remote_latency_test,
             minimize_window,
             toggle_maximize_window,
             close_window,

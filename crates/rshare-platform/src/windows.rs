@@ -8,19 +8,53 @@ cfg_if::cfg_if! {
 
 #[cfg(windows)]
 mod windows_impl {
+    use ::windows::{
+        core::{BSTR, HSTRING, PWSTR},
+        Win32::{
+            Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
+            Media::Audio::Endpoints::IAudioEndpointVolume,
+            Media::Audio::{
+                eCapture, eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+                DEVICE_STATE_ACTIVE,
+            },
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+                COINIT_MULTITHREADED, STGM_READ,
+            },
+        },
+    };
     use anyhow::{Context, Result};
-    use rshare_core::LocalHardwareDevice;
+    use rshare_core::{
+        LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalHardwareDevice,
+    };
     use std::cell::RefCell;
     use std::fmt;
     use std::mem::size_of;
-    use std::sync::{mpsc, Arc};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     type WindowsInputCallback = Arc<dyn Fn(WindowsInputEvent) + Send + Sync + 'static>;
 
+    static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
     thread_local! {
         static WINDOWS_HOOK_CALLBACK: RefCell<Option<WindowsInputCallback>> = RefCell::new(None);
+    }
+
+    /// Enable or disable local input suppression for low-level Windows hooks.
+    ///
+    /// When enabled, non-injected keyboard events and mouse button/wheel events are
+    /// captured for forwarding but not delivered to the local desktop.
+    pub fn set_local_input_suppressed(suppressed: bool) {
+        LOCAL_INPUT_SUPPRESSED.store(suppressed, Ordering::SeqCst);
+    }
+
+    pub fn local_input_suppressed() -> bool {
+        LOCAL_INPUT_SUPPRESSED.load(Ordering::SeqCst)
     }
 
     #[derive(Debug)]
@@ -163,6 +197,285 @@ mod windows_impl {
             .map(|part| part.replace('&', " "))
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| format!("{kind} {}", index + 1))
+    }
+
+    /// Enumerate active Windows audio render endpoints through Core Audio.
+    pub fn enumerate_audio_output_devices() -> Result<Vec<LocalAudioOutputDevice>> {
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            hr.ok().context("CoInitializeEx for Core Audio failed")?;
+            let _com_guard = ComApartmentGuard;
+
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .context("Core Audio MMDeviceEnumerator is unavailable")?;
+            let default_endpoint_id = default_render_endpoint_id(&enumerator);
+            let collection = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .context("Core Audio output endpoint enumeration failed")?;
+            let count = collection
+                .GetCount()
+                .context("Core Audio endpoint count query failed")?;
+            let mut outputs = Vec::with_capacity(count as usize);
+
+            for index in 0..count {
+                let device = collection
+                    .Item(index)
+                    .with_context(|| format!("Core Audio endpoint {index} lookup failed"))?;
+                let endpoint_id = device_endpoint_id(&device)
+                    .unwrap_or_else(|| format!("core-audio-output-{index}"));
+                let name = device_friendly_name(&device)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| format!("Audio Output {}", index + 1));
+                let volume = endpoint_volume_state(&device);
+                let default = default_endpoint_id
+                    .as_deref()
+                    .map(|default_id| default_id == endpoint_id)
+                    .unwrap_or(index == 0);
+
+                outputs.push(LocalAudioOutputDevice {
+                    id: format!("core-audio:{}", stable_audio_endpoint_token(&endpoint_id)),
+                    name,
+                    endpoint_id: Some(endpoint_id),
+                    source: "Windows Core Audio".to_string(),
+                    connected: true,
+                    default,
+                    muted: volume.as_ref().and_then(|state| state.muted),
+                    volume_percent: volume.as_ref().and_then(|state| state.volume_percent),
+                    channel_count: volume.and_then(|state| state.channel_count),
+                    driver_detail: Some("IMMDeviceEnumerator + IAudioEndpointVolume".to_string()),
+                });
+            }
+
+            outputs.sort_by(|left, right| {
+                right
+                    .default
+                    .cmp(&left.default)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+
+            Ok(outputs)
+        }
+    }
+
+    /// Enumerate active Windows audio capture endpoints plus loopback entries for render endpoints.
+    pub fn enumerate_audio_input_devices() -> Result<Vec<LocalAudioInputDevice>> {
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            hr.ok().context("CoInitializeEx for Core Audio failed")?;
+            let _com_guard = ComApartmentGuard;
+
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .context("Core Audio MMDeviceEnumerator is unavailable")?;
+            let default_capture_endpoint_id = default_capture_endpoint_id(&enumerator);
+            let collection = enumerator
+                .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+                .context("Core Audio input endpoint enumeration failed")?;
+            let count = collection
+                .GetCount()
+                .context("Core Audio input endpoint count query failed")?;
+            let mut inputs = Vec::with_capacity(count as usize);
+
+            for index in 0..count {
+                let device = collection
+                    .Item(index)
+                    .with_context(|| format!("Core Audio input endpoint {index} lookup failed"))?;
+                let endpoint_id = device_endpoint_id(&device)
+                    .unwrap_or_else(|| format!("core-audio-input-{index}"));
+                let name = device_friendly_name(&device)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| format!("Audio Input {}", index + 1));
+                let volume = endpoint_volume_state(&device);
+                let default = default_capture_endpoint_id
+                    .as_deref()
+                    .map(|default_id| default_id == endpoint_id)
+                    .unwrap_or(index == 0);
+
+                inputs.push(LocalAudioInputDevice {
+                    id: format!(
+                        "core-audio-input:{}",
+                        stable_audio_endpoint_token(&endpoint_id)
+                    ),
+                    name,
+                    endpoint_id: Some(endpoint_id),
+                    kind: LocalAudioInputKind::Microphone,
+                    source: "Windows Core Audio".to_string(),
+                    connected: true,
+                    default,
+                    muted: volume.as_ref().and_then(|state| state.muted),
+                    level_peak: 0,
+                    level_rms: 0,
+                    sample_rate: Some(48_000),
+                    channel_count: volume.and_then(|state| state.channel_count),
+                    driver_detail: Some("IMMDeviceEnumerator + IAudioEndpointVolume".to_string()),
+                });
+            }
+
+            for output in enumerate_audio_output_devices()? {
+                let Some(endpoint_id) = output.endpoint_id.clone() else {
+                    continue;
+                };
+                inputs.push(LocalAudioInputDevice {
+                    id: format!(
+                        "core-audio-loopback:{}",
+                        stable_audio_endpoint_token(&endpoint_id)
+                    ),
+                    name: format!("系统声音 ({})", output.name),
+                    endpoint_id: Some(endpoint_id),
+                    kind: LocalAudioInputKind::Loopback,
+                    source: "Windows WASAPI loopback".to_string(),
+                    connected: output.connected,
+                    default: output.default,
+                    muted: output.muted,
+                    level_peak: 0,
+                    level_rms: 0,
+                    sample_rate: Some(48_000),
+                    channel_count: output.channel_count.or(Some(2)),
+                    driver_detail: Some("WASAPI loopback capture endpoint".to_string()),
+                });
+            }
+
+            inputs.sort_by(|left, right| {
+                right
+                    .default
+                    .cmp(&left.default)
+                    .then_with(|| input_kind_rank(left.kind).cmp(&input_kind_rank(right.kind)))
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+
+            Ok(inputs)
+        }
+    }
+
+    pub fn set_audio_output_volume(endpoint_id: &str, volume_percent: u8) -> Result<()> {
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            hr.ok().context("CoInitializeEx for Core Audio failed")?;
+            let _com_guard = ComApartmentGuard;
+            let device = audio_endpoint_by_id(endpoint_id)?;
+            let volume: IAudioEndpointVolume = device
+                .Activate(CLSCTX_ALL, None)
+                .context("Core Audio endpoint volume control is unavailable")?;
+            let scalar = (volume_percent.min(100) as f32) / 100.0;
+            volume
+                .SetMasterVolumeLevelScalar(scalar, std::ptr::null())
+                .context("Core Audio output volume update failed")?;
+            Ok(())
+        }
+    }
+
+    pub fn set_audio_output_mute(endpoint_id: &str, muted: bool) -> Result<()> {
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            hr.ok().context("CoInitializeEx for Core Audio failed")?;
+            let _com_guard = ComApartmentGuard;
+            let device = audio_endpoint_by_id(endpoint_id)?;
+            let volume: IAudioEndpointVolume = device
+                .Activate(CLSCTX_ALL, None)
+                .context("Core Audio endpoint mute control is unavailable")?;
+            volume
+                .SetMute(muted, std::ptr::null())
+                .context("Core Audio output mute update failed")?;
+            Ok(())
+        }
+    }
+
+    pub fn set_default_audio_output(_endpoint_id: &str) -> Result<()> {
+        anyhow::bail!(
+            "Changing the Windows default audio output requires the undocumented PolicyConfig API and is not enabled in this build"
+        )
+    }
+
+    struct ComApartmentGuard;
+
+    impl Drop for ComApartmentGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct AudioEndpointVolumeState {
+        muted: Option<bool>,
+        volume_percent: Option<u8>,
+        channel_count: Option<u32>,
+    }
+
+    unsafe fn default_render_endpoint_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
+        enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .ok()
+            .and_then(|device| device_endpoint_id(&device))
+    }
+
+    unsafe fn default_capture_endpoint_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
+        enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()
+            .and_then(|device| device_endpoint_id(&device))
+    }
+
+    unsafe fn audio_endpoint_by_id(endpoint_id: &str) -> Result<IMMDevice> {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .context("Core Audio MMDeviceEnumerator is unavailable")?;
+        let id = HSTRING::from(endpoint_id);
+        enumerator
+            .GetDevice(&id)
+            .context("Core Audio endpoint lookup failed")
+    }
+
+    unsafe fn device_endpoint_id(device: &IMMDevice) -> Option<String> {
+        let id = device.GetId().ok()?;
+        Some(pwstr_to_string_and_free(id))
+    }
+
+    unsafe fn device_friendly_name(device: &IMMDevice) -> Option<String> {
+        let store = device.OpenPropertyStore(STGM_READ).ok()?;
+        let value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
+        let bstr = BSTR::try_from(&value).ok()?;
+        String::try_from(bstr).ok()
+    }
+
+    unsafe fn endpoint_volume_state(device: &IMMDevice) -> Option<AudioEndpointVolumeState> {
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+        let muted = volume.GetMute().ok().map(|value| value.as_bool());
+        let volume_percent = volume.GetMasterVolumeLevelScalar().ok().map(|value| {
+            let clamped = value.clamp(0.0, 1.0);
+            (clamped * 100.0).round() as u8
+        });
+        let channel_count = volume.GetChannelCount().ok();
+
+        Some(AudioEndpointVolumeState {
+            muted,
+            volume_percent,
+            channel_count,
+        })
+    }
+
+    unsafe fn pwstr_to_string_and_free(value: PWSTR) -> String {
+        let text = value.to_string().unwrap_or_default();
+        if !value.0.is_null() {
+            CoTaskMemFree(Some(value.0.cast()));
+        }
+        text
+    }
+
+    fn stable_audio_endpoint_token(endpoint_id: &str) -> String {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in endpoint_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    fn input_kind_rank(kind: LocalAudioInputKind) -> u8 {
+        match kind {
+            LocalAudioInputKind::Microphone => 0,
+            LocalAudioInputKind::Loopback => 1,
+        }
     }
 
     /// Input event captured by the native Windows low-level hooks.
@@ -791,7 +1104,11 @@ mod windows_impl {
     unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: usize, l_param: isize) -> isize {
         if code == HC_ACTION {
             if let Some(event) = unsafe { mouse_event_from_hook(w_param, l_param) } {
+                let suppress = should_suppress_local_event(&event);
                 dispatch_hook_event(event);
+                if suppress {
+                    return 1;
+                }
             }
         }
 
@@ -805,11 +1122,28 @@ mod windows_impl {
     ) -> isize {
         if code == HC_ACTION {
             if let Some(event) = unsafe { keyboard_event_from_hook(w_param, l_param) } {
+                let suppress = should_suppress_local_event(&event);
                 dispatch_hook_event(event);
+                if suppress {
+                    return 1;
+                }
             }
         }
 
         CallNextHookEx(0, code, w_param, l_param)
+    }
+
+    fn should_suppress_local_event(event: &WindowsInputEvent) -> bool {
+        if !local_input_suppressed() {
+            return false;
+        }
+
+        matches!(
+            event,
+            WindowsInputEvent::Key { .. }
+                | WindowsInputEvent::MouseButton { .. }
+                | WindowsInputEvent::MouseWheel { .. }
+        )
     }
 
     fn dispatch_hook_event(event: WindowsInputEvent) {
@@ -1692,6 +2026,13 @@ mod windows_impl {
         if ok == 0 || screens.is_empty() {
             return vec![WindowsInputListener::get_screen_info()];
         }
+        if screens.len() == 1 {
+            // GetMonitorInfoW may report DPI-virtualized logical pixels when the
+            // process is launched without full DPI awareness. For the single
+            // display case, prefer the physical device caps path used by the
+            // primary screen probe so diagnostics show the real panel size.
+            return vec![WindowsInputListener::get_screen_info()];
+        }
 
         screens.sort_by_key(|(primary, screen)| (!*primary, screen.x, screen.y));
         screens.into_iter().map(|(_, screen)| screen).collect()
@@ -1972,6 +2313,37 @@ mod windows_impl {
             };
 
             assert_eq!(convert_keyboard_hook_event(WM_KEYDOWN, &event), None);
+        }
+
+        #[test]
+        fn suppresses_keyboard_and_clicks_but_not_mouse_move() {
+            set_local_input_suppressed(true);
+
+            assert!(should_suppress_local_event(&WindowsInputEvent::Key {
+                vk: vk::VK_LWIN as u32,
+                down: true,
+            }));
+            assert!(should_suppress_local_event(
+                &WindowsInputEvent::MouseButton {
+                    button: 1,
+                    down: true,
+                }
+            ));
+            assert!(should_suppress_local_event(
+                &WindowsInputEvent::MouseWheel {
+                    delta_x: 0,
+                    delta_y: 1,
+                }
+            ));
+            assert!(!should_suppress_local_event(
+                &WindowsInputEvent::MouseMove { x: 1, y: 2 }
+            ));
+
+            set_local_input_suppressed(false);
+            assert!(!should_suppress_local_event(&WindowsInputEvent::Key {
+                vk: vk::VK_LWIN as u32,
+                down: true,
+            }));
         }
 
         #[derive(Default)]

@@ -4,9 +4,10 @@ use rshare_core::{
         DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
-    BackgroundProcessOwner, BackgroundRunMode, LocalControlDeviceSnapshot, LocalInputDeviceKind,
-    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
-    TrayRuntimeState,
+    BackgroundProcessOwner, BackgroundRunMode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
+    LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
+    LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
 };
 use std::collections::BTreeMap;
 use tokio::io::duplex;
@@ -52,6 +53,38 @@ async fn local_control_requests_round_trip_over_json_lines() {
 }
 
 #[tokio::test]
+async fn audio_control_requests_round_trip_over_json_lines() {
+    let requests = [
+        DaemonRequest::SetAudioOutputVolume {
+            endpoint_id: "endpoint-1".to_string(),
+            volume_percent: 42,
+        },
+        DaemonRequest::SetAudioOutputMute {
+            endpoint_id: "endpoint-1".to_string(),
+            muted: true,
+        },
+        DaemonRequest::StartAudioCapture {
+            source: LocalAudioCaptureSource::Loopback,
+            endpoint_id: Some("endpoint-1".to_string()),
+        },
+        DaemonRequest::StartAudioForwarding {
+            source: LocalAudioCaptureSource::Microphone,
+            endpoint_id: None,
+        },
+        DaemonRequest::RunAudioTest {
+            test: LocalAudioTestRequest::default(),
+        },
+    ];
+
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        assert_eq!(decoded, request);
+    }
+}
+
+#[tokio::test]
 async fn daemon_responses_round_trip_device_payloads() {
     let (mut writer, mut reader) = duplex(4096);
     let response = DaemonResponse::Devices(vec![DaemonDeviceSnapshot {
@@ -75,6 +108,30 @@ async fn local_control_response_round_trips_snapshot_payload() {
     let mut snapshot = LocalControlDeviceSnapshot::default();
     snapshot.keyboard.detected = true;
     snapshot.keyboard.last_key = Some("ShiftLeft".to_string());
+    snapshot.audio_outputs.push(LocalAudioOutputDevice {
+        id: "audio-default".to_string(),
+        name: "Speakers".to_string(),
+        source: "Windows Core Audio".to_string(),
+        connected: true,
+        default: true,
+        volume_percent: Some(42),
+        muted: Some(false),
+        ..LocalAudioOutputDevice::default()
+    });
+    snapshot.audio_inputs.push(LocalAudioInputDevice {
+        id: "loopback-default".to_string(),
+        name: "System sound".to_string(),
+        source: "Windows WASAPI loopback".to_string(),
+        kind: LocalAudioInputKind::Loopback,
+        connected: true,
+        default: true,
+        level_peak: 7,
+        level_rms: 3,
+        sample_rate: Some(48_000),
+        channel_count: Some(2),
+        ..LocalAudioInputDevice::default()
+    });
+    snapshot.audio_capture_state.status = LocalAudioCaptureStatus::CapturingLocal;
     let response = DaemonResponse::LocalControls(snapshot.clone());
 
     write_json_line(&mut writer, &response).await.unwrap();
@@ -95,6 +152,13 @@ fn local_control_snapshot_defaults_missing_fields_to_safe_values() {
     assert_eq!(snapshot.driver.status, "unavailable");
     assert!(snapshot.driver.device_path.is_none());
     assert!(snapshot.keyboard_devices.is_empty());
+    assert!(snapshot.audio_inputs.is_empty());
+    assert!(snapshot.audio_outputs.is_empty());
+    assert_eq!(
+        snapshot.audio_capture_state.status,
+        LocalAudioCaptureStatus::Idle
+    );
+    assert!(!snapshot.audio_stream_state.active);
 }
 
 #[test]

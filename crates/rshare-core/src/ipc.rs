@@ -7,9 +7,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
-    DeviceId, LayoutGraph, LocalControlDeviceSnapshot, LocalInputDiagnosticEvent,
-    LocalInputTestRequest, LocalInputTestResult, PrivilegeState, ResolvedInputMode,
-    TrayRuntimeState,
+    DeviceId, LayoutGraph, LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
+    LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
+    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -135,13 +135,48 @@ pub struct DaemonDeviceSnapshot {
 pub enum DaemonRequest {
     Status,
     Devices,
-    Connect { device_id: DeviceId },
-    Disconnect { device_id: DeviceId },
+    Connect {
+        device_id: DeviceId,
+    },
+    Disconnect {
+        device_id: DeviceId,
+    },
     GetLayout,
-    SetLayout { layout: LayoutGraph },
+    SetLayout {
+        layout: LayoutGraph,
+    },
     LocalControls,
     SubscribeLocalControls,
-    RunLocalInputTest { test: LocalInputTestRequest },
+    RunLocalInputTest {
+        test: LocalInputTestRequest,
+    },
+    RunRemoteLatencyTest {
+        device_id: DeviceId,
+    },
+    SetAudioDefaultOutput {
+        endpoint_id: String,
+    },
+    SetAudioOutputVolume {
+        endpoint_id: String,
+        volume_percent: u8,
+    },
+    SetAudioOutputMute {
+        endpoint_id: String,
+        muted: bool,
+    },
+    StartAudioCapture {
+        source: LocalAudioCaptureSource,
+        endpoint_id: Option<String>,
+    },
+    StopAudioCapture,
+    StartAudioForwarding {
+        source: LocalAudioCaptureSource,
+        endpoint_id: Option<String>,
+    },
+    StopAudioForwarding,
+    RunAudioTest {
+        test: LocalAudioTestRequest,
+    },
     Shutdown,
 }
 
@@ -154,6 +189,7 @@ pub enum DaemonResponse {
     LocalControls(LocalControlDeviceSnapshot),
     LocalControlEvent(LocalInputDiagnosticEvent),
     LocalInputTest(LocalInputTestResult),
+    LocalAudioTest(LocalAudioTestResult),
     Ack,
     Error(String),
 }

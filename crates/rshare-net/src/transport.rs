@@ -296,6 +296,8 @@ impl ConnectionPool {
         let conns = self.connections.lock().await;
         if let Some(conn) = conns.get(device_id) {
             conn.send_message(message).await?;
+        } else {
+            anyhow::bail!("No active connection for device {}", device_id);
         }
         Ok(())
     }
@@ -361,6 +363,22 @@ mod tests {
     fn test_connection_pool() {
         let pool = ConnectionPool::new(DeviceId::new_v4());
         assert_eq!(pool.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_pool_send_to_missing_connection_returns_error() {
+        let pool = ConnectionPool::new(DeviceId::new_v4());
+        let missing_id = DeviceId::new_v4();
+
+        let result = pool
+            .send_to(&missing_id, &Message::MouseMove { x: 1, y: 2 })
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No active connection"));
     }
 
     #[tokio::test]

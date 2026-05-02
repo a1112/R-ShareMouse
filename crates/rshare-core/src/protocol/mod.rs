@@ -6,11 +6,16 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::local_controls::LocalInputDiagnosticEvent;
+
 /// Device identifier
 pub type DeviceId = Uuid;
 
 /// Protocol version
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Application namespace for LAN discovery and handshake packets.
+pub const DISCOVERY_APP_ID: &str = "rsharemouse";
 
 /// Message priority for transmission ordering
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -169,6 +174,14 @@ pub struct DeviceCapabilities {
     #[serde(default)]
     pub supports_gamepad_inject: bool,
     #[serde(default)]
+    pub supports_audio_capture: bool,
+    #[serde(default)]
+    pub supports_audio_output_control: bool,
+    #[serde(default)]
+    pub supports_audio_forwarding: bool,
+    #[serde(default)]
+    pub audio_formats: Vec<AudioFormat>,
+    #[serde(default)]
     pub max_gamepads: u8,
     #[serde(default = "default_max_devices")]
     pub max_devices: u32,
@@ -189,10 +202,47 @@ impl Default for DeviceCapabilities {
             supports_hotkeys: true,
             supports_gamepad_capture: false,
             supports_gamepad_inject: false,
+            supports_audio_capture: false,
+            supports_audio_output_control: false,
+            supports_audio_forwarding: false,
+            audio_formats: Vec::new(),
             max_gamepads: 0,
             max_devices: 16,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFormat {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub sample_format: AudioSampleFormat,
+    pub frame_ms: u16,
+}
+
+impl AudioFormat {
+    pub fn pcm_i16_48k_stereo_20ms() -> Self {
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: AudioSampleFormat::PcmI16Le,
+            frame_ms: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioSampleFormat {
+    PcmI16Le,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFramePayload {
+    pub stream_id: Uuid,
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub format: AudioFormat,
+    pub data: Vec<u8>,
 }
 
 /// Canonical gamepad button names.
@@ -204,6 +254,8 @@ pub enum GamepadButton {
     North,
     LeftBumper,
     RightBumper,
+    LeftTrigger,
+    RightTrigger,
     Select,
     Start,
     Guide,
@@ -271,6 +323,8 @@ pub enum Message {
     // === Discovery and Handshake ===
     /// Initial hello message for device discovery
     Hello {
+        #[serde(default = "default_discovery_app_id")]
+        app_id: String,
         device_id: DeviceId,
         device_name: String,
         hostname: String,
@@ -279,6 +333,8 @@ pub enum Message {
     },
     /// Response to Hello message
     HelloBack {
+        #[serde(default = "default_discovery_app_id")]
+        app_id: String,
         device_id: DeviceId,
         device_name: String,
         hostname: String,
@@ -316,6 +372,33 @@ pub enum Message {
     GamepadDisconnected { gamepad_id: u8 },
     /// Full gamepad state snapshot.
     GamepadState { state: GamepadState },
+    /// Diagnostic-only local input event broadcast to connected peers.
+    InputDiagnostic {
+        device_id: DeviceId,
+        event: LocalInputDiagnosticEvent,
+    },
+    /// Diagnostic latency probe. Receivers answer with LatencyProbeAck.
+    LatencyProbe { sequence: u64, timestamp_ms: u64 },
+    /// Diagnostic latency probe acknowledgment.
+    LatencyProbeAck {
+        sequence: u64,
+        sent_timestamp_ms: u64,
+        received_timestamp_ms: u64,
+    },
+
+    // === Audio Streaming ===
+    /// Start a PCM audio stream to the remote renderer.
+    AudioStreamStart {
+        stream_id: Uuid,
+        source_device_id: DeviceId,
+        format: AudioFormat,
+    },
+    /// Single PCM audio frame.
+    AudioFrame { frame: AudioFramePayload },
+    /// Stop an active PCM audio stream.
+    AudioStreamStop { stream_id: Uuid, reason: String },
+    /// Report a non-fatal audio stream error.
+    AudioStreamError { stream_id: Uuid, message: String },
 
     // === Clipboard ===
     /// Clipboard data (text only for now)
@@ -370,6 +453,13 @@ impl Message {
             Message::MouseMove { .. }
             | Message::MouseWheel { .. }
             | Message::GamepadState { .. }
+            | Message::InputDiagnostic { .. }
+            | Message::LatencyProbe { .. }
+            | Message::LatencyProbeAck { .. }
+            | Message::AudioStreamStart { .. }
+            | Message::AudioFrame { .. }
+            | Message::AudioStreamStop { .. }
+            | Message::AudioStreamError { .. }
             | Message::ScreenUpdate { .. } => Priority::Normal,
 
             // Low: background operations
@@ -400,6 +490,7 @@ impl Message {
 /// Helper to create a Hello message
 pub fn hello_message(device_id: DeviceId, device_name: String, hostname: String) -> Message {
     Message::Hello {
+        app_id: DISCOVERY_APP_ID.to_string(),
         device_id,
         device_name,
         hostname,
@@ -416,6 +507,7 @@ pub fn hello_back_message(
     screen_info: ScreenInfo,
 ) -> Message {
     Message::HelloBack {
+        app_id: DISCOVERY_APP_ID.to_string(),
         device_id,
         device_name,
         hostname,
@@ -440,6 +532,10 @@ pub fn timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn default_discovery_app_id() -> String {
+    DISCOVERY_APP_ID.to_string()
 }
 
 #[cfg(test)]
@@ -500,6 +596,7 @@ mod tests {
     #[test]
     fn test_message_priority() {
         let critical = Message::Hello {
+            app_id: DISCOVERY_APP_ID.to_string(),
             device_id: Uuid::new_v4(),
             device_name: "Test".to_string(),
             hostname: "test".to_string(),
@@ -570,6 +667,29 @@ mod tests {
     }
 
     #[test]
+    fn audio_stream_messages_round_trip() {
+        let stream_id = Uuid::new_v4();
+        let frame = AudioFramePayload {
+            stream_id,
+            sequence: 7,
+            timestamp_ms: 42,
+            format: AudioFormat::pcm_i16_48k_stereo_20ms(),
+            data: vec![0, 1, 2, 3],
+        };
+        let msg = Message::AudioFrame {
+            frame: frame.clone(),
+        };
+
+        let serialized = serde_json::to_string(&msg).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+
+        match deserialized {
+            Message::AudioFrame { frame: decoded } => assert_eq!(decoded, frame),
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
     fn device_capabilities_default_missing_gamepad_fields_to_disabled() {
         let serialized = r#"{"supports_clipboard":true,"supports_hotkeys":true,"max_devices":16}"#;
         let capabilities: DeviceCapabilities = serde_json::from_str(serialized).unwrap();
@@ -578,6 +698,10 @@ mod tests {
         assert!(capabilities.supports_hotkeys);
         assert!(!capabilities.supports_gamepad_capture);
         assert!(!capabilities.supports_gamepad_inject);
+        assert!(!capabilities.supports_audio_capture);
+        assert!(!capabilities.supports_audio_output_control);
+        assert!(!capabilities.supports_audio_forwarding);
+        assert!(capabilities.audio_formats.is_empty());
         assert_eq!(capabilities.max_gamepads, 0);
     }
 }

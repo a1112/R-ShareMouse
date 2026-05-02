@@ -22,6 +22,14 @@ pub struct LocalControlDeviceSnapshot {
     #[serde(default)]
     pub gamepads: Vec<LocalGamepadState>,
     #[serde(default)]
+    pub audio_inputs: Vec<LocalAudioInputDevice>,
+    #[serde(default)]
+    pub audio_outputs: Vec<LocalAudioOutputDevice>,
+    #[serde(default)]
+    pub audio_capture_state: LocalAudioCaptureState,
+    #[serde(default)]
+    pub audio_stream_state: LocalAudioStreamState,
+    #[serde(default)]
     pub display: LocalDisplayState,
     #[serde(default)]
     pub capture_backend: LocalBackendDiagnosticState,
@@ -48,6 +56,10 @@ impl Default for LocalControlDeviceSnapshot {
             keyboard_devices: Vec::new(),
             mouse_devices: Vec::new(),
             gamepads: Vec::new(),
+            audio_inputs: Vec::new(),
+            audio_outputs: Vec::new(),
+            audio_capture_state: LocalAudioCaptureState::default(),
+            audio_stream_state: LocalAudioStreamState::default(),
             display: LocalDisplayState::default(),
             capture_backend: LocalBackendDiagnosticState::default(),
             inject_backend: LocalBackendDiagnosticState::default(),
@@ -97,6 +109,193 @@ impl Default for LocalHardwareDevice {
             event_count: 0,
             last_event_ms: 0,
             capabilities: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalAudioInputKind {
+    Microphone,
+    Loopback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioInputDevice {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default = "default_audio_input_kind")]
+    pub kind: LocalAudioInputKind,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub muted: Option<bool>,
+    #[serde(default)]
+    pub level_peak: u8,
+    #[serde(default)]
+    pub level_rms: u8,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub channel_count: Option<u32>,
+    #[serde(default)]
+    pub driver_detail: Option<String>,
+}
+
+impl Default for LocalAudioInputDevice {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            endpoint_id: None,
+            kind: LocalAudioInputKind::Microphone,
+            source: String::new(),
+            connected: false,
+            default: false,
+            muted: None,
+            level_peak: 0,
+            level_rms: 0,
+            sample_rate: None,
+            channel_count: None,
+            driver_detail: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioOutputDevice {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub muted: Option<bool>,
+    #[serde(default)]
+    pub volume_percent: Option<u8>,
+    #[serde(default)]
+    pub channel_count: Option<u32>,
+    #[serde(default)]
+    pub driver_detail: Option<String>,
+}
+
+impl Default for LocalAudioOutputDevice {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            endpoint_id: None,
+            source: String::new(),
+            connected: false,
+            default: false,
+            muted: None,
+            volume_percent: None,
+            channel_count: None,
+            driver_detail: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalAudioCaptureSource {
+    Microphone,
+    Loopback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalAudioCaptureStatus {
+    Idle,
+    CapturingLocal,
+    ForwardingRemote,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioCaptureState {
+    #[serde(default = "default_audio_capture_status")]
+    pub status: LocalAudioCaptureStatus,
+    #[serde(default)]
+    pub source: Option<LocalAudioCaptureSource>,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
+    pub level_peak: u8,
+    #[serde(default)]
+    pub level_rms: u8,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub channel_count: Option<u32>,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for LocalAudioCaptureState {
+    fn default() -> Self {
+        Self {
+            status: LocalAudioCaptureStatus::Idle,
+            source: None,
+            endpoint_id: None,
+            level_peak: 0,
+            level_rms: 0,
+            sample_rate: Some(48_000),
+            channel_count: Some(2),
+            started_at_ms: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioStreamState {
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub target_device_id: Option<String>,
+    #[serde(default)]
+    pub stream_id: Option<String>,
+    #[serde(default)]
+    pub frames_sent: u64,
+    #[serde(default)]
+    pub frames_received: u64,
+    #[serde(default)]
+    pub underruns: u64,
+    #[serde(default)]
+    pub overruns: u64,
+    #[serde(default)]
+    pub latency_ms: Option<u32>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for LocalAudioStreamState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            target_device_id: None,
+            stream_id: None,
+            frames_sent: 0,
+            frames_received: 0,
+            underruns: 0,
+            overruns: 0,
+            latency_ms: None,
+            last_error: None,
         }
     }
 }
@@ -419,6 +618,7 @@ pub enum LocalInputDeviceKind {
     Mouse,
     Gamepad,
     Display,
+    Audio,
     Backend,
 }
 
@@ -451,6 +651,55 @@ pub struct LocalInputTestResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioTestRequest {
+    #[serde(default = "default_audio_capture_source")]
+    pub source: LocalAudioCaptureSource,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+}
+
+impl Default for LocalAudioTestRequest {
+    fn default() -> Self {
+        Self {
+            source: LocalAudioCaptureSource::Loopback,
+            endpoint_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAudioTestResult {
+    pub status: LocalAudioTestStatus,
+    pub message: String,
+}
+
+impl LocalAudioTestResult {
+    pub fn success(message: impl Into<String>) -> Self {
+        Self {
+            status: LocalAudioTestStatus::Success,
+            message: message.into(),
+        }
+    }
+
+    pub fn failed(status: LocalAudioTestStatus, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalAudioTestStatus {
+    Success,
+    DeviceUnavailable,
+    PermissionDenied,
+    BackendUnavailable,
+    Unsupported,
+    Failed,
+}
+
 impl LocalInputTestResult {
     pub fn success(message: impl Into<String>) -> Self {
         Self {
@@ -478,6 +727,18 @@ pub enum LocalInputTestStatus {
 
 fn default_capture_source() -> String {
     "daemon".to_string()
+}
+
+fn default_audio_input_kind() -> LocalAudioInputKind {
+    LocalAudioInputKind::Microphone
+}
+
+fn default_audio_capture_source() -> LocalAudioCaptureSource {
+    LocalAudioCaptureSource::Loopback
+}
+
+fn default_audio_capture_status() -> LocalAudioCaptureStatus {
+    LocalAudioCaptureStatus::Idle
 }
 
 fn default_driver_status() -> String {

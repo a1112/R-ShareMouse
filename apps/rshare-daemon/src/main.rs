@@ -8,19 +8,24 @@ use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, read_json_line, write_json_line,
     BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, Direction, LayoutGraph, LayoutNode, LocalControlDeviceSnapshot,
-    LocalDisplayInfo, LocalDisplayState, LocalGamepadState, LocalInputDeviceKind,
-    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, LocalInputTestStatus, Message, ResolvedInputMode, ScreenInfo,
-    ServiceStatusSnapshot,
+    DaemonResponse, DeviceId, Direction, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
+    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message, ResolvedInputMode,
+    ScreenInfo, ServiceStatusSnapshot,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
-    InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend, RDevInputListener,
+    InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend,
 };
 
 #[cfg(target_os = "linux")]
 use rshare_input::EvdevCaptureBackend;
+#[cfg(not(windows))]
+use rshare_input::RDevInputListener;
+#[cfg(windows)]
+use rshare_input::{DefaultInputListener, InputEventChannel, InputListener};
 use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
 use tracing_subscriber::prelude::*;
 
@@ -48,6 +53,12 @@ struct TrackedDevice {
     last_seen_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLatencyProbe {
+    target: DeviceId,
+    sent_at_ms: u64,
+}
+
 struct DaemonState {
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
@@ -61,6 +72,7 @@ struct DaemonState {
     pending_keyboard_loopback_events: u8,
     pending_mouse_loopback_until_ms: u64,
     pending_mouse_loopback_events: u8,
+    pending_latency_probes: HashMap<u64, PendingLatencyProbe>,
 }
 
 impl DaemonState {
@@ -92,6 +104,7 @@ impl DaemonState {
             pending_keyboard_loopback_events: 0,
             pending_mouse_loopback_until_ms: 0,
             pending_mouse_loopback_events: 0,
+            pending_latency_probes: HashMap::new(),
         }
     }
 
@@ -512,6 +525,11 @@ const INJECTION_LOOPBACK_WINDOW_MS: u64 = 750;
 fn default_local_control_snapshot(width: u32, height: u32) -> LocalControlDeviceSnapshot {
     let mut snapshot = LocalControlDeviceSnapshot::default();
     snapshot.display = fallback_display_state(width, height);
+    refresh_platform_local_controls(&mut snapshot);
+    snapshot
+}
+
+fn refresh_platform_local_controls(snapshot: &mut LocalControlDeviceSnapshot) {
     #[cfg(windows)]
     {
         let screens = rshare_platform::windows::get_all_screens();
@@ -540,7 +558,26 @@ fn default_local_control_snapshot(width: u32, height: u32) -> LocalControlDevice
             snapshot.last_error = Some(format!("Raw Input enumeration failed: {error}"));
         }
     }
-    snapshot
+    #[cfg(windows)]
+    match rshare_platform::windows::enumerate_audio_output_devices() {
+        Ok(outputs) => {
+            snapshot.audio_outputs = outputs;
+        }
+        Err(error) => {
+            snapshot.audio_outputs.clear();
+            snapshot.last_error = Some(format!("Core Audio enumeration failed: {error}"));
+        }
+    }
+    #[cfg(windows)]
+    match rshare_platform::windows::enumerate_audio_input_devices() {
+        Ok(inputs) => {
+            snapshot.audio_inputs = inputs;
+        }
+        Err(error) => {
+            snapshot.audio_inputs.clear();
+            snapshot.last_error = Some(format!("Core Audio input enumeration failed: {error}"));
+        }
+    }
 }
 
 fn fallback_display_state(width: u32, height: u32) -> LocalDisplayState {
@@ -972,8 +1009,130 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn diagnostic_message(local_device_id: DeviceId, event: LocalInputDiagnosticEvent) -> Message {
+    Message::InputDiagnostic {
+        device_id: local_device_id,
+        event,
+    }
+}
+
+async fn broadcast_diagnostic_event(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    local_device_id: DeviceId,
+    event: LocalInputDiagnosticEvent,
+) {
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .broadcast(diagnostic_message(local_device_id, event))
+            .await
+    };
+
+    if let Err(error) = result {
+        tracing::debug!("Failed to broadcast input diagnostic event: {}", error);
+    }
+}
+
+fn normalize_remote_diagnostic_event(
+    from: DeviceId,
+    mut event: LocalInputDiagnosticEvent,
+) -> LocalInputDiagnosticEvent {
+    if let Some(original_device_id) = event.device_id.replace(from.to_string()) {
+        if original_device_id != from.to_string() {
+            event
+                .payload
+                .entry("origin_event_device_id".to_string())
+                .or_insert(original_device_id);
+        }
+    }
+    event
+        .payload
+        .entry("remote_device_id".to_string())
+        .or_insert_with(|| from.to_string());
+    event
+        .capture_path
+        .get_or_insert_with(|| "remote-daemon".to_string());
+    event
+}
+
+fn record_remote_diagnostic_event(
+    state: &mut DaemonState,
+    from: DeviceId,
+    event: LocalInputDiagnosticEvent,
+) -> LocalInputDiagnosticEvent {
+    let mut event = normalize_remote_diagnostic_event(from, event);
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+    event
+        .payload
+        .insert("remote_sequence".to_string(), event.sequence.to_string());
+    event.sequence = sequence;
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
+}
+
+fn record_latency_diagnostic_event(
+    state: &mut DaemonState,
+    target: DeviceId,
+    event_kind: impl Into<String>,
+    summary: impl Into<String>,
+    mut payload: BTreeMap<String, String>,
+) -> LocalInputDiagnosticEvent {
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+    payload
+        .entry("target_device_id".to_string())
+        .or_insert_with(|| target.to_string());
+
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms: timestamp_ms_now(),
+        device_kind: LocalInputDeviceKind::Backend,
+        event_kind: event_kind.into(),
+        summary: summary.into(),
+        device_id: Some(target.to_string()),
+        device_instance_id: None,
+        capture_path: Some("rshare-net".to_string()),
+        source: LocalInputEventSource::System,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
+}
+
 fn short_device_id(id: DeviceId) -> String {
     id.to_string().chars().take(8).collect()
+}
+
+fn record_audio_diagnostic_event(
+    state: &mut DaemonState,
+    event_kind: impl Into<String>,
+    summary: impl Into<String>,
+    mut payload: BTreeMap<String, String>,
+) -> LocalInputDiagnosticEvent {
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+    payload
+        .entry("sample_rate".to_string())
+        .or_insert_with(|| "48000".to_string());
+    payload
+        .entry("channels".to_string())
+        .or_insert_with(|| "2".to_string());
+
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms: timestamp_ms_now(),
+        device_kind: LocalInputDeviceKind::Audio,
+        event_kind: event_kind.into(),
+        summary: summary.into(),
+        device_id: None,
+        device_instance_id: None,
+        capture_path: Some("core-audio".to_string()),
+        source: LocalInputEventSource::System,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
 }
 
 /// Discover available backends and select the best one
@@ -1189,6 +1348,21 @@ fn is_device_connected(state: &DaemonState, id: DeviceId) -> bool {
         .get(&id)
         .map(|device| device.connected)
         .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn set_local_shortcut_suppression(enabled: bool) {
+    rshare_platform::windows::set_local_input_suppressed(enabled);
+}
+
+#[cfg(not(windows))]
+fn set_local_shortcut_suppression(_enabled: bool) {}
+
+fn sync_local_shortcut_suppression(state: &DaemonState) {
+    set_local_shortcut_suppression(matches!(
+        state.session.state(),
+        ControlSessionState::RemoteActive { .. }
+    ));
 }
 
 #[derive(Debug, Clone)]
@@ -1671,6 +1845,153 @@ async fn run_local_input_test(
     }
 }
 
+async fn run_remote_latency_test(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    device_id: DeviceId,
+) -> LocalInputTestResult {
+    let now = timestamp_ms_now();
+    let event = {
+        let mut state = state.write().await;
+        if !is_device_connected(&state, device_id) {
+            return LocalInputTestResult::failed(
+                LocalInputTestStatus::BackendUnavailable,
+                format!("Device {} is not connected.", short_device_id(device_id)),
+            );
+        }
+
+        let sequence = state.local_controls.sequence.saturating_add(1);
+        state.local_controls.sequence = sequence;
+        state.pending_latency_probes.insert(
+            sequence,
+            PendingLatencyProbe {
+                target: device_id,
+                sent_at_ms: now,
+            },
+        );
+
+        let mut payload = BTreeMap::new();
+        payload.insert("probe_sequence".to_string(), sequence.to_string());
+        payload.insert("sent_timestamp_ms".to_string(), now.to_string());
+        let event = LocalInputDiagnosticEvent {
+            sequence,
+            timestamp_ms: now,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_probe_sent".to_string(),
+            summary: format!("Latency probe sent to {}", short_device_id(device_id)),
+            device_id: Some(device_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload,
+        };
+        push_recent_local_event(&mut state.local_controls, event.clone());
+        event
+    };
+    let sequence = event.sequence;
+    let _ = local_events_tx.send(event);
+
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(
+                &device_id,
+                Message::LatencyProbe {
+                    sequence,
+                    timestamp_ms: now,
+                },
+            )
+            .await
+    };
+
+    match result {
+        Ok(()) => LocalInputTestResult::success(format!(
+            "Latency probe sent to {}.",
+            short_device_id(device_id)
+        )),
+        Err(error) => {
+            state.write().await.pending_latency_probes.remove(&sequence);
+            LocalInputTestResult::failed(LocalInputTestStatus::Failed, error.to_string())
+        }
+    }
+}
+
+async fn handle_network_message(
+    state: &Arc<RwLock<DaemonState>>,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    from: DeviceId,
+    message: Message,
+) {
+    match message {
+        Message::InputDiagnostic { event, .. } => {
+            let event = {
+                let mut state = state.write().await;
+                record_remote_diagnostic_event(&mut state, from, event)
+            };
+            let _ = local_events_tx.send(event);
+        }
+        Message::LatencyProbe {
+            sequence,
+            timestamp_ms,
+        } => {
+            let received_timestamp_ms = timestamp_ms_now();
+            let result = {
+                let mut manager = network_manager.lock().await;
+                manager
+                    .send_to(
+                        &from,
+                        Message::LatencyProbeAck {
+                            sequence,
+                            sent_timestamp_ms: timestamp_ms,
+                            received_timestamp_ms,
+                        },
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::debug!("Failed to answer latency probe from {}: {}", from, error);
+            }
+        }
+        Message::LatencyProbeAck {
+            sequence,
+            sent_timestamp_ms,
+            received_timestamp_ms,
+        } => {
+            let now = timestamp_ms_now();
+            let event = {
+                let mut state = state.write().await;
+                let pending = state.pending_latency_probes.remove(&sequence);
+                let rtt_ms = pending
+                    .as_ref()
+                    .map(|probe| now.saturating_sub(probe.sent_at_ms))
+                    .unwrap_or_else(|| now.saturating_sub(sent_timestamp_ms));
+                let target = pending.map(|probe| probe.target).unwrap_or(from);
+                let mut payload = BTreeMap::new();
+                payload.insert("probe_sequence".to_string(), sequence.to_string());
+                payload.insert("latency_ms".to_string(), rtt_ms.to_string());
+                payload.insert(
+                    "remote_received_timestamp_ms".to_string(),
+                    received_timestamp_ms.to_string(),
+                );
+                record_latency_diagnostic_event(
+                    &mut state,
+                    target,
+                    "latency_probe_ack",
+                    format!("Latency to {}: {} ms", short_device_id(target), rtt_ms),
+                    payload,
+                )
+            };
+            let _ = local_events_tx.send(event);
+        }
+        other => {
+            inject_remote_message(inject_backend, from, other).await;
+        }
+    }
+}
+
 async fn record_injected_test_event(
     state: &Arc<RwLock<DaemonState>>,
     kind: LocalInputTestKind,
@@ -1713,6 +2034,265 @@ async fn record_injected_test_event(
     event
 }
 
+async fn set_audio_output_volume(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_id: String,
+    volume_percent: u8,
+) -> DaemonResponse {
+    #[cfg(windows)]
+    let result = rshare_platform::windows::set_audio_output_volume(&endpoint_id, volume_percent);
+    #[cfg(not(windows))]
+    let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+        "Audio output volume control is only implemented on Windows in this build"
+    ));
+
+    match result {
+        Ok(()) => {
+            let event = {
+                let mut state = state.write().await;
+                refresh_platform_local_controls(&mut state.local_controls);
+                let mut payload = BTreeMap::new();
+                payload.insert("endpoint_id".to_string(), endpoint_id);
+                payload.insert(
+                    "volume_percent".to_string(),
+                    volume_percent.min(100).to_string(),
+                );
+                record_audio_diagnostic_event(
+                    &mut state,
+                    "output_volume",
+                    "Audio output volume changed",
+                    payload,
+                )
+            };
+            let _ = local_events_tx.send(event);
+            DaemonResponse::Ack
+        }
+        Err(error) => DaemonResponse::Error(error.to_string()),
+    }
+}
+
+async fn set_audio_output_mute(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_id: String,
+    muted: bool,
+) -> DaemonResponse {
+    #[cfg(windows)]
+    let result = rshare_platform::windows::set_audio_output_mute(&endpoint_id, muted);
+    #[cfg(not(windows))]
+    let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+        "Audio output mute control is only implemented on Windows in this build"
+    ));
+
+    match result {
+        Ok(()) => {
+            let event = {
+                let mut state = state.write().await;
+                refresh_platform_local_controls(&mut state.local_controls);
+                let mut payload = BTreeMap::new();
+                payload.insert("endpoint_id".to_string(), endpoint_id);
+                payload.insert("muted".to_string(), muted.to_string());
+                record_audio_diagnostic_event(
+                    &mut state,
+                    "output_mute",
+                    "Audio output mute changed",
+                    payload,
+                )
+            };
+            let _ = local_events_tx.send(event);
+            DaemonResponse::Ack
+        }
+        Err(error) => DaemonResponse::Error(error.to_string()),
+    }
+}
+
+async fn set_default_audio_output(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_id: String,
+) -> DaemonResponse {
+    #[cfg(windows)]
+    let result = rshare_platform::windows::set_default_audio_output(&endpoint_id);
+    #[cfg(not(windows))]
+    let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+        "Default audio output switching is only implemented on Windows in this build"
+    ));
+
+    match result {
+        Ok(()) => {
+            let event = {
+                let mut state = state.write().await;
+                refresh_platform_local_controls(&mut state.local_controls);
+                let mut payload = BTreeMap::new();
+                payload.insert("endpoint_id".to_string(), endpoint_id);
+                record_audio_diagnostic_event(
+                    &mut state,
+                    "default_output",
+                    "Default audio output changed",
+                    payload,
+                )
+            };
+            let _ = local_events_tx.send(event);
+            DaemonResponse::Ack
+        }
+        Err(error) => DaemonResponse::Error(error.to_string()),
+    }
+}
+
+async fn start_audio_capture(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    source: LocalAudioCaptureSource,
+    endpoint_id: Option<String>,
+) -> DaemonResponse {
+    let event = {
+        let mut state = state.write().await;
+        state.local_controls.audio_capture_state.status = LocalAudioCaptureStatus::CapturingLocal;
+        state.local_controls.audio_capture_state.source = Some(source);
+        state.local_controls.audio_capture_state.endpoint_id = endpoint_id.clone();
+        state.local_controls.audio_capture_state.started_at_ms = Some(timestamp_ms_now());
+        state.local_controls.audio_capture_state.last_error = None;
+        let mut payload = BTreeMap::new();
+        payload.insert("source".to_string(), format!("{:?}", source));
+        if let Some(endpoint_id) = endpoint_id {
+            payload.insert("endpoint_id".to_string(), endpoint_id);
+        }
+        record_audio_diagnostic_event(
+            &mut state,
+            "capture_start",
+            "Audio local capture state started",
+            payload,
+        )
+    };
+    let _ = local_events_tx.send(event);
+    DaemonResponse::Ack
+}
+
+async fn stop_audio_capture(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+) -> DaemonResponse {
+    let event = {
+        let mut state = state.write().await;
+        state.local_controls.audio_capture_state.status = LocalAudioCaptureStatus::Idle;
+        state.local_controls.audio_capture_state.source = None;
+        state.local_controls.audio_capture_state.endpoint_id = None;
+        state.local_controls.audio_capture_state.started_at_ms = None;
+        state.local_controls.audio_stream_state.active = false;
+        state.local_controls.audio_stream_state.target_device_id = None;
+        state.local_controls.audio_stream_state.stream_id = None;
+        record_audio_diagnostic_event(
+            &mut state,
+            "capture_stop",
+            "Audio local capture state stopped",
+            BTreeMap::new(),
+        )
+    };
+    let _ = local_events_tx.send(event);
+    DaemonResponse::Ack
+}
+
+async fn start_audio_forwarding(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    source: LocalAudioCaptureSource,
+    endpoint_id: Option<String>,
+) -> DaemonResponse {
+    let target = {
+        let state = state.read().await;
+        state
+            .session
+            .active_target()
+            .filter(|target| is_device_connected(&state, *target))
+    };
+    let Some(target) = target else {
+        let mut state = state.write().await;
+        state.local_controls.audio_capture_state.status = LocalAudioCaptureStatus::Error;
+        state.local_controls.audio_capture_state.last_error =
+            Some("No connected RemoteActive target for audio forwarding.".to_string());
+        state.local_controls.audio_stream_state.active = false;
+        state.local_controls.audio_stream_state.last_error =
+            Some("No connected RemoteActive target for audio forwarding.".to_string());
+        return DaemonResponse::Error(
+            "No connected RemoteActive target for audio forwarding.".to_string(),
+        );
+    };
+
+    let stream_id = DeviceId::new_v4().to_string();
+    let event = {
+        let mut state = state.write().await;
+        state.local_controls.audio_capture_state.status = LocalAudioCaptureStatus::ForwardingRemote;
+        state.local_controls.audio_capture_state.source = Some(source);
+        state.local_controls.audio_capture_state.endpoint_id = endpoint_id.clone();
+        state.local_controls.audio_capture_state.started_at_ms = Some(timestamp_ms_now());
+        state.local_controls.audio_capture_state.last_error = None;
+        state.local_controls.audio_stream_state.active = true;
+        state.local_controls.audio_stream_state.target_device_id = Some(target.to_string());
+        state.local_controls.audio_stream_state.stream_id = Some(stream_id.clone());
+        state.local_controls.audio_stream_state.latency_ms = Some(100);
+        state.local_controls.audio_stream_state.last_error = None;
+        let mut payload = BTreeMap::new();
+        payload.insert("source".to_string(), format!("{:?}", source));
+        payload.insert("target_device_id".to_string(), target.to_string());
+        payload.insert("stream_id".to_string(), stream_id);
+        if let Some(endpoint_id) = endpoint_id {
+            payload.insert("endpoint_id".to_string(), endpoint_id);
+        }
+        record_audio_diagnostic_event(
+            &mut state,
+            "forwarding_start",
+            "Audio forwarding state started",
+            payload,
+        )
+    };
+    let _ = local_events_tx.send(event);
+    DaemonResponse::Ack
+}
+
+async fn stop_audio_forwarding(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+) -> DaemonResponse {
+    let event = {
+        let mut state = state.write().await;
+        state.local_controls.audio_capture_state.status = LocalAudioCaptureStatus::Idle;
+        state.local_controls.audio_stream_state.active = false;
+        state.local_controls.audio_stream_state.target_device_id = None;
+        state.local_controls.audio_stream_state.stream_id = None;
+        record_audio_diagnostic_event(
+            &mut state,
+            "forwarding_stop",
+            "Audio forwarding state stopped",
+            BTreeMap::new(),
+        )
+    };
+    let _ = local_events_tx.send(event);
+    DaemonResponse::Ack
+}
+
+async fn run_audio_test(state: &Arc<RwLock<DaemonState>>) -> LocalAudioTestResult {
+    let (input_count, output_count) = {
+        let mut state = state.write().await;
+        refresh_platform_local_controls(&mut state.local_controls);
+        (
+            state.local_controls.audio_inputs.len(),
+            state.local_controls.audio_outputs.len(),
+        )
+    };
+
+    if input_count == 0 && output_count == 0 {
+        LocalAudioTestResult::failed(
+            LocalAudioTestStatus::DeviceUnavailable,
+            "No Core Audio input or output endpoint is available.",
+        )
+    } else {
+        LocalAudioTestResult::success(format!(
+            "Core Audio endpoints available: {input_count} input, {output_count} output."
+        ))
+    }
+}
+
 async fn send_forwarded_messages(
     network_manager: &Arc<Mutex<NetworkManager>>,
     target: DeviceId,
@@ -1750,9 +2330,10 @@ async fn run_input_forwarding_loop(
                     break;
                 };
 
-                let (target, messages) = {
+                let (target, messages, diagnostic, suppress_local_shortcuts) = {
                     let mut state = state.write().await;
                     let local_event = state.record_local_input_event(&event);
+                    let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
                     let messages = messages_for_input_event(
                         &mut state,
@@ -1762,8 +2343,15 @@ async fn run_input_forwarding_loop(
                         gamepad_forwarding_enabled,
                     );
                     let target = state.session.active_target();
-                    (target, messages)
+                    let suppress_local_shortcuts = matches!(
+                        state.session.state(),
+                        ControlSessionState::RemoteActive { .. }
+                    );
+                    (target, messages, diagnostic, suppress_local_shortcuts)
                 };
+                set_local_shortcut_suppression(suppress_local_shortcuts);
+
+                broadcast_diagnostic_event(&network_manager, diagnostic.0, diagnostic.1).await;
 
                 if let Some(target) = target {
                     send_forwarded_messages(&network_manager, target, messages).await;
@@ -1783,6 +2371,7 @@ async fn run_input_forwarding_loop(
                 };
 
                 let Some(target) = target else {
+                    set_local_shortcut_suppression(false);
                     routing.clear_remote_target();
                     forwarder.clear_target();
                     continue;
@@ -1798,6 +2387,7 @@ async fn run_input_forwarding_loop(
         }
     }
 
+    set_local_shortcut_suppression(false);
     Ok(())
 }
 
@@ -1914,7 +2504,7 @@ async fn run_windows_driver_capture_loop(
                     continue;
                 };
 
-                let (target, messages) = {
+                let (target, messages, diagnostic, suppress_local_shortcuts) = {
                     let mut state = state.write().await;
                     let mut local_event = state.record_local_input_event(&input_event);
                     local_event.device_id = Some(driver_event.device_id.clone());
@@ -1924,6 +2514,7 @@ async fn run_windows_driver_capture_loop(
                     local_event.payload.insert("driver_flags".to_string(), driver_event.flags.to_string());
                     update_driver_device_from_event(&mut state.local_controls, &driver_event, local_event.timestamp_ms);
                     replace_recent_local_event(&mut state.local_controls, local_event.clone());
+                    let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
                     let messages = messages_for_input_event(
                         &mut state,
@@ -1933,8 +2524,15 @@ async fn run_windows_driver_capture_loop(
                         true,
                     );
                     let target = state.session.active_target();
-                    (target, messages)
+                    let suppress_local_shortcuts = matches!(
+                        state.session.state(),
+                        ControlSessionState::RemoteActive { .. }
+                    );
+                    (target, messages, diagnostic, suppress_local_shortcuts)
                 };
+                set_local_shortcut_suppression(suppress_local_shortcuts);
+
+                broadcast_diagnostic_event(&network_manager, diagnostic.0, diagnostic.1).await;
 
                 if let Some(target) = target {
                     send_forwarded_messages(&network_manager, target, messages).await;
@@ -1944,6 +2542,7 @@ async fn run_windows_driver_capture_loop(
         }
     }
 
+    set_local_shortcut_suppression(false);
     Ok(())
 }
 
@@ -2270,7 +2869,20 @@ async fn main() -> Result<()> {
         }
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    let (input_rx, input_event_channel, _input_listener) = {
+        let (input_event_channel, input_rx) = InputEventChannel::new();
+        let callback_channel = input_event_channel.clone();
+        let mut input_listener = DefaultInputListener::new();
+        input_listener.start(Box::new(move |event| {
+            let _ = callback_channel.send(event);
+        }))?;
+        set_local_shortcut_suppression(false);
+        tracing::info!("Using native Windows low-level hook input capture");
+        (input_rx, input_event_channel, input_listener)
+    };
+
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
     let (input_rx, mut input_channel) = {
         let mut input_listener = RDevInputListener::new();
         let rx = input_listener.receiver();
@@ -2287,7 +2899,11 @@ async fn main() -> Result<()> {
             let (gamepad_channel, _gamepad_rx) = InputEventChannel::new();
             GilrsGamepadListener::new(gamepad_channel, gamepad_listener_config)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            GilrsGamepadListener::new(input_event_channel.clone(), gamepad_listener_config)
+        }
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
         {
             GilrsGamepadListener::new(
                 input_channel.as_ref().unwrap().channel(),
@@ -2298,7 +2914,7 @@ async fn main() -> Result<()> {
     gamepad_listener.start()?;
 
     // Start RDev listener if we're using it
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
     if let Some(ref mut listener) = input_channel {
         listener.start().await?;
     }
@@ -2347,6 +2963,8 @@ async fn main() -> Result<()> {
     let event_task = {
         let state = state.clone();
         let inject_backend = inject_backend.clone();
+        let network_manager = network_manager.clone();
+        let local_events_tx = local_events_tx.clone();
         let layout_path = layout_path.clone();
         tokio::spawn(async move {
             tracing::info!("Event task: starting to wait for events");
@@ -2372,14 +2990,25 @@ async fn main() -> Result<()> {
                         // Notify session state machine of target disconnection
                         state.session.on_target_disconnect(id);
                         state.remove_device(&id);
+                        sync_local_shortcut_suppression(&state);
                     }
                     NetworkEvent::MessageReceived { from, message } => {
-                        inject_remote_message(&inject_backend, from, message).await;
+                        handle_network_message(
+                            &state,
+                            &network_manager,
+                            &inject_backend,
+                            &local_events_tx,
+                            from,
+                            message,
+                        )
+                        .await;
                     }
                     NetworkEvent::ConnectionError { device_id, error } => {
                         tracing::warn!("Connection error to {}: {}", device_id, error);
                         let mut state = state.write().await;
+                        state.session.on_target_disconnect(device_id);
                         state.mark_connected(&device_id, false);
+                        sync_local_shortcut_suppression(&state);
                     }
                 }
             }
@@ -2417,6 +3046,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("tokio::select! exited, cleaning up");
+    set_local_shortcut_suppression(false);
     // Input listener cleanup is handled automatically by task drops
     network_manager.lock().await.stop().await?;
 
@@ -2497,7 +3127,8 @@ async fn handle_local_controls_ws_client(
 ) -> Result<()> {
     let mut websocket = accept_async(stream).await?;
     let snapshot = {
-        let state = state.read().await;
+        let mut state = state.write().await;
+        refresh_platform_local_controls(&mut state.local_controls);
         state.local_control_snapshot()
     };
     websocket
@@ -2591,7 +3222,10 @@ async fn handle_ipc_client(
 
             match result {
                 Ok(_) => {
-                    state.write().await.mark_connected(&device_id, false);
+                    let mut state = state.write().await;
+                    state.session.on_target_disconnect(device_id);
+                    state.mark_connected(&device_id, false);
+                    sync_local_shortcut_suppression(&state);
                     DaemonResponse::Ack
                 }
                 Err(err) => DaemonResponse::Error(err.to_string()),
@@ -2615,13 +3249,43 @@ async fn handle_ipc_client(
             }
         }
         DaemonRequest::LocalControls => {
-            let state = state.read().await;
+            let mut state = state.write().await;
+            refresh_platform_local_controls(&mut state.local_controls);
             DaemonResponse::LocalControls(state.local_control_snapshot())
         }
         DaemonRequest::RunLocalInputTest { test } => {
             let result =
                 run_local_input_test(&inject_backend, &state, &local_events_tx, test).await;
             DaemonResponse::LocalInputTest(result)
+        }
+        DaemonRequest::RunRemoteLatencyTest { device_id } => {
+            let result =
+                run_remote_latency_test(&network_manager, &state, &local_events_tx, device_id)
+                    .await;
+            DaemonResponse::LocalInputTest(result)
+        }
+        DaemonRequest::SetAudioDefaultOutput { endpoint_id } => {
+            set_default_audio_output(&state, &local_events_tx, endpoint_id).await
+        }
+        DaemonRequest::SetAudioOutputVolume {
+            endpoint_id,
+            volume_percent,
+        } => set_audio_output_volume(&state, &local_events_tx, endpoint_id, volume_percent).await,
+        DaemonRequest::SetAudioOutputMute { endpoint_id, muted } => {
+            set_audio_output_mute(&state, &local_events_tx, endpoint_id, muted).await
+        }
+        DaemonRequest::StartAudioCapture {
+            source,
+            endpoint_id,
+        } => start_audio_capture(&state, &local_events_tx, source, endpoint_id).await,
+        DaemonRequest::StopAudioCapture => stop_audio_capture(&state, &local_events_tx).await,
+        DaemonRequest::StartAudioForwarding {
+            source,
+            endpoint_id,
+        } => start_audio_forwarding(&state, &local_events_tx, source, endpoint_id).await,
+        DaemonRequest::StopAudioForwarding => stop_audio_forwarding(&state, &local_events_tx).await,
+        DaemonRequest::RunAudioTest { test: _ } => {
+            DaemonResponse::LocalAudioTest(run_audio_test(&state).await)
         }
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
         DaemonRequest::Shutdown => {

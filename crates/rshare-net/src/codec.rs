@@ -99,6 +99,13 @@ impl MessageCodec {
             Message::GamepadConnected { .. } => 15,
             Message::GamepadDisconnected { .. } => 16,
             Message::GamepadState { .. } => 17,
+            Message::InputDiagnostic { .. } => 25,
+            Message::LatencyProbe { .. } => 26,
+            Message::LatencyProbeAck { .. } => 27,
+            Message::AudioStreamStart { .. } => 18,
+            Message::AudioFrame { .. } => 19,
+            Message::AudioStreamStop { .. } => 23,
+            Message::AudioStreamError { .. } => 24,
 
             // Clipboard (20-29)
             Message::ClipboardData { .. } => 20,
@@ -287,6 +294,7 @@ mod tests {
     fn test_message_type_tags() {
         assert_eq!(
             MessageCodec::message_type_tag(&Message::Hello {
+                app_id: rshare_core::DISCOVERY_APP_ID.to_string(),
                 device_id: DeviceId::new_v4(),
                 device_name: String::new(),
                 hostname: String::new(),

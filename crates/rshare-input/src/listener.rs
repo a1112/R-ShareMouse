@@ -173,12 +173,7 @@ impl RDevInputListener {
                     }
                     EventType::ButtonPress(button) => {
                         if config.capture_mouse {
-                            let mouse_button = match button {
-                                rdev::Button::Left => MouseButton::Left,
-                                rdev::Button::Right => MouseButton::Right,
-                                rdev::Button::Middle => MouseButton::Middle,
-                                _ => MouseButton::Other(0),
-                            };
+                            let mouse_button = rdev_button_to_mouse_button(button);
                             let input_event =
                                 InputEvent::mouse_button(mouse_button, ButtonState::Pressed);
                             let _ = channel.send(input_event);
@@ -186,12 +181,7 @@ impl RDevInputListener {
                     }
                     EventType::ButtonRelease(button) => {
                         if config.capture_mouse {
-                            let mouse_button = match button {
-                                rdev::Button::Left => MouseButton::Left,
-                                rdev::Button::Right => MouseButton::Right,
-                                rdev::Button::Middle => MouseButton::Middle,
-                                _ => MouseButton::Other(0),
-                            };
+                            let mouse_button = rdev_button_to_mouse_button(button);
                             let input_event =
                                 InputEvent::mouse_button(mouse_button, ButtonState::Released);
                             let _ = channel.send(input_event);
@@ -288,12 +278,7 @@ impl RDevInputListener {
                         }
                         EventType::ButtonPress(button) => {
                             if config.capture_mouse {
-                                let mouse_button = match button {
-                                    rdev::Button::Left => MouseButton::Left,
-                                    rdev::Button::Right => MouseButton::Right,
-                                    rdev::Button::Middle => MouseButton::Middle,
-                                    _ => MouseButton::Other(0),
-                                };
+                                let mouse_button = rdev_button_to_mouse_button(button);
                                 let _ = channel.send(InputEvent::mouse_button(
                                     mouse_button,
                                     ButtonState::Pressed,
@@ -302,12 +287,7 @@ impl RDevInputListener {
                         }
                         EventType::ButtonRelease(button) => {
                             if config.capture_mouse {
-                                let mouse_button = match button {
-                                    rdev::Button::Left => MouseButton::Left,
-                                    rdev::Button::Right => MouseButton::Right,
-                                    rdev::Button::Middle => MouseButton::Middle,
-                                    _ => MouseButton::Other(0),
-                                };
+                                let mouse_button = rdev_button_to_mouse_button(button);
                                 let _ = channel.send(InputEvent::mouse_button(
                                     mouse_button,
                                     ButtonState::Released,
@@ -383,6 +363,19 @@ impl RDevInputListener {
 impl Default for RDevInputListener {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn rdev_button_to_mouse_button(button: rdev::Button) -> MouseButton {
+    match button {
+        rdev::Button::Left => MouseButton::Left,
+        rdev::Button::Right => MouseButton::Right,
+        rdev::Button::Middle => MouseButton::Middle,
+        // rdev reports Windows XBUTTON1/XBUTTON2 as Unknown(1/2). Some Linux
+        // stacks surface browser side buttons as 8/9.
+        rdev::Button::Unknown(1) | rdev::Button::Unknown(8) => MouseButton::Back,
+        rdev::Button::Unknown(2) | rdev::Button::Unknown(9) => MouseButton::Forward,
+        rdev::Button::Unknown(code) => MouseButton::Other(code),
     }
 }
 
@@ -661,6 +654,30 @@ mod tests {
         assert_eq!(
             rdev_key_to_key_code(rdev::Key::KpDelete),
             Some(KeyCode::KeypadDecimal)
+        );
+    }
+
+    #[test]
+    fn rdev_listener_maps_mouse_side_buttons() {
+        assert_eq!(
+            rdev_button_to_mouse_button(rdev::Button::Left),
+            MouseButton::Left
+        );
+        assert_eq!(
+            rdev_button_to_mouse_button(rdev::Button::Middle),
+            MouseButton::Middle
+        );
+        assert_eq!(
+            rdev_button_to_mouse_button(rdev::Button::Unknown(1)),
+            MouseButton::Back
+        );
+        assert_eq!(
+            rdev_button_to_mouse_button(rdev::Button::Unknown(2)),
+            MouseButton::Forward
+        );
+        assert_eq!(
+            rdev_button_to_mouse_button(rdev::Button::Unknown(42)),
+            MouseButton::Other(42)
         );
     }
 

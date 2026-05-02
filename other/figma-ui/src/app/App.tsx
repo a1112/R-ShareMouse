@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Settings,
   Square,
+  Volume2,
   Wifi,
   X,
 } from "lucide-react";
@@ -95,7 +96,7 @@ type DashboardPayload = {
 type LocalControlEvent = {
   sequence: number;
   timestamp_ms: number;
-  device_kind: "Keyboard" | "Mouse" | "Gamepad" | "Display" | "Backend";
+  device_kind: "Keyboard" | "Mouse" | "Gamepad" | "Display" | "Audio" | "Backend";
   event_kind: string;
   summary: string;
   device_id?: string | null;
@@ -181,6 +182,10 @@ type LocalControlsSnapshot = {
     last_axis?: string | null;
     last_seen_ms: number;
   }>;
+  audio_inputs?: AudioInputDevice[];
+  audio_outputs?: AudioOutputDevice[];
+  audio_capture_state?: AudioCaptureState;
+  audio_stream_state?: AudioStreamState;
   display: {
     display_count: number;
     virtual_x?: number;
@@ -223,18 +228,118 @@ type LocalInputTestResult = {
   message: string;
 };
 
-type LocalControlKind = "keyboard" | "mouse" | "gamepad" | "display";
-type LocalDevicePageKind = LocalControlKind | "remote";
+type LogEntry = {
+  timestamp: string;
+  level: string;
+  target: string;
+  message: string;
+};
+
+type LocalControlKind = "keyboard" | "mouse" | "gamepad" | "display" | "audio";
+type LocalDevicePageKind = "all" | LocalControlKind | "remote";
+type AudioInputDevice = {
+  id: string;
+  name: string;
+  endpoint_id?: string | null;
+  kind?: "Microphone" | "Loopback";
+  source?: string;
+  connected?: boolean;
+  default?: boolean;
+  muted?: boolean | null;
+  level_peak?: number;
+  level_rms?: number;
+  sample_rate?: number | null;
+  channel_count?: number | null;
+  driver_detail?: string | null;
+};
+type AudioOutputDevice = {
+  id: string;
+  name: string;
+  endpoint_id?: string | null;
+  source?: string;
+  connected?: boolean;
+  default?: boolean;
+  muted?: boolean | null;
+  volume_percent?: number | null;
+  channel_count?: number | null;
+  driver_detail?: string | null;
+};
+type AudioCaptureState = {
+  status?: "Idle" | "CapturingLocal" | "ForwardingRemote" | "Error";
+  source?: "Microphone" | "Loopback" | null;
+  endpoint_id?: string | null;
+  level_peak?: number;
+  level_rms?: number;
+  sample_rate?: number | null;
+  channel_count?: number | null;
+  started_at_ms?: number | null;
+  last_error?: string | null;
+};
+type AudioStreamState = {
+  active?: boolean;
+  target_device_id?: string | null;
+  stream_id?: string | null;
+  frames_sent?: number;
+  frames_received?: number;
+  underruns?: number;
+  overruns?: number;
+  latency_ms?: number | null;
+  last_error?: string | null;
+};
+type LocalDeviceSelectItem = {
+  id: string;
+  name: string;
+  detail: string;
+  live: boolean;
+  active: boolean;
+};
 
 type TauriInvoke = <T = unknown>(
   command: string,
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+type LocalControlSubscription = {
+  stop: () => void;
+  usesTauriBridge: boolean;
+};
+
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
+const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
+const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
+const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
+const NETWORK_COMMANDS = new Set([
+  "dashboard_state",
+  "start_service",
+  "stop_service",
+  "get_logs",
+  "clear_logs",
+  "connect_device",
+  "disconnect_device",
+  "get_layout",
+  "set_layout",
+  "local_controls_state",
+  "start_local_controls_stream",
+  "stop_local_controls_stream",
+  "run_local_input_test",
+  "run_remote_latency_test",
+  "set_audio_default_output",
+  "set_audio_output_volume",
+  "set_audio_output_mute",
+  "start_audio_capture",
+  "stop_audio_capture",
+  "start_audio_forwarding",
+  "stop_audio_forwarding",
+  "run_audio_test",
+]);
+const WEB_NOOP_COMMANDS = new Set([
+  "minimize_window",
+  "toggle_maximize_window",
+  "close_window",
+]);
 
 const EMPTY_PAYLOAD: DashboardPayload = {
   status: null,
@@ -278,16 +383,309 @@ async function listenTauriEvent<T>(
   return listen(eventName, (event) => handler(event.payload));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+async function daemonIpcRequest(request: unknown): Promise<unknown> {
+  const response = await fetch(DAEMON_IPC_BRIDGE_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : `daemon 网络 IPC 请求失败：HTTP ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+function daemonResponseValue<T>(response: unknown, variant: string): T {
+  if (variant === "Ack" && response === "Ack") {
+    return undefined as T;
+  }
+
+  if (isRecord(response)) {
+    if (Object.prototype.hasOwnProperty.call(response, "Error")) {
+      throw new Error(String(response.Error));
+    }
+    if (Object.prototype.hasOwnProperty.call(response, variant)) {
+      return response[variant] as T;
+    }
+  }
+
+  throw new Error(`daemon 返回了非预期响应：${JSON.stringify(response)}`);
+}
+
+async function daemonRequestValue<T>(request: unknown, variant: string): Promise<T> {
+  return daemonResponseValue<T>(await daemonIpcRequest(request), variant);
+}
+
+function localInputTestKindForDaemon(
+  kind: unknown,
+): "KeyboardShift" | "MouseMove" | "VirtualGamepadStatus" {
+  if (kind === "mouse" || kind === "mouse_move" || kind === "MouseMove") {
+    return "MouseMove";
+  }
+  if (
+    kind === "gamepad" ||
+    kind === "virtual_gamepad_status" ||
+    kind === "VirtualGamepadStatus"
+  ) {
+    return "VirtualGamepadStatus";
+  }
+  return "KeyboardShift";
+}
+
+async function buildNetworkDashboardState(): Promise<DashboardPayload> {
+  const status = await daemonRequestValue<unknown>("Status", "Status");
+
+  let devices: DashboardPayload["devices"] = [];
+  try {
+    devices = await daemonRequestValue<DashboardPayload["devices"]>("Devices", "Devices");
+  } catch {
+    devices = [];
+  }
+
+  let layout: unknown | null = null;
+  let layoutError: string | null = null;
+  try {
+    layout = await daemonRequestValue<unknown>("GetLayout", "Layout");
+  } catch (error) {
+    layoutError = error instanceof Error ? error.message : String(error);
+  }
+
+  return {
+    status,
+    devices,
+    layout,
+    visible_layout: layout,
+    layout_error: layoutError,
+    auto_started: false,
+  };
+}
+
+async function invokeNetworkCommand<T = unknown>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  switch (command) {
+    case "dashboard_state":
+      return (await buildNetworkDashboardState()) as T;
+    case "start_service":
+      return (await daemonRequestValue<unknown>("Status", "Status")) as T;
+    case "stop_service":
+      return await daemonRequestValue<T>("Shutdown", "Ack");
+    case "get_logs": {
+      const limit = Number(args?.limit ?? 1000);
+      const response = await fetch(
+        `${DAEMON_LOGS_BRIDGE_ENDPOINT}?limit=${encodeURIComponent(String(limit))}`,
+      );
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          isRecord(payload) && typeof payload.error === "string"
+            ? payload.error
+            : `日志网络网关请求失败：HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      return safeArray(payload as LogEntry[] | null | undefined) as T;
+    }
+    case "clear_logs": {
+      const response = await fetch(DAEMON_LOGS_BRIDGE_ENDPOINT, { method: "DELETE" });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          isRecord(payload) && typeof payload.error === "string"
+            ? payload.error
+            : `日志清理失败：HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      return undefined as T;
+    }
+    case "connect_device":
+      return await daemonRequestValue<T>(
+        { Connect: { device_id: args?.device_id ?? args?.deviceId } },
+        "Ack",
+      );
+    case "disconnect_device":
+      return await daemonRequestValue<T>(
+        { Disconnect: { device_id: args?.device_id ?? args?.deviceId } },
+        "Ack",
+      );
+    case "get_layout":
+      return await daemonRequestValue<T>("GetLayout", "Layout");
+    case "set_layout":
+      return await daemonRequestValue<T>({ SetLayout: { layout: args?.layout } }, "Ack");
+    case "local_controls_state":
+      return await daemonRequestValue<T>("LocalControls", "LocalControls");
+    case "run_local_input_test":
+      return await daemonRequestValue<T>(
+        {
+          RunLocalInputTest: {
+            test: { kind: localInputTestKindForDaemon(args?.kind) },
+          },
+        },
+        "LocalInputTest",
+      );
+    case "run_remote_latency_test":
+      return await daemonRequestValue<T>(
+        {
+          RunRemoteLatencyTest: {
+            device_id: args?.device_id ?? args?.deviceId,
+          },
+        },
+        "LocalInputTest",
+      );
+    case "set_audio_default_output":
+      return await daemonRequestValue<T>(
+        { SetAudioDefaultOutput: { endpoint_id: args?.endpoint_id ?? args?.endpointId } },
+        "Ack",
+      );
+    case "set_audio_output_volume":
+      return await daemonRequestValue<T>(
+        {
+          SetAudioOutputVolume: {
+            endpoint_id: args?.endpoint_id ?? args?.endpointId,
+            volume_percent: args?.volume_percent ?? args?.volumePercent,
+          },
+        },
+        "Ack",
+      );
+    case "set_audio_output_mute":
+      return await daemonRequestValue<T>(
+        {
+          SetAudioOutputMute: {
+            endpoint_id: args?.endpoint_id ?? args?.endpointId,
+            muted: args?.muted,
+          },
+        },
+        "Ack",
+      );
+    case "start_audio_capture":
+      return await daemonRequestValue<T>(
+        {
+          StartAudioCapture: {
+            source: args?.source ?? "Loopback",
+            endpoint_id: args?.endpoint_id ?? args?.endpointId ?? null,
+          },
+        },
+        "Ack",
+      );
+    case "stop_audio_capture":
+      return await daemonRequestValue<T>("StopAudioCapture", "Ack");
+    case "start_audio_forwarding":
+      return await daemonRequestValue<T>(
+        {
+          StartAudioForwarding: {
+            source: args?.source ?? "Loopback",
+            endpoint_id: args?.endpoint_id ?? args?.endpointId ?? null,
+          },
+        },
+        "Ack",
+      );
+    case "stop_audio_forwarding":
+      return await daemonRequestValue<T>("StopAudioForwarding", "Ack");
+    case "run_audio_test":
+      return await daemonRequestValue<T>(
+        {
+          RunAudioTest: {
+            test: {
+              source: args?.source ?? "Loopback",
+              endpoint_id: args?.endpoint_id ?? args?.endpointId ?? null,
+            },
+          },
+        },
+        "LocalAudioTest",
+      );
+    case "start_local_controls_stream":
+    case "stop_local_controls_stream":
+      return undefined as T;
+    default:
+      throw new Error(`命令 ${command} 尚未支持网络通信`);
+  }
+}
+
+async function listenLocalControlEvent(
+  handler: (payload: unknown) => void,
+): Promise<LocalControlSubscription | null> {
+  if (typeof WebSocket !== "undefined") {
+    const socket = new WebSocket(LOCAL_CONTROLS_WS_URL);
+    socket.addEventListener("message", (event) => {
+      try {
+        const payload =
+          typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+        handler(payload);
+      } catch (error) {
+        handler(error instanceof Error ? error.message : String(error));
+      }
+    });
+    socket.addEventListener("error", () => {
+      handler("本机输入实时 WebSocket 不可用");
+    });
+    socket.addEventListener("close", (event) => {
+      if (event.code !== 1000) {
+        handler("本机输入实时 WebSocket 已断开");
+      }
+    });
+    return {
+      stop: () => socket.close(1000),
+      usesTauriBridge: false,
+    };
+  }
+
+  const unlisten = await listenTauriEvent<unknown>("local-control-event", handler);
+  if (!unlisten) {
+    return null;
+  }
+
+  return {
+    stop: unlisten,
+    usesTauriBridge: true,
+  };
+}
+
 async function invokeCommand<T = unknown>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
-  const invoke = getInvoke();
-  if (!invoke) {
-    throw new Error("Tauri bridge unavailable");
+  let networkError: unknown = null;
+  if (NETWORK_COMMANDS.has(command)) {
+    try {
+      return await invokeNetworkCommand<T>(command, args);
+    } catch (error) {
+      networkError = error;
+    }
   }
 
-  return invoke<T>(command, args);
+  const invoke = getInvoke();
+  if (invoke) {
+    return invoke<T>(command, args);
+  }
+
+  if (WEB_NOOP_COMMANDS.has(command)) {
+    return undefined as T;
+  }
+
+  if (networkError) {
+    throw networkError;
+  }
+
+  throw new Error(`命令 ${command} 需要 Tauri bridge 或 daemon 网络网关`);
 }
 
 function loadHiddenMonitorIds(): Set<string> {
@@ -407,6 +805,14 @@ function applyLocalControlEvent(
         event.payload?.pressed_buttons !== undefined
           ? event.payload.pressed_buttons.split(",").map((item) => item.trim()).filter(Boolean)
           : existing?.pressed_buttons ?? [];
+      const buttonName = event.payload?.button ?? event.payload?.last_button?.split(/\s+/)[0];
+      if (buttonName && event.event_kind === "button") {
+        if (eventStateIsPressed(event) || event.payload?.last_button?.toLowerCase().includes("pressed")) {
+          pushUniqueString(pressedButtons, buttonName);
+        } else if (eventStateIsReleased(event) || event.payload?.last_button?.toLowerCase().includes("released")) {
+          removeString(pressedButtons, buttonName);
+        }
+      }
       const updated = {
         gamepad_id: gamepadId,
         name: event.payload?.name ?? existing?.name ?? `Gamepad ${gamepadId}`,
@@ -473,17 +879,97 @@ function applyLocalControlEvent(
 
 function mergeLocalControlSnapshot(
   current: LocalControlsSnapshot | null,
-  incoming: LocalControlsSnapshot,
+  incoming: LocalControlsSnapshot | null | undefined,
 ) {
+  const normalized = normalizeLocalControlsSnapshot(incoming);
   if (!current) {
-    return incoming;
+    return normalized;
   }
   return {
-    ...incoming,
+    ...normalized,
     recent_events: mergeLocalControlEvents(
       current.recent_events ?? [],
-      incoming.recent_events ?? [],
+      normalized.recent_events ?? [],
     ),
+  };
+}
+
+function normalizeLocalControlsSnapshot(
+  incoming: LocalControlsSnapshot | null | undefined,
+): LocalControlsSnapshot {
+  const snapshot = (isRecord(incoming) ? incoming : {}) as Partial<LocalControlsSnapshot>;
+  const keyboard = isRecord(snapshot.keyboard) ? snapshot.keyboard : {};
+  const mouse = isRecord(snapshot.mouse) ? snapshot.mouse : {};
+  const display = isRecord(snapshot.display) ? snapshot.display : {};
+  const virtualGamepad = isRecord(snapshot.virtual_gamepad) ? snapshot.virtual_gamepad : {};
+
+  return {
+    sequence: Number(snapshot.sequence ?? 0),
+    keyboard: {
+      detected: Boolean(keyboard.detected),
+      pressed_keys: safeArray(keyboard.pressed_keys as string[]),
+      last_key: typeof keyboard.last_key === "string" ? keyboard.last_key : null,
+      event_count: Number(keyboard.event_count ?? 0),
+      capture_source:
+        typeof keyboard.capture_source === "string" ? keyboard.capture_source : "daemon",
+    },
+    mouse: {
+      detected: Boolean(mouse.detected),
+      x: Number(mouse.x ?? 0),
+      y: Number(mouse.y ?? 0),
+      pressed_buttons: safeArray(mouse.pressed_buttons as string[]),
+      wheel_delta_x: Number(mouse.wheel_delta_x ?? 0),
+      wheel_delta_y: Number(mouse.wheel_delta_y ?? 0),
+      event_count: Number(mouse.event_count ?? 0),
+      move_count: Number(mouse.move_count ?? 0),
+      button_event_count: Number(mouse.button_event_count ?? 0),
+      button_press_count: Number(mouse.button_press_count ?? 0),
+      button_release_count: Number(mouse.button_release_count ?? 0),
+      wheel_event_count: Number(mouse.wheel_event_count ?? 0),
+      wheel_total_x: Number(mouse.wheel_total_x ?? 0),
+      wheel_total_y: Number(mouse.wheel_total_y ?? 0),
+      current_display_index:
+        mouse.current_display_index == null ? null : Number(mouse.current_display_index),
+      current_display_id:
+        typeof mouse.current_display_id === "string" ? mouse.current_display_id : null,
+      display_relative_x: Number(mouse.display_relative_x ?? mouse.x ?? 0),
+      display_relative_y: Number(mouse.display_relative_y ?? mouse.y ?? 0),
+      capture_source: typeof mouse.capture_source === "string" ? mouse.capture_source : "daemon",
+    },
+    keyboard_devices: safeArray(snapshot.keyboard_devices),
+    mouse_devices: safeArray(snapshot.mouse_devices),
+    gamepads: safeArray(snapshot.gamepads),
+    audio_inputs: safeArray(snapshot.audio_inputs),
+    audio_outputs: safeArray(snapshot.audio_outputs),
+    audio_capture_state: snapshot.audio_capture_state,
+    audio_stream_state: snapshot.audio_stream_state,
+    display: {
+      display_count: Number(display.display_count ?? 1),
+      virtual_x: Number(display.virtual_x ?? 0),
+      virtual_y: Number(display.virtual_y ?? 0),
+      primary_width: Number(display.primary_width ?? 1920),
+      primary_height: Number(display.primary_height ?? 1080),
+      layout_width: Number(display.layout_width ?? display.primary_width ?? 1920),
+      layout_height: Number(display.layout_height ?? display.primary_height ?? 1080),
+      displays: safeArray(display.displays as LocalControlsSnapshot["display"]["displays"]),
+    },
+    capture_backend: isRecord(snapshot.capture_backend) ? snapshot.capture_backend : {},
+    inject_backend: isRecord(snapshot.inject_backend) ? snapshot.inject_backend : {},
+    privilege_state:
+      typeof snapshot.privilege_state === "string" ? snapshot.privilege_state : null,
+    virtual_gamepad: {
+      status:
+        typeof virtualGamepad.status === "string" ? virtualGamepad.status : "not_implemented",
+      detail:
+        typeof virtualGamepad.detail === "string"
+          ? virtualGamepad.detail
+          : "Virtual HID gamepad injection is not implemented in this build.",
+    },
+    driver: isRecord(snapshot.driver)
+      ? (snapshot.driver as LocalControlsSnapshot["driver"])
+      : undefined,
+    recent_events: safeArray(snapshot.recent_events),
+    last_error: typeof snapshot.last_error === "string" ? snapshot.last_error : null,
   };
 }
 
@@ -507,6 +993,122 @@ function mergeLocalControlEvents(
   return Array.from(retained.values())
     .sort((a, b) => a.sequence - b.sequence)
     .slice(-96);
+}
+
+const BROWSER_GAMEPAD_BUTTONS = [
+  "South",
+  "East",
+  "West",
+  "North",
+  "LeftBumper",
+  "RightBumper",
+  "LeftTrigger",
+  "RightTrigger",
+  "Select",
+  "Start",
+  "LeftStick",
+  "RightStick",
+  "DPadUp",
+  "DPadDown",
+  "DPadLeft",
+  "DPadRight",
+  "Guide",
+];
+
+function mergeBrowserGamepadState(current: LocalControlsSnapshot | null) {
+  if (!current || typeof navigator.getGamepads !== "function") {
+    return current;
+  }
+
+  const pads = Array.from(navigator.getGamepads()).filter(
+    (gamepad): gamepad is Gamepad => Boolean(gamepad?.connected),
+  );
+  if (!pads.length) {
+    return current;
+  }
+
+  let changed = false;
+  const now = Date.now();
+  const gamepads = [...(current.gamepads ?? [])];
+
+  for (const pad of pads) {
+    const gamepadId = Math.max(0, Math.min(255, pad.index));
+    const existingIndex = gamepads.findIndex((item) => item.gamepad_id === gamepadId);
+    const existing = existingIndex >= 0 ? gamepads[existingIndex] : null;
+    const existingButtons = existing?.buttons ?? [];
+    const buttons = BROWSER_GAMEPAD_BUTTONS.map((name, index) => ({
+      button: name,
+      pressed: Boolean(pad.buttons[index]?.pressed || (pad.buttons[index]?.value ?? 0) > 0.5),
+    }));
+    const pressedButtons = buttons.filter((button) => button.pressed).map((button) => button.button);
+    const previousPressed = existing?.pressed_buttons ?? [];
+    const previousPressedKey = previousPressed.map(normalizedGamepadButton).sort().join("|");
+    const pressedKey = pressedButtons.map(normalizedGamepadButton).sort().join("|");
+    const buttonsChanged =
+      previousPressedKey !== pressedKey ||
+      buttons.some((button, index) => existingButtons[index]?.pressed !== button.pressed);
+    const lastPressed =
+      pressedButtons.find(
+        (button) => !previousPressed.some((previous) => normalizedGamepadButton(previous) === normalizedGamepadButton(button)),
+      ) ?? null;
+    const releasedCount = previousPressed.filter(
+      (button) => !pressedButtons.some((pressed) => normalizedGamepadButton(pressed) === normalizedGamepadButton(button)),
+    ).length;
+    const leftStickX = Math.round((pad.axes[0] ?? 0) * 32767);
+    const leftStickY = Math.round((pad.axes[1] ?? 0) * 32767);
+    const rightStickX = Math.round((pad.axes[2] ?? 0) * 32767);
+    const rightStickY = Math.round((pad.axes[3] ?? 0) * 32767);
+    const leftTriggerValue = Math.round((pad.buttons[6]?.value ?? 0) * 65535);
+    const rightTriggerValue = Math.round((pad.buttons[7]?.value ?? 0) * 65535);
+    const axisChanged =
+      !existing ||
+      Math.abs((existing.left_stick_x ?? 0) - leftStickX) > 512 ||
+      Math.abs((existing.left_stick_y ?? 0) - leftStickY) > 512 ||
+      Math.abs((existing.right_stick_x ?? 0) - rightStickX) > 512 ||
+      Math.abs((existing.right_stick_y ?? 0) - rightStickY) > 512;
+    const triggerChanged =
+      !existing ||
+      Math.abs((existing.left_trigger ?? 0) - leftTriggerValue) > 512 ||
+      Math.abs((existing.right_trigger ?? 0) - rightTriggerValue) > 512;
+    const identityChanged = !existing || existing.name !== (pad.id || existing.name || `Gamepad ${gamepadId}`) || !existing.connected;
+    const stateChanged = identityChanged || buttonsChanged || axisChanged || triggerChanged;
+
+    if (!stateChanged && existing) {
+      continue;
+    }
+
+    const next = {
+      gamepad_id: gamepadId,
+      name: pad.id || existing?.name || `Gamepad ${gamepadId}`,
+      connected: true,
+      buttons,
+      pressed_buttons: pressedButtons,
+      last_button: lastPressed ? `${lastPressed} pressed` : existing?.last_button ?? null,
+      left_stick_x: leftStickX,
+      left_stick_y: leftStickY,
+      right_stick_x: rightStickX,
+      right_stick_y: rightStickY,
+      left_trigger: leftTriggerValue,
+      right_trigger: rightTriggerValue,
+      event_count: (existing?.event_count ?? 0) + 1,
+      button_event_count: (existing?.button_event_count ?? 0) + (buttonsChanged ? 1 : 0),
+      button_press_count: (existing?.button_press_count ?? 0) + (lastPressed ? 1 : 0),
+      button_release_count: (existing?.button_release_count ?? 0) + releasedCount,
+      axis_event_count: (existing?.axis_event_count ?? 0) + (axisChanged ? 1 : 0),
+      trigger_event_count: (existing?.trigger_event_count ?? 0) + (triggerChanged ? 1 : 0),
+      last_axis: triggerChanged ? "trigger" : axisChanged ? "stick" : existing?.last_axis ?? null,
+      last_seen_ms: now,
+    };
+
+    changed = true;
+    if (existingIndex >= 0) {
+      gamepads[existingIndex] = next;
+    } else {
+      gamepads.push(next);
+    }
+  }
+
+  return changed ? { ...current, gamepads } : current;
 }
 
 function numberPayload(event: LocalControlEvent, key: string, fallback: number) {
@@ -635,6 +1237,11 @@ export default function App() {
     }
   }
 
+  async function refreshAll() {
+    await Promise.allSettled([refreshDashboard(), refreshLocalControls()]);
+    setRefreshTick((value) => value + 1);
+  }
+
   useEffect(() => {
     refreshDashboard();
     refreshLocalControls();
@@ -649,11 +1256,11 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: null | (() => void) = null;
+    let subscription: LocalControlSubscription | null = null;
 
     async function startStream() {
       try {
-        unlisten = await listenTauriEvent<unknown>("local-control-event", (payload) => {
+        const nextSubscription = await listenLocalControlEvent((payload) => {
           if (typeof payload === "string") {
             setLocalControlsError(payload);
             return;
@@ -677,7 +1284,13 @@ export default function App() {
           }
         });
 
-        if (!cancelled) {
+        if (cancelled) {
+          nextSubscription?.stop();
+          return;
+        }
+
+        subscription = nextSubscription;
+        if (subscription?.usesTauriBridge) {
           await invokeCommand("start_local_controls_stream");
         }
       } catch (streamError) {
@@ -688,9 +1301,24 @@ export default function App() {
     startStream();
     return () => {
       cancelled = true;
-      unlisten?.();
-      invokeCommand("stop_local_controls_stream").catch(() => {});
+      const usesTauriBridge = subscription?.usesTauriBridge ?? false;
+      subscription?.stop();
+      if (usesTauriBridge) {
+        invokeCommand("stop_local_controls_stream").catch(() => {});
+      }
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof navigator.getGamepads !== "function") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setLocalControls((current) => mergeBrowserGamepadState(current));
+    }, 50);
+
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -757,6 +1385,25 @@ export default function App() {
     setConfirmingInputTest(null);
     try {
       const result = await invokeCommand<LocalInputTestResult>("run_local_input_test", { kind });
+      setLocalInputTestResult(result);
+      await refreshLocalControls();
+    } catch (testError) {
+      setLocalInputTestResult({
+        status: "Failed",
+        message: String(testError),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runRemoteLatencyTest(deviceId: string) {
+    setBusy(true);
+    setConfirmingInputTest(null);
+    try {
+      const result = await invokeCommand<LocalInputTestResult>("run_remote_latency_test", {
+        device_id: deviceId,
+      });
       setLocalInputTestResult(result);
       await refreshLocalControls();
     } catch (testError) {
@@ -895,7 +1542,7 @@ export default function App() {
               paddingTop: headerMetrics.actionButtonPaddingY,
               paddingBottom: headerMetrics.actionButtonPaddingY,
             }}
-            onClick={refreshDashboard}
+            onClick={refreshAll}
             title={`刷新 ${refreshTick}`}
           >
             <span className="flex items-center gap-2">
@@ -908,14 +1555,14 @@ export default function App() {
             className="rounded-md text-sm transition"
             style={{
               background: model.service.online
-                ? "rgba(197, 48, 48, 0.18)"
+                ? "rgba(197, 48, 48, 0.08)"
                 : theme.accentSoft,
               color: model.service.online
-                ? "#ffb8c1"
+                ? "#8a1f1f"
                 : theme.text,
               border: `1px solid ${
                 model.service.online
-                  ? "rgba(197, 48, 48, 0.4)"
+                  ? "rgba(197, 48, 48, 0.55)"
                   : theme.accent
               }`,
               paddingLeft: headerMetrics.actionButtonPaddingX,
@@ -960,7 +1607,7 @@ export default function App() {
           </WindowButton>
           <WindowButton
             onClick={() => handleWindow("close_window")}
-            title="关闭"
+            title="鍏抽棴"
             tone="close"
             theme={theme}
             size={headerMetrics.windowButtonSize}
@@ -1014,11 +1661,13 @@ export default function App() {
             <DevicesPage
               busy={busy}
               devices={model.devices}
+              localDevice={model.settings.localDevice}
               localControls={localControls}
               localControlsError={localControlsError}
               localInputTestResult={localInputTestResult}
               confirmingInputTest={confirmingInputTest}
               onRunLocalInputTest={runLocalInputTest}
+              onRunRemoteLatencyTest={runRemoteLatencyTest}
               onConnect={connectDevice}
               onDisconnect={disconnectDevice}
               theme={theme}
@@ -1078,11 +1727,13 @@ export default function App() {
 
 function DevicesPage({
   devices,
+  localDevice,
   localControls,
   localControlsError,
   localInputTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
+  onRunRemoteLatencyTest,
   onConnect,
   onDisconnect,
   busy,
@@ -1097,11 +1748,17 @@ function DevicesPage({
     online: boolean;
     lastSeenLabel: string;
   }>;
+  localDevice: {
+    id: string;
+    name: string;
+    hostname: string;
+  };
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
+  onRunRemoteLatencyTest: (deviceId: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -1110,11 +1767,13 @@ function DevicesPage({
   return (
     <DevicesPageWithLocalControls
       devices={devices}
+      localDevice={localDevice}
       localControls={localControls}
       localControlsError={localControlsError}
       localInputTestResult={localInputTestResult}
       confirmingInputTest={confirmingInputTest}
       onRunLocalInputTest={onRunLocalInputTest}
+      onRunRemoteLatencyTest={onRunRemoteLatencyTest}
       onConnect={onConnect}
       onDisconnect={onDisconnect}
       busy={busy}
@@ -1126,7 +1785,7 @@ function DevicesPage({
     return (
       <EmptyPanel
         title="尚未发现设备"
-        detail="启动守护进程并保持同一局域网后，发现到的设备会同时出现在设备页和布局页。"
+        detail="启动守护进程并保持同一局域网后，发现的设备会同时出现在设备页和布局页。"
         theme={theme}
       />
     );
@@ -1212,13 +1871,67 @@ function DevicesPage({
   );
 }
 
+function LocalControlTypeButton({
+  kind,
+  active,
+  icon,
+  title,
+  detail,
+  live,
+  onClick,
+  theme,
+}: {
+  kind: LocalDevicePageKind;
+  active: boolean;
+  icon: ReactNode;
+  title: string;
+  detail: string;
+  live: boolean;
+  onClick: (kind: LocalDevicePageKind) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      className="flex h-9 shrink-0 items-center gap-2 rounded-md px-2.5 text-left text-xs transition"
+      style={{
+        border: `1px solid ${active ? theme.accent : theme.border}`,
+        background: active ? theme.accentSoft : theme.frame,
+        color: active ? theme.text : theme.textSub,
+      }}
+      onClick={() => onClick(kind)}
+    >
+      <span
+        className="flex h-6 w-6 shrink-0 items-center justify-center"
+        style={{ color: active ? theme.accent : theme.textMuted }}
+      >
+        {icon}
+      </span>
+      <span className="flex min-w-0 flex-col leading-tight">
+        <span className="truncate font-medium">{title}</span>
+        <span className="truncate text-[11px]" style={{ color: theme.textMuted }}>
+          {detail}
+        </span>
+      </span>
+      <span
+        className="h-1.5 w-1.5 shrink-0 rounded-full"
+        style={{ background: live ? theme.success : theme.textMuted, opacity: live ? 1 : 0.45 }}
+      />
+    </button>
+  );
+}
+
 function DevicesPageWithLocalControls({
   devices,
+  localDevice,
   localControls,
   localControlsError,
   localInputTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
+  onRunRemoteLatencyTest,
   onConnect,
   onDisconnect,
   busy,
@@ -1233,23 +1946,102 @@ function DevicesPageWithLocalControls({
     online: boolean;
     lastSeenLabel: string;
   }>;
+  localDevice: {
+    id: string;
+    name: string;
+    hostname: string;
+  };
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
+  onRunRemoteLatencyTest: (deviceId: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  const [selectedPage, setSelectedPage] = useState<LocalDevicePageKind>("keyboard");
+  const [selectedPage, setSelectedPage] = useState<LocalDevicePageKind>("all");
+  const [selectedDeviceIds, setSelectedDeviceIds] = useState<Record<string, string>>({});
+  const [selectedMonitorDeviceId, setSelectedMonitorDeviceId] = useState("local");
+  const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      return;
+    }
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then((devices) => {
+        if (cancelled) {
+          return;
+        }
+        setBrowserAudioOutputs(
+          devices
+            .filter((device) => device.kind === "audiooutput")
+            .map((device, index) => ({
+              id: device.deviceId || `audio-output-${index}`,
+              name: device.label || (index === 0 ? "默认音频输出" : `音频输出 ${index + 1}`),
+              endpoint_id: device.deviceId || undefined,
+              source: "browser audiooutput",
+              connected: true,
+              default: index === 0,
+            })),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBrowserAudioOutputs([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const audioOutputs =
+    localControls?.audio_outputs?.length ? localControls.audio_outputs : browserAudioOutputs;
+  const audioInputs = localControls?.audio_inputs ?? [];
+  const safeDevices = safeArray(devices);
+  const connectedDevices = safeDevices.filter((device) => device.connected);
+  const selectedRemoteDevice =
+    selectedMonitorDeviceId === "local"
+      ? null
+      : connectedDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
+  const connectedDeviceIds = new Set(connectedDevices.map((device) => device.id));
+  const monitorSnapshot = selectedRemoteDevice
+    ? buildRemoteMonitorSnapshot(localControls, selectedRemoteDevice.id)
+    : buildLocalMonitorSnapshot(localControls, connectedDeviceIds);
+  const monitorError = selectedRemoteDevice ? null : localControlsError;
+
+  useEffect(() => {
+    if (
+      selectedMonitorDeviceId !== "local" &&
+      !connectedDevices.some((device) => device.id === selectedMonitorDeviceId)
+    ) {
+      setSelectedMonitorDeviceId("local");
+    }
+  }, [connectedDevices, selectedMonitorDeviceId]);
+
+  const selectedDeviceId =
+    selectedPage === "all" || selectedPage === "remote"
+      ? undefined
+      : selectedDeviceIds[selectedPage];
+  const setSelectedDeviceId = (kind: LocalControlKind, deviceId: string) => {
+    setSelectedDeviceIds((current) => ({
+      ...current,
+      [kind]: deviceId,
+    }));
+  };
   const counts = {
-    keyboard: localInputDeviceCount(localControls, "keyboard"),
-    mouse: localInputDeviceCount(localControls, "mouse"),
-    gamepad: Math.max(1, localControls?.gamepads?.length ?? 0),
-    display: Math.max(1, localControls?.display.display_count ?? 0),
-    remote: devices.length,
+    all: Boolean(monitorSnapshot),
+    keyboard: localInputDeviceCount(monitorSnapshot, "keyboard"),
+    mouse: localInputDeviceCount(monitorSnapshot, "mouse"),
+    gamepad: Math.max(1, monitorSnapshot?.gamepads?.length ?? 0),
+    display: Math.max(1, monitorSnapshot?.display.display_count ?? 0),
+    audio: Math.max(1, audioInputs.length + audioOutputs.length),
+    remote: safeDevices.length,
   };
 
   return (
@@ -1262,10 +2054,20 @@ function DevicesPageWithLocalControls({
         }}
       >
         <div
-          className="rshare-scroll flex min-h-12 items-center gap-2 overflow-x-auto px-3 py-2"
+          className="rshare-scroll flex min-h-10 items-center gap-2 overflow-x-auto px-2 py-1"
           role="tablist"
           aria-label="设备类型"
         >
+        <LocalControlTypeButton
+          kind="all"
+          active={selectedPage === "all"}
+          icon={<LayoutGrid size={18} />}
+          title="全部设备"
+          detail="总览"
+          live={counts.all}
+          onClick={setSelectedPage}
+          theme={theme}
+        />
         <LocalControlTypeButton
           kind="keyboard"
           active={selectedPage === "keyboard"}
@@ -1307,23 +2109,78 @@ function DevicesPageWithLocalControls({
           theme={theme}
         />
         <LocalControlTypeButton
+          kind="audio"
+          active={selectedPage === "audio"}
+          icon={<Volume2 size={18} />}
+          title="音频设备"
+          detail={`${counts.audio} 个`}
+          live={audioInputs.length > 0 || audioOutputs.length > 0}
+          onClick={setSelectedPage}
+          theme={theme}
+        />
+        <LocalControlTypeButton
           kind="remote"
           active={selectedPage === "remote"}
           icon={<Monitor size={18} />}
           title="远端设备"
           detail={`${counts.remote} 台`}
-          live={devices.some((device) => device.connected)}
+           live={safeDevices.some((device) => device.connected)}
           onClick={setSelectedPage}
           theme={theme}
         />
+          <div className="ml-auto flex shrink-0 items-center gap-2 pl-2">
+            <span className="text-xs" style={{ color: theme.textMuted }}>
+              监听
+            </span>
+            <select
+              className="h-8 max-w-[220px] rounded-md px-2 text-xs outline-none"
+              style={{
+                border: `1px solid ${theme.border}`,
+                background: theme.frame,
+                color: theme.text,
+              }}
+              value={selectedMonitorDeviceId}
+              onChange={(event) => setSelectedMonitorDeviceId(event.currentTarget.value)}
+              title="选择要监听和测试延迟的设备"
+            >
+              <option value="local">
+                本机 · {localDevice.name}
+              </option>
+              {connectedDevices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name} · {device.hostname}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
-        <DeviceDriverStrip kind={selectedPage} snapshot={localControls} theme={theme} />
+        {selectedPage !== "all" && !selectedRemoteDevice ? (
+          <DeviceDriverStrip
+            kind={selectedPage}
+            snapshot={monitorSnapshot}
+            audioOutputs={audioOutputs}
+            selectedDeviceId={selectedDeviceId}
+            onSelectedDeviceIdChange={(deviceId) =>
+              setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
+            }
+            theme={theme}
+          />
+        ) : null}
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        {selectedPage === "remote" ? (
+        {selectedPage === "all" ? (
+          <AllDevicesOverview
+            snapshot={monitorSnapshot}
+            audioOutputs={audioOutputs}
+            selectedDeviceIds={selectedDeviceIds}
+            onSelectedDeviceIdChange={setSelectedDeviceId}
+            error={monitorError}
+            theme={theme}
+          />
+        ) : selectedPage === "remote" ? (
           <RemoteDevicesPanel
-            devices={devices}
+            devices={safeDevices}
             onConnect={onConnect}
             onDisconnect={onDisconnect}
             busy={busy}
@@ -1331,13 +2188,23 @@ function DevicesPageWithLocalControls({
           />
         ) : (
           <LocalControlDriverHub
-            snapshot={localControls}
-            error={localControlsError}
+            snapshot={monitorSnapshot}
+            error={monitorError}
             inputTestResult={localInputTestResult}
             confirmingInputTest={confirmingInputTest}
             selectedKind={selectedPage}
+            remoteDevice={selectedRemoteDevice}
+            selectedDeviceId={selectedDeviceId}
+            audioOutputs={audioOutputs}
             onSelectedKindChange={setSelectedPage}
-            onRunInputTest={onRunLocalInputTest}
+            onSelectedDeviceIdChange={(deviceId) =>
+              setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
+            }
+            onRunInputTest={
+              selectedRemoteDevice
+                ? () => onRunRemoteLatencyTest(selectedRemoteDevice.id)
+                : onRunLocalInputTest
+            }
             theme={theme}
           />
         )}
@@ -1450,6 +2317,942 @@ function DevicesPageWithLocalControls({
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function AllDevicesOverview({
+  snapshot,
+  audioOutputs,
+  selectedDeviceIds,
+  onSelectedDeviceIdChange,
+  error,
+  theme,
+}: {
+  snapshot: LocalControlsSnapshot | null;
+  audioOutputs: AudioOutputDevice[];
+  selectedDeviceIds: Record<string, string>;
+  onSelectedDeviceIdChange: (kind: LocalControlKind, deviceId: string) => void;
+  error: string | null;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const keyboardSelectedId = selectedLocalDeviceId(snapshot, "keyboard", selectedDeviceIds.keyboard);
+  const mouseSelectedId = selectedLocalDeviceId(snapshot, "mouse", selectedDeviceIds.mouse);
+  const gamepadSelectedId = selectedLocalDeviceId(snapshot, "gamepad", selectedDeviceIds.gamepad);
+  const keyboardEvents = selectedControlEvents(snapshot, "keyboard", keyboardSelectedId);
+  const mouseEvents = selectedControlEvents(snapshot, "mouse", mouseSelectedId);
+  const gamepadEvents = selectedControlEvents(snapshot, "gamepad", gamepadSelectedId);
+  const keyboardState = keyboardMonitorState(snapshot, keyboardSelectedId, keyboardEvents);
+  const mouseState = mouseMonitorState(snapshot, mouseSelectedId, mouseEvents);
+  const gamepad = selectedGamepad(snapshot, gamepadSelectedId);
+  const keyboardEvent = latestEvent(keyboardEvents);
+  const mouseEvent = latestEvent(mouseEvents);
+  const gamepadEvent = latestEvent(gamepadEvents);
+  const displayEvent = latestLocalControlEvent(snapshot, "Display") ?? mouseEvent;
+  const audioEvent = latestLocalControlEvent(snapshot, "Audio");
+  const keyboardSelector = (
+    <DeviceSelector
+      compact
+      items={localDeviceItems(snapshot, "keyboard")}
+      selectedId={keyboardSelectedId}
+      onChange={(deviceId) => onSelectedDeviceIdChange("keyboard", deviceId)}
+      theme={theme}
+    />
+  );
+  const mouseSelector = (
+    <DeviceSelector
+      compact
+      items={localDeviceItems(snapshot, "mouse")}
+      selectedId={mouseSelectedId}
+      onChange={(deviceId) => onSelectedDeviceIdChange("mouse", deviceId)}
+      theme={theme}
+    />
+  );
+  const gamepadSelector = (
+    <DeviceSelector
+      compact
+      items={localDeviceItems(snapshot, "gamepad")}
+      selectedId={gamepadSelectedId}
+      onChange={(deviceId) => onSelectedDeviceIdChange("gamepad", deviceId)}
+      theme={theme}
+    />
+  );
+  const displaySelector = (
+    <DeviceSelector
+      compact
+      items={localDeviceItems(snapshot, "display")}
+      selectedId={selectedDeviceIds.display}
+      onChange={(deviceId) => onSelectedDeviceIdChange("display", deviceId)}
+      theme={theme}
+    />
+  );
+  const audioSelector = (
+    <DeviceSelector
+      compact
+      items={localDeviceItems(snapshot, "audio", audioOutputs)}
+      selectedId={selectedDeviceIds.audio}
+      onChange={(deviceId) => onSelectedDeviceIdChange("audio", deviceId)}
+      theme={theme}
+    />
+  );
+
+  return (
+    <section
+      className="relative grid h-full min-h-0 grid-cols-1 gap-2 overflow-hidden p-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(220px,0.42fr)] xl:grid-rows-[minmax(0,1fr)_minmax(0,0.9fr)]"
+      style={{
+        border: `1px solid ${theme.border}`,
+        background: theme.frame,
+      }}
+    >
+      {error ? (
+        <div
+          className="absolute left-3 top-3 z-10 rounded px-3 py-2 text-xs"
+          style={{
+            border: "1px solid rgba(197, 48, 48, 0.45)",
+            background: "rgba(94, 24, 34, 0.72)",
+            color: "#ffb8c1",
+          }}
+        >
+          本机捕获不可用：{error}
+        </div>
+      ) : null}
+
+      <OverviewAnimationCard
+        icon={<Keyboard size={16} />}
+        title="键盘"
+        live={Boolean(snapshot?.keyboard.detected)}
+        event={keyboardEvent}
+        selector={keyboardSelector}
+        theme={theme}
+        className="xl:col-span-2"
+      >
+        <SimulatedKeyboard
+          compact
+          pressedKeys={keyboardState.pressedKeys}
+          lastKey={keyboardState.lastKey}
+          recentEvents={keyboardEvents}
+          eventCount={keyboardState.eventCount}
+          theme={theme}
+        />
+      </OverviewAnimationCard>
+
+      <OverviewAnimationCard
+        icon={<MousePointer2 size={16} />}
+        title="鼠标"
+        live={Boolean(snapshot?.mouse.detected)}
+        event={mouseEvent}
+        selector={mouseSelector}
+        theme={theme}
+      >
+        <SimulatedMouse
+          compact
+          x={mouseState.x}
+          y={mouseState.y}
+          pressedButtons={mouseState.pressedButtons}
+          recentEvents={mouseEvents}
+          wheelDeltaX={mouseState.wheelDeltaX}
+          wheelDeltaY={mouseState.wheelDeltaY}
+          wheelTotalX={mouseState.wheelTotalX}
+          wheelTotalY={mouseState.wheelTotalY}
+          eventCount={mouseState.eventCount}
+          moveCount={mouseState.moveCount}
+          buttonPressCount={mouseState.buttonPressCount}
+          buttonReleaseCount={mouseState.buttonReleaseCount}
+          wheelEventCount={mouseState.wheelEventCount}
+          displayRelativeX={mouseState.displayRelativeX}
+          displayRelativeY={mouseState.displayRelativeY}
+          currentDisplayIndex={mouseState.currentDisplayIndex}
+          currentDisplayId={mouseState.currentDisplayId}
+          displays={snapshot?.display.displays ?? []}
+          theme={theme}
+        />
+      </OverviewAnimationCard>
+
+      <OverviewAnimationCard
+        icon={<Gamepad2 size={16} />}
+        title="手柄"
+        live={Boolean(gamepad?.connected)}
+        event={gamepadEvent}
+        selector={gamepadSelector}
+        theme={theme}
+      >
+        <SimulatedGamepad
+          compact
+          gamepad={gamepad}
+          virtualDetail={snapshot?.virtual_gamepad.detail ?? "Virtual HID not implemented"}
+          theme={theme}
+        />
+      </OverviewAnimationCard>
+
+      <OverviewAnimationCard
+        icon={<HardDrive size={16} />}
+        title="显示设备"
+        live={(snapshot?.display.display_count ?? 0) > 0}
+        event={displayEvent}
+        selector={displaySelector}
+        theme={theme}
+      >
+        <DisplayActivityPreview snapshot={snapshot} theme={theme} />
+      </OverviewAnimationCard>
+      <OverviewAnimationCard
+        icon={<Volume2 size={16} />}
+        title="音频设备"
+        live={Boolean((snapshot?.audio_inputs?.length ?? 0) + audioOutputs.length)}
+        event={audioEvent}
+        selector={audioSelector}
+        theme={theme}
+      >
+        <AudioActivityPreview snapshot={snapshot} outputs={audioOutputs} theme={theme} />
+      </OverviewAnimationCard>
+    </section>
+  );
+}
+
+function latestLocalControlEvent(
+  snapshot: LocalControlsSnapshot | null,
+  kind: LocalControlEvent["device_kind"],
+) {
+  return [...(snapshot?.recent_events ?? [])]
+    .reverse()
+    .find((event) => event.device_kind === kind) ?? null;
+}
+
+function safeArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function isLogEntry(value: unknown): value is LogEntry {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.timestamp === "string" &&
+    typeof value.level === "string" &&
+    typeof value.target === "string" &&
+    typeof value.message === "string"
+  );
+}
+
+function eventDeviceKindForControlKind(kind: LocalControlKind): LocalControlEvent["device_kind"] {
+  switch (kind) {
+    case "keyboard":
+      return "Keyboard";
+    case "mouse":
+      return "Mouse";
+    case "gamepad":
+      return "Gamepad";
+    case "display":
+      return "Display";
+    case "audio":
+      return "Audio";
+  }
+}
+
+function isUnscopedDeviceSelection(deviceId: string | null | undefined) {
+  return !deviceId || deviceId.endsWith("-default");
+}
+
+function selectedLocalDeviceId(
+  snapshot: LocalControlsSnapshot | null,
+  kind: LocalControlKind,
+  selectedDeviceId?: string,
+  audioOutputs: AudioOutputDevice[] = [],
+) {
+  const devices = localDeviceItems(snapshot, kind, audioOutputs);
+  if (selectedDeviceId && devices.some((device) => device.id === selectedDeviceId)) {
+    return selectedDeviceId;
+  }
+  return devices.find((device) => device.active)?.id ?? devices[0]?.id;
+}
+
+function selectedControlEvents(
+  snapshot: LocalControlsSnapshot | null,
+  kind: LocalControlKind,
+  selectedDeviceId?: string,
+) {
+  const deviceKind = eventDeviceKindForControlKind(kind);
+  return safeArray(snapshot?.recent_events).filter(
+    (event) =>
+      event.device_kind === deviceKind &&
+      eventMatchesSelectedDevice(event, kind, selectedDeviceId),
+  );
+}
+
+function eventMatchesSelectedDevice(
+  event: LocalControlEvent,
+  kind: LocalControlKind,
+  selectedDeviceId?: string,
+) {
+  if (isUnscopedDeviceSelection(selectedDeviceId)) {
+    return true;
+  }
+
+  if (kind === "gamepad") {
+    const gamepadId = event.payload?.gamepad_id;
+    return (
+      (gamepadId !== undefined && `gamepad-${gamepadId}` === selectedDeviceId) ||
+      event.device_id === selectedDeviceId
+    );
+  }
+
+  if (kind === "display") {
+    return event.payload?.display_id === selectedDeviceId;
+  }
+
+  if (kind === "audio") {
+    return (
+      event.device_id === selectedDeviceId ||
+      event.payload?.endpoint_id === selectedDeviceId ||
+      event.payload?.target_endpoint_id === selectedDeviceId
+    );
+  }
+
+  const identifiers = [
+    event.device_id,
+    event.device_instance_id,
+    event.capture_path,
+    event.payload?.device_id,
+    event.payload?.device_instance_id,
+    event.payload?.origin_event_device_id,
+    event.payload?.capture_path,
+  ];
+  return identifiers.some((identifier) => identifier === selectedDeviceId);
+}
+
+function latestEvent(events: LocalControlEvent[]) {
+  return events.length ? events[events.length - 1] : null;
+}
+
+function keyboardMonitorState(
+  snapshot: LocalControlsSnapshot | null,
+  selectedDeviceId: string | undefined,
+  events: LocalControlEvent[],
+) {
+  if (isUnscopedDeviceSelection(selectedDeviceId)) {
+    return {
+      pressedKeys: snapshot?.keyboard.pressed_keys ?? [],
+      lastKey: snapshot?.keyboard.last_key ?? null,
+      eventCount: snapshot?.keyboard.event_count ?? 0,
+    };
+  }
+
+  const pressedKeys: string[] = [];
+  let lastKey: string | null = null;
+  for (const event of events) {
+    const key = keyboardEventKey(event);
+    if (!key) {
+      continue;
+    }
+    lastKey = key;
+    if (eventStateIsPressed(event)) {
+      pushUniqueString(pressedKeys, key);
+    } else if (eventStateIsReleased(event)) {
+      removeString(pressedKeys, key);
+    }
+  }
+  return {
+    pressedKeys,
+    lastKey,
+    eventCount: events.length,
+  };
+}
+
+function mouseMonitorState(
+  snapshot: LocalControlsSnapshot | null,
+  selectedDeviceId: string | undefined,
+  events: LocalControlEvent[],
+) {
+  if (isUnscopedDeviceSelection(selectedDeviceId)) {
+    return {
+      x: snapshot?.mouse.x ?? 0,
+      y: snapshot?.mouse.y ?? 0,
+      pressedButtons: snapshot?.mouse.pressed_buttons ?? [],
+      wheelDeltaX: snapshot?.mouse.wheel_delta_x ?? 0,
+      wheelDeltaY: snapshot?.mouse.wheel_delta_y ?? 0,
+      wheelTotalX: snapshot?.mouse.wheel_total_x ?? 0,
+      wheelTotalY: snapshot?.mouse.wheel_total_y ?? 0,
+      eventCount: snapshot?.mouse.event_count ?? 0,
+      moveCount: snapshot?.mouse.move_count ?? 0,
+      buttonPressCount: snapshot?.mouse.button_press_count ?? 0,
+      buttonReleaseCount: snapshot?.mouse.button_release_count ?? 0,
+      wheelEventCount: snapshot?.mouse.wheel_event_count ?? 0,
+      displayRelativeX: snapshot?.mouse.display_relative_x ?? snapshot?.mouse.x ?? 0,
+      displayRelativeY: snapshot?.mouse.display_relative_y ?? snapshot?.mouse.y ?? 0,
+      currentDisplayIndex: snapshot?.mouse.current_display_index ?? null,
+      currentDisplayId: snapshot?.mouse.current_display_id ?? null,
+    };
+  }
+
+  const pressedButtons: string[] = [];
+  let x = 0;
+  let y = 0;
+  let wheelDeltaX = 0;
+  let wheelDeltaY = 0;
+  let wheelTotalX = 0;
+  let wheelTotalY = 0;
+  let moveCount = 0;
+  let buttonPressCount = 0;
+  let buttonReleaseCount = 0;
+  let wheelEventCount = 0;
+  let displayRelativeX = 0;
+  let displayRelativeY = 0;
+  let currentDisplayIndex: number | null = null;
+  let currentDisplayId: string | null = null;
+
+  for (const event of events) {
+    x = numberPayload(event, "x", x);
+    y = numberPayload(event, "y", y);
+    displayRelativeX = numberPayload(event, "display_relative_x", displayRelativeX);
+    displayRelativeY = numberPayload(event, "display_relative_y", displayRelativeY);
+    currentDisplayIndex = optionalNumberPayload(event, "display_index", currentDisplayIndex);
+    currentDisplayId = event.payload?.display_id ?? currentDisplayId;
+
+    if (event.event_kind === "move") {
+      moveCount += 1;
+    } else if (event.event_kind === "button") {
+      const button = event.payload?.button;
+      if (button) {
+        if (eventStateIsPressed(event)) {
+          buttonPressCount += 1;
+          pushUniqueString(pressedButtons, button);
+        } else if (eventStateIsReleased(event)) {
+          buttonReleaseCount += 1;
+          removeString(pressedButtons, button);
+        }
+      }
+    } else if (event.event_kind === "wheel") {
+      wheelEventCount += 1;
+      wheelDeltaX = numberPayload(event, "delta_x", 0);
+      wheelDeltaY = numberPayload(event, "delta_y", 0);
+      wheelTotalX = numberPayload(event, "total_x", wheelTotalX + wheelDeltaX);
+      wheelTotalY = numberPayload(event, "total_y", wheelTotalY + wheelDeltaY);
+    }
+  }
+
+  return {
+    x,
+    y,
+    pressedButtons,
+    wheelDeltaX,
+    wheelDeltaY,
+    wheelTotalX,
+    wheelTotalY,
+    eventCount: events.length,
+    moveCount,
+    buttonPressCount,
+    buttonReleaseCount,
+    wheelEventCount,
+    displayRelativeX,
+    displayRelativeY,
+    currentDisplayIndex,
+    currentDisplayId,
+  };
+}
+
+function selectedGamepad(
+  snapshot: LocalControlsSnapshot | null,
+  selectedDeviceId: string | undefined,
+) {
+  const gamepads = safeArray(snapshot?.gamepads);
+  if (!isUnscopedDeviceSelection(selectedDeviceId)) {
+    const wanted = selectedDeviceId?.replace(/^gamepad-/, "");
+    const selected = gamepads.find((gamepad) => String(gamepad.gamepad_id) === wanted);
+    if (selected) {
+      return selected;
+    }
+  }
+  return gamepads.find((item) => item.connected) ?? gamepads[0] ?? null;
+}
+
+function buildLocalMonitorSnapshot(
+  snapshot: LocalControlsSnapshot | null,
+  remoteDeviceIds: ReadonlySet<string>,
+) {
+  if (!snapshot) {
+    return null;
+  }
+
+  return {
+    ...snapshot,
+    recent_events: safeArray(snapshot.recent_events).filter((event) => {
+      const sourceDeviceId = event.device_id ?? event.payload?.remote_device_id;
+      return !sourceDeviceId || !remoteDeviceIds.has(sourceDeviceId);
+    }),
+  };
+}
+
+function buildEmptyControlSnapshot(base: LocalControlsSnapshot | null): LocalControlsSnapshot {
+  return {
+    sequence: base?.sequence ?? 0,
+    keyboard: {
+      detected: false,
+      pressed_keys: [],
+      last_key: null,
+      event_count: 0,
+      capture_source: "remote diagnostic",
+    },
+    mouse: {
+      detected: false,
+      x: 0,
+      y: 0,
+      pressed_buttons: [],
+      wheel_delta_x: 0,
+      wheel_delta_y: 0,
+      event_count: 0,
+      move_count: 0,
+      button_event_count: 0,
+      button_press_count: 0,
+      button_release_count: 0,
+      wheel_event_count: 0,
+      wheel_total_x: 0,
+      wheel_total_y: 0,
+      current_display_index: null,
+      current_display_id: null,
+      display_relative_x: 0,
+      display_relative_y: 0,
+      capture_source: "remote diagnostic",
+    },
+    keyboard_devices: [],
+    mouse_devices: [],
+    gamepads: [],
+    audio_inputs: [],
+    audio_outputs: [],
+    audio_capture_state: base?.audio_capture_state,
+    audio_stream_state: base?.audio_stream_state,
+    display: base?.display ?? {
+      display_count: 1,
+      primary_width: 1920,
+      primary_height: 1080,
+      layout_width: 1920,
+      layout_height: 1080,
+      displays: [
+        {
+          display_id: "remote-primary",
+          x: 0,
+          y: 0,
+          width: 1920,
+          height: 1080,
+          primary: true,
+        },
+      ],
+    },
+    capture_backend: base?.capture_backend ?? {},
+    inject_backend: base?.inject_backend ?? {},
+    privilege_state: base?.privilege_state ?? null,
+    virtual_gamepad: base?.virtual_gamepad ?? {
+      status: "remote",
+      detail: "Remote diagnostic stream",
+    },
+    driver: base?.driver,
+    recent_events: [],
+    last_error: null,
+  };
+}
+
+function buildRemoteMonitorSnapshot(
+  snapshot: LocalControlsSnapshot | null,
+  remoteDeviceId: string,
+) {
+  const remoteEvents = safeArray(snapshot?.recent_events)
+    .filter((event) => {
+      const sourceDeviceId = event.device_id ?? event.payload?.remote_device_id;
+      return sourceDeviceId === remoteDeviceId;
+    })
+    .sort((left, right) => left.sequence - right.sequence);
+  let remoteSnapshot = buildEmptyControlSnapshot(snapshot);
+  for (const event of remoteEvents) {
+    remoteSnapshot = applyLocalControlEvent(remoteSnapshot, event);
+  }
+  return remoteSnapshot;
+}
+
+function localDeviceItems(
+  snapshot: LocalControlsSnapshot | null,
+  kind: LocalControlKind,
+  audioOutputs: AudioOutputDevice[] = [],
+): LocalDeviceSelectItem[] {
+  if (kind === "keyboard") {
+    const devices = safeArray(snapshot?.keyboard_devices);
+    if (devices.length) {
+      return devices.map((device, index) => ({
+        id: device.id || `keyboard-${index}`,
+        name: device.name || `键盘 ${index + 1}`,
+        detail: device.driver_detail ?? device.capture_path ?? device.source ?? "keyboard",
+        live: device.connected !== false,
+        active: index === 0,
+      }));
+    }
+    return [{
+      id: "keyboard-default",
+      name: "默认键盘",
+      detail: snapshot?.keyboard.capture_source ?? "等待输入事件",
+      live: Boolean(snapshot?.keyboard.detected),
+      active: true,
+    }];
+  }
+
+  if (kind === "mouse") {
+    const devices = safeArray(snapshot?.mouse_devices);
+    if (devices.length) {
+      return devices.map((device, index) => ({
+        id: device.id || `mouse-${index}`,
+        name: device.name || `鼠标 ${index + 1}`,
+        detail: device.driver_detail ?? device.capture_path ?? device.source ?? "mouse",
+        live: device.connected !== false,
+        active: index === 0,
+      }));
+    }
+    return [{
+      id: "mouse-default",
+      name: "默认鼠标",
+      detail: snapshot?.mouse.capture_source ?? "等待输入事件",
+      live: Boolean(snapshot?.mouse.detected),
+      active: true,
+    }];
+  }
+
+  if (kind === "gamepad") {
+    const gamepads = safeArray(snapshot?.gamepads);
+    if (gamepads.length) {
+      return gamepads.map((gamepad, index) => ({
+        id: `gamepad-${gamepad.gamepad_id}`,
+        name: gamepad.name || `手柄 ${gamepad.gamepad_id + 1}`,
+        detail: `事件 ${gamepad.event_count ?? 0}`,
+        live: Boolean(gamepad.connected),
+        active: index === 0,
+      }));
+    }
+    return [{
+      id: "gamepad-default",
+      name: "默认手柄",
+      detail: "未连接",
+      live: false,
+      active: true,
+    }];
+  }
+
+  if (kind === "display") {
+    const displays = safeArray(snapshot?.display?.displays);
+    if (displays.length) {
+      return displays.map((display, index) => ({
+        id: display.display_id || `display-${index}`,
+        name: display.primary ? "主显示器" : `显示器 ${index + 1}`,
+        detail: `${display.width} x ${display.height}`,
+        live: true,
+        active: Boolean(display.primary) || index === 0,
+      }));
+    }
+    return [{
+      id: "display-primary",
+      name: "主显示器",
+      detail: `${snapshot?.display?.primary_width ?? 1920} x ${snapshot?.display?.primary_height ?? 1080}`,
+      live: Boolean(snapshot?.display?.display_count),
+      active: true,
+    }];
+  }
+
+  const audioInputs = safeArray(snapshot?.audio_inputs).map((device, index) => ({
+    id: device.id || `audio-input-${index}`,
+    name: device.name || `音频输入 ${index + 1}`,
+    detail: `${device.kind ?? "Microphone"} / ${device.source ?? "audio"}`,
+    live: device.connected !== false,
+    active: Boolean(device.default),
+  }));
+  const outputs = safeArray(audioOutputs).map((device, index) => ({
+    id: device.id || `audio-output-${index}`,
+    name: device.name || `音频输出 ${index + 1}`,
+    detail: `${device.source ?? "audio"}${device.default ? " / default" : ""}`,
+    live: device.connected !== false,
+    active: Boolean(device.default),
+  }));
+  const items = [...audioInputs, ...outputs];
+  return items.length
+    ? items
+    : [{
+        id: "audio-default",
+        name: "默认音频",
+        detail: "等待枚举",
+        live: false,
+        active: true,
+      }];
+}
+
+function DeviceSelector({
+  items,
+  selectedId,
+  onChange,
+  compact = false,
+  theme,
+}: {
+  items: LocalDeviceSelectItem[] | null | undefined;
+  selectedId?: string;
+  onChange?: (deviceId: string) => void;
+  compact?: boolean;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const options = safeArray(items);
+  if (!options.length) {
+    return (
+      <span className="text-xs" style={{ color: theme.textMuted }}>
+        未检测到设备
+      </span>
+    );
+  }
+  const currentId =
+    selectedId && options.some((item) => item.id === selectedId)
+      ? selectedId
+      : options.find((item) => item.active)?.id ?? options[0].id;
+
+  return (
+    <select
+      className={`${compact ? "h-7 max-w-[160px]" : "h-8 max-w-[320px]"} rounded-md px-2 text-xs outline-none`}
+      style={{
+        border: `1px solid ${theme.border}`,
+        background: "rgba(255,255,255,0.035)",
+        color: theme.text,
+      }}
+      value={currentId}
+      onChange={(event) => onChange?.(event.currentTarget.value)}
+      title={options.find((item) => item.id === currentId)?.detail}
+    >
+      {options.map((item) => (
+        <option key={item.id} value={item.id}>
+          {item.live ? "● " : "○ "}
+          {item.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function OverviewAnimationCard({
+  icon,
+  title,
+  live,
+  event,
+  selector,
+  children,
+  theme,
+  className = "",
+}: {
+  icon: ReactNode;
+  title: string;
+  live: boolean;
+  event: LocalControlEvent | null;
+  selector?: ReactNode;
+  children: ReactNode;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  className?: string;
+}) {
+  return (
+    <article
+      className={`relative flex min-h-0 flex-col overflow-hidden ${className}`}
+      style={{
+        border: `1px solid ${event ? theme.accent : theme.border}`,
+        background: "rgba(255,255,255,0.02)",
+      }}
+    >
+      <div className="flex h-9 shrink-0 items-center gap-2 px-3">
+        <span style={{ color: event ? theme.accent : theme.textMuted }}>{icon}</span>
+        <span className="text-sm font-medium">{title}</span>
+        {selector ? <div className="min-w-0">{selector}</div> : null}
+        <span
+          className="ml-auto h-2.5 w-2.5 rounded-full"
+          style={{ background: live ? theme.success : theme.textMuted }}
+        />
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden px-3 pb-3">{children}</div>
+      {event ? (
+        <span
+          key={event.sequence}
+          className="pointer-events-none absolute right-4 top-4 h-3 w-3 rounded-full animate-ping"
+          style={{ background: theme.accent }}
+        />
+      ) : null}
+    </article>
+  );
+}
+
+function DisplayActivityPreview({
+  snapshot,
+  theme,
+}: {
+  snapshot: LocalControlsSnapshot | null;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const displays =
+    snapshot?.display.displays?.length
+      ? snapshot.display.displays
+      : [
+          {
+            display_id: "primary",
+            x: snapshot?.display.virtual_x ?? 0,
+            y: snapshot?.display.virtual_y ?? 0,
+            width: snapshot?.display.primary_width ?? 1920,
+            height: snapshot?.display.primary_height ?? 1080,
+            primary: true,
+          },
+        ];
+  const minX = Math.min(...displays.map((display) => display.x));
+  const minY = Math.min(...displays.map((display) => display.y));
+  const maxX = Math.max(...displays.map((display) => display.x + display.width));
+  const maxY = Math.max(...displays.map((display) => display.y + display.height));
+  const totalWidth = Math.max(1, maxX - minX);
+  const totalHeight = Math.max(1, maxY - minY);
+  const activeIndex = snapshot?.mouse.current_display_index ?? 0;
+  const activeDisplay = displays[activeIndex] ?? displays[0];
+  const cursorX =
+    ((activeDisplay.x - minX + (snapshot?.mouse.display_relative_x ?? snapshot?.mouse.x ?? 0)) /
+      totalWidth) *
+    100;
+  const cursorY =
+    ((activeDisplay.y - minY + (snapshot?.mouse.display_relative_y ?? snapshot?.mouse.y ?? 0)) /
+      totalHeight) *
+    100;
+
+  const cursorAbsoluteX = activeDisplay.x + (snapshot?.mouse.display_relative_x ?? snapshot?.mouse.x ?? 0);
+  const cursorAbsoluteY = activeDisplay.y + (snapshot?.mouse.display_relative_y ?? snapshot?.mouse.y ?? 0);
+  const strokeWidth = Math.max(totalWidth, totalHeight) / 260;
+  const labelSize = Math.max(totalHeight / 22, 42);
+
+  return (
+    <div
+      className="relative flex h-full min-h-[180px] items-center justify-center overflow-hidden p-3"
+      style={{
+        border: `1px solid ${theme.border}`,
+        backgroundImage:
+          "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px)",
+        backgroundSize: "24px 24px",
+      }}
+    >
+      <svg
+        className="h-full w-full"
+        viewBox={`${minX} ${minY} ${totalWidth} ${totalHeight}`}
+        preserveAspectRatio="xMidYMid meet"
+        role="img"
+        aria-label="display layout preview"
+      >
+        {displays.map((display, index) => (
+          <g key={display.display_id}>
+            <rect
+              x={display.x}
+              y={display.y}
+              width={display.width}
+              height={display.height}
+              fill={index === activeIndex ? theme.accentSoft : "rgba(255,255,255,0.045)"}
+              stroke={index === activeIndex ? theme.accent : theme.border}
+              strokeWidth={strokeWidth * (index === activeIndex ? 2 : 1)}
+            />
+            <text
+              x={display.x + display.width * 0.04}
+              y={display.y + display.height * 0.12}
+              fill={theme.textMuted}
+              fontSize={labelSize}
+            >
+              {display.primary ? "Primary" : `Display ${index + 1}`}
+            </text>
+            <text
+              x={display.x + display.width * 0.04}
+              y={display.y + display.height * 0.88}
+              fill={theme.textMuted}
+              fontSize={labelSize * 0.9}
+            >
+              {display.width} x {display.height}
+            </text>
+          </g>
+        ))}
+        <circle
+          cx={Math.min(maxX, Math.max(minX, cursorAbsoluteX))}
+          cy={Math.min(maxY, Math.max(minY, cursorAbsoluteY))}
+          r={Math.max(totalWidth, totalHeight) / 70}
+          fill={theme.accent}
+          opacity="0.24"
+        />
+        <circle
+          cx={Math.min(maxX, Math.max(minX, cursorAbsoluteX))}
+          cy={Math.min(maxY, Math.max(minY, cursorAbsoluteY))}
+          r={Math.max(totalWidth, totalHeight) / 140}
+          fill={theme.accent}
+        />
+      </svg>
+    </div>
+  );
+}
+
+function AudioActivityPreview({
+  snapshot,
+  outputs,
+  theme,
+}: {
+  snapshot: LocalControlsSnapshot | null;
+  outputs: AudioOutputDevice[];
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const inputs = snapshot?.audio_inputs ?? [];
+  const capture = snapshot?.audio_capture_state;
+  const stream = snapshot?.audio_stream_state;
+  const loopbackLevel = Math.max(
+    0,
+    ...inputs.filter((input) => input.kind === "Loopback").map((input) => input.level_peak ?? 0),
+    capture?.source === "Loopback" ? (capture.level_peak ?? 0) : 0,
+  );
+  const micLevel = Math.max(
+    0,
+    ...inputs.filter((input) => input.kind !== "Loopback").map((input) => input.level_peak ?? 0),
+    capture?.source === "Microphone" ? (capture.level_peak ?? 0) : 0,
+  );
+  const defaultOutput = outputs.find((output) => output.default) ?? outputs[0];
+  const status = stream?.active
+    ? "远端转发"
+    : capture?.status === "CapturingLocal"
+      ? "本机捕获"
+      : "空闲";
+
+  return (
+    <div
+      className="flex h-full min-h-[180px] flex-col justify-center gap-4 overflow-hidden p-4"
+      style={{
+        border: `1px solid ${theme.border}`,
+        background: "rgba(255,255,255,0.025)",
+      }}
+    >
+      <AudioLevelBar label="系统回环" value={loopbackLevel} theme={theme} />
+      <AudioLevelBar label="麦克风" value={micLevel} theme={theme} />
+      <div className="grid grid-cols-2 gap-3 text-xs">
+        <InfoRow label="输出" value={defaultOutput?.name ?? "无"} theme={theme} />
+        <InfoRow label="状态" value={status} theme={theme} />
+        <InfoRow label="输入" value={String(inputs.length)} theme={theme} />
+        <InfoRow label="端点" value={String(outputs.length)} theme={theme} />
+      </div>
+    </div>
+  );
+}
+
+function AudioLevelBar({
+  label,
+  value,
+  theme,
+}: {
+  label: string;
+  value: number;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const normalized = Math.max(0, Math.min(100, value));
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between text-xs" style={{ color: theme.textMuted }}>
+        <span>{label}</span>
+        <span>{Math.round(normalized)}%</span>
+      </div>
+      <div className="h-3 overflow-hidden rounded-sm" style={{ background: "rgba(255,255,255,0.055)" }}>
+        <div
+          className="h-full transition-[width]"
+          style={{
+            width: `${normalized}%`,
+            background: theme.accent,
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -1582,174 +3385,6 @@ function LocalControlCenter({
       theme={theme}
     />
   );
-
-  const recentEvents = snapshot?.recent_events ?? [];
-  const latestEvent = recentEvents.length ? recentEvents[recentEvents.length - 1] : undefined;
-  const gamepad = snapshot?.gamepads?.find((item) => item.connected) ?? snapshot?.gamepads?.[0];
-  const backendDetail = snapshot
-    ? `${backendHealthLabel(snapshot.capture_backend)} capture / ${backendHealthLabel(snapshot.inject_backend)} inject`
-    : "daemon IPC unavailable";
-
-  return (
-    <section
-      className="p-5"
-      style={{
-        background: theme.sidebar,
-        border: `1px solid ${theme.border}`,
-        boxShadow: theme.panelShadow,
-      }}
-    >
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-semibold">本机控制设备</h1>
-          <p className="mt-1 text-sm" style={{ color: theme.textMuted }}>
-            使用 daemon 捕获链路显示键盘、鼠标、手柄和显示设备反馈。
-          </p>
-        </div>
-        <StatusPill
-          label={error ? "不可用" : snapshot ? "实时反馈" : "等待 daemon"}
-          tone={error ? "danger" : snapshot ? "success" : "muted"}
-          theme={theme}
-        />
-      </div>
-
-      {error ? (
-        <div
-          className="mb-4 px-4 py-3 text-sm"
-          style={{
-            border: "1px solid rgba(197, 48, 48, 0.45)",
-            background: "rgba(94, 24, 34, 0.45)",
-            color: "#ffb8c1",
-          }}
-        >
-          本机驱动中心不可用：{error}
-        </div>
-      ) : null}
-
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-4">
-        <LocalDevicePanel
-          icon={<Keyboard size={18} />}
-          title="键盘"
-          status={snapshot?.keyboard.detected ? "捕获中" : "未检测"}
-          actionLabel={confirmingInputTest === "keyboard" ? "再次点击执行 Shift 测试" : "真实注入测试"}
-          onAction={() => onRunInputTest("keyboard")}
-          actionDisabled={!snapshot}
-          theme={theme}
-        >
-          <InfoRow label="最近按键" value={snapshot?.keyboard.last_key ?? "无"} theme={theme} />
-          <InfoRow
-            label="按下状态"
-            value={
-              snapshot?.keyboard.pressed_keys?.length
-                ? snapshot.keyboard.pressed_keys.join(", ")
-                : "无"
-            }
-            theme={theme}
-          />
-          <InfoRow label="事件计数" value={String(snapshot?.keyboard.event_count ?? 0)} theme={theme} />
-          <InfoRow label="捕获来源" value={snapshot?.keyboard.capture_source ?? "未知"} theme={theme} />
-        </LocalDevicePanel>
-
-        <LocalDevicePanel
-          icon={<MousePointer2 size={18} />}
-          title="鼠标"
-          status={snapshot?.mouse.detected ? "捕获中" : "未检测"}
-          actionLabel={confirmingInputTest === "mouse" ? "再次点击执行移动测试" : "真实注入测试"}
-          onAction={() => onRunInputTest("mouse")}
-          actionDisabled={!snapshot}
-          theme={theme}
-        >
-          <InfoRow
-            label="坐标"
-            value={`${Math.round(snapshot?.mouse.x ?? 0)}, ${Math.round(snapshot?.mouse.y ?? 0)}`}
-            theme={theme}
-          />
-          <InfoRow
-            label="按钮"
-            value={
-              snapshot?.mouse.pressed_buttons?.length
-                ? snapshot.mouse.pressed_buttons.join(", ")
-                : "无"
-            }
-            theme={theme}
-          />
-          <InfoRow
-            label="滚轮"
-            value={`${snapshot?.mouse.wheel_delta_x ?? 0}, ${snapshot?.mouse.wheel_delta_y ?? 0}`}
-            theme={theme}
-          />
-          <InfoRow label="事件计数" value={String(snapshot?.mouse.event_count ?? 0)} theme={theme} />
-        </LocalDevicePanel>
-
-        <LocalDevicePanel
-          icon={<Gamepad2 size={18} />}
-          title="手柄"
-          status={gamepad?.connected ? "gilrs 已识别" : "等待连接"}
-          theme={theme}
-        >
-          <InfoRow label="设备" value={gamepad?.name ?? "未识别"} theme={theme} />
-          <InfoRow
-            label="摇杆"
-            value={`L ${Number(gamepad?.left_stick_x ?? 0).toFixed(2)}, ${Number(gamepad?.left_stick_y ?? 0).toFixed(2)} / R ${Number(gamepad?.right_stick_x ?? 0).toFixed(2)}, ${Number(gamepad?.right_stick_y ?? 0).toFixed(2)}`}
-            theme={theme}
-          />
-          <InfoRow
-            label="扳机"
-            value={`L ${Number(gamepad?.left_trigger ?? 0).toFixed(2)} / R ${Number(gamepad?.right_trigger ?? 0).toFixed(2)}`}
-            theme={theme}
-          />
-          <InfoRow
-            label="虚拟手柄"
-            value={snapshot?.virtual_gamepad.detail ?? "Virtual HID not implemented"}
-            theme={theme}
-          />
-        </LocalDevicePanel>
-
-        <LocalDevicePanel
-          icon={<HardDrive size={18} />}
-          title="显示设备"
-          status={(snapshot?.display.display_count ?? 0) > 0 ? "已读取" : "未读取"}
-          theme={theme}
-        >
-          <InfoRow label="显示器数量" value={String(snapshot?.display.display_count ?? 0)} theme={theme} />
-          <InfoRow
-            label="主显示器"
-            value={`${snapshot?.display.primary_width ?? 0} x ${snapshot?.display.primary_height ?? 0}`}
-            theme={theme}
-          />
-          <InfoRow
-            label="布局尺寸"
-            value={`${snapshot?.display.layout_width ?? 0} x ${snapshot?.display.layout_height ?? 0}`}
-            theme={theme}
-          />
-          <InfoRow label="后端" value={backendDetail} theme={theme} />
-        </LocalDevicePanel>
-      </div>
-
-      <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <InfoRow label="权限状态" value={snapshot?.privilege_state ?? "未知"} theme={theme} />
-        <InfoRow
-          label="最近反馈"
-          value={latestEvent ? `${latestEvent.device_kind}: ${latestEvent.summary}` : "暂无"}
-          theme={theme}
-        />
-        <InfoRow
-          label="注入结果"
-          value={
-            inputTestResult
-              ? `${inputTestResult.status}: ${inputTestResult.message}`
-              : "需要二段确认后执行"
-          }
-          theme={theme}
-        />
-      </div>
-      {isInjectedFeedback(latestEvent?.source) ? (
-        <div className="mt-3 text-xs" style={{ color: theme.textMuted }}>
-          最近反馈可能为注入回环，已按驱动来源标记。
-        </div>
-      ) : null}
-    </section>
-  );
 }
 
 function LocalControlDriverHub({
@@ -1758,7 +3393,11 @@ function LocalControlDriverHub({
   inputTestResult,
   confirmingInputTest,
   selectedKind,
+  remoteDevice,
+  selectedDeviceId,
+  audioOutputs = [],
   onSelectedKindChange,
+  onSelectedDeviceIdChange,
   onRunInputTest,
   theme,
 }: {
@@ -1767,10 +3406,19 @@ function LocalControlDriverHub({
   inputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   selectedKind: LocalControlKind;
+  remoteDevice?: {
+    id: string;
+    name: string;
+    hostname: string;
+  } | null;
+  selectedDeviceId?: string;
+  audioOutputs?: AudioOutputDevice[];
   onSelectedKindChange: (kind: LocalControlKind) => void;
+  onSelectedDeviceIdChange?: (deviceId: string) => void;
   onRunInputTest: (kind: string) => void;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
+  const selectedDevices = localDeviceItems(snapshot, selectedKind, audioOutputs);
   return (
     <section className="flex h-full min-h-0 flex-col overflow-hidden">
       {error ? (
@@ -1793,9 +3441,25 @@ function LocalControlDriverHub({
           background: theme.frame,
         }}
       >
+        <div className="mb-2 flex h-9 shrink-0 items-center gap-2">
+          {remoteDevice ? (
+            <div className="min-w-0 text-xs" style={{ color: theme.textMuted }}>
+              正在监听 {remoteDevice.name} · {remoteDevice.hostname}
+            </div>
+          ) : (
+            <DeviceSelector
+              items={selectedDevices}
+              selectedId={selectedDeviceId}
+              onChange={onSelectedDeviceIdChange}
+              theme={theme}
+            />
+          )}
+        </div>
         <LocalControlDetail
           kind={selectedKind}
           snapshot={snapshot}
+          selectedDeviceId={selectedDeviceId}
+          remoteDevice={remoteDevice}
           inputTestResult={inputTestResult}
           confirmingInputTest={confirmingInputTest}
           onRunInputTest={onRunInputTest}
@@ -1804,498 +3468,58 @@ function LocalControlDriverHub({
       </div>
     </section>
   );
-
-  return (
-    <section
-      className="p-5"
-      style={{
-        background: theme.sidebar,
-        border: `1px solid ${theme.border}`,
-        boxShadow: theme.panelShadow,
-      }}
-    >
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-semibold">本机控制设备</h1>
-          <p className="mt-1 text-sm" style={{ color: theme.textMuted }}>
-            实机输入设备概览、底层捕获反馈和受控注入测试入口。
-          </p>
-        </div>
-        <StatusPill
-          label={error ? "不可用" : snapshot ? "daemon 实时" : "等待 daemon"}
-          tone={error ? "danger" : snapshot ? "success" : "muted"}
-          theme={theme}
-        />
-      </div>
-
-      {error ? (
-        <div
-          className="mb-4 px-4 py-3 text-sm"
-          style={{
-            border: "1px solid rgba(197, 48, 48, 0.45)",
-            background: "rgba(94, 24, 34, 0.45)",
-            color: "#ffb8c1",
-          }}
-        >
-          本机驱动中心不可用：{error}。远端设备列表仍可继续使用。
-        </div>
-      ) : null}
-
-      <div
-        className="mb-4 flex flex-wrap items-center gap-2 px-3 py-2"
-        role="tablist"
-        aria-label="本机设备类型"
-        style={{
-          border: `1px solid ${theme.border}`,
-          background: theme.toolbar,
-        }}
-      >
-        <LocalControlTypeButton
-          kind="keyboard"
-          active={selectedKind === "keyboard"}
-          icon={<Keyboard size={18} />}
-          title="键盘"
-          detail={`${counts.keyboard} 个实机输入`}
-          live={Boolean(snapshot?.keyboard.detected)}
-          onClick={onSelectedKindChange}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="mouse"
-          active={selectedKind === "mouse"}
-          icon={<MousePointer2 size={18} />}
-          title="鼠标"
-          detail={`${counts.mouse} 个实机输入`}
-          live={Boolean(snapshot?.mouse.detected)}
-          onClick={onSelectedKindChange}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="gamepad"
-          active={selectedKind === "gamepad"}
-          icon={<Gamepad2 size={18} />}
-          title="手柄"
-          detail={`${counts.gamepad} 个入口`}
-          live={Boolean(snapshot?.gamepads?.some((item) => item.connected))}
-          onClick={onSelectedKindChange}
-          theme={theme}
-        />
-        <LocalControlTypeButton
-          kind="display"
-          active={selectedKind === "display"}
-          icon={<HardDrive size={18} />}
-          title="显示设备"
-          detail={`${counts.display} 个显示器`}
-          live={(snapshot?.display.display_count ?? 0) > 0}
-          onClick={onSelectedKindChange}
-          theme={theme}
-        />
-      </div>
-
-      <div className="grid min-h-[540px] grid-cols-1 gap-3 xl:grid-cols-[280px_minmax(0,1fr)]">
-        <aside
-          className="p-3"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: theme.frame,
-          }}
-        >
-          <div className="mb-3 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
-            实机列表
-          </div>
-          <div className="flex flex-col gap-2">
-            {devices.map((device) => (
-              <button
-                key={device.id}
-                type="button"
-                className="rounded-md px-3 py-3 text-left transition"
-                style={{
-                  border: `1px solid ${device.active ? theme.accent : theme.border}`,
-                  background: device.active ? theme.accentSoft : "rgba(255,255,255,0.025)",
-                  color: theme.text,
-                }}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-medium">{device.name}</span>
-                  <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: device.live ? theme.success : theme.textMuted }} />
-                </div>
-                <div className="mt-1 text-xs" style={{ color: theme.textMuted }}>
-                  {device.detail}
-                </div>
-              </button>
-            ))}
-          </div>
-          <div className="mt-3 text-xs leading-5" style={{ color: theme.textMuted }}>
-            多键盘、多鼠标的独立枚举需要后续接入更底层设备捕获；当前先显示 daemon 聚合链路。
-          </div>
-        </aside>
-
-        <div
-          className="p-4"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: theme.frame,
-          }}
-        >
-          <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h3 className="text-base font-semibold">{selectedDevice?.name ?? "未检测到设备"}</h3>
-              <p className="mt-1 text-sm" style={{ color: theme.textMuted }}>
-                {selectedDevice?.detail ?? "等待 daemon 上报本机设备。"}
-              </p>
-            </div>
-            <StatusPill
-              label={selectedDevice?.live ? "有反馈" : "等待输入"}
-              tone={selectedDevice?.live ? "success" : "muted"}
-              theme={theme}
-            />
-          </div>
-
-          <LocalControlDetail
-            kind={selectedKind}
-            snapshot={snapshot}
-            inputTestResult={inputTestResult}
-            confirmingInputTest={confirmingInputTest}
-            onRunInputTest={onRunInputTest}
-            theme={theme}
-          />
-        </div>
-      </div>
-
-      <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <InfoRow label="权限状态" value={snapshot?.privilege_state ?? "未知"} theme={theme} />
-        <InfoRow
-          label="后端"
-          value={
-            snapshot
-              ? `${backendHealthLabel(snapshot.capture_backend)} / ${backendHealthLabel(snapshot.inject_backend)}`
-              : "daemon IPC unavailable"
-          }
-          theme={theme}
-        />
-        <InfoRow
-          label="最近反馈"
-          value={latestEvent ? `${latestEvent.device_kind}: ${latestEvent.summary}` : "暂无"}
-          theme={theme}
-        />
-      </div>
-      {isInjectedFeedback(latestEvent?.source) ? (
-        <div className="mt-3 text-xs" style={{ color: theme.textMuted }}>
-          最近反馈可能为注入回环，已按驱动来源标记。
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function localInputDeviceCount(snapshot: LocalControlsSnapshot | null, kind: "keyboard" | "mouse") {
-  const devices = kind === "keyboard" ? snapshot?.keyboard_devices ?? [] : snapshot?.mouse_devices ?? [];
-  const summary = summarizeRawInputDevices(devices);
-  return Math.max(1, summary.physicalGroups.length || (devices.length ? 1 : 0));
-}
-
-function localDeviceItems(snapshot: LocalControlsSnapshot | null, kind: LocalControlKind) {
-  if (kind === "keyboard") {
-    return localInputDeviceItems(
-      "keyboard",
-      "本机键盘",
-      snapshot?.keyboard_devices ?? [],
-      snapshot?.keyboard.capture_source ?? "daemon aggregate",
-      Boolean(snapshot?.keyboard.detected),
-    );
-  }
-
-  if (kind === "mouse") {
-    return localInputDeviceItems(
-      "mouse",
-      "本机鼠标",
-      snapshot?.mouse_devices ?? [],
-      snapshot?.mouse.capture_source ?? "daemon aggregate",
-      Boolean(snapshot?.mouse.detected),
-    );
-  }
-
-  if (kind === "gamepad") {
-    const gamepads = snapshot?.gamepads ?? [];
-    if (!gamepads.length) {
-      return [
-        {
-          id: "gamepad-empty",
-          name: "Gamepad slot",
-          detail: "gilrs waiting for device",
-          live: false,
-          active: true,
-        },
-      ];
-    }
-    return gamepads.map((gamepad, index) => ({
-      id: `gamepad-${gamepad.gamepad_id}`,
-      name: gamepad.name || `Gamepad ${gamepad.gamepad_id}`,
-      detail: `id ${gamepad.gamepad_id} / events ${gamepad.event_count}`,
-      live: Boolean(gamepad.connected),
-      active: index === 0,
-    }));
-  }
-
-  const displays = snapshot?.display.displays ?? [];
-  if (displays.length) {
-    return displays.map((display, index) => ({
-      id: display.display_id,
-      name: display.primary ? "Primary display" : `Display ${index + 1}`,
-      detail: `${display.width} x ${display.height} @ ${display.x}, ${display.y}`,
-      live: true,
-      active: display.primary,
-    }));
-  }
-
-  const displayCount = Math.max(1, snapshot?.display.display_count ?? 0);
-  return Array.from({ length: displayCount }, (_, index) => ({
-    id: `display-${index}`,
-    name: index === 0 ? "Primary display" : `Display ${index + 1}`,
-    detail:
-      index === 0
-        ? `${snapshot?.display.primary_width ?? 0} x ${snapshot?.display.primary_height ?? 0}`
-        : "detail pending platform enumeration",
-    live: (snapshot?.display.display_count ?? 0) > index,
-    active: index === 0,
-  }));
-}
-
-function localInputDeviceItems(
-  kind: "keyboard" | "mouse",
-  title: string,
-  devices: NonNullable<LocalControlsSnapshot["keyboard_devices"]>,
-  captureSource: string,
-  detected: boolean,
-) {
-  const summary = summarizeRawInputDevices(devices);
-  const detailParts = [captureSource];
-  if (devices.length) {
-    detailParts.push(`${summary.physicalGroups.length || 1} physical group`);
-    detailParts.push(`${devices.length} HID collection`);
-  }
-  if (summary.virtualGroups.length) {
-    detailParts.push(`${summary.virtualGroups.length} virtual loopback`);
-  }
-
-  const aggregate = {
-    id: `${kind}-aggregate`,
-    name: title,
-    detail: detailParts.join(" / "),
-    live: detected,
-    active: true,
-  };
-
-  if (summary.physicalGroups.length <= 1) {
-    return [aggregate];
-  }
-
-  return [
-    aggregate,
-    ...summary.physicalGroups.map((group, index) => ({
-      id: `${kind}-group-${group.key}`,
-      name: group.label || `${title} ${index + 1}`,
-      detail: `${group.devices.length} HID collection / ${group.detail}`,
-      live: group.devices.some((device) => device.connected),
-      active: false,
-    })),
-  ];
-}
-
-function summarizeRawInputDevices(devices: NonNullable<LocalControlsSnapshot["keyboard_devices"]>) {
-  const groups = new Map<
-    string,
-    {
-      key: string;
-      label: string;
-      detail: string;
-      virtual: boolean;
-      devices: typeof devices;
-    }
-  >();
-
-  for (const device of devices) {
-    const detail = device.driver_detail ?? device.device_instance_id ?? device.id ?? "";
-    const key = rawInputGroupKey(detail);
-    const existing = groups.get(key);
-    if (existing) {
-      existing.devices.push(device);
-      continue;
-    }
-    groups.set(key, {
-      key,
-      label: rawInputGroupLabel(detail),
-      detail: rawInputShortDetail(detail),
-      virtual: isVirtualRawInputDevice(detail),
-      devices: [device],
-    });
-  }
-
-  const values = Array.from(groups.values());
-  return {
-    physicalGroups: values.filter((group) => !group.virtual),
-    virtualGroups: values.filter((group) => group.virtual),
-  };
-}
-
-function rawInputGroupKey(detail: string) {
-  const normalized = detail.toUpperCase();
-  if (normalized.includes("HID_DEVICE_SYSTEM_VHF")) {
-    return "virtual:vhf";
-  }
-
-  const acpi = normalized.match(/ACPI#([^#]+)/);
-  if (acpi) {
-    return `acpi:${acpi[1]}`;
-  }
-
-  const hid = normalized.match(/HID#(VID_[0-9A-F]{4}&PID_[0-9A-F]{4}(?:&MI_[0-9A-F]{2})?)/);
-  if (hid) {
-    return `hid:${hid[1]}`;
-  }
-
-  return normalized.replace(/&COL\d+/g, "").split("#{")[0] || normalized;
-}
-
-function rawInputGroupLabel(detail: string) {
-  const normalized = detail.toUpperCase();
-  if (normalized.includes("HID_DEVICE_SYSTEM_VHF")) {
-    return "RShare Virtual HID";
-  }
-  const acpi = normalized.match(/ACPI#([^#]+)/);
-  if (acpi) {
-    return `Built-in device ${acpi[1]}`;
-  }
-  const hid = normalized.match(/VID_([0-9A-F]{4})&PID_([0-9A-F]{4})/);
-  if (hid) {
-    return `HID ${hid[1]}:${hid[2]}`;
-  }
-  return "HID device group";
-}
-
-function rawInputShortDetail(detail: string) {
-  if (!detail) {
-    return "raw input";
-  }
-  return detail
-    .replace(/^\\\\\?\\/i, "")
-    .replace(/#\{.*$/i, "")
-    .replace(/&COL\d+/gi, "");
-}
-
-function isVirtualRawInputDevice(detail: string) {
-  return detail.toUpperCase().includes("HID_DEVICE_SYSTEM_VHF");
 }
 
 function DeviceDriverStrip({
   kind,
   snapshot,
+  audioOutputs = [],
+  selectedDeviceId,
+  onSelectedDeviceIdChange,
   theme,
 }: {
   kind: LocalDevicePageKind;
   snapshot: LocalControlsSnapshot | null;
+  audioOutputs?: AudioOutputDevice[];
+  selectedDeviceId?: string;
+  onSelectedDeviceIdChange?: (deviceId: string) => void;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  if (kind === "remote") {
+  if (kind === "all" || kind === "remote") {
     return null;
   }
-
-  const devices = localDeviceItems(snapshot, kind).filter((device) => device.live);
-  const driverText =
-    kind === "keyboard"
-      ? snapshot?.keyboard.capture_source
-      : kind === "mouse"
-        ? snapshot?.mouse.capture_source
-        : kind === "gamepad"
-          ? snapshot?.virtual_gamepad.detail
-          : driverStatusLabel(snapshot);
-
-  if (!devices.length && !driverText) {
+  const devices = localDeviceItems(snapshot, kind, audioOutputs).filter((device) => device.live);
+  if (!devices.length) {
     return null;
   }
-
   return (
-    <div
-      className="rshare-scroll flex min-h-11 items-center gap-2 overflow-x-auto border-t px-3 py-2"
-      style={{ borderTopColor: theme.border }}
-    >
+    <div className="rshare-scroll flex shrink-0 gap-2 overflow-x-auto px-3 py-2" style={{ borderBottom: `1px solid ${theme.border}`, background: theme.frame }}>
       {devices.map((device) => (
-        <span
+        <button
           key={device.id}
-          className="inline-flex h-8 min-w-36 max-w-64 shrink-0 items-center gap-2 rounded-md px-3 text-sm"
+          type="button"
+          className="max-w-[260px] shrink-0 truncate rounded-md px-3 py-1.5 text-sm"
           style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.72)",
+            border: `1px solid ${selectedDeviceId === device.id || (!selectedDeviceId && device.active) ? theme.accent : theme.border}`,
+            background: selectedDeviceId === device.id || (!selectedDeviceId && device.active) ? theme.accentSoft : "rgba(255,255,255,0.04)",
             color: theme.text,
           }}
-          title={`${device.name} / ${device.detail}`}
+          onClick={() => onSelectedDeviceIdChange?.(device.id)}
+          title={device.detail}
         >
-          <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: theme.success }} />
-          <span className="truncate">{device.name}</span>
-        </span>
+          <span className="mr-2 inline-block h-2 w-2 rounded-full" style={{ background: device.live ? theme.success : theme.textMuted }} />
+          {device.name}
+        </button>
       ))}
-      {driverText ? (
-        <span
-          className="inline-flex h-8 min-w-44 max-w-[420px] shrink-0 items-center rounded-md px-3 text-sm"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.58)",
-            color: theme.textMuted,
-          }}
-          title={driverText}
-        >
-          <span className="truncate">{driverText}</span>
-        </span>
-      ) : null}
     </div>
-  );
-}
-
-function LocalControlTypeButton({
-  kind,
-  active,
-  icon,
-  title,
-  detail,
-  live,
-  onClick,
-  theme,
-}: {
-  kind: LocalDevicePageKind;
-  active: boolean;
-  icon: ReactNode;
-  title: string;
-  detail: string;
-  live: boolean;
-  onClick: (kind: LocalDevicePageKind) => void;
-  theme: typeof FIGMA_DESKTOP_THEME;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      className="flex h-10 min-w-[132px] shrink-0 items-center justify-center gap-2 rounded-md px-3 text-sm transition"
-      style={{
-        border: `1px solid ${active ? theme.accent : "transparent"}`,
-        background: active ? theme.accentSoft : "rgba(255,255,255,0.035)",
-        color: theme.text,
-      }}
-      onClick={() => onClick(kind)}
-    >
-      <span className="shrink-0">{icon}</span>
-      <span className="font-medium">{title}</span>
-      <span className="text-xs" style={{ color: theme.textMuted }}>
-        {detail}
-      </span>
-      <span className="h-2 w-2 rounded-full" style={{ background: live ? theme.success : theme.textMuted }} />
-    </button>
   );
 }
 
 function LocalControlDetail({
   kind,
   snapshot,
+  selectedDeviceId,
+  remoteDevice,
   inputTestResult,
   confirmingInputTest,
   onRunInputTest,
@@ -2303,115 +3527,94 @@ function LocalControlDetail({
 }: {
   kind: LocalControlKind;
   snapshot: LocalControlsSnapshot | null;
+  remoteDevice?: {
+    id: string;
+    name: string;
+    hostname: string;
+  } | null;
   inputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
+  selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  const gamepad = snapshot?.gamepads?.find((item) => item.connected) ?? snapshot?.gamepads?.[0];
-
+  const effectiveSelectedDeviceId = selectedLocalDeviceId(snapshot, kind, selectedDeviceId);
+  const recentEvents = selectedControlEvents(snapshot, kind, effectiveSelectedDeviceId);
   if (kind === "keyboard") {
-    const keyboardEvents = (snapshot?.recent_events ?? [])
-      .filter((event) => event.device_kind === "Keyboard")
-      .slice(-12)
-      .reverse();
+    const keyboardState = keyboardMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
+    const keyboardEvents = recentEvents.slice(-12).reverse();
+    const actionLabel = remoteDevice
+      ? "发送延迟探测"
+      : confirmingInputTest === "keyboard"
+        ? "再次点击执行 Shift 测试"
+        : "真实注入测试";
     return (
-      <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="min-h-0">
-          <SimulatedKeyboard
-            pressedKeys={snapshot?.keyboard.pressed_keys ?? []}
-            lastKey={snapshot?.keyboard.last_key ?? null}
-            recentEvents={snapshot?.recent_events ?? []}
-            eventCount={snapshot?.keyboard.event_count ?? 0}
-            theme={theme}
-          />
-        </div>
-        <div className="flex min-h-0 flex-col gap-3">
-          <KeyboardEventLog events={keyboardEvents} theme={theme} />
-          <InputTestAction
-            label={confirmingInputTest === "keyboard" ? "再次点击执行 Shift 测试" : "真实注入测试"}
-            result={inputTestResult}
-            disabled={!snapshot}
-            onClick={() => onRunInputTest("keyboard")}
-            theme={theme}
-          />
-        </div>
+      <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3">
+        <SimulatedKeyboard pressedKeys={keyboardState.pressedKeys} lastKey={keyboardState.lastKey} recentEvents={recentEvents} eventCount={keyboardState.eventCount} theme={theme} />
+        <div className="grid min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_420px]"><InputTestAction label={actionLabel} result={inputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("keyboard")} theme={theme} /><KeyboardEventLog events={keyboardEvents} theme={theme} /></div>
       </div>
     );
   }
-
   if (kind === "mouse") {
-    const mouseEvents = (snapshot?.recent_events ?? [])
-      .filter((event) => event.device_kind === "Mouse")
-      .slice(-12)
-      .reverse();
+    const mouseState = mouseMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
+    const mouseEvents = recentEvents.slice(-12).reverse();
+    const actionLabel = remoteDevice
+      ? "发送延迟探测"
+      : confirmingInputTest === "mouse"
+        ? "再次点击执行移动测试"
+        : "真实注入测试";
     return (
       <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="min-h-0">
-          <SimulatedMouse
-            x={snapshot?.mouse.x ?? 0}
-            y={snapshot?.mouse.y ?? 0}
-            pressedButtons={snapshot?.mouse.pressed_buttons ?? []}
-            wheelDeltaX={snapshot?.mouse.wheel_delta_x ?? 0}
-            wheelDeltaY={snapshot?.mouse.wheel_delta_y ?? 0}
-            wheelTotalX={snapshot?.mouse.wheel_total_x ?? 0}
-            wheelTotalY={snapshot?.mouse.wheel_total_y ?? 0}
-            eventCount={snapshot?.mouse.event_count ?? 0}
-            moveCount={snapshot?.mouse.move_count ?? 0}
-            buttonPressCount={snapshot?.mouse.button_press_count ?? 0}
-            buttonReleaseCount={snapshot?.mouse.button_release_count ?? 0}
-            wheelEventCount={snapshot?.mouse.wheel_event_count ?? 0}
-            displayRelativeX={snapshot?.mouse.display_relative_x ?? snapshot?.mouse.x ?? 0}
-            displayRelativeY={snapshot?.mouse.display_relative_y ?? snapshot?.mouse.y ?? 0}
-            currentDisplayIndex={snapshot?.mouse.current_display_index ?? null}
-            currentDisplayId={snapshot?.mouse.current_display_id ?? null}
-            displays={snapshot?.display.displays ?? []}
-            theme={theme}
-          />
-        </div>
-        <div className="flex min-h-0 flex-col gap-3">
-          <MouseEventLog events={mouseEvents} theme={theme} />
-          <InputTestAction
-            label={confirmingInputTest === "mouse" ? "再次点击执行移动测试" : "真实注入测试"}
-            result={inputTestResult}
-            disabled={!snapshot}
-            onClick={() => onRunInputTest("mouse")}
-            theme={theme}
-          />
-        </div>
+        <SimulatedMouse x={mouseState.x} y={mouseState.y} pressedButtons={mouseState.pressedButtons} recentEvents={recentEvents} wheelDeltaX={mouseState.wheelDeltaX} wheelDeltaY={mouseState.wheelDeltaY} wheelTotalX={mouseState.wheelTotalX} wheelTotalY={mouseState.wheelTotalY} eventCount={mouseState.eventCount} moveCount={mouseState.moveCount} buttonPressCount={mouseState.buttonPressCount} buttonReleaseCount={mouseState.buttonReleaseCount} wheelEventCount={mouseState.wheelEventCount} displayRelativeX={mouseState.displayRelativeX} displayRelativeY={mouseState.displayRelativeY} currentDisplayIndex={mouseState.currentDisplayIndex} currentDisplayId={mouseState.currentDisplayId} displays={snapshot?.display.displays ?? []} theme={theme} />
+        <div className="flex min-h-0 flex-col gap-3"><MouseEventLog events={mouseEvents} theme={theme} /><InputTestAction label={actionLabel} result={inputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("mouse")} theme={theme} /></div>
       </div>
     );
   }
-
   if (kind === "gamepad") {
-    const gamepadEvents = (snapshot?.recent_events ?? [])
-      .filter((event) => event.device_kind === "Gamepad")
-      .slice(-12)
-      .reverse();
-    return (
-      <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="min-h-0">
-          <SimulatedGamepad
-            gamepad={gamepad ?? null}
-            virtualDetail={snapshot?.virtual_gamepad.detail ?? "Virtual HID not implemented"}
-            theme={theme}
-          />
-        </div>
-        <GamepadEventLog events={gamepadEvents} theme={theme} />
-      </div>
-    );
+    const gamepad = selectedGamepad(snapshot, effectiveSelectedDeviceId);
+    const gamepadEvents = recentEvents.slice(-12).reverse();
+    return <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]"><SimulatedGamepad gamepad={gamepad} virtualDetail={snapshot?.virtual_gamepad.detail ?? "Virtual HID not implemented"} theme={theme} /><GamepadEventLog events={gamepadEvents} theme={theme} /></div>;
   }
+  if (kind === "audio") {
+    return <AudioDetail snapshot={snapshot} audioOutputs={snapshot?.audio_outputs ?? []} theme={theme} />;
+  }
+  return <DisplayActivityPreview snapshot={snapshot} theme={theme} />;
+}
 
+function AudioDetail({ snapshot, audioOutputs, theme }: { snapshot: LocalControlsSnapshot | null; audioOutputs: AudioOutputDevice[]; theme: typeof FIGMA_DESKTOP_THEME }) {
+  const inputs = snapshot?.audio_inputs ?? [];
+  const audioEvents = (snapshot?.recent_events ?? []).filter((event) => event.device_kind === "Audio").slice(-8).reverse();
+  const stream = snapshot?.audio_stream_state;
+  const capture = snapshot?.audio_capture_state;
+  const selectedInput = inputs.find((device) => device.default) ?? inputs[0];
+  const selectedOutput = audioOutputs.find((device) => device.default) ?? audioOutputs[0];
+  const startForwarding = () => void invokeCommand("start_audio_forwarding", { source: selectedInput?.kind === "Microphone" ? "Microphone" : "Loopback", endpoint_id: selectedInput?.endpoint_id ?? null });
   return (
-    <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-      <InfoRow label="显示器数量" value={String(snapshot?.display.display_count ?? 0)} theme={theme} />
-      <InfoRow label="主显示器" value={`${snapshot?.display.primary_width ?? 0} x ${snapshot?.display.primary_height ?? 0}`} theme={theme} />
-      <InfoRow label="布局尺寸" value={`${snapshot?.display.layout_width ?? 0} x ${snapshot?.display.layout_height ?? 0}`} theme={theme} />
-      <InfoRow label="显示设置" value="跳转能力待接入平台设置入口" theme={theme} />
+    <div className="grid h-full min-h-0 grid-cols-1 gap-3 overflow-hidden xl:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid min-h-0 grid-rows-[minmax(0,0.9fr)_minmax(0,1fr)] gap-3">
+        <section className="min-h-0 overflow-hidden p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}>
+          <div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold">音频输入 / 回环</h3><span className="text-xs" style={{ color: theme.textMuted }}>{capture?.status ?? "Idle"}</span></div>
+          <div className="grid h-[calc(100%-34px)] grid-cols-1 gap-3 overflow-hidden lg:grid-cols-2">{inputs.length ? inputs.map((device) => <AudioDeviceCard key={device.id} title={device.name} subtitle={`${device.kind === "Loopback" ? "系统输出回环" : "麦克风"} / ${device.source ?? "Core Audio"}`} live={device.connected !== false} defaultDevice={Boolean(device.default)} level={device.level_peak ?? 0} meta={[`${device.sample_rate ?? 48000} Hz`, `${device.channel_count ?? 2} ch`, device.muted ? "muted" : "unmuted"]} actions={<><button type="button" className="rounded-md px-3 py-1 text-xs" style={secondaryButtonStyle(theme)} onClick={() => void invokeCommand("start_audio_capture", { source: device.kind === "Loopback" ? "Loopback" : "Microphone", endpoint_id: device.endpoint_id ?? null })}>捕获</button><button type="button" className="rounded-md px-3 py-1 text-xs" style={secondaryButtonStyle(theme)} onClick={() => void invokeCommand("start_audio_forwarding", { source: device.kind === "Loopback" ? "Loopback" : "Microphone", endpoint_id: device.endpoint_id ?? null })}>转发</button></>} theme={theme} />) : <EmptyPanel title="未发现音频输入" detail="等待 Windows Core Audio 枚举或浏览器权限。" theme={theme} />}</div>
+        </section>
+        <section className="min-h-0 overflow-hidden p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}>
+          <div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold">音频输出</h3><span className="text-xs" style={{ color: theme.textMuted }}>{audioOutputs.length} endpoint</span></div>
+          <div className="grid h-[calc(100%-34px)] grid-cols-1 gap-3 overflow-hidden lg:grid-cols-2 xl:grid-cols-3">{audioOutputs.length ? audioOutputs.map((device) => <AudioDeviceCard key={device.id} title={device.name} subtitle={`${device.source ?? "Windows Core Audio"}${device.default ? " / default" : ""}`} live={device.connected !== false} defaultDevice={Boolean(device.default)} level={typeof device.volume_percent === "number" ? device.volume_percent : 0} meta={[typeof device.volume_percent === "number" ? `${device.volume_percent}%` : "unknown volume", device.muted ? "muted" : "unmuted", `${device.channel_count ?? 2} ch`]} actions={<><button type="button" className="rounded-md px-3 py-1 text-xs" style={secondaryButtonStyle(theme)} onClick={() => device.endpoint_id ? void invokeCommand("set_audio_output_mute", { endpoint_id: device.endpoint_id, muted: !device.muted }) : undefined}>{device.muted ? "取消静音" : "静音"}</button><input className="min-w-0 flex-1" type="range" min={0} max={100} defaultValue={device.volume_percent ?? 0} disabled={!device.endpoint_id} onChange={(event) => device.endpoint_id ? void invokeCommand("set_audio_output_volume", { endpoint_id: device.endpoint_id, volume_percent: Number(event.currentTarget.value) }) : undefined} /></>} theme={theme} />) : <EmptyPanel title="未发现音频输出" detail="等待 Windows Core Audio 输出端点枚举。" theme={theme} />}</div>
+        </section>
+      </div>
+      <aside className="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-3 overflow-hidden">
+        <section className="p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 text-sm font-semibold">远端音频</div><div className="grid grid-cols-2 gap-2 text-xs"><InfoRow label="目标" value={stream?.target_device_id?.slice(0, 8) ?? "无"} theme={theme} /><InfoRow label="状态" value={stream?.active ? "转发中" : (capture?.status ?? "Idle")} theme={theme} /><InfoRow label="延迟" value={stream?.latency_ms ? `${stream.latency_ms} ms` : "-"} theme={theme} /><InfoRow label="帧" value={String(stream?.frames_sent ?? 0)} theme={theme} /></div><div className="mt-3 flex gap-2"><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={secondaryButtonStyle(theme)} onClick={startForwarding}>开始转发</button><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={dangerButtonStyle(theme)} onClick={() => void invokeCommand("stop_audio_forwarding")}>停止</button></div></section>
+        <section className="p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 text-sm font-semibold">当前端点</div><InfoRow label="输入" value={selectedInput?.name ?? "无"} theme={theme} /><InfoRow label="输出" value={selectedOutput?.name ?? "无"} theme={theme} /></section>
+        <section className="min-h-0 overflow-hidden p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold">音频记录</h3><span className="text-xs" style={{ color: theme.textMuted }}>最近 {audioEvents.length} 条</span></div><div className="rshare-scroll h-full overflow-auto text-xs">{audioEvents.length ? audioEvents.map((event) => <div key={event.sequence} className="mb-2 grid grid-cols-[78px_minmax(0,1fr)] gap-2"><span style={{ color: theme.textMuted }}>{formatEventTime(event.timestamp_ms)}</span><span className="truncate">{event.summary}</span></div>) : <div style={{ color: theme.textMuted }}>等待音频事件</div>}</div></section>
+      </aside>
     </div>
   );
 }
 
+function AudioDeviceCard({ title, subtitle, live, defaultDevice, level, meta, actions, theme }: { title: string; subtitle: string; live: boolean; defaultDevice: boolean; level: number; meta: string[]; actions: ReactNode; theme: typeof FIGMA_DESKTOP_THEME }) {
+  return <div className="flex min-h-0 flex-col justify-between gap-3 rounded-md p-3" style={{ border: `1px solid ${defaultDevice ? theme.accent : theme.border}`, background: defaultDevice ? theme.accentSoft : "rgba(255,255,255,0.035)" }}><div className="min-w-0"><div className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full" style={{ background: live ? theme.success : theme.textMuted }} /><div className="truncate text-sm font-semibold">{title}</div></div><div className="mt-1 truncate text-xs" style={{ color: theme.textMuted }}>{subtitle}</div></div><AudioLevelBar label="level" value={level} theme={theme} /><div className="flex flex-wrap gap-2 text-[11px]" style={{ color: theme.textMuted }}>{meta.map((item) => <span key={item}>{item}</span>)}</div><div className="flex items-center gap-2">{actions}</div></div>;
+}
+function secondaryButtonStyle(theme: typeof FIGMA_DESKTOP_THEME) { return { border: `1px solid ${theme.accent}`, background: theme.accentSoft, color: theme.text }; }
+function dangerButtonStyle(_theme: typeof FIGMA_DESKTOP_THEME) { return { border: "1px solid rgba(197, 48, 48, 0.55)", background: "rgba(197, 48, 48, 0.12)", color: "#8a1f2d" }; }
 const KEYBOARD_ROWS: Array<Array<{ label: string; codes: string[]; width?: number }>> = [
   [
     { label: "Esc", codes: ["Escape"], width: 1.2 },
@@ -2659,12 +3862,14 @@ function SimulatedKeyboard({
   recentEvents,
   eventCount,
   theme,
+  compact = false,
 }: {
   pressedKeys: string[];
   lastKey: string | null;
   recentEvents: LocalControlEvent[];
   eventCount: number;
   theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
 }) {
   const activeCount = pressedKeys.length;
   const keyboardEvents = recentEvents.filter((event) => event.device_kind === "Keyboard");
@@ -2692,6 +3897,7 @@ function SimulatedKeyboard({
         background: "rgba(255,255,255,0.025)",
       }}
     >
+      {compact ? null : (
       <div className="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-2">
         <div className="text-sm font-medium">键盘按键测试</div>
         <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: theme.textMuted }}>
@@ -2700,6 +3906,7 @@ function SimulatedKeyboard({
           <KeyboardLegend tone="pressed" label="激活状态" theme={theme} />
         </div>
       </div>
+      )}
       <div ref={keyboardFrameRef} className="min-h-0 flex-1 overflow-hidden">
         <div
           className="mx-auto"
@@ -2751,6 +3958,7 @@ function SimulatedKeyboard({
           </div>
         </div>
       </div>
+      {compact ? null : (
       <div className="mt-3 grid shrink-0 grid-cols-3 gap-2 text-xs xl:grid-cols-6">
         <KeyboardSignal label="最后按键" value={lastKey ? keyDisplayName(lastKey) : "无"} theme={theme} />
         <KeyboardSignal label="按下状态" value={activeCount ? `${activeCount} 个按下` : "无"} theme={theme} />
@@ -2759,6 +3967,7 @@ function SimulatedKeyboard({
         <KeyboardSignal label="抬起次数" value={String(releasedCount)} theme={theme} />
         <KeyboardSignal label="总事件数" value={String(eventCount)} theme={theme} />
       </div>
+      )}
     </div>
   );
 }
@@ -2781,8 +3990,7 @@ function KeyboardEventLog({
       <div className="mb-2 flex shrink-0 items-center justify-between gap-3">
         <div className="text-sm font-medium">按键记录</div>
         <div className="text-xs" style={{ color: theme.textMuted }}>
-          最近 {events.length} 条
-        </div>
+          最近 {events.length} 条        </div>
       </div>
       <div className="rshare-scroll min-h-0 flex-1 space-y-1.5 overflow-auto pr-1">
         {events.length ? (
@@ -2836,8 +4044,7 @@ function MouseEventLog({
       <div className="mb-2 flex shrink-0 items-center justify-between gap-3">
         <div className="text-sm font-medium">鼠标记录</div>
         <div className="text-xs" style={{ color: theme.textMuted }}>
-          最近 {events.length} 条
-        </div>
+          最近 {events.length} 条        </div>
       </div>
       <div className="rshare-scroll min-h-0 flex-1 space-y-1.5 overflow-auto pr-1">
         {events.length ? (
@@ -3036,14 +4243,55 @@ function KeyboardSignal({
   );
 }
 
+function normalizeInputToken(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function mouseButtonAliases(name: string) {
+  const aliases: Record<string, string[]> = {
+    Left: ["left", "button0", "button1", "primary", "mouseleft"],
+    Right: ["right", "button2", "button3", "secondary", "mouseright"],
+    Middle: ["middle", "middlebutton", "button1", "button3", "wheel", "wheelbutton", "auxiliary", "mousemiddle"],
+    Back: ["back", "x1", "xbutton1", "button4", "button8", "browserback", "side1", "other1", "other4", "other8", "unknown1", "unknown4", "unknown8"],
+    Forward: ["forward", "x2", "xbutton2", "button5", "button9", "browserforward", "side2", "other2", "other5", "other9", "unknown2", "unknown5", "unknown9"],
+  };
+  return aliases[name] ?? [name];
+}
+
 function mouseButtonPressed(buttons: string[], name: string) {
-  return buttons.some((button) => button.toLowerCase() === name.toLowerCase());
+  const wanted = new Set(mouseButtonAliases(name).map(normalizeInputToken));
+  return buttons.some((button) =>
+    wanted.has(normalizeInputToken(button)),
+  );
+}
+
+function mouseButtonEventTokens(event: LocalControlEvent) {
+  return [
+    event.payload?.button,
+    event.payload?.button_name,
+    event.payload?.name,
+    event.payload?.pressed_buttons,
+    event.summary,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .flatMap((value) => value.split(/[,\s/]+/).filter(Boolean));
+}
+
+function mouseButtonRecentlyActive(events: LocalControlEvent[], name: string) {
+  const wanted = new Set(mouseButtonAliases(name).map(normalizeInputToken));
+  return events
+    .filter((event) => event.device_kind === "Mouse" && event.event_kind === "button")
+    .slice(-8)
+    .some((event) =>
+      mouseButtonEventTokens(event).some((token) => wanted.has(normalizeInputToken(token))),
+    );
 }
 
 function SimulatedMouse({
   x,
   y,
   pressedButtons,
+  recentEvents,
   wheelDeltaX,
   wheelDeltaY,
   wheelTotalX,
@@ -3059,10 +4307,12 @@ function SimulatedMouse({
   currentDisplayId,
   displays,
   theme,
+  compact = false,
 }: {
   x: number;
   y: number;
   pressedButtons: string[];
+  recentEvents: LocalControlEvent[];
   wheelDeltaX: number;
   wheelDeltaY: number;
   wheelTotalX: number;
@@ -3078,12 +4328,13 @@ function SimulatedMouse({
   currentDisplayId: string | null;
   displays: NonNullable<LocalControlsSnapshot["display"]["displays"]>;
   theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
 }) {
-  const leftDown = mouseButtonPressed(pressedButtons, "Left");
-  const rightDown = mouseButtonPressed(pressedButtons, "Right");
-  const middleDown = mouseButtonPressed(pressedButtons, "Middle");
-  const backDown = mouseButtonPressed(pressedButtons, "Back");
-  const forwardDown = mouseButtonPressed(pressedButtons, "Forward");
+  const leftDown = mouseButtonPressed(pressedButtons, "Left") || mouseButtonRecentlyActive(recentEvents, "Left");
+  const rightDown = mouseButtonPressed(pressedButtons, "Right") || mouseButtonRecentlyActive(recentEvents, "Right");
+  const middleDown = mouseButtonPressed(pressedButtons, "Middle") || mouseButtonRecentlyActive(recentEvents, "Middle");
+  const backDown = mouseButtonPressed(pressedButtons, "Back") || mouseButtonRecentlyActive(recentEvents, "Back");
+  const forwardDown = mouseButtonPressed(pressedButtons, "Forward") || mouseButtonRecentlyActive(recentEvents, "Forward");
   const activeDisplay =
     currentDisplayIndex !== null && currentDisplayIndex >= 0
       ? displays[currentDisplayIndex] ?? null
@@ -3103,17 +4354,90 @@ function SimulatedMouse({
     currentDisplayId ??
     (activeDisplay ? `display-${(currentDisplayIndex ?? 0) + 1}` : "虚拟桌面");
   const wheelActive = wheelDeltaX !== 0 || wheelDeltaY !== 0;
+  const wheelLabel =
+    wheelDeltaY > 0
+      ? "↑"
+      : wheelDeltaY < 0
+        ? "↓"
+        : wheelDeltaX > 0
+          ? "→"
+          : wheelDeltaX < 0
+            ? "←"
+            : "W";
+
+  if (compact) {
+    return (
+      <div
+        className="flex h-full min-h-0 items-center justify-center overflow-hidden p-2"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: "rgba(255,255,255,0.025)",
+        }}
+      >
+        <svg
+          className="h-full max-h-[260px] w-full max-w-[180px]"
+          viewBox="0 0 240 230"
+          role="img"
+          aria-label="mouse input preview"
+          preserveAspectRatio="xMidYMid meet"
+        >
+          <path
+            d="M120 18 C154 18 180 52 180 104 V160 C180 193 154 214 120 214 C86 214 60 193 60 160 V104 C60 52 86 18 120 18 Z"
+            fill="rgba(255,255,255,0.05)"
+            stroke={theme.border}
+            strokeWidth="1.5"
+          />
+          <path d="M120 18 L120 100" stroke={theme.border} strokeWidth="1.5" />
+          <path
+            d="M63 101 C64 49 89 20 120 18 L120 101 Z"
+            fill={leftDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
+            stroke={leftDown ? theme.accent : theme.border}
+          />
+          <path
+            d="M120 18 C151 20 176 49 177 101 L120 101 Z"
+            fill={rightDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
+            stroke={rightDown ? theme.accent : theme.border}
+          />
+          <rect
+            x="112"
+            y="54"
+            width="15"
+            height="38"
+            rx="7.5"
+            fill={middleDown || wheelActive ? theme.accentSoft : "rgba(255,255,255,0.08)"}
+            stroke={middleDown || wheelActive ? theme.accent : theme.border}
+          />
+          {wheelActive ? (
+            <text x="119.5" y="48" textAnchor="middle" fill={theme.accent} fontSize="15" fontWeight="700">
+              {wheelLabel}
+            </text>
+          ) : null}
+          <rect x="50" y="110" width="13" height="44" rx="6.5" fill={backDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={backDown ? theme.accent : theme.border} strokeWidth={backDown ? 2 : 1.2} />
+          <rect x="47" y="160" width="13" height="44" rx="6.5" fill={forwardDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={forwardDown ? theme.accent : theme.border} strokeWidth={forwardDown ? 2 : 1.2} />
+          <text x="91" y="72" fill={leftDown ? theme.accent : theme.textMuted} fontSize="12">L</text>
+          <text x="145" y="72" fill={rightDown ? theme.accent : theme.textMuted} fontSize="12">R</text>
+          <text x="119.5" y="78" textAnchor="middle" fill={middleDown || wheelActive ? theme.accent : theme.textMuted} fontSize="10" fontWeight={middleDown || wheelActive ? 700 : 400}>{wheelLabel}</text>
+          <text x="20" y="137" fill={backDown ? theme.accent : theme.textMuted} fontSize="11">Back</text>
+          <text x="26" y="188" fill={forwardDown ? theme.accent : theme.textMuted} fontSize="11">Fwd</text>
+        </svg>
+      </div>
+    );
+  }
 
   return (
     <div
-      className="grid h-full min-h-0 grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(220px,320px)_minmax(0,1fr)]"
+      className={
+        compact
+          ? "flex h-full min-h-0 items-center justify-center p-3"
+          : "grid h-full min-h-0 grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(220px,320px)_minmax(0,1fr)]"
+      }
       style={{
         border: `1px solid ${theme.border}`,
         background: "rgba(255,255,255,0.025)",
       }}
     >
       <div className="flex items-center justify-center">
-        <svg className="h-full max-h-[360px] w-full max-w-[280px]" viewBox="0 0 220 280" role="img" aria-label="mouse input preview">
+        <svg className="h-full max-h-[360px] w-full max-w-[240px]" viewBox="0 0 220 280" role="img" aria-label="mouse input preview">
           <rect x="54" y="18" width="112" height="236" rx="56" fill="rgba(255,255,255,0.05)" stroke={theme.border} />
           <path
             d="M110 18 L110 116"
@@ -3139,20 +4463,30 @@ function SimulatedMouse({
             fill={middleDown || wheelActive ? theme.accentSoft : "rgba(255,255,255,0.08)"}
             stroke={middleDown || wheelActive ? theme.accent : theme.border}
           />
-          <path d="M54 132 C43 143 39 160 41 184" fill="none" stroke={backDown ? theme.accent : theme.border} strokeWidth={backDown ? 6 : 4} strokeLinecap="round" />
-          <path d="M166 132 C177 143 181 160 179 184" fill="none" stroke={forwardDown ? theme.accent : theme.border} strokeWidth={forwardDown ? 6 : 4} strokeLinecap="round" />
+          {wheelActive ? (
+            <text x="110" y="58" textAnchor="middle" fill={theme.accent} fontSize="18" fontWeight="700">
+              {wheelLabel}
+            </text>
+          ) : null}
+          <rect x="42" y="132" width="14" height="46" rx="7" fill={backDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={backDown ? theme.accent : theme.border} strokeWidth={backDown ? 2 : 1.5} />
+          <rect x="38" y="182" width="14" height="46" rx="7" fill={forwardDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={forwardDown ? theme.accent : theme.border} strokeWidth={forwardDown ? 2 : 1.5} />
           <text x="82" y="82" fill={theme.textMuted} fontSize="11">L</text>
           <text x="134" y="82" fill={theme.textMuted} fontSize="11">R</text>
-          <text x="105" y="92" fill={theme.textMuted} fontSize="9">W</text>
-          <text x="16" y="164" fill={backDown ? theme.accent : theme.textMuted} fontSize="10">Back</text>
-          <text x="178" y="164" fill={forwardDown ? theme.accent : theme.textMuted} fontSize="10">Fwd</text>
+          <text x="110" y="92" textAnchor="middle" fill={middleDown || wheelActive ? theme.accent : theme.textMuted} fontSize="11" fontWeight={middleDown || wheelActive ? 700 : 400}>{wheelLabel}</text>
+          <text x="8" y="158" fill={backDown ? theme.accent : theme.textMuted} fontSize="10">Back</text>
+          <text x="8" y="210" fill={forwardDown ? theme.accent : theme.textMuted} fontSize="10">Fwd</text>
         </svg>
       </div>
+      {compact ? null : (
       <div className="flex min-w-0 flex-col gap-3">
+        {compact ? null : (
+        <>
         <div className="text-sm font-medium">鼠标实时绘制</div>
         <div className="text-xs" style={{ color: theme.textMuted }}>
-          全局 {Math.round(x)}, {Math.round(y)} / {displayName} 内 {Math.round(displayRelativeX)}, {Math.round(displayRelativeY)} · {display.width} x {display.height} @ {display.x}, {display.y}
+          鍏ㄥ眬 {Math.round(x)}, {Math.round(y)} / {displayName} 鍐?{Math.round(displayRelativeX)}, {Math.round(displayRelativeY)} 路 {display.width} x {display.height} @ {display.x}, {display.y}
         </div>
+        </>
+        )}
         <div
           className="relative min-h-0 flex-1 overflow-hidden rounded"
           style={{
@@ -3196,9 +4530,10 @@ function SimulatedMouse({
               color: theme.textMuted,
             }}
           >
-            滚轮 Δ {wheelDeltaX}, {wheelDeltaY}
+            婊氳疆 螖 {wheelDeltaX}, {wheelDeltaY}
           </div>
         </div>
+        {compact ? null : (
         <div className="grid shrink-0 grid-cols-2 gap-2 text-xs 2xl:grid-cols-4">
           <KeyboardSignal label="Left" value={leftDown ? "pressed" : "idle"} theme={theme} />
           <KeyboardSignal label="Middle" value={middleDown ? "pressed" : "idle"} theme={theme} />
@@ -3207,10 +4542,12 @@ function SimulatedMouse({
           <KeyboardSignal label="Forward" value={forwardDown ? "pressed" : "idle"} theme={theme} />
           <KeyboardSignal label="移动" value={String(moveCount)} theme={theme} />
           <KeyboardSignal label="按下/抬起" value={`${buttonPressCount}/${buttonReleaseCount}`} theme={theme} />
-          <KeyboardSignal label="滚轮" value={`${wheelEventCount} / ${wheelTotalX}, ${wheelTotalY}`} theme={theme} />
+          <KeyboardSignal label="婊氳疆" value={`${wheelEventCount} / ${wheelTotalX}, ${wheelTotalY}`} theme={theme} />
           <KeyboardSignal label="事件" value={String(eventCount)} theme={theme} />
         </div>
+        )}
       </div>
+      )}
     </div>
   );
 }
@@ -3237,7 +4574,43 @@ function gamepadButtonName(button: string | Record<string, unknown>) {
 }
 
 function normalizedGamepadButton(name: string) {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalizeInputToken(name);
+}
+
+function gamepadButtonAliases(name: string) {
+  const aliases: Record<string, string[]> = {
+    South: ["South", "ButtonSouth", "A", "ButtonA", "FaceDown", "Cross"],
+    East: ["East", "ButtonEast", "B", "ButtonB", "FaceRight", "Circle"],
+    West: ["West", "ButtonWest", "X", "ButtonX", "FaceLeft", "Square"],
+    North: ["North", "ButtonNorth", "Y", "ButtonY", "FaceUp", "Triangle"],
+    A: ["A", "South", "ButtonSouth", "ButtonA"],
+    B: ["B", "East", "ButtonEast", "ButtonB"],
+    X: ["X", "West", "ButtonWest", "ButtonX"],
+    Y: ["Y", "North", "ButtonNorth", "ButtonY"],
+    LeftBumper: ["LeftBumper", "LeftShoulder", "LB", "L1"],
+    RightBumper: ["RightBumper", "RightShoulder", "RB", "R1"],
+    LeftTrigger: ["LeftTrigger", "LeftTrigger2", "LT", "L2"],
+    RightTrigger: ["RightTrigger", "RightTrigger2", "RT", "R2"],
+    LeftStick: ["LeftStick", "LeftThumb", "LeftThumbstick", "L3"],
+    RightStick: ["RightStick", "RightThumb", "RightThumbstick", "R3"],
+    Select: ["Select", "Back", "Share"],
+    Start: ["Start", "Menu", "Options"],
+    Guide: ["Guide", "Mode", "Home", "Xbox"],
+    DPadUp: ["DPadUp", "DpadUp", "DPad Up", "Up"],
+    DPadDown: ["DPadDown", "DpadDown", "DPad Down", "Down"],
+    DPadLeft: ["DPadLeft", "DpadLeft", "DPad Left", "Left"],
+    DPadRight: ["DPadRight", "DpadRight", "DPad Right", "Right"],
+  };
+  return aliases[name] ?? [name];
+}
+
+function gamepadButtonTokens(gamepad: LocalGamepadSnapshot | null) {
+  if (!gamepad) {
+    return [];
+  }
+  return [
+    ...gamepadPressedButtons(gamepad),
+  ].filter(Boolean);
 }
 
 function gamepadPressedButtons(gamepad: LocalGamepadSnapshot | null) {
@@ -3253,15 +4626,21 @@ function gamepadPressedButtons(gamepad: LocalGamepadSnapshot | null) {
 }
 
 function gamepadButtonActive(gamepad: LocalGamepadSnapshot | null, names: string[]) {
-  const wanted = names.map(normalizedGamepadButton);
-  return gamepadPressedButtons(gamepad).some((button) =>
-    wanted.includes(normalizedGamepadButton(button)),
-  );
+  const wanted = names.flatMap(gamepadButtonAliases).map(normalizedGamepadButton);
+  return gamepadButtonTokens(gamepad).some((button) => {
+    const actual = normalizedGamepadButton(button);
+    return wanted.some((candidate) => actual === candidate || actual.includes(candidate));
+  });
 }
 
 function stickOffset(value: number) {
   const normalized = Math.max(-1, Math.min(1, Number(value ?? 0) / 32767));
-  return normalized * 22;
+  return normalized * 16;
+}
+
+function stickPercent(value: number) {
+  const normalized = Math.max(-1, Math.min(1, Number(value ?? 0) / 32767));
+  return Math.round(normalized * 100);
 }
 
 function triggerFill(value: number) {
@@ -3272,10 +4651,12 @@ function SimulatedGamepad({
   gamepad,
   virtualDetail,
   theme,
+  compact = false,
 }: {
   gamepad: LocalGamepadSnapshot | null;
   virtualDetail: string;
   theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
 }) {
   const connected = Boolean(gamepad?.connected);
   const pressed = gamepadPressedButtons(gamepad);
@@ -3285,24 +4666,52 @@ function SimulatedGamepad({
   const rightStickY = -stickOffset(gamepad?.right_stick_y ?? 0);
   const leftTrigger = triggerFill(gamepad?.left_trigger ?? 0);
   const rightTrigger = triggerFill(gamepad?.right_trigger ?? 0);
-  const buttonFill = (active: boolean) => (active ? theme.accent : "rgba(255,255,255,0.075)");
-  const buttonStroke = (active: boolean) => (active ? theme.accent : theme.border);
+  const isDark = theme.canvas === FIGMA_DESKTOP_THEME.canvas;
+  const bodyFill = isDark ? "rgba(255,255,255,0.018)" : "rgba(255,255,255,0.12)";
+  const bodyStroke = isDark ? "rgba(255,255,255,0.22)" : "#b8c0cb";
+  const controlFill = isDark ? "rgba(255,255,255,0.018)" : "rgba(255,255,255,0.2)";
+  const controlInnerFill = isDark ? "rgba(255,255,255,0.012)" : "rgba(255,255,255,0.14)";
+  const controlStroke = isDark ? "rgba(255,255,255,0.2)" : "#c3c9d2";
+  const activeFill = isDark ? "rgba(91,139,214,0.26)" : "rgba(77,126,214,0.16)";
+  const activeStrongFill = isDark ? "rgba(91,139,214,0.62)" : "rgba(77,126,214,0.46)";
+  const buttonFill = (active: boolean) => (active ? activeFill : controlFill);
+  const buttonStroke = (active: boolean) => (active ? theme.accent : controlStroke);
+  const buttonText = (active: boolean) => (active ? theme.accent : theme.textSub);
+  const leftBumperActive = gamepadButtonActive(gamepad, ["LeftBumper", "LB"]);
+  const rightBumperActive = gamepadButtonActive(gamepad, ["RightBumper", "RB"]);
+  const leftTriggerActive = leftTrigger > 2 || gamepadButtonActive(gamepad, ["LeftTrigger", "LT"]);
+  const rightTriggerActive = rightTrigger > 2 || gamepadButtonActive(gamepad, ["RightTrigger", "RT"]);
+  const leftStickActive = gamepadButtonActive(gamepad, ["LeftStick", "LeftThumb"]);
+  const rightStickActive = gamepadButtonActive(gamepad, ["RightStick", "RightThumb"]);
+  const guideActive = gamepadButtonActive(gamepad, ["Guide", "Mode"]);
   const faceButtons = [
-    { label: "Y", x: 500, y: 118, names: ["North", "Y"] },
-    { label: "X", x: 460, y: 158, names: ["West", "X"] },
-    { label: "B", x: 540, y: 158, names: ["East", "B"] },
-    { label: "A", x: 500, y: 198, names: ["South", "A"] },
+    { label: "Y", x: 506, y: 176, names: ["North", "Y"], color: "#2f9a48" },
+    { label: "X", x: 468, y: 214, names: ["West", "X"], color: theme.accent },
+    { label: "B", x: 544, y: 214, names: ["East", "B"], color: "#c94f4f" },
+    { label: "A", x: 506, y: 252, names: ["South", "A"], color: "#2f9a48" },
   ];
+  const dpadButtons = [
+    { key: "up", names: ["DPadUp"], path: "M0 -33 L9 -18 H-9 Z", activePath: "M-18 -50 H18 V-17 H-18 Z" },
+    { key: "down", names: ["DPadDown"], path: "M0 33 L9 18 H-9 Z", activePath: "M-18 17 H18 V50 H-18 Z" },
+    { key: "left", names: ["DPadLeft"], path: "M-33 0 L-18 -9 V9 Z", activePath: "M-50 -18 H-17 V18 H-50 Z" },
+    { key: "right", names: ["DPadRight"], path: "M33 0 L18 -9 V9 Z", activePath: "M17 -18 H50 V18 H17 Z" },
+  ];
+  const gamepadViewBox = compact ? "88 28 544 400" : "0 0 720 430";
 
   return (
     <div
-      className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-3 p-4"
+      className={
+        compact
+          ? "grid h-full min-h-0 grid-rows-[minmax(0,1fr)] gap-3 p-3"
+          : "grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-3 p-4"
+      }
       style={{
         border: `1px solid ${theme.border}`,
         background: "rgba(255,255,255,0.025)",
       }}
     >
       <div className="min-h-0">
+        {compact ? null : (
         <div className="mb-2 flex items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="truncate text-sm font-medium">{gamepad?.name ?? "Gamepad"}</div>
@@ -3320,72 +4729,122 @@ function SimulatedGamepad({
             {connected ? "live" : "idle"}
           </span>
         </div>
-        <svg className="h-full min-h-[260px] w-full" viewBox="0 0 640 360" role="img" aria-label="gamepad input preview">
-          <path
-            d="M176 86 C230 54 410 54 464 86 C542 132 594 234 570 288 C552 328 492 316 450 258 C424 224 392 214 320 214 C248 214 216 224 190 258 C148 316 88 328 70 288 C46 234 98 132 176 86 Z"
-            fill="rgba(255,255,255,0.045)"
-            stroke={theme.border}
-            strokeWidth="2"
-          />
-          <rect x="156" y="56" width="110" height="28" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["LeftBumper"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["LeftBumper"]))} />
-          <rect x="374" y="56" width="110" height="28" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["RightBumper"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["RightBumper"]))} />
-          <rect x="174" y="24" width="74" height="20" rx="6" fill="rgba(255,255,255,0.055)" stroke={theme.border} />
-          <rect x="392" y="24" width="74" height="20" rx="6" fill="rgba(255,255,255,0.055)" stroke={theme.border} />
-          <rect x="174" y="24" width={Math.max(2, leftTrigger * 0.74)} height="20" rx="6" fill={theme.accentSoft} />
-          <rect x="392" y="24" width={Math.max(2, rightTrigger * 0.74)} height="20" rx="6" fill={theme.accentSoft} />
-          <text x="184" y="75" fill={theme.textMuted} fontSize="12">LB</text>
-          <text x="440" y="75" fill={theme.textMuted} fontSize="12">RB</text>
-          <text x="197" y="39" fill={theme.textMuted} fontSize="10">LT {Math.round(leftTrigger)}%</text>
-          <text x="415" y="39" fill={theme.textMuted} fontSize="10">RT {Math.round(rightTrigger)}%</text>
-
-          <g transform="translate(168 172)">
-            <rect x="-18" y="-54" width="36" height="108" rx="8" fill="rgba(255,255,255,0.055)" stroke={theme.border} />
-            <rect x="-54" y="-18" width="108" height="36" rx="8" fill="rgba(255,255,255,0.055)" stroke={theme.border} />
-            <rect x="-18" y="-54" width="36" height="36" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["DPadUp"]))} />
-            <rect x="-18" y="18" width="36" height="36" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["DPadDown"]))} />
-            <rect x="-54" y="-18" width="36" height="36" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["DPadLeft"]))} />
-            <rect x="18" y="-18" width="36" height="36" rx="8" fill={buttonFill(gamepadButtonActive(gamepad, ["DPadRight"]))} />
+        )}
+        <svg
+          className={compact ? "h-full min-h-[220px] w-full" : "h-full min-h-[340px] w-full"}
+          viewBox={gamepadViewBox}
+          role="img"
+          aria-label="gamepad input preview"
+          preserveAspectRatio="xMidYMid meet"
+        >
+          <g>
+            <path
+              d="M196 148 C230 118 279 116 310 136 C329 148 344 153 360 153 C376 153 391 148 410 136 C441 116 490 118 524 148 C566 187 590 267 607 338 C624 410 587 440 540 426 C512 418 495 388 466 348 C448 323 421 306 384 306 H336 C299 306 272 323 254 348 C225 388 208 418 180 426 C133 440 96 410 113 338 C130 267 154 187 196 148 Z"
+              fill={bodyFill}
+              stroke={bodyStroke}
+              strokeWidth="2"
+            />
+            <path
+              d="M227 143 C255 130 293 130 319 146 H401 C427 130 465 130 493 143"
+              fill="none"
+              stroke={isDark ? "rgba(255,255,255,0.11)" : "rgba(116,123,132,0.22)"}
+              strokeWidth="2"
+              strokeLinecap="round"
+            />
           </g>
 
-          <g transform="translate(262 238)">
-            <circle r="50" fill={buttonFill(gamepadButtonActive(gamepad, ["LeftStick"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["LeftStick"]))} />
-            <circle cx={leftStickX} cy={leftStickY} r="22" fill={theme.accentSoft} stroke={theme.accent} />
-            <text x="-20" y="78" fill={theme.textMuted} fontSize="12">L {Math.round(gamepad?.left_stick_x ?? 0)}, {Math.round(gamepad?.left_stick_y ?? 0)}</text>
+          <g transform="translate(254 42)">
+            <rect x="0" y="0" width="82" height="28" rx="8" fill={buttonFill(leftTriggerActive)} stroke={buttonStroke(leftTriggerActive)} />
+            <rect x="0" y="0" width={leftTrigger > 0 ? Math.max(3, leftTrigger * 0.82) : 0} height="28" rx="8" fill={activeFill} />
+            <text x="18" y="18" fill={buttonText(leftTriggerActive)} fontSize="12" fontWeight="600">LT</text>
+            <text x="94" y="18" fill={theme.textMuted} fontSize="12">{Math.round(leftTrigger)}%</text>
+          </g>
+          <g transform="translate(384 42)">
+            <rect x="0" y="0" width="82" height="28" rx="8" fill={buttonFill(rightTriggerActive)} stroke={buttonStroke(rightTriggerActive)} />
+            <rect x="0" y="0" width={rightTrigger > 0 ? Math.max(3, rightTrigger * 0.82) : 0} height="28" rx="8" fill={activeFill} />
+            <text x="18" y="18" fill={buttonText(rightTriggerActive)} fontSize="12" fontWeight="600">RT</text>
+            <text x="94" y="18" fill={theme.textMuted} fontSize="12">{Math.round(rightTrigger)}%</text>
+          </g>
+          <g transform="translate(242 83)">
+            <rect x="0" y="0" width="108" height="32" rx="10" fill={buttonFill(leftBumperActive)} stroke={buttonStroke(leftBumperActive)} strokeWidth="2" />
+            <text x="54" y="21" textAnchor="middle" fill={buttonText(leftBumperActive)} fontSize="14" fontWeight="600">LB</text>
+          </g>
+          <g transform="translate(370 83)">
+            <rect x="0" y="0" width="108" height="32" rx="10" fill={buttonFill(rightBumperActive)} stroke={buttonStroke(rightBumperActive)} strokeWidth="2" />
+            <text x="54" y="21" textAnchor="middle" fill={buttonText(rightBumperActive)} fontSize="14" fontWeight="600">RB</text>
           </g>
 
-          <g transform="translate(388 238)">
-            <circle r="50" fill={buttonFill(gamepadButtonActive(gamepad, ["RightStick"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["RightStick"]))} />
-            <circle cx={rightStickX} cy={rightStickY} r="22" fill={theme.accentSoft} stroke={theme.accent} />
-            <text x="-20" y="78" fill={theme.textMuted} fontSize="12">R {Math.round(gamepad?.right_stick_x ?? 0)}, {Math.round(gamepad?.right_stick_y ?? 0)}</text>
+          <g transform="translate(224 202)">
+            <circle r="44" fill={controlInnerFill} stroke={controlStroke} strokeWidth="2" />
+            <circle r="30" fill={buttonFill(leftStickActive)} stroke={buttonStroke(leftStickActive)} strokeWidth="2" />
+            <circle cx={leftStickX} cy={leftStickY} r="12" fill={leftStickActive ? activeStrongFill : theme.accentSoft} stroke={theme.accent} strokeWidth="2" />
+          </g>
+
+          <g transform="translate(244 310)">
+            <path d="M-20 -52 H20 C27 -52 32 -47 32 -40 V-24 H48 C60 -24 65 -19 65 -8 V8 C65 19 60 24 48 24 H32 V40 C32 47 27 52 20 52 H-20 C-27 52 -32 47 -32 40 V24 H-48 C-60 24 -65 19 -65 8 V-8 C-65 -19 -60 -24 -48 -24 H-32 V-40 C-32 -47 -27 -52 -20 -52 Z" fill={controlFill} stroke={controlStroke} strokeWidth="2" />
+            {dpadButtons.map((button) => {
+              const active = gamepadButtonActive(gamepad, button.names);
+              return (
+                <g key={button.key}>
+                  <path d={button.activePath} fill={active ? activeFill : "transparent"} />
+                  <path d={button.path} fill={active ? theme.accent : theme.textMuted} opacity={active ? 1 : 0.76} />
+                </g>
+              );
+            })}
+          </g>
+
+          <g transform="translate(384 300)">
+            <circle r="44" fill={controlInnerFill} stroke={controlStroke} strokeWidth="2" />
+            <circle r="30" fill={buttonFill(rightStickActive)} stroke={buttonStroke(rightStickActive)} strokeWidth="2" />
+            <circle cx={rightStickX} cy={rightStickY} r="12" fill={rightStickActive ? activeStrongFill : theme.accentSoft} stroke={theme.accent} strokeWidth="2" />
+          </g>
+
+          <g transform="translate(317 213)">
+            <rect x="-28" y="-13" width="56" height="26" rx="13" fill={buttonFill(gamepadButtonActive(gamepad, ["Select"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Select"]))} strokeWidth="2" />
+            <rect x="72" y="-13" width="56" height="26" rx="13" fill={buttonFill(gamepadButtonActive(gamepad, ["Start"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Start"]))} strokeWidth="2" />
+            <circle cx="50" cy="35" r="19" fill={buttonFill(guideActive)} stroke={buttonStroke(guideActive)} strokeWidth="2" />
+            <text x="0" y="5" textAnchor="middle" fill={buttonText(gamepadButtonActive(gamepad, ["Select"]))} fontSize="11" fontWeight="600">Select</text>
+            <text x="100" y="5" textAnchor="middle" fill={buttonText(gamepadButtonActive(gamepad, ["Start"]))} fontSize="11" fontWeight="600">Start</text>
+            <path d="M45 35 L50 30 L55 35 L50 40 Z" fill={guideActive ? theme.accent : theme.textMuted} opacity={guideActive ? 1 : 0.7} />
           </g>
 
           {faceButtons.map((button) => {
             const active = gamepadButtonActive(gamepad, button.names);
             return (
               <g key={button.label}>
-                <circle cx={button.x} cy={button.y} r="24" fill={buttonFill(active)} stroke={buttonStroke(active)} strokeWidth="2" />
-                <text x={button.x} y={button.y + 5} textAnchor="middle" fill={active ? theme.text : theme.textMuted} fontSize="16" fontWeight="600">{button.label}</text>
+                <circle cx={button.x} cy={button.y} r="27" fill={buttonFill(active)} stroke={buttonStroke(active)} strokeWidth="2" />
+                <text
+                  x={button.x}
+                  y={button.y + 7}
+                  textAnchor="middle"
+                  fill={active ? theme.accent : button.color}
+                  fontSize="22"
+                  fontWeight="700"
+                >
+                  {button.label}
+                </text>
               </g>
             );
           })}
 
-          <rect x="286" y="145" width="48" height="24" rx="10" fill={buttonFill(gamepadButtonActive(gamepad, ["Select"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Select"]))} />
-          <rect x="346" y="145" width="48" height="24" rx="10" fill={buttonFill(gamepadButtonActive(gamepad, ["Start"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Start"]))} />
-          <circle cx="320" cy="186" r="17" fill={buttonFill(gamepadButtonActive(gamepad, ["Guide"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Guide"]))} />
-          <text x="310" y="162" fill={theme.textMuted} fontSize="10" textAnchor="middle">Select</text>
-          <text x="370" y="162" fill={theme.textMuted} fontSize="10" textAnchor="middle">Start</text>
         </svg>
       </div>
+      {compact ? null : (
       <div className="grid shrink-0 grid-cols-2 gap-2 text-xs lg:grid-cols-4">
-        <KeyboardSignal label="Pressed" value={pressed.length ? pressed.join(", ") : "none"} theme={theme} />
-        <KeyboardSignal label="Last" value={gamepad?.last_button ?? "none"} theme={theme} />
-        <KeyboardSignal label="Press/Release" value={`${gamepad?.button_press_count ?? 0}/${gamepad?.button_release_count ?? 0}`} theme={theme} />
-        <KeyboardSignal label="Button events" value={String(gamepad?.button_event_count ?? 0)} theme={theme} />
-        <KeyboardSignal label="Stick events" value={String(gamepad?.axis_event_count ?? 0)} theme={theme} />
-        <KeyboardSignal label="Trigger events" value={String(gamepad?.trigger_event_count ?? 0)} theme={theme} />
-        <KeyboardSignal label="Total" value={String(gamepad?.event_count ?? 0)} theme={theme} />
-        <KeyboardSignal label="Last axis" value={gamepad?.last_axis ?? "none"} theme={theme} />
+        <KeyboardSignal label="已按下" value={pressed.length ? pressed.join(", ") : "无"} theme={theme} />
+        <KeyboardSignal label="最近按键" value={gamepad?.last_button ?? "无"} theme={theme} />
+        <KeyboardSignal label="按下/抬起" value={`${gamepad?.button_press_count ?? 0}/${gamepad?.button_release_count ?? 0}`} theme={theme} />
+        <KeyboardSignal label="按键事件" value={String(gamepad?.button_event_count ?? 0)} theme={theme} />
+        <KeyboardSignal label="摇杆事件" value={String(gamepad?.axis_event_count ?? 0)} theme={theme} />
+        <KeyboardSignal label="扳机事件" value={String(gamepad?.trigger_event_count ?? 0)} theme={theme} />
+        <KeyboardSignal label="总事件数" value={String(gamepad?.event_count ?? 0)} theme={theme} />
+        <KeyboardSignal
+          label="摇杆"
+          value={`L ${stickPercent(gamepad?.left_stick_x ?? 0)}, ${stickPercent(gamepad?.left_stick_y ?? 0)} / R ${stickPercent(gamepad?.right_stick_x ?? 0)}, ${stickPercent(gamepad?.right_stick_y ?? 0)}`}
+          theme={theme}
+        />
       </div>
+      )}
     </div>
   );
 }
@@ -3408,8 +4867,7 @@ function GamepadEventLog({
       <div className="mb-2 flex shrink-0 items-center justify-between gap-3">
         <div className="text-sm font-medium">手柄记录</div>
         <div className="text-xs" style={{ color: theme.textMuted }}>
-          最近 {events.length} 条
-        </div>
+          最近 {events.length} 条        </div>
       </div>
       <div className="rshare-scroll min-h-0 flex-1 space-y-1.5 overflow-auto pr-1">
         {events.length ? (
@@ -3615,6 +5073,25 @@ function driverStatusLabel(snapshot: LocalControlsSnapshot | null) {
   return `${snapshot.driver.status}${version}${filter}${vhid}`;
 }
 
+function localInputDeviceCount(
+  snapshot: LocalControlsSnapshot | null,
+  kind: "keyboard" | "mouse",
+) {
+  if (!snapshot) {
+    return 0;
+  }
+
+  const devices =
+    kind === "keyboard" ? snapshot.keyboard_devices : snapshot.mouse_devices;
+  if (devices?.length) {
+    return devices.length;
+  }
+
+  const detected =
+    kind === "keyboard" ? snapshot.keyboard.detected : snapshot.mouse.detected;
+  return detected ? 1 : 0;
+}
+
 function backendHealthLabel(backend: Record<string, unknown> | null | undefined) {
   const name =
     typeof backend?.mode === "string"
@@ -3787,14 +5264,15 @@ function SettingsPage({
             className="mt-5 rounded-md px-4 py-2 text-sm transition"
             style={{
               background: service.online
-                ? "rgba(197, 48, 48, 0.18)"
+                ? "rgba(197, 48, 48, 0.08)"
                 : theme.accentSoft,
-              color: service.online ? "#ffb5c0" : theme.text,
+              color: service.online ? "#9f1f2d" : theme.accent,
               border: `1px solid ${
                 service.online
-                  ? "rgba(197, 48, 48, 0.35)"
+                  ? "rgba(197, 48, 48, 0.55)"
                   : theme.accent
               }`,
+              opacity: busy ? 0.7 : 1,
             }}
             disabled={busy}
             onClick={onToggleService}
@@ -4169,12 +5647,7 @@ function EmptyPanel({
 }
 
 function LogsPage({ theme }: { theme: typeof FIGMA_DESKTOP_THEME }) {
-  const [logs, setLogs] = useState<Array<{
-    timestamp: string;
-    level: string;
-    target: string;
-    message: string;
-  }>>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [filter, setFilter] = useState<"all" | "error" | "warn" | "info" | "debug">("all");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -4184,13 +5657,8 @@ function LogsPage({ theme }: { theme: typeof FIGMA_DESKTOP_THEME }) {
     setLoading(true);
     setError(null);
     try {
-      const result = await invokeCommand<{
-        timestamp: string;
-        level: string;
-        target: string;
-        message: string;
-      }[]>("get_logs", { limit: 1000 });
-      setLogs(result);
+      const result = await invokeCommand<LogEntry[] | null>("get_logs", { limit: 1000 });
+      setLogs(safeArray(result).filter(isLogEntry));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -4217,13 +5685,13 @@ function LogsPage({ theme }: { theme: typeof FIGMA_DESKTOP_THEME }) {
     return () => clearInterval(timer);
   }, [autoRefresh]);
 
-  const filteredLogs = logs.filter(log => {
+  const filteredLogs = safeArray(logs).filter(log => {
     if (filter === "all") return true;
     return log.level.toLowerCase() === filter;
   });
 
-  const getLevelColor = (level: string) => {
-    switch (level.toLowerCase()) {
+  const getLevelColor = (level: string | null | undefined) => {
+    switch (String(level ?? "").toLowerCase()) {
       case "error": return "#ffb5c0";
       case "warn": return "#e5c37a";
       case "info": return "#8de29d";
@@ -4241,7 +5709,7 @@ function LogsPage({ theme }: { theme: typeof FIGMA_DESKTOP_THEME }) {
           <div>
             <h2 className="text-lg font-semibold">服务日志</h2>
             <p className="text-sm" style={{ color: theme.textMuted }}>
-              查看守护进程的运行日志
+              查看守护进程的运行日志。
             </p>
           </div>
         </div>
@@ -4361,3 +5829,7 @@ function InfoRow({
     </div>
   );
 }
+
+
+
+
