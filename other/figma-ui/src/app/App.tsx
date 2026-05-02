@@ -3544,7 +3544,7 @@ function LocalControlDetail({
     const keyboardState = keyboardMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
     const keyboardEvents = recentEvents.slice(-12).reverse();
     const actionLabel = remoteDevice
-      ? "发送延迟探测"
+      ? "双端延迟探测"
       : confirmingInputTest === "keyboard"
         ? "再次点击执行 Shift 测试"
         : "真实注入测试";
@@ -3559,7 +3559,7 @@ function LocalControlDetail({
     const mouseState = mouseMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
     const mouseEvents = recentEvents.slice(-12).reverse();
     const actionLabel = remoteDevice
-      ? "发送延迟探测"
+      ? "双端延迟探测"
       : confirmingInputTest === "mouse"
         ? "再次点击执行移动测试"
         : "真实注入测试";

@@ -378,12 +378,23 @@ pub enum Message {
         event: LocalInputDiagnosticEvent,
     },
     /// Diagnostic latency probe. Receivers answer with LatencyProbeAck.
-    LatencyProbe { sequence: u64, timestamp_ms: u64 },
+    LatencyProbe {
+        sequence: u64,
+        timestamp_ms: u64,
+        #[serde(default)]
+        endpoint_switch: bool,
+        #[serde(default)]
+        origin_sequence: Option<u64>,
+    },
     /// Diagnostic latency probe acknowledgment.
     LatencyProbeAck {
         sequence: u64,
         sent_timestamp_ms: u64,
         received_timestamp_ms: u64,
+        #[serde(default)]
+        ack_timestamp_ms: u64,
+        #[serde(default)]
+        origin_sequence: Option<u64>,
     },
 
     // === Audio Streaming ===
@@ -687,6 +698,34 @@ mod tests {
             Message::AudioFrame { frame: decoded } => assert_eq!(decoded, frame),
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn latency_probe_defaults_endpoint_switch_fields() {
+        let probe_json = r#"{"LatencyProbe":{"sequence":7,"timestamp_ms":42}}"#;
+        let probe: Message = serde_json::from_str(probe_json).unwrap();
+        assert!(matches!(
+            probe,
+            Message::LatencyProbe {
+                sequence: 7,
+                timestamp_ms: 42,
+                endpoint_switch: false,
+                origin_sequence: None,
+            }
+        ));
+
+        let ack_json = r#"{"LatencyProbeAck":{"sequence":7,"sent_timestamp_ms":42,"received_timestamp_ms":43}}"#;
+        let ack: Message = serde_json::from_str(ack_json).unwrap();
+        assert!(matches!(
+            ack,
+            Message::LatencyProbeAck {
+                sequence: 7,
+                sent_timestamp_ms: 42,
+                received_timestamp_ms: 43,
+                ack_timestamp_ms: 0,
+                origin_sequence: None,
+            }
+        ));
     }
 
     #[test]

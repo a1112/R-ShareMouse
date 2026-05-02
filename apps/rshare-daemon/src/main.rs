@@ -57,6 +57,16 @@ struct TrackedDevice {
 struct PendingLatencyProbe {
     target: DeviceId,
     sent_at_ms: u64,
+    role: PendingLatencyProbeRole,
+}
+
+#[derive(Debug, Clone)]
+enum PendingLatencyProbeRole {
+    LocalRequested,
+    EndpointSwitchReport {
+        origin_device_id: DeviceId,
+        origin_sequence: u64,
+    },
 }
 
 struct DaemonState {
@@ -1100,6 +1110,85 @@ fn record_latency_diagnostic_event(
     event
 }
 
+fn add_latency_measurement_payload(
+    payload: &mut BTreeMap<String, String>,
+    local_sent_at_ms: u64,
+    sent_timestamp_ms: u64,
+    remote_received_timestamp_ms: u64,
+    remote_ack_timestamp_ms: u64,
+    local_received_timestamp_ms: u64,
+) -> (u64, u64) {
+    let ack_timestamp_ms = if remote_ack_timestamp_ms == 0 {
+        remote_received_timestamp_ms
+    } else {
+        remote_ack_timestamp_ms
+    };
+    let raw_round_trip_ms = local_received_timestamp_ms.saturating_sub(local_sent_at_ms);
+    let remote_processing_ms = ack_timestamp_ms.saturating_sub(remote_received_timestamp_ms);
+    let network_round_trip_ms = raw_round_trip_ms.saturating_sub(remote_processing_ms);
+    let estimated_one_way_ms = network_round_trip_ms / 2;
+
+    payload.insert("latency_ms".to_string(), network_round_trip_ms.to_string());
+    payload.insert(
+        "raw_round_trip_ms".to_string(),
+        raw_round_trip_ms.to_string(),
+    );
+    payload.insert(
+        "network_round_trip_ms".to_string(),
+        network_round_trip_ms.to_string(),
+    );
+    payload.insert(
+        "estimated_one_way_ms".to_string(),
+        estimated_one_way_ms.to_string(),
+    );
+    payload.insert(
+        "remote_processing_ms".to_string(),
+        remote_processing_ms.to_string(),
+    );
+    payload.insert(
+        "sent_timestamp_ms".to_string(),
+        sent_timestamp_ms.to_string(),
+    );
+    payload.insert(
+        "local_sent_timestamp_ms".to_string(),
+        local_sent_at_ms.to_string(),
+    );
+    payload.insert(
+        "remote_received_timestamp_ms".to_string(),
+        remote_received_timestamp_ms.to_string(),
+    );
+    payload.insert(
+        "remote_ack_timestamp_ms".to_string(),
+        ack_timestamp_ms.to_string(),
+    );
+    payload.insert(
+        "local_received_timestamp_ms".to_string(),
+        local_received_timestamp_ms.to_string(),
+    );
+
+    let t0 = sent_timestamp_ms as i128;
+    let t1 = remote_received_timestamp_ms as i128;
+    let t2 = ack_timestamp_ms as i128;
+    let t3 = local_received_timestamp_ms as i128;
+    let clock_offset_estimate_ms = ((t1 - t0) + (t2 - t3)) / 2;
+    let local_to_remote_estimate_ms = (t1 - t0 - clock_offset_estimate_ms).max(0) as u64;
+    let remote_to_local_estimate_ms = (t3 - t2 + clock_offset_estimate_ms).max(0) as u64;
+    payload.insert(
+        "clock_offset_estimate_ms".to_string(),
+        clock_offset_estimate_ms.to_string(),
+    );
+    payload.insert(
+        "local_to_remote_estimate_ms".to_string(),
+        local_to_remote_estimate_ms.to_string(),
+    );
+    payload.insert(
+        "remote_to_local_estimate_ms".to_string(),
+        remote_to_local_estimate_ms.to_string(),
+    );
+
+    (network_round_trip_ms, raw_round_trip_ms)
+}
+
 fn short_device_id(id: DeviceId) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -1868,18 +1957,24 @@ async fn run_remote_latency_test(
             PendingLatencyProbe {
                 target: device_id,
                 sent_at_ms: now,
+                role: PendingLatencyProbeRole::LocalRequested,
             },
         );
 
         let mut payload = BTreeMap::new();
         payload.insert("probe_sequence".to_string(), sequence.to_string());
         payload.insert("sent_timestamp_ms".to_string(), now.to_string());
+        payload.insert("endpoint_switch".to_string(), "true".to_string());
+        payload.insert("direction".to_string(), "local_to_remote".to_string());
         let event = LocalInputDiagnosticEvent {
             sequence,
             timestamp_ms: now,
             device_kind: LocalInputDeviceKind::Backend,
-            event_kind: "latency_probe_sent".to_string(),
-            summary: format!("Latency probe sent to {}", short_device_id(device_id)),
+            event_kind: "latency_endpoint_probe_sent".to_string(),
+            summary: format!(
+                "Dual-end latency probe sent to {}",
+                short_device_id(device_id)
+            ),
             device_id: Some(device_id.to_string()),
             device_instance_id: None,
             capture_path: Some("rshare-net".to_string()),
@@ -1900,6 +1995,8 @@ async fn run_remote_latency_test(
                 Message::LatencyProbe {
                     sequence,
                     timestamp_ms: now,
+                    endpoint_switch: true,
+                    origin_sequence: None,
                 },
             )
             .await
@@ -1907,13 +2004,117 @@ async fn run_remote_latency_test(
 
     match result {
         Ok(()) => LocalInputTestResult::success(format!(
-            "Latency probe sent to {}.",
+            "Dual-end latency probe sent to {}.",
             short_device_id(device_id)
         )),
         Err(error) => {
             state.write().await.pending_latency_probes.remove(&sequence);
             LocalInputTestResult::failed(LocalInputTestStatus::Failed, error.to_string())
         }
+    }
+}
+
+async fn start_endpoint_switch_latency_probe(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    target: DeviceId,
+    origin_sequence: u64,
+) {
+    let now = timestamp_ms_now();
+    let Some((local_device_id, sequence, event)) = ({
+        let mut state = state.write().await;
+        if !is_device_connected(&state, target) {
+            None
+        } else {
+            let sequence = state.local_controls.sequence.saturating_add(1);
+            state.local_controls.sequence = sequence;
+            state.pending_latency_probes.insert(
+                sequence,
+                PendingLatencyProbe {
+                    target,
+                    sent_at_ms: now,
+                    role: PendingLatencyProbeRole::EndpointSwitchReport {
+                        origin_device_id: target,
+                        origin_sequence,
+                    },
+                },
+            );
+
+            let mut payload = BTreeMap::new();
+            payload.insert("probe_sequence".to_string(), sequence.to_string());
+            payload.insert(
+                "origin_probe_sequence".to_string(),
+                origin_sequence.to_string(),
+            );
+            payload.insert("sent_timestamp_ms".to_string(), now.to_string());
+            payload.insert("endpoint_switch".to_string(), "false".to_string());
+            payload.insert("direction".to_string(), "endpoint_to_origin".to_string());
+            let event = LocalInputDiagnosticEvent {
+                sequence,
+                timestamp_ms: now,
+                device_kind: LocalInputDeviceKind::Backend,
+                event_kind: "latency_endpoint_switch_sent".to_string(),
+                summary: format!(
+                    "Endpoint switched latency probe sent to {}",
+                    short_device_id(target)
+                ),
+                device_id: Some(target.to_string()),
+                device_instance_id: None,
+                capture_path: Some("rshare-net".to_string()),
+                source: LocalInputEventSource::System,
+                payload,
+            };
+            push_recent_local_event(&mut state.local_controls, event.clone());
+            Some((state.status.device_id, sequence, event))
+        }
+    }) else {
+        return;
+    };
+
+    let _ = local_events_tx.send(event.clone());
+    broadcast_diagnostic_event(network_manager, local_device_id, event).await;
+
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(
+                &target,
+                Message::LatencyProbe {
+                    sequence,
+                    timestamp_ms: now,
+                    endpoint_switch: false,
+                    origin_sequence: Some(origin_sequence),
+                },
+            )
+            .await
+    };
+
+    if let Err(error) = result {
+        let event = {
+            let mut state = state.write().await;
+            state.pending_latency_probes.remove(&sequence);
+            let mut payload = BTreeMap::new();
+            payload.insert("probe_sequence".to_string(), sequence.to_string());
+            payload.insert(
+                "origin_probe_sequence".to_string(),
+                origin_sequence.to_string(),
+            );
+            payload.insert("error".to_string(), error.to_string());
+            record_latency_diagnostic_event(
+                &mut state,
+                target,
+                "latency_endpoint_switch_failed",
+                format!(
+                    "Endpoint switched latency probe to {} failed: {}",
+                    short_device_id(target),
+                    error
+                ),
+                payload,
+            )
+        };
+        let _ = local_events_tx.send(event.clone());
+        broadcast_diagnostic_event(network_manager, local_device_id, event).await;
     }
 }
 
@@ -1936,8 +2137,11 @@ async fn handle_network_message(
         Message::LatencyProbe {
             sequence,
             timestamp_ms,
+            endpoint_switch,
+            origin_sequence,
         } => {
             let received_timestamp_ms = timestamp_ms_now();
+            let ack_timestamp_ms = timestamp_ms_now();
             let result = {
                 let mut manager = network_manager.lock().await;
                 manager
@@ -1947,6 +2151,8 @@ async fn handle_network_message(
                             sequence,
                             sent_timestamp_ms: timestamp_ms,
                             received_timestamp_ms,
+                            ack_timestamp_ms,
+                            origin_sequence,
                         },
                     )
                     .await
@@ -1954,37 +2160,100 @@ async fn handle_network_message(
             if let Err(error) = result {
                 tracing::debug!("Failed to answer latency probe from {}: {}", from, error);
             }
+            if endpoint_switch {
+                start_endpoint_switch_latency_probe(
+                    network_manager,
+                    state,
+                    local_events_tx,
+                    from,
+                    sequence,
+                )
+                .await;
+            }
         }
         Message::LatencyProbeAck {
             sequence,
             sent_timestamp_ms,
             received_timestamp_ms,
+            ack_timestamp_ms,
+            origin_sequence,
         } => {
             let now = timestamp_ms_now();
-            let event = {
+            let (event, should_broadcast, local_device_id) = {
                 let mut state = state.write().await;
                 let pending = state.pending_latency_probes.remove(&sequence);
-                let rtt_ms = pending
+                let target = pending.as_ref().map(|probe| probe.target).unwrap_or(from);
+                let local_sent_at_ms = pending
                     .as_ref()
-                    .map(|probe| now.saturating_sub(probe.sent_at_ms))
-                    .unwrap_or_else(|| now.saturating_sub(sent_timestamp_ms));
-                let target = pending.map(|probe| probe.target).unwrap_or(from);
+                    .map(|probe| probe.sent_at_ms)
+                    .unwrap_or(sent_timestamp_ms);
                 let mut payload = BTreeMap::new();
                 payload.insert("probe_sequence".to_string(), sequence.to_string());
-                payload.insert("latency_ms".to_string(), rtt_ms.to_string());
-                payload.insert(
-                    "remote_received_timestamp_ms".to_string(),
-                    received_timestamp_ms.to_string(),
+                if let Some(origin_sequence) = origin_sequence {
+                    payload.insert(
+                        "origin_probe_sequence".to_string(),
+                        origin_sequence.to_string(),
+                    );
+                }
+                let (network_round_trip_ms, raw_round_trip_ms) = add_latency_measurement_payload(
+                    &mut payload,
+                    local_sent_at_ms,
+                    sent_timestamp_ms,
+                    received_timestamp_ms,
+                    ack_timestamp_ms,
+                    now,
                 );
-                record_latency_diagnostic_event(
-                    &mut state,
-                    target,
-                    "latency_probe_ack",
-                    format!("Latency to {}: {} ms", short_device_id(target), rtt_ms),
-                    payload,
-                )
+                let estimated_one_way_ms = network_round_trip_ms / 2;
+
+                let (event_kind, direction, summary, should_broadcast) = match pending
+                    .as_ref()
+                    .map(|probe| &probe.role)
+                {
+                    Some(PendingLatencyProbeRole::EndpointSwitchReport {
+                        origin_device_id,
+                        origin_sequence,
+                    }) => {
+                        payload
+                            .insert("origin_device_id".to_string(), origin_device_id.to_string());
+                        payload.insert(
+                            "origin_probe_sequence".to_string(),
+                            origin_sequence.to_string(),
+                        );
+                        (
+                            "latency_endpoint_switch_ack",
+                            "endpoint_to_origin",
+                            format!(
+                                "Endpoint-side latency to {}: {} ms RTT / ~{} ms one-way",
+                                short_device_id(*origin_device_id),
+                                network_round_trip_ms,
+                                estimated_one_way_ms
+                            ),
+                            true,
+                        )
+                    }
+                    _ => (
+                        "latency_probe_ack",
+                        "origin_to_endpoint",
+                        format!(
+                            "Latency to {}: {} ms RTT / ~{} ms one-way",
+                            short_device_id(target),
+                            network_round_trip_ms,
+                            estimated_one_way_ms
+                        ),
+                        false,
+                    ),
+                };
+                payload.insert("direction".to_string(), direction.to_string());
+                payload.insert("raw_latency_ms".to_string(), raw_round_trip_ms.to_string());
+                let event = record_latency_diagnostic_event(
+                    &mut state, target, event_kind, summary, payload,
+                );
+                (event, should_broadcast, state.status.device_id)
             };
-            let _ = local_events_tx.send(event);
+            let _ = local_events_tx.send(event.clone());
+            if should_broadcast {
+                broadcast_diagnostic_event(network_manager, local_device_id, event).await;
+            }
         }
         other => {
             inject_remote_message(inject_backend, from, other).await;
@@ -3441,6 +3710,24 @@ mod tests {
             27432,
             42,
         ))
+    }
+
+    #[test]
+    fn latency_payload_subtracts_remote_processing_time() {
+        let mut payload = BTreeMap::new();
+        let (network_round_trip_ms, raw_round_trip_ms) =
+            add_latency_measurement_payload(&mut payload, 100, 100, 112, 118, 140);
+
+        assert_eq!(raw_round_trip_ms, 40);
+        assert_eq!(network_round_trip_ms, 34);
+        assert_eq!(
+            payload.get("estimated_one_way_ms").map(String::as_str),
+            Some("17")
+        );
+        assert_eq!(
+            payload.get("remote_processing_ms").map(String::as_str),
+            Some("6")
+        );
     }
 
     #[test]
