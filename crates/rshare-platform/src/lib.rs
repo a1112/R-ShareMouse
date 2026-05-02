@@ -37,6 +37,9 @@ pub mod firewall;
 // Cross-platform system integration helpers
 pub mod system;
 
+// Experimental USB forwarding host runtime
+pub mod usb_forwarding;
+
 // Re-exports
 #[cfg(windows)]
 pub use windows::*;
@@ -54,6 +57,7 @@ pub use clipboard::*;
 pub use file_drop::*;
 pub use firewall::*;
 pub use system::*;
+pub use usb_forwarding::*;
 
 /// Clipboard listener configuration
 #[derive(Debug, Clone)]

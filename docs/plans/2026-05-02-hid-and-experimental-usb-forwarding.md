@@ -9,7 +9,7 @@ Stabilize the HID loop first:
 3. The daemon routes only hardware events and ignores injected loopback.
 4. The VHF driver injects keyboard, relative mouse, button, and wheel reports on the remote side.
 
-The generic USB forwarding path is experimental and disabled by default. It should not block the HID loop.
+The generic USB forwarding path is experimental. It should not block the HID loop.
 
 ## HID closure
 
@@ -65,12 +65,21 @@ host advertises UsbDeviceAttached
   -> UsbTransferCancel, UsbDeviceReset, UsbDeviceRelease handle teardown and recovery
 ```
 
-This is still only the transport contract. A complete Windows implementation still needs:
+The daemon now binds this protocol to a real Windows host-side runtime for WinUSB-compatible devices:
 
-1. host-side USB device selection and exclusive capture
-2. transfer scheduler for control, bulk, interrupt, and isochronous transfers
-3. virtual USB bus or UDE-based device surface on the receiver
+1. local IPC and local-control snapshots can list claimable USB device interfaces
+2. `UsbDeviceClaimRequest` opens the requested device interface with `CreateFileW` and `WinUsb_Initialize`
+3. endpoint metadata is queried with `WinUsb_QueryInterfaceSettings` / `WinUsb_QueryPipe`
+4. `UsbTransfer` executes synchronous control, bulk, and interrupt transfers with WinUSB
+5. `UsbTransferComplete`, `UsbForwardingError`, `UsbFlowControl`, reset, cancel, and release are wired through the daemon
+
+This is a real host-side USB transfer loop, not only a serialization contract. A complete end-to-end generic USB implementation still needs:
+
+1. receiver-side virtual USB bus or UDE-based device surface
+2. asynchronous transfer scheduler and stricter per-transfer timeout handling
+3. isochronous transfer support
 4. per-device allowlist and explicit user confirmation
-5. backpressure, cancellation, teardown, and reconnect semantics
+5. hotplug attach/detach advertisement from the host runtime
+6. reconnect semantics across session/device loss
 
 HID keyboard/mouse sharing should continue through the dedicated HID path. Generic USB forwarding is for devices that cannot be represented safely as standard input/audio/gamepad events.

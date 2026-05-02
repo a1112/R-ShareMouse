@@ -8,6 +8,7 @@ use rshare_core::{
     LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
     LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
+    UsbDeviceDescriptor, UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
 use tokio::io::duplex;
@@ -85,6 +86,17 @@ async fn audio_control_requests_round_trip_over_json_lines() {
 }
 
 #[tokio::test]
+async fn usb_device_requests_round_trip_over_json_lines() {
+    let (mut writer, mut reader) = duplex(1024);
+    let request = DaemonRequest::ListUsbDevices;
+
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+}
+
+#[tokio::test]
 async fn daemon_responses_round_trip_device_payloads() {
     let (mut writer, mut reader) = duplex(4096);
     let response = DaemonResponse::Devices(vec![DaemonDeviceSnapshot {
@@ -94,6 +106,35 @@ async fn daemon_responses_round_trip_device_payloads() {
         addresses: vec!["192.168.1.10:27431".to_string()],
         connected: false,
         last_seen_secs: Some(4),
+    }]);
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[tokio::test]
+async fn daemon_responses_round_trip_usb_device_payloads() {
+    let (mut writer, mut reader) = duplex(4096);
+    let response = DaemonResponse::UsbDevices(vec![UsbDeviceDescriptor {
+        bus_id: r#"\\?\usb#vid_045e&pid_028e#123456"#.to_string(),
+        vendor_id: 0x045e,
+        product_id: 0x028e,
+        class_code: 0,
+        subclass_code: 0,
+        protocol_code: 0,
+        manufacturer: Some("vendor".to_string()),
+        product: Some("device".to_string()),
+        serial_number: Some("123456".to_string()),
+        usb_version_bcd: 0x0200,
+        device_version_bcd: 0x0100,
+        speed: UsbDeviceSpeed::High,
+        active_configuration: Some(1),
+        container_id: None,
+        capture_exclusive_required: true,
+        configurations: Vec::new(),
+        endpoints: Vec::new(),
     }]);
 
     write_json_line(&mut writer, &response).await.unwrap();
@@ -154,6 +195,7 @@ fn local_control_snapshot_defaults_missing_fields_to_safe_values() {
     assert!(snapshot.keyboard_devices.is_empty());
     assert!(snapshot.audio_inputs.is_empty());
     assert!(snapshot.audio_outputs.is_empty());
+    assert!(snapshot.usb_devices.is_empty());
     assert_eq!(
         snapshot.audio_capture_state.status,
         LocalAudioCaptureStatus::Idle

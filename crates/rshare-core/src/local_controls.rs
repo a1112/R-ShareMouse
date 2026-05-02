@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
-    BackendHealth, BackendKind, GamepadButtonState, GamepadState, PrivilegeState, ResolvedInputMode,
+    BackendHealth, BackendKind, GamepadButtonState, GamepadState, PrivilegeState,
+    ResolvedInputMode, UsbDeviceDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub struct LocalControlDeviceSnapshot {
     pub audio_capture_state: LocalAudioCaptureState,
     #[serde(default)]
     pub audio_stream_state: LocalAudioStreamState,
+    #[serde(default)]
+    pub usb_devices: Vec<UsbDeviceDescriptor>,
     #[serde(default)]
     pub display: LocalDisplayState,
     #[serde(default)]
@@ -60,6 +63,7 @@ impl Default for LocalControlDeviceSnapshot {
             audio_outputs: Vec::new(),
             audio_capture_state: LocalAudioCaptureState::default(),
             audio_stream_state: LocalAudioStreamState::default(),
+            usb_devices: Vec::new(),
             display: LocalDisplayState::default(),
             capture_backend: LocalBackendDiagnosticState::default(),
             inject_backend: LocalBackendDiagnosticState::default(),

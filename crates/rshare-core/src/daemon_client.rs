@@ -13,7 +13,7 @@ use tokio_tungstenite::{
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
     DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, LayoutGraph, LocalControlDeviceSnapshot,
-    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
+    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot, UsbDeviceDescriptor,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -156,6 +156,14 @@ pub async fn request_set_layout(layout: LayoutGraph) -> Result<()> {
 pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
     match send_request(DaemonRequest::LocalControls).await? {
         DaemonResponse::LocalControls(snapshot) => Ok(snapshot),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_usb_devices() -> Result<Vec<UsbDeviceDescriptor>> {
+    match send_request(DaemonRequest::ListUsbDevices).await? {
+        DaemonResponse::UsbDevices(devices) => Ok(devices),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

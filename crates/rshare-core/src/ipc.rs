@@ -9,7 +9,7 @@ use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
     DeviceId, LayoutGraph, LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
     LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
-    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState,
+    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -145,6 +145,7 @@ pub enum DaemonRequest {
     SetLayout {
         layout: LayoutGraph,
     },
+    ListUsbDevices,
     LocalControls,
     SubscribeLocalControls,
     RunLocalInputTest {
@@ -185,6 +186,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Status(ServiceStatusSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),
+    UsbDevices(Vec<UsbDeviceDescriptor>),
     Layout(LayoutGraph),
     LocalControls(LocalControlDeviceSnapshot),
     LocalControlEvent(LocalInputDiagnosticEvent),

@@ -534,6 +534,8 @@ impl DaemonState {
 const LOCAL_CONTROL_RECENT_EVENT_LIMIT: usize = 64;
 const INJECTION_LOOPBACK_WINDOW_MS: u64 = 750;
 
+type UsbHostRuntime = Arc<Mutex<rshare_platform::ExperimentalUsbHostRuntime>>;
+
 fn default_local_control_snapshot(width: u32, height: u32) -> LocalControlDeviceSnapshot {
     let mut snapshot = LocalControlDeviceSnapshot::default();
     snapshot.display = fallback_display_state(width, height);
@@ -588,6 +590,16 @@ fn refresh_platform_local_controls(snapshot: &mut LocalControlDeviceSnapshot) {
         Err(error) => {
             snapshot.audio_inputs.clear();
             snapshot.last_error = Some(format!("Core Audio input enumeration failed: {error}"));
+        }
+    }
+    #[cfg(windows)]
+    match rshare_platform::ExperimentalUsbHostRuntime::new().enumerate_devices() {
+        Ok(devices) => {
+            snapshot.usb_devices = devices;
+        }
+        Err(error) => {
+            snapshot.usb_devices.clear();
+            snapshot.last_error = Some(format!("USB enumeration failed: {error}"));
         }
     }
 }
@@ -2149,6 +2161,7 @@ async fn handle_network_message(
     network_manager: &Arc<Mutex<NetworkManager>>,
     inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
     audio_runtime: &audio_runtime::AudioRuntimeHandle,
+    usb_runtime: &UsbHostRuntime,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     from: DeviceId,
     message: Message,
@@ -2434,7 +2447,7 @@ async fn handle_network_message(
         }
         Message::UsbDeviceAttached { device } => {
             tracing::debug!(
-                "Received experimental USB device attach from {} for {} ({:04x}:{:04x}); no USB runtime is bound yet",
+                "Received experimental USB device attach from {} for {} ({:04x}:{:04x})",
                 from,
                 device.bus_id,
                 device.vendor_id,
@@ -2450,12 +2463,41 @@ async fn handle_network_message(
             );
         }
         Message::UsbTransfer { transfer } => {
-            tracing::debug!(
-                "Received experimental USB transfer {} from {} for {}; no USB runtime is bound yet",
-                transfer.transfer_id,
-                from,
-                transfer.bus_id
-            );
+            let result = {
+                let mut runtime = usb_runtime.lock().await;
+                runtime.submit_transfer(&transfer)
+            };
+            match result {
+                Ok(completion) => {
+                    let message = Message::UsbTransferComplete {
+                        transfer_id: completion.transfer_id,
+                        bus_id: completion.bus_id,
+                        status: completion.status,
+                        transfer_status: completion.transfer_status,
+                        endpoint_address: completion.endpoint_address,
+                        transfer_kind: completion.transfer_kind,
+                        actual_length: completion.actual_length,
+                        data: completion.data,
+                        iso_packets: Vec::new(),
+                    };
+                    if let Err(error) = network_manager.lock().await.send_to(&from, message).await {
+                        tracing::warn!(
+                            "Failed to send USB transfer completion to {}: {}",
+                            from,
+                            error
+                        );
+                    }
+                }
+                Err(error) => {
+                    send_usb_error(
+                        network_manager,
+                        from,
+                        Some(transfer.bus_id),
+                        error.to_string(),
+                    )
+                    .await;
+                }
+            }
         }
         Message::UsbTransferComplete {
             transfer_id,
@@ -2480,11 +2522,41 @@ async fn handle_network_message(
             );
         }
         Message::UsbDeviceClaimRequest { request } => {
+            let response = {
+                let mut runtime = usb_runtime.lock().await;
+                runtime.claim_device(request)
+            };
+            let flow = if response.accepted {
+                let runtime = usb_runtime.lock().await;
+                Some(runtime.flow_control(response.bus_id.clone(), response.session_id))
+            } else {
+                None
+            };
+            let accepted = response.accepted;
+            let bus_id = response.bus_id.clone();
+            if let Err(error) = network_manager
+                .lock()
+                .await
+                .send_to(&from, Message::UsbDeviceClaimResponse { response })
+                .await
+            {
+                tracing::warn!("Failed to send USB claim response to {}: {}", from, error);
+            }
+            if let Some(flow) = flow {
+                if let Err(error) = network_manager
+                    .lock()
+                    .await
+                    .send_to(&from, Message::UsbFlowControl { flow })
+                    .await
+                {
+                    tracing::warn!("Failed to send USB flow control to {}: {}", from, error);
+                }
+            }
             tracing::debug!(
-                "Received experimental USB claim request {} from {} for {}; no USB runtime is bound yet",
-                request.request_id,
+                "Processed experimental USB claim request from {} for {} accepted={}",
                 from,
-                request.bus_id
+                bus_id,
+                accepted
             );
         }
         Message::UsbDeviceClaimResponse { response } => {
@@ -2501,39 +2573,57 @@ async fn handle_network_message(
             bus_id,
             reason,
         } => {
-            tracing::debug!(
-                "Received experimental USB release from {} for {} session {}: {}",
-                from,
-                bus_id,
-                session_id,
-                reason
-            );
+            let result = {
+                let mut runtime = usb_runtime.lock().await;
+                runtime.release_device(session_id)
+            };
+            match result {
+                Ok(()) => tracing::debug!(
+                    "Released experimental USB session {} for {} from {}: {}",
+                    session_id,
+                    bus_id,
+                    from,
+                    reason
+                ),
+                Err(error) => {
+                    send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
+                }
+            }
         }
         Message::UsbDeviceReset {
             session_id,
             bus_id,
             reset_kind,
         } => {
-            tracing::debug!(
-                "Received experimental USB reset from {} for {} session {:?}: {:?}",
-                from,
-                bus_id,
-                session_id,
-                reset_kind
-            );
+            let result = {
+                let mut runtime = usb_runtime.lock().await;
+                runtime.reset_device(session_id, &bus_id, reset_kind)
+            };
+            if let Err(error) = result {
+                send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
+            }
         }
         Message::UsbTransferCancel {
             transfer_id,
             bus_id,
             reason,
         } => {
-            tracing::debug!(
-                "Received experimental USB transfer cancel {} from {} for {}: {}",
-                transfer_id,
-                from,
-                bus_id,
-                reason
-            );
+            let result = {
+                let mut runtime = usb_runtime.lock().await;
+                runtime.cancel_transfer(transfer_id, &bus_id)
+            };
+            match result {
+                Ok(()) => tracing::debug!(
+                    "Cancelled experimental USB transfer {} from {} for {}: {}",
+                    transfer_id,
+                    from,
+                    bus_id,
+                    reason
+                ),
+                Err(error) => {
+                    send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
+                }
+            }
         }
         Message::UsbFlowControl { flow } => {
             tracing::debug!(
@@ -2547,6 +2637,27 @@ async fn handle_network_message(
         other => {
             inject_remote_message(inject_backend, from, other).await;
         }
+    }
+}
+
+async fn send_usb_error(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    target: DeviceId,
+    bus_id: Option<String>,
+    message: String,
+) {
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(&target, Message::UsbForwardingError { bus_id, message })
+            .await
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            "Failed to send USB forwarding error to {}: {}",
+            target,
+            error
+        );
     }
 }
 
@@ -3702,6 +3813,9 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
     let (local_events_tx, _) = broadcast::channel::<LocalInputDiagnosticEvent>(256);
     let audio_runtime = audio_runtime::AudioRuntimeHandle::start()?;
+    let usb_runtime = Arc::new(Mutex::new(
+        rshare_platform::ExperimentalUsbHostRuntime::new(),
+    ));
 
     // Input capture: try Evdev on Linux for kernel-level access, fallback to RDev
     #[cfg(target_os = "linux")]
@@ -3795,6 +3909,7 @@ async fn main() -> Result<()> {
         network_manager.clone(),
         inject_backend.clone(),
         audio_runtime.clone(),
+        usb_runtime.clone(),
         local_events_tx.clone(),
         layout_path.clone(),
         shutdown_tx.clone(),
@@ -3829,6 +3944,7 @@ async fn main() -> Result<()> {
         let inject_backend = inject_backend.clone();
         let network_manager = network_manager.clone();
         let audio_runtime = audio_runtime.clone();
+        let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
         let layout_path = layout_path.clone();
         tokio::spawn(async move {
@@ -3863,6 +3979,7 @@ async fn main() -> Result<()> {
                             &network_manager,
                             &inject_backend,
                             &audio_runtime,
+                            &usb_runtime,
                             &local_events_tx,
                             from,
                             message,
@@ -3929,6 +4046,7 @@ async fn run_ipc_server(
     network_manager: Arc<Mutex<NetworkManager>>,
     inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
     audio_runtime: audio_runtime::AudioRuntimeHandle,
+    usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
@@ -3939,6 +4057,7 @@ async fn run_ipc_server(
         let network_manager = network_manager.clone();
         let inject_backend = inject_backend.clone();
         let audio_runtime = audio_runtime.clone();
+        let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
         let layout_path = layout_path.clone();
         let shutdown_tx = shutdown_tx.clone();
@@ -3950,6 +4069,7 @@ async fn run_ipc_server(
                 network_manager,
                 inject_backend,
                 audio_runtime,
+                usb_runtime,
                 local_events_tx,
                 layout_path,
                 shutdown_tx,
@@ -4026,6 +4146,7 @@ async fn handle_ipc_client(
     network_manager: Arc<Mutex<NetworkManager>>,
     inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
     audio_runtime: audio_runtime::AudioRuntimeHandle,
+    usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
@@ -4121,6 +4242,10 @@ async fn handle_ipc_client(
                 Err(err) => DaemonResponse::Error(err.to_string()),
             }
         }
+        DaemonRequest::ListUsbDevices => match usb_runtime.lock().await.enumerate_devices() {
+            Ok(devices) => DaemonResponse::UsbDevices(devices),
+            Err(error) => DaemonResponse::Error(error.to_string()),
+        },
         DaemonRequest::LocalControls => {
             let mut state = state.write().await;
             refresh_platform_local_controls(&mut state.local_controls);
