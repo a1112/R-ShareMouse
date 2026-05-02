@@ -8,7 +8,7 @@ use rshare_core::{
     LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
     LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
-    UsbDeviceDescriptor, UsbDeviceSpeed,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
 use tokio::io::duplex;
@@ -87,13 +87,21 @@ async fn audio_control_requests_round_trip_over_json_lines() {
 
 #[tokio::test]
 async fn usb_device_requests_round_trip_over_json_lines() {
-    let (mut writer, mut reader) = duplex(1024);
-    let request = DaemonRequest::ListUsbDevices;
+    let requests = [
+        DaemonRequest::ListUsbDevices,
+        DaemonRequest::RunRemoteUsbDescriptorProbe {
+            device_id: Uuid::nil(),
+            bus_id: "usb:1-2".to_string(),
+        },
+    ];
 
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
 
-    assert_eq!(decoded, request);
+        assert_eq!(decoded, request);
+    }
 }
 
 #[tokio::test]
@@ -136,6 +144,29 @@ async fn daemon_responses_round_trip_usb_device_payloads() {
         configurations: Vec::new(),
         endpoints: Vec::new(),
     }]);
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[tokio::test]
+async fn daemon_responses_round_trip_usb_descriptor_probe_payload() {
+    let (mut writer, mut reader) = duplex(4096);
+    let response = DaemonResponse::UsbDescriptorProbe(UsbDescriptorProbeResult {
+        status: UsbDescriptorProbeStatus::Success,
+        message: "descriptor read".to_string(),
+        device_id: Uuid::nil(),
+        bus_id: "usb:1-2".to_string(),
+        request_id: 1,
+        transfer_id: 2,
+        session_id: Some(Uuid::nil()),
+        elapsed_ms: Some(4),
+        actual_length: Some(18),
+        descriptor: None,
+        descriptor_bytes: vec![18, 1, 0, 2],
+    });
 
     write_json_line(&mut writer, &response).await.unwrap();
     let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
@@ -196,6 +227,7 @@ fn local_control_snapshot_defaults_missing_fields_to_safe_values() {
     assert!(snapshot.audio_inputs.is_empty());
     assert!(snapshot.audio_outputs.is_empty());
     assert!(snapshot.usb_devices.is_empty());
+    assert!(snapshot.remote_usb_devices.is_empty());
     assert_eq!(
         snapshot.audio_capture_state.status,
         LocalAudioCaptureStatus::Idle

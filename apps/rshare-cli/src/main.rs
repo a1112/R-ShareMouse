@@ -9,7 +9,7 @@ mod commands;
 mod config;
 mod output;
 
-use commands::{config_cmd, devices, discover, start, stop};
+use commands::{config_cmd, devices, discover, start, stop, usb};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -114,6 +114,12 @@ enum Commands {
         #[arg(short, long)]
         continuous: bool,
     },
+
+    /// Experimental USB forwarding tools
+    Usb {
+        #[command(subcommand)]
+        usb_cmd: usb::UsbCommands,
+    },
 }
 
 #[tokio::main]
@@ -172,6 +178,9 @@ async fn main() -> Result<()> {
             } else {
                 discover::run_discover_scan(std::time::Duration::from_secs(duration)).await?;
             }
+        }
+        Commands::Usb { usb_cmd } => {
+            usb::execute(usb_cmd).await?;
         }
     }
 

@@ -73,6 +73,19 @@ The daemon now binds this protocol to a real Windows host-side runtime for WinUS
 4. `UsbTransfer` executes synchronous control, bulk, and interrupt transfers with WinUSB
 5. `UsbTransferComplete`, `UsbForwardingError`, `UsbFlowControl`, reset, cancel, and release are wired through the daemon
 
+The first transfer-level two-machine probe is also wired:
+
+```text
+peer connects
+  -> host advertises local WinUSB-compatible devices with UsbDeviceAttached
+  -> `rshare usb list` shows remote devices
+  -> `rshare usb probe <device_id> <bus_id>` sends UsbDeviceClaimRequest
+  -> host claims the device and executes a GET_DESCRIPTOR(Device) control transfer
+  -> receiver reports parsed VID/PID/class plus raw descriptor bytes
+```
+
+This probe is intentionally narrow. It validates real USB control traffic over the R-ShareMouse network path without pretending that a full virtual USB bus exists yet.
+
 This is a real host-side USB transfer loop, not only a serialization contract. A complete end-to-end generic USB implementation still needs:
 
 1. receiver-side virtual USB bus or UDE-based device surface

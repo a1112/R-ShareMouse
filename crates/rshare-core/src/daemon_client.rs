@@ -13,7 +13,8 @@ use tokio_tungstenite::{
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
     DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, LayoutGraph, LocalControlDeviceSnapshot,
-    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot, UsbDeviceDescriptor,
+    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot, UsbDescriptorProbeResult,
+    UsbDeviceDescriptor,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -182,6 +183,17 @@ pub async fn request_remote_latency_test(
 ) -> Result<LocalInputTestResult> {
     match send_request(DaemonRequest::RunRemoteLatencyTest { device_id }).await? {
         DaemonResponse::LocalInputTest(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_remote_usb_descriptor_probe(
+    device_id: crate::DeviceId,
+    bus_id: String,
+) -> Result<UsbDescriptorProbeResult> {
+    match send_request(DaemonRequest::RunRemoteUsbDescriptorProbe { device_id, bus_id }).await? {
+        DaemonResponse::UsbDescriptorProbe(result) => Ok(result),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

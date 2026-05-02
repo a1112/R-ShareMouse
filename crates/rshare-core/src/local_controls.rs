@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
-    BackendHealth, BackendKind, GamepadButtonState, GamepadState, PrivilegeState,
+    BackendHealth, BackendKind, DeviceId, GamepadButtonState, GamepadState, PrivilegeState,
     ResolvedInputMode, UsbDeviceDescriptor,
 };
 
@@ -32,6 +32,8 @@ pub struct LocalControlDeviceSnapshot {
     pub audio_stream_state: LocalAudioStreamState,
     #[serde(default)]
     pub usb_devices: Vec<UsbDeviceDescriptor>,
+    #[serde(default)]
+    pub remote_usb_devices: Vec<RemoteUsbDeviceSnapshot>,
     #[serde(default)]
     pub display: LocalDisplayState,
     #[serde(default)]
@@ -64,6 +66,7 @@ impl Default for LocalControlDeviceSnapshot {
             audio_capture_state: LocalAudioCaptureState::default(),
             audio_stream_state: LocalAudioStreamState::default(),
             usb_devices: Vec::new(),
+            remote_usb_devices: Vec::new(),
             display: LocalDisplayState::default(),
             capture_backend: LocalBackendDiagnosticState::default(),
             inject_backend: LocalBackendDiagnosticState::default(),
@@ -74,6 +77,16 @@ impl Default for LocalControlDeviceSnapshot {
             last_error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteUsbDeviceSnapshot {
+    pub device_id: DeviceId,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub connected: bool,
+    pub device: UsbDeviceDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +634,7 @@ pub enum LocalInputDeviceKind {
     Keyboard,
     Mouse,
     Gamepad,
+    Usb,
     Display,
     Audio,
     Backend,

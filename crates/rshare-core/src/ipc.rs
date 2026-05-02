@@ -130,6 +130,36 @@ pub struct DaemonDeviceSnapshot {
     pub last_seen_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UsbDescriptorProbeStatus {
+    Success,
+    DeviceUnavailable,
+    ClaimRejected,
+    TransferFailed,
+    Timeout,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsbDescriptorProbeResult {
+    pub status: UsbDescriptorProbeStatus,
+    pub message: String,
+    pub device_id: DeviceId,
+    pub bus_id: String,
+    pub request_id: u64,
+    pub transfer_id: u64,
+    #[serde(default)]
+    pub session_id: Option<DeviceId>,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub actual_length: Option<u32>,
+    #[serde(default)]
+    pub descriptor: Option<UsbDeviceDescriptor>,
+    #[serde(default)]
+    pub descriptor_bytes: Vec<u8>,
+}
+
 /// Client request over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
@@ -153,6 +183,10 @@ pub enum DaemonRequest {
     },
     RunRemoteLatencyTest {
         device_id: DeviceId,
+    },
+    RunRemoteUsbDescriptorProbe {
+        device_id: DeviceId,
+        bus_id: String,
     },
     SetAudioDefaultOutput {
         endpoint_id: String,
@@ -192,6 +226,7 @@ pub enum DaemonResponse {
     LocalControlEvent(LocalInputDiagnosticEvent),
     LocalInputTest(LocalInputTestResult),
     LocalAudioTest(LocalAudioTestResult),
+    UsbDescriptorProbe(UsbDescriptorProbeResult),
     Ack,
     Error(String),
 }

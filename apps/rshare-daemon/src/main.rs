@@ -14,8 +14,11 @@ use rshare_core::{
     LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message, ResolvedInputMode,
-    ScreenInfo, ServiceStatusSnapshot,
+    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
+    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -41,7 +44,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -71,6 +74,25 @@ enum PendingLatencyProbeRole {
     },
 }
 
+struct PendingUsbClaim {
+    target: DeviceId,
+    bus_id: String,
+    request_id: u64,
+    transfer_id: u64,
+    started_at_ms: u64,
+    result_tx: oneshot::Sender<UsbDescriptorProbeResult>,
+}
+
+struct PendingUsbTransfer {
+    target: DeviceId,
+    bus_id: String,
+    request_id: u64,
+    transfer_id: u64,
+    session_id: DeviceId,
+    started_at_ms: u64,
+    result_tx: oneshot::Sender<UsbDescriptorProbeResult>,
+}
+
 struct DaemonState {
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
@@ -85,6 +107,8 @@ struct DaemonState {
     pending_mouse_loopback_until_ms: u64,
     pending_mouse_loopback_events: u8,
     pending_latency_probes: HashMap<u64, PendingLatencyProbe>,
+    pending_usb_claims: HashMap<u64, PendingUsbClaim>,
+    pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
 }
 
 impl DaemonState {
@@ -117,6 +141,8 @@ impl DaemonState {
             pending_mouse_loopback_until_ms: 0,
             pending_mouse_loopback_events: 0,
             pending_latency_probes: HashMap::new(),
+            pending_usb_claims: HashMap::new(),
+            pending_usb_transfers: HashMap::new(),
         }
     }
 
@@ -148,6 +174,9 @@ impl DaemonState {
 
     fn remove_device(&mut self, id: &DeviceId) {
         self.devices.remove(id);
+        self.local_controls
+            .remote_usb_devices
+            .retain(|device| device.device_id != *id);
     }
 
     fn mark_connected(&mut self, id: &DeviceId, connected: bool) {
@@ -166,6 +195,11 @@ impl DaemonState {
                     last_seen_at: Instant::now(),
                 },
             );
+        }
+        for device in &mut self.local_controls.remote_usb_devices {
+            if device.device_id == *id {
+                device.connected = connected;
+            }
         }
     }
 
@@ -1238,6 +1272,173 @@ fn record_audio_diagnostic_event(
     event
 }
 
+fn record_usb_diagnostic_event(
+    state: &mut DaemonState,
+    device_id: Option<DeviceId>,
+    event_kind: impl Into<String>,
+    summary: impl Into<String>,
+    mut payload: BTreeMap<String, String>,
+) -> LocalInputDiagnosticEvent {
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+    if let Some(device_id) = device_id {
+        payload
+            .entry("remote_device_id".to_string())
+            .or_insert_with(|| device_id.to_string());
+    }
+
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms: timestamp_ms_now(),
+        device_kind: LocalInputDeviceKind::Usb,
+        event_kind: event_kind.into(),
+        summary: summary.into(),
+        device_id: device_id.map(|value| value.to_string()),
+        device_instance_id: None,
+        capture_path: Some("usb-forwarding".to_string()),
+        source: LocalInputEventSource::System,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
+}
+
+fn upsert_remote_usb_device(
+    state: &mut DaemonState,
+    from: DeviceId,
+    device: UsbDeviceDescriptor,
+) -> LocalInputDiagnosticEvent {
+    let device_name = state.devices.get(&from).map(|device| device.name.clone());
+    let connected = state
+        .devices
+        .get(&from)
+        .map(|device| device.connected)
+        .unwrap_or(true);
+    if let Some(existing) = state
+        .local_controls
+        .remote_usb_devices
+        .iter_mut()
+        .find(|entry| entry.device_id == from && entry.device.bus_id == device.bus_id)
+    {
+        existing.device_name = device_name.clone();
+        existing.connected = connected;
+        existing.device = device.clone();
+    } else {
+        state
+            .local_controls
+            .remote_usb_devices
+            .push(RemoteUsbDeviceSnapshot {
+                device_id: from,
+                device_name: device_name.clone(),
+                connected,
+                device: device.clone(),
+            });
+    }
+    state
+        .local_controls
+        .remote_usb_devices
+        .sort_by(|left, right| {
+            left.device_id
+                .cmp(&right.device_id)
+                .then(left.device.bus_id.cmp(&right.device.bus_id))
+        });
+
+    let mut payload = BTreeMap::new();
+    payload.insert("bus_id".to_string(), device.bus_id.clone());
+    payload.insert("vendor_id".to_string(), format!("{:04x}", device.vendor_id));
+    payload.insert(
+        "product_id".to_string(),
+        format!("{:04x}", device.product_id),
+    );
+    record_usb_diagnostic_event(
+        state,
+        Some(from),
+        "remote_usb_attached",
+        format!(
+            "Remote USB device advertised by {}: {:04x}:{:04x}",
+            short_device_id(from),
+            device.vendor_id,
+            device.product_id
+        ),
+        payload,
+    )
+}
+
+fn remove_remote_usb_device(
+    state: &mut DaemonState,
+    from: DeviceId,
+    bus_id: &str,
+    reason: &str,
+) -> LocalInputDiagnosticEvent {
+    state
+        .local_controls
+        .remote_usb_devices
+        .retain(|device| !(device.device_id == from && device.device.bus_id == bus_id));
+    let mut payload = BTreeMap::new();
+    payload.insert("bus_id".to_string(), bus_id.to_string());
+    payload.insert("reason".to_string(), reason.to_string());
+    record_usb_diagnostic_event(
+        state,
+        Some(from),
+        "remote_usb_detached",
+        format!(
+            "Remote USB device detached from {}: {reason}",
+            short_device_id(from)
+        ),
+        payload,
+    )
+}
+
+fn fail_pending_usb_for_device(state: &mut DaemonState, target: DeviceId, reason: &str) {
+    let claim_keys: Vec<u64> = state
+        .pending_usb_claims
+        .iter()
+        .filter(|(_, pending)| pending.target == target)
+        .map(|(key, _)| *key)
+        .collect();
+    for key in claim_keys {
+        if let Some(pending) = state.pending_usb_claims.remove(&key) {
+            let result = usb_probe_result(
+                UsbDescriptorProbeStatus::DeviceUnavailable,
+                reason.to_string(),
+                pending.target,
+                pending.bus_id,
+                pending.request_id,
+                pending.transfer_id,
+                None,
+                pending.started_at_ms,
+                Vec::new(),
+                None,
+            );
+            let _ = pending.result_tx.send(result);
+        }
+    }
+
+    let transfer_keys: Vec<u64> = state
+        .pending_usb_transfers
+        .iter()
+        .filter(|(_, pending)| pending.target == target)
+        .map(|(key, _)| *key)
+        .collect();
+    for key in transfer_keys {
+        if let Some(pending) = state.pending_usb_transfers.remove(&key) {
+            let result = usb_probe_result(
+                UsbDescriptorProbeStatus::DeviceUnavailable,
+                reason.to_string(),
+                pending.target,
+                pending.bus_id,
+                pending.request_id,
+                pending.transfer_id,
+                Some(pending.session_id),
+                pending.started_at_ms,
+                Vec::new(),
+                None,
+            );
+            let _ = pending.result_tx.send(result);
+        }
+    }
+}
+
 fn audio_source_label(source: LocalAudioCaptureSource) -> &'static str {
     match source {
         LocalAudioCaptureSource::Microphone => "Microphone",
@@ -2052,6 +2253,215 @@ async fn run_remote_latency_test(
     }
 }
 
+async fn run_remote_usb_descriptor_probe(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    device_id: DeviceId,
+    bus_id: String,
+) -> UsbDescriptorProbeResult {
+    let started_at_ms = timestamp_ms_now();
+    let (request_id, transfer_id, result_rx, event) = {
+        let mut state = state.write().await;
+        if !is_device_connected(&state, device_id) {
+            return usb_probe_result(
+                UsbDescriptorProbeStatus::DeviceUnavailable,
+                format!("Device {} is not connected.", short_device_id(device_id)),
+                device_id,
+                bus_id,
+                0,
+                0,
+                None,
+                started_at_ms,
+                Vec::new(),
+                None,
+            );
+        }
+
+        let request_id = state.local_controls.sequence.saturating_add(1);
+        let transfer_id = request_id.saturating_add(1);
+        state.local_controls.sequence = transfer_id;
+        let (result_tx, result_rx) = oneshot::channel();
+        state.pending_usb_claims.insert(
+            request_id,
+            PendingUsbClaim {
+                target: device_id,
+                bus_id: bus_id.clone(),
+                request_id,
+                transfer_id,
+                started_at_ms,
+                result_tx,
+            },
+        );
+
+        let mut payload = BTreeMap::new();
+        payload.insert("request_id".to_string(), request_id.to_string());
+        payload.insert("transfer_id".to_string(), transfer_id.to_string());
+        payload.insert("bus_id".to_string(), bus_id.clone());
+        let event = record_usb_diagnostic_event(
+            &mut state,
+            Some(device_id),
+            "usb_descriptor_probe_sent",
+            format!(
+                "USB descriptor probe sent to {}",
+                short_device_id(device_id)
+            ),
+            payload,
+        );
+        (request_id, transfer_id, result_rx, event)
+    };
+    let _ = local_events_tx.send(event);
+
+    let claim_request = UsbDeviceClaimRequest {
+        request_id,
+        bus_id: bus_id.clone(),
+        exclusive: false,
+        configuration_value: None,
+        interface_numbers: Vec::new(),
+    };
+    let send_result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(
+                &device_id,
+                Message::UsbDeviceClaimRequest {
+                    request: claim_request,
+                },
+            )
+            .await
+    };
+    if let Err(error) = send_result {
+        state.write().await.pending_usb_claims.remove(&request_id);
+        return usb_probe_result(
+            UsbDescriptorProbeStatus::Failed,
+            error.to_string(),
+            device_id,
+            bus_id,
+            request_id,
+            transfer_id,
+            None,
+            started_at_ms,
+            Vec::new(),
+            None,
+        );
+    }
+
+    match tokio::time::timeout(Duration::from_secs(5), result_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => usb_probe_result(
+            UsbDescriptorProbeStatus::Failed,
+            "USB descriptor probe was cancelled.".to_string(),
+            device_id,
+            bus_id,
+            request_id,
+            transfer_id,
+            None,
+            started_at_ms,
+            Vec::new(),
+            None,
+        ),
+        Err(_) => {
+            let mut state = state.write().await;
+            state.pending_usb_claims.remove(&request_id);
+            state.pending_usb_transfers.remove(&transfer_id);
+            usb_probe_result(
+                UsbDescriptorProbeStatus::Timeout,
+                "USB descriptor probe timed out.".to_string(),
+                device_id,
+                bus_id,
+                request_id,
+                transfer_id,
+                None,
+                started_at_ms,
+                Vec::new(),
+                None,
+            )
+        }
+    }
+}
+
+fn usb_device_descriptor_probe_transfer(
+    transfer_id: u64,
+    bus_id: String,
+    session_id: DeviceId,
+) -> UsbTransferPayload {
+    UsbTransferPayload {
+        transfer_id,
+        bus_id,
+        session_id: Some(session_id),
+        endpoint_address: 0,
+        transfer_kind: UsbTransferKind::Control,
+        direction: UsbTransferDirection::In,
+        setup_packet: None,
+        control_setup: Some(UsbControlSetupPacket {
+            request_type: 0x80,
+            request: 0x06,
+            value: 0x0100,
+            index: 0,
+            length: 18,
+        }),
+        stream_id: None,
+        expected_length: Some(18),
+        flags: Vec::new(),
+        iso_packets: Vec::new(),
+        data: Vec::new(),
+        timeout_ms: 1_000,
+    }
+}
+
+fn usb_probe_result(
+    status: UsbDescriptorProbeStatus,
+    message: String,
+    device_id: DeviceId,
+    bus_id: String,
+    request_id: u64,
+    transfer_id: u64,
+    session_id: Option<DeviceId>,
+    started_at_ms: u64,
+    descriptor_bytes: Vec<u8>,
+    actual_length: Option<u32>,
+) -> UsbDescriptorProbeResult {
+    let descriptor = usb_device_descriptor_from_bytes(&bus_id, &descriptor_bytes);
+    UsbDescriptorProbeResult {
+        status,
+        message,
+        device_id,
+        bus_id,
+        request_id,
+        transfer_id,
+        session_id,
+        elapsed_ms: Some(timestamp_ms_now().saturating_sub(started_at_ms)),
+        actual_length,
+        descriptor,
+        descriptor_bytes,
+    }
+}
+
+fn usb_device_descriptor_from_bytes(bus_id: &str, bytes: &[u8]) -> Option<UsbDeviceDescriptor> {
+    if bytes.len() < 18 || bytes[0] < 18 || bytes[1] != 0x01 {
+        return None;
+    }
+    Some(UsbDeviceDescriptor {
+        bus_id: bus_id.to_string(),
+        vendor_id: u16::from_le_bytes([bytes[8], bytes[9]]),
+        product_id: u16::from_le_bytes([bytes[10], bytes[11]]),
+        class_code: bytes[4],
+        subclass_code: bytes[5],
+        protocol_code: bytes[6],
+        manufacturer: None,
+        product: None,
+        serial_number: None,
+        usb_version_bcd: u16::from_le_bytes([bytes[2], bytes[3]]),
+        device_version_bcd: u16::from_le_bytes([bytes[12], bytes[13]]),
+        speed: UsbDeviceSpeed::Unknown,
+        active_configuration: None,
+        container_id: None,
+        capture_exclusive_required: true,
+        configurations: Vec::new(),
+        endpoints: Vec::new(),
+    })
+}
+
 async fn start_endpoint_switch_latency_probe(
     network_manager: &Arc<Mutex<NetworkManager>>,
     state: &Arc<RwLock<DaemonState>>,
@@ -2446,21 +2856,18 @@ async fn handle_network_message(
             let _ = local_events_tx.send(event);
         }
         Message::UsbDeviceAttached { device } => {
-            tracing::debug!(
-                "Received experimental USB device attach from {} for {} ({:04x}:{:04x})",
-                from,
-                device.bus_id,
-                device.vendor_id,
-                device.product_id
-            );
+            let event = {
+                let mut state = state.write().await;
+                upsert_remote_usb_device(&mut state, from, device)
+            };
+            let _ = local_events_tx.send(event);
         }
         Message::UsbDeviceDetached { bus_id, reason } => {
-            tracing::debug!(
-                "Received experimental USB device detach from {} for {}: {}",
-                from,
-                bus_id,
-                reason
-            );
+            let event = {
+                let mut state = state.write().await;
+                remove_remote_usb_device(&mut state, from, &bus_id, &reason)
+            };
+            let _ = local_events_tx.send(event);
         }
         Message::UsbTransfer { transfer } => {
             let result = {
@@ -2503,23 +2910,63 @@ async fn handle_network_message(
             transfer_id,
             bus_id,
             status,
+            transfer_status,
+            actual_length,
+            data,
             ..
         } => {
-            tracing::debug!(
-                "Received experimental USB transfer completion {} from {} for {} with status {}",
-                transfer_id,
-                from,
-                bus_id,
-                status
-            );
+            let pending = {
+                let mut state = state.write().await;
+                state.pending_usb_transfers.remove(&transfer_id)
+            };
+            if let Some(pending) = pending {
+                if pending.target == from {
+                    let probe_status =
+                        if status == 0 && matches!(transfer_status, UsbTransferStatus::Completed) {
+                            UsbDescriptorProbeStatus::Success
+                        } else {
+                            UsbDescriptorProbeStatus::TransferFailed
+                        };
+                    let result = usb_probe_result(
+                        probe_status,
+                        format!(
+                            "USB descriptor probe completed with status {} ({:?}).",
+                            status, transfer_status
+                        ),
+                        from,
+                        bus_id.clone(),
+                        pending.request_id,
+                        pending.transfer_id,
+                        Some(pending.session_id),
+                        pending.started_at_ms,
+                        data,
+                        actual_length,
+                    );
+                    let _ = pending.result_tx.send(result);
+                    let release = Message::UsbDeviceRelease {
+                        session_id: pending.session_id,
+                        bus_id,
+                        reason: "descriptor_probe_complete".to_string(),
+                    };
+                    if let Err(error) = network_manager.lock().await.send_to(&from, release).await {
+                        tracing::debug!(
+                            "Failed to release USB descriptor probe session: {}",
+                            error
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "Received experimental USB transfer completion {} from {} for {} with status {}",
+                    transfer_id,
+                    from,
+                    bus_id,
+                    status
+                );
+            }
         }
         Message::UsbForwardingError { bus_id, message } => {
-            tracing::debug!(
-                "Received experimental USB forwarding error from {} for {:?}: {}",
-                from,
-                bus_id,
-                message
-            );
+            complete_pending_usb_error(state, local_events_tx, from, bus_id, message).await;
         }
         Message::UsbDeviceClaimRequest { request } => {
             let response = {
@@ -2560,13 +3007,105 @@ async fn handle_network_message(
             );
         }
         Message::UsbDeviceClaimResponse { response } => {
-            tracing::debug!(
-                "Received experimental USB claim response {} from {} for {} accepted={}",
-                response.request_id,
-                from,
-                response.bus_id,
-                response.accepted
-            );
+            let action = {
+                let mut state = state.write().await;
+                let pending = state.pending_usb_claims.remove(&response.request_id);
+                match pending {
+                    Some(pending) if pending.target == from => {
+                        if response.accepted {
+                            match response.session_id {
+                                Some(session_id) => {
+                                    let transfer = usb_device_descriptor_probe_transfer(
+                                        pending.transfer_id,
+                                        response.bus_id.clone(),
+                                        session_id,
+                                    );
+                                    state.pending_usb_transfers.insert(
+                                        pending.transfer_id,
+                                        PendingUsbTransfer {
+                                            target: pending.target,
+                                            bus_id: pending.bus_id,
+                                            request_id: pending.request_id,
+                                            transfer_id: pending.transfer_id,
+                                            session_id,
+                                            started_at_ms: pending.started_at_ms,
+                                            result_tx: pending.result_tx,
+                                        },
+                                    );
+                                    Some((pending.target, transfer, pending.transfer_id))
+                                }
+                                None => {
+                                    let result = usb_probe_result(
+                                        UsbDescriptorProbeStatus::ClaimRejected,
+                                        "USB claim accepted without a session id.".to_string(),
+                                        pending.target,
+                                        pending.bus_id,
+                                        pending.request_id,
+                                        pending.transfer_id,
+                                        None,
+                                        pending.started_at_ms,
+                                        Vec::new(),
+                                        None,
+                                    );
+                                    let _ = pending.result_tx.send(result);
+                                    None
+                                }
+                            }
+                        } else {
+                            let result = usb_probe_result(
+                                UsbDescriptorProbeStatus::ClaimRejected,
+                                response.message.unwrap_or_else(|| {
+                                    "USB device claim was rejected.".to_string()
+                                }),
+                                pending.target,
+                                pending.bus_id,
+                                pending.request_id,
+                                pending.transfer_id,
+                                None,
+                                pending.started_at_ms,
+                                Vec::new(),
+                                None,
+                            );
+                            let _ = pending.result_tx.send(result);
+                            None
+                        }
+                    }
+                    Some(pending) => {
+                        state.pending_usb_claims.insert(pending.request_id, pending);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some((target, transfer, transfer_id)) = action {
+                let send_result = {
+                    let mut manager = network_manager.lock().await;
+                    manager
+                        .send_to(&target, Message::UsbTransfer { transfer })
+                        .await
+                };
+                if let Err(error) = send_result {
+                    let pending = {
+                        let mut state = state.write().await;
+                        state.pending_usb_transfers.remove(&transfer_id)
+                    };
+                    if let Some(pending) = pending {
+                        let result = usb_probe_result(
+                            UsbDescriptorProbeStatus::Failed,
+                            error.to_string(),
+                            target,
+                            pending.bus_id,
+                            pending.request_id,
+                            pending.transfer_id,
+                            Some(pending.session_id),
+                            pending.started_at_ms,
+                            Vec::new(),
+                            None,
+                        );
+                        let _ = pending.result_tx.send(result);
+                    }
+                }
+            }
         }
         Message::UsbDeviceRelease {
             session_id,
@@ -2658,6 +3197,121 @@ async fn send_usb_error(
             target,
             error
         );
+    }
+}
+
+async fn advertise_usb_devices_to(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    usb_runtime: &UsbHostRuntime,
+    target: DeviceId,
+) {
+    let devices = {
+        let runtime = usb_runtime.lock().await;
+        runtime.enumerate_devices()
+    };
+    let devices = match devices {
+        Ok(devices) => devices,
+        Err(error) => {
+            tracing::debug!("USB advertisement enumeration failed: {}", error);
+            return;
+        }
+    };
+
+    for device in devices {
+        let result = {
+            let mut manager = network_manager.lock().await;
+            manager
+                .send_to(&target, Message::UsbDeviceAttached { device })
+                .await
+        };
+        if let Err(error) = result {
+            tracing::debug!("Failed to advertise USB device to {}: {}", target, error);
+            break;
+        }
+    }
+}
+
+async fn complete_pending_usb_error(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    from: DeviceId,
+    bus_id: Option<String>,
+    message: String,
+) {
+    let (claim, transfer, event) = {
+        let mut state = state.write().await;
+        let claim_key = state
+            .pending_usb_claims
+            .iter()
+            .find(|(_, pending)| {
+                pending.target == from
+                    && bus_id
+                        .as_deref()
+                        .map(|bus_id| pending.bus_id == bus_id)
+                        .unwrap_or(true)
+            })
+            .map(|(key, _)| *key);
+        let transfer_key = state
+            .pending_usb_transfers
+            .iter()
+            .find(|(_, pending)| {
+                pending.target == from
+                    && bus_id
+                        .as_deref()
+                        .map(|bus_id| pending.bus_id == bus_id)
+                        .unwrap_or(true)
+            })
+            .map(|(key, _)| *key);
+        let claim = claim_key.and_then(|key| state.pending_usb_claims.remove(&key));
+        let transfer = transfer_key.and_then(|key| state.pending_usb_transfers.remove(&key));
+        let mut payload = BTreeMap::new();
+        if let Some(bus_id) = &bus_id {
+            payload.insert("bus_id".to_string(), bus_id.clone());
+        }
+        payload.insert("error".to_string(), message.clone());
+        let event = record_usb_diagnostic_event(
+            &mut state,
+            Some(from),
+            "usb_forwarding_error",
+            format!(
+                "USB forwarding error from {}: {message}",
+                short_device_id(from)
+            ),
+            payload,
+        );
+        (claim, transfer, event)
+    };
+    let _ = local_events_tx.send(event);
+
+    if let Some(pending) = claim {
+        let result = usb_probe_result(
+            UsbDescriptorProbeStatus::ClaimRejected,
+            message.clone(),
+            pending.target,
+            pending.bus_id,
+            pending.request_id,
+            pending.transfer_id,
+            None,
+            pending.started_at_ms,
+            Vec::new(),
+            None,
+        );
+        let _ = pending.result_tx.send(result);
+    }
+    if let Some(pending) = transfer {
+        let result = usb_probe_result(
+            UsbDescriptorProbeStatus::TransferFailed,
+            message,
+            pending.target,
+            pending.bus_id,
+            pending.request_id,
+            pending.transfer_id,
+            Some(pending.session_id),
+            pending.started_at_ms,
+            Vec::new(),
+            None,
+        );
+        let _ = pending.result_tx.send(result);
     }
 }
 
@@ -3963,13 +4617,21 @@ async fn main() -> Result<()> {
                         }
                     }
                     NetworkEvent::DeviceConnected(id) => {
-                        let mut state = state.write().await;
-                        state.mark_connected(&id, true)
+                        {
+                            let mut state = state.write().await;
+                            state.mark_connected(&id, true);
+                        }
+                        advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                     }
                     NetworkEvent::DeviceDisconnected(id) => {
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
                         state.session.on_target_disconnect(id);
+                        fail_pending_usb_for_device(
+                            &mut state,
+                            id,
+                            "USB probe target disconnected.",
+                        );
                         state.remove_device(&id);
                         sync_local_shortcut_suppression(&state);
                     }
@@ -3990,6 +4652,11 @@ async fn main() -> Result<()> {
                         tracing::warn!("Connection error to {}: {}", device_id, error);
                         let mut state = state.write().await;
                         state.session.on_target_disconnect(device_id);
+                        fail_pending_usb_for_device(
+                            &mut state,
+                            device_id,
+                            "USB probe target connection failed.",
+                        );
                         state.mark_connected(&device_id, false);
                         sync_local_shortcut_suppression(&state);
                     }
@@ -4262,6 +4929,17 @@ async fn handle_ipc_client(
                     .await;
             DaemonResponse::LocalInputTest(result)
         }
+        DaemonRequest::RunRemoteUsbDescriptorProbe { device_id, bus_id } => {
+            let result = run_remote_usb_descriptor_probe(
+                &network_manager,
+                &state,
+                &local_events_tx,
+                device_id,
+                bus_id,
+            )
+            .await;
+            DaemonResponse::UsbDescriptorProbe(result)
+        }
         DaemonRequest::SetAudioDefaultOutput { endpoint_id } => {
             set_default_audio_output(&state, &local_events_tx, endpoint_id).await
         }
@@ -4480,6 +5158,23 @@ mod tests {
             payload.get("remote_processing_ms").map(String::as_str),
             Some("6")
         );
+    }
+
+    #[test]
+    fn usb_descriptor_probe_parses_device_descriptor() {
+        let bytes = [
+            18, 1, 0x10, 0x02, 0xff, 0x01, 0x02, 64, 0x5e, 0x04, 0x8e, 0x02, 0x00, 0x01, 1, 2, 3, 1,
+        ];
+        let descriptor = usb_device_descriptor_from_bytes("usb:1-2", &bytes).unwrap();
+
+        assert_eq!(descriptor.bus_id, "usb:1-2");
+        assert_eq!(descriptor.vendor_id, 0x045e);
+        assert_eq!(descriptor.product_id, 0x028e);
+        assert_eq!(descriptor.class_code, 0xff);
+        assert_eq!(descriptor.subclass_code, 0x01);
+        assert_eq!(descriptor.protocol_code, 0x02);
+        assert_eq!(descriptor.usb_version_bcd, 0x0210);
+        assert_eq!(descriptor.device_version_bcd, 0x0100);
     }
 
     #[test]

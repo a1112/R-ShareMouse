@@ -43,7 +43,7 @@ pub use clipboard::ClipboardContent;
 pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
     read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
-    ServiceStatusSnapshot,
+    ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
 
 // Re-exports from local control diagnostics
@@ -55,6 +55,7 @@ pub use local_controls::{
     LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
     LocalInputTestStatus, LocalKeyboardState, LocalMouseState, LocalVirtualGamepadState,
+    RemoteUsbDeviceSnapshot,
 };
 
 // Re-exports from input_mode
