@@ -2479,6 +2479,71 @@ async fn handle_network_message(
                 message
             );
         }
+        Message::UsbDeviceClaimRequest { request } => {
+            tracing::debug!(
+                "Received experimental USB claim request {} from {} for {}; no USB runtime is bound yet",
+                request.request_id,
+                from,
+                request.bus_id
+            );
+        }
+        Message::UsbDeviceClaimResponse { response } => {
+            tracing::debug!(
+                "Received experimental USB claim response {} from {} for {} accepted={}",
+                response.request_id,
+                from,
+                response.bus_id,
+                response.accepted
+            );
+        }
+        Message::UsbDeviceRelease {
+            session_id,
+            bus_id,
+            reason,
+        } => {
+            tracing::debug!(
+                "Received experimental USB release from {} for {} session {}: {}",
+                from,
+                bus_id,
+                session_id,
+                reason
+            );
+        }
+        Message::UsbDeviceReset {
+            session_id,
+            bus_id,
+            reset_kind,
+        } => {
+            tracing::debug!(
+                "Received experimental USB reset from {} for {} session {:?}: {:?}",
+                from,
+                bus_id,
+                session_id,
+                reset_kind
+            );
+        }
+        Message::UsbTransferCancel {
+            transfer_id,
+            bus_id,
+            reason,
+        } => {
+            tracing::debug!(
+                "Received experimental USB transfer cancel {} from {} for {}: {}",
+                transfer_id,
+                from,
+                bus_id,
+                reason
+            );
+        }
+        Message::UsbFlowControl { flow } => {
+            tracing::debug!(
+                "Received experimental USB flow control from {} for {}: {} bytes, {} transfers",
+                from,
+                flow.bus_id,
+                flow.available_window_bytes,
+                flow.max_in_flight_transfers
+            );
+        }
         other => {
             inject_remote_message(inject_backend, from, other).await;
         }

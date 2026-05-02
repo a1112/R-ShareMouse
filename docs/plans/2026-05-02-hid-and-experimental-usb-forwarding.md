@@ -39,13 +39,33 @@ Manual validation should verify:
 The protocol now has capability and message types for USB-over-IP style forwarding:
 
 - `supports_usb_forwarding_experimental`
+- `usb_forwarding`
 - `UsbDeviceAttached`
 - `UsbDeviceDetached`
+- `UsbDeviceClaimRequest`
+- `UsbDeviceClaimResponse`
+- `UsbDeviceRelease`
+- `UsbDeviceReset`
 - `UsbTransfer`
 - `UsbTransferComplete`
+- `UsbTransferCancel`
+- `UsbFlowControl`
 - `UsbForwardingError`
 
-This is only the transport contract. A complete Windows implementation still needs:
+The metadata model can describe USB speed, active configuration, configurations, interfaces, alternate settings, endpoints, structured control setup packets, isochronous packet descriptors, transfer flags, typed completion status, and receiver-side flow control windows.
+
+The intended experimental control flow is:
+
+```text
+host advertises UsbDeviceAttached
+  -> receiver sends UsbDeviceClaimRequest
+  -> host replies UsbDeviceClaimResponse with session_id
+  -> receiver and host exchange UsbFlowControl
+  -> UsbTransfer / UsbTransferComplete carry endpoint traffic
+  -> UsbTransferCancel, UsbDeviceReset, UsbDeviceRelease handle teardown and recovery
+```
+
+This is still only the transport contract. A complete Windows implementation still needs:
 
 1. host-side USB device selection and exclusive capture
 2. transfer scheduler for control, bulk, interrupt, and isochronous transfers

@@ -122,12 +122,18 @@ impl MessageCodec {
             Message::Ack { .. } => 41,
             Message::Error { .. } => 42,
 
-            // Experimental USB forwarding (50-59)
+            // Experimental USB forwarding (50-69)
             Message::UsbDeviceAttached { .. } => 50,
             Message::UsbDeviceDetached { .. } => 51,
             Message::UsbTransfer { .. } => 52,
             Message::UsbTransferComplete { .. } => 53,
             Message::UsbForwardingError { .. } => 54,
+            Message::UsbDeviceClaimRequest { .. } => 55,
+            Message::UsbDeviceClaimResponse { .. } => 56,
+            Message::UsbDeviceRelease { .. } => 57,
+            Message::UsbDeviceReset { .. } => 58,
+            Message::UsbTransferCancel { .. } => 59,
+            Message::UsbFlowControl { .. } => 60,
         }
     }
 
@@ -224,8 +230,8 @@ impl Default for MessageDecoder {
 mod tests {
     use super::*;
     use rshare_core::{
-        hello_message, DeviceId, GamepadState, UsbTransferDirection, UsbTransferKind,
-        UsbTransferPayload,
+        hello_message, DeviceId, GamepadState, UsbDeviceClaimRequest, UsbTransferDirection,
+        UsbTransferKind, UsbTransferPayload,
     };
 
     #[test]
@@ -331,15 +337,34 @@ mod tests {
                 transfer: UsbTransferPayload {
                     transfer_id: 1,
                     bus_id: "usb:1-2".to_string(),
+                    session_id: None,
                     endpoint_address: 0x81,
                     transfer_kind: UsbTransferKind::Interrupt,
                     direction: UsbTransferDirection::In,
                     setup_packet: None,
+                    control_setup: None,
+                    stream_id: None,
+                    expected_length: Some(64),
+                    flags: Vec::new(),
+                    iso_packets: Vec::new(),
                     data: Vec::new(),
                     timeout_ms: 100,
                 },
             }),
             52
+        );
+
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::UsbDeviceClaimRequest {
+                request: UsbDeviceClaimRequest {
+                    request_id: 1,
+                    bus_id: "usb:1-2".to_string(),
+                    exclusive: true,
+                    configuration_value: Some(1),
+                    interface_numbers: vec![0],
+                },
+            }),
+            55
         );
     }
 

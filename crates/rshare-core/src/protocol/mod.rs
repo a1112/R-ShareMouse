@@ -182,6 +182,8 @@ pub struct DeviceCapabilities {
     #[serde(default)]
     pub supports_usb_forwarding_experimental: bool,
     #[serde(default)]
+    pub usb_forwarding: UsbForwardingCapabilities,
+    #[serde(default)]
     pub audio_formats: Vec<AudioFormat>,
     #[serde(default)]
     pub max_gamepads: u8,
@@ -208,6 +210,7 @@ impl Default for DeviceCapabilities {
             supports_audio_output_control: false,
             supports_audio_forwarding: false,
             supports_usb_forwarding_experimental: false,
+            usb_forwarding: UsbForwardingCapabilities::default(),
             audio_formats: Vec::new(),
             max_gamepads: 0,
             max_devices: 16,
@@ -248,6 +251,39 @@ pub struct AudioFramePayload {
     pub data: Vec<u8>,
 }
 
+/// Detailed capabilities for the experimental USB forwarding path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbForwardingCapabilities {
+    #[serde(default)]
+    pub max_transfer_size: u32,
+    #[serde(default)]
+    pub max_in_flight_transfers: u16,
+    #[serde(default)]
+    pub supports_hotplug: bool,
+    #[serde(default)]
+    pub supports_cancel: bool,
+    #[serde(default)]
+    pub supports_reset: bool,
+    #[serde(default)]
+    pub supports_isochronous: bool,
+    #[serde(default)]
+    pub supported_transfer_kinds: Vec<UsbTransferKind>,
+}
+
+impl Default for UsbForwardingCapabilities {
+    fn default() -> Self {
+        Self {
+            max_transfer_size: 0,
+            max_in_flight_transfers: 0,
+            supports_hotplug: false,
+            supports_cancel: false,
+            supports_reset: false,
+            supports_isochronous: false,
+            supported_transfer_kinds: Vec::new(),
+        }
+    }
+}
+
 /// USB transfer category for the experimental USB forwarding path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsbTransferKind {
@@ -264,14 +300,69 @@ pub enum UsbTransferDirection {
     Out,
 }
 
+/// Negotiated USB device speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbDeviceSpeed {
+    Unknown,
+    Low,
+    Full,
+    High,
+    Super,
+    SuperPlus,
+}
+
+impl Default for UsbDeviceSpeed {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 /// Endpoint metadata advertised by a USB device forwarding host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbEndpointDescriptor {
     pub address: u8,
+    #[serde(default)]
+    pub interface_number: u8,
+    #[serde(default)]
+    pub alternate_setting: u8,
     pub transfer_kind: UsbTransferKind,
     pub direction: UsbTransferDirection,
     pub max_packet_size: u16,
     pub interval_ms: Option<u8>,
+    #[serde(default)]
+    pub attributes: u8,
+    #[serde(default)]
+    pub max_burst: Option<u8>,
+    #[serde(default)]
+    pub max_streams: Option<u16>,
+}
+
+/// USB interface metadata under a configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbInterfaceDescriptor {
+    pub interface_number: u8,
+    pub alternate_setting: u8,
+    pub class_code: u8,
+    pub subclass_code: u8,
+    pub protocol_code: u8,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<UsbEndpointDescriptor>,
+}
+
+/// USB configuration metadata advertised by a forwarding host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbConfigurationDescriptor {
+    pub configuration_value: u8,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub attributes: u8,
+    #[serde(default)]
+    pub max_power_ma: u16,
+    #[serde(default)]
+    pub interfaces: Vec<UsbInterfaceDescriptor>,
 }
 
 /// Device metadata for experimental generic USB forwarding.
@@ -286,7 +377,79 @@ pub struct UsbDeviceDescriptor {
     pub manufacturer: Option<String>,
     pub product: Option<String>,
     pub serial_number: Option<String>,
+    #[serde(default)]
+    pub usb_version_bcd: u16,
+    #[serde(default)]
+    pub device_version_bcd: u16,
+    #[serde(default)]
+    pub speed: UsbDeviceSpeed,
+    #[serde(default)]
+    pub active_configuration: Option<u8>,
+    #[serde(default)]
+    pub container_id: Option<String>,
+    #[serde(default)]
+    pub capture_exclusive_required: bool,
+    #[serde(default)]
+    pub configurations: Vec<UsbConfigurationDescriptor>,
+    #[serde(default)]
     pub endpoints: Vec<UsbEndpointDescriptor>,
+}
+
+/// Structured USB control setup packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbControlSetupPacket {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+}
+
+impl UsbControlSetupPacket {
+    pub fn from_raw(bytes: [u8; 8]) -> Self {
+        Self {
+            request_type: bytes[0],
+            request: bytes[1],
+            value: u16::from_le_bytes([bytes[2], bytes[3]]),
+            index: u16::from_le_bytes([bytes[4], bytes[5]]),
+            length: u16::from_le_bytes([bytes[6], bytes[7]]),
+        }
+    }
+
+    pub fn to_raw(self) -> [u8; 8] {
+        let value = self.value.to_le_bytes();
+        let index = self.index.to_le_bytes();
+        let length = self.length.to_le_bytes();
+        [
+            self.request_type,
+            self.request,
+            value[0],
+            value[1],
+            index[0],
+            index[1],
+            length[0],
+            length[1],
+        ]
+    }
+}
+
+/// Optional transfer flags that affect USB host scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbTransferFlag {
+    ShortNotOk,
+    ZeroPacket,
+    NoDataStage,
+}
+
+/// Isochronous packet metadata for transfer scheduling and completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbIsoPacketDescriptor {
+    pub offset: u32,
+    pub length: u32,
+    #[serde(default)]
+    pub actual_length: Option<u32>,
+    #[serde(default)]
+    pub status: Option<i32>,
 }
 
 /// A single experimental USB transfer payload.
@@ -294,12 +457,96 @@ pub struct UsbDeviceDescriptor {
 pub struct UsbTransferPayload {
     pub transfer_id: u64,
     pub bus_id: String,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
     pub endpoint_address: u8,
     pub transfer_kind: UsbTransferKind,
     pub direction: UsbTransferDirection,
+    #[serde(default)]
     pub setup_packet: Option<[u8; 8]>,
+    #[serde(default)]
+    pub control_setup: Option<UsbControlSetupPacket>,
+    #[serde(default)]
+    pub stream_id: Option<u16>,
+    #[serde(default)]
+    pub expected_length: Option<u32>,
+    #[serde(default)]
+    pub flags: Vec<UsbTransferFlag>,
+    #[serde(default)]
+    pub iso_packets: Vec<UsbIsoPacketDescriptor>,
     pub data: Vec<u8>,
     pub timeout_ms: u32,
+}
+
+impl UsbTransferPayload {
+    pub fn control_setup_packet(&self) -> Option<UsbControlSetupPacket> {
+        self.control_setup
+            .or_else(|| self.setup_packet.map(UsbControlSetupPacket::from_raw))
+    }
+}
+
+/// Normalized completion status for the experimental USB forwarding path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbTransferStatus {
+    Completed,
+    Cancelled,
+    Stall,
+    Timeout,
+    DeviceGone,
+    ProtocolError,
+    Unsupported,
+    Failed,
+}
+
+impl Default for UsbTransferStatus {
+    fn default() -> Self {
+        Self::Completed
+    }
+}
+
+/// Request to claim a forwarded USB device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDeviceClaimRequest {
+    pub request_id: u64,
+    pub bus_id: String,
+    #[serde(default)]
+    pub exclusive: bool,
+    #[serde(default)]
+    pub configuration_value: Option<u8>,
+    #[serde(default)]
+    pub interface_numbers: Vec<u8>,
+}
+
+/// Response to an experimental USB device claim request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDeviceClaimResponse {
+    pub request_id: u64,
+    pub bus_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub granted_interfaces: Vec<u8>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// USB reset scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbDeviceResetKind {
+    Endpoint,
+    Interface,
+    Device,
+}
+
+/// Receiver-side flow control for USB transfer forwarding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbFlowControl {
+    pub bus_id: String,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    pub available_window_bytes: u32,
+    pub max_in_flight_transfers: u16,
 }
 
 /// Canonical gamepad button names.
@@ -480,13 +727,47 @@ pub enum Message {
         transfer_id: u64,
         bus_id: String,
         status: i32,
+        #[serde(default)]
+        transfer_status: UsbTransferStatus,
+        #[serde(default)]
+        endpoint_address: Option<u8>,
+        #[serde(default)]
+        transfer_kind: Option<UsbTransferKind>,
+        #[serde(default)]
+        actual_length: Option<u32>,
         data: Vec<u8>,
+        #[serde(default)]
+        iso_packets: Vec<UsbIsoPacketDescriptor>,
     },
     /// Non-fatal experimental USB forwarding error.
     UsbForwardingError {
         bus_id: Option<String>,
         message: String,
     },
+    /// Request exclusive or shared access to a forwarded USB device.
+    UsbDeviceClaimRequest { request: UsbDeviceClaimRequest },
+    /// Response to a USB device claim request.
+    UsbDeviceClaimResponse { response: UsbDeviceClaimResponse },
+    /// Release a previously claimed USB device.
+    UsbDeviceRelease {
+        session_id: Uuid,
+        bus_id: String,
+        reason: String,
+    },
+    /// Reset a USB endpoint/interface/device on the forwarding host.
+    UsbDeviceReset {
+        session_id: Option<Uuid>,
+        bus_id: String,
+        reset_kind: UsbDeviceResetKind,
+    },
+    /// Cancel an in-flight USB transfer.
+    UsbTransferCancel {
+        transfer_id: u64,
+        bus_id: String,
+        reason: String,
+    },
+    /// Advertise receiver-side transfer capacity.
+    UsbFlowControl { flow: UsbFlowControl },
 
     // === Clipboard ===
     /// Clipboard data (text only for now)
@@ -535,7 +816,9 @@ impl Message {
             | Message::Key { .. }
             | Message::KeyExtended { .. }
             | Message::GamepadConnected { .. }
-            | Message::GamepadDisconnected { .. } => Priority::High,
+            | Message::GamepadDisconnected { .. }
+            | Message::UsbTransfer { .. }
+            | Message::UsbTransferComplete { .. } => Priority::High,
 
             // Normal: continuous updates
             Message::MouseMove { .. }
@@ -550,8 +833,12 @@ impl Message {
             | Message::AudioStreamError { .. }
             | Message::UsbDeviceAttached { .. }
             | Message::UsbDeviceDetached { .. }
-            | Message::UsbTransfer { .. }
-            | Message::UsbTransferComplete { .. }
+            | Message::UsbDeviceClaimRequest { .. }
+            | Message::UsbDeviceClaimResponse { .. }
+            | Message::UsbDeviceRelease { .. }
+            | Message::UsbDeviceReset { .. }
+            | Message::UsbTransferCancel { .. }
+            | Message::UsbFlowControl { .. }
             | Message::ScreenUpdate { .. } => Priority::Normal,
 
             // Low: background operations
@@ -581,6 +868,12 @@ impl Message {
                 | Message::UsbTransfer { .. }
                 | Message::UsbTransferComplete { .. }
                 | Message::UsbForwardingError { .. }
+                | Message::UsbDeviceClaimRequest { .. }
+                | Message::UsbDeviceClaimResponse { .. }
+                | Message::UsbDeviceRelease { .. }
+                | Message::UsbDeviceReset { .. }
+                | Message::UsbTransferCancel { .. }
+                | Message::UsbFlowControl { .. }
         )
     }
 }
@@ -789,6 +1082,18 @@ mod tests {
 
     #[test]
     fn usb_forwarding_messages_round_trip() {
+        let endpoint = UsbEndpointDescriptor {
+            address: 0x81,
+            interface_number: 0,
+            alternate_setting: 0,
+            transfer_kind: UsbTransferKind::Interrupt,
+            direction: UsbTransferDirection::In,
+            max_packet_size: 64,
+            interval_ms: Some(4),
+            attributes: 0x03,
+            max_burst: None,
+            max_streams: None,
+        };
         let device = UsbDeviceDescriptor {
             bus_id: "usb:1-2".to_string(),
             vendor_id: 0x045e,
@@ -799,13 +1104,28 @@ mod tests {
             manufacturer: Some("Vendor".to_string()),
             product: Some("Controller".to_string()),
             serial_number: None,
-            endpoints: vec![UsbEndpointDescriptor {
-                address: 0x81,
-                transfer_kind: UsbTransferKind::Interrupt,
-                direction: UsbTransferDirection::In,
-                max_packet_size: 64,
-                interval_ms: Some(4),
+            usb_version_bcd: 0x0200,
+            device_version_bcd: 0x0100,
+            speed: UsbDeviceSpeed::Full,
+            active_configuration: Some(1),
+            container_id: Some("container-1".to_string()),
+            capture_exclusive_required: true,
+            configurations: vec![UsbConfigurationDescriptor {
+                configuration_value: 1,
+                description: Some("default".to_string()),
+                attributes: 0x80,
+                max_power_ma: 500,
+                interfaces: vec![UsbInterfaceDescriptor {
+                    interface_number: 0,
+                    alternate_setting: 0,
+                    class_code: 0xff,
+                    subclass_code: 0x5d,
+                    protocol_code: 0x01,
+                    description: Some("vendor interface".to_string()),
+                    endpoints: vec![endpoint.clone()],
+                }],
             }],
+            endpoints: vec![endpoint],
         };
         let attached = Message::UsbDeviceAttached {
             device: device.clone(),
@@ -820,13 +1140,35 @@ mod tests {
         let transfer = UsbTransferPayload {
             transfer_id: 42,
             bus_id: "usb:1-2".to_string(),
+            session_id: Some(Uuid::new_v4()),
             endpoint_address: 0x00,
             transfer_kind: UsbTransferKind::Control,
             direction: UsbTransferDirection::Out,
             setup_packet: Some([0, 9, 1, 0, 0, 0, 0, 0]),
+            control_setup: Some(UsbControlSetupPacket {
+                request_type: 0,
+                request: 9,
+                value: 1,
+                index: 0,
+                length: 0,
+            }),
+            stream_id: None,
+            expected_length: Some(0),
+            flags: vec![UsbTransferFlag::NoDataStage],
+            iso_packets: Vec::new(),
             data: vec![1, 2, 3],
             timeout_ms: 1000,
         };
+        assert_eq!(
+            transfer.control_setup_packet(),
+            Some(UsbControlSetupPacket {
+                request_type: 0,
+                request: 9,
+                value: 1,
+                index: 0,
+                length: 0,
+            })
+        );
         let msg = Message::UsbTransfer {
             transfer: transfer.clone(),
         };
@@ -837,7 +1179,127 @@ mod tests {
             _ => panic!("Wrong message type"),
         }
         assert!(msg.requires_ack());
-        assert_eq!(msg.priority(), Priority::Normal);
+        assert_eq!(msg.priority(), Priority::High);
+
+        let completion = Message::UsbTransferComplete {
+            transfer_id: 42,
+            bus_id: "usb:1-2".to_string(),
+            status: 0,
+            transfer_status: UsbTransferStatus::Completed,
+            endpoint_address: Some(0x81),
+            transfer_kind: Some(UsbTransferKind::Interrupt),
+            actual_length: Some(3),
+            data: vec![4, 5, 6],
+            iso_packets: Vec::new(),
+        };
+        let serialized = serde_json::to_string(&completion).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            Message::UsbTransferComplete {
+                transfer_id: 42,
+                transfer_status: UsbTransferStatus::Completed,
+                actual_length: Some(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn usb_forwarding_control_messages_round_trip() {
+        let session_id = Uuid::new_v4();
+        let claim = Message::UsbDeviceClaimRequest {
+            request: UsbDeviceClaimRequest {
+                request_id: 7,
+                bus_id: "usb:1-2".to_string(),
+                exclusive: true,
+                configuration_value: Some(1),
+                interface_numbers: vec![0, 1],
+            },
+        };
+        let serialized = serde_json::to_string(&claim).unwrap();
+        let decoded: Message = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::UsbDeviceClaimRequest {
+                request: UsbDeviceClaimRequest {
+                    request_id: 7,
+                    exclusive: true,
+                    ..
+                }
+            }
+        ));
+
+        let response = Message::UsbDeviceClaimResponse {
+            response: UsbDeviceClaimResponse {
+                request_id: 7,
+                bus_id: "usb:1-2".to_string(),
+                accepted: true,
+                session_id: Some(session_id),
+                granted_interfaces: vec![0, 1],
+                message: None,
+            },
+        };
+        let flow = Message::UsbFlowControl {
+            flow: UsbFlowControl {
+                bus_id: "usb:1-2".to_string(),
+                session_id: Some(session_id),
+                available_window_bytes: 65_536,
+                max_in_flight_transfers: 32,
+            },
+        };
+        assert!(response.requires_ack());
+        assert!(flow.requires_ack());
+        assert_eq!(flow.priority(), Priority::Normal);
+
+        let cancel = Message::UsbTransferCancel {
+            transfer_id: 11,
+            bus_id: "usb:1-2".to_string(),
+            reason: "timeout budget exceeded".to_string(),
+        };
+        let reset = Message::UsbDeviceReset {
+            session_id: Some(session_id),
+            bus_id: "usb:1-2".to_string(),
+            reset_kind: UsbDeviceResetKind::Endpoint,
+        };
+        assert!(cancel.requires_ack());
+        assert!(reset.requires_ack());
+    }
+
+    #[test]
+    fn usb_forwarding_defaults_old_messages() {
+        let raw_transfer = r#"{"UsbTransfer":{"transfer":{"transfer_id":1,"bus_id":"usb:1-2","endpoint_address":0,"transfer_kind":"Control","direction":"Out","setup_packet":[0,9,1,0,0,0,0,0],"data":[],"timeout_ms":100}}}"#;
+        let transfer: Message = serde_json::from_str(raw_transfer).unwrap();
+        match transfer {
+            Message::UsbTransfer { transfer } => {
+                assert_eq!(transfer.session_id, None);
+                assert!(transfer.flags.is_empty());
+                assert_eq!(
+                    transfer.control_setup_packet(),
+                    Some(UsbControlSetupPacket {
+                        request_type: 0,
+                        request: 9,
+                        value: 1,
+                        index: 0,
+                        length: 0,
+                    })
+                );
+            }
+            _ => panic!("Wrong message type"),
+        }
+
+        let raw_completion =
+            r#"{"UsbTransferComplete":{"transfer_id":1,"bus_id":"usb:1-2","status":0,"data":[]}}"#;
+        let completion: Message = serde_json::from_str(raw_completion).unwrap();
+        assert!(matches!(
+            completion,
+            Message::UsbTransferComplete {
+                transfer_status: UsbTransferStatus::Completed,
+                endpoint_address: None,
+                iso_packets,
+                ..
+            } if iso_packets.is_empty()
+        ));
     }
 
     #[test]
@@ -881,6 +1343,10 @@ mod tests {
         assert!(!capabilities.supports_audio_output_control);
         assert!(!capabilities.supports_audio_forwarding);
         assert!(!capabilities.supports_usb_forwarding_experimental);
+        assert_eq!(
+            capabilities.usb_forwarding,
+            UsbForwardingCapabilities::default()
+        );
         assert!(capabilities.audio_formats.is_empty());
         assert_eq!(capabilities.max_gamepads, 0);
     }
