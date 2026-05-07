@@ -1977,6 +1977,7 @@ function DeviceTreeNodeButton({
   icon,
   title,
   detail,
+  badge,
   live,
   onClick,
   theme,
@@ -1985,6 +1986,7 @@ function DeviceTreeNodeButton({
   icon: ReactNode;
   title: string;
   detail: string;
+  badge?: string;
   live: boolean;
   onClick: () => void;
   theme: typeof FIGMA_DESKTOP_THEME;
@@ -2008,7 +2010,17 @@ function DeviceTreeNodeButton({
         {icon}
       </span>
       <span className="min-w-0 flex-1">
-        <span className="block truncate font-medium">{title}</span>
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="block min-w-0 truncate font-medium">{title}</span>
+          {badge ? (
+            <span
+              className="shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+              style={{ background: theme.accentSoft, color: theme.accent }}
+            >
+              {badge}
+            </span>
+          ) : null}
+        </span>
         <span className="block truncate text-[10px]" style={{ color: theme.textMuted }}>
           {detail}
         </span>
@@ -2065,6 +2077,7 @@ function DevicesPageWithLocalControls({
   const [selectedMonitorDeviceId, setSelectedMonitorDeviceId] = useState("local");
   const [expandedDeviceKinds, setExpandedDeviceKinds] = useState<Record<string, boolean>>({});
   const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
+  const [expandedRemoteDevices, setExpandedRemoteDevices] = useState<Record<string, boolean>>({});
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
 
   useEffect(() => {
@@ -2150,6 +2163,9 @@ function DevicesPageWithLocalControls({
     remote: safeDevices.length,
   };
   const deviceTypeTabs = buildDeviceTypeSummaries(counts);
+  const controlTreeTabs = deviceTypeTabs.filter(
+    (tab) => tab.kind !== "all" && tab.kind !== "remote",
+  );
   const tabIcons: Record<LocalDevicePageKind, ReactNode> = {
     all: <LayoutGrid size={16} />,
     keyboard: <Keyboard size={16} />,
@@ -2174,9 +2190,12 @@ function DevicesPageWithLocalControls({
       [kind]: !current[kind],
     }));
   };
-  const localDeviceTabs = deviceTypeTabs.filter(
-    (tab) => tab.kind !== "all" && tab.kind !== "remote",
-  );
+  const toggleRemoteDevice = (deviceId: string) => {
+    setExpandedRemoteDevices((current) => ({
+      ...current,
+      [deviceId]: !current[deviceId],
+    }));
+  };
   const selectLocalRoot = () => {
     setSelectedMonitorDeviceId("local");
     setSelectedPage("all");
@@ -2186,6 +2205,17 @@ function DevicesPageWithLocalControls({
     setSelectedPage(kind);
     if (kind !== "all" && kind !== "remote") {
       const aggregate = localDeviceItems(monitorSnapshot, kind as LocalControlKind, audioOutputs)[0];
+      if (aggregate) {
+        setSelectedDeviceId(kind as LocalControlKind, aggregate.id);
+      }
+    }
+  };
+  const selectRemoteKind = (deviceId: string, kind: LocalDevicePageKind) => {
+    handleMonitorDeviceChange(deviceId);
+    setSelectedPage(kind);
+    if (kind !== "all" && kind !== "remote") {
+      const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, deviceId);
+      const aggregate = localDeviceItems(remoteSnapshot, kind as LocalControlKind, [])[0];
       if (aggregate) {
         setSelectedDeviceId(kind as LocalControlKind, aggregate.id);
       }
@@ -2202,11 +2232,11 @@ function DevicesPageWithLocalControls({
         }}
       >
         <div
-          className="rshare-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3"
+          className="rshare-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto py-3 pr-3 pl-0"
           role="tree"
           aria-label="设备树"
         >
-          <div className="mb-1 px-1">
+          <div className="mb-1 px-4">
             <div className="text-[11px] uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
               Device Console
             </div>
@@ -2232,15 +2262,16 @@ function DevicesPageWithLocalControls({
                 icon={<Monitor size={16} />}
                 title={localDevice.name}
                 detail={localDevice.hostname || "本机"}
+                badge="本机"
                 live={Boolean(monitorSnapshot)}
                 onClick={selectLocalRoot}
                 theme={theme}
               />
             </div>
             {localTreeExpanded ? (
-              <div className="ml-3 flex flex-col gap-1">
-                {localDeviceTabs.map((tab) => {
-            const kind = tab.kind as LocalDevicePageKind;
+              <div className="ml-2 flex flex-col gap-1">
+                {controlTreeTabs.map((tab) => {
+            const kind = tab.kind as LocalControlKind;
             const expanded = Boolean(expandedDeviceKinds[kind]);
             const children =
               localDeviceItems(monitorSnapshot, kind as LocalControlKind, audioOutputs)
@@ -2266,7 +2297,7 @@ function DevicesPageWithLocalControls({
                   </button>
                   <LocalControlTypeButton
                     kind={kind}
-                    active={selectedPage === kind}
+                    active={selectedMonitorDeviceId === "local" && selectedPage === kind}
                     icon={tabIcons[kind]}
                     title={tab.title}
                     detail={tab.detail}
@@ -2276,24 +2307,16 @@ function DevicesPageWithLocalControls({
                   />
                 </div>
                 {expanded && children.length ? (
-                  <div className="ml-4 flex flex-col gap-1">
+                  <div className="ml-3 flex flex-col gap-1">
                     {children.map((device) => (
                       <button
                         key={device.id}
                         type="button"
                         className="truncate rounded-md px-2 py-1.5 text-left text-xs"
                         style={{
-                          border: `1px solid ${
-                            (kind === "remote"
-                              ? selectedMonitorDeviceId === device.id
-                              : selectedDeviceIds[kind] === device.id)
-                              ? theme.accent
-                              : theme.border
-                          }`,
+                          border: `1px solid ${selectedDeviceIds[kind] === device.id ? theme.accent : theme.border}`,
                           background:
-                            (kind === "remote"
-                              ? selectedMonitorDeviceId === device.id
-                              : selectedDeviceIds[kind] === device.id)
+                            selectedDeviceIds[kind] === device.id
                               ? theme.accentSoft
                               : "rgba(255,255,255,0.035)",
                           color: theme.textSub,
@@ -2321,23 +2344,66 @@ function DevicesPageWithLocalControls({
             ) : null}
           </div>
 
-          {safeDevices.map((device) => (
-            <div key={device.id} className="flex items-center gap-1">
-              <span className="h-8 w-3 shrink-0" />
-              <DeviceTreeNodeButton
-                active={selectedMonitorDeviceId === device.id}
-                icon={<Monitor size={16} />}
-                title={device.name}
-                detail={device.connected ? "已连接" : device.hostname || "已发现"}
-                live={device.connected}
-                onClick={() => {
-                  handleMonitorDeviceChange(device.id);
-                  setSelectedPage("all");
-                }}
-                theme={theme}
-              />
-            </div>
-          ))}
+          {safeDevices.map((device) => {
+            const expanded = Boolean(expandedRemoteDevices[device.id]);
+            const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, device.id);
+            const remoteCounts = deviceTreeCounts(remoteSnapshot, []);
+            const remoteTabs = buildDeviceTypeSummaries(remoteCounts).filter(
+              (tab) => tab.kind !== "all" && tab.kind !== "remote",
+            );
+            return (
+              <div key={device.id} className="flex flex-col gap-1">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    className="flex h-8 w-6 shrink-0 items-center justify-center rounded"
+                    style={{ color: theme.textMuted }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleRemoteDevice(device.id);
+                    }}
+                    title={expanded ? "收起局域网设备" : "展开局域网设备"}
+                  >
+                    {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
+                  <DeviceTreeNodeButton
+                    active={selectedMonitorDeviceId === device.id && selectedPage === "all"}
+                    icon={<Monitor size={16} />}
+                    title={device.name}
+                    detail={device.hostname || (device.connected ? "已连接" : "已发现")}
+                    live={device.connected}
+                    onClick={() => {
+                      handleMonitorDeviceChange(device.id);
+                      setSelectedPage("all");
+                    }}
+                    theme={theme}
+                  />
+                </div>
+                {expanded ? (
+                  <div className="ml-2 flex flex-col gap-1">
+                    {remoteTabs.map((tab) => {
+                      const kind = tab.kind as LocalControlKind;
+                      return (
+                        <div key={`${device.id}-${kind}`} className="flex items-center gap-1">
+                          <span className="h-8 w-6 shrink-0" />
+                          <LocalControlTypeButton
+                            kind={kind}
+                            active={selectedMonitorDeviceId === device.id && selectedPage === kind}
+                            icon={tabIcons[kind]}
+                            title={tab.title}
+                            detail={tab.detail}
+                            live={remoteCounts[kind] > 0 || device.connected}
+                            onClick={() => selectRemoteKind(device.id, kind)}
+                            theme={theme}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -2359,7 +2425,7 @@ function DevicesPageWithLocalControls({
             selectedKind={selectedPage}
             remoteDevice={selectedRemoteDevice}
             selectedDeviceId={selectedDeviceId}
-            audioOutputs={audioOutputs}
+            audioOutputs={selectedRemoteDevice ? [] : audioOutputs}
             onSelectedKindChange={setSelectedPage}
             onSelectedDeviceIdChange={(deviceId) =>
               setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
@@ -3647,6 +3713,25 @@ function buildRemoteMonitorSnapshot(
     remoteSnapshot = applyLocalControlEvent(remoteSnapshot, event);
   }
   return remoteSnapshot;
+}
+
+function deviceTreeCounts(
+  snapshot: LocalControlsSnapshot | null,
+  audioOutputs: AudioOutputDevice[] = [],
+) {
+  const audioInputs = safeArray(snapshot?.audio_inputs);
+  const resolvedAudioOutputs = safeArray(snapshot?.audio_outputs).length
+    ? safeArray(snapshot?.audio_outputs)
+    : safeArray(audioOutputs);
+  return {
+    all: Boolean(snapshot),
+    keyboard: localInputDeviceCount(snapshot, "keyboard"),
+    mouse: localInputDeviceCount(snapshot, "mouse"),
+    gamepad: safeArray(snapshot?.gamepads).length,
+    display: snapshot?.display?.display_count ?? 0,
+    audio: audioInputs.length + resolvedAudioOutputs.length,
+    remote: 0,
+  };
 }
 
 function localDeviceItems(
