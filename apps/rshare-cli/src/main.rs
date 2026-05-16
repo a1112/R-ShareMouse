@@ -89,6 +89,10 @@ enum Commands {
 
     /// Run dual-machine readiness diagnostics
     Doctor {
+        /// Connect all discovered peers before checking event and injection readiness
+        #[arg(long)]
+        connect: bool,
+
         /// Run a safe remote Shift loopback inject probe against the first connected peer
         #[arg(long)]
         inject: bool,
@@ -179,11 +183,12 @@ async fn main() -> Result<()> {
             commands::status::execute(detailed).await?;
         }
         Commands::Doctor {
+            connect,
             inject,
             endpoint_events,
             strict,
         } => {
-            doctor::execute(inject, endpoint_events, strict).await?;
+            doctor::execute(connect, inject, endpoint_events, strict).await?;
         }
         Commands::Config { config_cmd } => {
             config_cmd::execute(config_cmd).await?;

@@ -27,18 +27,28 @@ struct DoctorCheck {
 }
 
 /// Execute the doctor command.
-pub async fn execute(inject: bool, endpoint_events: u16, strict: bool) -> Result<()> {
+pub async fn execute(
+    connect: bool,
+    inject: bool,
+    endpoint_events: u16,
+    strict: bool,
+) -> Result<()> {
     header("R-ShareMouse Doctor");
 
     let status_result = daemon_client::request_status().await;
     let status_error = status_result.as_ref().err().map(|error| error.to_string());
     let status = status_result.ok();
 
-    let devices = if status.is_some() {
+    let mut devices = if status.is_some() {
         daemon_client::request_devices().await.unwrap_or_default()
     } else {
         Vec::new()
     };
+
+    if connect {
+        connect_discovered_devices(&devices).await;
+        devices = daemon_client::request_devices().await.unwrap_or_default();
+    }
     let layout = if status.is_some() {
         daemon_client::request_layout().await.ok()
     } else {
@@ -49,12 +59,12 @@ pub async fn execute(inject: bool, endpoint_events: u16, strict: bool) -> Result
     } else {
         None
     };
-    let endpoint_events = collect_endpoint_events(status.as_ref(), &devices, endpoint_events).await;
     let inject_results = if inject {
         run_remote_inject_probe(&devices).await
     } else {
         Vec::new()
     };
+    let endpoint_events = collect_endpoint_events(status.as_ref(), &devices, endpoint_events).await;
 
     let checks = build_doctor_checks(
         status.as_ref(),
@@ -87,6 +97,18 @@ pub async fn execute(inject: bool, endpoint_events: u16, strict: bool) -> Result
     }
 
     Ok(())
+}
+
+async fn connect_discovered_devices(devices: &[DaemonDeviceSnapshot]) {
+    for device in devices.iter().filter(|device| !device.connected) {
+        match daemon_client::request_connect(device.id).await {
+            Ok(()) => println!("  {}", format!("Connected {}", device.name).green()),
+            Err(error) => eprintln!(
+                "{}",
+                format!("  [WARN] Connect {} failed: {error}", device.name).yellow()
+            ),
+        }
+    }
 }
 
 async fn collect_endpoint_events(

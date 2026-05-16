@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
@@ -308,8 +309,13 @@ impl NetworkManager {
 
     /// Connect to a specific device
     pub async fn connect_to(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
+        let address = normalize_discovered_connection_address(
+            address,
+            self.config.discovery_port,
+            connection_port(&self.config.bind_address),
+        );
         let mut conn = self.connection.lock().await;
-        conn.connect(device_id, address).await
+        conn.connect(device_id, &address).await
     }
 
     /// Disconnect from a device
@@ -317,6 +323,30 @@ impl NetworkManager {
         let mut conn = self.connection.lock().await;
         conn.disconnect(device_id).await
     }
+}
+
+fn connection_port(bind_address: &str) -> Option<u16> {
+    bind_address
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|address| address.port())
+}
+
+fn normalize_discovered_connection_address(
+    address: &str,
+    discovery_port: u16,
+    connection_port: Option<u16>,
+) -> String {
+    let Some(connection_port) = connection_port else {
+        return address.to_string();
+    };
+    let Ok(mut socket_addr) = address.parse::<SocketAddr>() else {
+        return address.to_string();
+    };
+    if socket_addr.port() == discovery_port {
+        socket_addr.set_port(connection_port);
+    }
+    socket_addr.to_string()
 }
 
 // Note: NetworkManager intentionally doesn't implement Clone
@@ -331,6 +361,18 @@ mod tests {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
         assert!(config.auto_connect);
+    }
+
+    #[test]
+    fn normalizes_discovery_source_port_to_connection_port() {
+        assert_eq!(
+            normalize_discovered_connection_address("192.168.1.241:27432", 27432, Some(27431)),
+            "192.168.1.241:27431"
+        );
+        assert_eq!(
+            normalize_discovered_connection_address("192.168.1.241:27431", 27432, Some(27431)),
+            "192.168.1.241:27431"
+        );
     }
 
     #[test]
