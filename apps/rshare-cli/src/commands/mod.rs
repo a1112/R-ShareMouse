@@ -3,6 +3,7 @@
 pub mod config_cmd;
 pub mod devices;
 pub mod discover;
+pub mod doctor;
 pub mod logs;
 pub mod start;
 pub mod status;

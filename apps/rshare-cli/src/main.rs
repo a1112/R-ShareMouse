@@ -9,7 +9,7 @@ mod commands;
 mod config;
 mod output;
 
-use commands::{config_cmd, devices, discover, start, stop, usb};
+use commands::{config_cmd, devices, discover, doctor, start, stop, usb};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -87,6 +87,21 @@ enum Commands {
         detailed: bool,
     },
 
+    /// Run dual-machine readiness diagnostics
+    Doctor {
+        /// Run a safe remote Shift loopback inject probe against the first connected peer
+        #[arg(long)]
+        inject: bool,
+
+        /// Endpoint event limit per peer
+        #[arg(long, default_value = "64")]
+        endpoint_events: u16,
+
+        /// Return a non-zero exit code when any blocking check is found
+        #[arg(long)]
+        strict: bool,
+    },
+
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -162,6 +177,13 @@ async fn main() -> Result<()> {
         }
         Commands::Status { detailed } => {
             commands::status::execute(detailed).await?;
+        }
+        Commands::Doctor {
+            inject,
+            endpoint_events,
+            strict,
+        } => {
+            doctor::execute(inject, endpoint_events, strict).await?;
         }
         Commands::Config { config_cmd } => {
             config_cmd::execute(config_cmd).await?;

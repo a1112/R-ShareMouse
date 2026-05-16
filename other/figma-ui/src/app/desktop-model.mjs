@@ -380,6 +380,95 @@ export function endpointEventToLocalControlEvent(event) {
   };
 }
 
+function localControlEventDeviceId(event) {
+  return event?.device_id ?? event?.payload?.remote_device_id ?? null;
+}
+
+function eventIsInjected(event) {
+  return ["Injected", "InjectedLoopback", "VirtualDevice"].includes(event?.source);
+}
+
+export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestResult = null) {
+  const remoteIds = new Set((remoteDevices ?? []).map((device) => device.id));
+  const connectedRemoteDevices = (remoteDevices ?? []).filter((device) => device.connected);
+  const events = snapshot?.recent_events ?? [];
+  const localEvents = events.filter((event) => {
+    const sourceDeviceId = localControlEventDeviceId(event);
+    return !sourceDeviceId || !remoteIds.has(sourceDeviceId);
+  });
+  const remoteEvents = events.filter((event) => remoteIds.has(localControlEventDeviceId(event)));
+  const remoteInjectedEvents = remoteEvents.filter(eventIsInjected);
+  const remoteInjectSucceeded =
+    inputTestResult?.status === "Success" || remoteInjectedEvents.length > 0;
+  const remoteInjectFailed =
+    inputTestResult &&
+    inputTestResult.status &&
+    inputTestResult.status !== "Success";
+  const captureActive = Boolean(snapshot?.capture_backend?.active);
+  const injectActive = Boolean(snapshot?.inject_backend?.active);
+
+  const checks = [
+    {
+      key: "local-events",
+      label: "本机事件",
+      state: statusCheck(localEvents.length > 0, Boolean(snapshot)),
+      detail: localEvents.length
+        ? `已捕获 ${localEvents.length} 条本机输入事件`
+        : snapshot
+          ? "等待键盘或鼠标事件"
+          : "本机控制快照不可用",
+    },
+    {
+      key: "remote-mirror",
+      label: "远端镜像",
+      state: statusCheck(remoteEvents.length > 0, connectedRemoteDevices.length > 0),
+      detail: remoteEvents.length
+        ? `已镜像 ${remoteEvents.length} 条远端端侧事件`
+        : connectedRemoteDevices.length
+          ? "已连接远端，等待远端输入事件"
+          : "先连接局域网远端设备",
+    },
+    {
+      key: "remote-inject",
+      label: "远端注入",
+      state: remoteInjectSucceeded
+        ? "pass"
+        : remoteInjectFailed
+          ? "block"
+          : connectedRemoteDevices.length
+            ? "warn"
+            : "block",
+      detail: remoteInjectSucceeded
+        ? "远端注入已返回成功或已观察到 loopback 事件"
+        : remoteInjectFailed
+          ? inputTestResult.message
+          : connectedRemoteDevices.length
+            ? "点击远端键盘或鼠标测试完成注入闭环"
+            : "没有可注入的已连接远端",
+    },
+    {
+      key: "endpoint-backend",
+      label: "端侧后端",
+      state: statusCheck(captureActive && injectActive, Boolean(snapshot)),
+      detail:
+        captureActive && injectActive
+          ? "捕获与注入后端均处于 active"
+          : snapshot
+            ? `capture=${captureActive ? "active" : "inactive"} / inject=${injectActive ? "active" : "inactive"}`
+            : "后端状态不可用",
+    },
+  ];
+
+  return {
+    ready: checks.every((check) => check.state === "pass"),
+    localEventCount: localEvents.length,
+    remoteEventCount: remoteEvents.length,
+    remoteInjectedEventCount: remoteInjectedEvents.length,
+    connectedRemoteCount: connectedRemoteDevices.length,
+    checks,
+  };
+}
+
 export function buildDeviceTypeSummaries(counts = {}) {
   return [
     { kind: "all", title: "综合", detail: "合并输出" },

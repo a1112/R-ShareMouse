@@ -5,6 +5,7 @@ import {
   buildDesktopViewModel,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
+  buildEndpointAcceptance,
   buildLocalControlsViewModel,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
@@ -164,6 +165,82 @@ test("endpointEventToLocalControlEvent preserves remote endpoint and physical de
   assert.equal(event.payload.device_id, "keyboard-hid-1");
   assert.equal(event.payload.remote_device_id, "remote-1");
   assert.equal(event.payload.device_display_name, "Remote Mechanical Keyboard");
+});
+
+test("buildEndpointAcceptance reports dual-machine event mirror and inject readiness", () => {
+  const acceptance = buildEndpointAcceptance(
+    {
+      capture_backend: { active: true },
+      inject_backend: { active: true },
+      recent_events: [
+        {
+          sequence: 1,
+          device_kind: "Keyboard",
+          event_kind: "key",
+          summary: "Local key A",
+          device_id: null,
+          source: "Hardware",
+          payload: { key: "A", state: "Pressed" },
+        },
+        {
+          sequence: 2,
+          device_kind: "Mouse",
+          event_kind: "move",
+          summary: "Remote mouse move",
+          device_id: "remote-1",
+          source: "Hardware",
+          payload: { remote_device_id: "remote-1" },
+        },
+        {
+          sequence: 3,
+          device_kind: "Keyboard",
+          event_kind: "key",
+          summary: "Injected ShiftLeft release",
+          device_id: "remote-1",
+          source: "InjectedLoopback",
+          payload: { remote_device_id: "remote-1", correlation_id: "inject-1" },
+        },
+      ],
+    },
+    [{ id: "remote-1", name: "Remote", connected: true }],
+    { status: "Success", message: "ok" },
+  );
+
+  assert.equal(acceptance.ready, true);
+  assert.equal(acceptance.remoteEventCount, 2);
+  assert.equal(acceptance.remoteInjectedEventCount, 1);
+  assert.deepEqual(
+    acceptance.checks.map((check) => [check.key, check.state]),
+    [
+      ["local-events", "pass"],
+      ["remote-mirror", "pass"],
+      ["remote-inject", "pass"],
+      ["endpoint-backend", "pass"],
+    ],
+  );
+});
+
+test("buildEndpointAcceptance keeps remote inject pending until a test or loopback event exists", () => {
+  const acceptance = buildEndpointAcceptance(
+    {
+      capture_backend: { active: true },
+      inject_backend: { active: true },
+      recent_events: [],
+    },
+    [{ id: "remote-1", name: "Remote", connected: true }],
+    null,
+  );
+
+  assert.equal(acceptance.ready, false);
+  assert.deepEqual(
+    acceptance.checks.map((check) => [check.key, check.state]),
+    [
+      ["local-events", "warn"],
+      ["remote-mirror", "warn"],
+      ["remote-inject", "warn"],
+      ["endpoint-backend", "pass"],
+    ],
+  );
 });
 
 test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {

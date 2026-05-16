@@ -28,6 +28,7 @@ import {
   buildDesktopViewModel,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
+  buildEndpointAcceptance,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
@@ -2473,6 +2474,11 @@ function DevicesPageWithLocalControls({
     localControls?.audio_outputs?.length ? localControls.audio_outputs : browserAudioOutputs;
   const audioInputs = localControls?.audio_inputs ?? [];
   const safeDevices = safeArray(devices);
+  const endpointAcceptance = buildEndpointAcceptance(
+    localControls,
+    safeDevices,
+    localInputTestResult,
+  );
   const selectedRemoteDevice =
     selectedMonitorDeviceId === "local"
       ? null
@@ -2763,37 +2769,40 @@ function DevicesPageWithLocalControls({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
-        {selectedPage === "all" ? (
-          <AllDevicesOverview
-            snapshot={monitorSnapshot}
-            audioOutputs={audioOutputs}
-            remoteDevices={safeDevices}
-            error={monitorError}
-            theme={theme}
-          />
-        ) : (
-          <LocalControlDriverHub
-            snapshot={monitorSnapshot}
-            error={monitorError}
-            inputTestResult={localInputTestResult}
-            confirmingInputTest={confirmingInputTest}
-            selectedKind={selectedPage}
-            remoteDevice={selectedRemoteDevice}
-            selectedDeviceId={selectedDeviceId}
-            audioOutputs={selectedRemoteDevice ? [] : audioOutputs}
-            onSelectedKindChange={setSelectedPage}
-            onSelectedDeviceIdChange={(deviceId) =>
-              setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
-            }
-            onRunInputTest={
-              selectedRemoteDevice
-                ? (kind) => onRunRemoteEndpointInputTest(selectedRemoteDevice.id, kind)
-                : onRunLocalInputTest
-            }
-            theme={theme}
-          />
-        )}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {selectedPage === "all" ? (
+            <AllDevicesOverview
+              snapshot={monitorSnapshot}
+              audioOutputs={audioOutputs}
+              remoteDevices={safeDevices}
+              error={monitorError}
+              theme={theme}
+            />
+          ) : (
+            <LocalControlDriverHub
+              snapshot={monitorSnapshot}
+              error={monitorError}
+              inputTestResult={localInputTestResult}
+              confirmingInputTest={confirmingInputTest}
+              selectedKind={selectedPage}
+              remoteDevice={selectedRemoteDevice}
+              selectedDeviceId={selectedDeviceId}
+              audioOutputs={selectedRemoteDevice ? [] : audioOutputs}
+              onSelectedKindChange={setSelectedPage}
+              onSelectedDeviceIdChange={(deviceId) =>
+                setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
+              }
+              onRunInputTest={
+                selectedRemoteDevice
+                  ? (kind) => onRunRemoteEndpointInputTest(selectedRemoteDevice.id, kind)
+                  : onRunLocalInputTest
+              }
+              theme={theme}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2903,6 +2912,66 @@ function DevicesPageWithLocalControls({
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function EndpointAcceptanceStrip({
+  acceptance,
+  theme,
+}: {
+  acceptance: {
+    ready: boolean;
+    checks: Array<{
+      key: string;
+      label: string;
+      state: "pass" | "warn" | "block";
+      detail: string;
+    }>;
+  };
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <div
+      className="flex shrink-0 items-center gap-2 overflow-hidden px-4 py-2 text-xs"
+      style={{
+        borderBottom: `1px solid ${theme.border}`,
+        background: theme.toolbar,
+      }}
+    >
+      <div className="mr-1 shrink-0 font-medium" style={{ color: theme.textSub }}>
+        双机验收
+      </div>
+      <div className="rshare-scroll flex min-w-0 flex-1 gap-2 overflow-x-auto">
+        {acceptance.checks.map((check) => (
+          <div
+            key={check.key}
+            className="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+            }}
+            title={check.detail}
+          >
+            <AcceptanceDot state={check.state} theme={theme} />
+            <span style={{ color: theme.text }}>{check.label}</span>
+            <AcceptanceBadge
+              label={acceptanceStateLabel(check.state)}
+              state={check.state}
+              theme={theme}
+            />
+          </div>
+        ))}
+      </div>
+      <span
+        className="shrink-0 rounded px-2 py-1"
+        style={{
+          background: acceptance.ready ? "rgba(73, 179, 92, 0.16)" : "rgba(214, 166, 75, 0.14)",
+          color: acceptance.ready ? "#8de29d" : "#f0c36b",
+        }}
+      >
+        {acceptance.ready ? "可开始边缘切换" : "待完成端侧闭环"}
+      </span>
     </div>
   );
 }
