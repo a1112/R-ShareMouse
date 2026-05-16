@@ -3,22 +3,25 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
+mod endpoint_runtime;
 
 use anyhow::Result;
+use endpoint_runtime::inject_endpoint_event;
 use futures_util::SinkExt;
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, read_json_line, write_json_line, AudioFormat,
     BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, Direction, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
-    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
-    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    DaemonResponse, DeviceId, Direction, EndpointEvent, EndpointEventFilter, EndpointEventStore,
+    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
+    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
+    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
+    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    LocalInputTestStatus, Message, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
+    ServiceStatusSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult,
+    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
+    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -93,6 +96,12 @@ struct PendingUsbTransfer {
     result_tx: oneshot::Sender<UsbDescriptorProbeResult>,
 }
 
+struct PendingEndpointInject {
+    target: DeviceId,
+    started_at_ms: u64,
+    result_tx: oneshot::Sender<EndpointInjectResult>,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeFeatureConfig {
     suppress_local_shortcuts_when_remote: bool,
@@ -140,6 +149,7 @@ struct DaemonState {
     backend_state: BackendRuntimeState,
     features: RuntimeFeatureConfig,
     local_controls: LocalControlDeviceSnapshot,
+    endpoint_events: EndpointEventStore,
     pending_keyboard_loopback_until_ms: u64,
     pending_keyboard_loopback_events: u8,
     pending_mouse_loopback_until_ms: u64,
@@ -147,6 +157,7 @@ struct DaemonState {
     pending_latency_probes: HashMap<u64, PendingLatencyProbe>,
     pending_usb_claims: HashMap<u64, PendingUsbClaim>,
     pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
+    pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
 }
 
 impl DaemonState {
@@ -176,6 +187,7 @@ impl DaemonState {
             backend_state,
             features,
             local_controls,
+            endpoint_events: EndpointEventStore::default(),
             pending_keyboard_loopback_until_ms: 0,
             pending_keyboard_loopback_events: 0,
             pending_mouse_loopback_until_ms: 0,
@@ -183,6 +195,7 @@ impl DaemonState {
             pending_latency_probes: HashMap::new(),
             pending_usb_claims: HashMap::new(),
             pending_usb_transfers: HashMap::new(),
+            pending_endpoint_injects: HashMap::new(),
         }
     }
 
@@ -330,6 +343,73 @@ impl DaemonState {
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
         self.local_controls.clone()
+    }
+
+    fn sync_endpoint_events_from_recent(&mut self) {
+        let endpoint_id = self.status.device_id;
+        let last_sequence = self.endpoint_events.last_sequence().unwrap_or_default();
+        for event in self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| event.sequence > last_sequence)
+            .cloned()
+        {
+            self.endpoint_events
+                .push(EndpointEvent::from_local_diagnostic(endpoint_id, event));
+        }
+    }
+
+    fn endpoint_events(
+        &mut self,
+        filter: &EndpointEventFilter,
+        after_sequence: Option<u64>,
+        limit: Option<u16>,
+    ) -> Vec<EndpointEvent> {
+        self.sync_endpoint_events_from_recent();
+        self.endpoint_events.query(filter, after_sequence, limit)
+    }
+
+    fn endpoint_event_from_local(&mut self, event: LocalInputDiagnosticEvent) -> EndpointEvent {
+        let endpoint_event = EndpointEvent::from_local_diagnostic(self.status.device_id, event);
+        self.endpoint_events.push(endpoint_event.clone());
+        endpoint_event
+    }
+
+    fn mirror_remote_endpoint_event(
+        &mut self,
+        from: DeviceId,
+        mut event: EndpointEvent,
+    ) -> EndpointEvent {
+        let sequence = self.local_controls.sequence.saturating_add(1);
+        self.local_controls.sequence = sequence;
+        event.event_id = sequence;
+        event.sequence = sequence;
+        event.endpoint_id = from;
+        if event.origin_endpoint_id == DeviceId::nil() {
+            event.origin_endpoint_id = from;
+        }
+        event.source = rshare_core::EndpointEventSource::RemoteMirror;
+        self.endpoint_events.push(event.clone());
+        event
+    }
+
+    fn complete_pending_endpoint_inject(
+        &mut self,
+        from: DeviceId,
+        mut result: EndpointInjectResult,
+    ) -> bool {
+        let Some(pending) = self.pending_endpoint_injects.remove(&result.correlation_id) else {
+            return false;
+        };
+        result.target = EndpointInjectTarget::Remote(from);
+        result.elapsed_ms = timestamp_ms_now().saturating_sub(pending.started_at_ms);
+        if pending.target != from {
+            result.accepted = false;
+            result.error = Some(EndpointInjectError::TransportFailed);
+        }
+        let _ = pending.result_tx.send(result);
+        true
     }
 
     fn refresh_local_controls_platform(&mut self) {
@@ -1136,6 +1216,7 @@ async fn broadcast_diagnostic_event(
     local_device_id: DeviceId,
     event: LocalInputDiagnosticEvent,
 ) {
+    let endpoint_event = EndpointEvent::from_local_diagnostic(local_device_id, event.clone());
     let result = {
         let mut manager = network_manager.lock().await;
         manager
@@ -1145,6 +1226,61 @@ async fn broadcast_diagnostic_event(
 
     if let Err(error) = result {
         tracing::debug!("Failed to broadcast input diagnostic event: {}", error);
+    }
+
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .broadcast(Message::EndpointEventDelta {
+                event: endpoint_event,
+            })
+            .await
+    };
+
+    if let Err(error) = result {
+        tracing::debug!("Failed to broadcast endpoint event delta: {}", error);
+    }
+}
+
+async fn request_remote_endpoint_events(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    state: &Arc<RwLock<DaemonState>>,
+    filter: &EndpointEventFilter,
+) {
+    let Some(endpoint_id) = filter.endpoint_id else {
+        return;
+    };
+    let local_device_id = {
+        let state = state.read().await;
+        state.status.device_id
+    };
+    if endpoint_id == local_device_id {
+        return;
+    }
+    let connected = {
+        let state = state.read().await;
+        is_device_connected(&state, endpoint_id)
+    };
+    if !connected {
+        return;
+    }
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(
+                &endpoint_id,
+                Message::EndpointEventSubscribe {
+                    filter: filter.clone(),
+                },
+            )
+            .await
+    };
+    if let Err(error) = result {
+        tracing::debug!(
+            "Failed to request endpoint events from {}: {}",
+            endpoint_id,
+            error
+        );
     }
 }
 
@@ -2154,6 +2290,177 @@ fn input_test_failure_status(error: &anyhow::Error) -> LocalInputTestStatus {
     }
 }
 
+fn endpoint_inject_error(error: &anyhow::Error) -> EndpointInjectError {
+    let error_text = error.to_string().to_lowercase();
+    if error_text.contains("permission") || error_text.contains("accessibility") {
+        EndpointInjectError::PermissionDenied
+    } else if error_text.contains("unavailable") || error_text.contains("not active") {
+        EndpointInjectError::BackendUnavailable
+    } else if error_text.contains("unsupported") {
+        EndpointInjectError::UnsupportedEvent
+    } else {
+        EndpointInjectError::Failed
+    }
+}
+
+fn degraded_unavailable_health() -> BackendHealth {
+    BackendHealth::Degraded {
+        reason: BackendFailureReason::Unavailable,
+    }
+}
+
+fn endpoint_inject_failure_result(
+    target: EndpointInjectTarget,
+    request: &EndpointInjectRequest,
+    backend_kind: Option<BackendKind>,
+    health: BackendHealth,
+    elapsed_ms: u64,
+    error: EndpointInjectError,
+) -> EndpointInjectResult {
+    EndpointInjectResult {
+        correlation_id: request.correlation_id.clone(),
+        target,
+        accepted: false,
+        backend_kind,
+        health,
+        elapsed_ms,
+        loopback_event_id: None,
+        error: Some(error),
+    }
+}
+
+fn endpoint_payload_to_input_event(request: &EndpointInjectRequest) -> Result<InputEvent> {
+    match (&request.device_kind, &request.payload) {
+        (
+            rshare_core::EndpointEventKind::Keyboard,
+            rshare_core::EndpointEventPayload::Keyboard { key, state },
+        ) => Ok(InputEvent::key(
+            parse_key_code(key)?,
+            parse_button_state(state)?,
+        )),
+        (
+            rshare_core::EndpointEventKind::Mouse,
+            rshare_core::EndpointEventPayload::MouseMove { x, y, .. },
+        ) => Ok(InputEvent::mouse_move(*x, *y)),
+        (
+            rshare_core::EndpointEventKind::Mouse,
+            rshare_core::EndpointEventPayload::MouseButton { button, state, .. },
+        ) => Ok(InputEvent::mouse_button(
+            parse_mouse_button(button)?,
+            parse_button_state(state)?,
+        )),
+        (
+            rshare_core::EndpointEventKind::Mouse,
+            rshare_core::EndpointEventPayload::MouseWheel {
+                delta_x, delta_y, ..
+            },
+        ) => Ok(InputEvent::mouse_wheel(*delta_x, *delta_y)),
+        _ => anyhow::bail!(
+            "Unsupported endpoint inject event: {:?} {:?}",
+            request.device_kind,
+            request.payload
+        ),
+    }
+}
+
+fn parse_button_state(value: &str) -> Result<rshare_input::ButtonState> {
+    match value.to_ascii_lowercase().as_str() {
+        "pressed" | "press" | "down" | "true" | "1" => Ok(rshare_input::ButtonState::Pressed),
+        "released" | "release" | "up" | "false" | "0" => Ok(rshare_input::ButtonState::Released),
+        other => anyhow::bail!("Unsupported button state: {other}"),
+    }
+}
+
+fn parse_mouse_button(value: &str) -> Result<rshare_input::MouseButton> {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "left" => Ok(rshare_input::MouseButton::Left),
+        "middle" => Ok(rshare_input::MouseButton::Middle),
+        "right" => Ok(rshare_input::MouseButton::Right),
+        "back" => Ok(rshare_input::MouseButton::Back),
+        "forward" => Ok(rshare_input::MouseButton::Forward),
+        other if other.starts_with("other(") && other.ends_with(')') => {
+            let number = other
+                .trim_start_matches("other(")
+                .trim_end_matches(')')
+                .parse::<u8>()?;
+            Ok(rshare_input::MouseButton::Other(number))
+        }
+        other => anyhow::bail!("Unsupported mouse button: {other}"),
+    }
+}
+
+fn parse_key_code(value: &str) -> Result<rshare_input::KeyCode> {
+    let value = value.trim();
+    let key = match value {
+        "Escape" | "Esc" => rshare_input::KeyCode::Escape,
+        "Enter" | "Return" => rshare_input::KeyCode::Enter,
+        "Tab" => rshare_input::KeyCode::Tab,
+        "Backspace" => rshare_input::KeyCode::Backspace,
+        "Delete" | "Del" => rshare_input::KeyCode::Delete,
+        "Insert" | "Ins" => rshare_input::KeyCode::Insert,
+        "Home" => rshare_input::KeyCode::Home,
+        "End" => rshare_input::KeyCode::End,
+        "PageUp" | "PgUp" => rshare_input::KeyCode::PageUp,
+        "PageDown" | "PgDn" => rshare_input::KeyCode::PageDown,
+        "Up" => rshare_input::KeyCode::Up,
+        "Down" => rshare_input::KeyCode::Down,
+        "Left" => rshare_input::KeyCode::Left,
+        "Right" => rshare_input::KeyCode::Right,
+        "ShiftLeft" => rshare_input::KeyCode::ShiftLeft,
+        "ShiftRight" => rshare_input::KeyCode::ShiftRight,
+        "ControlLeft" | "CtrlLeft" => rshare_input::KeyCode::ControlLeft,
+        "ControlRight" | "CtrlRight" => rshare_input::KeyCode::ControlRight,
+        "AltLeft" => rshare_input::KeyCode::AltLeft,
+        "AltRight" => rshare_input::KeyCode::AltRight,
+        "SuperLeft" | "MetaLeft" | "WinLeft" => rshare_input::KeyCode::SuperLeft,
+        "SuperRight" | "MetaRight" | "WinRight" => rshare_input::KeyCode::SuperRight,
+        "Space" => rshare_input::KeyCode::Space,
+        "CapsLock" => rshare_input::KeyCode::CapsLock,
+        "NumLock" => rshare_input::KeyCode::NumLock,
+        "F1" => rshare_input::KeyCode::F1,
+        "F2" => rshare_input::KeyCode::F2,
+        "F3" => rshare_input::KeyCode::F3,
+        "F4" => rshare_input::KeyCode::F4,
+        "F5" => rshare_input::KeyCode::F5,
+        "F6" => rshare_input::KeyCode::F6,
+        "F7" => rshare_input::KeyCode::F7,
+        "F8" => rshare_input::KeyCode::F8,
+        "F9" => rshare_input::KeyCode::F9,
+        "F10" => rshare_input::KeyCode::F10,
+        "F11" => rshare_input::KeyCode::F11,
+        "F12" => rshare_input::KeyCode::F12,
+        "Keypad0" => rshare_input::KeyCode::Keypad0,
+        "Keypad1" => rshare_input::KeyCode::Keypad1,
+        "Keypad2" => rshare_input::KeyCode::Keypad2,
+        "Keypad3" => rshare_input::KeyCode::Keypad3,
+        "Keypad4" => rshare_input::KeyCode::Keypad4,
+        "Keypad5" => rshare_input::KeyCode::Keypad5,
+        "Keypad6" => rshare_input::KeyCode::Keypad6,
+        "Keypad7" => rshare_input::KeyCode::Keypad7,
+        "Keypad8" => rshare_input::KeyCode::Keypad8,
+        "Keypad9" => rshare_input::KeyCode::Keypad9,
+        "KeypadAdd" => rshare_input::KeyCode::KeypadAdd,
+        "KeypadSubtract" => rshare_input::KeyCode::KeypadSubtract,
+        "KeypadMultiply" => rshare_input::KeyCode::KeypadMultiply,
+        "KeypadDivide" => rshare_input::KeyCode::KeypadDivide,
+        "KeypadDecimal" => rshare_input::KeyCode::KeypadDecimal,
+        "KeypadEnter" => rshare_input::KeyCode::KeypadEnter,
+        other if other.len() == 1 => {
+            rshare_input::KeyCode::Char(other.as_bytes()[0].to_ascii_uppercase())
+        }
+        other if other.starts_with("Raw(") && other.ends_with(')') => {
+            let number = other
+                .trim_start_matches("Raw(")
+                .trim_end_matches(')')
+                .parse::<u32>()?;
+            rshare_input::KeyCode::Raw(number)
+        }
+        other => anyhow::bail!("Unsupported key code: {other}"),
+    };
+    Ok(key)
+}
+
 async fn run_local_input_test(
     inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
     state: &Arc<RwLock<DaemonState>>,
@@ -2228,6 +2535,130 @@ async fn run_local_input_test(
         }
         Err(error) => {
             LocalInputTestResult::failed(input_test_failure_status(&error), error.to_string())
+        }
+    }
+}
+
+async fn record_endpoint_inject_event(
+    state: &Arc<RwLock<DaemonState>>,
+    request: &EndpointInjectRequest,
+) -> (EndpointEvent, LocalInputDiagnosticEvent) {
+    let mut state = state.write().await;
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+    let timestamp_ms = timestamp_ms_now();
+    let device_kind = match request.device_kind {
+        rshare_core::EndpointEventKind::Keyboard => LocalInputDeviceKind::Keyboard,
+        rshare_core::EndpointEventKind::Mouse => LocalInputDeviceKind::Mouse,
+        rshare_core::EndpointEventKind::Gamepad => LocalInputDeviceKind::Gamepad,
+        rshare_core::EndpointEventKind::Usb => LocalInputDeviceKind::Usb,
+        rshare_core::EndpointEventKind::Display => LocalInputDeviceKind::Display,
+        rshare_core::EndpointEventKind::Audio => LocalInputDeviceKind::Audio,
+        rshare_core::EndpointEventKind::Backend => LocalInputDeviceKind::Backend,
+        rshare_core::EndpointEventKind::Session => LocalInputDeviceKind::Backend,
+    };
+    let (event_kind, summary, mut payload) = endpoint_inject_diagnostic_payload(request);
+    payload.insert("correlation_id".to_string(), request.correlation_id.clone());
+
+    state.arm_injected_loopback(device_kind, timestamp_ms);
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms,
+        device_kind,
+        event_kind,
+        summary,
+        device_id: Some(format!("rshare-inject-{}", request.device_kind_slug())),
+        device_instance_id: None,
+        capture_path: Some("daemon-endpoint-inject".to_string()),
+        source: LocalInputEventSource::InjectedLoopback,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    let endpoint_event = state.endpoint_event_from_local(event.clone());
+    (endpoint_event, event)
+}
+
+fn endpoint_inject_diagnostic_payload(
+    request: &EndpointInjectRequest,
+) -> (String, String, BTreeMap<String, String>) {
+    let mut payload = BTreeMap::new();
+    match &request.payload {
+        rshare_core::EndpointEventPayload::Keyboard { key, state } => {
+            payload.insert("key".to_string(), key.clone());
+            payload.insert("state".to_string(), state.clone());
+            (
+                "key".to_string(),
+                format!("Injected {key} {state}"),
+                payload,
+            )
+        }
+        rshare_core::EndpointEventPayload::MouseMove { x, y, display_id } => {
+            payload.insert("x".to_string(), x.to_string());
+            payload.insert("y".to_string(), y.to_string());
+            if let Some(display_id) = display_id {
+                payload.insert("display_id".to_string(), display_id.clone());
+            }
+            (
+                "move".to_string(),
+                format!("Injected mouse move {x},{y}"),
+                payload,
+            )
+        }
+        rshare_core::EndpointEventPayload::MouseButton {
+            button,
+            state,
+            x,
+            y,
+        } => {
+            payload.insert("button".to_string(), button.clone());
+            payload.insert("state".to_string(), state.clone());
+            payload.insert("x".to_string(), x.to_string());
+            payload.insert("y".to_string(), y.to_string());
+            (
+                "button".to_string(),
+                format!("Injected mouse {button} {state}"),
+                payload,
+            )
+        }
+        rshare_core::EndpointEventPayload::MouseWheel {
+            delta_x,
+            delta_y,
+            x,
+            y,
+        } => {
+            payload.insert("delta_x".to_string(), delta_x.to_string());
+            payload.insert("delta_y".to_string(), delta_y.to_string());
+            payload.insert("x".to_string(), x.to_string());
+            payload.insert("y".to_string(), y.to_string());
+            (
+                "wheel".to_string(),
+                format!("Injected mouse wheel {delta_x},{delta_y}"),
+                payload,
+            )
+        }
+        _ => (
+            "injected".to_string(),
+            "Injected endpoint event".to_string(),
+            payload,
+        ),
+    }
+}
+
+trait EndpointInjectRequestExt {
+    fn device_kind_slug(&self) -> &'static str;
+}
+
+impl EndpointInjectRequestExt for EndpointInjectRequest {
+    fn device_kind_slug(&self) -> &'static str {
+        match self.device_kind {
+            rshare_core::EndpointEventKind::Keyboard => "keyboard",
+            rshare_core::EndpointEventKind::Mouse => "mouse",
+            rshare_core::EndpointEventKind::Gamepad => "gamepad",
+            rshare_core::EndpointEventKind::Usb => "usb",
+            rshare_core::EndpointEventKind::Display => "display",
+            rshare_core::EndpointEventKind::Audio => "audio",
+            rshare_core::EndpointEventKind::Backend => "backend",
+            rshare_core::EndpointEventKind::Session => "session",
         }
     }
 }
@@ -2677,16 +3108,98 @@ async fn handle_network_message(
     audio_runtime: &audio_runtime::AudioRuntimeHandle,
     usb_runtime: &UsbHostRuntime,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_events_tx: &broadcast::Sender<EndpointEvent>,
     from: DeviceId,
     message: Message,
 ) {
     match message {
         Message::InputDiagnostic { event, .. } => {
-            let event = {
+            let endpoint_event = {
+                let mut event = EndpointEvent::from_local_diagnostic(from, event.clone());
+                event.source = rshare_core::EndpointEventSource::RemoteMirror;
+                event
+            };
+            let (event, mirrored) = {
                 let mut state = state.write().await;
-                record_remote_diagnostic_event(&mut state, from, event)
+                let mirrored = state.mirror_remote_endpoint_event(from, endpoint_event);
+                (
+                    record_remote_diagnostic_event(&mut state, from, event),
+                    mirrored,
+                )
             };
             let _ = local_events_tx.send(event);
+            let _ = endpoint_events_tx.send(mirrored);
+        }
+        Message::EndpointEventSubscribe { filter } => {
+            let events = {
+                let mut state = state.write().await;
+                state.endpoint_events(&filter, None, Some(128))
+            };
+            let result = {
+                let mut manager = network_manager.lock().await;
+                manager
+                    .send_to(&from, Message::EndpointEventSnapshot { events })
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::debug!(
+                    "Failed to answer endpoint event subscription from {}: {}",
+                    from,
+                    error
+                );
+            }
+        }
+        Message::EndpointEventSnapshot { events } => {
+            for event in events {
+                let mirrored = {
+                    let mut state = state.write().await;
+                    state.mirror_remote_endpoint_event(from, event)
+                };
+                let _ = endpoint_events_tx.send(mirrored);
+            }
+        }
+        Message::EndpointEventDelta { event } => {
+            let mirrored = {
+                let mut state = state.write().await;
+                state.mirror_remote_endpoint_event(from, event)
+            };
+            let _ = endpoint_events_tx.send(mirrored);
+        }
+        Message::EndpointInjectRequest { request } => {
+            let result = inject_endpoint_event(
+                network_manager,
+                inject_backend,
+                state,
+                local_events_tx,
+                EndpointInjectTarget::Local,
+                request,
+            )
+            .await;
+            let send_result = {
+                let mut manager = network_manager.lock().await;
+                manager
+                    .send_to(&from, Message::EndpointInjectResult { result })
+                    .await
+            };
+            if let Err(error) = send_result {
+                tracing::debug!(
+                    "Failed to send endpoint inject result to {}: {}",
+                    from,
+                    error
+                );
+            }
+        }
+        Message::EndpointInjectResult { result } => {
+            let completed = {
+                let mut state = state.write().await;
+                state.complete_pending_endpoint_inject(from, result)
+            };
+            if !completed {
+                tracing::debug!(
+                    "Received endpoint inject result from {} without pending request",
+                    from
+                );
+            }
         }
         Message::LatencyProbe {
             sequence,
@@ -4720,6 +5233,7 @@ async fn main() -> Result<()> {
     let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
     let (local_events_tx, _) = broadcast::channel::<LocalInputDiagnosticEvent>(256);
+    let (endpoint_events_tx, _) = broadcast::channel::<EndpointEvent>(256);
     let audio_runtime = audio_runtime::AudioRuntimeHandle::start()?;
     let usb_runtime = Arc::new(Mutex::new(
         rshare_platform::ExperimentalUsbHostRuntime::new(),
@@ -4819,6 +5333,7 @@ async fn main() -> Result<()> {
         audio_runtime.clone(),
         usb_runtime.clone(),
         local_events_tx.clone(),
+        endpoint_events_tx.clone(),
         layout_path.clone(),
         shutdown_tx.clone(),
     ));
@@ -4854,6 +5369,7 @@ async fn main() -> Result<()> {
         let audio_runtime = audio_runtime.clone();
         let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
+        let endpoint_events_tx = endpoint_events_tx.clone();
         let layout_path = layout_path.clone();
         tokio::spawn(async move {
             tracing::info!("Event task: starting to wait for events");
@@ -4900,6 +5416,7 @@ async fn main() -> Result<()> {
                             &audio_runtime,
                             &usb_runtime,
                             &local_events_tx,
+                            &endpoint_events_tx,
                             from,
                             message,
                         )
@@ -4972,6 +5489,7 @@ async fn run_ipc_server(
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_events_tx: broadcast::Sender<EndpointEvent>,
     layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
@@ -4983,6 +5501,7 @@ async fn run_ipc_server(
         let audio_runtime = audio_runtime.clone();
         let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
+        let endpoint_events_tx = endpoint_events_tx.clone();
         let layout_path = layout_path.clone();
         let shutdown_tx = shutdown_tx.clone();
 
@@ -4995,6 +5514,7 @@ async fn run_ipc_server(
                 audio_runtime,
                 usb_runtime,
                 local_events_tx,
+                endpoint_events_tx,
                 layout_path,
                 shutdown_tx,
             )
@@ -5072,6 +5592,7 @@ async fn handle_ipc_client(
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    endpoint_events_tx: broadcast::Sender<EndpointEvent>,
     layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
@@ -5091,6 +5612,57 @@ async fn handle_ipc_client(
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        return Ok(());
+    }
+
+    if let DaemonRequest::SubscribeEndpointEvents { filter } = &request {
+        request_remote_endpoint_events(&network_manager, &state, filter).await;
+        let events = {
+            let mut state = state.write().await;
+            state.refresh_local_controls_platform();
+            state.endpoint_events(filter, None, Some(128))
+        };
+        write_json_line(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
+        let mut local_events = local_events_tx.subscribe();
+        let mut endpoint_events = endpoint_events_tx.subscribe();
+        loop {
+            tokio::select! {
+                event = local_events.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let endpoint_event = {
+                                let mut state = state.write().await;
+                                state.endpoint_event_from_local(event)
+                            };
+                            if filter.matches(&endpoint_event) {
+                                write_json_line(
+                                    &mut stream,
+                                    &DaemonResponse::EndpointEvent(endpoint_event),
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                event = endpoint_events.recv() => {
+                    match event {
+                        Ok(endpoint_event) => {
+                            if filter.matches(&endpoint_event) {
+                                write_json_line(
+                                    &mut stream,
+                                    &DaemonResponse::EndpointEvent(endpoint_event),
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
             }
         }
         return Ok(());
@@ -5187,6 +5759,28 @@ async fn handle_ipc_client(
             state.refresh_local_controls_platform();
             DaemonResponse::LocalControls(state.local_control_snapshot())
         }
+        DaemonRequest::EndpointEvents {
+            filter,
+            after_sequence,
+            limit,
+        } => {
+            let mut state = state.write().await;
+            state.refresh_local_controls_platform();
+            DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))
+        }
+        DaemonRequest::InjectEndpointEvent { target, request } => {
+            DaemonResponse::EndpointInjectResult(
+                inject_endpoint_event(
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    target,
+                    request,
+                )
+                .await,
+            )
+        }
         DaemonRequest::RunLocalInputTest { test } => {
             let result =
                 run_local_input_test(&inject_backend, &state, &local_events_tx, test).await;
@@ -5256,6 +5850,9 @@ async fn handle_ipc_client(
             DaemonResponse::LocalAudioTest(run_audio_test(&state).await)
         }
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
+        DaemonRequest::SubscribeEndpointEvents { .. } => {
+            unreachable!("handled before response match")
+        }
         DaemonRequest::Shutdown => {
             let _ = shutdown_tx.send(());
             DaemonResponse::Ack
@@ -5476,6 +6073,83 @@ mod tests {
         ));
         assert!(state.local_controls.keyboard.pressed_keys.is_empty());
         assert_eq!(state.local_controls.keyboard.event_count, 2);
+    }
+
+    #[test]
+    fn endpoint_events_project_from_local_diagnostics() {
+        let mut state = test_daemon_state();
+
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                endpoint_id: Some(state.status.device_id),
+                kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].endpoint_id, state.status.device_id);
+        assert_eq!(events[0].origin_endpoint_id, state.status.device_id);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(
+            events[0].device.attribution,
+            rshare_core::DeviceAttribution::Aggregate
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_delta_is_mirrored_under_remote_endpoint() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        let remote_event = rshare_core::EndpointEvent {
+            event_id: 7,
+            sequence: 7,
+            timestamp_ms: 42,
+            endpoint_id: remote,
+            origin_endpoint_id: remote,
+            device: rshare_core::EndpointDeviceRef {
+                device_id: "keyboard-default".to_string(),
+                instance_id: None,
+                display_name: "Aggregate Keyboard".to_string(),
+                kind: rshare_core::EndpointEventKind::Keyboard,
+                attribution: rshare_core::DeviceAttribution::Aggregate,
+            },
+            direction: rshare_core::EndpointEventDirection::Observed,
+            source: rshare_core::EndpointEventSource::Hardware,
+            kind: rshare_core::EndpointEventKind::Keyboard,
+            payload: rshare_core::EndpointEventPayload::Keyboard {
+                key: "A".to_string(),
+                state: "Pressed".to_string(),
+            },
+            correlation_id: None,
+        };
+
+        let mirrored = state.mirror_remote_endpoint_event(remote, remote_event);
+
+        assert_eq!(mirrored.endpoint_id, remote);
+        assert_eq!(mirrored.origin_endpoint_id, remote);
+        assert_eq!(
+            mirrored.source,
+            rshare_core::EndpointEventSource::RemoteMirror
+        );
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                endpoint_id: Some(remote),
+                kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        assert_eq!(events, vec![mirrored]);
     }
 
     #[test]
@@ -5713,6 +6387,164 @@ mod tests {
         .await;
 
         assert_eq!(result.status, LocalInputTestStatus::BackendUnavailable);
+    }
+
+    #[tokio::test]
+    async fn inject_endpoint_event_reports_result_and_correlated_loopback() {
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(TestInjectBackend {
+                active: true,
+                fail: false,
+                injected: Vec::new(),
+            })));
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local".to_string(),
+        )));
+        let (events, _rx) = broadcast::channel(4);
+        let correlation_id = "ipc-shift-1".to_string();
+
+        let result = inject_endpoint_event(
+            &network_manager,
+            &backend,
+            &state,
+            &events,
+            rshare_core::EndpointInjectTarget::Local,
+            rshare_core::EndpointInjectRequest {
+                correlation_id: correlation_id.clone(),
+                device_kind: rshare_core::EndpointEventKind::Keyboard,
+                payload: rshare_core::EndpointEventPayload::Keyboard {
+                    key: "ShiftLeft".to_string(),
+                    state: "Pressed".to_string(),
+                },
+                mode: rshare_core::EndpointInjectMode::RequireHealthyBackend,
+                timeout_ms: 750,
+            },
+        )
+        .await;
+
+        assert!(result.accepted);
+        assert_eq!(result.correlation_id, correlation_id);
+        assert_eq!(result.backend_kind, Some(BackendKind::Portable));
+        assert_eq!(result.error, None);
+        assert!(result.loopback_event_id.is_some());
+
+        let mut state = state.write().await;
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].correlation_id.as_deref(), Some("ipc-shift-1"));
+        assert_eq!(
+            events[0].direction,
+            rshare_core::EndpointEventDirection::InjectedLoopback
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_endpoint_inject_returns_transport_failure_without_connection() {
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(TestInjectBackend {
+                active: true,
+                fail: false,
+                injected: Vec::new(),
+            })));
+        let remote = DeviceId::new_v4();
+        let mut daemon_state = test_daemon_state();
+        daemon_state.devices.insert(
+            remote,
+            TrackedDevice {
+                id: remote,
+                name: "remote".to_string(),
+                hostname: "remote".to_string(),
+                addresses: vec!["127.0.0.1:1".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        let state = Arc::new(RwLock::new(daemon_state));
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local".to_string(),
+        )));
+        let (events, _rx) = broadcast::channel(4);
+
+        let result = inject_endpoint_event(
+            &network_manager,
+            &backend,
+            &state,
+            &events,
+            rshare_core::EndpointInjectTarget::Remote(remote),
+            rshare_core::EndpointInjectRequest {
+                correlation_id: "remote-shift-1".to_string(),
+                device_kind: rshare_core::EndpointEventKind::Keyboard,
+                payload: rshare_core::EndpointEventPayload::Keyboard {
+                    key: "ShiftLeft".to_string(),
+                    state: "Pressed".to_string(),
+                },
+                mode: rshare_core::EndpointInjectMode::RequireHealthyBackend,
+                timeout_ms: 750,
+            },
+        )
+        .await;
+
+        assert!(!result.accepted);
+        assert_eq!(
+            result.target,
+            rshare_core::EndpointInjectTarget::Remote(remote)
+        );
+        assert_eq!(
+            result.error,
+            Some(rshare_core::EndpointInjectError::TransportFailed)
+        );
+        assert!(state.read().await.pending_endpoint_injects.is_empty());
+    }
+
+    #[test]
+    fn remote_endpoint_inject_result_completes_pending_request() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        let (result_tx, mut result_rx) = oneshot::channel();
+        state.pending_endpoint_injects.insert(
+            "remote-shift-2".to_string(),
+            PendingEndpointInject {
+                target: remote,
+                started_at_ms: timestamp_ms_now(),
+                result_tx,
+            },
+        );
+
+        assert!(state.complete_pending_endpoint_inject(
+            remote,
+            rshare_core::EndpointInjectResult {
+                correlation_id: "remote-shift-2".to_string(),
+                target: rshare_core::EndpointInjectTarget::Local,
+                accepted: true,
+                backend_kind: Some(BackendKind::Portable),
+                health: BackendHealth::Healthy,
+                elapsed_ms: 1,
+                loopback_event_id: Some(9),
+                error: None,
+            },
+        ));
+
+        let result = result_rx.try_recv().unwrap();
+        assert!(result.accepted);
+        assert_eq!(
+            result.target,
+            rshare_core::EndpointInjectTarget::Remote(remote)
+        );
+        assert_eq!(result.error, None);
+        assert!(state.pending_endpoint_injects.is_empty());
     }
 
     #[test]

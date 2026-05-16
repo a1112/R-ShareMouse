@@ -3,8 +3,10 @@
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode, Config,
-    DaemonDeviceSnapshot, DaemonResponse, DeviceId, LayoutGraph, LocalControlDeviceSnapshot,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
+    DaemonDeviceSnapshot, DaemonResponse, DeviceId, EndpointEvent, EndpointEventFilter,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -91,6 +93,11 @@ struct LocalControlStreamState {
     task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
+#[derive(Default)]
+struct EndpointEventStreamState {
+    task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrayStatusView {
     status_text: String,
@@ -156,6 +163,27 @@ async fn disconnect_device(device_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
     daemon_client::request_local_controls()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn endpoint_events_state(
+    filter: EndpointEventFilter,
+    after_sequence: Option<u64>,
+    limit: Option<u16>,
+) -> Result<Vec<EndpointEvent>, String> {
+    daemon_client::request_endpoint_events(filter, after_sequence, limit)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn inject_endpoint_event(
+    target: EndpointInjectTarget,
+    request: EndpointInjectRequest,
+) -> Result<EndpointInjectResult, String> {
+    daemon_client::request_endpoint_inject(target, request)
         .await
         .map_err(|err| err.to_string())
 }
@@ -242,6 +270,54 @@ async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn stop_local_controls_stream(app: AppHandle) -> Result<(), String> {
     let state = app.state::<LocalControlStreamState>();
+    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+        task.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_endpoint_events_stream(
+    app: AppHandle,
+    filter: EndpointEventFilter,
+) -> Result<(), String> {
+    let state = app.state::<EndpointEventStreamState>();
+    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+        task.abort();
+    }
+
+    let app_for_task = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let mut stream = match daemon_client::subscribe_endpoint_events(filter).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = app_for_task.emit("endpoint-event", format!("error:{err}"));
+                return;
+            }
+        };
+
+        loop {
+            match daemon_client::read_local_control_event(&mut stream).await {
+                Ok(response @ DaemonResponse::EndpointEvents(_))
+                | Ok(response @ DaemonResponse::EndpointEvent(_))
+                | Ok(response @ DaemonResponse::EndpointInjectResult(_)) => {
+                    let _ = app_for_task.emit("endpoint-event", response);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let _ = app_for_task.emit("endpoint-event", format!("error:{err}"));
+                    break;
+                }
+            }
+        }
+    });
+    *state.task.lock().map_err(|err| err.to_string())? = Some(task);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_endpoint_events_stream(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<EndpointEventStreamState>();
     if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
         task.abort();
     }
@@ -471,6 +547,7 @@ fn main() {
             let _ = show_main_window(app);
         }))
         .manage(LocalControlStreamState::default())
+        .manage(EndpointEventStreamState::default())
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_event(&event) {
                 if let Err(err) = apply_tray_action(app, action) {
@@ -494,8 +571,12 @@ fn main() {
             connect_device,
             disconnect_device,
             local_controls_state,
+            endpoint_events_state,
+            inject_endpoint_event,
             start_local_controls_stream,
             stop_local_controls_stream,
+            start_endpoint_events_stream,
+            stop_endpoint_events_stream,
             run_local_input_test,
             run_remote_latency_test,
             minimize_window,

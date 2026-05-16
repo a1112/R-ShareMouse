@@ -7,9 +7,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
-    DeviceId, LayoutGraph, LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
-    LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
-    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor,
+    DeviceId, EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, LayoutGraph, LocalAudioCaptureSource, LocalAudioTestRequest,
+    LocalAudioTestResult, LocalControlDeviceSnapshot, LocalInputDiagnosticEvent,
+    LocalInputTestRequest, LocalInputTestResult, PrivilegeState, ResolvedInputMode,
+    TrayRuntimeState, UsbDeviceDescriptor,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -178,6 +180,22 @@ pub enum DaemonRequest {
     ListUsbDevices,
     LocalControls,
     SubscribeLocalControls,
+    EndpointEvents {
+        #[serde(default)]
+        filter: EndpointEventFilter,
+        #[serde(default)]
+        after_sequence: Option<u64>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    SubscribeEndpointEvents {
+        #[serde(default)]
+        filter: EndpointEventFilter,
+    },
+    InjectEndpointEvent {
+        target: EndpointInjectTarget,
+        request: EndpointInjectRequest,
+    },
     RunLocalInputTest {
         test: LocalInputTestRequest,
     },
@@ -224,6 +242,9 @@ pub enum DaemonResponse {
     Layout(LayoutGraph),
     LocalControls(LocalControlDeviceSnapshot),
     LocalControlEvent(LocalInputDiagnosticEvent),
+    EndpointEvents(Vec<EndpointEvent>),
+    EndpointEvent(EndpointEvent),
+    EndpointInjectResult(EndpointInjectResult),
     LocalInputTest(LocalInputTestResult),
     LocalAudioTest(LocalAudioTestResult),
     UsbDescriptorProbe(UsbDescriptorProbeResult),

@@ -4,11 +4,14 @@ use rshare_core::{
         DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
-    BackgroundProcessOwner, BackgroundRunMode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
-    LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
-    LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
+    BackgroundProcessOwner, BackgroundRunMode, DeviceAttribution, EndpointDeviceRef, EndpointEvent,
+    EndpointEventDirection, EndpointEventFilter, EndpointEventKind, EndpointEventPayload,
+    EndpointEventSource, EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioInputDevice,
+    LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest, LocalControlDeviceSnapshot,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
+    LocalInputTestRequest, TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceDescriptor, UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
 use tokio::io::duplex;
@@ -105,6 +108,60 @@ async fn usb_device_requests_round_trip_over_json_lines() {
 }
 
 #[tokio::test]
+async fn endpoint_event_requests_round_trip_over_json_lines() {
+    let requests = [
+        DaemonRequest::EndpointEvents {
+            filter: EndpointEventFilter {
+                endpoint_id: Some(Uuid::nil()),
+                kinds: vec![EndpointEventKind::Keyboard],
+                sources: vec![EndpointEventSource::Hardware],
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+            after_sequence: Some(7),
+            limit: Some(32),
+        },
+        DaemonRequest::SubscribeEndpointEvents {
+            filter: EndpointEventFilter {
+                kinds: vec![EndpointEventKind::Mouse],
+                ..EndpointEventFilter::default()
+            },
+        },
+    ];
+
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+}
+
+#[tokio::test]
+async fn endpoint_inject_request_round_trips_over_json_lines() {
+    let request = DaemonRequest::InjectEndpointEvent {
+        target: EndpointInjectTarget::Local,
+        request: EndpointInjectRequest {
+            correlation_id: "test-shift-1".to_string(),
+            device_kind: EndpointEventKind::Keyboard,
+            payload: EndpointEventPayload::Keyboard {
+                key: "ShiftLeft".to_string(),
+                state: "Pressed".to_string(),
+            },
+            mode: EndpointInjectMode::RequireHealthyBackend,
+            timeout_ms: 750,
+        },
+    };
+
+    let (mut writer, mut reader) = duplex(4096);
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+}
+
+#[tokio::test]
 async fn daemon_responses_round_trip_device_payloads() {
     let (mut writer, mut reader) = duplex(4096);
     let response = DaemonResponse::Devices(vec![DaemonDeviceSnapshot {
@@ -168,6 +225,63 @@ async fn daemon_responses_round_trip_usb_descriptor_probe_payload() {
         descriptor_bytes: vec![18, 1, 0, 2],
     });
 
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[tokio::test]
+async fn daemon_responses_round_trip_endpoint_event_payloads() {
+    let event = EndpointEvent {
+        event_id: 42,
+        sequence: 42,
+        timestamp_ms: 1_714_000_000_000,
+        endpoint_id: Uuid::nil(),
+        origin_endpoint_id: Uuid::nil(),
+        device: EndpointDeviceRef {
+            device_id: "keyboard-default".to_string(),
+            instance_id: None,
+            display_name: "Aggregate Keyboard".to_string(),
+            kind: EndpointEventKind::Keyboard,
+            attribution: DeviceAttribution::Aggregate,
+        },
+        direction: EndpointEventDirection::Observed,
+        source: EndpointEventSource::Hardware,
+        kind: EndpointEventKind::Keyboard,
+        payload: EndpointEventPayload::Keyboard {
+            key: "ShiftLeft".to_string(),
+            state: "Pressed".to_string(),
+        },
+        correlation_id: None,
+    };
+
+    for response in [
+        DaemonResponse::EndpointEvents(vec![event.clone()]),
+        DaemonResponse::EndpointEvent(event),
+    ] {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, response);
+    }
+}
+
+#[tokio::test]
+async fn daemon_responses_round_trip_endpoint_inject_result() {
+    let response = DaemonResponse::EndpointInjectResult(EndpointInjectResult {
+        correlation_id: "test-shift-1".to_string(),
+        target: EndpointInjectTarget::Local,
+        accepted: true,
+        backend_kind: Some(rshare_core::BackendKind::Portable),
+        health: rshare_core::BackendHealth::Healthy,
+        elapsed_ms: 3,
+        loopback_event_id: Some(42),
+        error: None,
+    });
+
+    let (mut writer, mut reader) = duplex(4096);
     write_json_line(&mut writer, &response).await.unwrap();
     let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
 

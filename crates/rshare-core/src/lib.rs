@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod config;
 pub mod daemon_client;
 pub mod device;
+pub mod endpoint_events;
 pub mod engine;
 pub mod input_mode;
 pub mod ipc;
@@ -44,6 +45,15 @@ pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
     read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
     ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+};
+
+// Re-exports from endpoint event observation/injection diagnostics
+pub use endpoint_events::{
+    DeviceAttribution, EndpointDeviceRef, EndpointEvent, EndpointEventDirection,
+    EndpointEventFilter, EndpointEventId, EndpointEventKind, EndpointEventPayload,
+    EndpointEventSource, EndpointEventStore, EndpointInjectError, EndpointInjectMode,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, EventCorrelationId,
+    DEFAULT_ENDPOINT_EVENT_LIMIT,
 };
 
 // Re-exports from local control diagnostics

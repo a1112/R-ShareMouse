@@ -6,7 +6,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::local_controls::LocalInputDiagnosticEvent;
+use crate::{
+    endpoint_events::{
+        EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    },
+    local_controls::LocalInputDiagnosticEvent,
+};
 
 /// Device identifier
 pub type DeviceId = Uuid;
@@ -681,6 +686,16 @@ pub enum Message {
         device_id: DeviceId,
         event: LocalInputDiagnosticEvent,
     },
+    /// Request endpoint event snapshots and future deltas from a peer.
+    EndpointEventSubscribe { filter: EndpointEventFilter },
+    /// Snapshot response for endpoint event subscription.
+    EndpointEventSnapshot { events: Vec<EndpointEvent> },
+    /// Single endpoint event delta broadcast by a peer.
+    EndpointEventDelta { event: EndpointEvent },
+    /// Request a peer to inject an endpoint event on its local machine.
+    EndpointInjectRequest { request: EndpointInjectRequest },
+    /// Response for a peer endpoint injection request.
+    EndpointInjectResult { result: EndpointInjectResult },
     /// Diagnostic latency probe. Receivers answer with LatencyProbeAck.
     LatencyProbe {
         sequence: u64,
@@ -817,6 +832,8 @@ impl Message {
             | Message::KeyExtended { .. }
             | Message::GamepadConnected { .. }
             | Message::GamepadDisconnected { .. }
+            | Message::EndpointInjectRequest { .. }
+            | Message::EndpointInjectResult { .. }
             | Message::UsbTransfer { .. }
             | Message::UsbTransferComplete { .. } => Priority::High,
 
@@ -825,6 +842,9 @@ impl Message {
             | Message::MouseWheel { .. }
             | Message::GamepadState { .. }
             | Message::InputDiagnostic { .. }
+            | Message::EndpointEventSubscribe { .. }
+            | Message::EndpointEventSnapshot { .. }
+            | Message::EndpointEventDelta { .. }
             | Message::LatencyProbe { .. }
             | Message::LatencyProbeAck { .. }
             | Message::AudioStreamStart { .. }
@@ -1328,6 +1348,96 @@ mod tests {
                 origin_sequence: None,
             }
         ));
+    }
+
+    #[test]
+    fn endpoint_event_protocol_messages_round_trip() {
+        let endpoint_id = Uuid::nil();
+        let event = EndpointEvent {
+            event_id: 1,
+            sequence: 1,
+            timestamp_ms: 42,
+            endpoint_id,
+            origin_endpoint_id: endpoint_id,
+            device: crate::EndpointDeviceRef {
+                device_id: "keyboard-default".to_string(),
+                instance_id: None,
+                display_name: "Aggregate Keyboard".to_string(),
+                kind: crate::EndpointEventKind::Keyboard,
+                attribution: crate::DeviceAttribution::Aggregate,
+            },
+            direction: crate::EndpointEventDirection::Observed,
+            source: crate::EndpointEventSource::Hardware,
+            kind: crate::EndpointEventKind::Keyboard,
+            payload: crate::EndpointEventPayload::Keyboard {
+                key: "A".to_string(),
+                state: "Pressed".to_string(),
+            },
+            correlation_id: None,
+        };
+
+        for message in [
+            Message::EndpointEventSubscribe {
+                filter: EndpointEventFilter {
+                    endpoint_id: Some(endpoint_id),
+                    kinds: vec![crate::EndpointEventKind::Keyboard],
+                    ..EndpointEventFilter::default()
+                },
+            },
+            Message::EndpointEventSnapshot {
+                events: vec![event.clone()],
+            },
+            Message::EndpointEventDelta { event },
+        ] {
+            let encoded = serde_json::to_string(&message).unwrap();
+            let decoded: Message = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                decoded,
+                Message::EndpointEventSubscribe { .. }
+                    | Message::EndpointEventSnapshot { .. }
+                    | Message::EndpointEventDelta { .. }
+            ));
+            assert_eq!(message.priority(), Priority::Normal);
+        }
+    }
+
+    #[test]
+    fn endpoint_inject_protocol_messages_round_trip() {
+        let request = crate::EndpointInjectRequest {
+            correlation_id: "remote-shift-1".to_string(),
+            device_kind: crate::EndpointEventKind::Keyboard,
+            payload: crate::EndpointEventPayload::Keyboard {
+                key: "ShiftLeft".to_string(),
+                state: "Pressed".to_string(),
+            },
+            mode: crate::EndpointInjectMode::RequireHealthyBackend,
+            timeout_ms: 750,
+        };
+        let result = crate::EndpointInjectResult {
+            correlation_id: request.correlation_id.clone(),
+            target: crate::EndpointInjectTarget::Local,
+            accepted: true,
+            backend_kind: Some(crate::BackendKind::Portable),
+            health: crate::BackendHealth::Healthy,
+            elapsed_ms: 4,
+            loopback_event_id: Some(9),
+            error: None,
+        };
+
+        for message in [
+            Message::EndpointInjectRequest {
+                request: request.clone(),
+            },
+            Message::EndpointInjectResult { result },
+        ] {
+            let encoded = serde_json::to_string(&message).unwrap();
+            let decoded: Message = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                decoded,
+                Message::EndpointInjectRequest { .. } | Message::EndpointInjectResult { .. }
+            ));
+            assert_eq!(message.priority(), Priority::High);
+        }
     }
 
     #[test]

@@ -12,9 +12,10 @@ use tokio_tungstenite::{
 
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
-    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, LayoutGraph, LocalControlDeviceSnapshot,
-    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot, UsbDescriptorProbeResult,
-    UsbDeviceDescriptor,
+    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, EndpointEvent, EndpointEventFilter,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -162,6 +163,35 @@ pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
     }
 }
 
+pub async fn request_endpoint_events(
+    filter: EndpointEventFilter,
+    after_sequence: Option<u64>,
+    limit: Option<u16>,
+) -> Result<Vec<EndpointEvent>> {
+    match send_request(DaemonRequest::EndpointEvents {
+        filter,
+        after_sequence,
+        limit,
+    })
+    .await?
+    {
+        DaemonResponse::EndpointEvents(events) => Ok(events),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_endpoint_inject(
+    target: EndpointInjectTarget,
+    request: EndpointInjectRequest,
+) -> Result<EndpointInjectResult> {
+    match send_request(DaemonRequest::InjectEndpointEvent { target, request }).await? {
+        DaemonResponse::EndpointInjectResult(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
 pub async fn request_usb_devices() -> Result<Vec<UsbDeviceDescriptor>> {
     match send_request(DaemonRequest::ListUsbDevices).await? {
         DaemonResponse::UsbDevices(devices) => Ok(devices),
@@ -207,10 +237,26 @@ pub async fn subscribe_local_controls() -> Result<TcpStream> {
     Ok(stream)
 }
 
+pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(default_ipc_addr())
+        .await
+        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    write_json_line(
+        &mut stream,
+        &DaemonRequest::SubscribeEndpointEvents { filter },
+    )
+    .await?;
+    Ok(stream)
+}
+
 pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonResponse> {
     let response: DaemonResponse = read_json_line(stream).await?;
     match response {
-        DaemonResponse::LocalControls(_) | DaemonResponse::LocalControlEvent(_) => Ok(response),
+        DaemonResponse::LocalControls(_)
+        | DaemonResponse::LocalControlEvent(_)
+        | DaemonResponse::EndpointEvents(_)
+        | DaemonResponse::EndpointEvent(_)
+        | DaemonResponse::EndpointInjectResult(_) => Ok(response),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }
@@ -234,9 +280,11 @@ pub async fn read_local_control_ws_event(
             WsMessage::Text(text) => {
                 let response: DaemonResponse = serde_json::from_str(&text)?;
                 return match response {
-                    DaemonResponse::LocalControls(_) | DaemonResponse::LocalControlEvent(_) => {
-                        Ok(response)
-                    }
+                    DaemonResponse::LocalControls(_)
+                    | DaemonResponse::LocalControlEvent(_)
+                    | DaemonResponse::EndpointEvents(_)
+                    | DaemonResponse::EndpointEvent(_)
+                    | DaemonResponse::EndpointInjectResult(_) => Ok(response),
                     DaemonResponse::Error(message) => anyhow::bail!(message),
                     other => anyhow::bail!("Unexpected daemon websocket response: {:?}", other),
                 };
