@@ -30,10 +30,12 @@
 - daemon 已能执行本地 endpoint 注入，并通过 correlation id 记录注入回环事件。
 - daemon 已能发送远端 endpoint 注入请求，并通过 pending correlation 等待远端注入结果。
 - endpoint 注入执行路径已拆到 `apps/rshare-daemon/src/endpoint_runtime.rs`，避免继续膨胀 daemon 主入口。
+- desktop 设备页已开始消费 endpoint 事件：本机/远端事件会转换成统一监控流，远端节点展开不再只依赖 UI 推导。
+- desktop 的“真实注入测试”已切换到 `inject_endpoint_event`，本机和远端使用同一个注入结果模型。
 
 仍未关闭的边界：
 
-- 远端注入链路已具备协议与 daemon runtime，但仍需要双机实机验证真实平台注入。
+- 远端注入链路已具备协议、daemon runtime 和 desktop 调用入口，但仍需要双机实机验证真实平台注入。
 - 当前注入 payload 只覆盖键盘、鼠标移动、鼠标按键和滚轮；手柄、音频、显示、USB 仍只作为观察事件进入模型。
 - 订阅链路还没有做跨连接断点续传和严格速率限制；现阶段依赖快照 + 增量广播。
 

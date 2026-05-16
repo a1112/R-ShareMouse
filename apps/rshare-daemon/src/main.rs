@@ -5764,6 +5764,7 @@ async fn handle_ipc_client(
             after_sequence,
             limit,
         } => {
+            request_remote_endpoint_events(&network_manager, &state, &filter).await;
             let mut state = state.write().await;
             state.refresh_local_controls_platform();
             DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))

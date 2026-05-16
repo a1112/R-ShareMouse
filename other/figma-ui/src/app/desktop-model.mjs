@@ -259,6 +259,127 @@ function backendDiagnosticLabel(backend) {
   return `${mode} ${health}`;
 }
 
+function endpointPayloadData(payload) {
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  return payload.data && typeof payload.data === "object" ? payload.data : payload;
+}
+
+function endpointEventSource(source, direction) {
+  if (direction === "InjectedLoopback") {
+    return "InjectedLoopback";
+  }
+  if (direction === "Injected") {
+    return "Injected";
+  }
+  switch (source) {
+    case "Driver":
+    case "Test":
+      return "DriverTest";
+    case "VirtualHid":
+      return "VirtualDevice";
+    case "SendInput":
+      return "Injected";
+    case "System":
+      return "System";
+    case "Hardware":
+    case "UserModeHook":
+    case "RemoteMirror":
+    default:
+      return "Hardware";
+  }
+}
+
+function endpointDeviceKind(kind) {
+  switch (kind) {
+    case "Keyboard":
+    case "Mouse":
+    case "Gamepad":
+    case "Display":
+    case "Audio":
+    case "Backend":
+      return kind;
+    default:
+      return "Backend";
+  }
+}
+
+function endpointEventKind(kind, payload) {
+  const payloadKind = payload?.kind;
+  if (kind === "Keyboard") {
+    return "key";
+  }
+  if (payloadKind === "MouseMove") {
+    return "move";
+  }
+  if (payloadKind === "MouseButton") {
+    return "button";
+  }
+  if (payloadKind === "MouseWheel") {
+    return "wheel";
+  }
+  return String(kind ?? "event").toLowerCase();
+}
+
+function endpointEventPayloadFields(event) {
+  const payload = event?.payload;
+  const data = endpointPayloadData(payload);
+  const fields =
+    data.fields && typeof data.fields === "object" && !Array.isArray(data.fields)
+      ? data.fields
+      : data;
+  const result = {};
+  for (const [key, value] of Object.entries(fields ?? {})) {
+    if (value !== undefined && value !== null && typeof value !== "object") {
+      result[key] = String(value);
+    }
+  }
+  if (event?.device?.device_id) {
+    result.device_id = String(event.device.device_id);
+  }
+  if (event?.device?.display_name) {
+    result.device_display_name = String(event.device.display_name);
+  }
+  if (event?.endpoint_id) {
+    result.endpoint_id = String(event.endpoint_id);
+    result.remote_device_id = String(event.endpoint_id);
+  }
+  if (event?.origin_endpoint_id) {
+    result.origin_endpoint_id = String(event.origin_endpoint_id);
+  }
+  if (event?.correlation_id) {
+    result.correlation_id = String(event.correlation_id);
+  }
+  return result;
+}
+
+export function endpointEventToLocalControlEvent(event) {
+  const payload = event?.payload;
+  const fields = endpointEventPayloadFields(event);
+  const deviceKind = endpointDeviceKind(event?.kind);
+  const eventKind = endpointEventKind(event?.kind, payload);
+  const summary =
+    fields.summary ??
+    (deviceKind === "Keyboard"
+      ? `Key ${fields.key ?? "Unknown"} ${fields.state ?? ""}`.trim()
+      : `${deviceKind} ${eventKind}`);
+
+  return {
+    sequence: Number(event?.sequence ?? event?.event_id ?? 0),
+    timestamp_ms: Number(event?.timestamp_ms ?? 0),
+    device_kind: deviceKind,
+    event_kind: eventKind,
+    summary,
+    device_id: event?.endpoint_id ? String(event.endpoint_id) : null,
+    device_instance_id:
+      typeof event?.device?.instance_id === "string" ? event.device.instance_id : null,
+    capture_path: event?.source ? `endpoint:${event.source}` : "endpoint",
+    source: endpointEventSource(event?.source, event?.direction),
+    payload: fields,
+  };
+}
+
 export function buildDeviceTypeSummaries(counts = {}) {
   return [
     { kind: "all", title: "综合", detail: "合并输出" },

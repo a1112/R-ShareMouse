@@ -6,6 +6,7 @@ import {
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildLocalControlsViewModel,
+  endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 
@@ -124,6 +125,45 @@ test("buildLocalControlsViewModel reports old daemon or unavailable daemon safel
   assert.equal(unavailable.gamepad.virtualStatus, "not_implemented");
   assert.equal(unavailable.display.primary.width, 0);
   assert.equal(unavailable.latestEvent, null);
+});
+
+test("endpointEventToLocalControlEvent preserves remote endpoint and physical device identity", () => {
+  const event = endpointEventToLocalControlEvent({
+    event_id: 9,
+    sequence: 9,
+    timestamp_ms: 1234,
+    endpoint_id: "remote-1",
+    origin_endpoint_id: "remote-1",
+    device: {
+      device_id: "keyboard-hid-1",
+      instance_id: "instance-1",
+      display_name: "Remote Mechanical Keyboard",
+      kind: "Keyboard",
+      attribution: "Exact",
+    },
+    direction: "Observed",
+    source: "RemoteMirror",
+    kind: "Keyboard",
+    payload: {
+      kind: "Keyboard",
+      data: {
+        key: "A",
+        state: "Pressed",
+      },
+    },
+    correlation_id: null,
+  });
+
+  assert.equal(event.device_kind, "Keyboard");
+  assert.equal(event.event_kind, "key");
+  assert.equal(event.device_id, "remote-1");
+  assert.equal(event.device_instance_id, "instance-1");
+  assert.equal(event.source, "Hardware");
+  assert.equal(event.payload.key, "A");
+  assert.equal(event.payload.state, "Pressed");
+  assert.equal(event.payload.device_id, "keyboard-hid-1");
+  assert.equal(event.payload.remote_device_id, "remote-1");
+  assert.equal(event.payload.device_display_name, "Remote Mechanical Keyboard");
 });
 
 test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {

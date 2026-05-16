@@ -28,6 +28,7 @@ import {
   buildDesktopViewModel,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
+  endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 import {
@@ -232,6 +233,43 @@ type LocalInputTestResult = {
   message: string;
 };
 
+type EndpointEvent = {
+  event_id: number;
+  sequence: number;
+  timestamp_ms: number;
+  endpoint_id: string;
+  origin_endpoint_id: string;
+  device: {
+    device_id: string;
+    instance_id?: string | null;
+    display_name: string;
+    kind: string;
+    attribution: string;
+  };
+  direction: string;
+  source: string;
+  kind: string;
+  payload: {
+    kind?: string;
+    data?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  correlation_id?: string | null;
+};
+
+type EndpointInjectTarget = "Local" | { Remote: string };
+
+type EndpointInjectResult = {
+  correlation_id: string;
+  target: EndpointInjectTarget;
+  accepted: boolean;
+  backend_kind?: string | null;
+  health: unknown;
+  elapsed_ms: number;
+  loopback_event_id?: number | null;
+  error?: string | null;
+};
+
 type LogEntry = {
   timestamp: string;
   level: string;
@@ -311,6 +349,7 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
+const ENDPOINT_EVENT_POLL_MS = 300;
 const LOCAL_CONTROL_EVENT_FLUSH_MS = 30;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
@@ -327,8 +366,12 @@ const NETWORK_COMMANDS = new Set([
   "get_layout",
   "set_layout",
   "local_controls_state",
+  "endpoint_events_state",
+  "inject_endpoint_event",
   "start_local_controls_stream",
   "stop_local_controls_stream",
+  "start_endpoint_events_stream",
+  "stop_endpoint_events_stream",
   "run_local_input_test",
   "run_remote_latency_test",
   "set_audio_default_output",
@@ -456,6 +499,108 @@ function localInputTestKindForDaemon(
   return "KeyboardShift";
 }
 
+function newCorrelationId(prefix: string) {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function endpointInjectTarget(deviceId?: string | null): EndpointInjectTarget {
+  return deviceId ? { Remote: deviceId } : "Local";
+}
+
+function endpointInjectResultToLocalInputTestResult(
+  result: EndpointInjectResult,
+): LocalInputTestResult {
+  if (result.accepted) {
+    return {
+      status: "Success",
+      message: `Endpoint 注入完成，耗时 ${result.elapsed_ms} ms`,
+    };
+  }
+
+  const error = result.error ?? "Failed";
+  const status: LocalInputTestResult["status"] =
+    error === "PermissionDenied"
+      ? "PermissionDenied"
+      : error === "BackendUnavailable" ||
+          error === "BackendDegraded" ||
+          error === "TargetDisconnected" ||
+          error === "Timeout"
+        ? "BackendUnavailable"
+        : error === "UnsupportedEvent"
+          ? "Unsupported"
+          : "Failed";
+  return {
+    status,
+    message: `Endpoint 注入失败：${error}`,
+  };
+}
+
+function endpointInjectRequests(
+  kind: string,
+  snapshot: LocalControlsSnapshot | null,
+): Array<Record<string, unknown>> {
+  if (kind === "mouse") {
+    return [
+      {
+        correlation_id: newCorrelationId("mouse-move"),
+        device_kind: "Mouse",
+        payload: {
+          kind: "MouseMove",
+          data: {
+            x: Number(snapshot?.mouse?.x ?? 0) + 8,
+            y: Number(snapshot?.mouse?.y ?? 0) + 8,
+            display_id: snapshot?.mouse?.current_display_id ?? null,
+          },
+        },
+        mode: "TestLoopback",
+        timeout_ms: 1000,
+      },
+    ];
+  }
+
+  return [
+    {
+      correlation_id: newCorrelationId("key-press"),
+      device_kind: "Keyboard",
+      payload: {
+        kind: "Keyboard",
+        data: {
+          key: "ShiftLeft",
+          state: "Pressed",
+        },
+      },
+      mode: "TestLoopback",
+      timeout_ms: 1000,
+    },
+    {
+      correlation_id: newCorrelationId("key-release"),
+      device_kind: "Keyboard",
+      payload: {
+        kind: "Keyboard",
+        data: {
+          key: "ShiftLeft",
+          state: "Released",
+        },
+      },
+      mode: "TestLoopback",
+      timeout_ms: 1000,
+    },
+  ];
+}
+
+function endpointEventFilter(endpointId?: string | null) {
+  return {
+    endpoint_id: endpointId ?? null,
+    device_id: null,
+    kinds: [],
+    sources: [],
+    include_loopback: true,
+  };
+}
+
 async function buildNetworkDashboardState(): Promise<DashboardPayload> {
   const status = await daemonRequestValue<unknown>("Status", "Status");
 
@@ -538,6 +683,27 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonRequestValue<T>({ SetLayout: { layout: args?.layout } }, "Ack");
     case "local_controls_state":
       return await daemonRequestValue<T>("LocalControls", "LocalControls");
+    case "endpoint_events_state":
+      return await daemonRequestValue<T>(
+        {
+          EndpointEvents: {
+            filter: args?.filter ?? endpointEventFilter(null),
+            after_sequence: args?.after_sequence ?? args?.afterSequence ?? null,
+            limit: args?.limit ?? 128,
+          },
+        },
+        "EndpointEvents",
+      );
+    case "inject_endpoint_event":
+      return await daemonRequestValue<T>(
+        {
+          InjectEndpointEvent: {
+            target: args?.target ?? "Local",
+            request: args?.request,
+          },
+        },
+        "EndpointInjectResult",
+      );
     case "run_local_input_test":
       return await daemonRequestValue<T>(
         {
@@ -619,6 +785,8 @@ async function invokeNetworkCommand<T = unknown>(
       );
     case "start_local_controls_stream":
     case "stop_local_controls_stream":
+    case "start_endpoint_events_stream":
+    case "stop_endpoint_events_stream":
       return undefined as T;
     default:
       throw new Error(`命令 ${command} 尚未支持网络通信`);
@@ -654,6 +822,20 @@ async function listenLocalControlEvent(
   }
 
   const unlisten = await listenTauriEvent<unknown>("local-control-event", handler);
+  if (!unlisten) {
+    return null;
+  }
+
+  return {
+    stop: unlisten,
+    usesTauriBridge: true,
+  };
+}
+
+async function listenEndpointEvent(
+  handler: (payload: unknown) => void,
+): Promise<LocalControlSubscription | null> {
+  const unlisten = await listenTauriEvent<unknown>("endpoint-event", handler);
   if (!unlisten) {
     return null;
   }
@@ -747,6 +929,11 @@ function applyLocalControlEvent(
         pressed_keys: pressedKeys,
         event_count: Number(snapshot.keyboard.event_count ?? 0) + 1,
       };
+      next.keyboard_devices = upsertEndpointInputDevice(
+        snapshot.keyboard_devices,
+        event,
+        "keyboard",
+      );
     }
   } else if (event.device_kind === "Mouse") {
     const pressedButtons = [...(snapshot.mouse.pressed_buttons ?? [])];
@@ -800,6 +987,11 @@ function applyLocalControlEvent(
         Number(snapshot.mouse.wheel_event_count ?? 0) +
         (event.event_kind === "wheel" ? 1 : 0),
     };
+    next.mouse_devices = upsertEndpointInputDevice(
+      snapshot.mouse_devices,
+      event,
+      "mouse",
+    );
   } else if (event.device_kind === "Gamepad") {
     const gamepadId = optionalNumberPayload(event, "gamepad_id", null);
     if (gamepadId !== null) {
@@ -880,6 +1072,17 @@ function applyLocalControlEvent(
   }
 
   return next;
+}
+
+function applyEndpointEvents(
+  snapshot: LocalControlsSnapshot | null,
+  endpointEvents: EndpointEvent[],
+): LocalControlsSnapshot {
+  const events = safeArray(endpointEvents)
+    .map((event) => endpointEventToLocalControlEvent(event) as LocalControlEvent)
+    .sort((left, right) => left.sequence - right.sequence);
+  const base = snapshot ?? buildEmptyControlSnapshot(null);
+  return events.reduce((next, event) => applyLocalControlEvent(next, event), base);
 }
 
 function mergeLocalControlSnapshot(
@@ -1152,6 +1355,48 @@ function removeString(values: string[], value: string) {
   }
 }
 
+function upsertEndpointInputDevice<T extends NonNullable<LocalControlsSnapshot["keyboard_devices"]>[number]>(
+  devices: T[] | undefined,
+  event: LocalControlEvent,
+  source: "keyboard" | "mouse",
+) {
+  const deviceId = event.payload?.device_id;
+  if (!deviceId) {
+    return devices ?? [];
+  }
+
+  const next = [...(devices ?? [])];
+  const index = next.findIndex(
+    (device) =>
+      normalizeDeviceIdentifier(device.id) === normalizeDeviceIdentifier(deviceId) ||
+      normalizeDeviceIdentifier(device.device_instance_id) ===
+        normalizeDeviceIdentifier(event.device_instance_id),
+  );
+  const existing = index >= 0 ? next[index] : null;
+  const updated = {
+    id: existing?.id ?? deviceId,
+    name:
+      event.payload?.device_display_name ??
+      existing?.name ??
+      (source === "keyboard" ? "Endpoint Keyboard" : "Endpoint Mouse"),
+    source: existing?.source ?? event.capture_path ?? "endpoint",
+    connected: true,
+    driver_detail: existing?.driver_detail ?? event.capture_path ?? null,
+    device_instance_id: existing?.device_instance_id ?? event.device_instance_id ?? null,
+    capture_path: existing?.capture_path ?? event.capture_path ?? null,
+    event_count: Number(existing?.event_count ?? 0) + 1,
+    last_event_ms: event.timestamp_ms,
+    capabilities: existing?.capabilities ?? [],
+  } as T;
+
+  if (index >= 0) {
+    next[index] = updated;
+  } else {
+    next.push(updated);
+  }
+  return next;
+}
+
 function getLayoutDevices(layoutDevices: Array<Record<string, unknown>>): LayoutDevice[] {
   return layoutDevices.map((device) => ({
     id: String(device.id),
@@ -1211,6 +1456,7 @@ export default function App() {
   const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
     loadHiddenMonitorIds,
   );
+  const endpointSequencesRef = useRef<Record<string, number>>({});
 
   const model = buildDesktopViewModel(payload);
   const layoutDevices = getLayoutDevices(model.layout.devices);
@@ -1220,6 +1466,15 @@ export default function App() {
   const chrome = buildPageChrome(page, theme);
   const footerStatus = buildFooterStatus(model);
   const headerMetrics = getHeaderMetrics();
+  const endpointIds = [
+    typeof payload.status === "object" &&
+    payload.status &&
+    "device_id" in payload.status
+      ? String((payload.status as { device_id?: unknown }).device_id ?? "")
+      : "",
+    ...safeArray(payload.devices).map((device) => device.id),
+  ].filter((id, index, values) => id && values.indexOf(id) === index);
+  const endpointPollKey = endpointIds.join("|");
 
   async function refreshDashboard() {
     try {
@@ -1359,6 +1614,111 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!endpointIds.length) {
+      return;
+    }
+
+    let cancelled = false;
+    let subscription: LocalControlSubscription | null = null;
+    let timer: number | null = null;
+
+    const rememberSequences = (events: EndpointEvent[]) => {
+      for (const event of events) {
+        const endpointId = event.endpoint_id;
+        if (!endpointId) {
+          continue;
+        }
+        endpointSequencesRef.current[endpointId] = Math.max(
+          endpointSequencesRef.current[endpointId] ?? 0,
+          Number(event.sequence ?? 0),
+        );
+      }
+    };
+
+    const applyEvents = (events: EndpointEvent[]) => {
+      if (!events.length) {
+        return;
+      }
+      rememberSequences(events);
+      setLocalControls((current) => applyEndpointEvents(current, events));
+      setLocalControlsError(null);
+    };
+
+    const handleEndpointPayload = (payload: unknown) => {
+      if (typeof payload === "string") {
+        setLocalControlsError(payload);
+        return;
+      }
+      const response = payload as {
+        EndpointEvents?: EndpointEvent[];
+        EndpointEvent?: EndpointEvent;
+      };
+      if (response.EndpointEvents) {
+        applyEvents(response.EndpointEvents);
+      } else if (response.EndpointEvent) {
+        applyEvents([response.EndpointEvent]);
+      }
+    };
+
+    async function pollEndpoint(endpointId: string) {
+      const events = await invokeCommand<EndpointEvent[]>("endpoint_events_state", {
+        filter: endpointEventFilter(endpointId),
+        after_sequence: endpointSequencesRef.current[endpointId] ?? null,
+        limit: 128,
+      });
+      applyEvents(events);
+    }
+
+    async function pollAllEndpoints() {
+      for (const endpointId of endpointIds) {
+        if (cancelled) {
+          return;
+        }
+        try {
+          await pollEndpoint(endpointId);
+        } catch (pollError) {
+          if (!cancelled) {
+            setLocalControlsError(String(pollError));
+          }
+        }
+      }
+    }
+
+    async function startEndpointStream() {
+      subscription = await listenEndpointEvent(handleEndpointPayload);
+      if (cancelled) {
+        subscription?.stop();
+        return;
+      }
+      if (subscription?.usesTauriBridge) {
+        await invokeCommand("start_endpoint_events_stream", {
+          filter: endpointEventFilter(null),
+        });
+      }
+    }
+
+    startEndpointStream().catch((streamError) => {
+      if (!cancelled) {
+        setLocalControlsError(String(streamError));
+      }
+    });
+    pollAllEndpoints();
+    timer = window.setInterval(pollAllEndpoints, ENDPOINT_EVENT_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
+      const usesTauriBridge = subscription?.usesTauriBridge ?? false;
+      subscription?.stop();
+      if (usesTauriBridge) {
+        invokeCommand("stop_endpoint_events_stream").catch(() => {});
+      }
+    };
+  }, [endpointPollKey]);
+
+  useEffect(() => {
     if (typeof navigator.getGamepads !== "function") {
       return;
     }
@@ -1424,7 +1784,7 @@ export default function App() {
     }
   }
 
-  async function runLocalInputTest(kind: string) {
+  async function runEndpointInputTest(kind: string, remoteDeviceId?: string) {
     if (confirmingInputTest !== kind) {
       setConfirmingInputTest(kind);
       return;
@@ -1433,8 +1793,19 @@ export default function App() {
     setBusy(true);
     setConfirmingInputTest(null);
     try {
-      const result = await invokeCommand<LocalInputTestResult>("run_local_input_test", { kind });
-      setLocalInputTestResult(result);
+      let latestResult: EndpointInjectResult | null = null;
+      for (const request of endpointInjectRequests(kind, localControls)) {
+        latestResult = await invokeCommand<EndpointInjectResult>("inject_endpoint_event", {
+          target: endpointInjectTarget(remoteDeviceId),
+          request,
+        });
+        if (!latestResult.accepted) {
+          break;
+        }
+      }
+      if (latestResult) {
+        setLocalInputTestResult(endpointInjectResultToLocalInputTestResult(latestResult));
+      }
       await refreshLocalControls();
     } catch (testError) {
       setLocalInputTestResult({
@@ -1446,23 +1817,8 @@ export default function App() {
     }
   }
 
-  async function runRemoteLatencyTest(deviceId: string) {
-    setBusy(true);
-    setConfirmingInputTest(null);
-    try {
-      const result = await invokeCommand<LocalInputTestResult>("run_remote_latency_test", {
-        device_id: deviceId,
-      });
-      setLocalInputTestResult(result);
-      await refreshLocalControls();
-    } catch (testError) {
-      setLocalInputTestResult({
-        status: "Failed",
-        message: String(testError),
-      });
-    } finally {
-      setBusy(false);
-    }
+  async function runRemoteEndpointInputTest(deviceId: string, kind: string) {
+    await runEndpointInputTest(kind, deviceId);
   }
 
   async function saveLayoutFromMonitors(monitors: MonitorData[]) {
@@ -1715,8 +2071,8 @@ export default function App() {
               localControlsError={localControlsError}
               localInputTestResult={localInputTestResult}
               confirmingInputTest={confirmingInputTest}
-              onRunLocalInputTest={runLocalInputTest}
-              onRunRemoteLatencyTest={runRemoteLatencyTest}
+              onRunLocalInputTest={runEndpointInputTest}
+              onRunRemoteEndpointInputTest={runRemoteEndpointInputTest}
               onConnect={connectDevice}
               onDisconnect={disconnectDevice}
               theme={theme}
@@ -1782,7 +2138,7 @@ function DevicesPage({
   localInputTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
-  onRunRemoteLatencyTest,
+  onRunRemoteEndpointInputTest,
   onConnect,
   onDisconnect,
   busy,
@@ -1807,7 +2163,7 @@ function DevicesPage({
   localInputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
-  onRunRemoteLatencyTest: (deviceId: string) => void;
+  onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -1822,7 +2178,7 @@ function DevicesPage({
       localInputTestResult={localInputTestResult}
       confirmingInputTest={confirmingInputTest}
       onRunLocalInputTest={onRunLocalInputTest}
-      onRunRemoteLatencyTest={onRunRemoteLatencyTest}
+      onRunRemoteEndpointInputTest={onRunRemoteEndpointInputTest}
       onConnect={onConnect}
       onDisconnect={onDisconnect}
       busy={busy}
@@ -2041,7 +2397,7 @@ function DevicesPageWithLocalControls({
   localInputTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
-  onRunRemoteLatencyTest,
+  onRunRemoteEndpointInputTest,
   onConnect,
   onDisconnect,
   busy,
@@ -2066,7 +2422,7 @@ function DevicesPageWithLocalControls({
   localInputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
-  onRunRemoteLatencyTest: (deviceId: string) => void;
+  onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -2432,7 +2788,7 @@ function DevicesPageWithLocalControls({
             }
             onRunInputTest={
               selectedRemoteDevice
-                ? () => onRunRemoteLatencyTest(selectedRemoteDevice.id)
+                ? (kind) => onRunRemoteEndpointInputTest(selectedRemoteDevice.id, kind)
                 : onRunLocalInputTest
             }
             theme={theme}
@@ -4457,7 +4813,7 @@ function LocalControlDetail({
     const keyboardState = keyboardMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
     const keyboardEvents = recentEvents.slice(-12).reverse();
     const actionLabel = remoteDevice
-      ? "双端延迟探测"
+      ? "远端真实注入测试"
       : confirmingInputTest === "keyboard"
         ? "再次点击执行 Shift 测试"
         : "真实注入测试";
@@ -4477,7 +4833,7 @@ function LocalControlDetail({
     const mouseState = mouseMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
     const mouseEvents = recentEvents.slice(-12).reverse();
     const actionLabel = remoteDevice
-      ? "双端延迟探测"
+      ? "远端真实注入测试"
       : confirmingInputTest === "mouse"
         ? "再次点击执行移动测试"
         : "真实注入测试";
