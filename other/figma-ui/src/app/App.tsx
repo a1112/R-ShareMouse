@@ -232,6 +232,12 @@ type LocalControlsSnapshot = {
 type LocalInputTestResult = {
   status: "Success" | "PermissionDenied" | "BackendUnavailable" | "Failed" | "Unsupported";
   message: string;
+  kind?: string | null;
+  targetId?: string | null;
+  successCount?: number;
+  totalCount?: number;
+  averageElapsedMs?: number | null;
+  maxElapsedMs?: number | null;
 };
 
 type EndpointEvent = {
@@ -511,17 +517,7 @@ function endpointInjectTarget(deviceId?: string | null): EndpointInjectTarget {
   return deviceId ? { Remote: deviceId } : "Local";
 }
 
-function endpointInjectResultToLocalInputTestResult(
-  result: EndpointInjectResult,
-): LocalInputTestResult {
-  if (result.accepted) {
-    return {
-      status: "Success",
-      message: `Endpoint 注入完成，耗时 ${result.elapsed_ms} ms`,
-    };
-  }
-
-  const error = result.error ?? "Failed";
+function endpointInjectStatusFromError(error: string): LocalInputTestResult["status"] {
   const status: LocalInputTestResult["status"] =
     error === "PermissionDenied"
       ? "PermissionDenied"
@@ -533,9 +529,44 @@ function endpointInjectResultToLocalInputTestResult(
         : error === "UnsupportedEvent"
           ? "Unsupported"
           : "Failed";
+  return status;
+}
+
+function endpointInjectResultsToLocalInputTestResult(
+  results: EndpointInjectResult[],
+  context: { kind: string; targetId?: string | null },
+): LocalInputTestResult {
+  const totalCount = results.length;
+  const successCount = results.filter((result) => result.accepted).length;
+  const latencies = results
+    .map((result) => Number(result.elapsed_ms))
+    .filter((value) => Number.isFinite(value));
+  const averageElapsedMs = latencies.length
+    ? Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)
+    : null;
+  const maxElapsedMs = latencies.length ? Math.max(...latencies) : null;
+  const failed = results.find((result) => !result.accepted);
+  const error = failed?.error ?? (totalCount ? "Failed" : "Timeout");
+  const status: LocalInputTestResult["status"] =
+    totalCount > 0 && successCount === totalCount
+      ? "Success"
+      : endpointInjectStatusFromError(error);
+  const latencyText =
+    averageElapsedMs == null || maxElapsedMs == null
+      ? ""
+      : `，平均 ${averageElapsedMs} ms，最大 ${maxElapsedMs} ms`;
   return {
     status,
-    message: `Endpoint 注入失败：${error}`,
+    message:
+      status === "Success"
+        ? `Endpoint 注入完成：${successCount}/${totalCount} 成功${latencyText}`
+        : `Endpoint 注入失败：${error}（${successCount}/${totalCount} 成功${latencyText}）`,
+    kind: context.kind,
+    targetId: context.targetId ?? null,
+    successCount,
+    totalCount,
+    averageElapsedMs,
+    maxElapsedMs,
   };
 }
 
@@ -1794,24 +1825,30 @@ export default function App() {
     setBusy(true);
     setConfirmingInputTest(null);
     try {
-      let latestResult: EndpointInjectResult | null = null;
+      const results: EndpointInjectResult[] = [];
       for (const request of endpointInjectRequests(kind, localControls)) {
-        latestResult = await invokeCommand<EndpointInjectResult>("inject_endpoint_event", {
+        const result = await invokeCommand<EndpointInjectResult>("inject_endpoint_event", {
           target: endpointInjectTarget(remoteDeviceId),
           request,
         });
-        if (!latestResult.accepted) {
+        results.push(result);
+        if (!result.accepted) {
           break;
         }
       }
-      if (latestResult) {
-        setLocalInputTestResult(endpointInjectResultToLocalInputTestResult(latestResult));
-      }
+      setLocalInputTestResult(
+        endpointInjectResultsToLocalInputTestResult(results, {
+          kind,
+          targetId: remoteDeviceId ?? null,
+        }),
+      );
       await refreshLocalControls();
     } catch (testError) {
       setLocalInputTestResult({
         status: "Failed",
         message: String(testError),
+        kind,
+        targetId: remoteDeviceId ?? null,
       });
     } finally {
       setBusy(false);
@@ -4878,6 +4915,14 @@ function LocalControlDetail({
   const recentEvents = attributionFallback
     ? selectedControlEvents(snapshot, kind, undefined)
     : scopedEvents;
+  const scopedInputTestResult =
+    inputTestResult &&
+    inputTestResult.kind === kind &&
+    (remoteDevice
+      ? inputTestResult.targetId === remoteDevice.id
+      : !inputTestResult.targetId)
+      ? inputTestResult
+      : null;
   if (kind === "keyboard") {
     const keyboardState = keyboardMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
     const keyboardEvents = recentEvents.slice(-12).reverse();
@@ -4894,7 +4939,7 @@ function LocalControlDetail({
             <DeviceAttributionNotice kind="键盘" theme={theme} />
           ) : null}
         </div>
-        <div className="grid min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_420px]"><InputTestAction label={actionLabel} result={inputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("keyboard")} theme={theme} /><KeyboardEventLog events={keyboardEvents} theme={theme} /></div>
+        <div className="grid min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_420px]"><InputTestAction label={actionLabel} result={scopedInputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("keyboard")} theme={theme} /><KeyboardEventLog events={keyboardEvents} theme={theme} /></div>
       </div>
     );
   }
@@ -4914,7 +4959,7 @@ function LocalControlDetail({
             <DeviceAttributionNotice kind="鼠标" theme={theme} />
           ) : null}
         </div>
-        <div className="flex min-h-0 flex-col gap-3"><MouseEventLog events={mouseEvents} theme={theme} /><InputTestAction label={actionLabel} result={inputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("mouse")} theme={theme} /></div>
+        <div className="flex min-h-0 flex-col gap-3"><MouseEventLog events={mouseEvents} theme={theme} /><InputTestAction label={actionLabel} result={scopedInputTestResult} disabled={remoteDevice ? false : !snapshot} onClick={() => onRunInputTest("mouse")} theme={theme} /></div>
       </div>
     );
   }
@@ -6446,6 +6491,28 @@ function InputTestAction({
       <div className="mt-2 truncate text-xs" style={{ color: theme.textMuted }} title={result ? `${result.status}: ${result.message}` : "尚未执行"}>
         {result ? `${result.status}: ${result.message}` : "尚未执行"}
       </div>
+      {result ? (
+        <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+          <div className="rounded-md px-2 py-1.5" style={{ background: "rgba(255,255,255,0.045)" }}>
+            <div style={{ color: theme.textMuted }}>平均延时</div>
+            <div className="font-semibold" style={{ color: theme.text }}>
+              {result.averageElapsedMs == null ? "-" : `${result.averageElapsedMs} ms`}
+            </div>
+          </div>
+          <div className="rounded-md px-2 py-1.5" style={{ background: "rgba(255,255,255,0.045)" }}>
+            <div style={{ color: theme.textMuted }}>最大延时</div>
+            <div className="font-semibold" style={{ color: theme.text }}>
+              {result.maxElapsedMs == null ? "-" : `${result.maxElapsedMs} ms`}
+            </div>
+          </div>
+          <div className="rounded-md px-2 py-1.5" style={{ background: "rgba(255,255,255,0.045)" }}>
+            <div style={{ color: theme.textMuted }}>注入</div>
+            <div className="font-semibold" style={{ color: theme.text }}>
+              {result.successCount ?? 0}/{result.totalCount ?? 0}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

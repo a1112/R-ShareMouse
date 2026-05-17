@@ -260,6 +260,35 @@ fn build_doctor_checks(
     });
     let layout_nodes = layout.map_or(0, |layout| layout.nodes.len());
 
+    let inject_success_count = inject_results
+        .iter()
+        .filter(|result| result.accepted)
+        .count();
+    let inject_detail = if inject_requested {
+        if inject_results.is_empty() && connected_count == 0 {
+            "未发现已连接远端，未执行注入探测".to_string()
+        } else if inject_results.is_empty() {
+            "远端注入探测未返回结果".to_string()
+        } else {
+            match inject_latency_summary(inject_results) {
+                Some((average_ms, max_ms)) => format!(
+                    "注入结果 {}/{} 成功，平均 {} ms，最大 {} ms",
+                    inject_success_count,
+                    inject_results.len(),
+                    average_ms,
+                    max_ms
+                ),
+                None => format!(
+                    "注入结果 {}/{} 成功",
+                    inject_success_count,
+                    inject_results.len()
+                ),
+            }
+        }
+    } else {
+        "未运行注入探测；使用 --inject 执行 Shift loopback".to_string()
+    };
+
     vec![
         DoctorCheck {
             key: "ipc",
@@ -359,20 +388,27 @@ fn build_doctor_checks(
             } else {
                 CheckState::Block
             },
-            detail: if inject_requested {
-                format!(
-                    "注入结果 {}/{} 成功",
-                    inject_results
-                        .iter()
-                        .filter(|result| result.accepted)
-                        .count(),
-                    inject_results.len()
-                )
-            } else {
-                "未运行注入探测；使用 --inject 执行 Shift loopback".to_string()
-            },
+            detail: inject_detail,
         },
     ]
+}
+
+fn inject_latency_summary(results: &[EndpointInjectResult]) -> Option<(u64, u64)> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let total = results
+        .iter()
+        .map(|result| result.elapsed_ms as u128)
+        .sum::<u128>();
+    let average = (total / results.len() as u128) as u64;
+    let max = results
+        .iter()
+        .map(|result| result.elapsed_ms)
+        .max()
+        .unwrap_or_default();
+    Some((average, max))
 }
 
 fn print_check(check: &DoctorCheck) {
@@ -444,6 +480,19 @@ mod tests {
         }
     }
 
+    fn endpoint_inject_result(target: DeviceId, elapsed_ms: u64) -> EndpointInjectResult {
+        EndpointInjectResult {
+            correlation_id: format!("test-{elapsed_ms}"),
+            target: EndpointInjectTarget::Remote(target),
+            accepted: true,
+            backend_kind: Some(rshare_core::BackendKind::Portable),
+            health: BackendHealth::Healthy,
+            elapsed_ms,
+            loopback_event_id: Some(elapsed_ms),
+            error: None,
+        }
+    }
+
     #[test]
     fn doctor_checks_pass_when_remote_events_and_inject_loopback_exist() {
         let local = Uuid::new_v4();
@@ -508,5 +557,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![CheckState::Warn, CheckState::Warn],
         );
+    }
+
+    #[test]
+    fn doctor_checks_report_remote_inject_latency_summary() {
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let checks = build_doctor_checks(
+            Some(&status(local)),
+            None,
+            &[device(remote, true)],
+            None,
+            Some(&LocalControlDeviceSnapshot::default()),
+            &[],
+            true,
+            &[
+                endpoint_inject_result(remote, 12),
+                endpoint_inject_result(remote, 18),
+            ],
+        );
+
+        let remote_inject = checks
+            .iter()
+            .find(|check| check.key == "remote-inject")
+            .expect("remote inject check");
+        assert_eq!(remote_inject.state, CheckState::Pass);
+        assert!(remote_inject.detail.contains("2/2 成功"));
+        assert!(remote_inject.detail.contains("平均 15 ms"));
+        assert!(remote_inject.detail.contains("最大 18 ms"));
+    }
+
+    #[test]
+    fn doctor_checks_explain_missing_remote_inject_probe() {
+        let local = Uuid::new_v4();
+        let checks = build_doctor_checks(
+            Some(&status(local)),
+            None,
+            &[],
+            None,
+            Some(&LocalControlDeviceSnapshot::default()),
+            &[],
+            true,
+            &[],
+        );
+
+        let remote_inject = checks
+            .iter()
+            .find(|check| check.key == "remote-inject")
+            .expect("remote inject check");
+        assert_eq!(remote_inject.state, CheckState::Block);
+        assert_eq!(remote_inject.detail, "未发现已连接远端，未执行注入探测");
     }
 }

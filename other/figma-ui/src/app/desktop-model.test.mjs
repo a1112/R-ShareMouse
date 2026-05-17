@@ -6,6 +6,7 @@ import {
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
+  buildEndpointInjectSummary,
   buildLocalControlsViewModel,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
@@ -241,6 +242,25 @@ test("buildEndpointAcceptance keeps remote inject pending until a test or loopba
       ["endpoint-backend", "pass"],
     ],
   );
+});
+
+test("buildEndpointInjectSummary reports scoped latency for the selected device page", () => {
+  const summary = buildEndpointInjectSummary(
+    [
+      { accepted: true, elapsed_ms: 12 },
+      { accepted: true, elapsed_ms: 18 },
+    ],
+    { kind: "keyboard", targetId: "remote-1" },
+  );
+
+  assert.equal(summary.status, "Success");
+  assert.equal(summary.kind, "keyboard");
+  assert.equal(summary.targetId, "remote-1");
+  assert.equal(summary.successCount, 2);
+  assert.equal(summary.totalCount, 2);
+  assert.equal(summary.averageElapsedMs, 15);
+  assert.equal(summary.maxElapsedMs, 18);
+  assert.equal(summary.message, "Endpoint 注入完成：2/2 成功，平均 15 ms，最大 18 ms");
 });
 
 test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {

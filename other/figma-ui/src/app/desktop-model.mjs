@@ -469,6 +469,61 @@ export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestR
   };
 }
 
+function endpointInjectStatusFromError(error) {
+  if (error === "PermissionDenied") {
+    return "PermissionDenied";
+  }
+  if (
+    error === "BackendUnavailable" ||
+    error === "BackendDegraded" ||
+    error === "TargetDisconnected" ||
+    error === "Timeout"
+  ) {
+    return "BackendUnavailable";
+  }
+  if (error === "UnsupportedEvent") {
+    return "Unsupported";
+  }
+  return "Failed";
+}
+
+export function buildEndpointInjectSummary(results = [], context = {}) {
+  const safeResults = Array.isArray(results) ? results : [];
+  const totalCount = safeResults.length;
+  const successCount = safeResults.filter((result) => result?.accepted).length;
+  const latencies = safeResults
+    .map((result) => Number(result?.elapsed_ms))
+    .filter((value) => Number.isFinite(value));
+  const averageElapsedMs = latencies.length
+    ? Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)
+    : null;
+  const maxElapsedMs = latencies.length ? Math.max(...latencies) : null;
+  const failed = safeResults.find((result) => !result?.accepted);
+  const status =
+    totalCount > 0 && successCount === totalCount
+      ? "Success"
+      : endpointInjectStatusFromError(failed?.error ?? (totalCount ? "Failed" : "Timeout"));
+  const latencyText =
+    averageElapsedMs == null || maxElapsedMs == null
+      ? ""
+      : `，平均 ${averageElapsedMs} ms，最大 ${maxElapsedMs} ms`;
+  const message =
+    status === "Success"
+      ? `Endpoint 注入完成：${successCount}/${totalCount} 成功${latencyText}`
+      : `Endpoint 注入失败：${failed?.error ?? "没有收到注入结果"}（${successCount}/${totalCount} 成功${latencyText}）`;
+
+  return {
+    status,
+    message,
+    kind: context.kind ?? null,
+    targetId: context.targetId ?? null,
+    successCount,
+    totalCount,
+    averageElapsedMs,
+    maxElapsedMs,
+  };
+}
+
 export function buildDeviceTypeSummaries(counts = {}) {
   return [
     { kind: "all", title: "综合", detail: "合并输出" },
