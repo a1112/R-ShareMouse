@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     emit_build_metadata();
-    tauri_build::build();
 }
 
 fn emit_build_metadata() {

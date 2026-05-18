@@ -9,6 +9,28 @@ mod commands;
 mod config;
 mod output;
 
+const UNKNOWN_BUILD_VALUE: &str = "unknown";
+const CLI_BUILD_INFO_PREFIX: &str = "rshare-build:";
+
+fn build_metadata() -> String {
+    let git_hash = option_env!("RSHARE_BUILD_GIT_HASH").unwrap_or(UNKNOWN_BUILD_VALUE);
+    let build_timestamp = option_env!("RSHARE_BUILD_TIMESTAMP").unwrap_or(UNKNOWN_BUILD_VALUE);
+    let dirty = option_env!("RSHARE_BUILD_DIRTY").unwrap_or("");
+    let dirty_suffix = if dirty.is_empty() {
+        String::new()
+    } else {
+        format!(" ({dirty})")
+    };
+
+    format!(
+        "{CLI_BUILD_INFO_PREFIX} version={} commit={} time={}{}",
+        env!("CARGO_PKG_VERSION"),
+        git_hash,
+        build_timestamp,
+        dirty_suffix
+    )
+}
+
 use commands::{config_cmd, devices, discover, doctor, start, stop, usb};
 use config_cmd::ConfigCommands;
 
@@ -143,6 +165,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    eprintln!("{}", build_metadata());
     let cli = Cli::parse();
 
     // Setup tracing

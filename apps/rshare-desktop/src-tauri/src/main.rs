@@ -17,6 +17,28 @@ use tauri::{
 };
 use tauri_plugin_single_instance::init;
 
+const UNKNOWN_BUILD_VALUE: &str = "unknown";
+const RSHARE_BUILD_INFO_PREFIX: &str = "rshare-build:";
+
+fn build_metadata() -> String {
+    let git_hash = option_env!("RSHARE_BUILD_GIT_HASH").unwrap_or(UNKNOWN_BUILD_VALUE);
+    let build_timestamp = option_env!("RSHARE_BUILD_TIMESTAMP").unwrap_or(UNKNOWN_BUILD_VALUE);
+    let dirty = option_env!("RSHARE_BUILD_DIRTY").unwrap_or("");
+    let dirty_suffix = if dirty.is_empty() {
+        String::new()
+    } else {
+        format!(" ({dirty})")
+    };
+
+    format!(
+        "{RSHARE_BUILD_INFO_PREFIX} version={} commit={} time={}{}",
+        env!("CARGO_PKG_VERSION"),
+        git_hash,
+        build_timestamp,
+        dirty_suffix
+    )
+}
+
 type BoxFutureResult<'a, T> = Pin<Box<dyn Future<Output = AnyhowResult<T>> + Send + 'a>>;
 const TRAY_ICON_ID: &str = "main-tray";
 const TRAY_STATUS_REFRESH_MS: u64 = 2_000;
@@ -541,6 +563,7 @@ fn build_acceptance(
 }
 
 fn main() {
+    eprintln!("{}", build_metadata());
     tauri::Builder::default()
         .plugin(init(|app, _args, _cwd| {
             // Focus the existing window when a second instance is launched
