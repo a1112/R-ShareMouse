@@ -3,6 +3,7 @@
 //! This crate contains the core business logic for the R-ShareMouse application,
 //! including protocol definitions, device management, configuration, and clipboard handling.
 
+pub mod capabilities;
 pub mod clipboard;
 pub mod config;
 pub mod daemon_client;
@@ -39,6 +40,12 @@ pub use config::{FeatureConfig, GamepadConfig, GamepadRoutingMode};
 
 // Re-exports from clipboard
 pub use clipboard::ClipboardContent;
+
+// Re-exports from capability registry
+pub use capabilities::{
+    local_capability_snapshots, remote_capability_snapshots, CapabilityRegistrySnapshot,
+    CapabilityState, DeviceCapabilitySnapshot, EndpointCapabilityKind, EndpointCapabilitySnapshot,
+};
 
 // Re-exports from local daemon IPC
 pub use ipc::{

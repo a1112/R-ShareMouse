@@ -17,13 +17,20 @@ pub async fn execute(detailed: bool) -> Result<()> {
 
     match rshare_core::daemon_client::request_status().await {
         Ok(status) => {
+            let capabilities = if detailed {
+                rshare_core::daemon_client::request_capabilities(None)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
             status_ok("Service Status: Running");
             kv("PID", &status.pid.to_string());
             kv("Device", &status.device_name);
             kv("Hostname", &status.hostname);
 
             if detailed {
-                print_detailed_status(&status);
+                print_detailed_status(&status, capabilities.as_ref());
             }
         }
         Err(err) => {
@@ -38,7 +45,10 @@ pub async fn execute(detailed: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_detailed_status(status: &rshare_core::ServiceStatusSnapshot) {
+fn print_detailed_status(
+    status: &rshare_core::ServiceStatusSnapshot,
+    capabilities: Option<&rshare_core::CapabilityRegistrySnapshot>,
+) {
     println!();
     println!("{}", "Network".bold());
     kv("Listening", &status.bind_address);
@@ -108,4 +118,35 @@ fn print_detailed_status(status: &rshare_core::ServiceStatusSnapshot) {
     println!("{}", "Identity".bold());
     kv("Device ID", &status.device_id.to_string());
     kv("Healthy", if status.healthy { "yes" } else { "no" });
+
+    println!();
+    println!("{}", "Capabilities".bold());
+    match capabilities {
+        Some(registry) => {
+            for device in &registry.devices {
+                let local_suffix = if device.device_id == registry.local_device_id {
+                    " (local)"
+                } else {
+                    ""
+                };
+                kv(
+                    &format!("{}{}", device.device_name, local_suffix),
+                    &device
+                        .capabilities
+                        .iter()
+                        .map(|capability| {
+                            let reason = capability
+                                .health_reason
+                                .as_deref()
+                                .map(|value| format!(": {value}"))
+                                .unwrap_or_default();
+                            format!("{:?}={:?}{reason}", capability.kind, capability.state)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+        None => kv("Registry", "unavailable"),
+    }
 }

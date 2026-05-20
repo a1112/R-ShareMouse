@@ -12,10 +12,10 @@ use tokio_tungstenite::{
 
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
-    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, EndpointEvent, EndpointEventFilter,
-    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
-    UsbDescriptorProbeResult, UsbDeviceDescriptor,
+    CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
+    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestRequest,
+    LocalInputTestResult, ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDeviceDescriptor,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -38,6 +38,16 @@ pub async fn request_status() -> Result<ServiceStatusSnapshot> {
 pub async fn request_devices() -> Result<Vec<DaemonDeviceSnapshot>> {
     match send_request(DaemonRequest::Devices).await? {
         DaemonResponse::Devices(devices) => Ok(devices),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_capabilities(
+    device_id: Option<DeviceId>,
+) -> Result<CapabilityRegistrySnapshot> {
+    match send_request(DaemonRequest::Capabilities { device_id }).await? {
+        DaemonResponse::Capabilities(snapshot) => Ok(snapshot),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }
