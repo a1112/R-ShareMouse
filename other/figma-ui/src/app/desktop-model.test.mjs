@@ -8,6 +8,7 @@ import {
   buildEndpointAcceptance,
   buildEndpointInjectSummary,
   buildLocalControlsViewModel,
+  buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
@@ -261,6 +262,83 @@ test("buildEndpointInjectSummary reports scoped latency for the selected device 
   assert.equal(summary.averageElapsedMs, 15);
   assert.equal(summary.maxElapsedMs, 18);
   assert.equal(summary.message, "Endpoint 注入完成：2/2 成功，平均 15 ms，最大 18 ms");
+});
+
+test("buildRemoteLatencySummary extracts the latest RTT for a selected remote device", () => {
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 10,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to old: 44 ms RTT / ~22 ms one-way",
+          device_id: "remote-1",
+          source: "System",
+          payload: {
+            target_device_id: "remote-1",
+            latency_ms: "44",
+            estimated_one_way_ms: "22",
+            raw_round_trip_ms: "50",
+            remote_processing_ms: "6",
+            direction: "origin_to_endpoint",
+          },
+        },
+        {
+          sequence: 11,
+          timestamp_ms: 2000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 30 ms RTT / ~15 ms one-way",
+          device_id: "remote-1",
+          source: "System",
+          payload: {
+            origin_device_id: "remote-1",
+            latency_ms: "30",
+            estimated_one_way_ms: "15",
+            raw_round_trip_ms: "33",
+            remote_processing_ms: "3",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    "remote-1",
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 30);
+  assert.equal(summary.estimatedOneWayMs, 15);
+  assert.equal(summary.rawRoundTripMs, 33);
+  assert.equal(summary.remoteProcessingMs, 3);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary reports pending probe when ACK has not arrived", () => {
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 5,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_probe_sent",
+          summary: "Dual-end latency probe sent",
+          device_id: "remote-2",
+          source: "System",
+          payload: {
+            target_device_id: "remote-2",
+          },
+        },
+      ],
+    },
+    "remote-2",
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.message, "等待远端 latency ACK");
 });
 
 test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {

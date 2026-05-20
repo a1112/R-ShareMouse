@@ -29,6 +29,7 @@ import {
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
+  buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
@@ -238,6 +239,17 @@ type LocalInputTestResult = {
   totalCount?: number;
   averageElapsedMs?: number | null;
   maxElapsedMs?: number | null;
+};
+
+type RemoteLatencySummary = {
+  state: "idle" | "pending" | "pass";
+  message: string;
+  networkRoundTripMs: number | null;
+  estimatedOneWayMs: number | null;
+  rawRoundTripMs: number | null;
+  remoteProcessingMs: number | null;
+  direction: string | null;
+  timestampMs: number | null;
 };
 
 type EndpointEvent = {
@@ -1483,6 +1495,8 @@ export default function App() {
   const [localControlsError, setLocalControlsError] = useState<string | null>(null);
   const [localInputTestResult, setLocalInputTestResult] =
     useState<LocalInputTestResult | null>(null);
+  const [remoteLatencyTestResult, setRemoteLatencyTestResult] =
+    useState<LocalInputTestResult | null>(null);
   const [confirmingInputTest, setConfirmingInputTest] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
@@ -1859,6 +1873,28 @@ export default function App() {
     await runEndpointInputTest(kind, deviceId);
   }
 
+  async function runRemoteLatencyProbe(deviceId: string) {
+    setBusy(true);
+    try {
+      const result = await invokeCommand<LocalInputTestResult>("run_remote_latency_test", {
+        device_id: deviceId,
+      });
+      setRemoteLatencyTestResult({
+        ...result,
+        targetId: deviceId,
+      });
+      await refreshLocalControls();
+    } catch (latencyError) {
+      setRemoteLatencyTestResult({
+        status: "Failed",
+        message: String(latencyError),
+        targetId: deviceId,
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveLayoutFromMonitors(monitors: MonitorData[]) {
     const rememberedLayout = model.layout.remembered;
     if (!rememberedLayout) {
@@ -2108,9 +2144,11 @@ export default function App() {
               localControls={localControls}
               localControlsError={localControlsError}
               localInputTestResult={localInputTestResult}
+              remoteLatencyTestResult={remoteLatencyTestResult}
               confirmingInputTest={confirmingInputTest}
               onRunLocalInputTest={runEndpointInputTest}
               onRunRemoteEndpointInputTest={runRemoteEndpointInputTest}
+              onRunRemoteLatencyTest={runRemoteLatencyProbe}
               onConnect={connectDevice}
               onDisconnect={disconnectDevice}
               theme={theme}
@@ -2174,9 +2212,11 @@ function DevicesPage({
   localControls,
   localControlsError,
   localInputTestResult,
+  remoteLatencyTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
   onRunRemoteEndpointInputTest,
+  onRunRemoteLatencyTest,
   onConnect,
   onDisconnect,
   busy,
@@ -2199,9 +2239,11 @@ function DevicesPage({
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
+  remoteLatencyTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
   onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
+  onRunRemoteLatencyTest: (deviceId: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -2214,9 +2256,11 @@ function DevicesPage({
       localControls={localControls}
       localControlsError={localControlsError}
       localInputTestResult={localInputTestResult}
+      remoteLatencyTestResult={remoteLatencyTestResult}
       confirmingInputTest={confirmingInputTest}
       onRunLocalInputTest={onRunLocalInputTest}
       onRunRemoteEndpointInputTest={onRunRemoteEndpointInputTest}
+      onRunRemoteLatencyTest={onRunRemoteLatencyTest}
       onConnect={onConnect}
       onDisconnect={onDisconnect}
       busy={busy}
@@ -2433,9 +2477,11 @@ function DevicesPageWithLocalControls({
   localControls,
   localControlsError,
   localInputTestResult,
+  remoteLatencyTestResult,
   confirmingInputTest,
   onRunLocalInputTest,
   onRunRemoteEndpointInputTest,
+  onRunRemoteLatencyTest,
   onConnect,
   onDisconnect,
   busy,
@@ -2458,9 +2504,11 @@ function DevicesPageWithLocalControls({
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
+  remoteLatencyTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
   onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
+  onRunRemoteLatencyTest: (deviceId: string) => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -2520,6 +2568,13 @@ function DevicesPageWithLocalControls({
     selectedMonitorDeviceId === "local"
       ? null
       : safeDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
+  const selectedRemoteLatency = selectedRemoteDevice
+    ? (buildRemoteLatencySummary(localControls, selectedRemoteDevice.id) as RemoteLatencySummary)
+    : null;
+  const scopedRemoteLatencyTestResult =
+    remoteLatencyTestResult && selectedRemoteDevice?.id === remoteLatencyTestResult.targetId
+      ? remoteLatencyTestResult
+      : null;
   const remoteDeviceIds = new Set(safeDevices.map((device) => device.id));
   const monitorSnapshot = selectedRemoteDevice
     ? buildRemoteMonitorSnapshot(localControls, selectedRemoteDevice.id)
@@ -2808,6 +2863,16 @@ function DevicesPageWithLocalControls({
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+        {selectedRemoteDevice ? (
+          <RemoteLatencyPanel
+            device={selectedRemoteDevice}
+            summary={selectedRemoteLatency}
+            result={scopedRemoteLatencyTestResult}
+            busy={busy}
+            onRun={() => onRunRemoteLatencyTest(selectedRemoteDevice.id)}
+            theme={theme}
+          />
+        ) : null}
         <div className="min-h-0 flex-1 overflow-hidden">
           {selectedPage === "all" ? (
             <AllDevicesOverview
@@ -3009,6 +3074,78 @@ function EndpointAcceptanceStrip({
       >
         {acceptance.ready ? "可开始边缘切换" : "待完成端侧闭环"}
       </span>
+    </div>
+  );
+}
+
+function latencyMetricValue(value: number | null | undefined) {
+  return value == null ? "-" : `${value} ms`;
+}
+
+function RemoteLatencyPanel({
+  device,
+  summary,
+  result,
+  busy,
+  onRun,
+  theme,
+}: {
+  device: {
+    id: string;
+    name: string;
+    hostname: string;
+    connected: boolean;
+  };
+  summary: RemoteLatencySummary | null;
+  result: LocalInputTestResult | null;
+  busy: boolean;
+  onRun: () => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const state = summary?.state ?? "idle";
+  const tone =
+    state === "pass" ? theme.success : state === "pending" ? "#d6a64b" : theme.textMuted;
+  return (
+    <div
+      className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2 text-xs"
+      style={{
+        borderBottom: `1px solid ${theme.border}`,
+        background: theme.frame,
+      }}
+    >
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: tone }} />
+          <span className="truncate font-medium" style={{ color: theme.text }}>
+            {device.name} · 网络与端侧延时
+          </span>
+          <span className="shrink-0" style={{ color: theme.textMuted }}>
+            {device.hostname}
+          </span>
+        </div>
+        <div className="mt-1 flex flex-wrap gap-2" style={{ color: theme.textMuted }}>
+          <span>RTT {latencyMetricValue(summary?.networkRoundTripMs)}</span>
+          <span>单向约 {latencyMetricValue(summary?.estimatedOneWayMs)}</span>
+          <span>原始 {latencyMetricValue(summary?.rawRoundTripMs)}</span>
+          <span>远端处理 {latencyMetricValue(summary?.remoteProcessingMs)}</span>
+          <span>{summary?.message ?? "尚未运行网络延时探测"}</span>
+          {result ? <span>最近命令：{result.message}</span> : null}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="rounded-md px-3 py-2 text-xs transition"
+        style={{
+          border: `1px solid ${device.connected ? theme.accent : theme.border}`,
+          background: device.connected ? theme.accentSoft : "rgba(255,255,255,0.035)",
+          color: device.connected ? theme.text : theme.textMuted,
+        }}
+        disabled={busy || !device.connected}
+        onClick={onRun}
+        title={device.connected ? "发送 latency probe 到当前远端" : "先连接远端设备"}
+      >
+        网络延时探测
+      </button>
     </div>
   );
 }

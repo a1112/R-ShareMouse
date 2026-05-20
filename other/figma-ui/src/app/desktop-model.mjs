@@ -524,6 +524,99 @@ export function buildEndpointInjectSummary(results = [], context = {}) {
   };
 }
 
+function numberOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function remoteLatencyEventTarget(event) {
+  return (
+    event?.payload?.target_device_id ??
+    event?.payload?.origin_device_id ??
+    event?.device_id ??
+    null
+  );
+}
+
+function isRemoteLatencyAck(event) {
+  return (
+    event?.device_kind === "Backend" &&
+    (event?.event_kind === "latency_probe_ack" ||
+      event?.event_kind === "latency_endpoint_switch_ack")
+  );
+}
+
+function isRemoteLatencySent(event) {
+  return (
+    event?.device_kind === "Backend" &&
+    (event?.event_kind === "latency_probe_sent" ||
+      event?.event_kind === "latency_endpoint_probe_sent" ||
+      event?.event_kind === "latency_endpoint_switch_sent")
+  );
+}
+
+function sortNewestEvent(left, right) {
+  const leftTime = Number(left?.timestamp_ms ?? 0);
+  const rightTime = Number(right?.timestamp_ms ?? 0);
+  if (leftTime !== rightTime) {
+    return rightTime - leftTime;
+  }
+  return Number(right?.sequence ?? 0) - Number(left?.sequence ?? 0);
+}
+
+export function buildRemoteLatencySummary(snapshot, deviceId) {
+  const events = [...(snapshot?.recent_events ?? [])].filter(
+    (event) => remoteLatencyEventTarget(event) === deviceId,
+  );
+  const ack = events.filter(isRemoteLatencyAck).sort(sortNewestEvent)[0];
+  if (ack) {
+    const payload = ack.payload ?? {};
+    const networkRoundTripMs = numberOrNull(
+      payload.network_round_trip_ms ?? payload.latency_ms,
+    );
+    const estimatedOneWayMs = numberOrNull(payload.estimated_one_way_ms);
+    const rawRoundTripMs = numberOrNull(
+      payload.raw_round_trip_ms ?? payload.raw_latency_ms,
+    );
+    const remoteProcessingMs = numberOrNull(payload.remote_processing_ms);
+    return {
+      state: "pass",
+      message: ack.summary ?? "Latency ACK received",
+      networkRoundTripMs,
+      estimatedOneWayMs,
+      rawRoundTripMs,
+      remoteProcessingMs,
+      direction: payload.direction ?? null,
+      timestampMs: Number(ack.timestamp_ms ?? 0),
+    };
+  }
+
+  const sent = events.filter(isRemoteLatencySent).sort(sortNewestEvent)[0];
+  if (sent) {
+    return {
+      state: "pending",
+      message: "等待远端 latency ACK",
+      networkRoundTripMs: null,
+      estimatedOneWayMs: null,
+      rawRoundTripMs: null,
+      remoteProcessingMs: null,
+      direction: sent.payload?.direction ?? null,
+      timestampMs: Number(sent.timestamp_ms ?? 0),
+    };
+  }
+
+  return {
+    state: "idle",
+    message: "尚未运行网络延时探测",
+    networkRoundTripMs: null,
+    estimatedOneWayMs: null,
+    rawRoundTripMs: null,
+    remoteProcessingMs: null,
+    direction: null,
+    timestampMs: null,
+  };
+}
+
 export function buildDeviceTypeSummaries(counts = {}) {
   return [
     { kind: "all", title: "综合", detail: "合并输出" },
