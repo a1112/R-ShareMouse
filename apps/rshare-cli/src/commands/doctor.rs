@@ -3,10 +3,11 @@
 use anyhow::Result;
 use colored::Colorize;
 use rshare_core::{
-    daemon_client, BackendHealth, DaemonDeviceSnapshot, DeviceId, EndpointEvent,
-    EndpointEventDirection, EndpointEventFilter, EndpointEventKind, EndpointEventPayload,
-    EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    LayoutGraph, LocalControlDeviceSnapshot, ServiceStatusSnapshot,
+    daemon_client, BackendHealth, CapabilityRegistrySnapshot, CapabilityState,
+    DaemonDeviceSnapshot, DeviceId, EndpointCapabilityKind, EndpointEvent, EndpointEventDirection,
+    EndpointEventFilter, EndpointEventKind, EndpointEventPayload, EndpointInjectMode,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalControlDeviceSnapshot, ServiceStatusSnapshot,
 };
 
 use crate::output::{header, kv};
@@ -59,6 +60,11 @@ pub async fn execute(
     } else {
         None
     };
+    let capabilities = if status.is_some() {
+        daemon_client::request_capabilities(None).await.ok()
+    } else {
+        None
+    };
     let inject_results = if inject {
         run_remote_inject_probe(&devices).await
     } else {
@@ -72,6 +78,7 @@ pub async fn execute(
         &devices,
         layout.as_ref(),
         local_controls.as_ref(),
+        capabilities.as_ref(),
         &endpoint_events,
         inject,
         &inject_results,
@@ -225,6 +232,7 @@ fn build_doctor_checks(
     devices: &[DaemonDeviceSnapshot],
     layout: Option<&LayoutGraph>,
     local_controls: Option<&LocalControlDeviceSnapshot>,
+    capabilities: Option<&CapabilityRegistrySnapshot>,
     endpoint_events: &[EndpointEvent],
     inject_requested: bool,
     inject_results: &[EndpointInjectResult],
@@ -298,6 +306,60 @@ fn build_doctor_checks(
             || !snapshot.recent_events.is_empty()
     });
     let layout_nodes = layout.map_or(0, |layout| layout.nodes.len());
+    let capability_registry_ready = capabilities.is_some();
+    let local_capabilities = capabilities.and_then(|registry| {
+        registry
+            .devices
+            .iter()
+            .find(|device| device.device_id == registry.local_device_id)
+    });
+    let capability_input_ready = local_capabilities
+        .and_then(|device| {
+            device
+                .capabilities
+                .iter()
+                .find(|capability| capability.kind == EndpointCapabilityKind::Input)
+        })
+        .map_or(false, |capability| {
+            capability.state == CapabilityState::Available
+        });
+    let capability_diagnostics_ready = local_capabilities
+        .and_then(|device| {
+            device
+                .capabilities
+                .iter()
+                .find(|capability| capability.kind == EndpointCapabilityKind::Diagnostics)
+        })
+        .map_or(false, |capability| {
+            capability.state == CapabilityState::Available
+        });
+    let capability_usb_boundary_clear = local_capabilities.map_or(false, |device| {
+        let usb_host = device
+            .capabilities
+            .iter()
+            .find(|capability| capability.kind == EndpointCapabilityKind::UsbHost)
+            .map(|capability| capability.state);
+        let usb_receiver = device
+            .capabilities
+            .iter()
+            .find(|capability| capability.kind == EndpointCapabilityKind::UsbReceiver)
+            .map(|capability| capability.state);
+        matches!(
+            usb_host,
+            Some(CapabilityState::Unavailable | CapabilityState::Experimental)
+        ) && matches!(usb_receiver, Some(CapabilityState::Unavailable))
+    });
+    let capability_detail = capabilities
+        .map(|registry| {
+            format!(
+                "devices={} input={} diagnostics={} usb_boundary={}",
+                registry.devices.len(),
+                capability_input_ready,
+                capability_diagnostics_ready,
+                capability_usb_boundary_clear
+            )
+        })
+        .unwrap_or_else(|| "capability registry unavailable".to_string());
 
     let inject_success_count = inject_results
         .iter()
@@ -360,6 +422,22 @@ fn build_doctor_checks(
             label: "QUIC 通道",
             state: network_state,
             detail: network_detail,
+        },
+        DoctorCheck {
+            key: "capabilities",
+            label: "能力注册",
+            state: if capability_registry_ready
+                && capability_input_ready
+                && capability_diagnostics_ready
+                && capability_usb_boundary_clear
+            {
+                CheckState::Pass
+            } else if daemon_online && capability_registry_ready {
+                CheckState::Warn
+            } else {
+                CheckState::Block
+            },
+            detail: capability_detail,
         },
         DoctorCheck {
             key: "layout",
@@ -542,6 +620,37 @@ mod tests {
         }
     }
 
+    fn capabilities(local: DeviceId) -> CapabilityRegistrySnapshot {
+        CapabilityRegistrySnapshot {
+            local_device_id: local,
+            generated_at_ms: 1,
+            devices: vec![rshare_core::DeviceCapabilitySnapshot {
+                device_id: local,
+                device_name: "local-R-ShareMouse".to_string(),
+                hostname: "local".to_string(),
+                connected: true,
+                capabilities: vec![
+                    rshare_core::EndpointCapabilitySnapshot::new(
+                        EndpointCapabilityKind::Input,
+                        CapabilityState::Available,
+                    ),
+                    rshare_core::EndpointCapabilitySnapshot::new(
+                        EndpointCapabilityKind::Diagnostics,
+                        CapabilityState::Available,
+                    ),
+                    rshare_core::EndpointCapabilitySnapshot::new(
+                        EndpointCapabilityKind::UsbHost,
+                        CapabilityState::Unavailable,
+                    ),
+                    rshare_core::EndpointCapabilitySnapshot::new(
+                        EndpointCapabilityKind::UsbReceiver,
+                        CapabilityState::Unavailable,
+                    ),
+                ],
+            }],
+        }
+    }
+
     #[test]
     fn doctor_checks_pass_when_remote_events_and_inject_loopback_exist() {
         let local = Uuid::new_v4();
@@ -558,6 +667,7 @@ mod tests {
             &[device(remote, true)],
             Some(&layout),
             Some(&controls),
+            Some(&capabilities(local)),
             &[
                 endpoint_event(remote, EndpointEventDirection::Observed),
                 endpoint_event(remote, EndpointEventDirection::InjectedLoopback),
@@ -575,6 +685,7 @@ mod tests {
                 ("ipc", CheckState::Pass),
                 ("discovery", CheckState::Pass),
                 ("network", CheckState::Pass),
+                ("capabilities", CheckState::Pass),
                 ("layout", CheckState::Pass),
                 ("local-capture", CheckState::Pass),
                 ("input-backend", CheckState::Pass),
@@ -594,6 +705,7 @@ mod tests {
             &[device(remote, true)],
             None,
             Some(&LocalControlDeviceSnapshot::default()),
+            Some(&capabilities(local)),
             &[],
             false,
             &[],
@@ -619,6 +731,7 @@ mod tests {
             &[device(remote, true)],
             None,
             Some(&LocalControlDeviceSnapshot::default()),
+            Some(&capabilities(local)),
             &[],
             true,
             &[
@@ -646,6 +759,7 @@ mod tests {
             &[],
             None,
             Some(&LocalControlDeviceSnapshot::default()),
+            Some(&capabilities(local)),
             &[],
             true,
             &[],

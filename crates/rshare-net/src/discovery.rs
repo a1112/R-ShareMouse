@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant};
 
 use rshare_core::{
-    hello_back_message, hello_message, DeviceId, Message, ScreenInfo, DISCOVERY_APP_ID,
+    hello_back_message, hello_message, DeviceCapabilities, DeviceId, Message, ScreenInfo,
+    DISCOVERY_APP_ID,
 };
 
 /// Discovery configuration
@@ -52,6 +53,7 @@ pub struct DiscoveredDevice {
     pub hostname: String,
     pub addresses: Vec<SocketAddr>,
     pub screen_info: Option<ScreenInfo>,
+    pub capabilities: DeviceCapabilities,
     pub last_seen: Instant,
 }
 
@@ -63,6 +65,7 @@ impl DiscoveredDevice {
                 device_id,
                 device_name,
                 hostname,
+                capabilities,
                 ..
             } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
@@ -70,6 +73,7 @@ impl DiscoveredDevice {
                 hostname: hostname.clone(),
                 addresses: vec![addr],
                 screen_info: None,
+                capabilities: capabilities.clone(),
                 last_seen: Instant::now(),
             }),
             Message::HelloBack {
@@ -78,6 +82,7 @@ impl DiscoveredDevice {
                 device_name,
                 hostname,
                 screen_info,
+                capabilities,
                 ..
             } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
@@ -85,6 +90,7 @@ impl DiscoveredDevice {
                 hostname: hostname.clone(),
                 addresses: vec![addr],
                 screen_info: Some(screen_info.clone()),
+                capabilities: capabilities.clone(),
                 last_seen: Instant::now(),
             }),
             _ => None,
@@ -707,6 +713,7 @@ mod tests {
             hostname: "test".to_string(),
             addresses: vec![],
             screen_info: None,
+            capabilities: DeviceCapabilities::default(),
             last_seen: Instant::now(),
         };
 
@@ -730,6 +737,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27432".parse().unwrap()],
                 screen_info: None,
+                capabilities: DeviceCapabilities::default(),
                 last_seen: Instant::now(),
             },
         );

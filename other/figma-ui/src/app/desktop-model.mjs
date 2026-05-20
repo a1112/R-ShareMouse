@@ -259,6 +259,60 @@ function backendDiagnosticLabel(backend) {
   return `${mode} ${health}`;
 }
 
+const CAPABILITY_LABELS = {
+  Input: "输入",
+  Clipboard: "剪贴板",
+  Gamepad: "手柄",
+  Audio: "音频",
+  DisplayTopology: "显示拓扑",
+  UsbHost: "USB 主机",
+  UsbReceiver: "USB 接收",
+  PrivilegedHelper: "特权助手",
+  Diagnostics: "诊断",
+};
+
+const CAPABILITY_STATE_LABELS = {
+  Available: "可用",
+  Degraded: "降级",
+  Unavailable: "不可用",
+  Experimental: "实验",
+};
+
+export function buildCapabilityOverview(registry) {
+  if (!registry || !Array.isArray(registry.devices)) {
+    return {
+      available: false,
+      localDeviceId: null,
+      generatedAtMs: null,
+      devices: [],
+    };
+  }
+
+  return {
+    available: true,
+    localDeviceId: registry.local_device_id ?? null,
+    generatedAtMs: registry.generated_at_ms ?? null,
+    devices: registry.devices.map((device) => ({
+      id: device.device_id,
+      name: device.device_name ?? "未知设备",
+      hostname: device.hostname ?? "",
+      connected: Boolean(device.connected),
+      local: device.device_id === registry.local_device_id,
+      capabilities: (device.capabilities ?? []).map((capability) => ({
+        kind: capability.kind,
+        label: CAPABILITY_LABELS[capability.kind] ?? capability.kind,
+        state: capability.state,
+        stateLabel: CAPABILITY_STATE_LABELS[capability.state] ?? capability.state,
+        reason: capability.health_reason ?? null,
+        permissionState: capability.permission_state ?? null,
+        latencyMs: capability.latency_ms ?? null,
+        transportState: capability.transport_state ?? null,
+        details: capability.details ?? {},
+      })),
+    })),
+  };
+}
+
 function endpointPayloadData(payload) {
   if (!payload || typeof payload !== "object") {
     return {};
@@ -1099,6 +1153,7 @@ function buildAcceptance(payload, status, remoteDevices, layout, inputMode) {
 
 export function buildDesktopViewModel(payload) {
   const status = payload?.status ?? null;
+  const capabilities = buildCapabilityOverview(payload?.capabilities ?? null);
   const localDevice = buildLocalDevice(status);
   const remoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
   const daemonLayout = buildLayoutFromVisibleGraph(
@@ -1143,6 +1198,7 @@ export function buildDesktopViewModel(payload) {
     service,
     layout,
     devices: remoteDevices,
+    capabilities,
     settings: {
       localDevice: {
         id: localDevice.id,

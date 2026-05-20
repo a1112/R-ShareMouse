@@ -9,19 +9,22 @@ use anyhow::Result;
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::SinkExt;
 use rshare_core::{
-    default_ipc_addr, default_local_controls_ws_addr, read_json_line, write_json_line, AudioFormat,
-    BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
+    default_ipc_addr, default_local_controls_ws_addr, local_capability_snapshots, read_json_line,
+    remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
+    BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, Direction, EndpointEvent, EndpointEventFilter, EndpointEventStore,
-    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
-    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
-    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteUsbDeviceSnapshot,
-    ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot, UsbControlSetupPacket,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
-    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
+    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
+    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, FeatureConfig, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
+    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    NetworkTransportSnapshot, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
+    ServiceStatusSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult,
+    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
+    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -61,6 +64,7 @@ struct TrackedDevice {
     hostname: String,
     addresses: Vec<String>,
     connected: bool,
+    capabilities: DeviceCapabilities,
     last_seen_at: Instant,
 }
 
@@ -133,6 +137,18 @@ impl RuntimeFeatureConfig {
 
     fn usb_advertising_enabled(&self) -> bool {
         self.usb_forwarding_experimental && self.usb_device_advertising
+    }
+
+    fn to_feature_config(&self) -> FeatureConfig {
+        let mut features = FeatureConfig::default();
+        features.suppress_local_shortcuts_when_remote = self.suppress_local_shortcuts_when_remote;
+        features.auto_endpoint_latency_probe = self.auto_endpoint_latency_probe;
+        features.audio_capture = self.audio_capture;
+        features.audio_forwarding = self.audio_forwarding;
+        features.usb_forwarding_experimental = self.usb_forwarding_experimental;
+        features.usb_device_advertising = self.usb_device_advertising;
+        features.usb_descriptor_probe = self.usb_descriptor_probe;
+        features
     }
 }
 
@@ -221,6 +237,7 @@ impl DaemonState {
                     .map(|addr| addr.to_string())
                     .collect(),
                 connected,
+                capabilities: device.capabilities,
                 last_seen_at: Instant::now(),
             },
         );
@@ -248,6 +265,7 @@ impl DaemonState {
                     hostname: "unknown".to_string(),
                     addresses: Vec::new(),
                     connected: true,
+                    capabilities: DeviceCapabilities::default(),
                     last_seen_at: Instant::now(),
                 },
             );
@@ -298,6 +316,60 @@ impl DaemonState {
 
         devices.sort_by(|left, right| left.name.cmp(&right.name));
         devices
+    }
+
+    fn capability_registry_snapshot(
+        &self,
+        network: &NetworkTransportSnapshot,
+        device_id_filter: Option<DeviceId>,
+    ) -> CapabilityRegistrySnapshot {
+        let mut devices = Vec::with_capacity(self.devices.len() + 1);
+        let mut local_capabilities = local_capability_snapshots(
+            &self.backend_state,
+            &self.local_controls,
+            network,
+            &self.features.to_feature_config(),
+        );
+        enrich_display_topology_from_layout(
+            &mut local_capabilities,
+            self.layout.get_node(self.status.device_id),
+        );
+        devices.push(DeviceCapabilitySnapshot {
+            device_id: self.status.device_id,
+            device_name: self.status.device_name.clone(),
+            hostname: self.status.hostname.clone(),
+            connected: true,
+            capabilities: local_capabilities,
+        });
+
+        devices.extend(self.devices.values().map(|device| {
+            let mut capabilities =
+                remote_capability_snapshots(&device.capabilities, device.connected);
+            enrich_display_topology_from_layout(&mut capabilities, self.layout.get_node(device.id));
+            DeviceCapabilitySnapshot {
+                device_id: device.id,
+                device_name: device.name.clone(),
+                hostname: device.hostname.clone(),
+                connected: device.connected,
+                capabilities,
+            }
+        }));
+
+        devices.sort_by(|left, right| {
+            left.device_name
+                .cmp(&right.device_name)
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+
+        if let Some(device_id) = device_id_filter {
+            devices.retain(|device| device.device_id == device_id);
+        }
+
+        CapabilityRegistrySnapshot {
+            local_device_id: self.status.device_id,
+            generated_at_ms: timestamp_ms_now(),
+            devices,
+        }
     }
 
     fn reconcile_local_layout_geometry(&mut self) -> bool {
@@ -1896,6 +1968,57 @@ fn resolve_backend_selection(
             Some("No input backend initialized successfully".to_string()),
         ),
     }
+}
+
+fn enrich_display_topology_from_layout(
+    capabilities: &mut [EndpointCapabilitySnapshot],
+    node: Option<&LayoutNode>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    let Some(display_capability) = capabilities
+        .iter_mut()
+        .find(|capability| capability.kind == EndpointCapabilityKind::DisplayTopology)
+    else {
+        return;
+    };
+
+    if node.displays.is_empty() {
+        return;
+    }
+
+    display_capability.state = CapabilityState::Available;
+    display_capability
+        .details
+        .insert("display_count".to_string(), node.displays.len().to_string());
+    if let Some(primary) = node.primary_display() {
+        display_capability
+            .details
+            .insert("primary_display_id".to_string(), primary.display_id.clone());
+        display_capability.details.insert(
+            "primary_resolution".to_string(),
+            format!("{}x{}", primary.width, primary.height),
+        );
+    }
+    display_capability.details.insert(
+        "display_geometries".to_string(),
+        node.displays
+            .iter()
+            .map(|display| {
+                format!(
+                    "{}:{}x{}@{},{}{}",
+                    display.display_id,
+                    display.width,
+                    display.height,
+                    display.x,
+                    display.y,
+                    if display.primary { ":primary" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    );
 }
 
 fn is_device_connected(state: &DaemonState, id: DeviceId) -> bool {
@@ -5967,6 +6090,16 @@ async fn handle_ipc_client(
             let state = state.read().await;
             DaemonResponse::Devices(state.device_snapshots())
         }
+        DaemonRequest::Capabilities { device_id } => {
+            let connection_infos = {
+                let manager = network_manager.lock().await;
+                manager.connection_infos().await
+            };
+            let network = network_snapshot_from_connections(&connection_infos);
+            let mut state = state.write().await;
+            state.refresh_local_controls_platform();
+            DaemonResponse::Capabilities(state.capability_registry_snapshot(&network, device_id))
+        }
         DaemonRequest::Connect { device_id } => {
             let address = {
                 let state = state.read().await;
@@ -6297,6 +6430,131 @@ mod tests {
             27432,
             42,
         ))
+    }
+
+    #[test]
+    fn capability_registry_snapshot_contains_local_reserved_capabilities() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.backend_state.update_aggregate_health();
+        state.local_controls.display.display_count = 1;
+
+        let snapshot =
+            state.capability_registry_snapshot(&NetworkTransportSnapshot::default(), None);
+
+        let local = snapshot
+            .devices
+            .iter()
+            .find(|device| device.device_id == snapshot.local_device_id)
+            .expect("local device capability snapshot");
+        for kind in [
+            rshare_core::EndpointCapabilityKind::Input,
+            rshare_core::EndpointCapabilityKind::Clipboard,
+            rshare_core::EndpointCapabilityKind::Gamepad,
+            rshare_core::EndpointCapabilityKind::Audio,
+            rshare_core::EndpointCapabilityKind::DisplayTopology,
+            rshare_core::EndpointCapabilityKind::UsbHost,
+            rshare_core::EndpointCapabilityKind::UsbReceiver,
+            rshare_core::EndpointCapabilityKind::PrivilegedHelper,
+            rshare_core::EndpointCapabilityKind::Diagnostics,
+        ] {
+            assert!(
+                local
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.kind == kind),
+                "missing reserved capability {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_registry_snapshot_includes_discovered_peer_and_filters_by_device() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        let mut advertised = DeviceCapabilities::default();
+        advertised.supports_audio_forwarding = true;
+        advertised.supports_usb_forwarding_experimental = true;
+        state.upsert_discovered(DiscoveredDevice {
+            id: remote_id,
+            name: "remote".to_string(),
+            hostname: "remote-host".to_string(),
+            addresses: vec!["127.0.0.1:27431".parse().unwrap()],
+            screen_info: None,
+            capabilities: advertised,
+            last_seen: Instant::now(),
+        });
+        state.mark_connected(&remote_id, true);
+
+        let snapshot = state
+            .capability_registry_snapshot(&NetworkTransportSnapshot::default(), Some(remote_id));
+
+        assert_eq!(snapshot.devices.len(), 1);
+        assert_eq!(snapshot.devices[0].device_id, remote_id);
+        assert!(snapshot.devices[0].capabilities.iter().any(|capability| {
+            capability.kind == rshare_core::EndpointCapabilityKind::UsbHost
+                && capability.state == rshare_core::CapabilityState::Experimental
+        }));
+    }
+
+    #[test]
+    fn capability_registry_snapshot_reports_multi_display_layout_details() {
+        let mut state = test_daemon_state();
+        let local_id = state.status.device_id;
+        let remote_id = DeviceId::new_v4();
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+        state.layout.add_node(LayoutNode {
+            device_id: remote_id,
+            displays: vec![
+                rshare_core::DisplayNode::primary(1920, 0, 2560, 1440),
+                rshare_core::DisplayNode::secondary("remote-left".to_string(), 0, 0, 1920, 1080),
+            ],
+        });
+
+        let snapshot = state
+            .capability_registry_snapshot(&NetworkTransportSnapshot::default(), Some(remote_id));
+        let remote = snapshot
+            .devices
+            .first()
+            .expect("remote capability snapshot");
+        let display = remote
+            .capabilities
+            .iter()
+            .find(|capability| {
+                capability.kind == rshare_core::EndpointCapabilityKind::DisplayTopology
+            })
+            .expect("display topology capability");
+
+        assert_eq!(snapshot.local_device_id, local_id);
+        assert_eq!(
+            display.details.get("display_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            display
+                .details
+                .get("primary_display_id")
+                .map(String::as_str),
+            Some("primary")
+        );
+        assert_eq!(
+            display
+                .details
+                .get("display_geometries")
+                .map(String::as_str),
+            Some("primary:2560x1440@1920,0:primary;remote-left:1920x1080@0,0")
+        );
     }
 
     #[test]
@@ -6758,6 +7016,7 @@ mod tests {
                 hostname: "remote".to_string(),
                 addresses: vec!["127.0.0.1:1".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -6880,6 +7139,7 @@ mod tests {
             hostname: "remote-host".to_string(),
             addresses: vec!["192.168.1.241:27431".parse().unwrap()],
             screen_info: Some(ScreenInfo::new(0, 0, 2560, 1440)),
+            capabilities: DeviceCapabilities::default(),
             last_seen: Instant::now(),
         });
 
@@ -7049,6 +7309,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7091,6 +7352,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7147,6 +7409,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7195,6 +7458,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7245,6 +7509,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7311,6 +7576,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7383,6 +7649,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7433,6 +7700,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7523,6 +7791,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7598,6 +7867,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7711,6 +7981,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7750,6 +8021,7 @@ mod tests {
                 hostname: "a-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );
@@ -7761,6 +8033,7 @@ mod tests {
                 hostname: "b-host".to_string(),
                 addresses: vec!["127.0.0.1:27432".to_string()],
                 connected: true,
+                capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
         );

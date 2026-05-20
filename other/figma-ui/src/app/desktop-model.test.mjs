@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildDesktopViewModel,
+  buildCapabilityOverview,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
@@ -26,6 +27,62 @@ test("buildDesktopViewModel returns an offline local-only layout when daemon is 
   assert.equal(model.acceptance.backgroundReady, false);
   assert.equal(model.acceptance.dualMachineReady, false);
   assert.equal(model.acceptance.nextStep, "启动守护进程后进行双机实机验收");
+});
+
+test("buildDesktopViewModel exposes daemon capability registry when present", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Local",
+      hostname: "local-host",
+      bind_address: "0.0.0.0:27431",
+      discovery_port: 27432,
+      healthy: true,
+    },
+    devices: [],
+    capabilities: {
+      local_device_id: "local-1",
+      generated_at_ms: 42,
+      devices: [
+        {
+          device_id: "local-1",
+          device_name: "Local",
+          hostname: "local-host",
+          connected: true,
+          capabilities: [
+            {
+              kind: "Input",
+              state: "Available",
+              health_reason: null,
+              details: { mode: "Portable" },
+            },
+            {
+              kind: "UsbReceiver",
+              state: "Unavailable",
+              health_reason: "receiver-side virtual USB bus not implemented",
+              details: {},
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.equal(model.capabilities.available, true);
+  assert.equal(model.capabilities.localDeviceId, "local-1");
+  assert.equal(model.capabilities.devices[0].capabilities[0].label, "输入");
+  assert.equal(model.capabilities.devices[0].capabilities[0].stateLabel, "可用");
+  assert.equal(
+    model.capabilities.devices[0].capabilities[1].reason,
+    "receiver-side virtual USB bus not implemented",
+  );
+});
+
+test("buildCapabilityOverview falls back cleanly when registry is missing", () => {
+  const overview = buildCapabilityOverview(null);
+
+  assert.equal(overview.available, false);
+  assert.deepEqual(overview.devices, []);
 });
 
 test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {

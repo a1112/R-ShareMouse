@@ -6,12 +6,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode, ControlSessionState,
-    DeviceId, EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, LayoutGraph, LocalAudioCaptureSource, LocalAudioTestRequest,
-    LocalAudioTestResult, LocalControlDeviceSnapshot, LocalInputDiagnosticEvent,
-    LocalInputTestRequest, LocalInputTestResult, PrivilegeState, ResolvedInputMode,
-    TrayRuntimeState, UsbDeviceDescriptor,
+    BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode,
+    CapabilityRegistrySnapshot, ControlSessionState, DeviceId, EndpointEvent, EndpointEventFilter,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
+    LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
+    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -211,6 +211,10 @@ pub struct UsbDescriptorProbeResult {
 pub enum DaemonRequest {
     Status,
     Devices,
+    Capabilities {
+        #[serde(default)]
+        device_id: Option<DeviceId>,
+    },
     Connect {
         device_id: DeviceId,
     },
@@ -282,6 +286,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Status(ServiceStatusSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),
+    Capabilities(CapabilityRegistrySnapshot),
     UsbDevices(Vec<UsbDeviceDescriptor>),
     Layout(LayoutGraph),
     LocalControls(LocalControlDeviceSnapshot),

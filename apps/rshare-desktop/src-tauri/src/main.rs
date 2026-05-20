@@ -2,11 +2,11 @@
 
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
-    daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode, Config,
-    DaemonDeviceSnapshot, DaemonResponse, DeviceId, EndpointEvent, EndpointEventFilter,
-    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    ServiceStatusSnapshot,
+    daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode,
+    CapabilityRegistrySnapshot, Config, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
+    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestKind,
+    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -56,6 +56,7 @@ const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 struct DashboardStatePayload {
     status: Option<ServiceStatusSnapshot>,
     devices: Vec<DaemonDeviceSnapshot>,
+    capabilities: Option<CapabilityRegistrySnapshot>,
     layout: Option<LayoutGraph>,
     visible_layout: Option<LayoutGraph>,
     layout_error: Option<String>,
@@ -132,6 +133,7 @@ async fn dashboard_state() -> Result<DashboardStatePayload, String> {
     dashboard_state_with(
         || Box::pin(async { ensure_daemon_status().await }),
         || Box::pin(async { daemon_client::request_devices().await }),
+        || Box::pin(async { daemon_client::request_capabilities(None).await }),
         || Box::pin(async { daemon_client::request_layout().await }),
         |layout| Box::pin(async move { daemon_client::request_set_layout(layout).await }),
     )
@@ -164,6 +166,23 @@ fn parse_device_id(device_id: &str) -> Result<DeviceId, String> {
     device_id
         .parse()
         .map_err(|err| format!("Invalid device id: {err}"))
+}
+
+fn parse_optional_device_id(device_id: Option<String>) -> Result<Option<DeviceId>, String> {
+    match device_id {
+        Some(value) if !value.trim().is_empty() => parse_device_id(value.trim()).map(Some),
+        _ => Ok(None),
+    }
+}
+
+#[tauri::command]
+async fn capabilities_state(
+    device_id: Option<String>,
+) -> Result<CapabilityRegistrySnapshot, String> {
+    let device_id = parse_optional_device_id(device_id)?;
+    daemon_client::request_capabilities(device_id)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -452,15 +471,17 @@ where
     }
 }
 
-async fn dashboard_state_with<Ensure, Devices, Layout, SaveLayout>(
+async fn dashboard_state_with<Ensure, Devices, Capabilities, Layout, SaveLayout>(
     mut ensure_status: Ensure,
     mut request_devices: Devices,
+    mut request_capabilities: Capabilities,
     mut request_layout: Layout,
     mut save_layout: SaveLayout,
 ) -> Result<DashboardStatePayload, String>
 where
     Ensure: FnMut() -> BoxFutureResult<'static, DesktopDaemonStatus>,
     Devices: FnMut() -> BoxFutureResult<'static, Vec<DaemonDeviceSnapshot>>,
+    Capabilities: FnMut() -> BoxFutureResult<'static, CapabilityRegistrySnapshot>,
     Layout: FnMut() -> BoxFutureResult<'static, LayoutGraph>,
     SaveLayout: FnMut(LayoutGraph) -> BoxFutureResult<'static, ()>,
 {
@@ -468,6 +489,7 @@ where
     let mut status = daemon.status;
     status.started_by_desktop = daemon.auto_started;
     let devices = request_devices().await.unwrap_or_default();
+    let capabilities = request_capabilities().await.ok();
     let mut layout_error = None;
     let mut layout = match request_layout().await {
         Ok(layout) => {
@@ -508,6 +530,7 @@ where
     Ok(DashboardStatePayload {
         status: Some(status),
         devices,
+        capabilities,
         layout: layout.take(),
         visible_layout,
         layout_error,
@@ -591,6 +614,7 @@ fn main() {
             dashboard_state,
             start_service,
             stop_service,
+            capabilities_state,
             connect_device,
             disconnect_device,
             local_controls_state,
@@ -1100,6 +1124,16 @@ mod tests {
         layout
     }
 
+    fn empty_capabilities() -> BoxFutureResult<'static, CapabilityRegistrySnapshot> {
+        Box::pin(async {
+            Ok(CapabilityRegistrySnapshot {
+                local_device_id: DeviceId::nil(),
+                generated_at_ms: 1,
+                devices: Vec::new(),
+            })
+        })
+    }
+
     fn sample_tray_click(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
         TrayIconEvent::Click {
             id: tauri::tray::TrayIconId::new(TRAY_ICON_ID),
@@ -1301,6 +1335,7 @@ mod tests {
                 })
             },
             || Box::pin(async { Ok(Vec::new()) }),
+            empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
             |_| Box::pin(async { Ok(()) }),
         )
@@ -1314,6 +1349,43 @@ mod tests {
         assert!(result.acceptance.background_ready);
         assert!(result.acceptance.tray_owned_by_daemon);
         assert_eq!(result.acceptance.tray_state, "Unavailable");
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_includes_capability_registry_when_available() {
+        let local_id = DeviceId::new_v4();
+        let result = dashboard_state_with(
+            move || {
+                Box::pin({
+                    let mut status = sample_status();
+                    status.device_id = local_id;
+                    async move {
+                        Ok(DesktopDaemonStatus {
+                            status,
+                            auto_started: false,
+                        })
+                    }
+                })
+            },
+            || Box::pin(async { Ok(Vec::new()) }),
+            move || {
+                Box::pin(async move {
+                    Ok(CapabilityRegistrySnapshot {
+                        local_device_id: local_id,
+                        generated_at_ms: 123,
+                        devices: Vec::new(),
+                    })
+                })
+            },
+            move || Box::pin(async move { Ok(sample_layout(local_id)) }),
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect("dashboard should include capability registry");
+
+        let capabilities = result.capabilities.expect("capability registry");
+        assert_eq!(capabilities.local_device_id, local_id);
+        assert_eq!(capabilities.generated_at_ms, 123);
     }
 
     #[tokio::test]
@@ -1348,6 +1420,7 @@ mod tests {
                     }])
                 })
             },
+            empty_capabilities,
             move || Box::pin(async move { Ok(sample_layout(local_id)) }),
             |_| Box::pin(async { Ok(()) }),
         )
@@ -1407,6 +1480,7 @@ mod tests {
         let result = dashboard_state_with(
             || Box::pin(async { Err(anyhow!("daemon rejected status probe")) }),
             || Box::pin(async { Ok(Vec::new()) }),
+            empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
             |_| Box::pin(async { Ok(()) }),
         )
@@ -1436,6 +1510,7 @@ mod tests {
                 })
             },
             || Box::pin(async { Ok(Vec::new()) }),
+            empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
             |_| Box::pin(async { Ok(()) }),
         )
@@ -1476,6 +1551,7 @@ mod tests {
                     }])
                 })
             },
+            empty_capabilities,
             move || Box::pin(async move { Ok(sample_layout(local_id)) }),
             {
                 let saved_layout = Arc::clone(&saved_layout);
@@ -1542,6 +1618,7 @@ mod tests {
                     }])
                 })
             },
+            empty_capabilities,
             move || {
                 let remembered = remembered.clone();
                 Box::pin(async move { Ok(remembered) })
@@ -1607,6 +1684,7 @@ mod tests {
                     }])
                 })
             },
+            empty_capabilities,
             move || Box::pin(async move { Ok(sample_layout(local_id)) }),
             |_| Box::pin(async { Err(anyhow!("layout save failed")) }),
         )

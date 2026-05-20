@@ -97,7 +97,27 @@ type DashboardPayload = {
   layout?: unknown | null;
   visible_layout?: unknown | null;
   layout_error?: string | null;
+  capabilities?: unknown | null;
   auto_started?: boolean;
+};
+
+type CapabilityOverview = {
+  available: boolean;
+  localDeviceId: string | null;
+  devices: Array<{
+    id: string;
+    name: string;
+    hostname: string;
+    connected: boolean;
+    local: boolean;
+    capabilities: Array<{
+      kind: string;
+      label: string;
+      state: string;
+      stateLabel: string;
+      reason?: string | null;
+    }>;
+  }>;
 };
 
 type LocalControlEvent = {
@@ -2140,6 +2160,7 @@ export default function App() {
             <DevicesPage
               busy={busy}
               devices={model.devices}
+              capabilities={model.capabilities}
               localDevice={model.settings.localDevice}
               localControls={localControls}
               localControlsError={localControlsError}
@@ -2208,6 +2229,7 @@ export default function App() {
 
 function DevicesPage({
   devices,
+  capabilities,
   localDevice,
   localControls,
   localControlsError,
@@ -2231,6 +2253,7 @@ function DevicesPage({
     online: boolean;
     lastSeenLabel: string;
   }>;
+  capabilities: CapabilityOverview;
   localDevice: {
     id: string;
     name: string;
@@ -2252,6 +2275,7 @@ function DevicesPage({
   return (
     <DevicesPageWithLocalControls
       devices={devices}
+      capabilities={capabilities}
       localDevice={localDevice}
       localControls={localControls}
       localControlsError={localControlsError}
@@ -2473,6 +2497,7 @@ function DeviceTreeNodeButton({
 
 function DevicesPageWithLocalControls({
   devices,
+  capabilities,
   localDevice,
   localControls,
   localControlsError,
@@ -2496,6 +2521,7 @@ function DevicesPageWithLocalControls({
     online: boolean;
     lastSeenLabel: string;
   }>;
+  capabilities: CapabilityOverview;
   localDevice: {
     id: string;
     name: string;
@@ -2675,6 +2701,12 @@ function DevicesPageWithLocalControls({
       }
     }
   };
+  const selectedCapabilityDevice = capabilities?.devices?.find((device) =>
+    selectedMonitorDeviceId === "local"
+      ? device.local
+      : device.id === selectedMonitorDeviceId,
+  );
+  const capabilityChips = selectedCapabilityDevice?.capabilities?.slice(0, 5) ?? [];
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden">
@@ -2695,6 +2727,36 @@ function DevicesPageWithLocalControls({
               Device Console
             </div>
             <div className="mt-1 text-sm font-semibold">设备控制</div>
+            {capabilities?.available ? (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {capabilityChips.map((capability) => (
+                  <span
+                    key={capability.kind}
+                    className="rounded px-1.5 py-0.5 text-[10px]"
+                    title={capability.reason ?? `${capability.label}: ${capability.stateLabel}`}
+                    style={{
+                      border: `1px solid ${theme.border}`,
+                      background:
+                        capability.state === "Available"
+                          ? "rgba(73,179,92,0.13)"
+                          : capability.state === "Experimental"
+                            ? "rgba(214,166,75,0.16)"
+                            : capability.state === "Degraded"
+                              ? "rgba(214,166,75,0.10)"
+                              : "rgba(255,255,255,0.035)",
+                      color:
+                        capability.state === "Available"
+                          ? theme.success
+                          : capability.state === "Unavailable"
+                            ? theme.textMuted
+                            : theme.textSub,
+                    }}
+                  >
+                    {capability.label} · {capability.stateLabel}
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-col gap-1">

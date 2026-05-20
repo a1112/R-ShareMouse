@@ -4,14 +4,16 @@ use rshare_core::{
         DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
-    BackgroundProcessOwner, BackgroundRunMode, DeviceAttribution, EndpointDeviceRef, EndpointEvent,
-    EndpointEventDirection, EndpointEventFilter, EndpointEventKind, EndpointEventPayload,
-    EndpointEventSource, EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioInputDevice,
-    LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest, LocalControlDeviceSnapshot,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceDescriptor, UsbDeviceSpeed,
+    BackgroundProcessOwner, BackgroundRunMode, CapabilityRegistrySnapshot, DeviceAttribution,
+    DeviceCapabilitySnapshot, EndpointCapabilityKind, EndpointCapabilitySnapshot,
+    EndpointDeviceRef, EndpointEvent, EndpointEventDirection, EndpointEventFilter,
+    EndpointEventKind, EndpointEventPayload, EndpointEventSource, EndpointInjectMode,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice,
+    LocalAudioTestRequest, LocalControlDeviceSnapshot, LocalInputDeviceKind,
+    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
+    TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor,
+    UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
 use tokio::io::duplex;
@@ -159,6 +161,49 @@ async fn endpoint_inject_request_round_trips_over_json_lines() {
     let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
+}
+
+#[tokio::test]
+async fn capability_requests_round_trip_over_json_lines() {
+    let requests = [
+        DaemonRequest::Capabilities { device_id: None },
+        DaemonRequest::Capabilities {
+            device_id: Some(Uuid::nil()),
+        },
+    ];
+
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+}
+
+#[tokio::test]
+async fn capability_response_round_trips_over_json_lines() {
+    let registry = CapabilityRegistrySnapshot {
+        local_device_id: Uuid::nil(),
+        generated_at_ms: 42,
+        devices: vec![DeviceCapabilitySnapshot {
+            device_id: Uuid::nil(),
+            device_name: "desktop".to_string(),
+            hostname: "desktop-host".to_string(),
+            connected: true,
+            capabilities: vec![EndpointCapabilitySnapshot::new(
+                EndpointCapabilityKind::Input,
+                rshare_core::CapabilityState::Available,
+            )],
+        }],
+    };
+    let response = DaemonResponse::Capabilities(registry.clone());
+
+    let (mut writer, mut reader) = duplex(4096);
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, DaemonResponse::Capabilities(registry));
 }
 
 #[tokio::test]
