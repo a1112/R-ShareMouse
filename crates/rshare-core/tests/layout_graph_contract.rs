@@ -319,6 +319,46 @@ fn layout_graph_display_projection_preserves_only_remembered_visible_links() {
 }
 
 #[test]
+fn layout_graph_online_projection_preserves_remembered_coordinates() {
+    let local_id = Uuid::new_v4();
+    let offline = Uuid::new_v4();
+    let online = Uuid::new_v4();
+    let mut graph = LayoutGraph::new(local_id);
+    graph.add_node(LayoutNode::new(local_id, 0, 0, 1920, 1080));
+    graph.add_node(LayoutNode::new(offline, 1920, 0, 1920, 1080));
+    graph.add_node(LayoutNode::new(online, 3840, 720, 2560, 1440));
+
+    let visible = graph.online_display_projection(HashSet::from([local_id, online]));
+
+    assert!(visible.get_node(offline).is_none());
+    let online_display = visible
+        .get_node(online)
+        .and_then(LayoutNode::primary_display)
+        .expect("online device should remain visible");
+    assert_eq!(online_display.x, 3840);
+    assert_eq!(online_display.y, 720);
+}
+
+#[test]
+fn layout_graph_online_projection_shifts_visible_nodes_into_view() {
+    let local_id = Uuid::new_v4();
+    let remote_id = Uuid::new_v4();
+    let mut graph = LayoutGraph::new(local_id);
+    graph.add_node(LayoutNode::new(local_id, 10064, 466, 2560, 1440));
+    graph.add_node(LayoutNode::new(remote_id, 12624, 466, 1920, 1080));
+
+    let visible = graph.online_display_projection(HashSet::from([local_id]));
+    let local_display = visible
+        .get_node(local_id)
+        .and_then(LayoutNode::primary_display)
+        .expect("local device should remain visible");
+
+    assert!(visible.get_node(remote_id).is_none());
+    assert_eq!(local_display.x, 0);
+    assert_eq!(local_display.y, 0);
+}
+
+#[test]
 fn layout_graph_upsert_link_for_edge_replaces_conflicting_targets() {
     let local_id = Uuid::new_v4();
     let old_target = Uuid::new_v4();

@@ -516,7 +516,7 @@ where
     };
 
     let visible_layout = layout.as_ref().map(|remembered| {
-        remembered.compact_online_display_projection(
+        remembered.online_display_projection(
             std::iter::once(status.device_id).chain(devices.iter().map(|device| device.id)),
         )
     });
@@ -1650,7 +1650,7 @@ mod tests {
                 .primary_display()
                 .unwrap()
                 .x,
-            1920
+            3840
         );
     }
 

@@ -508,6 +508,14 @@ export default function MonitorManager({
     }
   }, [dragging, handleMouseMove, handleMouseUp]);
 
+  const commitMonitors = useCallback((nextMonitors: MonitorData[]) => {
+    monitorsRef.current = nextMonitors;
+    pendingLocalSignatureRef.current = monitorGeometrySignature(nextMonitors);
+    pendingLocalSinceRef.current = Date.now();
+    setMonitors(nextMonitors);
+    onMonitorsCommit?.(nextMonitors);
+  }, [onMonitorsCommit]);
+
   /* ---- Panning: middle mouse / space+left click ---- */
   useEffect(() => {
     if (!isPanning) return;
@@ -578,20 +586,19 @@ export default function MonitorManager({
 
   /* ---- Auto-arrange ---- */
   const autoArrange = useCallback(() => {
-    setMonitors((prev) => {
-      const sorted = [...prev].sort((a, b) => {
-        if (a.deviceId !== b.deviceId) return a.deviceId.localeCompare(b.deviceId);
-        return a.primary ? -1 : 1;
-      });
-      let curX = 60;
-      const baseY = 180;
-      return sorted.map((m) => {
-        const newM = { ...m, x: curX, y: baseY + (260 - m.h) };
-        curX += m.w + 4;
-        return newM;
-      });
+    const sorted = [...monitorsRef.current].sort((a, b) => {
+      if (a.deviceId !== b.deviceId) return a.deviceId.localeCompare(b.deviceId);
+      return a.primary ? -1 : 1;
     });
-  }, []);
+    let curX = 60;
+    const baseY = 180;
+    const nextMonitors = sorted.map((m) => {
+      const newM = { ...m, x: curX, y: baseY + (260 - m.h) };
+      curX += m.w + 4;
+      return newM;
+    });
+    commitMonitors(nextMonitors);
+  }, [commitMonitors]);
 
   /* ---- Toggle monitor ---- */
   const toggleMonitor = useCallback((id: string) => {
@@ -651,10 +658,10 @@ export default function MonitorManager({
 
   /* ---- Swap two monitors' positions ---- */
   const swapMonitors = useCallback((aId: string, bId: string) => {
-    setMonitors((prev) => {
-      const a = prev.find((m) => m.id === aId);
-      const b = prev.find((m) => m.id === bId);
-      if (!a || !b) return prev;
+    const currentMonitors = monitorsRef.current;
+    const a = currentMonitors.find((m) => m.id === aId);
+    const b = currentMonitors.find((m) => m.id === bId);
+    if (!a || !b) return;
 
       // Determine spatial relationship: are they side-by-side (horizontal) or stacked (vertical)?
       const aCx = a.x + a.w / 2, aCy = a.y + a.h / 2;
@@ -715,7 +722,7 @@ export default function MonitorManager({
       }
 
       // Verify no overlap with other monitors
-      const others = prev.filter((m) => m.id !== aId && m.id !== bId && m.enabled);
+      const others = currentMonitors.filter((m) => m.id !== aId && m.id !== bId && m.enabled);
       const overlaps = (x: number, y: number, w: number, h: number) =>
         others.some((o) => x < o.x + o.w && x + w > o.x && y < o.y + o.h && y + h > o.y);
 
@@ -736,13 +743,13 @@ export default function MonitorManager({
         }
       }
 
-      return prev.map((m) => {
-        if (m.id === aId) return { ...m, x: newAx, y: newAy };
-        if (m.id === bId) return { ...m, x: newBx, y: newBy };
-        return m;
-      });
+    const nextMonitors = currentMonitors.map((m) => {
+      if (m.id === aId) return { ...m, x: newAx, y: newAy };
+      if (m.id === bId) return { ...m, x: newBx, y: newBy };
+      return m;
     });
-  }, []);
+    commitMonitors(nextMonitors);
+  }, [commitMonitors]);
 
   const toggleDeviceExpand = (id: string) => {
     setDevices((prev) => prev.map((d) => (d.id === id ? { ...d, expanded: !d.expanded } : d)));
@@ -755,10 +762,10 @@ export default function MonitorManager({
 
   /* ---- Move monitor in direction, snapping to nearest neighbor edge ---- */
   const moveMonitor = useCallback((id: string, dir: "left" | "right" | "up" | "down") => {
-    setMonitors((prev) => {
-      const mon = prev.find((m) => m.id === id);
-      if (!mon) return prev;
-      const others = prev.filter((m) => m.id !== id && m.enabled);
+    const currentMonitors = monitorsRef.current;
+    const mon = currentMonitors.find((m) => m.id === id);
+    if (!mon) return;
+    const others = currentMonitors.filter((m) => m.id !== id && m.enabled);
       const STEP = 20;
       let bestX = mon.x;
       let bestY = mon.y;
@@ -854,9 +861,11 @@ export default function MonitorManager({
         bestY = bestTarget;
       }
 
-      return prev.map((m) => (m.id === id ? { ...m, x: bestX, y: bestY } : m));
-    });
-  }, []);
+    const nextMonitors = currentMonitors.map((m) =>
+      m.id === id ? { ...m, x: bestX, y: bestY } : m,
+    );
+    commitMonitors(nextMonitors);
+  }, [commitMonitors]);
 
   return (
     <div className="w-full h-full flex flex-col overflow-hidden" style={{ background: t.bg, color: t.text }}>

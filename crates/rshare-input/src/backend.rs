@@ -498,10 +498,13 @@ impl CaptureDriver for WindowsNativeCaptureDriver {
 /// Virtual HID injection backend (Windows only).
 ///
 /// This backend uses virtual HID devices to inject input at a lower level.
-/// Currently scaffold only - returns Unsupported error.
+/// Mouse moves use SendInput absolute positioning because the VHF report path
+/// exposes relative movement only, while R-ShareMouse forwards absolute screen
+/// coordinates for edge crossing.
 #[cfg(target_os = "windows")]
 pub struct VirtualHidInjectBackend {
     client: rshare_platform::windows::WindowsDriverClient,
+    absolute_mouse: crate::emulator::WindowsNativeInputEmulator,
     health: BackendHealth,
 }
 
@@ -516,6 +519,7 @@ impl VirtualHidInjectBackend {
 
         Ok(Self {
             client,
+            absolute_mouse: crate::emulator::WindowsNativeInputEmulator::new()?,
             health: BackendHealth::Healthy,
         })
     }
@@ -569,7 +573,7 @@ impl InjectBackend for VirtualHidInjectBackend {
                 self.client
                     .inject_keyboard(keycode.to_raw() as u16, state.is_pressed())
             }
-            InputEvent::MouseMove { x, y } => self.client.inject_mouse_move(x, y),
+            InputEvent::MouseMove { x, y } => self.absolute_mouse.move_mouse(x, y),
             InputEvent::MouseButton { button, state } => self
                 .client
                 .inject_mouse_button(button.to_code(), state.is_pressed()),

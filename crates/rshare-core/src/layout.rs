@@ -333,6 +333,47 @@ impl LayoutGraph {
         projection
     }
 
+    /// Build an online-only projection for display rendering.
+    ///
+    /// Unlike `compact_online_display_projection`, this preserves the
+    /// remembered spacing between visible nodes. The returned graph is shifted
+    /// to the origin so editable UI surfaces do not open with every visible
+    /// monitor outside the initial viewport.
+    pub fn online_display_projection<I>(&self, online_devices: I) -> LayoutGraph
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
+        let mut visible_devices: HashSet<Uuid> = online_devices.into_iter().collect();
+        visible_devices.insert(self.local_device);
+
+        let mut nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|node| visible_devices.contains(&node.device_id))
+            .cloned()
+            .collect();
+        let (offset_x, offset_y) = layout_origin(&nodes);
+        for node in &mut nodes {
+            for display in &mut node.displays {
+                display.x -= offset_x;
+                display.y -= offset_y;
+            }
+        }
+
+        let mut projection = LayoutGraph::new(self.local_device);
+        projection.nodes = nodes;
+        projection.links = self
+            .links
+            .iter()
+            .filter(|link| {
+                visible_devices.contains(&link.from_device)
+                    && visible_devices.contains(&link.to_device)
+            })
+            .cloned()
+            .collect();
+        projection
+    }
+
     /// Resolve the target device for a given edge hit from a device.
     ///
     /// Returns `Some(target_id)` if:
@@ -456,6 +497,20 @@ fn node_display_bounds(node: &LayoutNode) -> (i32, i32, i32, i32) {
     }
 
     (left, top, right, bottom)
+}
+
+fn layout_origin(nodes: &[LayoutNode]) -> (i32, i32) {
+    nodes
+        .iter()
+        .map(node_display_bounds)
+        .fold(
+            Option::<(i32, i32)>::None,
+            |origin, (left, top, _, _)| match origin {
+                Some((min_left, min_top)) => Some((min_left.min(left), min_top.min(top))),
+                None => Some((left, top)),
+            },
+        )
+        .unwrap_or((0, 0))
 }
 
 #[cfg(test)]
