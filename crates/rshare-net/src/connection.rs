@@ -31,6 +31,13 @@ pub struct ConnectionInfo {
     pub last_activity: Instant,
     pub messages_sent: u64,
     pub messages_received: u64,
+    pub transport: String,
+    pub datagram_available: bool,
+    pub rtt_ms: Option<u64>,
+    pub last_datagram_rx_ms: Option<u64>,
+    pub datagram_tx_dropped: u64,
+    pub reliable_stream_reset_count: u64,
+    pub cert_trust_state: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -42,6 +49,13 @@ impl ConnectionInfo {
             last_activity: Instant::now(),
             messages_sent: 0,
             messages_received: 0,
+            transport: "quic".to_string(),
+            datagram_available: false,
+            rtt_ms: None,
+            last_datagram_rx_ms: None,
+            datagram_tx_dropped: 0,
+            reliable_stream_reset_count: 0,
+            cert_trust_state: None,
         }
     }
 
@@ -262,6 +276,25 @@ impl ConnectionManager {
         self.connections.values().cloned().collect()
     }
 
+    pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        let mut infos_by_id = self.connections.clone();
+        for (device_id, diagnostics) in self.pool.diagnostics_all().await {
+            let info = infos_by_id
+                .entry(device_id)
+                .or_insert_with(|| ConnectionInfo::new(device_id, diagnostics.address.clone()));
+            info.state = ConnectionState::Connected;
+            info.address = diagnostics.address;
+            info.transport = diagnostics.transport.to_string();
+            info.datagram_available = diagnostics.datagram_available;
+            info.rtt_ms = diagnostics.rtt_ms;
+            info.last_datagram_rx_ms = diagnostics.last_datagram_rx_ms;
+            info.datagram_tx_dropped = diagnostics.datagram_tx_dropped;
+            info.reliable_stream_reset_count = diagnostics.reliable_stream_reset_count;
+            info.cert_trust_state = diagnostics.cert_trust_state;
+        }
+        infos_by_id.into_values().collect()
+    }
+
     pub fn is_connected(&self, device_id: &DeviceId) -> bool {
         self.connections
             .get(device_id)
@@ -301,6 +334,10 @@ impl ConnectionManager {
 
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
+    }
+
+    pub fn transport_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.transport.local_addr()
     }
 }
 
@@ -421,17 +458,11 @@ mod tests {
     async fn outbound_connect_failure_emits_error_event() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
 
         let mut manager = ConnectionManager::new(local_id);
         let mut events = manager.events().unwrap();
 
-        assert!(manager
-            .connect(remote_id, &address.to_string())
-            .await
-            .is_err());
+        assert!(manager.connect(remote_id, "not-an-addr").await.is_err());
 
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -461,6 +492,13 @@ mod tests {
                 last_activity: Instant::now(),
                 messages_sent: 0,
                 messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: false,
+                rtt_ms: None,
+                last_datagram_rx_ms: None,
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: None,
             },
         );
         let mut events = manager.events().unwrap();
@@ -479,22 +517,31 @@ mod tests {
     async fn manager_emits_message_received_for_connected_device() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (stream, peer_addr) = listener.accept().await.unwrap();
-            let sender = crate::transport::QuicConnection::new(stream, remote_id, peer_addr);
-            sender
-                .send_message(&Message::MouseMove { x: 7, y: 9 })
-                .await
-                .unwrap();
-        });
+        let mut remote_manager = ConnectionManager::new(remote_id);
+        let mut remote_events = remote_manager.events().unwrap();
+        remote_manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote_manager.transport_local_addr().unwrap();
 
         let mut manager = ConnectionManager::new(local_id);
         let mut events = manager.events().unwrap();
         manager
             .connect(remote_id, &address.to_string())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ManagerEvent::Connected(device_id) = remote_events.recv().await.unwrap() {
+                    assert_eq!(device_id, local_id);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        remote_manager
+            .send_to(&local_id, Message::MouseMove { x: 7, y: 9 })
             .await
             .unwrap();
 
@@ -519,18 +566,19 @@ mod tests {
     async fn manager_emits_message_received_for_incoming_connection() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
 
         let mut manager = ConnectionManager::new(local_id);
         let mut events = manager.events().unwrap();
-        manager.start_server(&address.to_string()).await.unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
 
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let sender = crate::transport::QuicConnection::new(stream, remote_id, address);
-        sender
-            .send_message(&Message::MouseMove { x: 11, y: 13 })
+        let mut remote_manager = ConnectionManager::new(remote_id);
+        remote_manager
+            .connect(local_id, &address.to_string())
+            .await
+            .unwrap();
+        remote_manager
+            .send_to(&local_id, Message::MouseMove { x: 11, y: 13 })
             .await
             .unwrap();
 
@@ -548,28 +596,29 @@ mod tests {
         .unwrap();
 
         assert!(matches!(received.1, Message::MouseMove { x: 11, y: 13 }));
+
+        let connection_infos = manager.connection_infos().await;
+        assert!(connection_infos.iter().any(|info| {
+            info.device_id == remote_id
+                && info.state == ConnectionState::Connected
+                && info.transport == "quic"
+                && info.datagram_available
+        }));
     }
 
     #[tokio::test]
     async fn incoming_hello_binds_connection_to_remote_device_id() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
 
         let mut manager = ConnectionManager::new(local_id);
         let mut events = manager.events().unwrap();
-        manager.start_server(&address.to_string()).await.unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
 
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        let sender = crate::transport::QuicConnection::new(stream, remote_id, address);
-        sender
-            .send_message(&hello_message(
-                remote_id,
-                "remote".to_string(),
-                "remote-host".to_string(),
-            ))
+        let mut remote_manager = ConnectionManager::new(remote_id);
+        remote_manager
+            .connect(local_id, &address.to_string())
             .await
             .unwrap();
 
@@ -590,23 +639,9 @@ mod tests {
     async fn outbound_connect_accepts_hello_back_identity() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (stream, peer_addr) = listener.accept().await.unwrap();
-            let mut conn = crate::transport::QuicConnection::new(stream, remote_id, peer_addr);
-            let hello = conn.receive_message().await.unwrap();
-            assert!(matches!(hello, Message::Hello { device_id, .. } if device_id == local_id));
-            conn.send_message(&hello_back_message(
-                remote_id,
-                "remote".to_string(),
-                "remote-host".to_string(),
-                ScreenInfo::primary(),
-            ))
-            .await
-            .unwrap();
-        });
+        let mut remote_manager = ConnectionManager::new(remote_id);
+        remote_manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote_manager.transport_local_addr().unwrap();
 
         let mut manager = ConnectionManager::new(local_id);
         let mut events = manager.events().unwrap();

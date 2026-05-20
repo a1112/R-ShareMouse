@@ -41,6 +41,9 @@ quinn = "0.11"
 bytes = "1.7"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+rcgen = "0.14"
+rustls = "0.23"
+sha2 = "0.10"
 
 # Input handling
 rdev = "0.5"

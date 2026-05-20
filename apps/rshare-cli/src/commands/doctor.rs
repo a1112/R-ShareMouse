@@ -252,6 +252,45 @@ fn build_doctor_checks(
     let input_backend_ready = status
         .and_then(|snapshot| snapshot.backend_health.as_ref())
         .map_or(false, |health| matches!(health, BackendHealth::Healthy));
+    let network_detail = status
+        .map(|snapshot| {
+            let rtt = snapshot
+                .network
+                .rtt_ms
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "-".to_string());
+            let trust = snapshot
+                .network
+                .cert_trust_state
+                .as_deref()
+                .unwrap_or("unknown");
+            format!(
+                "transport={} datagram={} rtt={} dropped={} resets={} cert={}",
+                snapshot.network.transport,
+                if snapshot.network.datagram_available {
+                    "yes"
+                } else {
+                    "no"
+                },
+                rtt,
+                snapshot.network.datagram_tx_dropped,
+                snapshot.network.reliable_stream_reset_count,
+                trust
+            )
+        })
+        .unwrap_or_else(|| "network status unavailable".to_string());
+    let network_state = status.map_or(CheckState::Block, |snapshot| {
+        if snapshot.network.transport == "quic"
+            && snapshot.network.datagram_available
+            && !snapshot.network.realtime_degraded
+        {
+            CheckState::Pass
+        } else if daemon_online && snapshot.network.transport == "quic" {
+            CheckState::Warn
+        } else {
+            CheckState::Block
+        }
+    });
     let local_capture_ready = local_controls.map_or(false, |snapshot| {
         snapshot.keyboard.detected
             || snapshot.mouse.detected
@@ -315,6 +354,12 @@ fn build_doctor_checks(
                 CheckState::Pass
             },
             detail: format!("已发现 {} 台，已连接 {} 台", devices.len(), connected_count),
+        },
+        DoctorCheck {
+            key: "network",
+            label: "QUIC 通道",
+            state: network_state,
+            detail: network_detail,
         },
         DoctorCheck {
             key: "layout",
@@ -441,6 +486,10 @@ mod tests {
             42,
         );
         status.backend_health = Some(BackendHealth::Healthy);
+        status.network.datagram_available = true;
+        status.network.realtime_degraded = false;
+        status.network.rtt_ms = Some(2);
+        status.network.cert_trust_state = Some("trusted".to_string());
         status
     }
 
@@ -525,6 +574,7 @@ mod tests {
             vec![
                 ("ipc", CheckState::Pass),
                 ("discovery", CheckState::Pass),
+                ("network", CheckState::Pass),
                 ("layout", CheckState::Pass),
                 ("local-capture", CheckState::Pass),
                 ("input-backend", CheckState::Pass),

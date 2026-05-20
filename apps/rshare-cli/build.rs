@@ -12,7 +12,8 @@ fn emit_build_metadata() {
         unix_timestamp()
     );
 
-    let git_hash = git_output(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let git_hash =
+        git_output(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RSHARE_BUILD_GIT_HASH={git_hash}");
 
     let git_dirty = match git_output(&["status", "--porcelain"]) {
@@ -30,10 +31,12 @@ fn git_output(args: &[&str]) -> Option<String> {
         return None;
     }
 
-    let value = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn git_exe() -> Option<&'static str> {
@@ -58,10 +61,16 @@ fn git_exe() -> Option<&'static str> {
 
 fn has_command(name: &str) -> bool {
     if !cfg!(windows) {
-        return Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success());
+        return Command::new(name)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
     }
 
-    Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success())
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn has_path(candidate: &str) -> bool {

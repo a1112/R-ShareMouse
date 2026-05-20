@@ -18,10 +18,10 @@ use rshare_core::{
     LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
     LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    LocalInputTestStatus, Message, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
-    ServiceStatusSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteUsbDeviceSnapshot,
+    ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot, UsbControlSetupPacket,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
+    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -34,7 +34,10 @@ use rshare_input::EvdevCaptureBackend;
 use rshare_input::RDevInputListener;
 #[cfg(windows)]
 use rshare_input::{DefaultInputListener, InputEventChannel, InputListener};
-use rshare_net::{DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig};
+use rshare_net::{
+    connection::ConnectionInfo, DiscoveredDevice, NetworkEvent, NetworkManager,
+    NetworkManagerConfig,
+};
 use tracing_subscriber::prelude::*;
 
 #[cfg(windows)]
@@ -1204,6 +1207,45 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
+    let mut snapshot = NetworkTransportSnapshot {
+        datagram_available: connections
+            .iter()
+            .any(|connection| connection.datagram_available),
+        realtime_degraded: connections.is_empty()
+            || connections
+                .iter()
+                .any(|connection| !connection.datagram_available),
+        rtt_ms: connections
+            .iter()
+            .filter_map(|connection| connection.rtt_ms)
+            .min(),
+        last_datagram_rx_ms: connections
+            .iter()
+            .filter_map(|connection| connection.last_datagram_rx_ms)
+            .min(),
+        datagram_tx_dropped: connections
+            .iter()
+            .map(|connection| connection.datagram_tx_dropped)
+            .sum(),
+        reliable_stream_reset_count: connections
+            .iter()
+            .map(|connection| connection.reliable_stream_reset_count)
+            .sum(),
+        cert_trust_state: None,
+        ..NetworkTransportSnapshot::default()
+    };
+
+    if let Some(state) = connections
+        .iter()
+        .find_map(|connection| connection.cert_trust_state.clone())
+    {
+        snapshot.cert_trust_state = Some(state);
+    }
+
+    snapshot
+}
+
 fn diagnostic_message(local_device_id: DeviceId, event: LocalInputDiagnosticEvent) -> Message {
     Message::InputDiagnostic {
         device_id: local_device_id,
@@ -1838,17 +1880,10 @@ fn resolve_backend_selection(
             let mode = result
                 .to_input_mode()
                 .unwrap_or(ResolvedInputMode::Portable);
-            let health = if result.degraded {
-                BackendHealth::Degraded {
-                    reason: BackendFailureReason::Unavailable,
-                }
-            } else {
-                BackendHealth::Healthy
-            };
             (
                 Some(mode),
                 available_kinds,
-                health,
+                BackendHealth::Healthy,
                 result.degradation_reason.clone(),
             )
         }
@@ -1894,6 +1929,8 @@ struct InputRoutingState {
     screen_width: u32,
     screen_height: u32,
     edge_threshold: u32,
+    modifiers: ActiveModifiers,
+    pending_return_edge: Option<Direction>,
 }
 
 impl InputRoutingState {
@@ -1903,6 +1940,8 @@ impl InputRoutingState {
             screen_width: screen_width.max(1),
             screen_height: screen_height.max(1),
             edge_threshold: edge_threshold.max(1),
+            modifiers: ActiveModifiers::default(),
+            pending_return_edge: None,
         }
     }
 
@@ -1926,6 +1965,42 @@ impl InputRoutingState {
 
     fn set_remote_target(&mut self, target: DeviceId) {
         self.remote_target = Some(target);
+    }
+
+    fn schedule_return_to_local(&mut self, return_edge: Direction) {
+        self.pending_return_edge = Some(return_edge);
+    }
+
+    fn take_pending_return_edge(&mut self) -> Option<Direction> {
+        self.pending_return_edge.take()
+    }
+
+    fn update_modifier_state(&mut self, event: &InputEvent) -> ActiveModifiers {
+        match event {
+            InputEvent::Key { keycode, state } => {
+                self.modifiers.update_key(*keycode, state.is_pressed());
+            }
+            InputEvent::KeyExtended {
+                keycode,
+                state,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => {
+                self.modifiers = ActiveModifiers {
+                    shift: *shift,
+                    ctrl: *ctrl,
+                    alt: *alt,
+                    meta: *meta,
+                    ..ActiveModifiers::default()
+                };
+                self.modifiers.update_key(*keycode, state.is_pressed());
+            }
+            _ => {}
+        }
+
+        self.modifiers
     }
 
     fn hit_edges(&self, event: &InputEvent) -> Vec<Direction> {
@@ -1962,6 +2037,101 @@ impl InputRoutingState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveModifiers {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift_key: u32,
+    ctrl_key: u32,
+    alt_key: u32,
+    meta_key: u32,
+}
+
+impl Default for ActiveModifiers {
+    fn default() -> Self {
+        Self {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+            shift_key: 0x10,
+            ctrl_key: 0x11,
+            alt_key: 0x12,
+            meta_key: 0x5B,
+        }
+    }
+}
+
+impl ActiveModifiers {
+    fn any(self) -> bool {
+        self.shift || self.ctrl || self.alt || self.meta
+    }
+
+    fn update_key(&mut self, keycode: rshare_input::KeyCode, pressed: bool) {
+        let raw = keycode.to_raw();
+        match raw {
+            0x10 | 0xA0 | 0xA1 => {
+                self.shift = pressed;
+                if pressed {
+                    self.shift_key = raw;
+                }
+            }
+            0x11 | 0xA2 | 0xA3 => {
+                self.ctrl = pressed;
+                if pressed {
+                    self.ctrl_key = raw;
+                }
+            }
+            0x12 | 0xA4 | 0xA5 => {
+                self.alt = pressed;
+                if pressed {
+                    self.alt_key = raw;
+                }
+            }
+            0x5B | 0x5C => {
+                self.meta = pressed;
+                if pressed {
+                    self.meta_key = raw;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn release_messages(self) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(4);
+        if self.meta {
+            messages.push(key_release_message(self.meta_key));
+        }
+        if self.shift {
+            messages.push(key_release_message(self.shift_key));
+        }
+        if self.alt {
+            messages.push(key_release_message(self.alt_key));
+        }
+        if self.ctrl {
+            messages.push(key_release_message(self.ctrl_key));
+        }
+        messages
+    }
+}
+
+fn key_release_message(keycode: u32) -> Message {
+    Message::Key {
+        keycode,
+        state: rshare_core::KeyState::Released,
+    }
+}
+
+fn is_modifier_key(keycode: rshare_input::KeyCode) -> bool {
+    matches!(
+        keycode.to_raw(),
+        0x10 | 0x11 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0x5B | 0x5C
+    )
+}
+
 fn input_event_to_raw_event(
     event: rshare_input::InputEvent,
 ) -> Option<rshare_core::engine::RawInputEvent> {
@@ -1984,12 +2154,21 @@ fn input_event_to_raw_event(
                 pressed: state.is_pressed(),
             })
         }
-        rshare_input::InputEvent::KeyExtended { keycode, state, .. } => {
-            Some(rshare_core::engine::RawInputEvent::Key {
-                keycode: keycode.to_raw(),
-                pressed: state.is_pressed(),
-            })
-        }
+        rshare_input::InputEvent::KeyExtended {
+            keycode,
+            state,
+            shift,
+            ctrl,
+            alt,
+            meta,
+        } => Some(rshare_core::engine::RawInputEvent::KeyExtended {
+            keycode: keycode.to_raw(),
+            pressed: state.is_pressed(),
+            shift,
+            ctrl,
+            alt,
+            meta,
+        }),
         rshare_input::InputEvent::GamepadConnected { info } => {
             Some(rshare_core::engine::RawInputEvent::GamepadConnected { info })
         }
@@ -1999,6 +2178,27 @@ fn input_event_to_raw_event(
         rshare_input::InputEvent::GamepadState { state } => {
             Some(rshare_core::engine::RawInputEvent::GamepadState { state })
         }
+    }
+}
+
+fn input_event_to_raw_event_with_modifiers(
+    event: rshare_input::InputEvent,
+    modifiers: ActiveModifiers,
+) -> Option<rshare_core::engine::RawInputEvent> {
+    match event {
+        rshare_input::InputEvent::Key { keycode, state }
+            if modifiers.any() && !is_modifier_key(keycode) =>
+        {
+            Some(rshare_core::engine::RawInputEvent::KeyExtended {
+                keycode: keycode.to_raw(),
+                pressed: state.is_pressed(),
+                shift: modifiers.shift,
+                ctrl: modifiers.ctrl,
+                alt: modifiers.alt,
+                meta: modifiers.meta,
+            })
+        }
+        other => input_event_to_raw_event(other),
     }
 }
 
@@ -2013,6 +2213,8 @@ fn messages_for_input_event(
         return Vec::new();
     }
 
+    let active_modifiers = routing.update_modifier_state(&event);
+
     // Get connected peers set
     let connected_peers: std::collections::HashSet<_> = state
         .devices
@@ -2022,6 +2224,8 @@ fn messages_for_input_event(
         .collect();
     let local_id = state.status.device_id;
     let edge_hits = routing.hit_edges(&event);
+    let mut activation_edge = None;
+    let mut activation_target = None;
 
     match state.session.state() {
         ControlSessionState::RemoteActive {
@@ -2034,6 +2238,11 @@ fn messages_for_input_event(
                 routing.clear_remote_target();
                 forwarder.clear_target();
                 return Vec::new();
+            }
+
+            if is_quick_return_hotkey(&event, active_modifiers) {
+                routing.schedule_return_to_local(entered_via.opposite());
+                return active_modifiers.release_messages();
             }
 
             let return_edge = entered_via.opposite();
@@ -2059,6 +2268,8 @@ fn messages_for_input_event(
             }) {
                 if state.session.on_edge_hit(edge, Some(target)).is_ok() {
                     routing.set_remote_target(target);
+                    activation_edge = Some(edge);
+                    activation_target = Some(target);
                 } else {
                     forwarder.clear_target();
                     return Vec::new();
@@ -2087,7 +2298,13 @@ fn messages_for_input_event(
 
     let activated_on_this_event = Some(target) != forwarder.target();
     forwarder.set_target(target);
-    let Some(raw_event) = input_event_to_raw_event(event) else {
+    let event = match (activation_edge, activation_target) {
+        (Some(edge), Some(target)) => {
+            edge_penetration_mouse_event(state, target, edge, event, routing.edge_threshold)
+        }
+        _ => event,
+    };
+    let Some(raw_event) = input_event_to_raw_event_with_modifiers(event, active_modifiers) else {
         return Vec::new();
     };
 
@@ -2096,6 +2313,59 @@ fn messages_for_input_event(
         messages = forwarder.flush_batch();
     }
     messages
+}
+
+fn is_quick_return_hotkey(event: &InputEvent, modifiers: ActiveModifiers) -> bool {
+    let (keycode, state) = match event {
+        InputEvent::Key { keycode, state } | InputEvent::KeyExtended { keycode, state, .. } => {
+            (*keycode, *state)
+        }
+        _ => return false,
+    };
+
+    if !state.is_pressed() || !modifiers.ctrl || !modifiers.alt {
+        return false;
+    }
+
+    matches!(keycode.to_raw(), 0x4C | 0x08 | 0x1B)
+}
+
+fn edge_penetration_mouse_event(
+    state: &DaemonState,
+    target: DeviceId,
+    edge: Direction,
+    event: InputEvent,
+    edge_threshold: u32,
+) -> InputEvent {
+    let (x, y) = match event {
+        InputEvent::MouseMove { x, y } => (x, y),
+        other => return other,
+    };
+
+    let (target_width, target_height) = target_primary_display_size(state, target).unwrap_or((
+        state.local_controls.display.primary_width,
+        state.local_controls.display.primary_height,
+    ));
+    let margin = edge_threshold.max(1) as i32;
+    let max_x = target_width.saturating_sub(1) as i32;
+    let max_y = target_height.saturating_sub(1) as i32;
+
+    let (mapped_x, mapped_y) = match edge {
+        Direction::Right => (margin.min(max_x), y.clamp(0, max_y)),
+        Direction::Left => ((max_x - margin).max(0), y.clamp(0, max_y)),
+        Direction::Top => (x.clamp(0, max_x), (max_y - margin).max(0)),
+        Direction::Bottom => (x.clamp(0, max_x), margin.min(max_y)),
+    };
+
+    InputEvent::mouse_move(mapped_x, mapped_y)
+}
+
+fn target_primary_display_size(state: &DaemonState, target: DeviceId) -> Option<(u32, u32)> {
+    state
+        .layout
+        .get_node(target)?
+        .primary_display()
+        .map(|display| (display.width.max(1), display.height.max(1)))
 }
 
 fn is_gamepad_input_event(event: &InputEvent) -> bool {
@@ -4713,7 +4983,7 @@ async fn run_input_forwarding_loop(
 ) -> Result<()> {
     let mut forwarder = rshare_core::engine::ForwardingEngine::new();
     let mut routing = InputRoutingState::default_with_threshold(edge_threshold);
-    let mut flush_interval = tokio::time::interval(Duration::from_millis(8));
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(2));
 
     loop {
         tokio::select! {
@@ -4747,6 +5017,13 @@ async fn run_input_forwarding_loop(
 
                 if let Some(target) = target {
                     send_forwarded_messages(&network_manager, target, messages).await;
+                }
+                if let Some(return_edge) = routing.take_pending_return_edge() {
+                    let mut state = state.write().await;
+                    let _ = state.session.on_return_edge_hit(return_edge);
+                    routing.clear_remote_target();
+                    forwarder.clear_target();
+                    set_local_shortcut_suppression(false);
                 }
             }
             _ = flush_interval.tick() => {
@@ -4928,6 +5205,13 @@ async fn run_windows_driver_capture_loop(
 
                 if let Some(target) = target {
                     send_forwarded_messages(&network_manager, target, messages).await;
+                }
+                if let Some(return_edge) = routing.take_pending_return_edge() {
+                    let mut state = state.write().await;
+                    let _ = state.session.on_return_edge_hit(return_edge);
+                    routing.clear_remote_target();
+                    forwarder.clear_target();
+                    set_local_shortcut_suppression(false);
                 }
             }
             _ = shutdown_rx.recv() => break,
@@ -5670,8 +5954,14 @@ async fn handle_ipc_client(
 
     let response = match request {
         DaemonRequest::Status => {
+            let connection_infos = {
+                let manager = network_manager.lock().await;
+                manager.connection_infos().await
+            };
             let state = state.read().await;
-            DaemonResponse::Status(state.status_snapshot())
+            let mut snapshot = state.status_snapshot();
+            snapshot.network = network_snapshot_from_connections(&connection_infos);
+            DaemonResponse::Status(snapshot)
         }
         DaemonRequest::Devices => {
             let state = state.read().await;
@@ -6607,7 +6897,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn healthy_candidates_remain_visible_after_selection() {
+    fn fallback_selection_preserves_selected_backend_health() {
         let candidates = vec![
             candidate_from_component_health(
                 BackendKind::Portable,
@@ -6627,12 +6917,7 @@ mod tests {
 
         assert_eq!(mode, Some(ResolvedInputMode::Portable));
         assert_eq!(available, vec![BackendKind::Portable]);
-        assert!(matches!(
-            health,
-            BackendHealth::Degraded {
-                reason: BackendFailureReason::Unavailable
-            }
-        ));
+        assert!(matches!(health, BackendHealth::Healthy));
         assert!(error.unwrap().contains("using Portable"));
     }
 
@@ -7002,6 +7287,293 @@ mod tests {
                 keycode: 0x20,
                 state: rshare_core::KeyState::Pressed
             }
+        ));
+    }
+
+    #[test]
+    fn key_extended_forwarding_preserves_combo_modifiers() {
+        use rshare_core::{Direction, LayoutLink, Message};
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        state.layout.add_link(LayoutLink {
+            from_device: local_id,
+            from_edge: Direction::Right,
+            to_device: remote_id,
+            to_edge: Direction::Left,
+        });
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let _ = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(1919, 500),
+            true,
+        );
+        let messages = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::key_extended(
+                rshare_input::KeyCode::Raw(0x41),
+                rshare_input::ButtonState::Pressed,
+                true,
+                true,
+                false,
+                false,
+            ),
+            true,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0],
+            Message::KeyExtended {
+                keycode: 0x41,
+                state: rshare_core::KeyState::Pressed,
+                shift: true,
+                ctrl: true,
+                alt: false,
+                meta: false
+            }
+        ));
+    }
+
+    #[test]
+    fn right_edge_activation_enters_remote_from_opposite_edge() {
+        use rshare_core::{Direction, LayoutLink, Message};
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 2560, 1440));
+        state.layout.add_link(LayoutLink {
+            from_device: local_id,
+            from_edge: Direction::Right,
+            to_device: remote_id,
+            to_edge: Direction::Left,
+        });
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let messages = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(1919, 500),
+            true,
+        );
+
+        assert!(matches!(
+            messages.first(),
+            Some(Message::MouseMove { x: 10, y: 500 })
+        ));
+    }
+
+    #[test]
+    fn quick_return_hotkey_exits_remote_without_forwarding_shortcut() {
+        use rshare_core::{Direction, LayoutLink, Message};
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        state.layout.add_link(LayoutLink {
+            from_device: local_id,
+            from_edge: Direction::Right,
+            to_device: remote_id,
+            to_edge: Direction::Left,
+        });
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let _ = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(1919, 500),
+            true,
+        );
+        let messages = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::key_extended(
+                rshare_input::KeyCode::Raw(0x4C),
+                rshare_input::ButtonState::Pressed,
+                false,
+                true,
+                true,
+                false,
+            ),
+            true,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::Key {
+                    keycode: 0x11,
+                    state: rshare_core::KeyState::Released
+                }
+            )
+        }));
+        assert!(messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::Key {
+                    keycode: 0x12,
+                    state: rshare_core::KeyState::Released
+                }
+            )
+        }));
+        let return_edge = routing.take_pending_return_edge().unwrap();
+        let _ = state.session.on_return_edge_hit(return_edge);
+        routing.clear_remote_target();
+        forwarder.clear_target();
+
+        assert_eq!(routing.remote_target(), None);
+        assert_eq!(forwarder.target(), None);
+        assert!(matches!(
+            state.status_snapshot().session_state,
+            Some(rshare_core::ControlSessionState::LocalReady)
+        ));
+    }
+
+    #[test]
+    fn ordinary_key_with_tracked_modifiers_forwards_as_combo() {
+        use rshare_core::{Direction, LayoutLink, Message};
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                last_seen_at: Instant::now(),
+            },
+        );
+        state
+            .layout
+            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+        state.layout.add_link(LayoutLink {
+            from_device: local_id,
+            from_edge: Direction::Right,
+            to_device: remote_id,
+            to_edge: Direction::Left,
+        });
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let _ = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::key(
+                rshare_input::KeyCode::ControlLeft,
+                rshare_input::ButtonState::Pressed,
+            ),
+            true,
+        );
+        let _ = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(1919, 500),
+            true,
+        );
+        let messages = messages_for_input_event(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::key(
+                rshare_input::KeyCode::Raw(0x43),
+                rshare_input::ButtonState::Pressed,
+            ),
+            true,
+        );
+
+        assert!(matches!(
+            messages.first(),
+            Some(Message::KeyExtended {
+                keycode: 0x43,
+                state: rshare_core::KeyState::Pressed,
+                ctrl: true,
+                ..
+            })
         ));
     }
 

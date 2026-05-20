@@ -490,6 +490,34 @@ test("buildDeviceGalleryItems carries live input activity for physical simulator
   assert.equal(display.activity.pointerY, 180);
 });
 
+test("buildDeviceGalleryItems maps mouse pointer to matching display id", () => {
+  const items = buildDeviceGalleryItems({
+    mouse: {
+      detected: true,
+      current_display_id: "right",
+      display_relative_x: 48,
+      display_relative_y: 64,
+    },
+    display: {
+      display_count: 2,
+      primary_width: 1920,
+      primary_height: 1080,
+      displays: [
+        { display_id: "primary", width: 1920, height: 1080, primary: true },
+        { display_id: "right", width: 2560, height: 1440, primary: false },
+      ],
+    },
+  });
+
+  const primary = items.find((item) => item.id === "gallery-display-primary");
+  const right = items.find((item) => item.id === "gallery-display-right");
+
+  assert.equal(primary.activity.pointerVisible, false);
+  assert.equal(right.activity.pointerVisible, true);
+  assert.equal(right.activity.pointerX, 48);
+  assert.equal(right.activity.pointerY, 64);
+});
+
 test("buildDesktopViewModel maps daemon devices into layout and device cards", () => {
   const payload = {
     status: {

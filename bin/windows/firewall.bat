@@ -10,7 +10,7 @@ REM   bin\windows\firewall.bat install   # Install and enable
 setlocal enabledelayedexpansion
 
 set DISCOVERY_PORT=27432
-set SERVICE_PORT=27435
+set SERVICE_PORT=27431
 set APP_NAME=R-ShareMouse
 set RULE_NAME_DISCOVERY=%APP_NAME% - Discovery
 set RULE_NAME_SERVICE=%APP_NAME% - Service
@@ -50,7 +50,7 @@ if errorlevel 1 (
 echo.
 echo Required ports for %APP_NAME%:
 echo   %DISCOVERY_PORT%/udp  - Device discovery
-echo   %SERVICE_PORT%/tcp    - Daemon service
+echo   %SERVICE_PORT%/udp    - QUIC device transport
 echo.
 
 REM Check discovery rule
@@ -64,9 +64,9 @@ if errorlevel 1 (
 REM Check service rule
 netsh advfirewall firewall show rule name="%RULE_NAME_SERVICE%" >nul 2>&1
 if errorlevel 1 (
-    echo [X] Port %SERVICE_PORT%/tcp - Rule not found
+    echo [X] Port %SERVICE_PORT%/udp - Rule not found
 ) else (
-    echo [OK] Port %SERVICE_PORT%/tcp - Rule exists
+    echo [OK] Port %SERVICE_PORT%/udp - Rule exists
 )
 
 echo.
@@ -100,9 +100,9 @@ if errorlevel 1 (
     echo [OK] Added discovery rule
 )
 
-REM Add service rule (TCP)
-echo [Adding rule for port %SERVICE_PORT%/tcp...]
-netsh advfirewall firewall add rule name="%RULE_NAME_SERVICE%" dir=in action=allow protocol=TCP localport=%SERVICE_PORT% program="%EXE_PATH%" enable=yes profile=any >nul 2>&1
+REM Add device transport rule (QUIC over UDP)
+echo [Adding rule for port %SERVICE_PORT%/udp...]
+netsh advfirewall firewall add rule name="%RULE_NAME_SERVICE%" dir=in action=allow protocol=UDP localport=%SERVICE_PORT% program="%EXE_PATH%" enable=yes profile=any >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Failed to add service rule
     echo You may need to run as administrator
@@ -163,7 +163,7 @@ echo   uninstall        Same as disable
 echo.
 echo Ports:
 echo   %DISCOVERY_PORT%/udp  - Device discovery
-echo   %SERVICE_PORT%/tcp    - Daemon service
+echo   %SERVICE_PORT%/udp    - QUIC device transport
 echo.
 echo Note: May require administrator privileges.
 echo       Right-click Command Prompt and select "Run as administrator"

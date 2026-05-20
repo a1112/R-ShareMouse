@@ -45,6 +45,29 @@ fn print_detailed_status(status: &rshare_core::ServiceStatusSnapshot) {
     kv("Discovery Port", &status.discovery_port.to_string());
     kv("Discovered Devices", &status.discovered_devices.to_string());
     kv("Connected Devices", &status.connected_devices.to_string());
+    kv("Transport", &status.network.transport);
+    kv(
+        "Realtime Datagram",
+        if status.network.datagram_available {
+            "available"
+        } else {
+            "unavailable"
+        },
+    );
+    if let Some(rtt_ms) = status.network.rtt_ms {
+        kv("RTT", &format!("{rtt_ms} ms"));
+    }
+    kv(
+        "Datagram Dropped",
+        &status.network.datagram_tx_dropped.to_string(),
+    );
+    kv(
+        "Reliable Resets",
+        &status.network.reliable_stream_reset_count.to_string(),
+    );
+    if let Some(cert_state) = &status.network.cert_trust_state {
+        kv("Certificate Trust", cert_state);
+    }
 
     println!();
     println!("{}", "Input Backend".bold());

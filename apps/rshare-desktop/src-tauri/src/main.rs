@@ -1090,6 +1090,7 @@ mod tests {
             tray_owner: rshare_core::BackgroundProcessOwner::Daemon,
             tray_state: rshare_core::TrayRuntimeState::Unavailable,
             started_by_desktop: false,
+            network: rshare_core::NetworkTransportSnapshot::default(),
         }
     }
 

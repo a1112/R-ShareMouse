@@ -17,7 +17,7 @@ NC='\033[0m'
 
 # R-ShareMouse ports
 DISCOVERY_PORT=27432  # UDP
-SERVICE_PORT=27435    # TCP
+SERVICE_PORT=27431    # UDP QUIC
 
 # Get config port from cargo config if available
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rshare/config.toml"
@@ -90,7 +90,7 @@ show_status() {
     echo ""
     echo -e "${BLUE}Required ports for $APP_NAME:${NC}"
     echo "  $DISCOVERY_PORT/udp  - Device discovery"
-    echo "  $SERVICE_PORT/tcp    - Daemon service"
+    echo "  $SERVICE_PORT/udp    - QUIC device transport"
     echo ""
 
     # Check anchor file
@@ -129,11 +129,11 @@ enable_rules() {
 pass in proto udp from any to any port $DISCOVERY_PORT
 
 # Allow daemon service (TCP)
-pass in proto tcp from any to any port $SERVICE_PORT
+pass in proto udp from any to any port $SERVICE_PORT
 
 # Allow outgoing traffic
 pass out proto udp from any to any port $DISCOVERY_PORT
-pass out proto tcp from any to any port $SERVICE_PORT
+pass out proto udp from any to any port $SERVICE_PORT
 EOF
 
     echo -e "${GREEN}Created anchor file: $PF_ANCHOR_FILE${NC}"
@@ -216,7 +216,7 @@ case $ACTION in
         echo ""
         echo "Ports:"
         echo "  $DISCOVERY_PORT/udp  - Device discovery"
-        echo "  $SERVICE_PORT/tcp    - Daemon service"
+        echo "  $SERVICE_PORT/udp    - QUIC device transport"
         echo ""
         echo "Note: macOS requires root privileges to modify firewall rules."
         echo "      Use 'sudo $0 enable' to configure."

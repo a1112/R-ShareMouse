@@ -167,7 +167,7 @@ impl NetworkManager {
     /// Get current connection information snapshots.
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         let conn = self.connection.lock().await;
-        conn.connections()
+        conn.connection_infos().await
     }
 
     /// Check if a device is connected

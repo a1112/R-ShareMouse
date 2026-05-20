@@ -44,6 +44,23 @@ pub trait InputEmulator {
     fn is_active(&self) -> bool;
 }
 
+fn active_modifier_keycodes(shift: bool, ctrl: bool, alt: bool, meta: bool) -> Vec<KeyCode> {
+    let mut modifiers = Vec::with_capacity(4);
+    if ctrl {
+        modifiers.push(KeyCode::ControlLeft);
+    }
+    if alt {
+        modifiers.push(KeyCode::AltLeft);
+    }
+    if shift {
+        modifiers.push(KeyCode::ShiftLeft);
+    }
+    if meta {
+        modifiers.push(KeyCode::SuperLeft);
+    }
+    modifiers
+}
+
 /// Configuration for input emulator
 #[derive(Debug, Clone)]
 pub struct EmulatorConfig {
@@ -185,10 +202,14 @@ impl InputEmulator for EnigoInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
-            InputEvent::KeyExtended { keycode, state, .. } => match state {
-                ButtonState::Pressed => self.press_key(keycode)?,
-                ButtonState::Released => self.release_key(keycode)?,
-            },
+            InputEvent::KeyExtended {
+                keycode,
+                state,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -352,6 +373,35 @@ impl InputEmulator for EnigoInputEmulator {
     }
 }
 
+impl EnigoInputEmulator {
+    fn emulate_key_with_modifiers(
+        &mut self,
+        keycode: KeyCode,
+        state: ButtonState,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) -> Result<()> {
+        let modifiers = active_modifier_keycodes(shift, ctrl, alt, meta);
+        match state {
+            ButtonState::Pressed => {
+                for modifier in modifiers.iter().copied().filter(|m| *m != keycode) {
+                    self.press_key(modifier)?;
+                }
+                self.press_key(keycode)?;
+            }
+            ButtonState::Released => {
+                self.release_key(keycode)?;
+                for modifier in modifiers.into_iter().rev().filter(|m| *m != keycode) {
+                    self.release_key(modifier)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Native macOS input emulator backed by CoreGraphics.
 #[cfg(target_os = "macos")]
 pub struct MacosNativeInputEmulator {
@@ -441,10 +491,14 @@ impl InputEmulator for MacosNativeInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
-            InputEvent::KeyExtended { keycode, state, .. } => match state {
-                ButtonState::Pressed => self.press_key(keycode)?,
-                ButtonState::Released => self.release_key(keycode)?,
-            },
+            InputEvent::KeyExtended {
+                keycode,
+                state,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -503,6 +557,36 @@ impl InputEmulator for MacosNativeInputEmulator {
 
     fn is_active(&self) -> bool {
         self.active
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacosNativeInputEmulator {
+    fn emulate_key_with_modifiers(
+        &mut self,
+        keycode: KeyCode,
+        state: ButtonState,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) -> Result<()> {
+        let modifiers = active_modifier_keycodes(shift, ctrl, alt, meta);
+        match state {
+            ButtonState::Pressed => {
+                for modifier in modifiers.iter().copied().filter(|m| *m != keycode) {
+                    self.press_key(modifier)?;
+                }
+                self.press_key(keycode)?;
+            }
+            ButtonState::Released => {
+                self.release_key(keycode)?;
+                for modifier in modifiers.into_iter().rev().filter(|m| *m != keycode) {
+                    self.release_key(modifier)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -707,10 +791,14 @@ impl InputEmulator for WindowsNativeInputEmulator {
                 ButtonState::Pressed => self.press_key(keycode)?,
                 ButtonState::Released => self.release_key(keycode)?,
             },
-            InputEvent::KeyExtended { keycode, state, .. } => match state {
-                ButtonState::Pressed => self.press_key(keycode)?,
-                ButtonState::Released => self.release_key(keycode)?,
-            },
+            InputEvent::KeyExtended {
+                keycode,
+                state,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -769,6 +857,36 @@ impl InputEmulator for WindowsNativeInputEmulator {
 
     fn is_active(&self) -> bool {
         self.active
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsNativeInputEmulator {
+    fn emulate_key_with_modifiers(
+        &mut self,
+        keycode: KeyCode,
+        state: ButtonState,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) -> Result<()> {
+        let modifiers = active_modifier_keycodes(shift, ctrl, alt, meta);
+        match state {
+            ButtonState::Pressed => {
+                for modifier in modifiers.iter().copied().filter(|m| *m != keycode) {
+                    self.press_key(modifier)?;
+                }
+                self.press_key(keycode)?;
+            }
+            ButtonState::Released => {
+                self.release_key(keycode)?;
+                for modifier in modifiers.into_iter().rev().filter(|m| *m != keycode) {
+                    self.release_key(modifier)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

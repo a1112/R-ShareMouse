@@ -44,8 +44,8 @@ impl Default for ForwardingConfig {
     fn default() -> Self {
         Self {
             mode: ForwardingMode::All,
-            mouse_batch_size: 10,
-            max_batch_delay: Duration::from_millis(16), // ~60fps
+            mouse_batch_size: 1,
+            max_batch_delay: Duration::from_millis(2),
             compress_events: true,
         }
     }
@@ -63,13 +63,39 @@ pub struct ForwardingStats {
 /// Raw input event for forwarding
 #[derive(Debug, Clone)]
 pub enum RawInputEvent {
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: u8, pressed: bool },
-    MouseWheel { delta_x: i32, delta_y: i32 },
-    Key { keycode: u32, pressed: bool },
-    GamepadConnected { info: GamepadDeviceInfo },
-    GamepadDisconnected { gamepad_id: u8 },
-    GamepadState { state: GamepadState },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseWheel {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
+    KeyExtended {
+        keycode: u32,
+        pressed: bool,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    },
+    GamepadConnected {
+        info: GamepadDeviceInfo,
+    },
+    GamepadDisconnected {
+        gamepad_id: u8,
+    },
+    GamepadState {
+        state: GamepadState,
+    },
 }
 
 /// Event batch for efficient transmission
@@ -78,6 +104,7 @@ pub struct EventBatch {
     mouse_moves: Vec<(i32, i32)>,
     mouse_buttons: Vec<(u8, bool)>,
     keys: Vec<(u32, bool)>,
+    key_extended: Vec<(u32, bool, bool, bool, bool, bool)>,
     wheel_delta: Option<(i32, i32)>,
 }
 
@@ -90,6 +117,7 @@ impl EventBatch {
         self.mouse_moves.is_empty()
             && self.mouse_buttons.is_empty()
             && self.keys.is_empty()
+            && self.key_extended.is_empty()
             && self.wheel_delta.is_none()
     }
 
@@ -103,6 +131,19 @@ impl EventBatch {
 
     pub fn add_key(&mut self, keycode: u32, pressed: bool) {
         self.keys.push((keycode, pressed));
+    }
+
+    pub fn add_key_extended(
+        &mut self,
+        keycode: u32,
+        pressed: bool,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) {
+        self.key_extended
+            .push((keycode, pressed, shift, ctrl, alt, meta));
     }
 
     pub fn set_wheel_delta(&mut self, delta_x: i32, delta_y: i32) {
@@ -119,6 +160,7 @@ impl EventBatch {
         self.mouse_moves.clear();
         self.mouse_buttons.clear();
         self.keys.clear();
+        self.key_extended.clear();
         self.wheel_delta = None;
     }
 }
@@ -196,6 +238,18 @@ impl ForwardingEngine {
                 self.current_batch.add_key(keycode, pressed);
                 messages.extend(self.flush_batch());
             }
+            RawInputEvent::KeyExtended {
+                keycode,
+                pressed,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => {
+                self.current_batch
+                    .add_key_extended(keycode, pressed, shift, ctrl, alt, meta);
+                messages.extend(self.flush_batch());
+            }
             RawInputEvent::GamepadConnected { info } => {
                 messages.extend(self.flush_batch());
                 messages.push(Message::GamepadConnected { info });
@@ -266,6 +320,24 @@ impl ForwardingEngine {
             self.stats.events_sent += 1;
         }
 
+        // Send key events with modifier state intact. Combo shortcuts rely on
+        // this path; downgrading to Message::Key loses Ctrl/Alt/Shift/Meta.
+        for (keycode, pressed, shift, ctrl, alt, meta) in &self.current_batch.key_extended {
+            messages.push(Message::KeyExtended {
+                keycode: *keycode,
+                state: if *pressed {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
+                shift: *shift,
+                ctrl: *ctrl,
+                alt: *alt,
+                meta: *meta,
+            });
+            self.stats.events_sent += 1;
+        }
+
         self.current_batch.clear();
         self.batch_start = None;
         self.stats.last_send = Some(Instant::now());
@@ -326,7 +398,8 @@ mod tests {
     #[test]
     fn test_forwarding_config_default() {
         let config = ForwardingConfig::default();
-        assert_eq!(config.mouse_batch_size, 10);
+        assert_eq!(config.mouse_batch_size, 1);
+        assert_eq!(config.max_batch_delay, Duration::from_millis(2));
         assert!(config.compress_events);
     }
 
@@ -352,19 +425,18 @@ mod tests {
         let device_id = DeviceId::new_v4();
         engine.set_target(device_id);
 
-        // Process enough events to fill batch
-        for i in 0..10 {
-            let event = RawInputEvent::MouseMove { x: i, y: i };
-            let _ = engine.process_event(event);
-        }
+        let messages = engine.process_event(RawInputEvent::MouseMove { x: 10, y: 10 });
 
-        // Only final position is sent when batch fills
+        assert_eq!(messages.len(), 1);
         assert_eq!(engine.stats().events_sent, 1);
     }
 
     #[test]
     fn test_flush_on_button() {
-        let mut engine = ForwardingEngine::new();
+        let mut engine = ForwardingEngine::new().with_config(ForwardingConfig {
+            mouse_batch_size: 10,
+            ..ForwardingConfig::default()
+        });
         let device_id = DeviceId::new_v4();
         engine.set_target(device_id);
 
@@ -392,7 +464,10 @@ mod tests {
 
     #[test]
     fn gamepad_events_flush_pending_mouse_batch_and_forward_snapshot() {
-        let mut engine = ForwardingEngine::new();
+        let mut engine = ForwardingEngine::new().with_config(ForwardingConfig {
+            mouse_batch_size: 10,
+            ..ForwardingConfig::default()
+        });
         engine.set_target(DeviceId::new_v4());
 
         assert!(engine
@@ -406,5 +481,33 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0], Message::MouseMove { x: 10, y: 20 }));
         assert!(matches!(messages[1], Message::GamepadState { .. }));
+    }
+
+    #[test]
+    fn key_extended_preserves_modifier_state() {
+        let mut engine = ForwardingEngine::new();
+        engine.set_target(DeviceId::new_v4());
+
+        let messages = engine.process_event(RawInputEvent::KeyExtended {
+            keycode: 0x4C,
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: true,
+            meta: false,
+        });
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0],
+            Message::KeyExtended {
+                keycode: 0x4C,
+                state: KeyState::Pressed,
+                shift: false,
+                ctrl: true,
+                alt: true,
+                meta: false
+            }
+        ));
     }
 }

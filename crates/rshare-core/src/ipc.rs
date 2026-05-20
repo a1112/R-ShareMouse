@@ -71,6 +71,49 @@ pub struct ServiceStatusSnapshot {
     /// True when this snapshot was returned after desktop auto-started the daemon.
     #[serde(default)]
     pub started_by_desktop: bool,
+
+    /// Device transport diagnostics for peer-to-peer control traffic.
+    #[serde(default)]
+    pub network: NetworkTransportSnapshot,
+}
+
+/// Runtime diagnostics for the device-to-device transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkTransportSnapshot {
+    /// Transport implementation currently used for peer traffic.
+    pub transport: String,
+    /// Whether QUIC datagrams are available for realtime input.
+    pub datagram_available: bool,
+    /// True when realtime datagrams are unavailable and input falls back to reliable streams.
+    pub realtime_degraded: bool,
+    /// Smoothed RTT for the active connection set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+    /// Milliseconds since the last realtime datagram was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_datagram_rx_ms: Option<u64>,
+    /// Count of realtime datagrams dropped before fallback.
+    pub datagram_tx_dropped: u64,
+    /// Count of reliable stream resets/reopens observed by the runtime.
+    pub reliable_stream_reset_count: u64,
+    /// Current certificate trust state for active peer connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_trust_state: Option<String>,
+}
+
+impl Default for NetworkTransportSnapshot {
+    fn default() -> Self {
+        Self {
+            transport: "quic".to_string(),
+            datagram_available: false,
+            realtime_degraded: true,
+            rtt_ms: None,
+            last_datagram_rx_ms: None,
+            datagram_tx_dropped: 0,
+            reliable_stream_reset_count: 0,
+            cert_trust_state: None,
+        }
+    }
 }
 
 fn default_background_owner() -> BackgroundProcessOwner {
@@ -117,6 +160,7 @@ impl ServiceStatusSnapshot {
             tray_owner: default_background_owner(),
             tray_state: default_tray_state(),
             started_by_desktop: false,
+            network: NetworkTransportSnapshot::default(),
         }
     }
 }

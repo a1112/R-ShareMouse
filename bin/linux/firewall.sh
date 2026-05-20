@@ -15,7 +15,7 @@ NC='\033[0m'
 
 # R-ShareMouse ports
 DISCOVERY_PORT=27432  # UDP
-SERVICE_PORT=27435    # TCP
+SERVICE_PORT=27431    # UDP QUIC
 
 # Get config port from cargo config if available
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rshare/config.toml"
@@ -41,12 +41,12 @@ detect_firewall() {
 # Check if rules exist
 check_rules_ufw() {
     ufw status | grep -q "$DISCOVERY_PORT.*udp" && echo "discovery" || echo ""
-    ufw status | grep -q "$SERVICE_PORT.*tcp" && echo "service" || echo ""
+    ufw status | grep -q "$SERVICE_PORT.*udp" && echo "service" || echo ""
 }
 
 check_rules_firewalld() {
     firewall-cmd --list-ports 2>/dev/null | grep -q "${DISCOVERY_PORT}/udp" && echo "discovery" || echo ""
-    firewall-cmd --list-ports 2>/dev/null | grep -q "${SERVICE_PORT}/tcp" && echo "service" || echo ""
+    firewall-cmd --list-ports 2>/dev/null | grep -q "${SERVICE_PORT}/udp" && echo "service" || echo ""
 }
 
 check_rules_iptables() {
@@ -62,7 +62,7 @@ add_rules_ufw() {
     ufw allow ${DISCOVERY_PORT}/udp comment "${APP_NAME} Discovery" 2>/dev/null || true
 
     # Allow service port (TCP)
-    ufw allow ${SERVICE_PORT}/tcp comment "${APP_NAME} Service" 2>/dev/null || true
+    ufw allow ${SERVICE_PORT}/udp comment "${APP_NAME} QUIC" 2>/dev/null || true
 
     echo -e "${GREEN}UFW rules added${NC}"
 }
@@ -74,7 +74,7 @@ add_rules_firewalld() {
     firewall-cmd --permanent --add-port=${DISCOVERY_PORT}/udp 2>/dev/null || true
 
     # Allow service port (TCP)
-    firewall-cmd --permanent --add-port=${SERVICE_PORT}/tcp 2>/dev/null || true
+    firewall-cmd --permanent --add-port=${SERVICE_PORT}/udp 2>/dev/null || true
 
     # Reload to apply
     firewall-cmd --reload 2>/dev/null || true
@@ -89,7 +89,7 @@ add_rules_iptables() {
     iptables -A INPUT -p udp --dport ${DISCOVERY_PORT} -j ACCEPT 2>/dev/null || true
 
     # Allow service port (TCP)
-    iptables -A INPUT -p tcp --dport ${SERVICE_PORT} -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p udp --dport ${SERVICE_PORT} -j ACCEPT 2>/dev/null || true
 
     # Save rules (varies by distribution)
     if command -v iptables-save >/dev/null 2>&1; then
@@ -109,7 +109,7 @@ remove_rules_ufw() {
     echo -e "${YELLOW}Removing UFW rules...${NC}"
 
     ufw delete allow ${DISCOVERY_PORT}/udp 2>/dev/null || true
-    ufw delete allow ${SERVICE_PORT}/tcp 2>/dev/null || true
+    ufw delete allow ${SERVICE_PORT}/udp 2>/dev/null || true
 
     echo -e "${GREEN}UFW rules removed${NC}"
 }
@@ -118,7 +118,7 @@ remove_rules_firewalld() {
     echo -e "${YELLOW}Removing firewalld rules...${NC}"
 
     firewall-cmd --permanent --remove-port=${DISCOVERY_PORT}/udp 2>/dev/null || true
-    firewall-cmd --permanent --remove-port=${SERVICE_PORT}/tcp 2>/dev/null || true
+    firewall-cmd --permanent --remove-port=${SERVICE_PORT}/udp 2>/dev/null || true
     firewall-cmd --reload 2>/dev/null || true
 
     echo -e "${GREEN}firewalld rules removed${NC}"
@@ -128,7 +128,7 @@ remove_rules_iptables() {
     echo -e "${YELLOW}Removing iptables rules...${NC}"
 
     iptables -D INPUT -p udp --dport ${DISCOVERY_PORT} -j ACCEPT 2>/dev/null || true
-    iptables -D INPUT -p tcp --dport ${SERVICE_PORT} -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p udp --dport ${SERVICE_PORT} -j ACCEPT 2>/dev/null || true
 
     echo -e "${GREEN}iptables rules removed${NC}"
 }
@@ -176,7 +176,7 @@ show_status() {
     echo ""
     echo -e "${BLUE}Required ports for $APP_NAME:${NC}"
     echo "  $DISCOVERY_PORT/udp  - Device discovery"
-    echo "  ${SERVICE_PORT}/tcp    - Daemon service"
+    echo "  ${SERVICE_PORT}/udp    - QUIC device transport"
     echo ""
 
     # Check if rules exist (may require root)
@@ -197,9 +197,9 @@ show_status() {
         fi
 
         if [ -n "$STATUS_SERVICE" ]; then
-            echo -e "  ${GREEN}[✓]${NC} Port $SERVICE_PORT/tcp (service)"
+            echo -e "  ${GREEN}[✓]${NC} Port $SERVICE_PORT/udp (transport)"
         else
-            echo -e "  ${RED}[✗]${NC} Port $SERVICE_PORT/tcp (service)"
+            echo -e "  ${RED}[✗]${NC} Port $SERVICE_PORT/udp (transport)"
         fi
     fi
 
@@ -249,7 +249,7 @@ case $ACTION in
         echo ""
         echo "Ports:"
         echo "  $DISCOVERY_PORT/udp  - Device discovery"
-        echo "  $SERVICE_PORT/tcp    - Daemon service"
+        echo "  $SERVICE_PORT/udp    - QUIC device transport"
         echo ""
         ;;
     *)

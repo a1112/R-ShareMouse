@@ -1,7 +1,7 @@
 //! Windows firewall configuration for R-ShareMouse
 //!
 //! Automatically configures Windows Defender Firewall to allow
-//! R-ShareMouse discovery and service ports.
+//! R-ShareMouse discovery and QUIC device transport ports.
 
 cfg_if::cfg_if! {
     if #[cfg(windows)] {
@@ -24,7 +24,7 @@ mod windows_impl {
     ///
     /// This function adds firewall rules for:
     /// - UDP port 27432 (device discovery)
-    /// - TCP port 27431 (service communication)
+    /// - UDP port 27431 (QUIC device transport)
     ///
     /// # Errors
     ///
@@ -41,8 +41,8 @@ mod windows_impl {
              Please restart as administrator or manually add firewall rules:\n\
              netsh advfirewall firewall add rule name=\"R-ShareMouse Discovery (UDP-In)\" \
              dir=in action=allow protocol=UDP localport=27432\n\
-             netsh advfirewall firewall add rule name=\"R-ShareMouse Service (TCP-In)\" \
-             dir=in action=allow protocol=TCP localport=27431"
+             netsh advfirewall firewall add rule name=\"R-ShareMouse Transport (QUIC UDP-In)\" \
+             dir=in action=allow protocol=UDP localport=27431"
             ));
         }
 
@@ -61,18 +61,18 @@ mod windows_impl {
             }
         }
 
-        // Add TCP service rule
-        match add_firewall_rule("R-ShareMouse Service (TCP-In)", "27431", "TCP") {
+        // Add QUIC device transport rule
+        match add_firewall_rule("R-ShareMouse Transport (QUIC UDP-In)", "27431", "UDP") {
             Ok(existed) => {
-                result.tcp_service = if existed {
+                result.quic_transport = if existed {
                     FirewallRuleStatus::AlreadyExisted
                 } else {
                     FirewallRuleStatus::Created
                 };
             }
             Err(e) => {
-                tracing::warn!("Failed to add TCP service rule: {}", e);
-                result.tcp_service = FirewallRuleStatus::Failed(e.to_string());
+                tracing::warn!("Failed to add QUIC transport rule: {}", e);
+                result.quic_transport = FirewallRuleStatus::Failed(e.to_string());
             }
         }
 
@@ -86,7 +86,7 @@ mod windows_impl {
         }
 
         check_rule_exists("R-ShareMouse Discovery (UDP-In)")
-            && check_rule_exists("R-ShareMouse Service (TCP-In)")
+            && check_rule_exists("R-ShareMouse Transport (QUIC UDP-In)")
     }
 
     /// Remove R-ShareMouse firewall rules
@@ -98,7 +98,7 @@ mod windows_impl {
         }
 
         let _ = remove_firewall_rule("R-ShareMouse Discovery (UDP-In)");
-        let _ = remove_firewall_rule("R-ShareMouse Service (TCP-In)");
+        let _ = remove_firewall_rule("R-ShareMouse Transport (QUIC UDP-In)");
 
         Ok(())
     }
@@ -107,7 +107,7 @@ mod windows_impl {
     #[derive(Debug, Clone, Default)]
     pub struct FirewallConfigResult {
         pub udp_discovery: FirewallRuleStatus,
-        pub tcp_service: FirewallRuleStatus,
+        pub quic_transport: FirewallRuleStatus,
     }
 
     impl FirewallConfigResult {
@@ -117,7 +117,7 @@ mod windows_impl {
                 self.udp_discovery,
                 FirewallRuleStatus::Created | FirewallRuleStatus::AlreadyExisted
             ) && matches!(
-                self.tcp_service,
+                self.quic_transport,
                 FirewallRuleStatus::Created | FirewallRuleStatus::AlreadyExisted
             )
         }
@@ -294,7 +294,7 @@ mod windows_impl {
         fn test_firewall_config_result_success() {
             let mut result = FirewallConfigResult::default();
             result.udp_discovery = FirewallRuleStatus::Created;
-            result.tcp_service = FirewallRuleStatus::AlreadyExisted;
+            result.quic_transport = FirewallRuleStatus::AlreadyExisted;
             assert!(result.is_success());
         }
     }

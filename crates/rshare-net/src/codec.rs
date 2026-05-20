@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
-use rshare_core::Message;
+use rshare_core::{GamepadButton, GamepadButtonState, GamepadState, Message};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Message frame format
 ///
@@ -14,6 +15,307 @@ use rshare_core::Message;
 /// This allows for efficient streaming and future protocol extensions.
 
 const FRAME_HEADER_SIZE: usize = 5; // length (4) + type (1)
+
+/// Compact realtime datagram header size.
+///
+/// Header layout:
+/// - version: u8
+/// - message_type: u8
+/// - flags: u8
+/// - payload_len: u16
+/// - seq: u32
+/// - timestamp_us: u64
+pub const REALTIME_FRAME_HEADER_SIZE: usize = 17;
+pub const REALTIME_PROTOCOL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RealtimeMessageType {
+    MouseMove = 1,
+    GamepadState = 2,
+}
+
+impl RealtimeMessageType {
+    fn decode(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::MouseMove),
+            2 => Ok(Self::GamepadState),
+            other => anyhow::bail!("Unknown realtime message type: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeFrame {
+    pub version: u8,
+    pub message_type: RealtimeMessageType,
+    pub flags: u8,
+    pub payload_len: u16,
+    pub seq: u32,
+    pub timestamp_us: u64,
+    pub payload: Vec<u8>,
+}
+
+impl RealtimeFrame {
+    pub fn new(
+        message_type: RealtimeMessageType,
+        flags: u8,
+        seq: u32,
+        timestamp_us: u64,
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        let payload_len = u16::try_from(payload.len())
+            .map_err(|_| anyhow::anyhow!("Realtime payload too large: {} bytes", payload.len()))?;
+        Ok(Self {
+            version: REALTIME_PROTOCOL_VERSION,
+            message_type,
+            flags,
+            payload_len,
+            seq,
+            timestamp_us,
+            payload,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut frame = BytesMut::with_capacity(REALTIME_FRAME_HEADER_SIZE + self.payload.len());
+        frame.put_u8(self.version);
+        frame.put_u8(self.message_type as u8);
+        frame.put_u8(self.flags);
+        frame.put_u16(self.payload_len);
+        frame.put_u32(self.seq);
+        frame.put_u64(self.timestamp_us);
+        frame.put_slice(&self.payload);
+        frame.to_vec()
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < REALTIME_FRAME_HEADER_SIZE {
+            anyhow::bail!("Realtime frame too short: {} bytes", data.len());
+        }
+
+        let version = data[0];
+        if version != REALTIME_PROTOCOL_VERSION {
+            anyhow::bail!("Unsupported realtime frame version: {version}");
+        }
+
+        let message_type = RealtimeMessageType::decode(data[1])?;
+        let flags = data[2];
+        let payload_len = u16::from_be_bytes([data[3], data[4]]);
+        let seq = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+        let timestamp_us = u64::from_be_bytes([
+            data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
+        ]);
+
+        let expected_len = REALTIME_FRAME_HEADER_SIZE + payload_len as usize;
+        if data.len() != expected_len {
+            anyhow::bail!(
+                "Realtime payload length mismatch: expected {}, got {}",
+                expected_len,
+                data.len()
+            );
+        }
+
+        Ok(Self {
+            version,
+            message_type,
+            flags,
+            payload_len,
+            seq,
+            timestamp_us,
+            payload: data[REALTIME_FRAME_HEADER_SIZE..].to_vec(),
+        })
+    }
+}
+
+pub struct RealtimeInputCodec;
+
+impl RealtimeInputCodec {
+    pub fn encode_message(seq: u32, message: &Message) -> Result<Option<Vec<u8>>> {
+        let timestamp_us = timestamp_us();
+        match message {
+            Message::MouseMove { x, y } => {
+                let mut payload = BytesMut::with_capacity(8);
+                payload.put_i32(*x);
+                payload.put_i32(*y);
+                Ok(Some(
+                    RealtimeFrame::new(
+                        RealtimeMessageType::MouseMove,
+                        0,
+                        seq,
+                        timestamp_us,
+                        payload.to_vec(),
+                    )?
+                    .encode(),
+                ))
+            }
+            Message::GamepadState { state } => Ok(Some(
+                RealtimeFrame::new(
+                    RealtimeMessageType::GamepadState,
+                    0,
+                    seq,
+                    timestamp_us,
+                    encode_gamepad_state(state)?,
+                )?
+                .encode(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn decode_message(data: &[u8]) -> Result<Message> {
+        let frame = RealtimeFrame::decode(data)?;
+        match frame.message_type {
+            RealtimeMessageType::MouseMove => {
+                if frame.payload.len() != 8 {
+                    anyhow::bail!(
+                        "MouseMove realtime payload must be 8 bytes, got {}",
+                        frame.payload.len()
+                    );
+                }
+                let x = i32::from_be_bytes(frame.payload[0..4].try_into()?);
+                let y = i32::from_be_bytes(frame.payload[4..8].try_into()?);
+                Ok(Message::MouseMove { x, y })
+            }
+            RealtimeMessageType::GamepadState => Ok(Message::GamepadState {
+                state: decode_gamepad_state(&frame.payload)?,
+            }),
+        }
+    }
+}
+
+pub struct ControlMessageCodec;
+
+impl ControlMessageCodec {
+    pub fn encode(message: &Message) -> Result<Vec<u8>> {
+        MessageCodec::encode(message)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Message> {
+        MessageCodec::decode(data)
+    }
+}
+
+fn timestamp_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+fn encode_gamepad_state(state: &GamepadState) -> Result<Vec<u8>> {
+    let button_count = u16::try_from(state.buttons.len())
+        .map_err(|_| anyhow::anyhow!("Too many gamepad buttons: {}", state.buttons.len()))?;
+    let mut payload = BytesMut::with_capacity(1 + 8 + 8 + 8 + 4 + 2 + state.buttons.len() * 3);
+    payload.put_u8(state.gamepad_id);
+    payload.put_u64(state.sequence);
+    payload.put_u64(state.timestamp_ms);
+    payload.put_i16(state.left_stick_x);
+    payload.put_i16(state.left_stick_y);
+    payload.put_i16(state.right_stick_x);
+    payload.put_i16(state.right_stick_y);
+    payload.put_u16(state.left_trigger);
+    payload.put_u16(state.right_trigger);
+    payload.put_u16(button_count);
+    for button in &state.buttons {
+        payload.put_u16(encode_gamepad_button(button.button));
+        payload.put_u8(u8::from(button.pressed));
+    }
+    Ok(payload.to_vec())
+}
+
+fn decode_gamepad_state(data: &[u8]) -> Result<GamepadState> {
+    const FIXED_LEN: usize = 1 + 8 + 8 + 8 + 4 + 2;
+    if data.len() < FIXED_LEN {
+        anyhow::bail!(
+            "GamepadState realtime payload too short: {} bytes",
+            data.len()
+        );
+    }
+    let mut bytes = BytesMut::from(data);
+    let gamepad_id = bytes.get_u8();
+    let sequence = bytes.get_u64();
+    let timestamp_ms = bytes.get_u64();
+    let left_stick_x = bytes.get_i16();
+    let left_stick_y = bytes.get_i16();
+    let right_stick_x = bytes.get_i16();
+    let right_stick_y = bytes.get_i16();
+    let left_trigger = bytes.get_u16();
+    let right_trigger = bytes.get_u16();
+    let button_count = bytes.get_u16() as usize;
+    if bytes.len() != button_count * 3 {
+        anyhow::bail!(
+            "GamepadState button payload length mismatch: {} bytes for {} buttons",
+            bytes.len(),
+            button_count
+        );
+    }
+    let mut buttons = Vec::with_capacity(button_count);
+    for _ in 0..button_count {
+        let button = decode_gamepad_button(bytes.get_u16());
+        let pressed = bytes.get_u8() != 0;
+        buttons.push(GamepadButtonState { button, pressed });
+    }
+    Ok(GamepadState {
+        gamepad_id,
+        sequence,
+        buttons,
+        left_stick_x,
+        left_stick_y,
+        right_stick_x,
+        right_stick_y,
+        left_trigger,
+        right_trigger,
+        timestamp_ms,
+    })
+}
+
+fn encode_gamepad_button(button: GamepadButton) -> u16 {
+    match button {
+        GamepadButton::South => 0,
+        GamepadButton::East => 1,
+        GamepadButton::West => 2,
+        GamepadButton::North => 3,
+        GamepadButton::LeftBumper => 4,
+        GamepadButton::RightBumper => 5,
+        GamepadButton::LeftTrigger => 6,
+        GamepadButton::RightTrigger => 7,
+        GamepadButton::Select => 8,
+        GamepadButton::Start => 9,
+        GamepadButton::Guide => 10,
+        GamepadButton::LeftStick => 11,
+        GamepadButton::RightStick => 12,
+        GamepadButton::DPadUp => 13,
+        GamepadButton::DPadDown => 14,
+        GamepadButton::DPadLeft => 15,
+        GamepadButton::DPadRight => 16,
+        GamepadButton::Other(code) => 0x8000 | code,
+    }
+}
+
+fn decode_gamepad_button(code: u16) -> GamepadButton {
+    match code {
+        0 => GamepadButton::South,
+        1 => GamepadButton::East,
+        2 => GamepadButton::West,
+        3 => GamepadButton::North,
+        4 => GamepadButton::LeftBumper,
+        5 => GamepadButton::RightBumper,
+        6 => GamepadButton::LeftTrigger,
+        7 => GamepadButton::RightTrigger,
+        8 => GamepadButton::Select,
+        9 => GamepadButton::Start,
+        10 => GamepadButton::Guide,
+        11 => GamepadButton::LeftStick,
+        12 => GamepadButton::RightStick,
+        13 => GamepadButton::DPadUp,
+        14 => GamepadButton::DPadDown,
+        15 => GamepadButton::DPadLeft,
+        16 => GamepadButton::DPadRight,
+        other if other & 0x8000 != 0 => GamepadButton::Other(other & 0x7fff),
+        other => GamepadButton::Other(other),
+    }
+}
 
 /// Message codec for encoding/decoding messages
 pub struct MessageCodec;
@@ -404,5 +706,79 @@ mod tests {
 
         let result = MessageCodec::encode(&msg);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn realtime_mouse_move_encode_decode() {
+        let encoded = RealtimeInputCodec::encode_message(7, &Message::MouseMove { x: 123, y: -45 })
+            .unwrap()
+            .unwrap();
+        let frame = RealtimeFrame::decode(&encoded).unwrap();
+        assert_eq!(frame.version, REALTIME_PROTOCOL_VERSION);
+        assert_eq!(frame.message_type, RealtimeMessageType::MouseMove);
+        assert_eq!(frame.payload_len, 8);
+        assert_eq!(frame.seq, 7);
+
+        let decoded = RealtimeInputCodec::decode_message(&encoded).unwrap();
+        assert!(matches!(decoded, Message::MouseMove { x: 123, y: -45 }));
+    }
+
+    #[test]
+    fn realtime_gamepad_state_encode_decode() {
+        let mut state = GamepadState::neutral(2, 99, 1234);
+        state.left_stick_x = -12;
+        state.right_trigger = 500;
+        state.buttons.push(GamepadButtonState {
+            button: GamepadButton::South,
+            pressed: true,
+        });
+        state.buttons.push(GamepadButtonState {
+            button: GamepadButton::Other(42),
+            pressed: false,
+        });
+
+        let encoded = RealtimeInputCodec::encode_message(9, &Message::GamepadState { state })
+            .unwrap()
+            .unwrap();
+        let decoded = RealtimeInputCodec::decode_message(&encoded).unwrap();
+
+        match decoded {
+            Message::GamepadState { state } => {
+                assert_eq!(state.gamepad_id, 2);
+                assert_eq!(state.sequence, 99);
+                assert_eq!(state.left_stick_x, -12);
+                assert_eq!(state.right_trigger, 500);
+                assert_eq!(state.buttons.len(), 2);
+                assert_eq!(state.buttons[0].button, GamepadButton::South);
+                assert!(state.buttons[0].pressed);
+                assert_eq!(state.buttons[1].button, GamepadButton::Other(42));
+                assert!(!state.buttons[1].pressed);
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn realtime_decode_rejects_unknown_version_and_type() {
+        let mut encoded = RealtimeInputCodec::encode_message(1, &Message::MouseMove { x: 1, y: 2 })
+            .unwrap()
+            .unwrap();
+        encoded[0] = REALTIME_PROTOCOL_VERSION + 1;
+        assert!(RealtimeFrame::decode(&encoded).is_err());
+
+        let mut encoded = RealtimeInputCodec::encode_message(1, &Message::MouseMove { x: 1, y: 2 })
+            .unwrap()
+            .unwrap();
+        encoded[1] = 99;
+        assert!(RealtimeFrame::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn realtime_decode_rejects_payload_length_mismatch() {
+        let mut encoded = RealtimeInputCodec::encode_message(1, &Message::MouseMove { x: 1, y: 2 })
+            .unwrap()
+            .unwrap();
+        encoded.pop();
+        assert!(RealtimeFrame::decode(&encoded).is_err());
     }
 }

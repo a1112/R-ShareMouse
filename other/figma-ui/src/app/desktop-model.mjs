@@ -742,18 +742,29 @@ export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevic
   for (const display of displays) {
     const width = Number(display.width ?? snapshot?.display?.primary_width ?? 1920);
     const height = Number(display.height ?? snapshot?.display?.primary_height ?? 1080);
-    const currentDisplayIndex = Number(snapshot?.mouse?.current_display_index ?? 0);
+    const displayId = display.display_id ?? "primary";
+    const currentDisplayId = snapshot?.mouse?.current_display_id ?? null;
+    const hasCurrentDisplayIndex =
+      snapshot?.mouse?.current_display_index !== undefined &&
+      snapshot?.mouse?.current_display_index !== null;
+    const currentDisplayIndex = Number(snapshot?.mouse?.current_display_index ?? -1);
     const displayIndex = displays.indexOf(display);
-    const pointerOnDisplay =
-      snapshot?.mouse?.detected && (currentDisplayIndex === displayIndex || display.primary);
+    const pointerOnDisplay = Boolean(
+      snapshot?.mouse?.detected &&
+        (currentDisplayId
+          ? currentDisplayId === displayId
+          : hasCurrentDisplayIndex
+            ? currentDisplayIndex === displayIndex
+            : display.primary),
+    );
     items.push({
-      id: `gallery-display-${display.display_id ?? "primary"}`,
+      id: `gallery-display-${displayId}`,
       kind: "display",
       title: display.primary ? "主显示" : "显示",
       detail: `${width} x ${height}`,
       metric: display.primary ? "Primary" : "Display",
       activity: {
-        pointerVisible: Boolean(pointerOnDisplay),
+        pointerVisible: pointerOnDisplay,
         pointerX: Number(snapshot?.mouse?.display_relative_x ?? snapshot?.mouse?.x ?? 0),
         pointerY: Number(snapshot?.mouse?.display_relative_y ?? snapshot?.mouse?.y ?? 0),
         width,

@@ -127,9 +127,10 @@ Uses Windows Firewall with `netsh advfirewall`.
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 27432 | UDP | Device discovery (mDNS) |
-| 27435 | TCP | Daemon service (IPC) |
+| 27431 | UDP | QUIC device transport |
+| 27435 | TCP | Local daemon IPC (loopback only) |
 
-*Note: The service port may be different if configured in `~/.config/rshare/config.toml`*
+*Note: The device transport port may be different if configured in `~/.config/rshare/config.toml`. The IPC port is local-only and should not be opened to the LAN.*
 
 ## Platform-Specific Features
 
