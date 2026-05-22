@@ -76,6 +76,8 @@ struct DesktopAcceptancePayload {
     discovered_devices: usize,
     connected_devices: usize,
     visible_layout_devices: usize,
+    local_display_count: usize,
+    local_ready: bool,
     input_ready: bool,
     dual_machine_ready: bool,
     next_step: String,
@@ -573,11 +575,17 @@ fn build_acceptance(
     let visible_layout_devices = visible_layout
         .map(|layout| layout.nodes.len())
         .unwrap_or_default();
+    let local_display_count = visible_layout
+        .and_then(|layout| layout.get_node(status.device_id))
+        .map(|node| node.displays.len())
+        .unwrap_or_default();
     let input_ready = status.input_mode.is_some()
         && matches!(status.backend_health, Some(BackendHealth::Healthy));
     let background_ready = status.background_owner == BackgroundProcessOwner::Daemon
         && status.background_mode == BackgroundRunMode::BackgroundProcess;
     let tray_owned_by_daemon = status.tray_owner == BackgroundProcessOwner::Daemon;
+    let local_ready =
+        background_ready && input_ready && layout_error.is_none() && local_display_count > 0;
     let dual_machine_ready = background_ready
         && input_ready
         && layout_error.is_none()
@@ -587,6 +595,8 @@ fn build_acceptance(
         "后台服务未就绪，先启动守护进程"
     } else if !input_ready {
         "输入后端未就绪，先检查权限或后端降级"
+    } else if local_ready && devices.is_empty() {
+        "本机能力已就绪，可以进行本机设备监控；双机验收等待局域网发现"
     } else if devices.is_empty() {
         "打开另一台机器并保持同一局域网，等待自动发现"
     } else if layout_error.is_some() || visible_layout_devices <= 1 {
@@ -604,6 +614,8 @@ fn build_acceptance(
         discovered_devices: devices.len(),
         connected_devices: devices.iter().filter(|device| device.connected).count(),
         visible_layout_devices,
+        local_display_count,
+        local_ready,
         input_ready,
         dual_machine_ready,
         next_step: next_step.to_string(),
@@ -1152,6 +1164,21 @@ mod tests {
         layout
     }
 
+    fn sample_multi_display_layout(local_id: DeviceId) -> LayoutGraph {
+        let mut layout = LayoutGraph::new(local_id);
+        let mut node = rshare_core::LayoutNode::new(local_id, 0, 0, 2560, 1440);
+        node.displays.push(rshare_core::DisplayNode {
+            display_id: "display-2".to_string(),
+            x: 2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            primary: false,
+        });
+        layout.add_node(node);
+        layout
+    }
+
     fn empty_capabilities() -> BoxFutureResult<'static, CapabilityRegistrySnapshot> {
         Box::pin(async {
             Ok(CapabilityRegistrySnapshot {
@@ -1462,6 +1489,44 @@ mod tests {
         assert_eq!(
             result.acceptance.next_step,
             "打开另一台机器并连接设备，开始边缘切换验收"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_state_reports_local_acceptance_without_remote_devices() {
+        let local_id = DeviceId::new_v4();
+
+        let result = dashboard_state_with(
+            move || {
+                Box::pin({
+                    let mut status = sample_status();
+                    status.device_id = local_id;
+                    status.input_mode = Some(rshare_core::ResolvedInputMode::Portable);
+                    status.backend_health = Some(rshare_core::BackendHealth::Healthy);
+                    async move {
+                        Ok(DesktopDaemonStatus {
+                            status,
+                            auto_started: false,
+                        })
+                    }
+                })
+            },
+            || Box::pin(async { Ok(Vec::new()) }),
+            empty_capabilities,
+            move || Box::pin(async move { Ok(sample_multi_display_layout(local_id)) }),
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect("dashboard should expose local acceptance");
+
+        assert!(result.acceptance.input_ready);
+        assert!(result.acceptance.local_ready);
+        assert_eq!(result.acceptance.local_display_count, 2);
+        assert_eq!(result.acceptance.visible_layout_devices, 1);
+        assert!(!result.acceptance.dual_machine_ready);
+        assert_eq!(
+            result.acceptance.next_step,
+            "本机能力已就绪，可以进行本机设备监控；双机验收等待局域网发现"
         );
     }
 

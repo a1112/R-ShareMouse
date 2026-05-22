@@ -81,6 +81,12 @@ pub struct FeatureConfig {
     /// Suppress local OS shortcuts while this machine is controlling a remote target.
     #[serde(default = "default_true")]
     pub suppress_local_shortcuts_when_remote: bool,
+    /// Allow edge-triggered automatic forwarding of captured input to a remote target.
+    ///
+    /// Disabled by default while Alpha endpoint diagnostics are being validated; manual
+    /// endpoint injection tests remain available through the daemon IPC.
+    #[serde(default)]
+    pub automatic_input_forwarding: bool,
     /// Ask the remote endpoint to run the reverse latency probe automatically.
     #[serde(default = "default_true")]
     pub auto_endpoint_latency_probe: bool,
@@ -171,6 +177,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             suppress_local_shortcuts_when_remote: true,
+            automatic_input_forwarding: false,
             auto_endpoint_latency_probe: true,
             audio_capture: true,
             audio_forwarding: true,
@@ -368,6 +375,7 @@ mod tests {
         assert_eq!(config.gamepad.max_update_hz, 120);
         assert!(!config.gamepad.vibration);
         assert!(config.features.suppress_local_shortcuts_when_remote);
+        assert!(!config.features.automatic_input_forwarding);
         assert!(config.features.auto_endpoint_latency_probe);
         assert!(config.features.audio_capture);
         assert!(config.features.audio_forwarding);

@@ -76,9 +76,9 @@ exit /b 0
 echo [Configuring Windows Firewall rules...]
 echo.
 
-REM Get the executable path
-set EXE_PATH=%~dp0\..\..\target\release\rshare-gui.exe
-if not exist "%EXE_PATH%" set EXE_PATH=%~dp0\..\..\target\debug\rshare-gui.exe
+REM Get the daemon executable path. The daemon owns UDP discovery and QUIC transport.
+set EXE_PATH=%~dp0\..\..\target\release\rshare-daemon.exe
+if not exist "%EXE_PATH%" set EXE_PATH=%~dp0\..\..\target\debug\rshare-daemon.exe
 
 REM Check if exe exists
 if exist "%EXE_PATH%" goto found_exe

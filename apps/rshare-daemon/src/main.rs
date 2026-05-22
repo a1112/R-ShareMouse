@@ -13,7 +13,7 @@ use rshare_core::{
     remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
+    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction, DisplayNode,
     EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
     EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
     EndpointInjectTarget, FeatureConfig, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
@@ -112,6 +112,7 @@ struct PendingEndpointInject {
 #[derive(Debug, Clone)]
 struct RuntimeFeatureConfig {
     suppress_local_shortcuts_when_remote: bool,
+    automatic_input_forwarding: bool,
     auto_endpoint_latency_probe: bool,
     audio_capture: bool,
     audio_forwarding: bool,
@@ -126,6 +127,7 @@ impl RuntimeFeatureConfig {
             suppress_local_shortcuts_when_remote: config
                 .features
                 .suppress_local_shortcuts_when_remote,
+            automatic_input_forwarding: config.features.automatic_input_forwarding,
             auto_endpoint_latency_probe: config.features.auto_endpoint_latency_probe,
             audio_capture: config.features.audio_capture,
             audio_forwarding: config.features.audio_forwarding,
@@ -142,6 +144,7 @@ impl RuntimeFeatureConfig {
     fn to_feature_config(&self) -> FeatureConfig {
         let mut features = FeatureConfig::default();
         features.suppress_local_shortcuts_when_remote = self.suppress_local_shortcuts_when_remote;
+        features.automatic_input_forwarding = self.automatic_input_forwarding;
         features.auto_endpoint_latency_probe = self.auto_endpoint_latency_probe;
         features.audio_capture = self.audio_capture;
         features.audio_forwarding = self.audio_forwarding;
@@ -373,12 +376,8 @@ impl DaemonState {
     }
 
     fn reconcile_local_layout_geometry(&mut self) -> bool {
-        let local_screen = current_primary_screen_info();
-        self.layout.update_primary_display_geometry(
-            self.status.device_id,
-            local_screen.width,
-            local_screen.height,
-        )
+        let displays = display_nodes_from_local_display_state(&self.local_controls.display);
+        upsert_layout_node_displays(&mut self.layout, self.status.device_id, displays)
     }
 
     fn update_backend_state(
@@ -490,6 +489,7 @@ impl DaemonState {
     fn refresh_local_controls_platform(&mut self) {
         let features = self.features.clone();
         refresh_platform_local_controls(&mut self.local_controls, &features);
+        self.reconcile_local_layout_geometry();
     }
 
     fn arm_injected_loopback(&mut self, device_kind: LocalInputDeviceKind, timestamp_ms: u64) {
@@ -891,6 +891,9 @@ fn display_state_from_windows_screens(
         .find(|screen| screen.x == 0 && screen.y == 0)
         .unwrap_or(&screens[0]);
 
+    let mut sorted_screens = screens.to_vec();
+    sorted_screens.sort_by_key(|screen| (screen.x, screen.y));
+
     LocalDisplayState {
         display_count: screens.len(),
         virtual_x: min_x,
@@ -899,7 +902,7 @@ fn display_state_from_windows_screens(
         primary_height: primary.height,
         layout_width: max_x.saturating_sub(min_x).max(0) as u32,
         layout_height: max_y.saturating_sub(min_y).max(0) as u32,
-        displays: screens
+        displays: sorted_screens
             .iter()
             .enumerate()
             .map(|(index, screen)| LocalDisplayInfo {
@@ -918,14 +921,88 @@ fn display_state_from_windows_screens(
     }
 }
 
+fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<DisplayNode> {
+    let mut displays = if display.displays.is_empty() {
+        vec![LocalDisplayInfo {
+            display_id: "primary".to_string(),
+            x: 0,
+            y: 0,
+            width: display.primary_width.max(1),
+            height: display.primary_height.max(1),
+            primary: true,
+        }]
+    } else {
+        display.displays.clone()
+    };
+    displays.sort_by_key(|display| (display.x, display.y));
+
+    let has_primary = displays.iter().any(|display| display.primary);
+    displays
+        .into_iter()
+        .enumerate()
+        .map(|(index, display)| DisplayNode {
+            display_id: if display.display_id.trim().is_empty() {
+                if display.primary || (!has_primary && index == 0) {
+                    "primary".to_string()
+                } else {
+                    format!("display-{}", index + 1)
+                }
+            } else {
+                display.display_id
+            },
+            x: display.x,
+            y: display.y,
+            width: display.width.max(1),
+            height: display.height.max(1),
+            primary: display.primary || (!has_primary && index == 0),
+        })
+        .collect()
+}
+
+fn upsert_layout_node_displays(
+    layout: &mut LayoutGraph,
+    local_device_id: DeviceId,
+    displays: Vec<DisplayNode>,
+) -> bool {
+    let displays = if displays.is_empty() {
+        vec![DisplayNode::primary(0, 0, 1920, 1080)]
+    } else {
+        displays
+    };
+
+    if let Some(node) = layout
+        .nodes
+        .iter_mut()
+        .find(|node| node.device_id == local_device_id)
+    {
+        if node.displays == displays {
+            return false;
+        }
+        node.displays = displays;
+        return true;
+    }
+
+    layout.add_node(LayoutNode {
+        device_id: local_device_id,
+        displays,
+    });
+    true
+}
+
 fn push_recent_local_event(
     snapshot: &mut LocalControlDeviceSnapshot,
     event: LocalInputDiagnosticEvent,
 ) {
     snapshot.recent_events.push(event);
-    if snapshot.recent_events.len() > LOCAL_CONTROL_RECENT_EVENT_LIMIT {
-        let overflow = snapshot.recent_events.len() - LOCAL_CONTROL_RECENT_EVENT_LIMIT;
-        snapshot.recent_events.drain(0..overflow);
+    while snapshot.recent_events.len() > LOCAL_CONTROL_RECENT_EVENT_LIMIT {
+        let remove_index = snapshot
+            .recent_events
+            .iter()
+            .position(|event| {
+                event.device_kind == LocalInputDeviceKind::Mouse && event.event_kind == "move"
+            })
+            .unwrap_or(0);
+        snapshot.recent_events.remove(remove_index);
     }
 }
 
@@ -2436,6 +2513,49 @@ fn messages_for_input_event(
         messages = forwarder.flush_batch();
     }
     messages
+}
+
+#[derive(Debug)]
+struct CapturedInputForwardingOutcome {
+    target: Option<DeviceId>,
+    messages: Vec<Message>,
+    suppress_local_shortcuts: bool,
+}
+
+fn captured_input_forwarding_outcome(
+    state: &mut DaemonState,
+    routing: &mut InputRoutingState,
+    forwarder: &mut rshare_core::engine::ForwardingEngine,
+    event: InputEvent,
+    gamepad_forwarding_enabled: bool,
+) -> CapturedInputForwardingOutcome {
+    if !state.features.automatic_input_forwarding {
+        if state.session.is_remote_active() {
+            state.session.reset();
+        }
+        routing.clear_remote_target();
+        forwarder.clear_target();
+        return CapturedInputForwardingOutcome {
+            target: None,
+            messages: Vec::new(),
+            suppress_local_shortcuts: false,
+        };
+    }
+
+    let messages =
+        messages_for_input_event(state, routing, forwarder, event, gamepad_forwarding_enabled);
+    let target = state.session.active_target();
+    let suppress_local_shortcuts = state.features.suppress_local_shortcuts_when_remote
+        && matches!(
+            state.session.state(),
+            ControlSessionState::RemoteActive { .. }
+        );
+
+    CapturedInputForwardingOutcome {
+        target,
+        messages,
+        suppress_local_shortcuts,
+    }
 }
 
 fn is_quick_return_hotkey(event: &InputEvent, modifiers: ActiveModifiers) -> bool {
@@ -5120,19 +5240,19 @@ async fn run_input_forwarding_loop(
                     let local_event = state.record_local_input_event(&event);
                     let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
-                    let messages = messages_for_input_event(
+                    let outcome = captured_input_forwarding_outcome(
                         &mut state,
                         &mut routing,
                         &mut forwarder,
                         event,
                         gamepad_forwarding_enabled,
                     );
-                    let target = state.session.active_target();
-                    let suppress_local_shortcuts = matches!(
-                        state.session.state(),
-                        ControlSessionState::RemoteActive { .. }
-                    );
-                    (target, messages, diagnostic, suppress_local_shortcuts)
+                    (
+                        outcome.target,
+                        outcome.messages,
+                        diagnostic,
+                        outcome.suppress_local_shortcuts,
+                    )
                 };
                 set_local_shortcut_suppression(suppress_local_shortcuts);
 
@@ -5155,11 +5275,18 @@ async fn run_input_forwarding_loop(
                 }
 
                 let target = {
-                    let state = state.read().await;
-                    state
-                        .session
-                        .active_target()
-                        .filter(|target| is_device_connected(&state, *target))
+                    let mut state = state.write().await;
+                    if !state.features.automatic_input_forwarding {
+                        if state.session.is_remote_active() {
+                            state.session.reset();
+                        }
+                        None
+                    } else {
+                        state
+                            .session
+                            .active_target()
+                            .filter(|target| is_device_connected(&state, *target))
+                    }
                 };
 
                 let Some(target) = target else {
@@ -5308,19 +5435,19 @@ async fn run_windows_driver_capture_loop(
                     replace_recent_local_event(&mut state.local_controls, local_event.clone());
                     let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
-                    let messages = messages_for_input_event(
+                    let outcome = captured_input_forwarding_outcome(
                         &mut state,
                         &mut routing,
                         &mut forwarder,
                         input_event,
                         true,
                     );
-                    let target = state.session.active_target();
-                    let suppress_local_shortcuts = matches!(
-                        state.session.state(),
-                        ControlSessionState::RemoteActive { .. }
-                    );
-                    (target, messages, diagnostic, suppress_local_shortcuts)
+                    (
+                        outcome.target,
+                        outcome.messages,
+                        diagnostic,
+                        outcome.suppress_local_shortcuts,
+                    )
                 };
                 set_local_shortcut_suppression(suppress_local_shortcuts);
 
@@ -6766,6 +6893,79 @@ mod tests {
     }
 
     #[test]
+    fn recent_local_events_preserve_mouse_button_under_move_flood() {
+        let mut state = test_daemon_state();
+
+        state.record_local_input_event(&rshare_input::InputEvent::mouse_button(
+            rshare_input::MouseButton::Left,
+            rshare_input::ButtonState::Pressed,
+        ));
+        state.record_local_input_event(&rshare_input::InputEvent::mouse_button(
+            rshare_input::MouseButton::Left,
+            rshare_input::ButtonState::Released,
+        ));
+
+        for index in 0..100 {
+            state.record_local_input_event(&rshare_input::InputEvent::mouse_move(index, index));
+        }
+
+        assert!(
+            state
+                .local_controls
+                .recent_events
+                .iter()
+                .any(|event| event.device_kind == LocalInputDeviceKind::Mouse
+                    && event.event_kind == "button"
+                    && event.payload.get("button").map(String::as_str) == Some("Left")),
+            "mouse button events should remain visible in recent_events after move flood"
+        );
+    }
+
+    #[test]
+    fn local_layout_geometry_binds_multiple_displays_into_one_device_node() {
+        let mut state = test_daemon_state();
+        let local_id = state.status.device_id;
+        state.local_controls.display = LocalDisplayState {
+            display_count: 2,
+            virtual_x: 0,
+            virtual_y: 0,
+            primary_width: 2560,
+            primary_height: 1440,
+            layout_width: 5120,
+            layout_height: 1440,
+            displays: vec![
+                LocalDisplayInfo {
+                    display_id: "primary".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                    primary: true,
+                },
+                LocalDisplayInfo {
+                    display_id: "display-2".to_string(),
+                    x: 2560,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                    primary: false,
+                },
+            ],
+        };
+
+        assert!(state.reconcile_local_layout_geometry());
+
+        let local_node = state.layout.get_node(local_id).expect("local layout node");
+        assert_eq!(local_node.displays.len(), 2);
+        assert!(local_node.displays[0].primary);
+        assert_eq!(local_node.displays[0].x, 0);
+        assert_eq!(local_node.displays[0].width, 2560);
+        assert_eq!(local_node.displays[1].display_id, "display-2");
+        assert_eq!(local_node.displays[1].x, 2560);
+        assert_eq!(local_node.displays[1].height, 1440);
+    }
+
+    #[test]
     fn local_gamepad_event_updates_diagnostic_snapshot() {
         let mut state = test_daemon_state();
 
@@ -7329,6 +7529,105 @@ mod tests {
 
         assert!(messages.is_empty());
         assert_eq!(forwarder.target(), None);
+    }
+
+    #[test]
+    fn captured_input_does_not_auto_forward_when_disabled_by_default() {
+        use rshare_core::{Direction, LayoutLink};
+
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.layout.upsert_link_for_edge(LayoutLink::new(
+            local_id,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+        let outcome = captured_input_forwarding_outcome(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::MouseMove { x: 1919, y: 540 },
+            true,
+        );
+
+        assert!(outcome.messages.is_empty());
+        assert_eq!(outcome.target, None);
+        assert_eq!(state.session.active_target(), None);
+        assert_eq!(forwarder.target(), None);
+        assert_eq!(routing.remote_target(), None);
+    }
+
+    #[test]
+    fn captured_input_forwards_when_explicitly_enabled() {
+        use rshare_core::{Direction, LayoutLink};
+
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.features.automatic_input_forwarding = true;
+        state.layout.upsert_link_for_edge(LayoutLink::new(
+            local_id,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+        let outcome = captured_input_forwarding_outcome(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::MouseMove { x: 1919, y: 540 },
+            true,
+        );
+
+        assert_eq!(outcome.target, Some(remote_id));
+        assert_eq!(state.session.active_target(), Some(remote_id));
+        assert_eq!(forwarder.target(), Some(remote_id));
     }
 
     #[test]
