@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  BUILTIN_HARDWARE_ASSET_MANIFESTS,
   buildHardwareAssetChoices,
   normalizeHardwareAssetManifest,
   resolveActiveHardwareRegions,
@@ -25,6 +26,14 @@ const keyboardManifest = {
     },
   ],
 };
+
+test("built-in hardware manifests include gamepad", () => {
+  assert.ok(
+    BUILTIN_HARDWARE_ASSET_MANIFESTS.includes(
+      "/assets/hardware/live2d/gamepad/manifest.json",
+    ),
+  );
+});
 
 test("normalizeHardwareAssetManifest resolves relative layer urls", () => {
   const asset = normalizeHardwareAssetManifest(
@@ -120,6 +129,61 @@ test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
 
   assert.equal(active[0].id, "mouse.left");
   assert.equal(active[0].shape.radius, 38);
+});
+
+test("normalizeHardwareAssetManifest preserves polygon region points", () => {
+  const asset = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.gamepad.xbox",
+    name: "Xbox Style Controller",
+    kind: "gamepad",
+    base_size: { width: 1205, height: 826 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "gamepad.button.a",
+        label: "A",
+        action: { kind: "gamepad_button", buttons: ["A", "South"] },
+        shape: {
+          kind: "polygon",
+          points: [
+            { x: 0.74, y: 0.56 },
+            { x: 0.77, y: 0.52 },
+            { x: 0.8, y: 0.56 },
+          ],
+        },
+      },
+    ],
+  });
+
+  assert.equal(asset.kind, "gamepad");
+  assert.equal(asset.regions[0].shape.kind, "polygon");
+  assert.deepEqual(asset.regions[0].shape.points[1], { x: 0.77, y: 0.52 });
+});
+
+test("resolveActiveHardwareRegions matches gamepad button aliases", () => {
+  const asset = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.gamepad.xbox",
+    name: "Xbox Style Controller",
+    kind: "gamepad",
+    base_size: { width: 1205, height: 826 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "gamepad.button.a",
+        label: "A",
+        action: { kind: "gamepad_button", buttons: ["A", "South", "ButtonSouth"] },
+        shape: { kind: "rect", x: 0.72, y: 0.52, w: 0.05, h: 0.06 },
+      },
+    ],
+  });
+
+  const active = resolveActiveHardwareRegions(asset, {
+    pressedButtons: ["South"],
+  });
+
+  assert.deepEqual(active.map((region) => region.id), ["gamepad.button.a"]);
 });
 
 test("resolveSelectedHardwareAsset falls back to first matching kind", () => {

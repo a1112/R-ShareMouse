@@ -3,6 +3,7 @@ export const BUILTIN_HARDWARE_ASSET_MANIFESTS = Object.freeze([
   "/assets/hardware/live2d/keyboard/gaming/manifest.json",
   "/assets/hardware/live2d/mouse/manifest.json",
   "/assets/hardware/live2d/mouse/gaming/manifest.json",
+  "/assets/hardware/live2d/gamepad/manifest.json",
 ]);
 
 export function normalizeHardwareAssetManifest(raw, baseUrlOrOptions = "") {
@@ -72,7 +73,27 @@ function normalizeRegion(region) {
     id: String(region.id),
     label: String(region.label ?? region.id),
     action: region.action ?? inferLegacyAction(region),
-    shape: region.shape ?? legacyRectShape(region),
+    shape: normalizeShape(region.shape ?? legacyRectShape(region)),
+  };
+}
+
+function normalizeShape(shape) {
+  if (shape?.kind === "polygon") {
+    return {
+      kind: "polygon",
+      points: (shape.points ?? []).map((point) => ({
+        x: Number(point.x ?? 0),
+        y: Number(point.y ?? 0),
+      })),
+    };
+  }
+  return {
+    kind: "rect",
+    x: Number(shape?.x ?? 0),
+    y: Number(shape?.y ?? 0),
+    w: Number(shape?.w ?? 0),
+    h: Number(shape?.h ?? 0),
+    radius: Number(shape?.radius ?? 7),
   };
 }
 
