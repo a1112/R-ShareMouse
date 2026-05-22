@@ -692,13 +692,13 @@ function numberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function remoteLatencyEventTarget(event) {
-  return (
-    event?.payload?.target_device_id ??
-    event?.payload?.origin_device_id ??
-    event?.device_id ??
-    null
-  );
+function remoteLatencyEventMatchesDevice(event, deviceId) {
+  return [
+    event?.payload?.target_device_id,
+    event?.payload?.origin_device_id,
+    event?.payload?.remote_device_id,
+    event?.device_id,
+  ].some((candidate) => candidate === deviceId);
 }
 
 function isRemoteLatencyAck(event) {
@@ -725,6 +725,16 @@ function sortNewestEvent(left, right) {
     return rightTime - leftTime;
   }
   return Number(right?.sequence ?? 0) - Number(left?.sequence ?? 0);
+}
+
+function eventIsNewer(left, right) {
+  if (!left) {
+    return false;
+  }
+  if (!right) {
+    return true;
+  }
+  return sortNewestEvent(left, right) < 0;
 }
 
 function maxTimestampMs(...values) {
@@ -827,9 +837,23 @@ function eventSummaryIsNewerThanDaemon(eventSummary, daemonFeedback, snapshot) {
 
 function buildRemoteLatencyEventSummary(snapshot, deviceId) {
   const events = [...(snapshot?.recent_events ?? [])].filter(
-    (event) => remoteLatencyEventTarget(event) === deviceId,
+    (event) => remoteLatencyEventMatchesDevice(event, deviceId),
   );
   const ack = events.filter(isRemoteLatencyAck).sort(sortNewestEvent)[0];
+  const sent = events.filter(isRemoteLatencySent).sort(sortNewestEvent)[0];
+  if (eventIsNewer(sent, ack)) {
+    return {
+      state: "pending",
+      message: "等待远端 latency ACK",
+      networkRoundTripMs: null,
+      estimatedOneWayMs: null,
+      rawRoundTripMs: null,
+      remoteProcessingMs: null,
+      direction: sent.payload?.direction ?? null,
+      timestampMs: numberOrNull(sent.timestamp_ms),
+    };
+  }
+
   if (ack) {
     const payload = ack.payload ?? {};
     const networkRoundTripMs = numberOrNull(
@@ -852,7 +876,6 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
     };
   }
 
-  const sent = events.filter(isRemoteLatencySent).sort(sortNewestEvent)[0];
   if (sent) {
     return {
       state: "pending",
