@@ -17,6 +17,8 @@ use tauri::{
 };
 use tauri_plugin_single_instance::init;
 
+mod hardware_assets;
+
 const UNKNOWN_BUILD_VALUE: &str = "unknown";
 const RSHARE_BUILD_INFO_PREFIX: &str = "rshare-build:";
 
@@ -418,6 +420,29 @@ async fn set_layout(layout: LayoutGraph) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn list_hardware_assets(
+    app: AppHandle,
+) -> Result<Vec<hardware_assets::InstalledHardwareAsset>, String> {
+    let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    hardware_assets::list_installed_hardware_assets(&dir).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn import_hardware_asset(
+    app: AppHandle,
+    bytes: Vec<u8>,
+) -> Result<hardware_assets::InstalledHardwareAsset, String> {
+    let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    hardware_assets::import_hardware_asset_package(&dir, &bytes).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn export_hardware_asset(app: AppHandle, asset_id: String) -> Result<Vec<u8>, String> {
+    let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    hardware_assets::export_hardware_asset_package(&dir, &asset_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn show_tray(app: AppHandle) -> Result<(), String> {
     show_main_window(&app)
 }
@@ -634,6 +659,9 @@ fn main() {
             set_config,
             get_layout,
             set_layout,
+            list_hardware_assets,
+            import_hardware_asset,
+            export_hardware_asset,
             show_tray,
             hide_to_tray,
             get_logs,

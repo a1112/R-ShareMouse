@@ -163,6 +163,14 @@ impl HardwareAssetManifest {
 
         Ok(())
     }
+
+    pub fn referenced_paths(&self) -> Vec<&str> {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.src.as_deref())
+            .chain(self.mask.iter().map(|mask| mask.src.as_str()))
+            .collect()
+    }
 }
 
 pub fn validate_asset_relative_path(path: &str) -> bool {
