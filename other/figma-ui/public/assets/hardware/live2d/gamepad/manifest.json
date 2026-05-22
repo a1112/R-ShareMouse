@@ -1,0 +1,478 @@
+{
+  "schema_version": 1,
+  "id": "builtin.gamepad.xbox",
+  "name": "Xbox Style Controller",
+  "kind": "gamepad",
+  "base_size": {
+    "width": 1205,
+    "height": 826
+  },
+  "layers": [
+    {
+      "id": "base",
+      "role": "base",
+      "render": "image",
+      "src": "base.png"
+    },
+    {
+      "id": "press-effect",
+      "role": "pressEffect",
+      "render": "runtime"
+    }
+  ],
+  "regions": [
+    {
+      "id": "gamepad.button.a",
+      "label": "A",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "A",
+          "South",
+          "ButtonSouth",
+          "ButtonA"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.744,
+        "y": 0.524,
+        "w": 0.052,
+        "h": 0.074,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.button.b",
+      "label": "B",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "B",
+          "East",
+          "ButtonEast",
+          "ButtonB"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.797,
+        "y": 0.466,
+        "w": 0.052,
+        "h": 0.074,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.button.x",
+      "label": "X",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "X",
+          "West",
+          "ButtonWest",
+          "ButtonX"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.691,
+        "y": 0.466,
+        "w": 0.052,
+        "h": 0.074,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.button.y",
+      "label": "Y",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "Y",
+          "North",
+          "ButtonNorth",
+          "ButtonY"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.744,
+        "y": 0.407,
+        "w": 0.052,
+        "h": 0.074,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.dpad.up",
+      "label": "Up",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "DPadUp",
+          "DpadUp",
+          "Up"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.259,
+            "y": 0.548
+          },
+          {
+            "x": 0.304,
+            "y": 0.548
+          },
+          {
+            "x": 0.304,
+            "y": 0.611
+          },
+          {
+            "x": 0.259,
+            "y": 0.611
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.dpad.down",
+      "label": "Down",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "DPadDown",
+          "DpadDown",
+          "Down"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.259,
+            "y": 0.685
+          },
+          {
+            "x": 0.304,
+            "y": 0.685
+          },
+          {
+            "x": 0.304,
+            "y": 0.748
+          },
+          {
+            "x": 0.259,
+            "y": 0.748
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.dpad.left",
+      "label": "Left",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "DPadLeft",
+          "DpadLeft",
+          "Left"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.216,
+            "y": 0.62
+          },
+          {
+            "x": 0.272,
+            "y": 0.62
+          },
+          {
+            "x": 0.272,
+            "y": 0.68
+          },
+          {
+            "x": 0.216,
+            "y": 0.68
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.dpad.right",
+      "label": "Right",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "DPadRight",
+          "DpadRight",
+          "Right"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.292,
+            "y": 0.62
+          },
+          {
+            "x": 0.348,
+            "y": 0.62
+          },
+          {
+            "x": 0.348,
+            "y": 0.68
+          },
+          {
+            "x": 0.292,
+            "y": 0.68
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.bumper.left",
+      "label": "LB",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "LeftBumper",
+          "LeftShoulder",
+          "LB",
+          "L1"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.213,
+            "y": 0.118
+          },
+          {
+            "x": 0.414,
+            "y": 0.118
+          },
+          {
+            "x": 0.394,
+            "y": 0.176
+          },
+          {
+            "x": 0.233,
+            "y": 0.176
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.bumper.right",
+      "label": "RB",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "RightBumper",
+          "RightShoulder",
+          "RB",
+          "R1"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.586,
+            "y": 0.118
+          },
+          {
+            "x": 0.787,
+            "y": 0.118
+          },
+          {
+            "x": 0.767,
+            "y": 0.176
+          },
+          {
+            "x": 0.606,
+            "y": 0.176
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.trigger.left",
+      "label": "LT",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "LeftTrigger",
+          "LeftTrigger2",
+          "LT",
+          "L2"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.236,
+            "y": 0.044
+          },
+          {
+            "x": 0.394,
+            "y": 0.044
+          },
+          {
+            "x": 0.39,
+            "y": 0.101
+          },
+          {
+            "x": 0.239,
+            "y": 0.101
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.trigger.right",
+      "label": "RT",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "RightTrigger",
+          "RightTrigger2",
+          "RT",
+          "R2"
+        ]
+      },
+      "shape": {
+        "kind": "polygon",
+        "points": [
+          {
+            "x": 0.606,
+            "y": 0.044
+          },
+          {
+            "x": 0.764,
+            "y": 0.044
+          },
+          {
+            "x": 0.761,
+            "y": 0.101
+          },
+          {
+            "x": 0.61,
+            "y": 0.101
+          }
+        ]
+      }
+    },
+    {
+      "id": "gamepad.stick.left",
+      "label": "LS",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "LeftStick",
+          "LeftThumb",
+          "LS",
+          "L3"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.238,
+        "y": 0.374,
+        "w": 0.092,
+        "h": 0.134,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.stick.right",
+      "label": "RS",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "RightStick",
+          "RightThumb",
+          "RS",
+          "R3"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.553,
+        "y": 0.622,
+        "w": 0.092,
+        "h": 0.134,
+        "radius": 999
+      }
+    },
+    {
+      "id": "gamepad.button.select",
+      "label": "Select",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "Select",
+          "Back",
+          "View"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.397,
+        "y": 0.432,
+        "w": 0.054,
+        "h": 0.038,
+        "radius": 18
+      }
+    },
+    {
+      "id": "gamepad.button.start",
+      "label": "Start",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "Start",
+          "Menu"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.549,
+        "y": 0.432,
+        "w": 0.054,
+        "h": 0.038,
+        "radius": 18
+      }
+    },
+    {
+      "id": "gamepad.button.guide",
+      "label": "Guide",
+      "action": {
+        "kind": "gamepad_button",
+        "buttons": [
+          "Guide",
+          "Mode",
+          "Home"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.472,
+        "y": 0.469,
+        "w": 0.055,
+        "h": 0.081,
+        "radius": 999
+      }
+    }
+  ]
+}

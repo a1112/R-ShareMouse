@@ -107,6 +107,29 @@ test("checked-in office mouse manifest has mapped button regions", () => {
   );
 });
 
+test("checked-in xbox style gamepad manifest has mapped button regions", () => {
+  const raw = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../public/assets/hardware/live2d/gamepad/manifest.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const asset = normalizeHardwareAssetManifest(
+    raw,
+    "/assets/hardware/live2d/gamepad/",
+  );
+
+  assert.equal(asset.id, "builtin.gamepad.xbox");
+  assert.equal(asset.kind, "gamepad");
+  assert.ok(asset.layers.some((layer) => layer.src.endsWith("/base.png")));
+  assert.ok(asset.regions.some((region) => region.id === "gamepad.button.a"));
+  assert.ok(asset.regions.some((region) => region.id === "gamepad.dpad.up"));
+  assert.ok(asset.regions.some((region) => region.id === "gamepad.trigger.left"));
+});
+
 test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
   const mouse = normalizeHardwareAssetManifest({
     schema_version: 1,
