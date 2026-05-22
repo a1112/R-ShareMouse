@@ -525,9 +525,12 @@ impl DaemonState {
                     .filter(|event| latency_event_matches_target(event, device.id))
                     .max_by_key(|event| (event.timestamp_ms, event.sequence));
 
-                if let Some((_, pending)) = latest_pending {
+                if let Some((pending_sequence, pending)) = latest_pending {
                     let pending_is_newest = latest_ack
-                        .map(|ack| pending.sent_at_ms > ack.timestamp_ms)
+                        .map(|ack| {
+                            (pending.sent_at_ms, *pending_sequence)
+                                > (ack.timestamp_ms, ack.sequence)
+                        })
                         .unwrap_or(true);
                     if pending_is_newest {
                         let pending_duration_ms = now_ms.saturating_sub(pending.sent_at_ms);
@@ -6911,6 +6914,47 @@ mod tests {
         assert_eq!(device.status, LatencyFeedbackStatus::Pending);
         assert_eq!(device.last_probe_sent_ms, Some(1000));
         assert_eq!(device.pending_duration_ms, Some(250));
+    }
+
+    #[test]
+    fn remote_latency_feedback_prefers_same_millisecond_newer_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency ACK event");
+        ack.timestamp_ms = 1000;
+        ack.sequence = 7;
+        state.local_controls.sequence = 7;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1100);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(100));
     }
 
     #[test]
