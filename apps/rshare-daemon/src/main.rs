@@ -558,17 +558,14 @@ impl DaemonState {
                     .iter()
                     .filter(|event| is_latency_ack_event(event))
                     .filter(|event| latency_event_matches_target(event, device.id))
-                    .max_by_key(|event| (event.timestamp_ms, event.sequence));
+                    .max_by_key(|event| latency_ack_order_key(event));
 
                 if let Some((pending_sequence, pending)) = latest_pending {
                     let pending_is_newest = latest_ack
                         .map(|ack| {
                             latency_ack_probe_sequence(ack)
                                 .map(|ack_sequence| *pending_sequence > ack_sequence)
-                                .unwrap_or_else(|| {
-                                    (pending.sent_at_ms, *pending_sequence)
-                                        > (ack.timestamp_ms, ack.sequence)
-                                })
+                                .unwrap_or_else(|| *pending_sequence > ack.sequence)
                         })
                         .unwrap_or(true);
                     if pending_is_newest {
@@ -1613,6 +1610,13 @@ fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> 
     }
 
     parse_latency_payload_u64(&event.payload, &["probe_sequence"])
+}
+
+fn latency_ack_order_key(event: &LocalInputDiagnosticEvent) -> (u64, u64) {
+    (
+        latency_ack_probe_sequence(event).unwrap_or(event.sequence),
+        event.sequence,
+    )
 }
 
 fn latency_feedback_status_priority(status: LatencyFeedbackStatus) -> u8 {
@@ -7083,6 +7087,60 @@ mod tests {
         assert_eq!(feedback.devices.len(), 1);
         assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
         assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_local_sequence_when_remote_ack_timestamps_are_skewed() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let old_ack = LocalInputDiagnosticEvent {
+            sequence: 40,
+            timestamp_ms: 20_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "Old endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("origin_probe_sequence".to_string(), "40".to_string()),
+                ("network_round_trip_ms".to_string(), "90".to_string()),
+            ]),
+        };
+        record_remote_diagnostic_event(&mut state, remote_id, old_ack);
+
+        let new_ack = LocalInputDiagnosticEvent {
+            sequence: 41,
+            timestamp_ms: 1_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "New endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("origin_probe_sequence".to_string(), "41".to_string()),
+                ("network_round_trip_ms".to_string(), "24".to_string()),
+            ]),
+        };
+        record_remote_diagnostic_event(&mut state, remote_id, new_ack);
+
+        let feedback = state.remote_latency_feedback(21_000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices[0].network_round_trip_ms, Some(24));
+        assert_eq!(
+            feedback.devices[0].summary.as_deref(),
+            Some("New endpoint latency sample")
+        );
     }
 
     #[test]
