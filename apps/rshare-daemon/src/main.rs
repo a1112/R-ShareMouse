@@ -564,7 +564,7 @@ impl DaemonState {
                 if let Some((pending_sequence, pending)) = latest_pending {
                     let pending_is_newest = latest_ack
                         .map(|ack| {
-                            latency_ack_probe_sequence(ack)
+                            latency_ack_completion_sequence_for_pending(ack, pending)
                                 .map(|ack_sequence| *pending_sequence > ack_sequence)
                                 .unwrap_or_else(|| *pending_sequence > ack.sequence)
                         })
@@ -1613,6 +1613,25 @@ fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> 
     }
 
     parse_latency_payload_u64(&event.payload, &["probe_sequence"])
+}
+
+fn latency_ack_completion_sequence_for_pending(
+    event: &LocalInputDiagnosticEvent,
+    pending: &PendingLatencyProbe,
+) -> Option<u64> {
+    if event.event_kind != "latency_endpoint_switch_ack" {
+        return parse_latency_payload_u64(&event.payload, &["probe_sequence"]);
+    }
+
+    match pending.role {
+        PendingLatencyProbeRole::LocalRequested => {
+            parse_latency_payload_u64(&event.payload, &["origin_probe_sequence"])
+                .or_else(|| parse_latency_payload_u64(&event.payload, &["probe_sequence"]))
+        }
+        PendingLatencyProbeRole::EndpointSwitchReport { .. } => {
+            parse_latency_payload_u64(&event.payload, &["probe_sequence"])
+        }
+    }
 }
 
 fn latency_ack_order_key(event: &LocalInputDiagnosticEvent) -> (u64, u64) {
@@ -7091,6 +7110,101 @@ mod tests {
         assert_eq!(feedback.devices.len(), 1);
         assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
         assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_endpoint_probe_sequence_for_endpoint_switch_pending() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "20".to_string());
+        payload.insert("origin_probe_sequence".to_string(), "1000".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Old endpoint-side latency sample",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 20;
+        state.local_controls.sequence = 20;
+        state.pending_latency_probes.insert(
+            21,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1125,
+                role: PendingLatencyProbeRole::EndpointSwitchReport {
+                    origin_device_id: remote_id,
+                    origin_sequence: 1001,
+                },
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1175);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(21));
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(50));
+    }
+
+    #[test]
+    fn remote_latency_feedback_does_not_use_origin_sequence_fallback_for_endpoint_pending() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_probe_sequence".to_string(), "1000".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Malformed endpoint-side latency sample",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 20;
+        state.local_controls.sequence = 20;
+        state.pending_latency_probes.insert(
+            21,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1125,
+                role: PendingLatencyProbeRole::EndpointSwitchReport {
+                    origin_device_id: remote_id,
+                    origin_sequence: 1001,
+                },
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1175);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(21));
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(50));
     }
 
     #[test]
