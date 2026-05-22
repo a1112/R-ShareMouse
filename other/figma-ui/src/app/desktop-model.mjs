@@ -982,6 +982,10 @@ export const HARDWARE_RIG_ASSETS = Object.freeze({
     manifest: "/assets/hardware/live2d/mouse/manifest.json",
     base: "/assets/hardware/live2d/mouse/base.png",
   },
+  gamepad: {
+    manifest: "/assets/hardware/live2d/gamepad/manifest.json",
+    base: "/assets/hardware/live2d/gamepad/base.png",
+  },
 });
 
 const RECENT_BUTTON_EVENT_WINDOW_MS = 900;

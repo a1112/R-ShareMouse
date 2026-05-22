@@ -1029,12 +1029,37 @@ test("buildDeviceGalleryItems assigns Live2D hardware rigs to interactive device
     [
       ["keyboard", "keyboard", "default"],
       ["mouse", "mouse", "default"],
-      ["gamepad", null, null],
+      ["gamepad", "gamepad", "default"],
       ["display", null, null],
       ["audio", null, null],
       ["remote", null, null],
     ],
   );
+});
+
+test("buildDeviceGalleryItems marks gamepad as hardware rig asset", () => {
+  const items = buildDeviceGalleryItems({
+    gamepads: [
+      {
+        gamepad_id: 0,
+        name: "Xbox Style Controller",
+        connected: true,
+        pressed_buttons: ["South"],
+        left_stick_x: 0,
+        left_stick_y: 0,
+        right_stick_x: 0,
+        right_stick_y: 0,
+        left_trigger: 0,
+        right_trigger: 0,
+        event_count: 1,
+      },
+    ],
+    display: { display_count: 0 },
+  });
+
+  const gamepad = items.find((item) => item.kind === "gamepad");
+  assert.equal(gamepad.rigKind, "gamepad");
+  assert.equal(gamepad.rigVariant, "default");
 });
 
 test("buildDeviceGalleryItems carries live input activity for physical simulators", () => {
