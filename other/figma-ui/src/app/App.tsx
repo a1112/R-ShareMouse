@@ -4378,7 +4378,7 @@ function HardwarePolygonOverlay({
     return null;
   }
   const polygon = points
-    .map((point) => `${point.x * 100}% ${point.y * 100}%`)
+    .map((point) => `${point.x * 100},${point.y * 100}`)
     .join(", ");
   const center = points.reduce(
     (sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }),
@@ -4386,19 +4386,46 @@ function HardwarePolygonOverlay({
   );
   const centerX = (center.x / points.length) * 100;
   const centerY = (center.y / points.length) * 100;
+  const strokeWidth = compact ? 1.15 : 1.35;
 
   return (
     <span
-      className="pointer-events-none absolute inset-0 hardware-press-flash transition-all duration-75"
+      className="pointer-events-none absolute inset-0 transition-all duration-75"
       style={{
-        clipPath: `polygon(${polygon})`,
-        background: `radial-gradient(circle at ${centerX}% ${centerY}%, rgba(255,255,255,0.62), ${accent}cc 28%, ${accent}66 66%, transparent 100%)`,
-        border: `1px solid ${accent}`,
         color: theme.text,
-        boxShadow: `0 0 28px ${accent}aa`,
         mixBlendMode: "screen",
       }}
     >
+      <svg
+        className="absolute inset-0 h-full w-full hardware-press-flash overflow-visible"
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        aria-hidden="true"
+        focusable="false"
+        style={{
+          transformOrigin: `${centerX}% ${centerY}%`,
+        }}
+      >
+        <polygon
+          points={polygon}
+          fill={accent}
+          fillOpacity="0.34"
+          stroke={accent}
+          strokeOpacity="0.95"
+          strokeWidth={strokeWidth}
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+          style={{
+            filter: `drop-shadow(0 0 14px ${accent}aa)`,
+            paintOrder: "stroke fill",
+          }}
+        />
+        <polygon
+          points={polygon}
+          fill="rgba(255,255,255,0.4)"
+          fillOpacity="0.24"
+        />
+      </svg>
       {label ? (
         <span
           className="absolute hardware-legend-glow font-semibold"
