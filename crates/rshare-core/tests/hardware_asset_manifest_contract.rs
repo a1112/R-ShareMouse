@@ -1,5 +1,6 @@
 use rshare_core::{
-    HardwareAssetKind, HardwareAssetManifest, HardwareControlAction, HardwareRegionShape,
+    HardwareAssetKind, HardwareAssetManifest, HardwareAssetValidationError, HardwareControlAction,
+    HardwareRegionShape,
 };
 
 fn valid_keyboard_manifest() -> HardwareAssetManifest {
@@ -40,4 +41,52 @@ fn parses_valid_keyboard_manifest() {
         HardwareRegionShape::Rect { .. }
     ));
     manifest.validate().unwrap();
+}
+
+#[test]
+fn rejects_unsafe_layer_paths() {
+    let mut manifest = valid_keyboard_manifest();
+    manifest.layers[0].src = Some("../escape.png".to_string());
+
+    assert_eq!(
+        manifest.validate().unwrap_err(),
+        HardwareAssetValidationError::UnsafePath("../escape.png".to_string())
+    );
+}
+
+#[test]
+fn rejects_mask_channels_that_reference_unknown_regions() {
+    let mut manifest = valid_keyboard_manifest();
+    manifest.mask = Some(
+        serde_json::from_value(serde_json::json!({
+            "src": "mask.png",
+            "channels": [{ "value": 32, "region_id": "missing" }]
+        }))
+        .unwrap(),
+    );
+
+    assert_eq!(
+        manifest.validate().unwrap_err(),
+        HardwareAssetValidationError::UnknownMaskRegion("missing".to_string())
+    );
+}
+
+#[test]
+fn rejects_duplicate_mask_values() {
+    let mut manifest = valid_keyboard_manifest();
+    manifest.mask = Some(
+        serde_json::from_value(serde_json::json!({
+            "src": "mask.png",
+            "channels": [
+                { "value": 32, "region_id": "key.a" },
+                { "value": 32, "region_id": "key.a" }
+            ]
+        }))
+        .unwrap(),
+    );
+
+    assert_eq!(
+        manifest.validate().unwrap_err(),
+        HardwareAssetValidationError::DuplicateMaskValue(32)
+    );
 }

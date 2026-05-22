@@ -97,6 +97,12 @@ pub enum HardwareAssetValidationError {
     DuplicateId(String),
     #[error("invalid normalized geometry for region {0}")]
     InvalidGeometry(String),
+    #[error("unsafe hardware asset path: {0}")]
+    UnsafePath(String),
+    #[error("mask references unknown region: {0}")]
+    UnknownMaskRegion(String),
+    #[error("duplicate mask channel value: {0}")]
+    DuplicateMaskValue(u8),
 }
 
 impl HardwareAssetManifest {
@@ -118,20 +124,56 @@ impl HardwareAssetManifest {
             if !ids.insert(layer.id.clone()) {
                 return Err(HardwareAssetValidationError::DuplicateId(layer.id.clone()));
             }
+            if let Some(src) = &layer.src {
+                if !validate_asset_relative_path(src) {
+                    return Err(HardwareAssetValidationError::UnsafePath(src.clone()));
+                }
+            }
         }
+        let mut region_ids = HashSet::new();
         for region in &self.regions {
             if !ids.insert(region.id.clone()) {
                 return Err(HardwareAssetValidationError::DuplicateId(region.id.clone()));
             }
+            region_ids.insert(region.id.clone());
             if !region.shape.is_valid_normalized() {
                 return Err(HardwareAssetValidationError::InvalidGeometry(
                     region.id.clone(),
                 ));
             }
         }
+        if let Some(mask) = &self.mask {
+            if !validate_asset_relative_path(&mask.src) {
+                return Err(HardwareAssetValidationError::UnsafePath(mask.src.clone()));
+            }
+            let mut mask_values = HashSet::new();
+            for channel in &mask.channels {
+                if !mask_values.insert(channel.value) {
+                    return Err(HardwareAssetValidationError::DuplicateMaskValue(
+                        channel.value,
+                    ));
+                }
+                if !region_ids.contains(&channel.region_id) {
+                    return Err(HardwareAssetValidationError::UnknownMaskRegion(
+                        channel.region_id.clone(),
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
+}
+
+pub fn validate_asset_relative_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('\\')
+        && !trimmed.contains(':')
+        && !trimmed
+            .split(['/', '\\'])
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 impl HardwareRegionShape {

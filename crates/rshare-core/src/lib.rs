@@ -41,8 +41,8 @@ pub use config::{FeatureConfig, GamepadConfig, GamepadRoutingMode};
 
 // Re-exports from hardware asset packs
 pub use hardware_assets::{
-    HardwareAssetKind, HardwareAssetLayer, HardwareAssetManifest, HardwareAssetSize,
-    HardwareAssetValidationError, HardwareControlAction, HardwareControlRegion,
+    validate_asset_relative_path, HardwareAssetKind, HardwareAssetLayer, HardwareAssetManifest,
+    HardwareAssetSize, HardwareAssetValidationError, HardwareControlAction, HardwareControlRegion,
     HardwareMaskChannel, HardwareMaskMapping, HardwarePoint, HardwareRegionShape,
     HARDWARE_ASSET_SCHEMA_VERSION,
 };
