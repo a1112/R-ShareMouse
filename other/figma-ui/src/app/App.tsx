@@ -4251,6 +4251,8 @@ function HardwareRigView({
   accent,
   theme,
   compact = false,
+  fitToHeight = false,
+  fitMaxHeight,
 }: {
   kind: HardwareRigKind;
   variant?: HardwareRigVariant;
@@ -4258,6 +4260,8 @@ function HardwareRigView({
   accent: string;
   theme: typeof FIGMA_DESKTOP_THEME;
   compact?: boolean;
+  fitToHeight?: boolean;
+  fitMaxHeight?: number;
 }) {
   const { assets, selectedIds } = useHardwareAssetCatalog();
   const rigVariant = normalizeHardwareRigVariant(variant);
@@ -4308,14 +4312,18 @@ function HardwareRigView({
   const rig = selectedRig ?? manifestRig ?? fallbackRig;
   const width = compact ? rig.display.compactWidth : rig.display.fullWidth;
   const maxHeight = compact ? rig.display.compactHeight : rig.display.fullHeight;
+  const fittedHeight = fitMaxHeight
+    ? `min(100%, ${fitMaxHeight}px)`
+    : "100%";
   const imageLayers = rig.layers.filter((layer) => layer.render === "image" && layer.src);
   return (
     <div
       className="relative mx-auto overflow-hidden"
       style={{
-        width: "100%",
+        width: fitToHeight ? "auto" : "100%",
+        height: fitToHeight ? fittedHeight : undefined,
         maxWidth: width,
-        maxHeight,
+        maxHeight: fitToHeight ? fittedHeight : maxHeight,
         aspectRatio: `${rig.baseSize.width} / ${rig.baseSize.height}`,
         filter: `drop-shadow(0 14px 22px rgba(0,0,0,0.24))`,
       }}
@@ -4354,7 +4362,7 @@ function HardwareRigView({
           theme={theme}
           compact={compact}
         />
-      ) : (
+      ) : kind === "mouse" ? (
         <MouseRigHotspots
           activity={activity}
           variant={rigVariant}
@@ -4362,7 +4370,7 @@ function HardwareRigView({
           theme={theme}
           compact={compact}
         />
-      )}
+      ) : null}
     </div>
   );
 }
@@ -7065,6 +7073,10 @@ function normalizeInputToken(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function normalizedGamepadButton(value: string) {
+  return normalizeInputToken(value);
+}
+
 function normalizeHardwareRigVariant(value: string | null | undefined): HardwareRigVariant {
   return value === "gaming" ? "gaming" : "office";
 }
@@ -7381,46 +7393,6 @@ function gamepadButtonName(button: string | Record<string, unknown>) {
   return value === null || value === undefined ? key : `${key}(${String(value)})`;
 }
 
-function normalizedGamepadButton(name: string) {
-  return normalizeInputToken(name);
-}
-
-function gamepadButtonAliases(name: string) {
-  const aliases: Record<string, string[]> = {
-    South: ["South", "ButtonSouth", "A", "ButtonA", "FaceDown", "Cross"],
-    East: ["East", "ButtonEast", "B", "ButtonB", "FaceRight", "Circle"],
-    West: ["West", "ButtonWest", "X", "ButtonX", "FaceLeft", "Square"],
-    North: ["North", "ButtonNorth", "Y", "ButtonY", "FaceUp", "Triangle"],
-    A: ["A", "South", "ButtonSouth", "ButtonA"],
-    B: ["B", "East", "ButtonEast", "ButtonB"],
-    X: ["X", "West", "ButtonWest", "ButtonX"],
-    Y: ["Y", "North", "ButtonNorth", "ButtonY"],
-    LeftBumper: ["LeftBumper", "LeftShoulder", "LB", "L1"],
-    RightBumper: ["RightBumper", "RightShoulder", "RB", "R1"],
-    LeftTrigger: ["LeftTrigger", "LeftTrigger2", "LT", "L2"],
-    RightTrigger: ["RightTrigger", "RightTrigger2", "RT", "R2"],
-    LeftStick: ["LeftStick", "LeftThumb", "LeftThumbstick", "L3"],
-    RightStick: ["RightStick", "RightThumb", "RightThumbstick", "R3"],
-    Select: ["Select", "Back", "Share"],
-    Start: ["Start", "Menu", "Options"],
-    Guide: ["Guide", "Mode", "Home", "Xbox"],
-    DPadUp: ["DPadUp", "DpadUp", "DPad Up", "Up"],
-    DPadDown: ["DPadDown", "DpadDown", "DPad Down", "Down"],
-    DPadLeft: ["DPadLeft", "DpadLeft", "DPad Left", "Left"],
-    DPadRight: ["DPadRight", "DpadRight", "DPad Right", "Right"],
-  };
-  return aliases[name] ?? [name];
-}
-
-function gamepadButtonTokens(gamepad: LocalGamepadSnapshot | null) {
-  if (!gamepad) {
-    return [];
-  }
-  return [
-    ...gamepadPressedButtons(gamepad),
-  ].filter(Boolean);
-}
-
 function gamepadPressedButtons(gamepad: LocalGamepadSnapshot | null) {
   if (!gamepad) {
     return [];
@@ -7431,19 +7403,6 @@ function gamepadPressedButtons(gamepad: LocalGamepadSnapshot | null) {
   return (gamepad.buttons ?? [])
     .filter((button) => button.pressed)
     .map((button) => gamepadButtonName(button.button));
-}
-
-function gamepadButtonActive(gamepad: LocalGamepadSnapshot | null, names: string[]) {
-  const wanted = names.flatMap(gamepadButtonAliases).map(normalizedGamepadButton);
-  return gamepadButtonTokens(gamepad).some((button) => {
-    const actual = normalizedGamepadButton(button);
-    return wanted.some((candidate) => actual === candidate || actual.includes(candidate));
-  });
-}
-
-function stickOffset(value: number) {
-  const normalized = Math.max(-1, Math.min(1, Number(value ?? 0) / 32767));
-  return normalized * 16;
 }
 
 function stickPercent(value: number) {
@@ -7468,43 +7427,8 @@ function SimulatedGamepad({
 }) {
   const connected = Boolean(gamepad?.connected);
   const pressed = gamepadPressedButtons(gamepad);
-  const leftStickX = stickOffset(gamepad?.left_stick_x ?? 0);
-  const leftStickY = -stickOffset(gamepad?.left_stick_y ?? 0);
-  const rightStickX = stickOffset(gamepad?.right_stick_x ?? 0);
-  const rightStickY = -stickOffset(gamepad?.right_stick_y ?? 0);
   const leftTrigger = triggerFill(gamepad?.left_trigger ?? 0);
   const rightTrigger = triggerFill(gamepad?.right_trigger ?? 0);
-  const isDark = theme.canvas === FIGMA_DESKTOP_THEME.canvas;
-  const bodyFill = isDark ? "rgba(255,255,255,0.018)" : "rgba(255,255,255,0.12)";
-  const bodyStroke = isDark ? "rgba(255,255,255,0.22)" : "#b8c0cb";
-  const controlFill = isDark ? "rgba(255,255,255,0.018)" : "rgba(255,255,255,0.2)";
-  const controlInnerFill = isDark ? "rgba(255,255,255,0.012)" : "rgba(255,255,255,0.14)";
-  const controlStroke = isDark ? "rgba(255,255,255,0.2)" : "#c3c9d2";
-  const activeFill = isDark ? "rgba(91,139,214,0.26)" : "rgba(77,126,214,0.16)";
-  const activeStrongFill = isDark ? "rgba(91,139,214,0.62)" : "rgba(77,126,214,0.46)";
-  const buttonFill = (active: boolean) => (active ? activeFill : controlFill);
-  const buttonStroke = (active: boolean) => (active ? theme.accent : controlStroke);
-  const buttonText = (active: boolean) => (active ? theme.accent : theme.textSub);
-  const leftBumperActive = gamepadButtonActive(gamepad, ["LeftBumper", "LB"]);
-  const rightBumperActive = gamepadButtonActive(gamepad, ["RightBumper", "RB"]);
-  const leftTriggerActive = leftTrigger > 2 || gamepadButtonActive(gamepad, ["LeftTrigger", "LT"]);
-  const rightTriggerActive = rightTrigger > 2 || gamepadButtonActive(gamepad, ["RightTrigger", "RT"]);
-  const leftStickActive = gamepadButtonActive(gamepad, ["LeftStick", "LeftThumb"]);
-  const rightStickActive = gamepadButtonActive(gamepad, ["RightStick", "RightThumb"]);
-  const guideActive = gamepadButtonActive(gamepad, ["Guide", "Mode"]);
-  const faceButtons = [
-    { label: "Y", x: 506, y: 176, names: ["North", "Y"], color: "#2f9a48" },
-    { label: "X", x: 468, y: 214, names: ["West", "X"], color: theme.accent },
-    { label: "B", x: 544, y: 214, names: ["East", "B"], color: "#c94f4f" },
-    { label: "A", x: 506, y: 252, names: ["South", "A"], color: "#2f9a48" },
-  ];
-  const dpadButtons = [
-    { key: "up", names: ["DPadUp"], path: "M0 -33 L9 -18 H-9 Z", activePath: "M-18 -50 H18 V-17 H-18 Z" },
-    { key: "down", names: ["DPadDown"], path: "M0 33 L9 18 H-9 Z", activePath: "M-18 17 H18 V50 H-18 Z" },
-    { key: "left", names: ["DPadLeft"], path: "M-33 0 L-18 -9 V9 Z", activePath: "M-50 -18 H-17 V18 H-50 Z" },
-    { key: "right", names: ["DPadRight"], path: "M33 0 L18 -9 V9 Z", activePath: "M17 -18 H50 V18 H17 Z" },
-  ];
-  const gamepadViewBox = compact ? "88 28 544 400" : "0 0 720 430";
 
   return (
     <div
@@ -7538,104 +7462,23 @@ function SimulatedGamepad({
           </span>
         </div>
         )}
-        <svg
-          className={compact ? "h-full min-h-[220px] w-full" : "h-full min-h-[340px] w-full"}
-          viewBox={gamepadViewBox}
-          role="img"
-          aria-label="gamepad input preview"
-          preserveAspectRatio="xMidYMid meet"
-        >
-          <g>
-            <path
-              d="M196 148 C230 118 279 116 310 136 C329 148 344 153 360 153 C376 153 391 148 410 136 C441 116 490 118 524 148 C566 187 590 267 607 338 C624 410 587 440 540 426 C512 418 495 388 466 348 C448 323 421 306 384 306 H336 C299 306 272 323 254 348 C225 388 208 418 180 426 C133 440 96 410 113 338 C130 267 154 187 196 148 Z"
-              fill={bodyFill}
-              stroke={bodyStroke}
-              strokeWidth="2"
-            />
-            <path
-              d="M227 143 C255 130 293 130 319 146 H401 C427 130 465 130 493 143"
-              fill="none"
-              stroke={isDark ? "rgba(255,255,255,0.11)" : "rgba(116,123,132,0.22)"}
-              strokeWidth="2"
-              strokeLinecap="round"
-            />
-          </g>
-
-          <g transform="translate(254 42)">
-            <rect x="0" y="0" width="82" height="28" rx="8" fill={buttonFill(leftTriggerActive)} stroke={buttonStroke(leftTriggerActive)} />
-            <rect x="0" y="0" width={leftTrigger > 0 ? Math.max(3, leftTrigger * 0.82) : 0} height="28" rx="8" fill={activeFill} />
-            <text x="18" y="18" fill={buttonText(leftTriggerActive)} fontSize="12" fontWeight="600">LT</text>
-            <text x="94" y="18" fill={theme.textMuted} fontSize="12">{Math.round(leftTrigger)}%</text>
-          </g>
-          <g transform="translate(384 42)">
-            <rect x="0" y="0" width="82" height="28" rx="8" fill={buttonFill(rightTriggerActive)} stroke={buttonStroke(rightTriggerActive)} />
-            <rect x="0" y="0" width={rightTrigger > 0 ? Math.max(3, rightTrigger * 0.82) : 0} height="28" rx="8" fill={activeFill} />
-            <text x="18" y="18" fill={buttonText(rightTriggerActive)} fontSize="12" fontWeight="600">RT</text>
-            <text x="94" y="18" fill={theme.textMuted} fontSize="12">{Math.round(rightTrigger)}%</text>
-          </g>
-          <g transform="translate(242 83)">
-            <rect x="0" y="0" width="108" height="32" rx="10" fill={buttonFill(leftBumperActive)} stroke={buttonStroke(leftBumperActive)} strokeWidth="2" />
-            <text x="54" y="21" textAnchor="middle" fill={buttonText(leftBumperActive)} fontSize="14" fontWeight="600">LB</text>
-          </g>
-          <g transform="translate(370 83)">
-            <rect x="0" y="0" width="108" height="32" rx="10" fill={buttonFill(rightBumperActive)} stroke={buttonStroke(rightBumperActive)} strokeWidth="2" />
-            <text x="54" y="21" textAnchor="middle" fill={buttonText(rightBumperActive)} fontSize="14" fontWeight="600">RB</text>
-          </g>
-
-          <g transform="translate(224 202)">
-            <circle r="44" fill={controlInnerFill} stroke={controlStroke} strokeWidth="2" />
-            <circle r="30" fill={buttonFill(leftStickActive)} stroke={buttonStroke(leftStickActive)} strokeWidth="2" />
-            <circle cx={leftStickX} cy={leftStickY} r="12" fill={leftStickActive ? activeStrongFill : theme.accentSoft} stroke={theme.accent} strokeWidth="2" />
-          </g>
-
-          <g transform="translate(244 310)">
-            <path d="M-20 -52 H20 C27 -52 32 -47 32 -40 V-24 H48 C60 -24 65 -19 65 -8 V8 C65 19 60 24 48 24 H32 V40 C32 47 27 52 20 52 H-20 C-27 52 -32 47 -32 40 V24 H-48 C-60 24 -65 19 -65 8 V-8 C-65 -19 -60 -24 -48 -24 H-32 V-40 C-32 -47 -27 -52 -20 -52 Z" fill={controlFill} stroke={controlStroke} strokeWidth="2" />
-            {dpadButtons.map((button) => {
-              const active = gamepadButtonActive(gamepad, button.names);
-              return (
-                <g key={button.key}>
-                  <path d={button.activePath} fill={active ? activeFill : "transparent"} />
-                  <path d={button.path} fill={active ? theme.accent : theme.textMuted} opacity={active ? 1 : 0.76} />
-                </g>
-              );
-            })}
-          </g>
-
-          <g transform="translate(384 300)">
-            <circle r="44" fill={controlInnerFill} stroke={controlStroke} strokeWidth="2" />
-            <circle r="30" fill={buttonFill(rightStickActive)} stroke={buttonStroke(rightStickActive)} strokeWidth="2" />
-            <circle cx={rightStickX} cy={rightStickY} r="12" fill={rightStickActive ? activeStrongFill : theme.accentSoft} stroke={theme.accent} strokeWidth="2" />
-          </g>
-
-          <g transform="translate(317 213)">
-            <rect x="-28" y="-13" width="56" height="26" rx="13" fill={buttonFill(gamepadButtonActive(gamepad, ["Select"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Select"]))} strokeWidth="2" />
-            <rect x="72" y="-13" width="56" height="26" rx="13" fill={buttonFill(gamepadButtonActive(gamepad, ["Start"]))} stroke={buttonStroke(gamepadButtonActive(gamepad, ["Start"]))} strokeWidth="2" />
-            <circle cx="50" cy="35" r="19" fill={buttonFill(guideActive)} stroke={buttonStroke(guideActive)} strokeWidth="2" />
-            <text x="0" y="5" textAnchor="middle" fill={buttonText(gamepadButtonActive(gamepad, ["Select"]))} fontSize="11" fontWeight="600">Select</text>
-            <text x="100" y="5" textAnchor="middle" fill={buttonText(gamepadButtonActive(gamepad, ["Start"]))} fontSize="11" fontWeight="600">Start</text>
-            <path d="M45 35 L50 30 L55 35 L50 40 Z" fill={guideActive ? theme.accent : theme.textMuted} opacity={guideActive ? 1 : 0.7} />
-          </g>
-
-          {faceButtons.map((button) => {
-            const active = gamepadButtonActive(gamepad, button.names);
-            return (
-              <g key={button.label}>
-                <circle cx={button.x} cy={button.y} r="27" fill={buttonFill(active)} stroke={buttonStroke(active)} strokeWidth="2" />
-                <text
-                  x={button.x}
-                  y={button.y + 7}
-                  textAnchor="middle"
-                  fill={active ? theme.accent : button.color}
-                  fontSize="22"
-                  fontWeight="700"
-                >
-                  {button.label}
-                </text>
-              </g>
-            );
-          })}
-
-        </svg>
+        <div className="flex h-full min-h-0 items-center justify-center overflow-hidden">
+          <HardwareRigView
+            kind="gamepad"
+            activity={{
+              pressedButtons: [
+                ...pressed,
+                ...(leftTrigger > 2 ? ["LeftTrigger", "LT"] : []),
+                ...(rightTrigger > 2 ? ["RightTrigger", "RT"] : []),
+              ],
+            }}
+            accent={theme.accent}
+            theme={theme}
+            compact={compact}
+            fitToHeight
+            fitMaxHeight={compact ? 180 : 260}
+          />
+        </div>
       </div>
       {compact ? null : (
       <div className="grid shrink-0 grid-cols-2 gap-2 text-xs lg:grid-cols-4">
