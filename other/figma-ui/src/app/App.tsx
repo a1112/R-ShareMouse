@@ -263,6 +263,7 @@ type LocalControlsSnapshot = {
     last_error?: string | null;
   };
   recent_events: LocalControlEvent[];
+  latency_feedback?: unknown | null;
   last_error?: string | null;
 };
 
@@ -278,7 +279,7 @@ type LocalInputTestResult = {
 };
 
 type RemoteLatencySummary = {
-  state: "idle" | "pending" | "pass";
+  state: "idle" | "pending" | "pass" | "warn" | "fail";
   message: string;
   networkRoundTripMs: number | null;
   estimatedOneWayMs: number | null;
@@ -2279,6 +2280,7 @@ export default function App() {
               devices={model.devices}
               capabilities={model.capabilities}
               localDevice={model.settings.localDevice}
+              latencyFeedback={model.latencyFeedback}
               localControls={localControls}
               localControlsError={localControlsError}
               localInputTestResult={localInputTestResult}
@@ -2349,6 +2351,7 @@ function DevicesPage({
   devices,
   capabilities,
   localDevice,
+  latencyFeedback,
   localControls,
   localControlsError,
   localInputTestResult,
@@ -2377,6 +2380,7 @@ function DevicesPage({
     name: string;
     hostname: string;
   };
+  latencyFeedback: unknown | null;
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
@@ -2395,6 +2399,7 @@ function DevicesPage({
       devices={devices}
       capabilities={capabilities}
       localDevice={localDevice}
+      latencyFeedback={latencyFeedback}
       localControls={localControls}
       localControlsError={localControlsError}
       localInputTestResult={localInputTestResult}
@@ -2617,6 +2622,7 @@ function DevicesPageWithLocalControls({
   devices,
   capabilities,
   localDevice,
+  latencyFeedback,
   localControls,
   localControlsError,
   localInputTestResult,
@@ -2645,6 +2651,7 @@ function DevicesPageWithLocalControls({
     name: string;
     hostname: string;
   };
+  latencyFeedback: unknown | null;
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
@@ -2719,8 +2726,18 @@ function DevicesPageWithLocalControls({
     selectedMonitorDeviceId === "local"
       ? null
       : safeDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
+  const latencyFeedbackSnapshot =
+    latencyFeedback == null
+      ? localControls
+      : ({
+          ...(localControls ?? {}),
+          latency_feedback: latencyFeedback,
+        } as LocalControlsSnapshot);
   const selectedRemoteLatency = selectedRemoteDevice
-    ? (buildRemoteLatencySummary(localControls, selectedRemoteDevice.id) as RemoteLatencySummary)
+    ? (buildRemoteLatencySummary(
+        latencyFeedbackSnapshot,
+        selectedRemoteDevice.id,
+      ) as RemoteLatencySummary)
     : null;
   const scopedRemoteLatencyTestResult =
     remoteLatencyTestResult && selectedRemoteDevice?.id === remoteLatencyTestResult.targetId
@@ -3321,7 +3338,13 @@ function RemoteLatencyPanel({
 }) {
   const state = summary?.state ?? "idle";
   const tone =
-    state === "pass" ? theme.success : state === "pending" ? "#d6a64b" : theme.textMuted;
+    state === "pass"
+      ? theme.success
+      : state === "pending" || state === "warn"
+        ? "#d6a64b"
+        : state === "fail"
+          ? "#e56b6f"
+          : theme.textMuted;
   return (
     <div
       className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2 text-xs"

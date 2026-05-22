@@ -60,8 +60,9 @@ pub use capabilities::{
 pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
     read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
-    NetworkTransportSnapshot, ServiceStatusSnapshot, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus,
+    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LocalInputFeedback, NetworkTransportSnapshot,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
 
 // Re-exports from endpoint event observation/injection diagnostics

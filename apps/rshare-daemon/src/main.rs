@@ -16,15 +16,16 @@ use rshare_core::{
     DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction, DisplayNode,
     EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
     EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, FeatureConfig, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
-    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
-    ServiceStatusSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
+    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
+    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
+    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest,
+    LocalInputTestResult, LocalInputTestStatus, Message, NetworkTransportSnapshot,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode,
+    ScreenInfo, ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
+    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -38,8 +39,8 @@ use rshare_input::RDevInputListener;
 #[cfg(windows)]
 use rshare_input::{DefaultInputListener, InputEventChannel, InputListener};
 use rshare_net::{
-    connection::ConnectionInfo, DiscoveredDevice, NetworkEvent, NetworkManager,
-    NetworkManagerConfig,
+    connection::{ConnectionInfo, ConnectionState},
+    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
 };
 use tracing_subscriber::prelude::*;
 
@@ -250,9 +251,15 @@ impl DaemonState {
 
     fn remove_device(&mut self, id: &DeviceId) {
         self.devices.remove(id);
+        self.clear_pending_latency_probes_for(*id);
         self.local_controls
             .remote_usb_devices
             .retain(|device| device.device_id != *id);
+    }
+
+    fn clear_pending_latency_probes_for(&mut self, id: DeviceId) {
+        self.pending_latency_probes
+            .retain(|_, probe| probe.target != id);
     }
 
     fn mark_connected(&mut self, id: &DeviceId, connected: bool) {
@@ -272,6 +279,9 @@ impl DaemonState {
                     last_seen_at: Instant::now(),
                 },
             );
+        }
+        if !connected {
+            self.clear_pending_latency_probes_for(*id);
         }
         for device in &mut self.local_controls.remote_usb_devices {
             if device.device_id == *id {
@@ -301,6 +311,37 @@ impl DaemonState {
         snapshot.active_target = self.session.active_target();
 
         snapshot
+    }
+
+    fn latency_feedback_snapshot(&self, transport: TransportFeedback) -> LatencyFeedbackSnapshot {
+        let now_ms = timestamp_ms_now();
+
+        LatencyFeedbackSnapshot {
+            generated_at_ms: now_ms,
+            local_input: self.local_input_feedback(),
+            remote_latency: self.remote_latency_feedback(now_ms),
+            transport,
+        }
+    }
+
+    fn status_snapshot_with_network_and_transport(
+        &self,
+        network: &NetworkTransportSnapshot,
+        transport: TransportFeedback,
+    ) -> ServiceStatusSnapshot {
+        let mut snapshot = self.status_snapshot();
+        snapshot.network = network.clone();
+        snapshot.latency_feedback = self.latency_feedback_snapshot(transport);
+        snapshot
+    }
+
+    fn status_snapshot_for_connections(
+        &self,
+        connection_infos: &[ConnectionInfo],
+    ) -> ServiceStatusSnapshot {
+        let network = network_snapshot_from_connections(connection_infos);
+        let transport = transport_feedback_from_connections(&network, connection_infos);
+        self.status_snapshot_with_network_and_transport(&network, transport)
     }
 
     fn device_snapshots(&self) -> Vec<DaemonDeviceSnapshot> {
@@ -417,6 +458,169 @@ impl DaemonState {
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
         self.local_controls.clone()
+    }
+
+    fn local_input_feedback(&self) -> LocalInputFeedback {
+        let event_count = self
+            .local_controls
+            .keyboard
+            .event_count
+            .saturating_add(self.local_controls.mouse.event_count);
+
+        if self.backend_state.selected_mode.is_none() {
+            return LocalInputFeedback {
+                status: LatencyFeedbackStatus::Unavailable,
+                event_count,
+                ..LocalInputFeedback::default()
+            };
+        }
+
+        let latest_event = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| is_eligible_local_input_feedback_event(event))
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_keyboard = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Keyboard
+            })
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_mouse = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Mouse
+            })
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+
+        LocalInputFeedback {
+            status: if matches!(
+                self.backend_state.aggregate_health,
+                BackendHealth::Degraded { .. }
+            ) {
+                LatencyFeedbackStatus::Degraded
+            } else if event_count == 0 {
+                LatencyFeedbackStatus::Idle
+            } else {
+                LatencyFeedbackStatus::Healthy
+            },
+            event_count,
+            latest_sequence: latest_event.map(|event| event.sequence),
+            latest_event_ms: latest_event.map(|event| event.timestamp_ms),
+            latest_keyboard_event_ms: latest_keyboard.map(|event| event.timestamp_ms),
+            latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
+            capture_path: latest_event.and_then(|event| event.capture_path.clone()),
+        }
+    }
+
+    fn remote_latency_feedback(&self, now_ms: u64) -> RemoteLatencyFeedback {
+        let mut tracked_devices: Vec<_> = self.devices.values().collect();
+        tracked_devices.sort_by_key(|device| device.id.to_string());
+
+        let devices = tracked_devices
+            .into_iter()
+            .map(|device| {
+                let mut feedback = RemoteDeviceLatencyFeedback {
+                    device_id: device.id,
+                    status: LatencyFeedbackStatus::Unavailable,
+                    device_name: Some(device.name.clone()),
+                    latest_sequence: None,
+                    last_probe_sent_ms: None,
+                    last_ack_ms: None,
+                    pending_duration_ms: None,
+                    network_round_trip_ms: None,
+                    raw_round_trip_ms: None,
+                    estimated_one_way_ms: None,
+                    remote_processing_ms: None,
+                    direction: None,
+                    summary: None,
+                };
+
+                if !device.connected {
+                    return feedback;
+                }
+
+                let latest_pending = self
+                    .pending_latency_probes
+                    .iter()
+                    .filter(|(_, probe)| probe.target == device.id)
+                    .max_by_key(|(sequence, probe)| (probe.sent_at_ms, **sequence));
+                let latest_ack = self
+                    .local_controls
+                    .recent_events
+                    .iter()
+                    .filter(|event| is_latency_ack_event(event))
+                    .filter(|event| latency_event_matches_target(event, device.id))
+                    .max_by_key(|event| latency_ack_order_key(event));
+
+                if let Some((pending_sequence, pending)) = latest_pending {
+                    let pending_is_newest = latest_ack
+                        .map(|ack| {
+                            latency_ack_completion_sequence_for_pending(ack, pending)
+                                .map(|ack_sequence| *pending_sequence > ack_sequence)
+                                .unwrap_or_else(|| *pending_sequence > ack.sequence)
+                        })
+                        .unwrap_or(true);
+                    if pending_is_newest {
+                        let pending_duration_ms = now_ms.saturating_sub(pending.sent_at_ms);
+                        feedback.status = if pending_duration_ms > LATENCY_PROBE_TIMEOUT_MS {
+                            LatencyFeedbackStatus::Timeout
+                        } else {
+                            LatencyFeedbackStatus::Pending
+                        };
+                        feedback.latest_sequence = Some(*pending_sequence);
+                        feedback.last_probe_sent_ms = Some(pending.sent_at_ms);
+                        feedback.pending_duration_ms = Some(pending_duration_ms);
+                        return feedback;
+                    }
+                }
+
+                if let Some(ack) = latest_ack {
+                    let network_round_trip_ms = parse_latency_payload_u64(
+                        &ack.payload,
+                        &["network_round_trip_ms", "latency_ms"],
+                    );
+                    feedback.status =
+                        if network_round_trip_ms.is_some_and(|rtt| rtt <= LATENCY_HEALTHY_RTT_MS) {
+                            LatencyFeedbackStatus::Healthy
+                        } else {
+                            LatencyFeedbackStatus::Degraded
+                        };
+                    feedback.latest_sequence = Some(ack.sequence);
+                    feedback.last_ack_ms = Some(ack.timestamp_ms);
+                    feedback.network_round_trip_ms = network_round_trip_ms;
+                    feedback.raw_round_trip_ms = parse_latency_payload_u64(
+                        &ack.payload,
+                        &["raw_round_trip_ms", "raw_latency_ms"],
+                    );
+                    feedback.estimated_one_way_ms =
+                        parse_latency_payload_u64(&ack.payload, &["estimated_one_way_ms"]);
+                    feedback.remote_processing_ms =
+                        parse_latency_payload_u64(&ack.payload, &["remote_processing_ms"]);
+                    feedback.direction = ack.payload.get("direction").cloned();
+                    feedback.summary = Some(ack.summary.clone());
+                } else {
+                    feedback.status = LatencyFeedbackStatus::Idle;
+                }
+
+                feedback
+            })
+            .collect::<Vec<_>>();
+
+        let status = devices
+            .iter()
+            .map(|device| device.status)
+            .max_by_key(|status| latency_feedback_status_priority(*status))
+            .unwrap_or(LatencyFeedbackStatus::Unavailable);
+
+        RemoteLatencyFeedback { status, devices }
     }
 
     fn sync_endpoint_events_from_recent(&mut self) {
@@ -763,6 +967,15 @@ impl DaemonState {
         push_recent_local_event(&mut self.local_controls, event.clone());
         event
     }
+}
+
+fn is_eligible_local_input_feedback_event(event: &LocalInputDiagnosticEvent) -> bool {
+    matches!(
+        event.device_kind,
+        LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
+    ) && !event.payload.contains_key("remote_device_id")
+        && !event.payload.contains_key("origin_event_device_id")
+        && event.capture_path.as_deref() != Some("remote-daemon")
 }
 
 const LOCAL_CONTROL_RECENT_EVENT_LIMIT: usize = 64;
@@ -1356,6 +1569,9 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+const LATENCY_HEALTHY_RTT_MS: u64 = 50;
+const LATENCY_PROBE_TIMEOUT_MS: u64 = 1_500;
+
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
     let mut snapshot = NetworkTransportSnapshot {
         datagram_available: connections
@@ -1393,6 +1609,124 @@ fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkT
     }
 
     snapshot
+}
+
+fn connected_connection_count(connections: &[ConnectionInfo]) -> usize {
+    connections
+        .iter()
+        .filter(|connection| connection.state == ConnectionState::Connected)
+        .count()
+}
+
+fn transport_feedback_from_connections(
+    network: &NetworkTransportSnapshot,
+    connections: &[ConnectionInfo],
+) -> TransportFeedback {
+    let connected_count = connected_connection_count(connections);
+    let status = if connected_count == 0 {
+        LatencyFeedbackStatus::Unavailable
+    } else if connections
+        .iter()
+        .filter(|connection| connection.state == ConnectionState::Connected)
+        .any(|connection| {
+            !connection.datagram_available
+                || connection.datagram_tx_dropped > 0
+                || connection.reliable_stream_reset_count > 0
+                || connection.rtt_ms.is_none()
+                || connection
+                    .rtt_ms
+                    .is_some_and(|rtt| rtt > LATENCY_HEALTHY_RTT_MS)
+        })
+    {
+        LatencyFeedbackStatus::Degraded
+    } else {
+        LatencyFeedbackStatus::Healthy
+    };
+
+    TransportFeedback {
+        status,
+        transport: network.transport.clone(),
+        datagram_available: network.datagram_available,
+        realtime_degraded: network.realtime_degraded,
+        rtt_ms: network.rtt_ms,
+        last_datagram_rx_ms: network.last_datagram_rx_ms,
+        datagram_tx_dropped: network.datagram_tx_dropped,
+        reliable_stream_reset_count: network.reliable_stream_reset_count,
+        cert_trust_state: network.cert_trust_state.clone(),
+    }
+}
+
+fn is_latency_ack_event(event: &LocalInputDiagnosticEvent) -> bool {
+    matches!(
+        event.event_kind.as_str(),
+        "latency_probe_ack" | "latency_endpoint_switch_ack"
+    )
+}
+
+fn parse_latency_payload_u64(payload: &BTreeMap<String, String>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| payload.get(*key))
+        .find_map(|value| value.parse::<u64>().ok())
+}
+
+fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: DeviceId) -> bool {
+    ["target_device_id", "origin_device_id"]
+        .iter()
+        .filter_map(|key| event.payload.get(*key))
+        .filter_map(|value| DeviceId::parse_str(value).ok())
+        .chain(
+            event
+                .device_id
+                .as_deref()
+                .and_then(|value| DeviceId::parse_str(value).ok()),
+        )
+        .any(|candidate| candidate == target)
+}
+
+fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> {
+    if event.event_kind == "latency_endpoint_switch_ack" {
+        return parse_latency_payload_u64(&event.payload, &["origin_probe_sequence"])
+            .or_else(|| parse_latency_payload_u64(&event.payload, &["probe_sequence"]));
+    }
+
+    parse_latency_payload_u64(&event.payload, &["probe_sequence"])
+}
+
+fn latency_ack_completion_sequence_for_pending(
+    event: &LocalInputDiagnosticEvent,
+    pending: &PendingLatencyProbe,
+) -> Option<u64> {
+    if event.event_kind != "latency_endpoint_switch_ack" {
+        return parse_latency_payload_u64(&event.payload, &["probe_sequence"]);
+    }
+
+    match pending.role {
+        PendingLatencyProbeRole::LocalRequested => {
+            parse_latency_payload_u64(&event.payload, &["origin_probe_sequence"])
+                .or_else(|| parse_latency_payload_u64(&event.payload, &["probe_sequence"]))
+        }
+        PendingLatencyProbeRole::EndpointSwitchReport { .. } => {
+            parse_latency_payload_u64(&event.payload, &["probe_sequence"])
+        }
+    }
+}
+
+fn latency_ack_order_key(event: &LocalInputDiagnosticEvent) -> (u64, u64) {
+    (
+        event.sequence,
+        latency_ack_probe_sequence(event).unwrap_or(event.sequence),
+    )
+}
+
+fn latency_feedback_status_priority(status: LatencyFeedbackStatus) -> u8 {
+    match status {
+        LatencyFeedbackStatus::Timeout => 5,
+        LatencyFeedbackStatus::Degraded => 4,
+        LatencyFeedbackStatus::Pending => 3,
+        LatencyFeedbackStatus::Healthy => 2,
+        LatencyFeedbackStatus::Idle => 1,
+        LatencyFeedbackStatus::Unavailable => 0,
+    }
 }
 
 fn diagnostic_message(local_device_id: DeviceId, event: LocalInputDiagnosticEvent) -> Message {
@@ -6209,9 +6543,7 @@ async fn handle_ipc_client(
                 manager.connection_infos().await
             };
             let state = state.read().await;
-            let mut snapshot = state.status_snapshot();
-            snapshot.network = network_snapshot_from_connections(&connection_infos);
-            DaemonResponse::Status(snapshot)
+            DaemonResponse::Status(state.status_snapshot_for_connections(&connection_infos))
         }
         DaemonRequest::Devices => {
             let state = state.read().await;
@@ -6559,6 +6891,14 @@ mod tests {
         ))
     }
 
+    fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {
+        let mut info = ConnectionInfo::new(device_id, "127.0.0.1:27431".to_string());
+        info.state = rshare_net::connection::ConnectionState::Connected;
+        info.datagram_available = true;
+        info.rtt_ms = rtt_ms;
+        info
+    }
+
     #[test]
     fn capability_registry_snapshot_contains_local_reserved_capabilities() {
         let mut state = test_daemon_state();
@@ -6703,6 +7043,575 @@ mod tests {
     }
 
     #[test]
+    fn transport_feedback_reports_unavailable_without_connections() {
+        let network = network_snapshot_from_connections(&[]);
+        let feedback = transport_feedback_from_connections(&network, &[]);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert!(feedback.realtime_degraded);
+    }
+
+    #[test]
+    fn transport_feedback_reports_healthy_realtime_connection() {
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
+
+        let feedback = transport_feedback_from_connections(&network, &connections);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.rtt_ms, Some(12));
+    }
+
+    #[test]
+    fn transport_feedback_degrades_when_realtime_is_degraded() {
+        let mut connection = connected_connection_info(DeviceId::new_v4(), Some(22));
+        connection.datagram_available = false;
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
+
+        let feedback = transport_feedback_from_connections(&network, &connections);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+    }
+
+    #[test]
+    fn transport_feedback_degrades_without_rtt_measurement() {
+        let connection = connected_connection_info(DeviceId::new_v4(), None);
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
+
+        let feedback = transport_feedback_from_connections(&network, &connections);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1250);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        let device = &feedback.devices[0];
+        assert_eq!(device.device_id, remote_id);
+        assert_eq!(device.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(device.latest_sequence, Some(7));
+        assert_eq!(device.last_probe_sent_ms, Some(1000));
+        assert_eq!(device.pending_duration_ms, Some(250));
+    }
+
+    #[test]
+    fn remote_latency_feedback_prefers_same_millisecond_newer_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency ACK event");
+        ack.timestamp_ms = 1000;
+        ack.sequence = 7;
+        state.local_controls.sequence = 7;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1100);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(100));
+    }
+
+    #[test]
+    fn remote_latency_feedback_prefers_newer_pending_over_delayed_old_ack() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "7".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 9;
+        state.local_controls.sequence = 9;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1150);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_origin_probe_sequence_for_endpoint_switch_ack_ordering() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "99".to_string());
+        payload.insert("origin_probe_sequence".to_string(), "7".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 9;
+        state.local_controls.sequence = 9;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1150);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_endpoint_probe_sequence_for_endpoint_switch_pending() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "20".to_string());
+        payload.insert("origin_probe_sequence".to_string(), "1000".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Old endpoint-side latency sample",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 20;
+        state.local_controls.sequence = 20;
+        state.pending_latency_probes.insert(
+            21,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1125,
+                role: PendingLatencyProbeRole::EndpointSwitchReport {
+                    origin_device_id: remote_id,
+                    origin_sequence: 1001,
+                },
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1175);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(21));
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(50));
+    }
+
+    #[test]
+    fn remote_latency_feedback_does_not_use_origin_sequence_fallback_for_endpoint_pending() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_probe_sequence".to_string(), "1000".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Malformed endpoint-side latency sample",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 20;
+        state.local_controls.sequence = 20;
+        state.pending_latency_probes.insert(
+            21,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1125,
+                role: PendingLatencyProbeRole::EndpointSwitchReport {
+                    origin_device_id: remote_id,
+                    origin_sequence: 1001,
+                },
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1175);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(21));
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(50));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_local_sequence_when_remote_ack_timestamps_are_skewed() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let old_ack = LocalInputDiagnosticEvent {
+            sequence: 40,
+            timestamp_ms: 20_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "Old endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("origin_probe_sequence".to_string(), "40".to_string()),
+                ("network_round_trip_ms".to_string(), "90".to_string()),
+            ]),
+        };
+        record_remote_diagnostic_event(&mut state, remote_id, old_ack);
+
+        let new_ack = LocalInputDiagnosticEvent {
+            sequence: 41,
+            timestamp_ms: 1_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "New endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("origin_probe_sequence".to_string(), "41".to_string()),
+                ("network_round_trip_ms".to_string(), "24".to_string()),
+            ]),
+        };
+        record_remote_diagnostic_event(&mut state, remote_id, new_ack);
+
+        let feedback = state.remote_latency_feedback(21_000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices[0].network_round_trip_ms, Some(24));
+        assert_eq!(
+            feedback.devices[0].summary.as_deref(),
+            Some("New endpoint latency sample")
+        );
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_local_sequence_across_ack_sequence_domains() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let normal_ack = LocalInputDiagnosticEvent {
+            sequence: 100,
+            timestamp_ms: 1_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_probe_ack".to_string(),
+            summary: "Old normal latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("target_device_id".to_string(), remote_id.to_string()),
+                ("probe_sequence".to_string(), "100".to_string()),
+                ("network_round_trip_ms".to_string(), "24".to_string()),
+            ]),
+        };
+        push_recent_local_event(&mut state.local_controls, normal_ack);
+
+        let endpoint_ack = LocalInputDiagnosticEvent {
+            sequence: 102,
+            timestamp_ms: 1_100,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "New endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("probe_sequence".to_string(), "101".to_string()),
+                ("origin_probe_sequence".to_string(), "7".to_string()),
+                ("network_round_trip_ms".to_string(), "30".to_string()),
+            ]),
+        };
+        push_recent_local_event(&mut state.local_controls, endpoint_ack);
+        state.local_controls.sequence = 102;
+
+        let feedback = state.remote_latency_feedback(1_200);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(102));
+        assert_eq!(feedback.devices[0].network_round_trip_ms, Some(30));
+        assert_eq!(
+            feedback.devices[0].summary.as_deref(),
+            Some("New endpoint latency sample")
+        );
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_timeout_for_stale_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(3000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Timeout);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Timeout);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(2000));
+    }
+
+    #[test]
+    fn remote_latency_pending_probes_are_cleared_when_device_is_removed() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        state.remove_device(&remote_id);
+
+        assert!(!state
+            .pending_latency_probes
+            .values()
+            .any(|probe| probe.target == remote_id));
+
+        state.mark_connected(&remote_id, true);
+        let feedback = state.remote_latency_feedback(3000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Idle);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Idle);
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_ack_metrics() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        payload.insert("raw_round_trip_ms".to_string(), "30".to_string());
+        payload.insert("estimated_one_way_ms".to_string(), "12".to_string());
+        payload.insert("remote_processing_ms".to_string(), "6".to_string());
+        payload.insert("direction".to_string(), "origin_to_endpoint".to_string());
+        let event = record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        let device = &feedback.devices[0];
+        assert_eq!(device.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(device.latest_sequence, Some(event.sequence));
+        assert_eq!(device.last_ack_ms, Some(event.timestamp_ms));
+        assert_eq!(device.network_round_trip_ms, Some(24));
+        assert_eq!(device.raw_round_trip_ms, Some(30));
+        assert_eq!(device.estimated_one_way_ms, Some(12));
+        assert_eq!(device.remote_processing_ms, Some(6));
+        assert_eq!(device.direction.as_deref(), Some("origin_to_endpoint"));
+        assert_eq!(
+            device.summary.as_deref(),
+            Some("Latency to remote: 24 ms RTT / ~12 ms one-way")
+        );
+    }
+
+    #[test]
+    fn remote_latency_feedback_degrades_ack_missing_or_high_rtt() {
+        let mut state = test_daemon_state();
+        let missing_rtt_id = DeviceId::new_v4();
+        let high_rtt_id = DeviceId::new_v4();
+        state.mark_connected(&missing_rtt_id, true);
+        state.mark_connected(&high_rtt_id, true);
+
+        record_latency_diagnostic_event(
+            &mut state,
+            missing_rtt_id,
+            "latency_probe_ack",
+            "Latency probe missing RTT",
+            BTreeMap::new(),
+        );
+
+        let mut high_rtt_payload = BTreeMap::new();
+        high_rtt_payload.insert("target_device_id".to_string(), high_rtt_id.to_string());
+        high_rtt_payload.insert("network_round_trip_ms".to_string(), "51".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            high_rtt_id,
+            "latency_probe_ack",
+            "Latency probe high RTT",
+            high_rtt_payload,
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+        let missing = feedback
+            .devices
+            .iter()
+            .find(|device| device.device_id == missing_rtt_id)
+            .expect("missing RTT device feedback");
+        assert_eq!(missing.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(missing.network_round_trip_ms, None);
+        let high = feedback
+            .devices
+            .iter()
+            .find(|device| device.device_id == high_rtt_id)
+            .expect("high RTT device feedback");
+        assert_eq!(high.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(high.network_round_trip_ms, Some(51));
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_disconnected_device_unavailable() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: Vec::new(),
+                connected: false,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].device_id, remote_id);
+        assert_eq!(feedback.devices[0].device_name.as_deref(), Some("remote"));
+        assert_eq!(
+            feedback.devices[0].status,
+            LatencyFeedbackStatus::Unavailable
+        );
+        assert_eq!(feedback.devices[0].network_round_trip_ms, None);
+        assert_eq!(feedback.devices[0].pending_duration_ms, None);
+    }
+
+    #[test]
     fn usb_descriptor_probe_parses_device_descriptor() {
         let bytes = [
             18, 1, 0x10, 0x02, 0xff, 0x01, 0x02, 64, 0x5e, 0x04, 0x8e, 0x02, 0x00, 0x01, 1, 2, 3, 1,
@@ -6749,6 +7658,165 @@ mod tests {
         ));
         assert!(state.local_controls.keyboard.pressed_keys.is_empty());
         assert_eq!(state.local_controls.keyboard.event_count, 2);
+    }
+
+    #[test]
+    fn local_input_feedback_is_idle_when_backend_is_healthy_without_events() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Idle);
+        assert_eq!(feedback.event_count, 0);
+    }
+
+    #[test]
+    fn local_input_feedback_uses_latest_keyboard_and_mouse_events() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        state.record_local_input_event(&rshare_input::InputEvent::mouse_move(10, 20));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 2);
+        assert_eq!(feedback.latest_sequence, Some(2));
+        assert!(feedback.latest_keyboard_event_ms.is_some());
+        assert!(feedback.latest_mouse_event_ms.is_some());
+    }
+
+    #[test]
+    fn local_input_feedback_ignores_later_backend_diagnostic_for_latest_input() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        let keyboard_event = state.local_controls.recent_events.last_mut().unwrap();
+        keyboard_event.capture_path = Some("portable-capture".to_string());
+        let keyboard_sequence = keyboard_event.sequence;
+        let keyboard_timestamp_ms = keyboard_event.timestamp_ms;
+
+        let backend_event = LocalInputDiagnosticEvent {
+            sequence: keyboard_sequence.saturating_add(1),
+            timestamp_ms: keyboard_timestamp_ms.saturating_add(1),
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency".to_string(),
+            summary: "Network latency sample".to_string(),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::new(),
+        };
+        state.local_controls.sequence = backend_event.sequence;
+        push_recent_local_event(&mut state.local_controls, backend_event);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
+        assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
+        assert_eq!(feedback.capture_path.as_deref(), Some("portable-capture"));
+    }
+
+    #[test]
+    fn local_input_feedback_ignores_remote_keyboard_diagnostic_for_latest_input() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        let keyboard_event = state.local_controls.recent_events.last_mut().unwrap();
+        keyboard_event.capture_path = Some("portable-capture".to_string());
+        let keyboard_sequence = keyboard_event.sequence;
+        let keyboard_timestamp_ms = keyboard_event.timestamp_ms;
+
+        let remote_device_id = DeviceId::new_v4();
+        let mut payload = BTreeMap::new();
+        payload.insert("remote_device_id".to_string(), remote_device_id.to_string());
+        let remote_event = LocalInputDiagnosticEvent {
+            sequence: keyboard_sequence.saturating_add(1),
+            timestamp_ms: keyboard_timestamp_ms.saturating_add(1),
+            device_kind: LocalInputDeviceKind::Keyboard,
+            event_kind: "key".to_string(),
+            summary: "Remote key ShiftLeft Pressed".to_string(),
+            device_id: Some(remote_device_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("remote-daemon".to_string()),
+            source: LocalInputEventSource::System,
+            payload,
+        };
+        state.local_controls.sequence = remote_event.sequence;
+        push_recent_local_event(&mut state.local_controls, remote_event);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
+        assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
+        assert_eq!(
+            feedback.latest_keyboard_event_ms,
+            Some(keyboard_timestamp_ms)
+        );
+        assert_eq!(feedback.capture_path.as_deref(), Some("portable-capture"));
+    }
+
+    #[test]
+    fn local_input_feedback_is_unavailable_without_selected_backend() {
+        let mut state = test_daemon_state();
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert_eq!(feedback.event_count, 1);
+    }
+
+    #[test]
+    fn local_input_feedback_is_degraded_when_selected_backend_is_degraded() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.backend_state.aggregate_health = BackendHealth::Degraded {
+            reason: BackendFailureReason::RuntimeError,
+        };
+        let event = state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(event.sequence));
+        assert_eq!(feedback.latest_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_keyboard_event_ms, Some(event.timestamp_ms));
+    }
+
+    #[test]
+    fn local_input_feedback_saturates_event_count() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.local_controls.keyboard.event_count = u64::MAX;
+        state.local_controls.mouse.event_count = 1;
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, u64::MAX);
     }
 
     #[test]
@@ -8439,6 +9507,83 @@ mod tests {
             Some(ControlSessionState::LocalReady)
         );
         assert_eq!(snapshot.active_target, None);
+    }
+
+    #[test]
+    fn status_snapshot_includes_latency_feedback() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+
+        let snapshot = state.status_snapshot_for_connections(&[]);
+
+        assert_eq!(
+            snapshot.latency_feedback.local_input.status,
+            LatencyFeedbackStatus::Idle
+        );
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_uses_connection_snapshot_network() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
+        assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_uses_connection_infos_for_transport_availability() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_degrades_when_any_connection_rtt_is_high() {
+        let state = test_daemon_state();
+        let fast_connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+        let slow_connection = connected_connection_info(DeviceId::new_v4(), Some(200));
+
+        let snapshot = state.status_snapshot_for_connections(&[fast_connection, slow_connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn status_snapshot_for_connections_populates_latency_feedback() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert!(snapshot.latency_feedback.generated_at_ms > 0);
+        assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
     }
 
     #[test]

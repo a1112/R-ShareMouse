@@ -75,6 +75,9 @@ pub struct ServiceStatusSnapshot {
     /// Device transport diagnostics for peer-to-peer control traffic.
     #[serde(default)]
     pub network: NetworkTransportSnapshot,
+    /// Daemon-owned latency feedback for local input, remote probes, and transport health.
+    #[serde(default)]
+    pub latency_feedback: LatencyFeedbackSnapshot,
 }
 
 /// Runtime diagnostics for the device-to-device transport.
@@ -114,6 +117,169 @@ impl Default for NetworkTransportSnapshot {
             cert_trust_state: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LatencyFeedbackStatus {
+    Idle,
+    Pending,
+    Healthy,
+    Degraded,
+    Timeout,
+    Unavailable,
+}
+
+impl Default for LatencyFeedbackStatus {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatencyFeedbackSnapshot {
+    #[serde(default)]
+    pub generated_at_ms: u64,
+    #[serde(default)]
+    pub local_input: LocalInputFeedback,
+    #[serde(default)]
+    pub remote_latency: RemoteLatencyFeedback,
+    #[serde(default)]
+    pub transport: TransportFeedback,
+}
+
+impl Default for LatencyFeedbackSnapshot {
+    fn default() -> Self {
+        Self {
+            generated_at_ms: 0,
+            local_input: LocalInputFeedback::default(),
+            remote_latency: RemoteLatencyFeedback::default(),
+            transport: TransportFeedback::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalInputFeedback {
+    #[serde(default)]
+    pub status: LatencyFeedbackStatus,
+    #[serde(default)]
+    pub event_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_keyboard_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_mouse_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_path: Option<String>,
+}
+
+impl Default for LocalInputFeedback {
+    fn default() -> Self {
+        Self {
+            status: LatencyFeedbackStatus::Unavailable,
+            event_count: 0,
+            latest_sequence: None,
+            latest_event_ms: None,
+            latest_keyboard_event_ms: None,
+            latest_mouse_event_ms: None,
+            capture_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteLatencyFeedback {
+    #[serde(default)]
+    pub status: LatencyFeedbackStatus,
+    #[serde(default)]
+    pub devices: Vec<RemoteDeviceLatencyFeedback>,
+}
+
+impl Default for RemoteLatencyFeedback {
+    fn default() -> Self {
+        Self {
+            status: LatencyFeedbackStatus::Unavailable,
+            devices: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteDeviceLatencyFeedback {
+    pub device_id: DeviceId,
+    #[serde(default)]
+    pub status: LatencyFeedbackStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_sent_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ack_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_round_trip_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_round_trip_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_one_way_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_processing_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportFeedback {
+    #[serde(default)]
+    pub status: LatencyFeedbackStatus,
+    #[serde(default = "default_transport_name")]
+    pub transport: String,
+    #[serde(default)]
+    pub datagram_available: bool,
+    #[serde(default = "default_realtime_degraded")]
+    pub realtime_degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_datagram_rx_ms: Option<u64>,
+    #[serde(default)]
+    pub datagram_tx_dropped: u64,
+    #[serde(default)]
+    pub reliable_stream_reset_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_trust_state: Option<String>,
+}
+
+impl Default for TransportFeedback {
+    fn default() -> Self {
+        Self {
+            status: LatencyFeedbackStatus::Unavailable,
+            transport: default_transport_name(),
+            datagram_available: false,
+            realtime_degraded: true,
+            rtt_ms: None,
+            last_datagram_rx_ms: None,
+            datagram_tx_dropped: 0,
+            reliable_stream_reset_count: 0,
+            cert_trust_state: None,
+        }
+    }
+}
+
+fn default_transport_name() -> String {
+    "quic".to_string()
+}
+
+fn default_realtime_degraded() -> bool {
+    true
 }
 
 fn default_background_owner() -> BackgroundProcessOwner {
@@ -161,6 +327,7 @@ impl ServiceStatusSnapshot {
             tray_state: default_tray_state(),
             started_by_desktop: false,
             network: NetworkTransportSnapshot::default(),
+            latency_feedback: LatencyFeedbackSnapshot::default(),
         }
     }
 }

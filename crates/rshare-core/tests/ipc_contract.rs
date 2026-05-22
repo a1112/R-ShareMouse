@@ -433,6 +433,82 @@ fn default_status_snapshot_starts_empty_and_healthy() {
 }
 
 #[test]
+fn latency_feedback_defaults_to_safe_unavailable_state() {
+    let snapshot: rshare_core::ServiceStatusSnapshot = serde_json::from_str(
+        r#"{
+            "device_id":"00000000-0000-0000-0000-000000000000",
+            "device_name":"desktop",
+            "hostname":"desktop-host",
+            "bind_address":"0.0.0.0:27431",
+            "discovery_port":27432,
+            "pid":42,
+            "discovered_devices":0,
+            "connected_devices":0,
+            "healthy":true
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot.latency_feedback.transport.status,
+        rshare_core::LatencyFeedbackStatus::Unavailable
+    );
+    assert!(snapshot.latency_feedback.remote_latency.devices.is_empty());
+}
+
+#[tokio::test]
+async fn latency_feedback_status_response_round_trips_populated_payload() {
+    let mut snapshot = ServiceStatusSnapshot::new(
+        Uuid::nil(),
+        "desktop".to_string(),
+        "desktop-host".to_string(),
+        "0.0.0.0:27431".to_string(),
+        27432,
+        42,
+    );
+
+    snapshot.latency_feedback.generated_at_ms = 123;
+    snapshot.latency_feedback.local_input.status = rshare_core::LatencyFeedbackStatus::Healthy;
+    snapshot.latency_feedback.local_input.event_count = 2;
+    snapshot.latency_feedback.local_input.latest_sequence = Some(7);
+    snapshot.latency_feedback.local_input.latest_event_ms = Some(111);
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_keyboard_event_ms = Some(109);
+    snapshot.latency_feedback.local_input.capture_path = Some("portable".to_string());
+    snapshot.latency_feedback.remote_latency.devices.push(
+        rshare_core::RemoteDeviceLatencyFeedback {
+            device_id: Uuid::nil(),
+            status: rshare_core::LatencyFeedbackStatus::Healthy,
+            device_name: Some("laptop".to_string()),
+            latest_sequence: Some(9),
+            last_probe_sent_ms: Some(100),
+            last_ack_ms: Some(112),
+            pending_duration_ms: None,
+            network_round_trip_ms: Some(12),
+            raw_round_trip_ms: None,
+            estimated_one_way_ms: Some(6),
+            remote_processing_ms: None,
+            direction: Some("right".to_string()),
+            summary: Some("12 ms round trip".to_string()),
+        },
+    );
+    snapshot.latency_feedback.transport.status = rshare_core::LatencyFeedbackStatus::Healthy;
+    snapshot.latency_feedback.transport.datagram_available = true;
+    snapshot.latency_feedback.transport.realtime_degraded = false;
+    snapshot.latency_feedback.transport.rtt_ms = Some(12);
+
+    let response = DaemonResponse::Status(snapshot.clone());
+    let (mut writer, mut reader) = duplex(4096);
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[test]
 fn default_status_snapshot_reports_daemon_owned_background_runtime() {
     let snapshot = ServiceStatusSnapshot::new(
         Uuid::nil(),

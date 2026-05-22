@@ -85,6 +85,36 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
   assert.deepEqual(overview.devices, []);
 });
 
+test("buildDesktopViewModel exposes daemon latency feedback when present", () => {
+  const latencyFeedback = {
+    status: "Degraded",
+    remote_latency: {
+      status: "Degraded",
+      devices: [
+        {
+          device_id: "remote-1",
+          status: "Timeout",
+          pending_duration_ms: 2000,
+        },
+      ],
+    },
+  };
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Local",
+      hostname: "local-host",
+      bind_address: "0.0.0.0:27431",
+      discovery_port: 27432,
+      healthy: false,
+      latency_feedback: latencyFeedback,
+    },
+    devices: [],
+  });
+
+  assert.equal(model.latencyFeedback, latencyFeedback);
+});
+
 test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {
   const model = buildLocalControlsViewModel(
     {
@@ -321,6 +351,449 @@ test("buildEndpointInjectSummary reports scoped latency for the selected device 
   assert.equal(summary.message, "Endpoint 注入完成：2/2 成功，平均 15 ms，最大 18 ms");
 });
 
+test("buildRemoteLatencySummary prefers daemon latency feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const snapshot = {
+    latency_feedback: {
+      remote_latency: {
+        devices: [
+          {
+            device_id: deviceId,
+            status: "Healthy",
+            summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            network_round_trip_ms: 24,
+            estimated_one_way_ms: 12,
+            raw_round_trip_ms: 30,
+            remote_processing_ms: 6,
+            direction: "origin_to_endpoint",
+            last_ack_ms: 1000,
+          },
+        ],
+      },
+    },
+    recent_events: [
+      {
+        device_kind: "Backend",
+        event_kind: "latency_probe_ack",
+        timestamp_ms: 900,
+        device_id: deviceId,
+        payload: { network_round_trip_ms: "99" },
+      },
+    ],
+  };
+
+  const summary = buildRemoteLatencySummary(snapshot, deviceId);
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.estimatedOneWayMs, 12);
+});
+
+test("buildRemoteLatencySummary maps daemon timeout feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Timeout",
+              pending_duration_ms: 1800,
+            },
+          ],
+        },
+      },
+      recent_events: [],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "fail");
+  assert.match(summary.message, /超时/);
+});
+
+test("buildRemoteLatencySummary maps daemon degraded feedback with metrics", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "degraded",
+              network_round_trip_ms: "42",
+              estimated_one_way_ms: "21",
+              raw_round_trip_ms: "48",
+              remote_processing_ms: "6",
+              direction: "endpoint_to_origin",
+              last_ack_ms: "2000",
+            },
+          ],
+        },
+      },
+      recent_events: [],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "warn");
+  assert.equal(summary.networkRoundTripMs, 42);
+  assert.equal(summary.estimatedOneWayMs, 21);
+  assert.equal(summary.rawRoundTripMs, 48);
+  assert.equal(summary.remoteProcessingMs, 6);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary shows pending event newer than stale daemon idle feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 1000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Idle",
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 12,
+          timestamp_ms: 1500,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.timestampMs, 1500);
+});
+
+test("buildRemoteLatencySummary shows ACK event newer than stale daemon pending feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 1000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Pending",
+              last_probe_sent_ms: 950,
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 13,
+          timestamp_ms: 1600,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.timestampMs, 1600);
+});
+
+test("buildRemoteLatencySummary lets newer event override daemon ACK timestamp skew", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 1000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Healthy",
+              latest_sequence: 20,
+              last_ack_ms: 9000,
+              network_round_trip_ms: 24,
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 21,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "21",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.timestampMs, 1100);
+});
+
+test("buildRemoteLatencySummary lets fresh mirrored ACK override stale daemon pending by sequence", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 5000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Pending",
+              latest_sequence: 29,
+              last_probe_sent_ms: 4900,
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 30,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            remote_device_id: deviceId,
+            origin_probe_sequence: "30",
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary shows newer sent event instead of older ACK metrics", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 20,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "20",
+            network_round_trip_ms: "24",
+          },
+        },
+        {
+          sequence: 21,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "21",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.timestampMs, 1100);
+});
+
+test("buildRemoteLatencySummary treats endpoint switch sent and ACK origin sequence consistently", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 99,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_sent",
+          summary: "Endpoint switched latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "99",
+            origin_probe_sequence: "7",
+          },
+        },
+        {
+          sequence: 100,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            origin_device_id: deviceId,
+            probe_sequence: "99",
+            origin_probe_sequence: "7",
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary uses local sequence when ACK timestamp is skewed ahead", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 20,
+          timestamp_ms: 9000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "20",
+            network_round_trip_ms: "24",
+          },
+        },
+        {
+          sequence: 21,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "21",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.timestampMs, 1100);
+});
+
+test("buildRemoteLatencySummary matches mirrored endpoint ACK by remote_device_id", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const localId = "00000000-0000-0000-0000-000000000002";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 30,
+          timestamp_ms: 1200,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            target_device_id: localId,
+            origin_event_device_id: localId,
+            remote_device_id: deviceId,
+            origin_probe_sequence: "30",
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary keeps explicit null daemon metrics as null", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Healthy",
+              network_round_trip_ms: null,
+              estimated_one_way_ms: null,
+              raw_round_trip_ms: null,
+              remote_processing_ms: null,
+              last_ack_ms: null,
+            },
+          ],
+        },
+      },
+      recent_events: [],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.estimatedOneWayMs, null);
+  assert.equal(summary.rawRoundTripMs, null);
+  assert.equal(summary.remoteProcessingMs, null);
+  assert.equal(summary.timestampMs, null);
+});
+
 test("buildRemoteLatencySummary extracts the latest RTT for a selected remote device", () => {
   const summary = buildRemoteLatencySummary(
     {
@@ -370,6 +843,34 @@ test("buildRemoteLatencySummary extracts the latest RTT for a selected remote de
   assert.equal(summary.rawRoundTripMs, 33);
   assert.equal(summary.remoteProcessingMs, 3);
   assert.equal(summary.direction, "endpoint_to_origin");
+});
+
+test("buildRemoteLatencySummary marks high RTT event ACK as warning", () => {
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 40,
+          timestamp_ms: 2000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 90 ms RTT / ~45 ms one-way",
+          device_id: "remote-1",
+          source: "System",
+          payload: {
+            target_device_id: "remote-1",
+            probe_sequence: "40",
+            network_round_trip_ms: "90",
+            estimated_one_way_ms: "45",
+          },
+        },
+      ],
+    },
+    "remote-1",
+  );
+
+  assert.equal(summary.state, "warn");
+  assert.equal(summary.networkRoundTripMs, 90);
 });
 
 test("buildRemoteLatencySummary reports pending probe when ACK has not arrived", () => {
