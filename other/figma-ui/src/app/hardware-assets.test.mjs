@@ -88,3 +88,27 @@ test("checked-in office mouse manifest has mapped button regions", () => {
     "mouse_button",
   );
 });
+
+test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
+  const mouse = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.mouse.office",
+    name: "Office Mouse",
+    kind: "mouse",
+    base_size: { width: 575, height: 1109 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "mouse.left",
+        label: "Left",
+        action: { kind: "mouse_button", buttons: ["Left"] },
+        shape: { kind: "rect", x: 0.2, y: 0.07, w: 0.3, h: 0.4, radius: 38 },
+      },
+    ],
+  });
+
+  const active = resolveActiveHardwareRegions(mouse, { leftDown: true });
+
+  assert.equal(active[0].id, "mouse.left");
+  assert.equal(active[0].shape.radius, 38);
+});

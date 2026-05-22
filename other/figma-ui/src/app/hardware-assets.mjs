@@ -98,11 +98,27 @@ function keyboardActionMatches(action, activity) {
 
 function mouseActionMatches(action, activity) {
   const candidates = new Set((action.buttons ?? []).map(normalizeButtonToken));
+  for (const [button, active] of Object.entries(mouseBooleanState(activity))) {
+    if (active && candidates.has(normalizeButtonToken(button))) {
+      return true;
+    }
+  }
   const buttons = [
     ...(activity.pressedButtons ?? []),
     ...(activity.recentButtons ?? []),
   ];
   return buttons.some((button) => candidates.has(normalizeButtonToken(button)));
+}
+
+function mouseBooleanState(activity) {
+  return {
+    Left: Boolean(activity.leftDown),
+    Right: Boolean(activity.rightDown),
+    Middle: Boolean(activity.middleDown || activity.wheelActive),
+    Wheel: Boolean(activity.middleDown || activity.wheelActive),
+    Back: Boolean(activity.backDown),
+    Forward: Boolean(activity.forwardDown),
+  };
 }
 
 function gamepadActionMatches(action, activity) {
