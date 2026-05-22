@@ -13,6 +13,7 @@ pub struct InstalledHardwareAsset {
     pub kind: HardwareAssetKind,
     pub manifest_path: String,
     pub folder_path: String,
+    pub manifest: HardwareAssetManifest,
 }
 
 pub fn hardware_asset_root(app_data_dir: &Path) -> PathBuf {
@@ -144,11 +145,12 @@ fn installed_asset_from_manifest(
     manifest: HardwareAssetManifest,
 ) -> InstalledHardwareAsset {
     InstalledHardwareAsset {
-        id: manifest.id,
-        name: manifest.name,
-        kind: manifest.kind,
+        id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        kind: manifest.kind.clone(),
         manifest_path: folder.join("manifest.json").to_string_lossy().into_owned(),
         folder_path: folder.to_string_lossy().into_owned(),
+        manifest,
     }
 }
 
@@ -244,6 +246,17 @@ mod tests {
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].id, "user.keyboard.sample");
         assert_eq!(installed[0].name, "Sample");
+    }
+
+    #[test]
+    fn listed_assets_include_manifest_payload_for_frontend_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        import_hardware_asset_package(temp.path(), &sample_package_bytes()).unwrap();
+
+        let installed = list_installed_hardware_assets(temp.path()).unwrap();
+
+        assert_eq!(installed[0].manifest.id, "user.keyboard.sample");
+        assert_eq!(installed[0].manifest.layers[0].src.as_deref(), Some("base.png"));
     }
 
     #[test]

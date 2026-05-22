@@ -5,7 +5,13 @@ export const BUILTIN_HARDWARE_ASSET_MANIFESTS = Object.freeze([
   "/assets/hardware/live2d/mouse/gaming/manifest.json",
 ]);
 
-export function normalizeHardwareAssetManifest(raw, baseUrl = "") {
+export function normalizeHardwareAssetManifest(raw, baseUrlOrOptions = "") {
+  const options =
+    typeof baseUrlOrOptions === "string"
+      ? { baseUrl: baseUrlOrOptions }
+      : (baseUrlOrOptions ?? {});
+  const baseUrl = options.baseUrl ?? "";
+  const resolveUrl = options.resolveUrl;
   const baseSize = raw.base_size ?? raw.baseSize ?? { width: 1, height: 1 };
   return {
     id: String(raw.id),
@@ -20,7 +26,7 @@ export function normalizeHardwareAssetManifest(raw, baseUrl = "") {
       id: String(layer.id),
       role: String(layer.role),
       render: layer.render ?? (layer.src ? "image" : "runtime"),
-      src: layer.src ? resolveAssetUrl(baseUrl, layer.src) : null,
+      src: layer.src ? resolveAssetUrl(baseUrl, layer.src, resolveUrl) : null,
       opacity: layer.opacity == null ? 1 : Number(layer.opacity),
     })),
     regions: (raw.regions ?? raw.hotspots ?? []).map(normalizeRegion),
@@ -43,9 +49,20 @@ export function resolveActiveHardwareRegions(asset, activity = {}) {
   );
 }
 
-function resolveAssetUrl(baseUrl, src) {
-  if (/^(https?:|data:|blob:|\/)/i.test(src)) {
+export function resolveSelectedHardwareAsset(assets = [], kind, selectedId) {
+  return (
+    assets.find((asset) => asset.kind === kind && asset.id === selectedId) ??
+    assets.find((asset) => asset.kind === kind) ??
+    null
+  );
+}
+
+function resolveAssetUrl(baseUrl, src, resolveUrl) {
+  if (/^([a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
     return src;
+  }
+  if (typeof resolveUrl === "function") {
+    return resolveUrl(src);
   }
   return `${baseUrl.replace(/\/?$/, "/")}${src}`;
 }

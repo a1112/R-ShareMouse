@@ -6,6 +6,7 @@ import {
   buildHardwareAssetChoices,
   normalizeHardwareAssetManifest,
   resolveActiveHardwareRegions,
+  resolveSelectedHardwareAsset,
 } from "./hardware-assets.mjs";
 
 const keyboardManifest = {
@@ -34,6 +35,14 @@ test("normalizeHardwareAssetManifest resolves relative layer urls", () => {
   assert.equal(asset.id, "builtin.keyboard.office");
   assert.equal(asset.baseSize.width, 1000);
   assert.equal(asset.layers[0].src, "/assets/hardware/keyboard/base.png");
+});
+
+test("normalizeHardwareAssetManifest accepts a custom relative url resolver", () => {
+  const asset = normalizeHardwareAssetManifest(keyboardManifest, {
+    resolveUrl: (src) => `asset://local/${src}`,
+  });
+
+  assert.equal(asset.layers[0].src, "asset://local/base.png");
 });
 
 test("resolveActiveHardwareRegions matches pressed keyboard codes", () => {
@@ -111,4 +120,16 @@ test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
 
   assert.equal(active[0].id, "mouse.left");
   assert.equal(active[0].shape.radius, 38);
+});
+
+test("resolveSelectedHardwareAsset falls back to first matching kind", () => {
+  const assets = [
+    { id: "builtin.keyboard.office", kind: "keyboard", name: "Office" },
+    { id: "builtin.keyboard.gaming", kind: "keyboard", name: "Gaming" },
+  ];
+
+  assert.equal(
+    resolveSelectedHardwareAsset(assets, "keyboard", "missing").id,
+    "builtin.keyboard.office",
+  );
 });
