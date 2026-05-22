@@ -90,3 +90,53 @@ fn rejects_duplicate_mask_values() {
         HardwareAssetValidationError::DuplicateMaskValue(32)
     );
 }
+
+#[test]
+fn parses_valid_gamepad_manifest_with_polygon_regions() {
+    let manifest: HardwareAssetManifest = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "id": "builtin.gamepad.xbox",
+        "name": "Xbox Style Controller",
+        "kind": "gamepad",
+        "base_size": { "width": 1205, "height": 826 },
+        "layers": [
+            { "id": "base", "role": "base", "src": "base.png" }
+        ],
+        "regions": [
+            {
+                "id": "gamepad.button.a",
+                "label": "A",
+                "action": {
+                    "kind": "gamepad_button",
+                    "buttons": ["A", "South", "ButtonSouth"]
+                },
+                "shape": {
+                    "kind": "polygon",
+                    "points": [
+                        { "x": 0.74, "y": 0.56 },
+                        { "x": 0.77, "y": 0.52 },
+                        { "x": 0.80, "y": 0.56 },
+                        { "x": 0.77, "y": 0.60 }
+                    ]
+                }
+            }
+        ],
+        "mask": {
+            "src": "mask.png",
+            "channels": [{ "value": 32, "region_id": "gamepad.button.a" }]
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(manifest.kind, HardwareAssetKind::Gamepad);
+    assert!(matches!(
+        manifest.regions[0].action,
+        HardwareControlAction::GamepadButton { .. }
+    ));
+    assert!(matches!(
+        manifest.regions[0].shape,
+        HardwareRegionShape::Polygon { .. }
+    ));
+    manifest.validate().unwrap();
+    assert_eq!(manifest.referenced_paths(), vec!["base.png", "mask.png"]);
+}
