@@ -400,7 +400,6 @@ test("buildRemoteLatencySummary reports pending probe when ACK has not arrived",
 
 test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {
   const tabs = buildDeviceTypeSummaries({
-    all: true,
     keyboard: 7,
     mouse: 4,
     gamepad: 1,
@@ -412,7 +411,6 @@ test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {
   assert.deepEqual(
     tabs.map((tab) => [tab.kind, tab.title, tab.detail]),
     [
-      ["all", "综合", "合并输出"],
       ["keyboard", "键盘", "7"],
       ["mouse", "鼠标", "4"],
       ["gamepad", "手柄", "1"],
@@ -503,6 +501,41 @@ test("buildDeviceGalleryItems centers the physical device layout around the disp
   assert.equal(gamepad.x < display.x, true);
 });
 
+test("buildDeviceGalleryItems assigns Live2D hardware rigs to interactive devices", () => {
+  const items = buildDeviceGalleryItems(
+    {
+      keyboard: { detected: true, event_count: 12 },
+      mouse: { detected: true, event_count: 20 },
+      keyboard_devices: [{ id: "kbd-1", name: "Keyboard A", connected: true }],
+      mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+      gamepads: [{ gamepad_id: 0, name: "Pad", connected: true, event_count: 5 }],
+      display: {
+        display_count: 1,
+        primary_width: 2560,
+        primary_height: 1440,
+        displays: [{ display_id: "primary", width: 2560, height: 1440, primary: true }],
+      },
+      audio_inputs: [{ id: "mic", name: "Mic", connected: true }],
+      audio_outputs: [],
+      recent_events: [],
+    },
+    [{ id: "speaker", name: "Speaker", connected: true }],
+    [{ id: "remote-1", name: "Remote PC", hostname: "remote", connected: false }],
+  );
+
+  assert.deepEqual(
+    items.map((item) => [item.kind, item.rigKind, item.rigVariant]),
+    [
+      ["keyboard", "keyboard", "default"],
+      ["mouse", "mouse", "default"],
+      ["gamepad", null, null],
+      ["display", null, null],
+      ["audio", null, null],
+      ["remote", null, null],
+    ],
+  );
+});
+
 test("buildDeviceGalleryItems carries live input activity for physical simulators", () => {
   const items = buildDeviceGalleryItems({
     keyboard: {
@@ -530,7 +563,20 @@ test("buildDeviceGalleryItems carries live input activity for physical simulator
       primary_height: 1440,
       displays: [{ display_id: "primary", width: 2560, height: 1440, primary: true }],
     },
-    recent_events: [],
+    recent_events: [
+      {
+        device_kind: "Keyboard",
+        event_kind: "key",
+        summary: "Key Enter Released",
+        payload: { key: "Enter", state: "Released" },
+      },
+      {
+        device_kind: "Mouse",
+        event_kind: "button",
+        summary: "Mouse button Right Pressed",
+        payload: { button: "Right", state: "Pressed" },
+      },
+    ],
   });
 
   const keyboard = items.find((item) => item.kind === "keyboard");
@@ -539,7 +585,9 @@ test("buildDeviceGalleryItems carries live input activity for physical simulator
 
   assert.deepEqual(keyboard.activity.pressedKeys, ["A", "Char(73)"]);
   assert.equal(keyboard.activity.lastKey, "Enter");
+  assert.equal(keyboard.activity.keyboardEvents.length, 1);
   assert.deepEqual(mouse.activity.pressedButtons, ["Left"]);
+  assert.ok(mouse.activity.recentButtons.includes("Right"));
   assert.equal(mouse.activity.x, 420);
   assert.equal(mouse.activity.wheelDeltaY, -1);
   assert.equal(display.activity.pointerVisible, true);
@@ -573,6 +621,36 @@ test("buildDeviceGalleryItems maps mouse pointer to matching display id", () => 
   assert.equal(right.activity.pointerVisible, true);
   assert.equal(right.activity.pointerX, 48);
   assert.equal(right.activity.pointerY, 64);
+});
+
+test("buildDeviceGalleryItems ignores stale mouse button events preserved by daemon", () => {
+  const items = buildDeviceGalleryItems({
+    mouse: {
+      detected: true,
+      event_count: 100,
+      pressed_buttons: [],
+    },
+    mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+    recent_events: [
+      {
+        device_kind: "Mouse",
+        event_kind: "button",
+        timestamp_ms: 1000,
+        summary: "Mouse button Left Released",
+        payload: { button: "Left", state: "Released" },
+      },
+      {
+        device_kind: "Mouse",
+        event_kind: "move",
+        timestamp_ms: 5000,
+        summary: "Mouse move 10, 10",
+        payload: { x: "10", y: "10" },
+      },
+    ],
+  });
+
+  const mouse = items.find((item) => item.kind === "mouse");
+  assert.deepEqual(mouse.activity.recentButtons, []);
 });
 
 test("buildDesktopViewModel maps daemon devices into layout and device cards", () => {
@@ -751,6 +829,71 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
   assert.equal(model.layout.remembered.nodes.length, 3);
 });
 
+test("buildDesktopViewModel snaps visible layout monitor groups before rendering", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "127.0.0.1",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 1,
+      connected_devices: 0,
+      healthy: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote Workstation",
+        hostname: "remote",
+        addresses: ["192.168.1.30"],
+        connected: false,
+        last_seen_secs: 2,
+      },
+    ],
+    layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [
+            { display_id: "left", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+            { display_id: "right", x: 2560, y: 0, width: 2560, height: 1440, primary: false },
+          ],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 5118, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+      ],
+      links: [],
+    },
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [
+            { display_id: "left", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+            { display_id: "right", x: 2560, y: 0, width: 2560, height: 1440, primary: false },
+          ],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 5118, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+      ],
+      links: [],
+    },
+  });
+
+  const remoteMonitor = model.layout.monitors.find((monitor) => monitor.deviceId === "remote-1");
+  assert.equal(remoteMonitor.x, 80 + 5120 * 0.12);
+});
+
 test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry and preserves offline nodes", () => {
   const remembered = {
     version: 1,
@@ -806,6 +949,80 @@ test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry a
     ],
   );
   assert.notEqual(updated, remembered);
+});
+
+test("updateRememberedLayoutFromVisibleMonitors snaps visible device groups edge-to-edge", () => {
+  const remembered = {
+    version: 1,
+    local_device: "local-1",
+    nodes: [
+      {
+        device_id: "local-1",
+        displays: [
+          { display_id: "left", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+          { display_id: "right", x: 2560, y: 0, width: 2560, height: 1440, primary: false },
+        ],
+      },
+      {
+        device_id: "remote-1",
+        displays: [
+          { display_id: "primary", x: 5200, y: 0, width: 1920, height: 1080, primary: true },
+        ],
+      },
+    ],
+    links: [],
+  };
+
+  const updated = updateRememberedLayoutFromVisibleMonitors(remembered, [
+    {
+      id: "local-1-left",
+      deviceId: "local-1",
+      displayId: "left",
+      rememberedX: 0,
+      rememberedY: 0,
+      visibleX: 0,
+      visibleY: 0,
+      x: 80,
+      y: 170,
+    },
+    {
+      id: "local-1-right",
+      deviceId: "local-1",
+      displayId: "right",
+      rememberedX: 2560,
+      rememberedY: 0,
+      visibleX: 2560,
+      visibleY: 0,
+      x: 80 + 2560 * 0.12,
+      y: 170,
+    },
+    {
+      id: "remote-1-primary",
+      deviceId: "remote-1",
+      displayId: "primary",
+      rememberedX: 5200,
+      rememberedY: 0,
+      visibleX: 5200,
+      visibleY: 0,
+      x: 80 + (5120 * 0.12) + 9,
+      y: 170,
+    },
+  ]);
+
+  const localNode = updated.nodes.find((node) => node.device_id === "local-1");
+  const remoteDisplay = updated.nodes
+    .find((node) => node.device_id === "remote-1")
+    .displays.find((display) => display.display_id === "primary");
+
+  assert.deepEqual(
+    localNode.displays.map((display) => [display.display_id, display.x, display.y]),
+    [
+      ["left", 0, 0],
+      ["right", 2560, 0],
+    ],
+  );
+  assert.equal(remoteDisplay.x, 5120);
+  assert.equal(remoteDisplay.y, 0);
 });
 
 test("buildDesktopViewModel does not synthesize remote layout when daemon layout is unavailable", () => {
@@ -879,6 +1096,8 @@ test("buildDesktopViewModel exposes desktop acceptance payload for settings chec
       discovered_devices: 1,
       connected_devices: 0,
       visible_layout_devices: 2,
+      local_display_count: 1,
+      local_ready: true,
       input_ready: true,
       dual_machine_ready: true,
       next_step: "打开另一台机器并连接设备，开始边缘切换验收",
@@ -890,8 +1109,77 @@ test("buildDesktopViewModel exposes desktop acceptance payload for settings chec
   assert.equal(model.acceptance.trayOwnedByDaemon, true);
   assert.equal(model.acceptance.trayState, "Unavailable");
   assert.equal(model.acceptance.dualMachineReady, true);
+  assert.equal(model.acceptance.localReady, true);
+  assert.equal(model.acceptance.localDisplayCount, 1);
   assert.equal(model.acceptance.autoStarted, true);
   assert.equal(model.acceptance.checks[0].label, "后台服务");
   assert.equal(model.acceptance.checks[0].state, "pass");
+  assert.equal(model.acceptance.checks.some((check) => check.key === "local"), true);
   assert.equal(model.acceptance.checks.at(-1).label, "双机验收");
+});
+
+test("buildDesktopViewModel prioritizes local acceptance when no remote devices are discovered", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "192.168.1.10:24801",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 0,
+      connected_devices: 0,
+      healthy: true,
+      input_mode: "Portable",
+      available_backends: ["Portable"],
+      backend_health: "Healthy",
+      background_owner: "Daemon",
+      background_mode: "BackgroundProcess",
+      tray_owner: "Daemon",
+      tray_state: "Running",
+    },
+    devices: [],
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [
+            { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+            { display_id: "display-2", x: 2560, y: 0, width: 2560, height: 1440, primary: false },
+          ],
+        },
+      ],
+      links: [],
+    },
+    acceptance: {
+      daemon_online: true,
+      background_ready: true,
+      tray_owned_by_daemon: true,
+      tray_state: "Running",
+      local_endpoint: "192.168.1.10:24801",
+      discovered_devices: 0,
+      connected_devices: 0,
+      visible_layout_devices: 1,
+      local_display_count: 2,
+      local_ready: true,
+      input_ready: true,
+      dual_machine_ready: false,
+      next_step: "本机能力已就绪，可以进行本机设备监控；双机验收等待局域网发现",
+    },
+  });
+
+  const localCheck = model.acceptance.checks.find((check) => check.key === "local");
+  const layoutCheck = model.acceptance.checks.find((check) => check.key === "layout");
+  const discoveryCheck = model.acceptance.checks.find((check) => check.key === "discovery");
+  const dualMachineCheck = model.acceptance.checks.find((check) => check.key === "dual-machine");
+
+  assert.equal(model.acceptance.localReady, true);
+  assert.equal(model.acceptance.dualMachineReady, false);
+  assert.equal(localCheck.state, "pass");
+  assert.equal(layoutCheck.state, "pass");
+  assert.equal(discoveryCheck.state, "warn");
+  assert.equal(dualMachineCheck.state, "warn");
+  assert.equal(layoutCheck.detail, "本机显示器 2 块，Layout 当前显示 1 个在线节点");
 });

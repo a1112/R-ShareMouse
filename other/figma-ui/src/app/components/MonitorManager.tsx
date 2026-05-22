@@ -26,6 +26,7 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
+  Lock,
 } from "lucide-react";
 
 /* ---------- Types ---------- */
@@ -151,6 +152,13 @@ interface SnapLine {
   end: number;
 }
 
+interface RectBounds {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
 interface MonitorManagerProps {
   devices?: DeviceData[];
   monitors?: MonitorData[];
@@ -196,6 +204,36 @@ function preserveMonitorEnabledState(
       ? { ...monitor, enabled: enabledById.get(monitor.id) ?? monitor.enabled }
       : monitor,
   );
+}
+
+function monitorBounds(monitor: MonitorData): RectBounds {
+  return {
+    left: monitor.x,
+    right: monitor.x + monitor.w,
+    top: monitor.y,
+    bottom: monitor.y + monitor.h,
+  };
+}
+
+function groupBounds(monitors: MonitorData[], dx = 0, dy = 0): RectBounds {
+  return monitors.reduce(
+    (bounds, monitor) => ({
+      left: Math.min(bounds.left, monitor.x + dx),
+      right: Math.max(bounds.right, monitor.x + dx + monitor.w),
+      top: Math.min(bounds.top, monitor.y + dy),
+      bottom: Math.max(bounds.bottom, monitor.y + dy + monitor.h),
+    }),
+    {
+      left: Infinity,
+      right: -Infinity,
+      top: Infinity,
+      bottom: -Infinity,
+    },
+  );
+}
+
+function rectsOverlap(a: RectBounds, b: RectBounds) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
 /* ---------- Component ---------- */
@@ -437,6 +475,136 @@ export default function MonitorManager({
     []
   );
 
+  const computeGroupSnap = useCallback(
+    (sourceMonitors: MonitorData[], dragId: string, rawX: number, rawY: number) => {
+      const dragMonitor = sourceMonitors.find((monitor) => monitor.id === dragId);
+      if (!dragMonitor) {
+        return { dx: 0, dy: 0, lines: [] as SnapLine[] };
+      }
+
+      const group = sourceMonitors.filter(
+        (monitor) => monitor.enabled && monitor.deviceId === dragMonitor.deviceId,
+      );
+      const others = sourceMonitors.filter(
+        (monitor) => monitor.enabled && monitor.deviceId !== dragMonitor.deviceId,
+      );
+      const rawDx = rawX - dragMonitor.x;
+      const rawDy = rawY - dragMonitor.y;
+      let bestDx = rawDx;
+      let bestDy = rawDy;
+      const lines: SnapLine[] = [];
+      const rawBounds = groupBounds(group, bestDx, bestDy);
+      let minDx = SNAP_DISTANCE + 1;
+      let minDy = SNAP_DISTANCE + 1;
+
+      for (const other of others) {
+        const o = monitorBounds(other);
+
+        const verticalCandidates: [number, number][] = [
+          [rawBounds.left, o.left],
+          [rawBounds.left, o.right],
+          [rawBounds.right, o.left],
+          [rawBounds.right, o.right],
+          [(rawBounds.left + rawBounds.right) / 2, (o.left + o.right) / 2],
+        ];
+        for (const [dragEdge, otherEdge] of verticalCandidates) {
+          const dist = Math.abs(dragEdge - otherEdge);
+          if (dist < SNAP_DISTANCE && dist <= minDx) {
+            minDx = dist;
+            bestDx = rawDx + otherEdge - dragEdge;
+            lines.push({
+              orientation: "v",
+              pos: otherEdge,
+              start: Math.min(rawBounds.top, o.top),
+              end: Math.max(rawBounds.bottom, o.bottom),
+            });
+          }
+        }
+
+        const horizontalCandidates: [number, number][] = [
+          [rawBounds.top, o.top],
+          [rawBounds.top, o.bottom],
+          [rawBounds.bottom, o.top],
+          [rawBounds.bottom, o.bottom],
+          [(rawBounds.top + rawBounds.bottom) / 2, (o.top + o.bottom) / 2],
+        ];
+        for (const [dragEdge, otherEdge] of horizontalCandidates) {
+          const dist = Math.abs(dragEdge - otherEdge);
+          if (dist < SNAP_DISTANCE && dist <= minDy) {
+            minDy = dist;
+            bestDy = rawDy + otherEdge - dragEdge;
+            lines.push({
+              orientation: "h",
+              pos: otherEdge,
+              start: Math.min(rawBounds.left, o.left),
+              end: Math.max(rawBounds.right, o.right),
+            });
+          }
+        }
+      }
+
+      return { dx: bestDx, dy: bestDy, lines };
+    },
+    [],
+  );
+
+  const resolveGroupCollision = useCallback(
+    (sourceMonitors: MonitorData[], dragId: string, dx: number, dy: number, rawDx: number, rawDy: number) => {
+      const dragMonitor = sourceMonitors.find((monitor) => monitor.id === dragId);
+      if (!dragMonitor) {
+        return { dx, dy };
+      }
+
+      const group = sourceMonitors.filter(
+        (monitor) => monitor.enabled && monitor.deviceId === dragMonitor.deviceId,
+      );
+      const others = sourceMonitors.filter(
+        (monitor) => monitor.enabled && monitor.deviceId !== dragMonitor.deviceId,
+      );
+      const bounds = groupBounds(group, dx, dy);
+      const overlaps = (candidateDx: number, candidateDy: number) => {
+        const candidate = groupBounds(group, candidateDx, candidateDy);
+        return others.some((other) => rectsOverlap(candidate, monitorBounds(other)));
+      };
+
+      if (!overlaps(dx, dy)) {
+        return { dx, dy };
+      }
+
+      const width = bounds.right - bounds.left;
+      const height = bounds.bottom - bounds.top;
+      let best = { dx: rawDx, dy: rawDy };
+      let bestDist = Infinity;
+
+      for (const other of others) {
+        const o = monitorBounds(other);
+        const candidates = [
+          { left: o.right, top: bounds.top },
+          { left: o.left - width, top: bounds.top },
+          { left: bounds.left, top: o.bottom },
+          { left: bounds.left, top: o.top - height },
+        ];
+
+        for (const candidate of candidates) {
+          const candidateDx = dx + candidate.left - bounds.left;
+          const candidateDy = dy + candidate.top - bounds.top;
+          if (overlaps(candidateDx, candidateDy)) {
+            continue;
+          }
+
+          const dist = Math.hypot(candidateDx - rawDx, candidateDy - rawDy);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = { dx: candidateDx, dy: candidateDy };
+          }
+        }
+      }
+
+      return best;
+    },
+    [],
+  );
+
   /* ---- Drag handlers ---- */
   const handleMouseDown = useCallback(
     (e: React.MouseEvent, id: string) => {
@@ -471,6 +639,32 @@ export default function MonitorManager({
       const currentOffset = dragOffsetRef.current;
       const rawX = (e.clientX - rect.left) / currentZoom - currentPan.x - currentOffset.x;
       const rawY = (e.clientY - rect.top) / currentZoom - currentPan.y - currentOffset.y;
+      const dragGroup = currentMonitors.filter(
+        (monitor) => monitor.enabled && monitor.deviceId === mon.deviceId,
+      );
+      if (dragGroup.length > 1) {
+        const rawDx = rawX - mon.x;
+        const rawDy = rawY - mon.y;
+        const snapped = computeGroupSnap(currentMonitors, dragId, rawX, rawY);
+        const resolved = resolveGroupCollision(
+          currentMonitors,
+          dragId,
+          snapped.dx,
+          snapped.dy,
+          rawDx,
+          rawDy,
+        );
+        const nextMonitors = currentMonitors.map((m) =>
+          m.enabled && m.deviceId === mon.deviceId
+            ? { ...m, x: m.x + resolved.dx, y: m.y + resolved.dy }
+            : m,
+        );
+        monitorsRef.current = nextMonitors;
+        pendingLocalSignatureRef.current = monitorGeometrySignature(nextMonitors);
+        setSnapLines(resolved.dx === snapped.dx && resolved.dy === snapped.dy ? snapped.lines : []);
+        setMonitors(nextMonitors);
+        return;
+      }
       const { x, y, lines } = computeSnap(currentMonitors, dragId, rawX, rawY, mon.w, mon.h);
       const resolved = resolveCollision(currentMonitors, dragId, x, y, mon.w, mon.h, rawX, rawY);
       const nextMonitors = currentMonitors.map((m) =>
@@ -481,7 +675,7 @@ export default function MonitorManager({
       setSnapLines(resolved.x === x && resolved.y === y ? lines : []);
       setMonitors(nextMonitors);
     },
-    [computeSnap, resolveCollision]
+    [computeGroupSnap, computeSnap, resolveCollision, resolveGroupCollision]
   );
 
   const handleMouseUp = useCallback(() => {
@@ -586,19 +780,25 @@ export default function MonitorManager({
 
   /* ---- Auto-arrange ---- */
   const autoArrange = useCallback(() => {
+    const deviceOrder = new Map(devices.map((device, index) => [device.id, index]));
     const sorted = [...monitorsRef.current].sort((a, b) => {
-      if (a.deviceId !== b.deviceId) return a.deviceId.localeCompare(b.deviceId);
-      return a.primary ? -1 : 1;
+      const deviceDelta =
+        (deviceOrder.get(a.deviceId) ?? Number.MAX_SAFE_INTEGER) -
+        (deviceOrder.get(b.deviceId) ?? Number.MAX_SAFE_INTEGER);
+      if (deviceDelta !== 0) return deviceDelta;
+      if (a.x !== b.x) return a.x - b.x;
+      if (a.primary !== b.primary) return a.primary ? -1 : 1;
+      return a.label.localeCompare(b.label);
     });
     let curX = 60;
     const baseY = 180;
     const nextMonitors = sorted.map((m) => {
       const newM = { ...m, x: curX, y: baseY + (260 - m.h) };
-      curX += m.w + 4;
+      curX += m.w;
       return newM;
     });
     commitMonitors(nextMonitors);
-  }, [commitMonitors]);
+  }, [commitMonitors, devices]);
 
   /* ---- Toggle monitor ---- */
   const toggleMonitor = useCallback((id: string) => {
@@ -765,6 +965,21 @@ export default function MonitorManager({
     const currentMonitors = monitorsRef.current;
     const mon = currentMonitors.find((m) => m.id === id);
     if (!mon) return;
+    const sameDeviceGroup = currentMonitors.filter(
+      (m) => m.enabled && m.deviceId === mon.deviceId,
+    );
+    if (sameDeviceGroup.length > 1) {
+      const STEP = 20;
+      const dx = dir === "left" ? -STEP : dir === "right" ? STEP : 0;
+      const dy = dir === "up" ? -STEP : dir === "down" ? STEP : 0;
+      const nextMonitors = currentMonitors.map((m) =>
+        m.enabled && m.deviceId === mon.deviceId
+          ? { ...m, x: m.x + dx, y: m.y + dy }
+          : m,
+      );
+      commitMonitors(nextMonitors);
+      return;
+    }
     const others = currentMonitors.filter((m) => m.id !== id && m.enabled);
       const STEP = 20;
       let bestX = mon.x;
@@ -1245,33 +1460,42 @@ export default function MonitorManager({
               return (
                 <div
                   key={`swap-${i}`}
-                  className="absolute flex items-center justify-center rounded-full cursor-pointer transition-all duration-150"
+                  className={`absolute flex items-center justify-center rounded-full transition-all duration-150 ${line.sameDevice ? "" : "cursor-pointer"}`}
                   style={{
                     left: cx - 10,
                     top: cy - 10,
                     width: 20,
                     height: 20,
                     backgroundColor: baseColor,
-                    opacity: 0.85,
+                    opacity: line.sameDevice ? 0.9 : 0.85,
                     pointerEvents: "auto",
                     zIndex: 18,
                     boxShadow: `0 1px 4px rgba(0,0,0,0.3)`,
                   }}
                   onMouseEnter={(e) => {
+                    if (line.sameDevice) return;
                     e.currentTarget.style.transform = "scale(1.3)";
                     e.currentTarget.style.opacity = "1";
                     e.currentTarget.style.boxShadow = `0 0 10px ${baseColor}88`;
                   }}
                   onMouseLeave={(e) => {
+                    if (line.sameDevice) return;
                     e.currentTarget.style.transform = "scale(1)";
                     e.currentTarget.style.opacity = "0.85";
                     e.currentTarget.style.boxShadow = `0 1px 4px rgba(0,0,0,0.3)`;
                   }}
                   onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
-                  onClick={(e) => { e.stopPropagation(); swapMonitors(line.aId, line.bId); }}
-                  title="交换位置"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!line.sameDevice) swapMonitors(line.aId, line.bId);
+                  }}
+                  title={line.sameDevice ? "同设备显示器已锁定成组" : "交换位置"}
                 >
-                  <span style={{ color: "#fff", fontSize: 10, fontWeight: 700, lineHeight: 1 }}>⇆</span>
+                  {line.sameDevice ? (
+                    <Lock size={10} style={{ color: "#fff" }} />
+                  ) : (
+                    <span style={{ color: "#fff", fontSize: 10, fontWeight: 700, lineHeight: 1 }}>⇆</span>
+                  )}
                 </div>
               );
             })}

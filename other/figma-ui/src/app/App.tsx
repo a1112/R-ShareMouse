@@ -1,7 +1,15 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ChevronDown,
   ChevronRight,
+  Download,
   FileText,
   Gamepad2,
   HardDrive,
@@ -15,6 +23,7 @@ import {
   RotateCcw,
   Settings,
   Square,
+  Upload,
   Volume2,
   Wifi,
   X,
@@ -44,6 +53,13 @@ import {
   FIGMA_DESKTOP_THEME,
   getDesktopTheme,
 } from "./desktop-theme.mjs";
+import {
+  BUILTIN_HARDWARE_ASSET_MANIFESTS,
+  buildHardwareAssetChoices,
+  normalizeHardwareAssetManifest,
+  resolveActiveHardwareRegions,
+  resolveSelectedHardwareAsset,
+} from "./hardware-assets.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
 
@@ -317,7 +333,7 @@ type LogEntry = {
 };
 
 type LocalControlKind = "keyboard" | "mouse" | "gamepad" | "display" | "audio";
-type LocalDevicePageKind = "all" | LocalControlKind | "remote";
+type LocalDevicePageKind = "overview" | LocalControlKind | "remote";
 type AudioInputDevice = {
   id: string;
   name: string;
@@ -388,9 +404,13 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
-const ENDPOINT_EVENT_POLL_MS = 300;
-const LOCAL_CONTROL_EVENT_FLUSH_MS = 30;
+const ENDPOINT_EVENT_POLL_MS = 80;
+const LOCAL_CONTROL_EVENT_FLUSH_MS = 8;
+const RECENT_HARDWARE_EVENT_WINDOW_MS = 900;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
+const HARDWARE_RIG_VARIANT_STORAGE_KEY = "rshare.hardwareRigVariant";
+const HARDWARE_ASSET_KEYBOARD_STORAGE_KEY = "rshare.hardwareAsset.keyboard";
+const HARDWARE_ASSET_MOUSE_STORAGE_KEY = "rshare.hardwareAsset.mouse";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
@@ -440,11 +460,24 @@ function getInvoke(): TauriInvoke | null {
     __TAURI__?: {
       core?: {
         invoke?: TauriInvoke;
+        convertFileSrc?: (filePath: string, protocol?: string) => string;
       };
     };
   };
 
   return tauriWindow.__TAURI__?.core?.invoke ?? null;
+}
+
+function getConvertFileSrc(): ((filePath: string, protocol?: string) => string) | null {
+  const tauriWindow = window as Window & {
+    __TAURI__?: {
+      core?: {
+        convertFileSrc?: (filePath: string, protocol?: string) => string;
+      };
+    };
+  };
+
+  return tauriWindow.__TAURI__?.core?.convertFileSrc ?? null;
 }
 
 async function listenTauriEvent<T>(
@@ -860,6 +893,14 @@ async function invokeNetworkCommand<T = unknown>(
 async function listenLocalControlEvent(
   handler: (payload: unknown) => void,
 ): Promise<LocalControlSubscription | null> {
+  const unlisten = await listenTauriEvent<unknown>("local-control-event", handler);
+  if (unlisten) {
+    return {
+      stop: unlisten,
+      usesTauriBridge: true,
+    };
+  }
+
   if (typeof WebSocket !== "undefined") {
     const socket = new WebSocket(LOCAL_CONTROLS_WS_URL);
     socket.addEventListener("message", (event) => {
@@ -884,16 +925,7 @@ async function listenLocalControlEvent(
       usesTauriBridge: false,
     };
   }
-
-  const unlisten = await listenTauriEvent<unknown>("local-control-event", handler);
-  if (!unlisten) {
-    return null;
-  }
-
-  return {
-    stop: unlisten,
-    usesTauriBridge: true,
-  };
+  return null;
 }
 
 async function listenEndpointEvent(
@@ -1522,6 +1554,15 @@ export default function App() {
   const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
     loadHiddenMonitorIds,
   );
+  const [hardwareAssetCatalog, setHardwareAssetCatalog] =
+    useState<HardwareAssetCatalogState>({
+      assets: [],
+      installed: [],
+      loading: true,
+      error: null,
+    });
+  const [selectedHardwareAssetIds, setSelectedHardwareAssetIds] =
+    useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
 
   const model = buildDesktopViewModel(payload);
@@ -1563,14 +1604,75 @@ export default function App() {
     }
   }
 
+  async function refreshHardwareAssets() {
+    setHardwareAssetCatalog((current) => ({ ...current, loading: true, error: null }));
+    try {
+      const builtinAssets = await loadBuiltinHardwareRigAssets();
+      const installedResult = await loadInstalledHardwareRigAssets();
+      setHardwareAssetCatalog({
+        assets: [...builtinAssets, ...installedResult.assets],
+        installed: installedResult.installed,
+        loading: false,
+        error: installedResult.error,
+      });
+    } catch (assetError) {
+      setHardwareAssetCatalog((current) => ({
+        ...current,
+        loading: false,
+        error: String(assetError),
+      }));
+    }
+  }
+
   async function refreshAll() {
-    await Promise.allSettled([refreshDashboard(), refreshLocalControls()]);
+    await Promise.allSettled([
+      refreshDashboard(),
+      refreshLocalControls(),
+      refreshHardwareAssets(),
+    ]);
     setRefreshTick((value) => value + 1);
   }
+
+  function setSelectedHardwareAssetId(kind: HardwareRigKind, assetId: string) {
+    setSelectedHardwareAssetIds((current) => ({
+      ...current,
+      [kind]: assetId,
+    }));
+  }
+
+  async function importHardwareAssetFile(file: File) {
+    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+    await invokeCommand<InstalledHardwareAsset>("import_hardware_asset", { bytes });
+    await refreshHardwareAssets();
+  }
+
+  async function exportHardwareAssetFile(assetId: string) {
+    const bytes = await invokeCommand<number[]>("export_hardware_asset", { assetId });
+    const asset =
+      hardwareAssetCatalog.assets.find((item) => item.id === assetId) ??
+      hardwareAssetCatalog.installed.find((item) => item.id === assetId);
+    downloadHardwareAssetPackage(
+      new Uint8Array(bytes),
+      `${safeDownloadName(asset?.name ?? assetId)}.rshare-asset.zip`,
+    );
+  }
+
+  const hardwareAssetContext: HardwareAssetContextValue = {
+    assets: hardwareAssetCatalog.assets,
+    installed: hardwareAssetCatalog.installed,
+    selectedIds: selectedHardwareAssetIds,
+    loading: hardwareAssetCatalog.loading,
+    error: hardwareAssetCatalog.error,
+    setSelectedId: setSelectedHardwareAssetId,
+    refresh: refreshHardwareAssets,
+    importFile: importHardwareAssetFile,
+    exportAsset: exportHardwareAssetFile,
+  };
 
   useEffect(() => {
     refreshDashboard();
     refreshLocalControls();
+    refreshHardwareAssets();
     const timer = window.setInterval(() => {
       refreshDashboard();
       refreshLocalControls();
@@ -1579,6 +1681,20 @@ export default function App() {
 
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(
+      HARDWARE_ASSET_KEYBOARD_STORAGE_KEY,
+      selectedHardwareAssetIds.keyboard,
+    );
+    window.localStorage.setItem(
+      HARDWARE_ASSET_MOUSE_STORAGE_KEY,
+      selectedHardwareAssetIds.mouse,
+    );
+  }, [selectedHardwareAssetIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1968,13 +2084,14 @@ export default function App() {
   }
 
   return (
-    <div
-      className="flex h-full min-h-0 flex-col overflow-hidden"
-      style={{
-        background: theme.frame,
-        color: theme.text,
-      }}
-    >
+    <HardwareAssetContext.Provider value={hardwareAssetContext}>
+      <div
+        className="flex h-full min-h-0 flex-col overflow-hidden"
+        style={{
+          background: theme.frame,
+          color: theme.text,
+        }}
+      >
       <header
         className="flex shrink-0 items-center"
         style={{
@@ -2223,7 +2340,8 @@ export default function App() {
           </div>
         </footer>
       </main>
-    </div>
+      </div>
+    </HardwareAssetContext.Provider>
   );
 }
 
@@ -2540,13 +2658,19 @@ function DevicesPageWithLocalControls({
   busy: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  const [selectedPage, setSelectedPage] = useState<LocalDevicePageKind>("all");
+  const [selectedPage, setSelectedPage] = useState<LocalDevicePageKind>("overview");
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<Record<string, string>>({});
   const [selectedMonitorDeviceId, setSelectedMonitorDeviceId] = useState("local");
   const [expandedDeviceKinds, setExpandedDeviceKinds] = useState<Record<string, boolean>>({});
   const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
   const [expandedRemoteDevices, setExpandedRemoteDevices] = useState<Record<string, boolean>>({});
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
+  const { selectedIds, setSelectedId } = useHardwareAssetCatalog();
+  const hardwareRigVariant = hardwareRigVariantForManifest(selectedIds.keyboard);
+  const setHardwareRigVariant = (variant: HardwareRigVariant) => {
+    setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
+    setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2581,6 +2705,7 @@ function DevicesPageWithLocalControls({
       cancelled = true;
     };
   }, []);
+
   const audioOutputs =
     localControls?.audio_outputs?.length ? localControls.audio_outputs : browserAudioOutputs;
   const audioInputs = localControls?.audio_inputs ?? [];
@@ -2624,7 +2749,7 @@ function DevicesPageWithLocalControls({
   }, [safeDevices, selectedMonitorDeviceId]);
 
   const selectedDeviceId =
-    selectedPage === "all" || selectedPage === "remote"
+    selectedPage === "overview" || selectedPage === "remote"
       ? undefined
       : selectedDeviceIds[selectedPage];
   const setSelectedDeviceId = (kind: LocalControlKind, deviceId: string) => {
@@ -2634,7 +2759,6 @@ function DevicesPageWithLocalControls({
     }));
   };
   const counts = {
-    all: Boolean(monitorSnapshot),
     keyboard: localInputDeviceCount(monitorSnapshot, "keyboard"),
     mouse: localInputDeviceCount(monitorSnapshot, "mouse"),
     gamepad: Math.max(1, monitorSnapshot?.gamepads?.length ?? 0),
@@ -2644,10 +2768,10 @@ function DevicesPageWithLocalControls({
   };
   const deviceTypeTabs = buildDeviceTypeSummaries(counts);
   const controlTreeTabs = deviceTypeTabs.filter(
-    (tab) => tab.kind !== "all" && tab.kind !== "remote",
+    (tab) => tab.kind !== "remote",
   );
   const tabIcons: Record<LocalDevicePageKind, ReactNode> = {
-    all: <LayoutGrid size={16} />,
+    overview: <LayoutGrid size={16} />,
     keyboard: <Keyboard size={16} />,
     mouse: <MousePointer2 size={16} />,
     gamepad: <Gamepad2 size={16} />,
@@ -2656,7 +2780,7 @@ function DevicesPageWithLocalControls({
     remote: <Monitor size={16} />,
   };
   const tabLive: Record<LocalDevicePageKind, boolean> = {
-    all: counts.all,
+    overview: Boolean(monitorSnapshot),
     keyboard: Boolean(localControls?.keyboard.detected),
     mouse: Boolean(localControls?.mouse.detected),
     gamepad: Boolean(localControls?.gamepads?.some((item) => item.connected)),
@@ -2678,12 +2802,12 @@ function DevicesPageWithLocalControls({
   };
   const selectLocalRoot = () => {
     setSelectedMonitorDeviceId("local");
-    setSelectedPage("all");
+    setSelectedPage("overview");
   };
   const selectLocalKind = (kind: LocalDevicePageKind) => {
     setSelectedMonitorDeviceId("local");
     setSelectedPage(kind);
-    if (kind !== "all" && kind !== "remote") {
+    if (kind !== "remote") {
       const aggregate = localDeviceItems(monitorSnapshot, kind as LocalControlKind, audioOutputs)[0];
       if (aggregate) {
         setSelectedDeviceId(kind as LocalControlKind, aggregate.id);
@@ -2693,7 +2817,7 @@ function DevicesPageWithLocalControls({
   const selectRemoteKind = (deviceId: string, kind: LocalDevicePageKind) => {
     handleMonitorDeviceChange(deviceId);
     setSelectedPage(kind);
-    if (kind !== "all" && kind !== "remote") {
+    if (kind !== "remote") {
       const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, deviceId);
       const aggregate = localDeviceItems(remoteSnapshot, kind as LocalControlKind, [])[0];
       if (aggregate) {
@@ -2757,6 +2881,33 @@ function DevicesPageWithLocalControls({
                 ))}
               </div>
             ) : null}
+            <div className="mt-3">
+              <div className="mb-1 text-[11px]" style={{ color: theme.textMuted }}>
+                硬件贴图
+              </div>
+              <div className="grid grid-cols-2 gap-1 rounded-md p-1" style={{ background: "rgba(255,255,255,0.04)" }}>
+                {(["office", "gaming"] as HardwareRigVariant[]).map((variant) => {
+                  const active =
+                    selectedIds.keyboard === builtinHardwareAssetId("keyboard", variant) &&
+                    selectedIds.mouse === builtinHardwareAssetId("mouse", variant);
+                  return (
+                    <button
+                      key={variant}
+                      type="button"
+                      className="rounded px-2 py-1 text-xs transition"
+                      style={{
+                        border: `1px solid ${active ? theme.accent : "transparent"}`,
+                        background: active ? theme.accentSoft : "transparent",
+                        color: active ? theme.text : theme.textMuted,
+                      }}
+                      onClick={() => setHardwareRigVariant(variant)}
+                    >
+                      {HARDWARE_RIG_VARIANT_LABELS[variant]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
 
           <div className="flex flex-col gap-1">
@@ -2774,7 +2925,7 @@ function DevicesPageWithLocalControls({
                 {localTreeExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               </button>
               <DeviceTreeNodeButton
-                active={selectedMonitorDeviceId === "local" && selectedPage === "all"}
+                active={selectedMonitorDeviceId === "local" && selectedPage === "overview"}
                 icon={<Monitor size={16} />}
                 title={localDevice.name}
                 detail={localDevice.hostname || "本机"}
@@ -2865,7 +3016,7 @@ function DevicesPageWithLocalControls({
             const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, device.id);
             const remoteCounts = deviceTreeCounts(remoteSnapshot, []);
             const remoteTabs = buildDeviceTypeSummaries(remoteCounts).filter(
-              (tab) => tab.kind !== "all" && tab.kind !== "remote",
+              (tab) => tab.kind !== "remote",
             );
             return (
               <div key={device.id} className="flex flex-col gap-1">
@@ -2883,14 +3034,14 @@ function DevicesPageWithLocalControls({
                     {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                   </button>
                   <DeviceTreeNodeButton
-                    active={selectedMonitorDeviceId === device.id && selectedPage === "all"}
+                    active={selectedMonitorDeviceId === device.id && selectedPage === "overview"}
                     icon={<Monitor size={16} />}
                     title={device.name}
                     detail={device.hostname || (device.connected ? "已连接" : "已发现")}
                     live={device.connected}
                     onClick={() => {
                       handleMonitorDeviceChange(device.id);
-                      setSelectedPage("all");
+                      setSelectedPage("overview");
                     }}
                     theme={theme}
                   />
@@ -2936,12 +3087,13 @@ function DevicesPageWithLocalControls({
           />
         ) : null}
         <div className="min-h-0 flex-1 overflow-hidden">
-          {selectedPage === "all" ? (
+          {selectedPage === "overview" ? (
             <AllDevicesOverview
               snapshot={monitorSnapshot}
-              audioOutputs={audioOutputs}
-              remoteDevices={safeDevices}
+              audioOutputs={selectedRemoteDevice ? [] : audioOutputs}
+              remoteDevices={selectedRemoteDevice ? [] : safeDevices}
               error={monitorError}
+              hardwareRigVariant={hardwareRigVariant}
               theme={theme}
             />
           ) : (
@@ -2950,19 +3102,22 @@ function DevicesPageWithLocalControls({
               error={monitorError}
               inputTestResult={localInputTestResult}
               confirmingInputTest={confirmingInputTest}
-              selectedKind={selectedPage}
+              selectedKind={selectedPage === "remote" ? "keyboard" : selectedPage}
               remoteDevice={selectedRemoteDevice}
               selectedDeviceId={selectedDeviceId}
               audioOutputs={selectedRemoteDevice ? [] : audioOutputs}
-              onSelectedKindChange={setSelectedPage}
+              onSelectedKindChange={(kind) => setSelectedPage(kind)}
               onSelectedDeviceIdChange={(deviceId) =>
-                setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
+                selectedPage !== "remote"
+                  ? setSelectedDeviceId(selectedPage as LocalControlKind, deviceId)
+                  : undefined
               }
               onRunInputTest={
                 selectedRemoteDevice
                   ? (kind) => onRunRemoteEndpointInputTest(selectedRemoteDevice.id, kind)
                   : onRunLocalInputTest
               }
+              hardwareRigVariant={hardwareRigVariant}
               theme={theme}
             />
           )}
@@ -3217,6 +3372,7 @@ function AllDevicesOverview({
   audioOutputs,
   remoteDevices,
   error,
+  hardwareRigVariant,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
@@ -3231,6 +3387,7 @@ function AllDevicesOverview({
     lastSeenLabel: string;
   }>;
   error: string | null;
+  hardwareRigVariant: HardwareRigVariant;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const galleryItems = buildDeviceGalleryItems(snapshot, audioOutputs, remoteDevices);
@@ -3423,6 +3580,7 @@ function AllDevicesOverview({
                 item={item}
                 dragging={draggingNode?.id === item.id}
                 onMouseDown={(event) => beginNodeDrag(event, item)}
+                hardwareRigVariant={hardwareRigVariant}
                 theme={theme}
               />
             ))
@@ -3460,12 +3618,15 @@ function DeviceGalleryNode({
   item,
   dragging,
   onMouseDown,
+  hardwareRigVariant,
   theme,
 }: {
   item: {
     id: string;
     kind: string;
     shape?: string;
+    rigKind?: string | null;
+    rigVariant?: string | null;
     title: string;
     detail: string;
     metric: string;
@@ -3478,6 +3639,7 @@ function DeviceGalleryNode({
   };
   dragging: boolean;
   onMouseDown: (event: React.MouseEvent) => void;
+  hardwareRigVariant: HardwareRigVariant;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const accent =
@@ -3503,19 +3665,848 @@ function DeviceGalleryNode({
       }}
       title={`${item.title} · ${item.detail}`}
     >
-      <PhysicalDeviceShape item={item} accent={accent} theme={theme} />
+      <PhysicalDeviceShape
+        item={item}
+        accent={accent}
+        hardwareRigVariant={hardwareRigVariant}
+        theme={theme}
+      />
     </article>
+  );
+}
+
+type HardwareRigKind = "keyboard" | "mouse";
+type HardwareRigVariant = "office" | "gaming";
+
+type HardwareRigLayerRole =
+  | "base"
+  | "keycaps"
+  | "legendGlow"
+  | "pressEffect"
+  | "buttonPressEffect"
+  | "wheelPulse";
+
+type HardwareRigLayerDefinition = {
+  id: string;
+  role: string;
+  render: "image" | "runtime";
+  src?: string | null;
+  opacity?: number;
+};
+
+type HardwareRigRegion = {
+  id: string;
+  label: string;
+  action?: {
+    kind?: string;
+    codes?: string[];
+    buttons?: string[];
+  };
+  shape: {
+    kind: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    radius?: number;
+  };
+};
+
+type HardwareRigDefinition = {
+  kind: HardwareRigKind;
+  manifest: string;
+  id?: string;
+  name?: string;
+  source?: "builtin" | "installed";
+  readonly?: boolean;
+  manifestPath?: string;
+  folderPath?: string;
+  baseSize: {
+    width: number;
+    height: number;
+  };
+  display: {
+    compactWidth: number;
+    compactHeight: number;
+    fullWidth: number;
+    fullHeight: number;
+  };
+  layers: HardwareRigLayerDefinition[];
+  regions?: HardwareRigRegion[];
+};
+
+type HardwareRigActivity = {
+  pressedKeys?: string[];
+  lastKey?: string | null;
+  keyboardEvents?: LocalControlEvent[];
+  leftDown?: boolean;
+  rightDown?: boolean;
+  middleDown?: boolean;
+  backDown?: boolean;
+  forwardDown?: boolean;
+  wheelActive?: boolean;
+  wheelLabel?: string;
+  recentButtons?: string[];
+};
+
+type InstalledHardwareAsset = {
+  id: string;
+  name: string;
+  kind: HardwareRigKind | "gamepad";
+  manifestPath: string;
+  folderPath: string;
+  manifest?: Record<string, unknown>;
+};
+
+type HardwareAssetCatalogState = {
+  assets: HardwareRigDefinition[];
+  installed: InstalledHardwareAsset[];
+  loading: boolean;
+  error: string | null;
+};
+
+type HardwareAssetContextValue = HardwareAssetCatalogState & {
+  selectedIds: Record<HardwareRigKind, string>;
+  setSelectedId: (kind: HardwareRigKind, assetId: string) => void;
+  refresh: () => Promise<void>;
+  importFile: (file: File) => Promise<void>;
+  exportAsset: (assetId: string) => Promise<void>;
+};
+
+const DEFAULT_HARDWARE_ASSET_CONTEXT: HardwareAssetContextValue = {
+  assets: [],
+  installed: [],
+  loading: false,
+  error: null,
+  selectedIds: {
+    keyboard: "builtin.keyboard.office",
+    mouse: "builtin.mouse.office",
+  },
+  setSelectedId: () => undefined,
+  refresh: async () => undefined,
+  importFile: async () => undefined,
+  exportAsset: async () => undefined,
+};
+
+const HardwareAssetContext = createContext<HardwareAssetContextValue>(
+  DEFAULT_HARDWARE_ASSET_CONTEXT,
+);
+
+function useHardwareAssetCatalog() {
+  return useContext(HardwareAssetContext);
+}
+
+const HARDWARE_RIG_VARIANT_LABELS: Record<HardwareRigVariant, string> = {
+  office: "办公",
+  gaming: "游戏",
+};
+
+const HARDWARE_RIGS: Record<HardwareRigKind, Record<HardwareRigVariant, HardwareRigDefinition>> = {
+  keyboard: {
+    office: {
+    kind: "keyboard",
+    manifest: "/assets/hardware/live2d/keyboard/manifest.json",
+    baseSize: {
+      width: 1694,
+      height: 544,
+    },
+    display: {
+      compactWidth: 420,
+      compactHeight: 150,
+      fullWidth: 980,
+      fullHeight: 300,
+    },
+    layers: [
+      {
+        id: "keyboard-base",
+        role: "base",
+        render: "image",
+        src: "/assets/hardware/live2d/keyboard/base.png",
+      },
+      {
+        id: "keyboard-keycap-hotspots",
+        role: "keycaps",
+        render: "runtime",
+      },
+      {
+        id: "keyboard-legend-glow",
+        role: "legendGlow",
+        render: "runtime",
+      },
+      {
+        id: "keyboard-press-effect",
+        role: "pressEffect",
+        render: "runtime",
+      },
+    ],
+    },
+    gaming: {
+      kind: "keyboard",
+      manifest: "/assets/hardware/live2d/keyboard/gaming/manifest.json",
+      baseSize: {
+        width: 1650,
+        height: 547,
+      },
+      display: {
+        compactWidth: 420,
+        compactHeight: 150,
+        fullWidth: 980,
+        fullHeight: 300,
+      },
+      layers: [
+        {
+          id: "keyboard-gaming-base",
+          role: "base",
+          render: "image",
+          src: "/assets/hardware/live2d/keyboard/gaming/base.png",
+        },
+        {
+          id: "keyboard-gaming-keycap-hotspots",
+          role: "keycaps",
+          render: "runtime",
+        },
+        {
+          id: "keyboard-gaming-legend-glow",
+          role: "legendGlow",
+          render: "runtime",
+        },
+        {
+          id: "keyboard-gaming-press-effect",
+          role: "pressEffect",
+          render: "runtime",
+        },
+      ],
+    },
+  },
+  mouse: {
+    office: {
+    kind: "mouse",
+    manifest: "/assets/hardware/live2d/mouse/manifest.json",
+    baseSize: {
+      width: 575,
+      height: 1109,
+    },
+    display: {
+      compactWidth: 145,
+      compactHeight: 245,
+      fullWidth: 260,
+      fullHeight: 420,
+    },
+    layers: [
+      {
+        id: "mouse-base",
+        role: "base",
+        render: "image",
+        src: "/assets/hardware/live2d/mouse/base.png",
+      },
+      {
+        id: "mouse-button-press-effect",
+        role: "buttonPressEffect",
+        render: "runtime",
+      },
+      {
+        id: "mouse-wheel-pulse",
+        role: "wheelPulse",
+        render: "runtime",
+      },
+    ],
+    },
+    gaming: {
+      kind: "mouse",
+      manifest: "/assets/hardware/live2d/mouse/gaming/manifest.json",
+      baseSize: {
+        width: 652,
+        height: 1154,
+      },
+      display: {
+        compactWidth: 145,
+        compactHeight: 245,
+        fullWidth: 260,
+        fullHeight: 420,
+      },
+      layers: [
+        {
+          id: "mouse-gaming-base",
+          role: "base",
+          render: "image",
+          src: "/assets/hardware/live2d/mouse/gaming/base.png",
+        },
+        {
+          id: "mouse-gaming-button-press-effect",
+          role: "buttonPressEffect",
+          render: "runtime",
+        },
+        {
+          id: "mouse-gaming-wheel-pulse",
+          role: "wheelPulse",
+          render: "runtime",
+        },
+      ],
+    },
+  },
+};
+
+const MOUSE_RIG_HOTSPOTS: Record<HardwareRigVariant, Array<{
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+}>> = {
+  office: [
+  { id: "left", label: "L", x: 0.20, y: 0.07, w: 0.30, h: 0.40, radius: 38 },
+  { id: "right", label: "R", x: 0.51, y: 0.07, w: 0.30, h: 0.40, radius: 38 },
+  { id: "middle", label: "W", x: 0.43, y: 0.04, w: 0.15, h: 0.28, radius: 22 },
+  { id: "back", label: "Back", x: 0.02, y: 0.35, w: 0.09, h: 0.15, radius: 12 },
+  { id: "forward", label: "Fwd", x: 0.02, y: 0.53, w: 0.09, h: 0.15, radius: 12 },
+  ],
+  gaming: [
+    { id: "left", label: "L", x: 0.21, y: 0.05, w: 0.29, h: 0.38, radius: 38 },
+    { id: "right", label: "R", x: 0.51, y: 0.05, w: 0.29, h: 0.38, radius: 38 },
+    { id: "middle", label: "W", x: 0.43, y: 0.03, w: 0.15, h: 0.24, radius: 22 },
+    { id: "back", label: "Back", x: 0.02, y: 0.31, w: 0.10, h: 0.13, radius: 12 },
+    { id: "forward", label: "Fwd", x: 0.02, y: 0.47, w: 0.10, h: 0.13, radius: 12 },
+  ],
+};
+
+function builtinHardwareAssetId(kind: HardwareRigKind, variant: HardwareRigVariant) {
+  return `builtin.${kind}.${variant}`;
+}
+
+function hardwareAssetStorageKey(kind: HardwareRigKind) {
+  return kind === "keyboard"
+    ? HARDWARE_ASSET_KEYBOARD_STORAGE_KEY
+    : HARDWARE_ASSET_MOUSE_STORAGE_KEY;
+}
+
+function loadSelectedHardwareAssetIds(): Record<HardwareRigKind, string> {
+  if (typeof window === "undefined") {
+    return {
+      keyboard: builtinHardwareAssetId("keyboard", "office"),
+      mouse: builtinHardwareAssetId("mouse", "office"),
+    };
+  }
+
+  const legacyVariant = normalizeHardwareRigVariant(
+    window.localStorage.getItem(HARDWARE_RIG_VARIANT_STORAGE_KEY),
+  );
+  return {
+    keyboard:
+      window.localStorage.getItem(HARDWARE_ASSET_KEYBOARD_STORAGE_KEY) ??
+      builtinHardwareAssetId("keyboard", legacyVariant),
+    mouse:
+      window.localStorage.getItem(HARDWARE_ASSET_MOUSE_STORAGE_KEY) ??
+      builtinHardwareAssetId("mouse", legacyVariant),
+  };
+}
+
+async function loadBuiltinHardwareRigAssets(): Promise<HardwareRigDefinition[]> {
+  const assets = await Promise.all(
+    BUILTIN_HARDWARE_ASSET_MANIFESTS.map(async (manifestUrl) => {
+      const response = await fetch(manifestUrl);
+      if (!response.ok) {
+        throw new Error(`内置硬件资产读取失败：${manifestUrl}`);
+      }
+      const raw = await response.json();
+      const baseUrl = manifestUrl.slice(0, manifestUrl.lastIndexOf("/") + 1);
+      return hardwareRigFromManifest(raw, {
+        manifestUrl,
+        baseUrl,
+        source: "builtin",
+        readonly: true,
+      });
+    }),
+  );
+  return assets.filter(isHardwareRigDefinition);
+}
+
+async function loadInstalledHardwareRigAssets(): Promise<{
+  installed: InstalledHardwareAsset[];
+  assets: HardwareRigDefinition[];
+  error: string | null;
+}> {
+  try {
+    const installed =
+      await invokeCommand<InstalledHardwareAsset[]>("list_hardware_assets");
+    const assets = installed
+      .map((asset) =>
+        asset.manifest
+          ? hardwareRigFromManifest(asset.manifest, {
+              manifestUrl: asset.manifestPath,
+              source: "installed",
+              readonly: false,
+              manifestPath: asset.manifestPath,
+              folderPath: asset.folderPath,
+              resolveUrl: (src) =>
+                convertHardwareAssetFileSrc(
+                  joinHardwareAssetPath(asset.folderPath, src),
+                ),
+            })
+          : null,
+      )
+      .filter(isHardwareRigDefinition);
+    return { installed, assets, error: null };
+  } catch (error) {
+    const message = String(error);
+    if (message.includes("需要 Tauri bridge")) {
+      return { installed: [], assets: [], error: null };
+    }
+    return { installed: [], assets: [], error: message };
+  }
+}
+
+function hardwareRigFromManifest(
+  raw: Record<string, unknown>,
+  options: {
+    manifestUrl: string;
+    baseUrl?: string;
+    source: "builtin" | "installed";
+    readonly: boolean;
+    manifestPath?: string;
+    folderPath?: string;
+    resolveUrl?: (src: string) => string;
+  },
+): HardwareRigDefinition | null {
+  const manifest = normalizeHardwareAssetManifest(raw, {
+    baseUrl: options.baseUrl ?? "",
+    resolveUrl: options.resolveUrl,
+  });
+  if (manifest.kind !== "keyboard" && manifest.kind !== "mouse") {
+    return null;
+  }
+
+  const kind = manifest.kind as HardwareRigKind;
+  const fallback = HARDWARE_RIGS[kind][hardwareRigVariantForManifest(manifest.id)];
+  return {
+    ...fallback,
+    kind,
+    manifest: options.manifestUrl,
+    id: manifest.id,
+    name: manifest.name,
+    source: options.source,
+    readonly: options.readonly,
+    manifestPath: options.manifestPath,
+    folderPath: options.folderPath,
+    baseSize: manifest.baseSize,
+    layers: manifest.layers,
+    regions: manifest.regions,
+  };
+}
+
+function hardwareRigVariantForManifest(assetId: string): HardwareRigVariant {
+  return assetId.endsWith(".gaming") || assetId.includes(".gaming.")
+    ? "gaming"
+    : "office";
+}
+
+function isHardwareRigDefinition(
+  value: HardwareRigDefinition | null,
+): value is HardwareRigDefinition {
+  return Boolean(value);
+}
+
+function convertHardwareAssetFileSrc(filePath: string) {
+  const convert = typeof window === "undefined" ? null : getConvertFileSrc();
+  return convert ? convert(filePath) : filePath;
+}
+
+function joinHardwareAssetPath(folderPath: string, relativePath: string) {
+  const separator = folderPath.includes("\\") ? "\\" : "/";
+  const folder = folderPath.replace(/[\\/]+$/, "");
+  const relative = relativePath.replace(/[\\/]+/g, separator);
+  return `${folder}${separator}${relative}`;
+}
+
+function downloadHardwareAssetPackage(bytes: Uint8Array, fileName: string) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const blob = new Blob([bytes], { type: "application/zip" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function safeDownloadName(value: string) {
+  const name = value.trim().replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "");
+  return name || "hardware-asset";
+}
+
+function HardwareRigView({
+  kind,
+  variant = "office",
+  activity,
+  accent,
+  theme,
+  compact = false,
+}: {
+  kind: HardwareRigKind;
+  variant?: HardwareRigVariant;
+  activity: HardwareRigActivity;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
+}) {
+  const { assets, selectedIds } = useHardwareAssetCatalog();
+  const rigVariant = normalizeHardwareRigVariant(variant);
+  const fallbackRig = HARDWARE_RIGS[kind][rigVariant];
+  const selectedRig = resolveSelectedHardwareAsset(
+    assets,
+    kind,
+    selectedIds[kind],
+  ) as HardwareRigDefinition | null;
+  const [manifestRig, setManifestRig] = useState<HardwareRigDefinition | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setManifestRig(null);
+
+    fetch(fallbackRig.manifest)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((raw) => {
+        if (cancelled || !raw) {
+          return;
+        }
+        const baseUrl = fallbackRig.manifest.slice(
+          0,
+          fallbackRig.manifest.lastIndexOf("/") + 1,
+        );
+        const manifest = normalizeHardwareAssetManifest(raw, baseUrl);
+        setManifestRig({
+          ...fallbackRig,
+          id: manifest.id,
+          name: manifest.name,
+          kind: manifest.kind,
+          baseSize: manifest.baseSize,
+          layers: manifest.layers,
+          regions: manifest.regions,
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setManifestRig(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fallbackRig, kind]);
+
+  const rig = selectedRig ?? manifestRig ?? fallbackRig;
+  const width = compact ? rig.display.compactWidth : rig.display.fullWidth;
+  const maxHeight = compact ? rig.display.compactHeight : rig.display.fullHeight;
+  const imageLayers = rig.layers.filter((layer) => layer.render === "image" && layer.src);
+  return (
+    <div
+      className="relative mx-auto overflow-hidden"
+      style={{
+        width: "100%",
+        maxWidth: width,
+        maxHeight,
+        aspectRatio: `${rig.baseSize.width} / ${rig.baseSize.height}`,
+        filter: `drop-shadow(0 14px 22px rgba(0,0,0,0.24))`,
+      }}
+      role="img"
+      aria-label={`${rig.name ?? kind} hardware rig`}
+      data-rig-kind={kind}
+      data-rig-variant={rigVariant}
+      data-rig-asset={rig.id ?? ""}
+      data-rig-manifest={rig.manifest}
+    >
+      {imageLayers.map((layer) => (
+        <img
+          key={layer.id}
+          className="absolute inset-0 h-full w-full object-contain"
+          src={layer.src}
+          alt=""
+          draggable={false}
+          style={{
+            opacity: layer.opacity ?? 1,
+          }}
+        />
+      ))}
+      {rig.regions?.length ? (
+        <HardwareRigRegionOverlays
+          asset={rig}
+          activity={activity}
+          accent={accent}
+          theme={theme}
+          compact={compact}
+        />
+      ) : kind === "keyboard" ? (
+        <KeyboardRigHotspots
+          activity={activity}
+          variant={rigVariant}
+          accent={accent}
+          theme={theme}
+          compact={compact}
+        />
+      ) : (
+        <MouseRigHotspots
+          activity={activity}
+          variant={rigVariant}
+          accent={accent}
+          theme={theme}
+          compact={compact}
+        />
+      )}
+    </div>
+  );
+}
+
+function HardwareHotspotOverlay({
+  x,
+  y,
+  w,
+  h,
+  radius,
+  active,
+  tested = false,
+  label,
+  accent,
+  theme,
+  compact = false,
+}: {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+  active: boolean;
+  tested?: boolean;
+  label?: string;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
+}) {
+  if (!active && !tested) {
+    return null;
+  }
+  return (
+    <span
+      className={`pointer-events-none absolute flex items-center justify-center text-[10px] font-semibold transition-all duration-75 ${
+        active ? "hardware-press-flash" : tested ? "hardware-legend-glow" : ""
+      }`}
+      style={{
+        left: `${x * 100}%`,
+        top: `${y * 100}%`,
+        width: `${w * 100}%`,
+        height: `${h * 100}%`,
+        borderRadius: radius,
+        background: active
+          ? `radial-gradient(circle at 50% 30%, rgba(255,255,255,0.64), ${accent}cc 34%, ${accent}66 72%, transparent 100%)`
+          : `radial-gradient(circle at 50% 45%, ${accent}4d, ${accent}20 64%, transparent 100%)`,
+        border: `1px solid ${active ? accent : `${accent}77`}`,
+        color: active ? "#ffffff" : theme.accent,
+        boxShadow: active
+          ? `0 0 28px ${accent}cc, 0 0 48px ${accent}55, inset 0 -5px 0 rgba(0,0,0,0.22)`
+          : `0 0 10px ${accent}33`,
+        transform: active ? "translateY(2px) scale(0.98)" : "translateY(0)",
+        textShadow: active ? "0 0 8px rgba(255,255,255,0.65)" : "none",
+        mixBlendMode: active ? "screen" : "plus-lighter",
+        fontSize: compact ? 8 : 10,
+        backdropFilter: active ? "saturate(1.6)" : undefined,
+      }}
+    >
+      {label ? (
+        <span
+          className={active ? "hardware-legend-glow" : undefined}
+          style={{ color: "inherit" }}
+        >
+          {label}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+function HardwareRigRegionOverlays({
+  asset,
+  activity,
+  accent,
+  theme,
+  compact,
+}: {
+  asset: HardwareRigDefinition;
+  activity: HardwareRigActivity;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact: boolean;
+}) {
+  const regions = resolveActiveHardwareRegions(asset, activity) as HardwareRigRegion[];
+
+  return (
+    <>
+      {regions.map((region) => {
+        const shape = region.shape;
+        if (shape.kind !== "rect") {
+          return null;
+        }
+        return (
+          <HardwareHotspotOverlay
+            key={region.id}
+            x={shape.x}
+            y={shape.y}
+            w={shape.w}
+            h={shape.h}
+            radius={shape.radius ?? 7}
+            active
+            label={hardwareRegionLabel(region, activity, compact)}
+            accent={accent}
+            theme={theme}
+            compact={compact}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+function hardwareRegionLabel(
+  region: HardwareRigRegion,
+  activity: HardwareRigActivity,
+  compact: boolean,
+) {
+  if (region.action?.kind === "mouse_button") {
+    const buttons = region.action.buttons ?? [];
+    if (
+      buttons.some((button) => /^(middle|wheel)$/i.test(button)) &&
+      activity.wheelLabel
+    ) {
+      return activity.wheelLabel;
+    }
+    if (region.id === "mouse.left") {
+      return "L";
+    }
+    if (region.id === "mouse.right") {
+      return "R";
+    }
+    if (region.id === "mouse.forward") {
+      return "Fwd";
+    }
+  }
+  return compact && region.action?.kind === "keyboard_key" ? undefined : region.label;
+}
+
+function KeyboardRigHotspots({
+  activity,
+  variant,
+  accent,
+  theme,
+  compact,
+}: {
+  activity: HardwareRigActivity;
+  variant: HardwareRigVariant;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact: boolean;
+}) {
+  const pressedKeys = activity.pressedKeys ?? [];
+  const keyboardEvents = activity.keyboardEvents ?? [];
+  const lastKey = activity.lastKey ?? null;
+  const baseWidth = HARDWARE_RIGS.keyboard[variant].baseSize.width;
+  const baseHeight = HARDWARE_RIGS.keyboard[variant].baseSize.height;
+  const rowYs = [30, 120, 210, 300, 390, 468];
+  const keyUnit = 65;
+  const keyGap = 10;
+  return (
+    <>
+      {KEYBOARD_ROWS.map((row, rowIndex) => {
+        let cursorX = 22;
+        return row.map((key, keyIndex) => {
+          const keyWidth = Math.max(58, (key.width ?? 1) * keyUnit);
+          const state = keyVisualState(key, pressedKeys, keyboardEvents, lastKey);
+          const active = state === "pressed";
+          const tested = state === "tested";
+          const hotspot = (
+            <HardwareHotspotOverlay
+              key={`${rowIndex}-${keyIndex}-${key.label}`}
+              x={cursorX / baseWidth}
+              y={(rowYs[rowIndex] ?? 92) / baseHeight}
+              w={keyWidth / baseWidth}
+              h={58 / baseHeight}
+              radius={7}
+              active={active}
+              tested={tested}
+              label={active || (!compact && tested) ? key.label : undefined}
+              accent={accent}
+              theme={theme}
+              compact={compact}
+            />
+          );
+          cursorX += keyWidth + keyGap;
+          return hotspot;
+        });
+      })}
+    </>
+  );
+}
+
+function MouseRigHotspots({
+  activity,
+  variant,
+  accent,
+  theme,
+  compact,
+}: {
+  activity: HardwareRigActivity;
+  variant: HardwareRigVariant;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact: boolean;
+}) {
+  const recentButtons = activity.recentButtons ?? [];
+  const buttonActive = (name: string) =>
+    Boolean(stateById[name]) || mouseButtonPressed(recentButtons, name);
+  const stateById: Record<string, boolean> = {
+    left: Boolean(activity.leftDown),
+    right: Boolean(activity.rightDown),
+    middle: Boolean(activity.middleDown || activity.wheelActive),
+    back: Boolean(activity.backDown),
+    forward: Boolean(activity.forwardDown),
+  };
+  return (
+    <>
+      {MOUSE_RIG_HOTSPOTS[variant].map((hotspot) => (
+        <HardwareHotspotOverlay
+          key={hotspot.id}
+          x={hotspot.x}
+          y={hotspot.y}
+          w={hotspot.w}
+          h={hotspot.h}
+          radius={hotspot.radius}
+          active={buttonActive(hotspot.id)}
+          tested={hotspot.id === "middle" && Boolean(activity.wheelActive)}
+          label={hotspot.id === "middle" ? activity.wheelLabel ?? hotspot.label : hotspot.label}
+          accent={accent}
+          theme={theme}
+          compact={compact}
+        />
+      ))}
+    </>
   );
 }
 
 function PhysicalDeviceShape({
   item,
   accent,
+  hardwareRigVariant,
   theme,
 }: {
   item: {
     kind: string;
     shape?: string;
+    rigKind?: string | null;
+    rigVariant?: string | null;
     title: string;
     detail: string;
     metric: string;
@@ -3523,6 +4514,7 @@ function PhysicalDeviceShape({
     activity?: Record<string, unknown>;
   };
   accent: string;
+  hardwareRigVariant: HardwareRigVariant;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const label = (
@@ -3614,16 +4606,12 @@ function PhysicalDeviceShape({
     const activity = item.activity ?? {};
     const pressedKeys = Array.isArray(activity.pressedKeys) ? activity.pressedKeys : [];
     const lastKey = typeof activity.lastKey === "string" ? activity.lastKey : null;
-    const rows = [
-      ["Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Del"],
-      ["Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-      ["Caps", "A", "S", "D", "F", "G", "H", "J", "K", "L"],
-      ["Shift", "Z", "X", "C", "V", "B", "N", "M", "Enter"],
-      ["Ctrl", "Win", "Alt", "Space", "Alt", "Fn"],
-    ];
+    const keyboardEvents = Array.isArray(activity.keyboardEvents)
+      ? (activity.keyboardEvents as LocalControlEvent[])
+      : [];
     return (
       <div
-        className="relative h-full w-full rounded-2xl border p-4 pt-12"
+        className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-2xl border p-4"
         style={{
           borderColor: item.live ? accent : theme.border,
           background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
@@ -3632,37 +4620,14 @@ function PhysicalDeviceShape({
       >
         {label}
         {liveDot}
-        <div className="grid gap-1.5">
-          {rows.map((row, rowIndex) => (
-            <div key={rowIndex} className="flex justify-center gap-1.5">
-              {row.map((key) => (
-                (() => {
-                  const active = galleryKeyboardKeyActive(key, pressedKeys, lastKey);
-                  return (
-                    <span
-                      key={`${rowIndex}-${key}`}
-                      className="flex h-5 items-center justify-center rounded text-[9px] transition"
-                      style={{
-                        width: key === "Space" ? 118 : key.length > 4 ? 52 : 34,
-                        background: active
-                          ? accent
-                          : key === "Space"
-                            ? `${accent}22`
-                            : "rgba(255,255,255,0.06)",
-                        border: `1px solid ${active ? accent : theme.border}`,
-                        color: active ? "#ffffff" : theme.textSub,
-                        boxShadow: active ? `0 0 10px ${accent}66` : "none",
-                        transform: active ? "translateY(1px)" : "translateY(0)",
-                      }}
-                    >
-                      {key}
-                    </span>
-                  );
-                })()
-              ))}
-            </div>
-          ))}
-        </div>
+        <HardwareRigView
+          kind="keyboard"
+          variant={hardwareRigVariant}
+          activity={{ pressedKeys, lastKey, keyboardEvents }}
+          accent={accent}
+          theme={theme}
+          compact
+        />
         <div
           className="absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
           style={{
@@ -3683,51 +4648,39 @@ function PhysicalDeviceShape({
   if (item.shape === "mouse") {
     const activity = item.activity ?? {};
     const pressedButtons = Array.isArray(activity.pressedButtons)
-      ? activity.pressedButtons.map((value) => normalizeGamepadButtonToken(String(value)))
+      ? activity.pressedButtons.map((value) => String(value))
       : [];
-    const leftPressed = pressedButtons.includes("left") || pressedButtons.includes("l");
-    const rightPressed = pressedButtons.includes("right") || pressedButtons.includes("r");
+    const recentButtons = Array.isArray(activity.recentButtons)
+      ? activity.recentButtons.map((value) => String(value))
+      : [];
+    const leftPressed = mouseButtonPressed(pressedButtons, "Left") || mouseButtonPressed(recentButtons, "Left");
+    const rightPressed = mouseButtonPressed(pressedButtons, "Right") || mouseButtonPressed(recentButtons, "Right");
+    const middlePressed = mouseButtonPressed(pressedButtons, "Middle") || mouseButtonPressed(recentButtons, "Middle");
+    const backPressed = mouseButtonPressed(pressedButtons, "Back") || mouseButtonPressed(recentButtons, "Back");
+    const forwardPressed = mouseButtonPressed(pressedButtons, "Forward") || mouseButtonPressed(recentButtons, "Forward");
     const wheelDeltaY = Number(activity.wheelDeltaY ?? 0);
     const wheelDeltaX = Number(activity.wheelDeltaX ?? 0);
     const pointerX = Math.round(Number(activity.x ?? 0));
     const pointerY = Math.round(Number(activity.y ?? 0));
     return (
-      <div className="relative h-full w-full">
-        <div
-          className="absolute left-1/2 top-5 h-[82%] w-[62%] -translate-x-1/2 rounded-[46%] border-2"
-          style={{
-            borderColor: item.live ? accent : theme.border,
-            background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
-            boxShadow: theme.panelShadow,
+      <div className="relative flex h-full w-full items-center justify-center overflow-hidden">
+        <HardwareRigView
+          kind="mouse"
+          variant={hardwareRigVariant}
+          activity={{
+            leftDown: leftPressed,
+            rightDown: rightPressed,
+            middleDown: middlePressed,
+            backDown: backPressed,
+            forwardDown: forwardPressed,
+            recentButtons,
+            wheelActive: wheelDeltaX !== 0 || wheelDeltaY !== 0,
+            wheelLabel: wheelDeltaY > 0 ? "↑" : wheelDeltaY < 0 ? "↓" : wheelDeltaX > 0 ? "→" : wheelDeltaX < 0 ? "←" : "W",
           }}
-        >
-          <div
-            className="absolute left-1/2 top-7 h-10 w-2 -translate-x-1/2 rounded-full"
-            style={{
-              background: wheelDeltaY ? accent : theme.border,
-              boxShadow: wheelDeltaY ? `0 0 12px ${accent}` : "none",
-            }}
-          />
-          <div className="absolute left-1/2 top-0 h-24 w-px -translate-x-1/2" style={{ background: theme.border }} />
-          <div
-            className="absolute left-3 top-8 flex h-14 w-10 items-center justify-center rounded-tl-[32px] text-[10px]"
-            style={{
-              color: leftPressed ? "#ffffff" : theme.textMuted,
-              background: leftPressed ? accent : "transparent",
-            }}
-          >
-            L
-          </div>
-          <div
-            className="absolute right-3 top-8 flex h-14 w-10 items-center justify-center rounded-tr-[32px] text-[10px]"
-            style={{
-              color: rightPressed ? "#ffffff" : theme.textMuted,
-              background: rightPressed ? accent : "transparent",
-            }}
-          >
-            R
-          </div>
-        </div>
+          accent={accent}
+          theme={theme}
+          compact
+        />
         <div className="absolute left-0 top-3">
           {label}
         </div>
@@ -4395,6 +5348,15 @@ function deviceTreeCounts(
   };
 }
 
+function firstAvailableControlKind(
+  snapshot: LocalControlsSnapshot | null,
+  audioOutputs: AudioOutputDevice[] = [],
+): LocalControlKind {
+  const counts = deviceTreeCounts(snapshot, audioOutputs);
+  const priority: LocalControlKind[] = ["keyboard", "mouse", "gamepad", "display", "audio"];
+  return priority.find((kind) => counts[kind] > 0) ?? "keyboard";
+}
+
 function localDeviceItems(
   snapshot: LocalControlsSnapshot | null,
   kind: LocalControlKind,
@@ -4947,6 +5909,7 @@ function LocalControlDriverHub({
   onSelectedKindChange,
   onSelectedDeviceIdChange,
   onRunInputTest,
+  hardwareRigVariant = "office",
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
@@ -4964,6 +5927,7 @@ function LocalControlDriverHub({
   onSelectedKindChange: (kind: LocalControlKind) => void;
   onSelectedDeviceIdChange?: (deviceId: string) => void;
   onRunInputTest: (kind: string) => void;
+  hardwareRigVariant?: HardwareRigVariant;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const selectedDevices = localDeviceItems(snapshot, selectedKind, audioOutputs);
@@ -5012,6 +5976,7 @@ function LocalControlDriverHub({
           inputTestResult={inputTestResult}
           confirmingInputTest={confirmingInputTest}
           onRunInputTest={onRunInputTest}
+          hardwareRigVariant={hardwareRigVariant}
           theme={theme}
         />
       </div>
@@ -5036,7 +6001,7 @@ function DeviceDriverStrip({
   theme: typeof FIGMA_DESKTOP_THEME;
   vertical?: boolean;
 }) {
-  if (kind === "all" || kind === "remote") {
+  if (kind === "remote") {
     return null;
   }
   const devices = localDeviceItems(snapshot, kind, audioOutputs).filter((device) => device.live);
@@ -5086,6 +6051,7 @@ function LocalControlDetail({
   inputTestResult,
   confirmingInputTest,
   onRunInputTest,
+  hardwareRigVariant,
   theme,
 }: {
   kind: LocalControlKind;
@@ -5100,6 +6066,7 @@ function LocalControlDetail({
   confirmingInputTest: string | null;
   selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
+  hardwareRigVariant: HardwareRigVariant;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const effectiveSelectedDeviceId = selectedLocalDeviceId(snapshot, kind, selectedDeviceId);
@@ -5133,7 +6100,7 @@ function LocalControlDetail({
     return (
       <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3">
         <div className="relative min-h-0">
-          <SimulatedKeyboard pressedKeys={keyboardState.pressedKeys} lastKey={keyboardState.lastKey} recentEvents={recentEvents} eventCount={keyboardState.eventCount} theme={theme} />
+          <SimulatedKeyboard pressedKeys={keyboardState.pressedKeys} lastKey={keyboardState.lastKey} recentEvents={recentEvents} eventCount={keyboardState.eventCount} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="键盘" theme={theme} />
           ) : null}
@@ -5153,7 +6120,7 @@ function LocalControlDetail({
     return (
       <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="relative min-h-0">
-          <SimulatedMouse x={mouseState.x} y={mouseState.y} pressedButtons={mouseState.pressedButtons} recentEvents={recentEvents} wheelDeltaX={mouseState.wheelDeltaX} wheelDeltaY={mouseState.wheelDeltaY} wheelTotalX={mouseState.wheelTotalX} wheelTotalY={mouseState.wheelTotalY} eventCount={mouseState.eventCount} moveCount={mouseState.moveCount} buttonPressCount={mouseState.buttonPressCount} buttonReleaseCount={mouseState.buttonReleaseCount} wheelEventCount={mouseState.wheelEventCount} displayRelativeX={mouseState.displayRelativeX} displayRelativeY={mouseState.displayRelativeY} currentDisplayIndex={mouseState.currentDisplayIndex} currentDisplayId={mouseState.currentDisplayId} displays={snapshot?.display.displays ?? []} theme={theme} />
+          <SimulatedMouse x={mouseState.x} y={mouseState.y} pressedButtons={mouseState.pressedButtons} recentEvents={recentEvents} wheelDeltaX={mouseState.wheelDeltaX} wheelDeltaY={mouseState.wheelDeltaY} wheelTotalX={mouseState.wheelTotalX} wheelTotalY={mouseState.wheelTotalY} eventCount={mouseState.eventCount} moveCount={mouseState.moveCount} buttonPressCount={mouseState.buttonPressCount} buttonReleaseCount={mouseState.buttonReleaseCount} wheelEventCount={mouseState.wheelEventCount} displayRelativeX={mouseState.displayRelativeX} displayRelativeY={mouseState.displayRelativeY} currentDisplayIndex={mouseState.currentDisplayIndex} currentDisplayId={mouseState.currentDisplayId} displays={snapshot?.display.displays ?? []} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="鼠标" theme={theme} />
           ) : null}
@@ -5555,9 +6522,6 @@ function keyboardUniqueTestedCount(events: LocalControlEvent[]) {
   ).size;
 }
 
-const KEYBOARD_CANVAS_WIDTH = 1340;
-const KEYBOARD_CANVAS_HEIGHT = 294;
-
 function SimulatedKeyboard({
   pressedKeys,
   lastKey,
@@ -5578,19 +6542,6 @@ function SimulatedKeyboard({
   const testedCount = keyboardUniqueTestedCount(keyboardEvents);
   const pressedCount = keyboardEvents.filter(eventStateIsPressed).length;
   const releasedCount = keyboardEvents.filter(eventStateIsReleased).length;
-  const [keyboardFrameRef, keyboardFrameSize] = useElementSize<HTMLDivElement>();
-  const keyboardScale = Math.min(
-    1,
-    Math.max(
-      0.2,
-      Math.min(
-        (keyboardFrameSize.width || KEYBOARD_CANVAS_WIDTH) / KEYBOARD_CANVAS_WIDTH,
-        (keyboardFrameSize.height || KEYBOARD_CANVAS_HEIGHT) / KEYBOARD_CANVAS_HEIGHT,
-      ),
-    ),
-  );
-  const scaledKeyboardWidth = KEYBOARD_CANVAS_WIDTH * keyboardScale;
-  const scaledKeyboardHeight = KEYBOARD_CANVAS_HEIGHT * keyboardScale;
   return (
     <div
       className="flex h-full min-h-0 flex-col overflow-hidden p-3"
@@ -5609,56 +6560,18 @@ function SimulatedKeyboard({
         </div>
       </div>
       )}
-      <div ref={keyboardFrameRef} className="min-h-0 flex-1 overflow-hidden">
-        <div
-          className="mx-auto"
-          style={{ width: scaledKeyboardWidth, height: scaledKeyboardHeight }}
-        >
-          <div
-            className="flex flex-col gap-1.5"
-            style={{
-              width: KEYBOARD_CANVAS_WIDTH,
-              height: KEYBOARD_CANVAS_HEIGHT,
-              transform: `scale(${keyboardScale})`,
-              transformOrigin: "top left",
-            }}
-          >
-        {KEYBOARD_ROWS.map((row, rowIndex) => (
-          <div key={rowIndex} className="flex gap-1.5">
-            {row.map((key, keyIndex) => {
-              const state = keyVisualState(key, pressedKeys, keyboardEvents, lastKey);
-              const pressed = state === "pressed";
-              const tested = state === "tested";
-              return (
-                <div
-                  key={`${rowIndex}-${keyIndex}-${key.label}`}
-                  className="flex h-11 items-center justify-start rounded-md px-2 text-sm transition"
-                  style={{
-                    flex: `${key.width ?? 1} 0 0`,
-                    minWidth: 36,
-                    border: `1px solid ${pressed ? theme.accent : tested ? "rgba(80, 140, 245, 0.45)" : theme.border}`,
-                    background: pressed
-                      ? theme.accent
-                      : tested
-                        ? "rgba(80, 140, 245, 0.18)"
-                        : "rgba(255,255,255,0.055)",
-                    color: pressed ? "#ffffff" : theme.text,
-                    boxShadow: pressed
-                      ? `inset 0 -4px 0 rgba(0,0,0,0.24), 0 0 0 1px ${theme.accent}`
-                      : tested
-                        ? "inset 0 -3px 0 rgba(80, 140, 245, 0.35)"
-                        : "inset 0 -2px 0 rgba(0,0,0,0.18)",
-                    transform: pressed ? "translateY(1px)" : "translateY(0)",
-                  }}
-                >
-                  <span className="truncate">{key.label}</span>
-                </div>
-              );
-            })}
-          </div>
-        ))}
-          </div>
-        </div>
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+        <HardwareRigView
+          kind="keyboard"
+          activity={{
+            pressedKeys,
+            lastKey,
+            keyboardEvents,
+          }}
+          accent={theme.accent}
+          theme={theme}
+          compact={compact}
+        />
       </div>
       {compact ? null : (
       <div className="mt-3 grid shrink-0 grid-cols-3 gap-2 text-xs xl:grid-cols-6">
@@ -5949,6 +6862,10 @@ function normalizeInputToken(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function normalizeHardwareRigVariant(value: string | null | undefined): HardwareRigVariant {
+  return value === "gaming" ? "gaming" : "office";
+}
+
 function mouseButtonAliases(name: string) {
   const aliases: Record<string, string[]> = {
     Left: ["left", "button0", "button1", "primary", "mouseleft"],
@@ -5981,8 +6898,18 @@ function mouseButtonEventTokens(event: LocalControlEvent) {
 
 function mouseButtonRecentlyActive(events: LocalControlEvent[], name: string) {
   const wanted = new Set(mouseButtonAliases(name).map(normalizeInputToken));
+  const latestTimestamp = events.reduce(
+    (latest, event) => Math.max(latest, Number(event.timestamp_ms ?? 0)),
+    0,
+  );
   return events
     .filter((event) => event.device_kind === "Mouse" && event.event_kind === "button")
+    .filter((event) => {
+      if (!latestTimestamp) {
+        return true;
+      }
+      return latestTimestamp - Number(event.timestamp_ms ?? 0) <= RECENT_HARDWARE_EVENT_WINDOW_MS;
+    })
     .slice(-8)
     .some((event) =>
       mouseButtonEventTokens(event).some((token) => wanted.has(normalizeInputToken(token))),
@@ -6076,52 +7003,17 @@ function SimulatedMouse({
           background: "rgba(255,255,255,0.025)",
         }}
       >
-        <svg
-          className="h-full max-h-[260px] w-full max-w-[180px]"
-          viewBox="0 0 240 230"
-          role="img"
-          aria-label="mouse input preview"
-          preserveAspectRatio="xMidYMid meet"
-        >
-          <path
-            d="M120 18 C154 18 180 52 180 104 V160 C180 193 154 214 120 214 C86 214 60 193 60 160 V104 C60 52 86 18 120 18 Z"
-            fill="rgba(255,255,255,0.05)"
-            stroke={theme.border}
-            strokeWidth="1.5"
-          />
-          <path d="M120 18 L120 100" stroke={theme.border} strokeWidth="1.5" />
-          <path
-            d="M63 101 C64 49 89 20 120 18 L120 101 Z"
-            fill={leftDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
-            stroke={leftDown ? theme.accent : theme.border}
-          />
-          <path
-            d="M120 18 C151 20 176 49 177 101 L120 101 Z"
-            fill={rightDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
-            stroke={rightDown ? theme.accent : theme.border}
-          />
-          <rect
-            x="112"
-            y="54"
-            width="15"
-            height="38"
-            rx="7.5"
-            fill={middleDown || wheelActive ? theme.accentSoft : "rgba(255,255,255,0.08)"}
-            stroke={middleDown || wheelActive ? theme.accent : theme.border}
-          />
-          {wheelActive ? (
-            <text x="119.5" y="48" textAnchor="middle" fill={theme.accent} fontSize="15" fontWeight="700">
-              {wheelLabel}
-            </text>
-          ) : null}
-          <rect x="50" y="110" width="13" height="44" rx="6.5" fill={backDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={backDown ? theme.accent : theme.border} strokeWidth={backDown ? 2 : 1.2} />
-          <rect x="47" y="160" width="13" height="44" rx="6.5" fill={forwardDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={forwardDown ? theme.accent : theme.border} strokeWidth={forwardDown ? 2 : 1.2} />
-          <text x="91" y="72" fill={leftDown ? theme.accent : theme.textMuted} fontSize="12">L</text>
-          <text x="145" y="72" fill={rightDown ? theme.accent : theme.textMuted} fontSize="12">R</text>
-          <text x="119.5" y="78" textAnchor="middle" fill={middleDown || wheelActive ? theme.accent : theme.textMuted} fontSize="10" fontWeight={middleDown || wheelActive ? 700 : 400}>{wheelLabel}</text>
-          <text x="20" y="137" fill={backDown ? theme.accent : theme.textMuted} fontSize="11">Back</text>
-          <text x="26" y="188" fill={forwardDown ? theme.accent : theme.textMuted} fontSize="11">Fwd</text>
-        </svg>
+        <MouseHardwarePreview
+          leftDown={leftDown}
+          rightDown={rightDown}
+          middleDown={middleDown}
+          backDown={backDown}
+          forwardDown={forwardDown}
+          wheelActive={wheelActive}
+          wheelLabel={wheelLabel}
+          theme={theme}
+          compact
+        />
       </div>
     );
   }
@@ -6139,45 +7031,16 @@ function SimulatedMouse({
       }}
     >
       <div className="flex items-center justify-center">
-        <svg className="h-full max-h-[360px] w-full max-w-[240px]" viewBox="0 0 220 280" role="img" aria-label="mouse input preview">
-          <rect x="54" y="18" width="112" height="236" rx="56" fill="rgba(255,255,255,0.05)" stroke={theme.border} />
-          <path
-            d="M110 18 L110 116"
-            stroke={theme.border}
-            strokeWidth="2"
-          />
-          <path
-            d="M57 116 C58 52 82 20 110 18 L110 116 Z"
-            fill={leftDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
-            stroke={leftDown ? theme.accent : theme.border}
-          />
-          <path
-            d="M110 18 C138 20 162 52 163 116 L110 116 Z"
-            fill={rightDown ? theme.accentSoft : "rgba(255,255,255,0.04)"}
-            stroke={rightDown ? theme.accent : theme.border}
-          />
-          <rect
-            x="101"
-            y="64"
-            width="18"
-            height="46"
-            rx="9"
-            fill={middleDown || wheelActive ? theme.accentSoft : "rgba(255,255,255,0.08)"}
-            stroke={middleDown || wheelActive ? theme.accent : theme.border}
-          />
-          {wheelActive ? (
-            <text x="110" y="58" textAnchor="middle" fill={theme.accent} fontSize="18" fontWeight="700">
-              {wheelLabel}
-            </text>
-          ) : null}
-          <rect x="42" y="132" width="14" height="46" rx="7" fill={backDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={backDown ? theme.accent : theme.border} strokeWidth={backDown ? 2 : 1.5} />
-          <rect x="38" y="182" width="14" height="46" rx="7" fill={forwardDown ? theme.accentSoft : "rgba(255,255,255,0.04)"} stroke={forwardDown ? theme.accent : theme.border} strokeWidth={forwardDown ? 2 : 1.5} />
-          <text x="82" y="82" fill={theme.textMuted} fontSize="11">L</text>
-          <text x="134" y="82" fill={theme.textMuted} fontSize="11">R</text>
-          <text x="110" y="92" textAnchor="middle" fill={middleDown || wheelActive ? theme.accent : theme.textMuted} fontSize="11" fontWeight={middleDown || wheelActive ? 700 : 400}>{wheelLabel}</text>
-          <text x="8" y="158" fill={backDown ? theme.accent : theme.textMuted} fontSize="10">Back</text>
-          <text x="8" y="210" fill={forwardDown ? theme.accent : theme.textMuted} fontSize="10">Fwd</text>
-        </svg>
+        <MouseHardwarePreview
+          leftDown={leftDown}
+          rightDown={rightDown}
+          middleDown={middleDown}
+          backDown={backDown}
+          forwardDown={forwardDown}
+          wheelActive={wheelActive}
+          wheelLabel={wheelLabel}
+          theme={theme}
+        />
       </div>
       {compact ? null : (
       <div className="flex min-w-0 flex-col gap-3">
@@ -6251,6 +7114,46 @@ function SimulatedMouse({
       </div>
       )}
     </div>
+  );
+}
+
+function MouseHardwarePreview({
+  leftDown,
+  rightDown,
+  middleDown,
+  backDown,
+  forwardDown,
+  wheelActive,
+  wheelLabel,
+  theme,
+  compact = false,
+}: {
+  leftDown: boolean;
+  rightDown: boolean;
+  middleDown: boolean;
+  backDown: boolean;
+  forwardDown: boolean;
+  wheelActive: boolean;
+  wheelLabel: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
+}) {
+  return (
+    <HardwareRigView
+      kind="mouse"
+      activity={{
+        leftDown,
+        rightDown,
+        middleDown,
+        backDown,
+        forwardDown,
+        wheelActive,
+        wheelLabel,
+      }}
+      accent={theme.accent}
+      theme={theme}
+      compact={compact}
+    />
   );
 }
 
@@ -6853,6 +7756,254 @@ function StatusPill({
   );
 }
 
+function HardwareAssetSettingsPanel({
+  theme,
+}: {
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const {
+    assets,
+    installed,
+    selectedIds,
+    loading,
+    error,
+    setSelectedId,
+    refresh,
+    importFile,
+    exportAsset,
+  } = useHardwareAssetCatalog();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const choices = buildHardwareAssetChoices(assets);
+  const selectedKeyboard = resolveSelectedHardwareAsset(
+    assets,
+    "keyboard",
+    selectedIds.keyboard,
+  ) as HardwareRigDefinition | null;
+  const selectedMouse = resolveSelectedHardwareAsset(
+    assets,
+    "mouse",
+    selectedIds.mouse,
+  ) as HardwareRigDefinition | null;
+
+  const handleImportFile = async (file: File | null | undefined) => {
+    if (!file) {
+      return;
+    }
+    setBusyAction("import");
+    setMessage(null);
+    try {
+      await importFile(file);
+      setMessage(`已导入 ${file.name}`);
+    } catch (importError) {
+      setMessage(`导入失败：${String(importError)}`);
+    } finally {
+      setBusyAction(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  };
+
+  const handleExport = async (assetId: string) => {
+    setBusyAction(`export:${assetId}`);
+    setMessage(null);
+    try {
+      await exportAsset(assetId);
+      setMessage("已生成资产压缩包");
+    } catch (exportError) {
+      setMessage(`导出失败：${String(exportError)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const renderSelect = (
+    kind: HardwareRigKind,
+    label: string,
+    icon: ReactNode,
+    selected: HardwareRigDefinition | null,
+  ) => {
+    const options = kind === "keyboard" ? choices.keyboard : choices.mouse;
+    return (
+      <label className="block min-w-0 flex-1 text-sm">
+        <span className="mb-1 flex items-center gap-2" style={{ color: theme.textSub }}>
+          {icon}
+          {label}
+        </span>
+        <select
+          className="h-9 w-full rounded-md px-2 text-sm outline-none"
+          value={selected?.id ?? selectedIds[kind]}
+          onChange={(event) => setSelectedId(kind, event.currentTarget.value)}
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.frame,
+            color: theme.text,
+          }}
+        >
+          {options.map((option) => (
+            <option key={option.id} value={option.id}>
+              {option.name}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  };
+
+  return (
+    <section
+      className="p-5"
+      style={{
+        background: theme.sidebar,
+        border: `1px solid ${theme.border}`,
+        boxShadow: theme.panelShadow,
+      }}
+    >
+      <div className="mb-4 flex items-center gap-3">
+        <div
+          className="flex h-11 w-11 items-center justify-center rounded-md"
+          style={{
+            background: "rgba(255,255,255,0.04)",
+            color: theme.textSub,
+          }}
+        >
+          <FileText size={18} />
+        </div>
+        <div className="min-w-0">
+          <h2 className="text-lg font-semibold">硬件资产</h2>
+          <p className="text-sm" style={{ color: theme.textMuted }}>
+            贴图、按键区域和导入包状态。
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {renderSelect(
+          "keyboard",
+          "键盘资产",
+          <Keyboard size={14} />,
+          selectedKeyboard,
+        )}
+        {renderSelect(
+          "mouse",
+          "鼠标资产",
+          <MousePointer2 size={14} />,
+          selectedMouse,
+        )}
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <input
+          ref={fileInputRef}
+          className="hidden"
+          type="file"
+          accept=".zip,.rshare-asset.zip,application/zip"
+          onChange={(event) => void handleImportFile(event.currentTarget.files?.[0])}
+        />
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm transition"
+          style={secondaryButtonStyle(theme)}
+          disabled={busyAction === "import"}
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <Upload size={14} />
+          导入
+        </button>
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm transition"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.frame,
+            color: theme.textSub,
+          }}
+          disabled={loading}
+          onClick={() => void refresh()}
+        >
+          <RotateCcw size={14} />
+          刷新
+        </button>
+      </div>
+
+      {error || message ? (
+        <div
+          className="mt-3 rounded-md px-3 py-2 text-xs"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.frame,
+            color: error ? "#ffb5c0" : theme.textSub,
+          }}
+        >
+          {message ?? error}
+        </div>
+      ) : null}
+
+      <div className="mt-4 space-y-2">
+        {installed.length ? (
+          installed.map((asset) => (
+            <div
+              key={asset.id}
+              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm"
+              style={{
+                border: `1px solid ${theme.border}`,
+                background: theme.frame,
+              }}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-medium">{asset.name}</div>
+                <div className="truncate text-xs" style={{ color: theme.textMuted }}>
+                  {hardwareAssetKindLabel(asset.kind)} · {asset.id}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs"
+                style={{
+                  border: `1px solid ${theme.accent}`,
+                  background: theme.accentSoft,
+                  color: theme.text,
+                }}
+                disabled={busyAction === `export:${asset.id}`}
+                onClick={() => void handleExport(asset.id)}
+              >
+                <Download size={13} />
+                导出
+              </button>
+            </div>
+          ))
+        ) : (
+          <div
+            className="rounded-md px-3 py-2 text-xs"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+              color: theme.textMuted,
+            }}
+          >
+            当前只有内置资产。
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function hardwareAssetKindLabel(kind: string) {
+  if (kind === "keyboard") {
+    return "键盘";
+  }
+  if (kind === "mouse") {
+    return "鼠标";
+  }
+  if (kind === "gamepad") {
+    return "手柄";
+  }
+  return kind;
+}
+
 function SettingsPage({
   acceptance,
   localDevice,
@@ -6874,6 +8025,8 @@ function SettingsPage({
     discoveredDevices: number;
     connectedDevices: number;
     visibleLayoutDevices: number;
+    localDisplayCount: number;
+    localReady: boolean;
     inputReady: boolean;
     dualMachineReady: boolean;
     nextStep: string;
@@ -7004,6 +8157,8 @@ function SettingsPage({
             {service.online ? "停止服务" : "启动服务"}
           </button>
         </section>
+
+        <HardwareAssetSettingsPanel theme={theme} />
 
         <section
           className="p-5"

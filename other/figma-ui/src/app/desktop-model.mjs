@@ -3,6 +3,7 @@ const LOCAL_DEVICE_COLOR = "#60a5fa";
 const LAYOUT_SCALE = 0.12;
 const CANVAS_ORIGIN_X = 80;
 const CANVAS_ORIGIN_Y = 170;
+const LAYOUT_COMMIT_SNAP_DISTANCE = Math.ceil(12 / LAYOUT_SCALE);
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -93,8 +94,16 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
     return null;
   }
 
+  const visibleNodes = snapVisibleDeviceGroupsEdgeToEdge(
+    visibleLayout.nodes.map((node) => ({
+      ...node,
+      displays: (node.displays ?? []).map((display) => ({ ...display })),
+    })),
+    new Set(visibleLayout.nodes.map((node) => node.device_id)),
+  );
+
   const layoutMonitors = [];
-  for (const node of visibleLayout.nodes) {
+  for (const node of visibleNodes) {
     const device = deviceLookup.get(node.device_id);
     if (!device) {
       continue;
@@ -146,6 +155,102 @@ function primaryDisplay(node) {
   return (node.displays ?? []).find((display) => display.primary) ?? node.displays?.[0] ?? null;
 }
 
+function nodeDisplayBounds(node) {
+  const displays = node.displays ?? [];
+  if (!displays.length) {
+    return null;
+  }
+
+  return displays.reduce(
+    (bounds, display) => {
+      const x = Number(display.x ?? 0);
+      const y = Number(display.y ?? 0);
+      const width = Number(display.width ?? 0);
+      const height = Number(display.height ?? 0);
+
+      return {
+        left: Math.min(bounds.left, x),
+        top: Math.min(bounds.top, y),
+        right: Math.max(bounds.right, x + width),
+        bottom: Math.max(bounds.bottom, y + height),
+      };
+    },
+    {
+      left: Infinity,
+      top: Infinity,
+      right: -Infinity,
+      bottom: -Infinity,
+    },
+  );
+}
+
+function translateNodeDisplays(node, dx, dy) {
+  if (!dx && !dy) {
+    return node;
+  }
+
+  return {
+    ...node,
+    displays: (node.displays ?? []).map((display) => ({
+      ...display,
+      x: Math.round(Number(display.x ?? 0) + dx),
+      y: Math.round(Number(display.y ?? 0) + dy),
+    })),
+  };
+}
+
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && aEnd > bStart;
+}
+
+function snapVisibleDeviceGroupsEdgeToEdge(nodes, visibleDeviceIds) {
+  const visible = new Set(visibleDeviceIds);
+  const sortedVisibleNodes = nodes
+    .filter((node) => visible.has(node.device_id))
+    .map((node) => ({ node, bounds: nodeDisplayBounds(node) }))
+    .filter((entry) => entry.bounds)
+    .sort((left, right) => left.bounds.left - right.bounds.left);
+
+  if (sortedVisibleNodes.length < 2) {
+    return nodes;
+  }
+
+  const offsets = new Map();
+  for (let index = 0; index < sortedVisibleNodes.length - 1; index += 1) {
+    const left = sortedVisibleNodes[index];
+    const right = sortedVisibleNodes[index + 1];
+    const horizontalGap = right.bounds.left - left.bounds.right;
+    const verticallyAligned = rangesOverlap(
+      left.bounds.top,
+      left.bounds.bottom,
+      right.bounds.top,
+      right.bounds.bottom,
+    );
+
+    if (
+      Math.abs(horizontalGap) <= LAYOUT_COMMIT_SNAP_DISTANCE &&
+      verticallyAligned
+    ) {
+      const dx = -horizontalGap;
+      offsets.set(right.node.device_id, {
+        dx: (offsets.get(right.node.device_id)?.dx ?? 0) + dx,
+        dy: 0,
+      });
+      right.bounds.left += dx;
+      right.bounds.right += dx;
+    }
+  }
+
+  if (!offsets.size) {
+    return nodes;
+  }
+
+  return nodes.map((node) => {
+    const offset = offsets.get(node.device_id);
+    return offset ? translateNodeDisplays(node, offset.dx, offset.dy) : node;
+  });
+}
+
 function rebuildHorizontalLinks(nodes) {
   const sorted = [...nodes].sort((left, right) => {
     const leftDisplay = primaryDisplay(left);
@@ -184,8 +289,9 @@ export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, moni
       monitor,
     ]),
   );
+  const visibleDeviceIds = new Set((monitors ?? []).map((monitor) => monitor.deviceId));
 
-  const nodes = rememberedLayout.nodes.map((node) => ({
+  const nodes = snapVisibleDeviceGroupsEdgeToEdge(rememberedLayout.nodes.map((node) => ({
       ...node,
       displays: (node.displays ?? []).map((display) => {
         const displayId = display.display_id ?? "primary";
@@ -213,7 +319,7 @@ export function updateRememberedLayoutFromVisibleMonitors(rememberedLayout, moni
           ),
         };
       }),
-    }));
+    })), visibleDeviceIds);
 
   return {
     ...rememberedLayout,
@@ -673,14 +779,78 @@ export function buildRemoteLatencySummary(snapshot, deviceId) {
 
 export function buildDeviceTypeSummaries(counts = {}) {
   return [
-    { kind: "all", title: "综合", detail: "合并输出" },
     { kind: "keyboard", title: "键盘", detail: String(counts.keyboard ?? 0) },
     { kind: "mouse", title: "鼠标", detail: String(counts.mouse ?? 0) },
     { kind: "gamepad", title: "手柄", detail: String(counts.gamepad ?? 0) },
     { kind: "display", title: "显示", detail: String(counts.display ?? 0) },
     { kind: "audio", title: "音频", detail: String(counts.audio ?? 0) },
     { kind: "remote", title: "远端", detail: String(counts.remote ?? 0) },
-  ];
+];
+}
+
+export const HARDWARE_RIG_ASSETS = Object.freeze({
+  keyboard: {
+    manifest: "/assets/hardware/live2d/keyboard/manifest.json",
+    base: "/assets/hardware/live2d/keyboard/base.png",
+  },
+  mouse: {
+    manifest: "/assets/hardware/live2d/mouse/manifest.json",
+    base: "/assets/hardware/live2d/mouse/base.png",
+  },
+});
+
+const RECENT_BUTTON_EVENT_WINDOW_MS = 900;
+
+function hardwareRigForKind(kind) {
+  return HARDWARE_RIG_ASSETS[kind] ? kind : null;
+}
+
+function hardwareRigVariantForKind(kind) {
+  return HARDWARE_RIG_ASSETS[kind] ? "default" : null;
+}
+
+function recentKeyboardEvents(snapshot) {
+  return (snapshot?.recent_events ?? [])
+    .filter((event) => event?.device_kind === "Keyboard")
+    .slice(-12);
+}
+
+function eventPayloadTokens(event, keys) {
+  return keys
+    .flatMap((key) => {
+      const value = event?.payload?.[key];
+      if (Array.isArray(value)) {
+        return value;
+      }
+      if (value === null || value === undefined) {
+        return [];
+      }
+      return String(value).split(/[,\s/]+/);
+    })
+    .filter(Boolean);
+}
+
+function recentMouseButtons(snapshot) {
+  const events = snapshot?.recent_events ?? [];
+  const latestTimestamp = events.reduce(
+    (latest, event) => Math.max(latest, Number(event?.timestamp_ms ?? 0)),
+    0,
+  );
+  return events
+    .filter((event) => event?.device_kind === "Mouse" && event?.event_kind === "button")
+    .filter((event) => {
+      if (!latestTimestamp) {
+        return true;
+      }
+      const timestamp = Number(event?.timestamp_ms ?? 0);
+      return latestTimestamp - timestamp <= RECENT_BUTTON_EVENT_WINDOW_MS;
+    })
+    .slice(-8)
+    .flatMap((event) => [
+      ...eventPayloadTokens(event, ["button", "button_name", "name", "pressed_buttons"]),
+      event?.summary,
+    ])
+    .filter(Boolean);
 }
 
 function galleryNode(index, item) {
@@ -714,6 +884,8 @@ function galleryNode(index, item) {
     w: point.w,
     h: point.h,
     shape: point.shape,
+    rigKind: hardwareRigForKind(item.kind),
+    rigVariant: hardwareRigVariantForKind(item.kind),
     ...item,
   };
 }
@@ -750,6 +922,7 @@ export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevic
       activity: {
         pressedKeys: snapshot?.keyboard?.pressed_keys ?? [],
         lastKey: snapshot?.keyboard?.last_key ?? null,
+        keyboardEvents: recentKeyboardEvents(snapshot),
       },
       live: Boolean(snapshot?.keyboard?.detected || keyboardDevices.some((device) => device.connected !== false)),
     });
@@ -764,6 +937,7 @@ export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevic
       metric: `${Number(snapshot?.mouse?.event_count ?? 0)} 次`,
       activity: {
         pressedButtons: snapshot?.mouse?.pressed_buttons ?? [],
+        recentButtons: recentMouseButtons(snapshot),
         x: Number(snapshot?.mouse?.x ?? 0),
         y: Number(snapshot?.mouse?.y ?? 0),
         wheelDeltaX: Number(snapshot?.mouse?.wheel_delta_x ?? 0),
@@ -1056,6 +1230,14 @@ function buildAcceptanceChecks(acceptance, status, inputMode) {
       detail: acceptance.localEndpoint,
     },
     {
+      key: "local",
+      label: "本机能力",
+      state: statusCheck(acceptance.localReady),
+      detail: acceptance.localReady
+        ? `本机后台、输入后端和 ${acceptance.localDisplayCount} 块显示器已就绪`
+        : "本机后台、输入后端或显示器布局未就绪",
+    },
+    {
       key: "discovery",
       label: "局域网发现",
       state: statusCheck(acceptance.discoveredDevices > 0, acceptance.daemonOnline),
@@ -1064,8 +1246,8 @@ function buildAcceptanceChecks(acceptance, status, inputMode) {
     {
       key: "layout",
       label: "布局接管",
-      state: statusCheck(acceptance.visibleLayoutDevices > 1, acceptance.daemonOnline),
-      detail: `Layout 当前显示 ${acceptance.visibleLayoutDevices} 个在线节点`,
+      state: statusCheck(acceptance.localDisplayCount > 0, acceptance.daemonOnline),
+      detail: `本机显示器 ${acceptance.localDisplayCount} 块，Layout 当前显示 ${acceptance.visibleLayoutDevices} 个在线节点`,
     },
     {
       key: "input",
@@ -1092,6 +1274,15 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
   const trayState = status?.tray_state ?? "Unavailable";
   const visibleLayoutDevices = payload?.visible_layout?.nodes?.length ?? layout.devices.length;
   const inputReady = daemonOnline && Boolean(status?.input_mode) && inputMode.health === "Healthy";
+  const localDisplayCount =
+    payload?.visible_layout?.nodes
+      ?.find((node) => node.device_id === status?.device_id)
+      ?.displays?.length ?? (layout.monitors.filter((monitor) => monitor.deviceId === status?.device_id).length || 0);
+  const localReady =
+    backgroundReady &&
+    inputReady &&
+    localDisplayCount > 0 &&
+    !payload?.layout_error;
   const dualMachineReady =
     backgroundReady &&
     inputReady &&
@@ -1102,6 +1293,8 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
   let nextStep = "启动守护进程后进行双机实机验收";
   if (daemonOnline && !inputReady) {
     nextStep = "检查输入后端权限或降级原因";
+  } else if (daemonOnline && localReady && remoteDevices.length === 0) {
+    nextStep = "本机能力已就绪，可以进行本机设备监控；双机验收等待局域网发现";
   } else if (daemonOnline && remoteDevices.length === 0) {
     nextStep = "打开另一台机器并保持同一局域网，等待自动发现";
   } else if (daemonOnline && !dualMachineReady) {
@@ -1119,6 +1312,8 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
     discoveredDevices: remoteDevices.length,
     connectedDevices: remoteDevices.filter((device) => device.connected).length,
     visibleLayoutDevices,
+    localDisplayCount,
+    localReady,
     inputReady,
     dualMachineReady,
     nextStep,
@@ -1138,6 +1333,8 @@ function buildAcceptance(payload, status, remoteDevices, layout, inputMode) {
         discoveredDevices: Number(raw.discovered_devices ?? remoteDevices.length),
         connectedDevices: Number(raw.connected_devices ?? 0),
         visibleLayoutDevices: Number(raw.visible_layout_devices ?? layout.devices.length),
+        localDisplayCount: Number(raw.local_display_count ?? 0),
+        localReady: Boolean(raw.local_ready),
         inputReady: Boolean(raw.input_ready),
         dualMachineReady: Boolean(raw.dual_machine_ready),
         nextStep: raw.next_step ?? "继续完成实机验收",

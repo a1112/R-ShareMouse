@@ -47,3 +47,39 @@ select {
   background: rgba(110, 124, 145, 0.68);
   background-clip: content-box;
 }
+
+@keyframes hardware-press-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.88) translateY(0);
+    filter: blur(1px);
+  }
+  38% {
+    opacity: 1;
+    transform: scale(1) translateY(2px);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0.72;
+    transform: scale(0.98) translateY(1px);
+    filter: blur(0);
+  }
+}
+
+@keyframes hardware-glow-breathe {
+  0%,
+  100% {
+    opacity: 0.58;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+.hardware-press-flash {
+  animation: hardware-press-flash 170ms ease-out both;
+}
+
+.hardware-legend-glow {
+  animation: hardware-glow-breathe 720ms ease-in-out infinite;
+}
