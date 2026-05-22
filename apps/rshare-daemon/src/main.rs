@@ -39,8 +39,8 @@ use rshare_input::RDevInputListener;
 #[cfg(windows)]
 use rshare_input::{DefaultInputListener, InputEventChannel, InputListener};
 use rshare_net::{
-    connection::ConnectionInfo, DiscoveredDevice, NetworkEvent, NetworkManager,
-    NetworkManagerConfig,
+    connection::{ConnectionInfo, ConnectionState},
+    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
 };
 use tracing_subscriber::prelude::*;
 
@@ -310,33 +310,35 @@ impl DaemonState {
         snapshot
     }
 
-    fn latency_feedback_snapshot(
-        &self,
-        network: &NetworkTransportSnapshot,
-    ) -> LatencyFeedbackSnapshot {
+    fn latency_feedback_snapshot(&self, transport: TransportFeedback) -> LatencyFeedbackSnapshot {
         let now_ms = timestamp_ms_now();
-        let connected_devices = self
-            .devices
-            .values()
-            .filter(|device| device.connected)
-            .count();
 
         LatencyFeedbackSnapshot {
             generated_at_ms: now_ms,
             local_input: self.local_input_feedback(),
             remote_latency: self.remote_latency_feedback(now_ms),
-            transport: transport_feedback_from_network(network, connected_devices),
+            transport,
         }
     }
 
-    fn status_snapshot_with_network(
+    fn status_snapshot_with_network_and_transport(
         &self,
         network: &NetworkTransportSnapshot,
+        transport: TransportFeedback,
     ) -> ServiceStatusSnapshot {
         let mut snapshot = self.status_snapshot();
         snapshot.network = network.clone();
-        snapshot.latency_feedback = self.latency_feedback_snapshot(network);
+        snapshot.latency_feedback = self.latency_feedback_snapshot(transport);
         snapshot
+    }
+
+    fn status_snapshot_for_connections(
+        &self,
+        connection_infos: &[ConnectionInfo],
+    ) -> ServiceStatusSnapshot {
+        let network = network_snapshot_from_connections(connection_infos);
+        let transport = transport_feedback_from_connections(&network, connection_infos);
+        self.status_snapshot_with_network_and_transport(&network, transport)
     }
 
     fn device_snapshots(&self) -> Vec<DaemonDeviceSnapshot> {
@@ -1491,7 +1493,6 @@ fn timestamp_ms_now() -> u64 {
 }
 
 const LATENCY_HEALTHY_RTT_MS: u64 = 50;
-const LATENCY_DEGRADED_RTT_MS: u64 = 120;
 const LATENCY_PROBE_TIMEOUT_MS: u64 = 1_500;
 
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
@@ -1533,25 +1534,32 @@ fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkT
     snapshot
 }
 
-fn transport_feedback_from_network(
+fn connected_connection_count(connections: &[ConnectionInfo]) -> usize {
+    connections
+        .iter()
+        .filter(|connection| connection.state == ConnectionState::Connected)
+        .count()
+}
+
+fn transport_feedback_from_connections(
     network: &NetworkTransportSnapshot,
-    connected_devices: usize,
+    connections: &[ConnectionInfo],
 ) -> TransportFeedback {
-    let status = if connected_devices == 0 {
+    let connected_count = connected_connection_count(connections);
+    let status = if connected_count == 0 {
         LatencyFeedbackStatus::Unavailable
-    } else if network.realtime_degraded
-        || !network.datagram_available
-        || network.datagram_tx_dropped > 0
-        || network.reliable_stream_reset_count > 0
-        || network.rtt_ms.is_none()
-        || network
-            .rtt_ms
-            .is_some_and(|rtt| rtt >= LATENCY_DEGRADED_RTT_MS)
-    {
-        LatencyFeedbackStatus::Degraded
-    } else if network
-        .rtt_ms
-        .is_some_and(|rtt| rtt > LATENCY_HEALTHY_RTT_MS)
+    } else if connections
+        .iter()
+        .filter(|connection| connection.state == ConnectionState::Connected)
+        .any(|connection| {
+            !connection.datagram_available
+                || connection.datagram_tx_dropped > 0
+                || connection.reliable_stream_reset_count > 0
+                || connection.rtt_ms.is_none()
+                || connection
+                    .rtt_ms
+                    .is_some_and(|rtt| rtt > LATENCY_HEALTHY_RTT_MS)
+        })
     {
         LatencyFeedbackStatus::Degraded
     } else {
@@ -6381,9 +6389,8 @@ async fn handle_ipc_client(
                 let manager = network_manager.lock().await;
                 manager.connection_infos().await
             };
-            let network = network_snapshot_from_connections(&connection_infos);
             let state = state.read().await;
-            DaemonResponse::Status(state.status_snapshot_with_network(&network))
+            DaemonResponse::Status(state.status_snapshot_for_connections(&connection_infos))
         }
         DaemonRequest::Devices => {
             let state = state.read().await;
@@ -6731,6 +6738,14 @@ mod tests {
         ))
     }
 
+    fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {
+        let mut info = ConnectionInfo::new(device_id, "127.0.0.1:27431".to_string());
+        info.state = rshare_net::connection::ConnectionState::Connected;
+        info.datagram_available = true;
+        info.rtt_ms = rtt_ms;
+        info
+    }
+
     #[test]
     fn capability_registry_snapshot_contains_local_reserved_capabilities() {
         let mut state = test_daemon_state();
@@ -6877,7 +6892,7 @@ mod tests {
     #[test]
     fn transport_feedback_reports_unavailable_without_connections() {
         let network = network_snapshot_from_connections(&[]);
-        let feedback = transport_feedback_from_network(&network, 0);
+        let feedback = transport_feedback_from_connections(&network, &[]);
 
         assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
         assert!(feedback.realtime_degraded);
@@ -6885,14 +6900,11 @@ mod tests {
 
     #[test]
     fn transport_feedback_reports_healthy_realtime_connection() {
-        let network = NetworkTransportSnapshot {
-            datagram_available: true,
-            realtime_degraded: false,
-            rtt_ms: Some(12),
-            ..NetworkTransportSnapshot::default()
-        };
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
 
-        let feedback = transport_feedback_from_network(&network, 1);
+        let feedback = transport_feedback_from_connections(&network, &connections);
 
         assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
         assert_eq!(feedback.rtt_ms, Some(12));
@@ -6900,28 +6912,23 @@ mod tests {
 
     #[test]
     fn transport_feedback_degrades_when_realtime_is_degraded() {
-        let network = NetworkTransportSnapshot {
-            datagram_available: false,
-            realtime_degraded: true,
-            rtt_ms: Some(22),
-            ..NetworkTransportSnapshot::default()
-        };
+        let mut connection = connected_connection_info(DeviceId::new_v4(), Some(22));
+        connection.datagram_available = false;
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
 
-        let feedback = transport_feedback_from_network(&network, 1);
+        let feedback = transport_feedback_from_connections(&network, &connections);
 
         assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
     }
 
     #[test]
     fn transport_feedback_degrades_without_rtt_measurement() {
-        let network = NetworkTransportSnapshot {
-            datagram_available: true,
-            realtime_degraded: false,
-            rtt_ms: None,
-            ..NetworkTransportSnapshot::default()
-        };
+        let connection = connected_connection_info(DeviceId::new_v4(), None);
+        let connections = [connection];
+        let network = network_snapshot_from_connections(&connections);
 
-        let feedback = transport_feedback_from_network(&network, 1);
+        let feedback = transport_feedback_from_connections(&network, &connections);
 
         assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
     }
@@ -8974,9 +8981,8 @@ mod tests {
     fn status_snapshot_includes_latency_feedback() {
         let mut state = test_daemon_state();
         state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
-        let network = NetworkTransportSnapshot::default();
 
-        let snapshot = state.status_snapshot_with_network(&network);
+        let snapshot = state.status_snapshot_for_connections(&[]);
 
         assert_eq!(
             snapshot.latency_feedback.local_input.status,
@@ -8989,18 +8995,11 @@ mod tests {
     }
 
     #[test]
-    fn status_snapshot_latency_feedback_uses_passed_network_snapshot() {
-        let mut state = test_daemon_state();
-        let remote_id = DeviceId::new_v4();
-        state.mark_connected(&remote_id, true);
-        let network = NetworkTransportSnapshot {
-            datagram_available: true,
-            realtime_degraded: false,
-            rtt_ms: Some(12),
-            ..NetworkTransportSnapshot::default()
-        };
+    fn status_snapshot_latency_feedback_uses_connection_snapshot_network() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
 
-        let snapshot = state.status_snapshot_with_network(&network);
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
 
         assert_eq!(snapshot.network.rtt_ms, Some(12));
         assert_eq!(
@@ -9008,6 +9007,51 @@ mod tests {
             LatencyFeedbackStatus::Healthy
         );
         assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_uses_connection_infos_for_transport_availability() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_degrades_when_any_connection_rtt_is_high() {
+        let state = test_daemon_state();
+        let fast_connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+        let slow_connection = connected_connection_info(DeviceId::new_v4(), Some(200));
+
+        let snapshot = state.status_snapshot_for_connections(&[fast_connection, slow_connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn status_snapshot_for_connections_populates_latency_feedback() {
+        let state = test_daemon_state();
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+
+        let snapshot = state.status_snapshot_for_connections(&[connection]);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert!(snapshot.latency_feedback.generated_at_ms > 0);
+        assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
     }
 
     #[test]
