@@ -4,6 +4,7 @@ const LAYOUT_SCALE = 0.12;
 const CANVAS_ORIGIN_X = 80;
 const CANVAS_ORIGIN_Y = 170;
 const LAYOUT_COMMIT_SNAP_DISTANCE = Math.ceil(12 / LAYOUT_SCALE);
+const LATENCY_HEALTHY_RTT_MS = 50;
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -730,6 +731,12 @@ function remoteLatencyProbeSequence(event) {
 }
 
 function sortNewestEvent(left, right) {
+  const leftSequence = numberOrNull(left?.sequence);
+  const rightSequence = numberOrNull(right?.sequence);
+  if (leftSequence != null && rightSequence != null && leftSequence !== rightSequence) {
+    return rightSequence - leftSequence;
+  }
+
   const leftProbeSequence = remoteLatencyProbeSequence(left);
   const rightProbeSequence = remoteLatencyProbeSequence(right);
   if (
@@ -738,12 +745,6 @@ function sortNewestEvent(left, right) {
     leftProbeSequence !== rightProbeSequence
   ) {
     return rightProbeSequence - leftProbeSequence;
-  }
-
-  const leftSequence = numberOrNull(left?.sequence);
-  const rightSequence = numberOrNull(right?.sequence);
-  if (leftSequence != null && rightSequence != null && leftSequence !== rightSequence) {
-    return rightSequence - leftSequence;
   }
 
   const leftTime = numberOrNull(left?.timestamp_ms) ?? 0;
@@ -903,7 +904,10 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
     );
     const remoteProcessingMs = numberOrNull(payload.remote_processing_ms);
     return {
-      state: "pass",
+      state:
+        networkRoundTripMs != null && networkRoundTripMs <= LATENCY_HEALTHY_RTT_MS
+          ? "pass"
+          : "warn",
       message: ack.summary ?? "Latency ACK received",
       networkRoundTripMs,
       estimatedOneWayMs,

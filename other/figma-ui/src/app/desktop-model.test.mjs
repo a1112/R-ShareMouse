@@ -845,6 +845,34 @@ test("buildRemoteLatencySummary extracts the latest RTT for a selected remote de
   assert.equal(summary.direction, "endpoint_to_origin");
 });
 
+test("buildRemoteLatencySummary marks high RTT event ACK as warning", () => {
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 40,
+          timestamp_ms: 2000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 90 ms RTT / ~45 ms one-way",
+          device_id: "remote-1",
+          source: "System",
+          payload: {
+            target_device_id: "remote-1",
+            probe_sequence: "40",
+            network_round_trip_ms: "90",
+            estimated_one_way_ms: "45",
+          },
+        },
+      ],
+    },
+    "remote-1",
+  );
+
+  assert.equal(summary.state, "warn");
+  assert.equal(summary.networkRoundTripMs, 90);
+});
+
 test("buildRemoteLatencySummary reports pending probe when ACK has not arrived", () => {
   const summary = buildRemoteLatencySummary(
     {

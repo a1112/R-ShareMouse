@@ -1617,8 +1617,8 @@ fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> 
 
 fn latency_ack_order_key(event: &LocalInputDiagnosticEvent) -> (u64, u64) {
     (
-        latency_ack_probe_sequence(event).unwrap_or(event.sequence),
         event.sequence,
+        latency_ack_probe_sequence(event).unwrap_or(event.sequence),
     )
 }
 
@@ -7141,6 +7141,62 @@ mod tests {
         assert_eq!(feedback.devices.len(), 1);
         assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Healthy);
         assert_eq!(feedback.devices[0].network_round_trip_ms, Some(24));
+        assert_eq!(
+            feedback.devices[0].summary.as_deref(),
+            Some("New endpoint latency sample")
+        );
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_local_sequence_across_ack_sequence_domains() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let normal_ack = LocalInputDiagnosticEvent {
+            sequence: 100,
+            timestamp_ms: 1_000,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_probe_ack".to_string(),
+            summary: "Old normal latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("target_device_id".to_string(), remote_id.to_string()),
+                ("probe_sequence".to_string(), "100".to_string()),
+                ("network_round_trip_ms".to_string(), "24".to_string()),
+            ]),
+        };
+        push_recent_local_event(&mut state.local_controls, normal_ack);
+
+        let endpoint_ack = LocalInputDiagnosticEvent {
+            sequence: 102,
+            timestamp_ms: 1_100,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_endpoint_switch_ack".to_string(),
+            summary: "New endpoint latency sample".to_string(),
+            device_id: Some(remote_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([
+                ("origin_device_id".to_string(), remote_id.to_string()),
+                ("probe_sequence".to_string(), "101".to_string()),
+                ("origin_probe_sequence".to_string(), "7".to_string()),
+                ("network_round_trip_ms".to_string(), "30".to_string()),
+            ]),
+        };
+        push_recent_local_event(&mut state.local_controls, endpoint_ack);
+        state.local_controls.sequence = 102;
+
+        let feedback = state.remote_latency_feedback(1_200);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].latest_sequence, Some(102));
+        assert_eq!(feedback.devices[0].network_round_trip_ms, Some(30));
         assert_eq!(
             feedback.devices[0].summary.as_deref(),
             Some("New endpoint latency sample")
