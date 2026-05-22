@@ -442,24 +442,25 @@ impl DaemonState {
             .local_controls
             .recent_events
             .iter()
-            .filter(|event| {
-                matches!(
-                    event.device_kind,
-                    LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
-                )
-            })
+            .filter(|event| is_eligible_local_input_feedback_event(event))
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
         let latest_keyboard = self
             .local_controls
             .recent_events
             .iter()
-            .filter(|event| event.device_kind == LocalInputDeviceKind::Keyboard)
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Keyboard
+            })
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
         let latest_mouse = self
             .local_controls
             .recent_events
             .iter()
-            .filter(|event| event.device_kind == LocalInputDeviceKind::Mouse)
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Mouse
+            })
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
 
         LocalInputFeedback {
@@ -825,6 +826,15 @@ impl DaemonState {
         push_recent_local_event(&mut self.local_controls, event.clone());
         event
     }
+}
+
+fn is_eligible_local_input_feedback_event(event: &LocalInputDiagnosticEvent) -> bool {
+    matches!(
+        event.device_kind,
+        LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
+    ) && !event.payload.contains_key("remote_device_id")
+        && !event.payload.contains_key("origin_event_device_id")
+        && event.capture_path.as_deref() != Some("remote-daemon")
 }
 
 const LOCAL_CONTROL_RECENT_EVENT_LIMIT: usize = 64;
@@ -6848,6 +6858,50 @@ mod tests {
         assert_eq!(feedback.event_count, 1);
         assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
         assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
+        assert_eq!(
+            feedback.capture_path.as_deref(),
+            Some("portable-capture")
+        );
+    }
+
+    #[test]
+    fn local_input_feedback_ignores_remote_keyboard_diagnostic_for_latest_input() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        let keyboard_event = state.local_controls.recent_events.last_mut().unwrap();
+        keyboard_event.capture_path = Some("portable-capture".to_string());
+        let keyboard_sequence = keyboard_event.sequence;
+        let keyboard_timestamp_ms = keyboard_event.timestamp_ms;
+
+        let remote_device_id = DeviceId::new_v4();
+        let mut payload = BTreeMap::new();
+        payload.insert("remote_device_id".to_string(), remote_device_id.to_string());
+        let remote_event = LocalInputDiagnosticEvent {
+            sequence: keyboard_sequence.saturating_add(1),
+            timestamp_ms: keyboard_timestamp_ms.saturating_add(1),
+            device_kind: LocalInputDeviceKind::Keyboard,
+            event_kind: "key".to_string(),
+            summary: "Remote key ShiftLeft Pressed".to_string(),
+            device_id: Some(remote_device_id.to_string()),
+            device_instance_id: None,
+            capture_path: Some("remote-daemon".to_string()),
+            source: LocalInputEventSource::System,
+            payload,
+        };
+        state.local_controls.sequence = remote_event.sequence;
+        push_recent_local_event(&mut state.local_controls, remote_event);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
+        assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
+        assert_eq!(feedback.latest_keyboard_event_ms, Some(keyboard_timestamp_ms));
         assert_eq!(
             feedback.capture_path.as_deref(),
             Some("portable-capture")
