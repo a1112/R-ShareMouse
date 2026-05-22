@@ -1,0 +1,2124 @@
+{
+  "schema_version": 1,
+  "id": "builtin.keyboard.gaming",
+  "name": "Gaming Keyboard",
+  "kind": "keyboard",
+  "base_size": {
+    "width": 1650,
+    "height": 547
+  },
+  "layers": [
+    {
+      "id": "base",
+      "role": "base",
+      "render": "image",
+      "src": "base.png"
+    },
+    {
+      "id": "legend-glow",
+      "role": "legendGlow",
+      "render": "runtime"
+    },
+    {
+      "id": "press-effect",
+      "role": "pressEffect",
+      "render": "runtime"
+    }
+  ],
+  "regions": [
+    {
+      "id": "key.escape",
+      "label": "Esc",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Esc",
+          "Escape"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.054845,
+        "w": 0.047273,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f1",
+      "label": "F1",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F1",
+          "Raw(112)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.066667,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f2",
+      "label": "F2",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F2",
+          "Raw(113)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.112121,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f3",
+      "label": "F3",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F3",
+          "Raw(114)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.157576,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f4",
+      "label": "F4",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F4",
+          "Raw(115)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.20303,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f5",
+      "label": "F5",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F5",
+          "Raw(116)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.248485,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f6",
+      "label": "F6",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F6",
+          "Raw(117)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.293939,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f7",
+      "label": "F7",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F7",
+          "Raw(118)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.339394,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f8",
+      "label": "F8",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F8",
+          "Raw(119)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.384848,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f9",
+      "label": "F9",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F9",
+          "Raw(120)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.430303,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f10",
+      "label": "F10",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F10",
+          "Raw(121)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.475758,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f11",
+      "label": "F11",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F11",
+          "Raw(122)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.521212,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.f12",
+      "label": "F12",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F12",
+          "Raw(123)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.566667,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.printscreen",
+      "label": "PrtSc",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "PrtSc",
+          "PrintScreen",
+          "Snapshot",
+          "Raw(44)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.612121,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.scrolllock",
+      "label": "Scroll",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Scroll",
+          "ScrollLock",
+          "Raw(145)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.657576,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.pause",
+      "label": "Pause",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Pause",
+          "Raw(19)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.70303,
+        "y": 0.054845,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.192",
+      "label": "`",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "`",
+          "Raw(192)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.49",
+      "label": "1",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "1",
+          "Char(49)",
+          "Raw(49)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.058788,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.50",
+      "label": "2",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "2",
+          "Char(50)",
+          "Raw(50)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.104242,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.51",
+      "label": "3",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "3",
+          "Char(51)",
+          "Raw(51)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.149697,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.52",
+      "label": "4",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "4",
+          "Char(52)",
+          "Raw(52)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.195152,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.53",
+      "label": "5",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "5",
+          "Char(53)",
+          "Raw(53)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.240606,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.54",
+      "label": "6",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "6",
+          "Char(54)",
+          "Raw(54)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.286061,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.55",
+      "label": "7",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "7",
+          "Char(55)",
+          "Raw(55)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.331515,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.56",
+      "label": "8",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "8",
+          "Char(56)",
+          "Raw(56)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.37697,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.57",
+      "label": "9",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "9",
+          "Char(57)",
+          "Raw(57)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.422424,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.48",
+      "label": "0",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "0",
+          "Char(48)",
+          "Raw(48)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.467879,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.189",
+      "label": "-",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "-",
+          "Raw(189)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.513333,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.187",
+      "label": "=",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "=",
+          "Raw(187)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.558788,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.backspace",
+      "label": "Backspace",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Backspace",
+          "Raw(8)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.604242,
+        "y": 0.219378,
+        "w": 0.078788,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.insert",
+      "label": "Ins",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Ins",
+          "Insert",
+          "Raw(45)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.689091,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.home",
+      "label": "Home",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Home",
+          "Raw(36)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.734545,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.pageup",
+      "label": "PgUp",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "PgUp",
+          "PageUp",
+          "Raw(33)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.78,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.numlock",
+      "label": "Num",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Num",
+          "NumLock",
+          "Raw(144)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.825455,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypaddivide",
+      "label": "/",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "/",
+          "KeypadDivide",
+          "Raw(111)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.870909,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadmultiply",
+      "label": "*",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "*",
+          "KeypadMultiply",
+          "Raw(106)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.916364,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadsubtract",
+      "label": "-",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "-",
+          "KeypadSubtract",
+          "Raw(109)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.961818,
+        "y": 0.219378,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.tab",
+      "label": "Tab",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Tab",
+          "Raw(9)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.383912,
+        "w": 0.059091,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.81",
+      "label": "Q",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Q",
+          "Char(81)",
+          "Raw(81)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.078485,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.87",
+      "label": "W",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "W",
+          "Char(87)",
+          "Raw(87)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.123939,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.69",
+      "label": "E",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "E",
+          "Char(69)",
+          "Raw(69)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.169394,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.82",
+      "label": "R",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "R",
+          "Char(82)",
+          "Raw(82)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.214848,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.84",
+      "label": "T",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "T",
+          "Char(84)",
+          "Raw(84)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.260303,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.89",
+      "label": "Y",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Y",
+          "Char(89)",
+          "Raw(89)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.305758,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.85",
+      "label": "U",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "U",
+          "Char(85)",
+          "Raw(85)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.351212,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.73",
+      "label": "I",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "I",
+          "Char(73)",
+          "Raw(73)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.396667,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.79",
+      "label": "O",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "O",
+          "Char(79)",
+          "Raw(79)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.442121,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.80",
+      "label": "P",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "P",
+          "Char(80)",
+          "Raw(80)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.487576,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.219",
+      "label": "[",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "[",
+          "Raw(219)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.53303,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.221",
+      "label": "]",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "]",
+          "Raw(221)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.578485,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.220",
+      "label": "\\",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "\\",
+          "Raw(220)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.623939,
+        "y": 0.383912,
+        "w": 0.059091,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.delete",
+      "label": "Del",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Del",
+          "Delete",
+          "Raw(46)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.689091,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.end",
+      "label": "End",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "End",
+          "Raw(35)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.734545,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.pagedown",
+      "label": "PgDn",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "PgDn",
+          "PageDown",
+          "Raw(34)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.78,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad7",
+      "label": "7",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "7",
+          "Keypad7",
+          "Raw(103)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.825455,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad8",
+      "label": "8",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "8",
+          "Keypad8",
+          "Raw(104)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.870909,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad9",
+      "label": "9",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "9",
+          "Keypad9",
+          "Raw(105)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.916364,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadadd",
+      "label": "+",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "+",
+          "KeypadAdd",
+          "Raw(107)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.961818,
+        "y": 0.383912,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.capslock",
+      "label": "Caps",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Caps",
+          "CapsLock",
+          "Raw(20)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.548446,
+        "w": 0.070909,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.65",
+      "label": "A",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "A",
+          "Char(65)",
+          "Raw(65)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.090303,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.83",
+      "label": "S",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "S",
+          "Char(83)",
+          "Raw(83)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.135758,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.68",
+      "label": "D",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "D",
+          "Char(68)",
+          "Raw(68)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.181212,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.70",
+      "label": "F",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "F",
+          "Char(70)",
+          "Raw(70)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.226667,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.71",
+      "label": "G",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "G",
+          "Char(71)",
+          "Raw(71)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.272121,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.72",
+      "label": "H",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "H",
+          "Char(72)",
+          "Raw(72)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.317576,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.74",
+      "label": "J",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "J",
+          "Char(74)",
+          "Raw(74)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.36303,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.75",
+      "label": "K",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "K",
+          "Char(75)",
+          "Raw(75)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.408485,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.76",
+      "label": "L",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "L",
+          "Char(76)",
+          "Raw(76)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.453939,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.186",
+      "label": ";",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          ";",
+          "Raw(186)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.499394,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.222",
+      "label": "'",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "'",
+          "Raw(222)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.544848,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.enter",
+      "label": "Enter",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Enter",
+          "Raw(13)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.590303,
+        "y": 0.548446,
+        "w": 0.086667,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad4",
+      "label": "4",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "4",
+          "Keypad4",
+          "Raw(100)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.68303,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad5",
+      "label": "5",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "5",
+          "Keypad5",
+          "Raw(101)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.728485,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad6",
+      "label": "6",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "6",
+          "Keypad6",
+          "Raw(102)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.773939,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadadd.2",
+      "label": "+",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "+",
+          "KeypadAdd",
+          "Raw(107)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.819394,
+        "y": 0.548446,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.shiftleft",
+      "label": "Shift",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Shift",
+          "ShiftLeft",
+          "Raw(16)",
+          "Raw(160)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.71298,
+        "w": 0.090606,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.90",
+      "label": "Z",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Z",
+          "Char(90)",
+          "Raw(90)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.11,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.88",
+      "label": "X",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "X",
+          "Char(88)",
+          "Raw(88)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.155455,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.67",
+      "label": "C",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "C",
+          "Char(67)",
+          "Raw(67)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.200909,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.86",
+      "label": "V",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "V",
+          "Char(86)",
+          "Raw(86)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.246364,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.66",
+      "label": "B",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "B",
+          "Char(66)",
+          "Raw(66)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.291818,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.78",
+      "label": "N",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "N",
+          "Char(78)",
+          "Raw(78)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.337273,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.char.77",
+      "label": "M",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "M",
+          "Char(77)",
+          "Raw(77)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.382727,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.188",
+      "label": ",",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          ",",
+          "Raw(188)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.428182,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.190",
+      "label": ".",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          ".",
+          "Raw(190)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.473636,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.191",
+      "label": "/",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "/",
+          "Raw(191)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.519091,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.shiftright",
+      "label": "Shift",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Shift",
+          "ShiftRight",
+          "Raw(16)",
+          "Raw(161)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.564545,
+        "y": 0.71298,
+        "w": 0.106364,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.up",
+      "label": "Up",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Up",
+          "Raw(38)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.67697,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad1",
+      "label": "1",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "1",
+          "Keypad1",
+          "Raw(97)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.722424,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad2",
+      "label": "2",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "2",
+          "Keypad2",
+          "Raw(98)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.767879,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad3",
+      "label": "3",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "3",
+          "Keypad3",
+          "Raw(99)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.813333,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadenter",
+      "label": "Enter",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Enter",
+          "KeypadEnter",
+          "Raw(13)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.858788,
+        "y": 0.71298,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.controlleft",
+      "label": "Ctrl",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Ctrl",
+          "ControlLeft",
+          "Raw(17)",
+          "Raw(162)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.013333,
+        "y": 0.855576,
+        "w": 0.059091,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.superleft",
+      "label": "Win",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Win",
+          "SuperLeft",
+          "Raw(91)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.078485,
+        "y": 0.855576,
+        "w": 0.051212,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.altleft",
+      "label": "Alt",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Alt",
+          "AltLeft",
+          "Raw(18)",
+          "Raw(164)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.135758,
+        "y": 0.855576,
+        "w": 0.051212,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.space",
+      "label": "Space",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Space",
+          "Raw(32)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.19303,
+        "y": 0.855576,
+        "w": 0.236364,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.altright",
+      "label": "Alt",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Alt",
+          "AltRight",
+          "Raw(18)",
+          "Raw(165)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.435455,
+        "y": 0.855576,
+        "w": 0.051212,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.superright",
+      "label": "Win",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Win",
+          "SuperRight",
+          "Raw(92)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.492727,
+        "y": 0.855576,
+        "w": 0.051212,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.raw.93",
+      "label": "Menu",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Menu",
+          "Raw(93)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.55,
+        "y": 0.855576,
+        "w": 0.051212,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.controlright",
+      "label": "Ctrl",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Ctrl",
+          "ControlRight",
+          "Raw(17)",
+          "Raw(163)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.607273,
+        "y": 0.855576,
+        "w": 0.059091,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.left",
+      "label": "←",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "←",
+          "Left",
+          "Raw(37)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.672424,
+        "y": 0.855576,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.down",
+      "label": "↓",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "↓",
+          "Down",
+          "Raw(40)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.717879,
+        "y": 0.855576,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.right",
+      "label": "→",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "→",
+          "Right",
+          "Raw(39)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.763333,
+        "y": 0.855576,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypad0",
+      "label": "0",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "0",
+          "Keypad0",
+          "Raw(96)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.808788,
+        "y": 0.855576,
+        "w": 0.078788,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypaddecimal",
+      "label": ".",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          ".",
+          "KeypadDecimal",
+          "Raw(110)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.893636,
+        "y": 0.855576,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    },
+    {
+      "id": "key.keypadenter.2",
+      "label": "Enter",
+      "action": {
+        "kind": "keyboard_key",
+        "codes": [
+          "Enter",
+          "KeypadEnter",
+          "Raw(13)"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.939091,
+        "y": 0.855576,
+        "w": 0.039394,
+        "h": 0.106033,
+        "radius": 7
+      }
+    }
+  ]
+}

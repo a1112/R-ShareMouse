@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   buildHardwareAssetChoices,
@@ -62,5 +63,28 @@ test("buildHardwareAssetChoices groups assets by kind", () => {
   assert.deepEqual(
     choices.keyboard.map((choice) => [choice.id, choice.name]),
     [["builtin.keyboard.office", "Office Keyboard"]],
+  );
+});
+
+test("checked-in office mouse manifest has mapped button regions", () => {
+  const raw = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../public/assets/hardware/live2d/mouse/manifest.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const asset = normalizeHardwareAssetManifest(
+    raw,
+    "/assets/hardware/live2d/mouse/",
+  );
+
+  assert.equal(asset.id, "builtin.mouse.office");
+  assert.ok(asset.regions.some((region) => region.id === "mouse.left"));
+  assert.equal(
+    asset.regions.find((region) => region.id === "mouse.left").action.kind,
+    "mouse_button",
   );
 });

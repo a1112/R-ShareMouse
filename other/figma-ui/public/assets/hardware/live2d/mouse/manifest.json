@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "id": "builtin.mouse.office",
+  "name": "Office Mouse",
+  "kind": "mouse",
+  "base_size": {
+    "width": 575,
+    "height": 1109
+  },
+  "layers": [
+    {
+      "id": "base",
+      "role": "base",
+      "render": "image",
+      "src": "base.png"
+    },
+    {
+      "id": "button-press-effect",
+      "role": "buttonPressEffect",
+      "render": "runtime"
+    },
+    {
+      "id": "wheel-pulse",
+      "role": "wheelPulse",
+      "render": "runtime"
+    }
+  ],
+  "regions": [
+    {
+      "id": "mouse.left",
+      "label": "Left",
+      "action": {
+        "kind": "mouse_button",
+        "buttons": [
+          "Left",
+          "left"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.2,
+        "y": 0.07,
+        "w": 0.3,
+        "h": 0.4,
+        "radius": 38
+      }
+    },
+    {
+      "id": "mouse.right",
+      "label": "Right",
+      "action": {
+        "kind": "mouse_button",
+        "buttons": [
+          "Right",
+          "right"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.51,
+        "y": 0.07,
+        "w": 0.3,
+        "h": 0.4,
+        "radius": 38
+      }
+    },
+    {
+      "id": "mouse.middle",
+      "label": "Wheel",
+      "action": {
+        "kind": "mouse_button",
+        "buttons": [
+          "Middle",
+          "Wheel",
+          "middle"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.43,
+        "y": 0.04,
+        "w": 0.15,
+        "h": 0.28,
+        "radius": 22
+      }
+    },
+    {
+      "id": "mouse.back",
+      "label": "Back",
+      "action": {
+        "kind": "mouse_button",
+        "buttons": [
+          "Back",
+          "back"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.02,
+        "y": 0.35,
+        "w": 0.09,
+        "h": 0.15,
+        "radius": 12
+      }
+    },
+    {
+      "id": "mouse.forward",
+      "label": "Forward",
+      "action": {
+        "kind": "mouse_button",
+        "buttons": [
+          "Forward",
+          "forward"
+        ]
+      },
+      "shape": {
+        "kind": "rect",
+        "x": 0.02,
+        "y": 0.53,
+        "w": 0.09,
+        "h": 0.15,
+        "radius": 12
+      }
+    }
+  ]
+}
