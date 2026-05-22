@@ -424,10 +424,13 @@ impl DaemonState {
     // Staged for Task 5 status snapshot wiring.
     #[allow(dead_code)]
     fn local_input_feedback(&self) -> LocalInputFeedback {
-        let event_count =
-            self.local_controls.keyboard.event_count + self.local_controls.mouse.event_count;
+        let event_count = self
+            .local_controls
+            .keyboard
+            .event_count
+            .saturating_add(self.local_controls.mouse.event_count);
 
-        if !self.backend_state.has_end_to_end_path() {
+        if self.backend_state.selected_mode.is_none() {
             return LocalInputFeedback {
                 status: LatencyFeedbackStatus::Unavailable,
                 event_count,
@@ -439,6 +442,12 @@ impl DaemonState {
             .local_controls
             .recent_events
             .iter()
+            .filter(|event| {
+                matches!(
+                    event.device_kind,
+                    LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
+                )
+            })
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
         let latest_keyboard = self
             .local_controls
@@ -454,7 +463,12 @@ impl DaemonState {
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
 
         LocalInputFeedback {
-            status: if event_count == 0 {
+            status: if matches!(
+                self.backend_state.aggregate_health,
+                BackendHealth::Degraded { .. }
+            ) {
+                LatencyFeedbackStatus::Degraded
+            } else if event_count == 0 {
                 LatencyFeedbackStatus::Idle
             } else {
                 LatencyFeedbackStatus::Healthy
@@ -6798,6 +6812,94 @@ mod tests {
         assert_eq!(feedback.latest_sequence, Some(2));
         assert!(feedback.latest_keyboard_event_ms.is_some());
         assert!(feedback.latest_mouse_event_ms.is_some());
+    }
+
+    #[test]
+    fn local_input_feedback_ignores_later_backend_diagnostic_for_latest_input() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        let keyboard_event = state.local_controls.recent_events.last_mut().unwrap();
+        keyboard_event.capture_path = Some("portable-capture".to_string());
+        let keyboard_sequence = keyboard_event.sequence;
+        let keyboard_timestamp_ms = keyboard_event.timestamp_ms;
+
+        let backend_event = LocalInputDiagnosticEvent {
+            sequence: keyboard_sequence.saturating_add(1),
+            timestamp_ms: keyboard_timestamp_ms.saturating_add(1),
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency".to_string(),
+            summary: "Network latency sample".to_string(),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::new(),
+        };
+        state.local_controls.sequence = backend_event.sequence;
+        push_recent_local_event(&mut state.local_controls, backend_event);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
+        assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
+        assert_eq!(
+            feedback.capture_path.as_deref(),
+            Some("portable-capture")
+        );
+    }
+
+    #[test]
+    fn local_input_feedback_is_unavailable_without_selected_backend() {
+        let mut state = test_daemon_state();
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert_eq!(feedback.event_count, 1);
+    }
+
+    #[test]
+    fn local_input_feedback_is_degraded_when_selected_backend_is_degraded() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.backend_state.aggregate_health = BackendHealth::Degraded {
+            reason: BackendFailureReason::RuntimeError,
+        };
+        let event = state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(event.sequence));
+        assert_eq!(feedback.latest_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_keyboard_event_ms, Some(event.timestamp_ms));
+    }
+
+    #[test]
+    fn local_input_feedback_saturates_event_count() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.local_controls.keyboard.event_count = u64::MAX;
+        state.local_controls.mouse.event_count = 1;
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, u64::MAX);
     }
 
     #[test]
