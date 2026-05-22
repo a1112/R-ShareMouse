@@ -84,6 +84,24 @@ test("buildHardwareAssetChoices groups assets by kind", () => {
   );
 });
 
+test("buildHardwareAssetChoices groups gamepad assets", () => {
+  const gamepad = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.gamepad.xbox",
+    name: "Xbox Style Controller",
+    kind: "gamepad",
+    base_size: { width: 1205, height: 826 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [],
+  });
+  const choices = buildHardwareAssetChoices([gamepad]);
+
+  assert.deepEqual(
+    choices.gamepad.map((choice) => choice.id),
+    ["builtin.gamepad.xbox"],
+  );
+});
+
 test("checked-in office mouse manifest has mapped button regions", () => {
   const raw = JSON.parse(
     readFileSync(
@@ -337,5 +355,16 @@ test("resolveSelectedHardwareAsset falls back to first matching kind", () => {
   assert.equal(
     resolveSelectedHardwareAsset(assets, "keyboard", "missing").id,
     "builtin.keyboard.office",
+  );
+});
+
+test("resolveSelectedHardwareAsset falls back to first matching gamepad", () => {
+  const assets = [
+    { id: "builtin.gamepad.xbox", kind: "gamepad", name: "Xbox Style Controller" },
+  ];
+
+  assert.equal(
+    resolveSelectedHardwareAsset(assets, "gamepad", "missing").id,
+    "builtin.gamepad.xbox",
   );
 });

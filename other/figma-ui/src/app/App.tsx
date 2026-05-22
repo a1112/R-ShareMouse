@@ -412,6 +412,7 @@ const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 const HARDWARE_RIG_VARIANT_STORAGE_KEY = "rshare.hardwareRigVariant";
 const HARDWARE_ASSET_KEYBOARD_STORAGE_KEY = "rshare.hardwareAsset.keyboard";
 const HARDWARE_ASSET_MOUSE_STORAGE_KEY = "rshare.hardwareAsset.mouse";
+const HARDWARE_ASSET_GAMEPAD_STORAGE_KEY = "rshare.hardwareAsset.gamepad";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
@@ -1695,6 +1696,10 @@ export default function App() {
       HARDWARE_ASSET_MOUSE_STORAGE_KEY,
       selectedHardwareAssetIds.mouse,
     );
+    window.localStorage.setItem(
+      HARDWARE_ASSET_GAMEPAD_STORAGE_KEY,
+      selectedHardwareAssetIds.gamepad,
+    );
   }, [selectedHardwareAssetIds]);
 
   useEffect(() => {
@@ -2677,6 +2682,7 @@ function DevicesPageWithLocalControls({
   const setHardwareRigVariant = (variant: HardwareRigVariant) => {
     setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
     setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
+    setSelectedId("gamepad", "builtin.gamepad.xbox");
   };
 
   useEffect(() => {
@@ -3698,7 +3704,7 @@ function DeviceGalleryNode({
   );
 }
 
-type HardwareRigKind = "keyboard" | "mouse";
+type HardwareRigKind = "keyboard" | "mouse" | "gamepad";
 type HardwareRigVariant = "office" | "gaming";
 
 type HardwareRigLayerRole =
@@ -3782,7 +3788,7 @@ type HardwareRigActivity = {
 type InstalledHardwareAsset = {
   id: string;
   name: string;
-  kind: HardwareRigKind | "gamepad";
+  kind: HardwareRigKind;
   manifestPath: string;
   folderPath: string;
   manifest?: Record<string, unknown>;
@@ -3811,6 +3817,7 @@ const DEFAULT_HARDWARE_ASSET_CONTEXT: HardwareAssetContextValue = {
   selectedIds: {
     keyboard: "builtin.keyboard.office",
     mouse: "builtin.mouse.office",
+    gamepad: "builtin.gamepad.xbox",
   },
   setSelectedId: () => undefined,
   refresh: async () => undefined,
@@ -3974,6 +3981,62 @@ const HARDWARE_RIGS: Record<HardwareRigKind, Record<HardwareRigVariant, Hardware
       ],
     },
   },
+  gamepad: {
+    office: {
+      kind: "gamepad",
+      manifest: "/assets/hardware/live2d/gamepad/manifest.json",
+      baseSize: {
+        width: 1205,
+        height: 826,
+      },
+      display: {
+        compactWidth: 280,
+        compactHeight: 180,
+        fullWidth: 720,
+        fullHeight: 430,
+      },
+      layers: [
+        {
+          id: "gamepad-base",
+          role: "base",
+          render: "image",
+          src: "/assets/hardware/live2d/gamepad/base.png",
+        },
+        {
+          id: "gamepad-press-effect",
+          role: "pressEffect",
+          render: "runtime",
+        },
+      ],
+    },
+    gaming: {
+      kind: "gamepad",
+      manifest: "/assets/hardware/live2d/gamepad/manifest.json",
+      baseSize: {
+        width: 1205,
+        height: 826,
+      },
+      display: {
+        compactWidth: 280,
+        compactHeight: 180,
+        fullWidth: 720,
+        fullHeight: 430,
+      },
+      layers: [
+        {
+          id: "gamepad-base",
+          role: "base",
+          render: "image",
+          src: "/assets/hardware/live2d/gamepad/base.png",
+        },
+        {
+          id: "gamepad-press-effect",
+          role: "pressEffect",
+          render: "runtime",
+        },
+      ],
+    },
+  },
 };
 
 const MOUSE_RIG_HOTSPOTS: Record<HardwareRigVariant, Array<{
@@ -4006,9 +4069,13 @@ function builtinHardwareAssetId(kind: HardwareRigKind, variant: HardwareRigVaria
 }
 
 function hardwareAssetStorageKey(kind: HardwareRigKind) {
-  return kind === "keyboard"
-    ? HARDWARE_ASSET_KEYBOARD_STORAGE_KEY
-    : HARDWARE_ASSET_MOUSE_STORAGE_KEY;
+  if (kind === "keyboard") {
+    return HARDWARE_ASSET_KEYBOARD_STORAGE_KEY;
+  }
+  if (kind === "mouse") {
+    return HARDWARE_ASSET_MOUSE_STORAGE_KEY;
+  }
+  return HARDWARE_ASSET_GAMEPAD_STORAGE_KEY;
 }
 
 function loadSelectedHardwareAssetIds(): Record<HardwareRigKind, string> {
@@ -4016,6 +4083,7 @@ function loadSelectedHardwareAssetIds(): Record<HardwareRigKind, string> {
     return {
       keyboard: builtinHardwareAssetId("keyboard", "office"),
       mouse: builtinHardwareAssetId("mouse", "office"),
+      gamepad: "builtin.gamepad.xbox",
     };
   }
 
@@ -4029,6 +4097,9 @@ function loadSelectedHardwareAssetIds(): Record<HardwareRigKind, string> {
     mouse:
       window.localStorage.getItem(HARDWARE_ASSET_MOUSE_STORAGE_KEY) ??
       builtinHardwareAssetId("mouse", legacyVariant),
+    gamepad:
+      window.localStorage.getItem(HARDWARE_ASSET_GAMEPAD_STORAGE_KEY) ??
+      "builtin.gamepad.xbox",
   };
 }
 
@@ -4103,7 +4174,11 @@ function hardwareRigFromManifest(
     baseUrl: options.baseUrl ?? "",
     resolveUrl: options.resolveUrl,
   });
-  if (manifest.kind !== "keyboard" && manifest.kind !== "mouse") {
+  if (
+    manifest.kind !== "keyboard" &&
+    manifest.kind !== "mouse" &&
+    manifest.kind !== "gamepad"
+  ) {
     return null;
   }
 
@@ -7915,6 +7990,11 @@ function HardwareAssetSettingsPanel({
     "mouse",
     selectedIds.mouse,
   ) as HardwareRigDefinition | null;
+  const selectedGamepad = resolveSelectedHardwareAsset(
+    assets,
+    "gamepad",
+    selectedIds.gamepad,
+  ) as HardwareRigDefinition | null;
 
   const handleImportFile = async (file: File | null | undefined) => {
     if (!file) {
@@ -7954,7 +8034,7 @@ function HardwareAssetSettingsPanel({
     icon: ReactNode,
     selected: HardwareRigDefinition | null,
   ) => {
-    const options = kind === "keyboard" ? choices.keyboard : choices.mouse;
+    const options = choices[kind] ?? [];
     return (
       <label className="block min-w-0 flex-1 text-sm">
         <span className="mb-1 flex items-center gap-2" style={{ color: theme.textSub }}>
@@ -8008,7 +8088,7 @@ function HardwareAssetSettingsPanel({
         </div>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-2">
+      <div className="grid gap-3 md:grid-cols-3">
         {renderSelect(
           "keyboard",
           "键盘资产",
@@ -8020,6 +8100,12 @@ function HardwareAssetSettingsPanel({
           "鼠标资产",
           <MousePointer2 size={14} />,
           selectedMouse,
+        )}
+        {renderSelect(
+          "gamepad",
+          "手柄资产",
+          <Gamepad2 size={14} />,
+          selectedGamepad,
         )}
       </div>
 
