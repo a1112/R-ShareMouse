@@ -22,10 +22,11 @@ use rshare_core::{
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
-    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
+    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -481,6 +482,104 @@ impl DaemonState {
             latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
             capture_path: latest_event.and_then(|event| event.capture_path.clone()),
         }
+    }
+
+    // Staged for Task 5 status snapshot wiring.
+    #[allow(dead_code)]
+    fn remote_latency_feedback(&self, now_ms: u64) -> RemoteLatencyFeedback {
+        let mut tracked_devices: Vec<_> = self.devices.values().collect();
+        tracked_devices.sort_by_key(|device| device.id.to_string());
+
+        let devices = tracked_devices
+            .into_iter()
+            .map(|device| {
+                let mut feedback = RemoteDeviceLatencyFeedback {
+                    device_id: device.id,
+                    status: LatencyFeedbackStatus::Unavailable,
+                    device_name: Some(device.name.clone()),
+                    last_probe_sent_ms: None,
+                    last_ack_ms: None,
+                    pending_duration_ms: None,
+                    network_round_trip_ms: None,
+                    raw_round_trip_ms: None,
+                    estimated_one_way_ms: None,
+                    remote_processing_ms: None,
+                    direction: None,
+                    summary: None,
+                };
+
+                if !device.connected {
+                    return feedback;
+                }
+
+                let latest_pending = self
+                    .pending_latency_probes
+                    .iter()
+                    .filter(|(_, probe)| probe.target == device.id)
+                    .max_by_key(|(sequence, probe)| (probe.sent_at_ms, **sequence));
+                let latest_ack = self
+                    .local_controls
+                    .recent_events
+                    .iter()
+                    .filter(|event| is_latency_ack_event(event))
+                    .filter(|event| latency_event_matches_target(event, device.id))
+                    .max_by_key(|event| (event.timestamp_ms, event.sequence));
+
+                if let Some((_, pending)) = latest_pending {
+                    let pending_is_newest = latest_ack
+                        .map(|ack| pending.sent_at_ms > ack.timestamp_ms)
+                        .unwrap_or(true);
+                    if pending_is_newest {
+                        let pending_duration_ms = now_ms.saturating_sub(pending.sent_at_ms);
+                        feedback.status = if pending_duration_ms > LATENCY_PROBE_TIMEOUT_MS {
+                            LatencyFeedbackStatus::Timeout
+                        } else {
+                            LatencyFeedbackStatus::Pending
+                        };
+                        feedback.last_probe_sent_ms = Some(pending.sent_at_ms);
+                        feedback.pending_duration_ms = Some(pending_duration_ms);
+                        return feedback;
+                    }
+                }
+
+                if let Some(ack) = latest_ack {
+                    let network_round_trip_ms = parse_latency_payload_u64(
+                        &ack.payload,
+                        &["network_round_trip_ms", "latency_ms"],
+                    );
+                    feedback.status =
+                        if network_round_trip_ms.is_some_and(|rtt| rtt <= LATENCY_HEALTHY_RTT_MS) {
+                            LatencyFeedbackStatus::Healthy
+                        } else {
+                            LatencyFeedbackStatus::Degraded
+                        };
+                    feedback.last_ack_ms = Some(ack.timestamp_ms);
+                    feedback.network_round_trip_ms = network_round_trip_ms;
+                    feedback.raw_round_trip_ms = parse_latency_payload_u64(
+                        &ack.payload,
+                        &["raw_round_trip_ms", "raw_latency_ms"],
+                    );
+                    feedback.estimated_one_way_ms =
+                        parse_latency_payload_u64(&ack.payload, &["estimated_one_way_ms"]);
+                    feedback.remote_processing_ms =
+                        parse_latency_payload_u64(&ack.payload, &["remote_processing_ms"]);
+                    feedback.direction = ack.payload.get("direction").cloned();
+                    feedback.summary = Some(ack.summary.clone());
+                } else {
+                    feedback.status = LatencyFeedbackStatus::Idle;
+                }
+
+                feedback
+            })
+            .collect::<Vec<_>>();
+
+        let status = devices
+            .iter()
+            .map(|device| device.status)
+            .max_by_key(|status| latency_feedback_status_priority(*status))
+            .unwrap_or(LatencyFeedbackStatus::Unavailable);
+
+        RemoteLatencyFeedback { status, devices }
     }
 
     fn sync_endpoint_events_from_recent(&mut self) {
@@ -1356,6 +1455,8 @@ fn timestamp_ms_now() -> u64 {
 const LATENCY_HEALTHY_RTT_MS: u64 = 50;
 #[allow(dead_code)]
 const LATENCY_DEGRADED_RTT_MS: u64 = 120;
+#[allow(dead_code)]
+const LATENCY_PROBE_TIMEOUT_MS: u64 = 1_500;
 
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
     let mut snapshot = NetworkTransportSnapshot {
@@ -1433,6 +1534,48 @@ fn transport_feedback_from_network(
         datagram_tx_dropped: network.datagram_tx_dropped,
         reliable_stream_reset_count: network.reliable_stream_reset_count,
         cert_trust_state: network.cert_trust_state.clone(),
+    }
+}
+
+#[allow(dead_code)]
+fn is_latency_ack_event(event: &LocalInputDiagnosticEvent) -> bool {
+    matches!(
+        event.event_kind.as_str(),
+        "latency_probe_ack" | "latency_endpoint_switch_ack"
+    )
+}
+
+#[allow(dead_code)]
+fn parse_latency_payload_u64(payload: &BTreeMap<String, String>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| payload.get(*key))
+        .find_map(|value| value.parse::<u64>().ok())
+}
+
+#[allow(dead_code)]
+fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: DeviceId) -> bool {
+    ["target_device_id", "origin_device_id"]
+        .iter()
+        .filter_map(|key| event.payload.get(*key))
+        .filter_map(|value| DeviceId::parse_str(value).ok())
+        .chain(
+            event
+                .device_id
+                .as_deref()
+                .and_then(|value| DeviceId::parse_str(value).ok()),
+        )
+        .any(|candidate| candidate == target)
+}
+
+#[allow(dead_code)]
+fn latency_feedback_status_priority(status: LatencyFeedbackStatus) -> u8 {
+    match status {
+        LatencyFeedbackStatus::Timeout => 5,
+        LatencyFeedbackStatus::Degraded => 4,
+        LatencyFeedbackStatus::Pending => 3,
+        LatencyFeedbackStatus::Healthy => 2,
+        LatencyFeedbackStatus::Idle => 1,
+        LatencyFeedbackStatus::Unavailable => 0,
     }
 }
 
@@ -6743,6 +6886,168 @@ mod tests {
         let feedback = transport_feedback_from_network(&network, 1);
 
         assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1250);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        let device = &feedback.devices[0];
+        assert_eq!(device.device_id, remote_id);
+        assert_eq!(device.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(device.last_probe_sent_ms, Some(1000));
+        assert_eq!(device.pending_duration_ms, Some(250));
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_timeout_for_stale_pending_probe() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(3000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Timeout);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Timeout);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(2000));
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_ack_metrics() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        payload.insert("raw_round_trip_ms".to_string(), "30".to_string());
+        payload.insert("estimated_one_way_ms".to_string(), "12".to_string());
+        payload.insert("remote_processing_ms".to_string(), "6".to_string());
+        payload.insert("direction".to_string(), "origin_to_endpoint".to_string());
+        let event = record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.devices.len(), 1);
+        let device = &feedback.devices[0];
+        assert_eq!(device.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(device.last_ack_ms, Some(event.timestamp_ms));
+        assert_eq!(device.network_round_trip_ms, Some(24));
+        assert_eq!(device.raw_round_trip_ms, Some(30));
+        assert_eq!(device.estimated_one_way_ms, Some(12));
+        assert_eq!(device.remote_processing_ms, Some(6));
+        assert_eq!(device.direction.as_deref(), Some("origin_to_endpoint"));
+        assert_eq!(
+            device.summary.as_deref(),
+            Some("Latency to remote: 24 ms RTT / ~12 ms one-way")
+        );
+    }
+
+    #[test]
+    fn remote_latency_feedback_degrades_ack_missing_or_high_rtt() {
+        let mut state = test_daemon_state();
+        let missing_rtt_id = DeviceId::new_v4();
+        let high_rtt_id = DeviceId::new_v4();
+        state.mark_connected(&missing_rtt_id, true);
+        state.mark_connected(&high_rtt_id, true);
+
+        record_latency_diagnostic_event(
+            &mut state,
+            missing_rtt_id,
+            "latency_probe_ack",
+            "Latency probe missing RTT",
+            BTreeMap::new(),
+        );
+
+        let mut high_rtt_payload = BTreeMap::new();
+        high_rtt_payload.insert("target_device_id".to_string(), high_rtt_id.to_string());
+        high_rtt_payload.insert("network_round_trip_ms".to_string(), "51".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            high_rtt_id,
+            "latency_probe_ack",
+            "Latency probe high RTT",
+            high_rtt_payload,
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+        let missing = feedback
+            .devices
+            .iter()
+            .find(|device| device.device_id == missing_rtt_id)
+            .expect("missing RTT device feedback");
+        assert_eq!(missing.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(missing.network_round_trip_ms, None);
+        let high = feedback
+            .devices
+            .iter()
+            .find(|device| device.device_id == high_rtt_id)
+            .expect("high RTT device feedback");
+        assert_eq!(high.status, LatencyFeedbackStatus::Degraded);
+        assert_eq!(high.network_round_trip_ms, Some(51));
+    }
+
+    #[test]
+    fn remote_latency_feedback_reports_disconnected_device_unavailable() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: Vec::new(),
+                connected: false,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(timestamp_ms_now());
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].device_id, remote_id);
+        assert_eq!(feedback.devices[0].device_name.as_deref(), Some("remote"));
+        assert_eq!(
+            feedback.devices[0].status,
+            LatencyFeedbackStatus::Unavailable
+        );
+        assert_eq!(feedback.devices[0].network_round_trip_ms, None);
+        assert_eq!(feedback.devices[0].pending_duration_ms, None);
     }
 
     #[test]
