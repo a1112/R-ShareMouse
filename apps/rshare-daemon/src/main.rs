@@ -1280,7 +1280,10 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+// Staged for Task 5 status snapshot wiring.
+#[allow(dead_code)]
 const LATENCY_HEALTHY_RTT_MS: u64 = 50;
+#[allow(dead_code)]
 const LATENCY_DEGRADED_RTT_MS: u64 = 120;
 
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
@@ -1322,6 +1325,8 @@ fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkT
     snapshot
 }
 
+// Staged for Task 5 status snapshot wiring.
+#[allow(dead_code)]
 fn transport_feedback_from_network(
     network: &NetworkTransportSnapshot,
     connected_devices: usize,
@@ -1332,6 +1337,7 @@ fn transport_feedback_from_network(
         || !network.datagram_available
         || network.datagram_tx_dropped > 0
         || network.reliable_stream_reset_count > 0
+        || network.rtt_ms.is_none()
         || network
             .rtt_ms
             .is_some_and(|rtt| rtt >= LATENCY_DEGRADED_RTT_MS)
@@ -6646,6 +6652,20 @@ mod tests {
             datagram_available: false,
             realtime_degraded: true,
             rtt_ms: Some(22),
+            ..NetworkTransportSnapshot::default()
+        };
+
+        let feedback = transport_feedback_from_network(&network, 1);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
+    }
+
+    #[test]
+    fn transport_feedback_degrades_without_rtt_measurement() {
+        let network = NetworkTransportSnapshot {
+            datagram_available: true,
+            realtime_degraded: false,
+            rtt_ms: None,
             ..NetworkTransportSnapshot::default()
         };
 
