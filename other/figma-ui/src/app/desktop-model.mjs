@@ -718,13 +718,37 @@ function isRemoteLatencySent(event) {
   );
 }
 
+function remoteLatencyProbeSequence(event) {
+  const payload = event?.payload ?? {};
+  if (event?.event_kind === "latency_endpoint_switch_ack") {
+    return numberOrNull(payload.origin_probe_sequence) ?? numberOrNull(payload.probe_sequence);
+  }
+  return numberOrNull(payload.probe_sequence) ?? numberOrNull(payload.origin_probe_sequence);
+}
+
 function sortNewestEvent(left, right) {
-  const leftTime = Number(left?.timestamp_ms ?? 0);
-  const rightTime = Number(right?.timestamp_ms ?? 0);
+  const leftProbeSequence = remoteLatencyProbeSequence(left);
+  const rightProbeSequence = remoteLatencyProbeSequence(right);
+  if (
+    leftProbeSequence != null &&
+    rightProbeSequence != null &&
+    leftProbeSequence !== rightProbeSequence
+  ) {
+    return rightProbeSequence - leftProbeSequence;
+  }
+
+  const leftSequence = numberOrNull(left?.sequence);
+  const rightSequence = numberOrNull(right?.sequence);
+  if (leftSequence != null && rightSequence != null && leftSequence !== rightSequence) {
+    return rightSequence - leftSequence;
+  }
+
+  const leftTime = numberOrNull(left?.timestamp_ms) ?? 0;
+  const rightTime = numberOrNull(right?.timestamp_ms) ?? 0;
   if (leftTime !== rightTime) {
     return rightTime - leftTime;
   }
-  return Number(right?.sequence ?? 0) - Number(left?.sequence ?? 0);
+  return 0;
 }
 
 function eventIsNewer(left, right) {

@@ -562,6 +562,46 @@ test("buildRemoteLatencySummary shows newer sent event instead of older ACK metr
   assert.equal(summary.timestampMs, 1100);
 });
 
+test("buildRemoteLatencySummary uses local sequence when ACK timestamp is skewed ahead", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 20,
+          timestamp_ms: 9000,
+          device_kind: "Backend",
+          event_kind: "latency_probe_ack",
+          summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "20",
+            network_round_trip_ms: "24",
+          },
+        },
+        {
+          sequence: 21,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "21",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.timestampMs, 1100);
+});
+
 test("buildRemoteLatencySummary matches mirrored endpoint ACK by remote_device_id", () => {
   const deviceId = "00000000-0000-0000-0000-000000000001";
   const localId = "00000000-0000-0000-0000-000000000002";
