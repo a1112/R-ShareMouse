@@ -16,17 +16,16 @@ use rshare_core::{
     DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
     EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
     EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, FeatureConfig, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LatencyFeedbackStatus,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
-    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
+    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
+    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
+    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest,
+    LocalInputTestResult, LocalInputTestStatus, Message, NetworkTransportSnapshot,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode,
+    ScreenInfo, ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
+    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -311,6 +310,35 @@ impl DaemonState {
         snapshot
     }
 
+    fn latency_feedback_snapshot(
+        &self,
+        network: &NetworkTransportSnapshot,
+    ) -> LatencyFeedbackSnapshot {
+        let now_ms = timestamp_ms_now();
+        let connected_devices = self
+            .devices
+            .values()
+            .filter(|device| device.connected)
+            .count();
+
+        LatencyFeedbackSnapshot {
+            generated_at_ms: now_ms,
+            local_input: self.local_input_feedback(),
+            remote_latency: self.remote_latency_feedback(now_ms),
+            transport: transport_feedback_from_network(network, connected_devices),
+        }
+    }
+
+    fn status_snapshot_with_network(
+        &self,
+        network: &NetworkTransportSnapshot,
+    ) -> ServiceStatusSnapshot {
+        let mut snapshot = self.status_snapshot();
+        snapshot.network = network.clone();
+        snapshot.latency_feedback = self.latency_feedback_snapshot(network);
+        snapshot
+    }
+
     fn device_snapshots(&self) -> Vec<DaemonDeviceSnapshot> {
         let mut devices: Vec<_> = self
             .devices
@@ -431,8 +459,6 @@ impl DaemonState {
         self.local_controls.clone()
     }
 
-    // Staged for Task 5 status snapshot wiring.
-    #[allow(dead_code)]
     fn local_input_feedback(&self) -> LocalInputFeedback {
         let event_count = self
             .local_controls
@@ -493,8 +519,6 @@ impl DaemonState {
         }
     }
 
-    // Staged for Task 5 status snapshot wiring.
-    #[allow(dead_code)]
     fn remote_latency_feedback(&self, now_ms: u64) -> RemoteLatencyFeedback {
         let mut tracked_devices: Vec<_> = self.devices.values().collect();
         tracked_devices.sort_by_key(|device| device.id.to_string());
@@ -1466,12 +1490,8 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-// Staged for Task 5 status snapshot wiring.
-#[allow(dead_code)]
 const LATENCY_HEALTHY_RTT_MS: u64 = 50;
-#[allow(dead_code)]
 const LATENCY_DEGRADED_RTT_MS: u64 = 120;
-#[allow(dead_code)]
 const LATENCY_PROBE_TIMEOUT_MS: u64 = 1_500;
 
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
@@ -1513,8 +1533,6 @@ fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkT
     snapshot
 }
 
-// Staged for Task 5 status snapshot wiring.
-#[allow(dead_code)]
 fn transport_feedback_from_network(
     network: &NetworkTransportSnapshot,
     connected_devices: usize,
@@ -1553,7 +1571,6 @@ fn transport_feedback_from_network(
     }
 }
 
-#[allow(dead_code)]
 fn is_latency_ack_event(event: &LocalInputDiagnosticEvent) -> bool {
     matches!(
         event.event_kind.as_str(),
@@ -1561,14 +1578,12 @@ fn is_latency_ack_event(event: &LocalInputDiagnosticEvent) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn parse_latency_payload_u64(payload: &BTreeMap<String, String>, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .filter_map(|key| payload.get(*key))
         .find_map(|value| value.parse::<u64>().ok())
 }
 
-#[allow(dead_code)]
 fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: DeviceId) -> bool {
     ["target_device_id", "origin_device_id"]
         .iter()
@@ -1583,7 +1598,6 @@ fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: Devic
         .any(|candidate| candidate == target)
 }
 
-#[allow(dead_code)]
 fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> {
     if event.event_kind == "latency_endpoint_switch_ack" {
         return parse_latency_payload_u64(&event.payload, &["origin_probe_sequence"])
@@ -1593,7 +1607,6 @@ fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> 
     parse_latency_payload_u64(&event.payload, &["probe_sequence"])
 }
 
-#[allow(dead_code)]
 fn latency_feedback_status_priority(status: LatencyFeedbackStatus) -> u8 {
     match status {
         LatencyFeedbackStatus::Timeout => 5,
@@ -6368,10 +6381,9 @@ async fn handle_ipc_client(
                 let manager = network_manager.lock().await;
                 manager.connection_infos().await
             };
+            let network = network_snapshot_from_connections(&connection_infos);
             let state = state.read().await;
-            let mut snapshot = state.status_snapshot();
-            snapshot.network = network_snapshot_from_connections(&connection_infos);
-            DaemonResponse::Status(snapshot)
+            DaemonResponse::Status(state.status_snapshot_with_network(&network))
         }
         DaemonRequest::Devices => {
             let state = state.read().await;
@@ -7345,10 +7357,7 @@ mod tests {
         assert_eq!(feedback.event_count, 1);
         assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
         assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
-        assert_eq!(
-            feedback.capture_path.as_deref(),
-            Some("portable-capture")
-        );
+        assert_eq!(feedback.capture_path.as_deref(), Some("portable-capture"));
     }
 
     #[test]
@@ -7388,11 +7397,11 @@ mod tests {
         assert_eq!(feedback.event_count, 1);
         assert_eq!(feedback.latest_sequence, Some(keyboard_sequence));
         assert_eq!(feedback.latest_event_ms, Some(keyboard_timestamp_ms));
-        assert_eq!(feedback.latest_keyboard_event_ms, Some(keyboard_timestamp_ms));
         assert_eq!(
-            feedback.capture_path.as_deref(),
-            Some("portable-capture")
+            feedback.latest_keyboard_event_ms,
+            Some(keyboard_timestamp_ms)
         );
+        assert_eq!(feedback.capture_path.as_deref(), Some("portable-capture"));
     }
 
     #[test]
@@ -8959,6 +8968,46 @@ mod tests {
             Some(ControlSessionState::LocalReady)
         );
         assert_eq!(snapshot.active_target, None);
+    }
+
+    #[test]
+    fn status_snapshot_includes_latency_feedback() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        let network = NetworkTransportSnapshot::default();
+
+        let snapshot = state.status_snapshot_with_network(&network);
+
+        assert_eq!(
+            snapshot.latency_feedback.local_input.status,
+            LatencyFeedbackStatus::Idle
+        );
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn status_snapshot_latency_feedback_uses_passed_network_snapshot() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        let network = NetworkTransportSnapshot {
+            datagram_available: true,
+            realtime_degraded: false,
+            rtt_ms: Some(12),
+            ..NetworkTransportSnapshot::default()
+        };
+
+        let snapshot = state.status_snapshot_with_network(&network);
+
+        assert_eq!(snapshot.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
+        assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
     }
 
     #[test]
