@@ -10,6 +10,7 @@ pub mod daemon_client;
 pub mod device;
 pub mod endpoint_events;
 pub mod engine;
+pub mod hardware_assets;
 pub mod input_mode;
 pub mod ipc;
 pub mod layout;
@@ -37,6 +38,14 @@ pub use device::{Device, DevicePosition, DeviceRegistry, DeviceStatus, ScreenLay
 // Re-exports from config
 pub use config::Config;
 pub use config::{FeatureConfig, GamepadConfig, GamepadRoutingMode};
+
+// Re-exports from hardware asset packs
+pub use hardware_assets::{
+    HardwareAssetKind, HardwareAssetLayer, HardwareAssetManifest, HardwareAssetSize,
+    HardwareAssetValidationError, HardwareControlAction, HardwareControlRegion,
+    HardwareMaskChannel, HardwareMaskMapping, HardwarePoint, HardwareRegionShape,
+    HARDWARE_ASSET_SCHEMA_VERSION,
+};
 
 // Re-exports from clipboard
 pub use clipboard::ClipboardContent;
