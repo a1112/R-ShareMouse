@@ -1585,6 +1585,11 @@ fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: Devic
 
 #[allow(dead_code)]
 fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> {
+    if event.event_kind == "latency_endpoint_switch_ack" {
+        return parse_latency_payload_u64(&event.payload, &["origin_probe_sequence"])
+            .or_else(|| parse_latency_payload_u64(&event.payload, &["probe_sequence"]));
+    }
+
     parse_latency_payload_u64(&event.payload, &["probe_sequence"])
 }
 
@@ -6997,6 +7002,50 @@ mod tests {
             .recent_events
             .last_mut()
             .expect("latency ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 9;
+        state.local_controls.sequence = 9;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1150);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
+    fn remote_latency_feedback_uses_origin_probe_sequence_for_endpoint_switch_ack_ordering() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("origin_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "99".to_string());
+        payload.insert("origin_probe_sequence".to_string(), "7".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_endpoint_switch_ack",
+            "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency endpoint switch ACK event");
         ack.timestamp_ms = 1100;
         ack.sequence = 9;
         state.local_controls.sequence = 9;
