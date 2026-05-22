@@ -249,9 +249,15 @@ impl DaemonState {
 
     fn remove_device(&mut self, id: &DeviceId) {
         self.devices.remove(id);
+        self.clear_pending_latency_probes_for(*id);
         self.local_controls
             .remote_usb_devices
             .retain(|device| device.device_id != *id);
+    }
+
+    fn clear_pending_latency_probes_for(&mut self, id: DeviceId) {
+        self.pending_latency_probes
+            .retain(|_, probe| probe.target != id);
     }
 
     fn mark_connected(&mut self, id: &DeviceId, connected: bool) {
@@ -271,6 +277,9 @@ impl DaemonState {
                     last_seen_at: Instant::now(),
                 },
             );
+        }
+        if !connected {
+            self.clear_pending_latency_probes_for(*id);
         }
         for device in &mut self.local_controls.remote_usb_devices {
             if device.device_id == *id {
@@ -528,8 +537,12 @@ impl DaemonState {
                 if let Some((pending_sequence, pending)) = latest_pending {
                     let pending_is_newest = latest_ack
                         .map(|ack| {
-                            (pending.sent_at_ms, *pending_sequence)
-                                > (ack.timestamp_ms, ack.sequence)
+                            latency_ack_probe_sequence(ack)
+                                .map(|ack_sequence| *pending_sequence > ack_sequence)
+                                .unwrap_or_else(|| {
+                                    (pending.sent_at_ms, *pending_sequence)
+                                        > (ack.timestamp_ms, ack.sequence)
+                                })
                         })
                         .unwrap_or(true);
                     if pending_is_newest {
@@ -1568,6 +1581,11 @@ fn latency_event_matches_target(event: &LocalInputDiagnosticEvent, target: Devic
                 .and_then(|value| DeviceId::parse_str(value).ok()),
         )
         .any(|candidate| candidate == target)
+}
+
+#[allow(dead_code)]
+fn latency_ack_probe_sequence(event: &LocalInputDiagnosticEvent) -> Option<u64> {
+    parse_latency_payload_u64(&event.payload, &["probe_sequence"])
 }
 
 #[allow(dead_code)]
@@ -6958,6 +6976,48 @@ mod tests {
     }
 
     #[test]
+    fn remote_latency_feedback_prefers_newer_pending_over_delayed_old_ack() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+
+        let mut payload = BTreeMap::new();
+        payload.insert("target_device_id".to_string(), remote_id.to_string());
+        payload.insert("probe_sequence".to_string(), "7".to_string());
+        payload.insert("network_round_trip_ms".to_string(), "24".to_string());
+        record_latency_diagnostic_event(
+            &mut state,
+            remote_id,
+            "latency_probe_ack",
+            "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            payload,
+        );
+        let ack = state
+            .local_controls
+            .recent_events
+            .last_mut()
+            .expect("latency ACK event");
+        ack.timestamp_ms = 1100;
+        ack.sequence = 9;
+        state.local_controls.sequence = 9;
+        state.pending_latency_probes.insert(
+            8,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        let feedback = state.remote_latency_feedback(1150);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Pending);
+        assert_eq!(feedback.devices[0].pending_duration_ms, Some(150));
+    }
+
+    #[test]
     fn remote_latency_feedback_reports_timeout_for_stale_pending_probe() {
         let mut state = test_daemon_state();
         let remote_id = DeviceId::new_v4();
@@ -6977,6 +7037,35 @@ mod tests {
         assert_eq!(feedback.devices.len(), 1);
         assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Timeout);
         assert_eq!(feedback.devices[0].pending_duration_ms, Some(2000));
+    }
+
+    #[test]
+    fn remote_latency_pending_probes_are_cleared_when_device_is_removed() {
+        let mut state = test_daemon_state();
+        let remote_id = DeviceId::new_v4();
+        state.mark_connected(&remote_id, true);
+        state.pending_latency_probes.insert(
+            7,
+            PendingLatencyProbe {
+                target: remote_id,
+                sent_at_ms: 1000,
+                role: PendingLatencyProbeRole::LocalRequested,
+            },
+        );
+
+        state.remove_device(&remote_id);
+
+        assert!(!state
+            .pending_latency_probes
+            .values()
+            .any(|probe| probe.target == remote_id));
+
+        state.mark_connected(&remote_id, true);
+        let feedback = state.remote_latency_feedback(3000);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Idle);
+        assert_eq!(feedback.devices.len(), 1);
+        assert_eq!(feedback.devices[0].status, LatencyFeedbackStatus::Idle);
     }
 
     #[test]
