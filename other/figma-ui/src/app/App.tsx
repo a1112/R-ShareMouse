@@ -3782,6 +3782,7 @@ type HardwareRigActivity = {
   wheelActive?: boolean;
   wheelLabel?: string;
   recentButtons?: string[];
+  pressedButtons?: string[];
 };
 
 type InstalledHardwareAsset = {
@@ -7476,7 +7477,7 @@ function SimulatedGamepad({
             theme={theme}
             compact={compact}
             fitToHeight
-            fitMaxHeight={compact ? 180 : 260}
+            fitMaxHeight={compact ? 170 : 230}
           />
         </div>
       </div>

@@ -182,6 +182,15 @@ test("checked-in xbox style gamepad manifest has mapped button regions", () => {
   assert.deepEqual(activeRegionIds(["South"]), ["gamepad.button.a"]);
   assert.deepEqual(activeRegionIds(["DPadUp"]), ["gamepad.dpad.up"]);
   assert.deepEqual(activeRegionIds(["LeftTrigger"]), ["gamepad.trigger.left"]);
+  assert.deepEqual(activeRegionIds(["Cross"]), ["gamepad.button.a"]);
+  assert.deepEqual(activeRegionIds(["Circle"]), ["gamepad.button.b"]);
+  assert.deepEqual(activeRegionIds(["Square"]), ["gamepad.button.x"]);
+  assert.deepEqual(activeRegionIds(["Triangle"]), ["gamepad.button.y"]);
+  assert.deepEqual(activeRegionIds(["Share"]), ["gamepad.button.select"]);
+  assert.deepEqual(activeRegionIds(["Options"]), ["gamepad.button.start"]);
+  assert.deepEqual(activeRegionIds(["Xbox"]), ["gamepad.button.guide"]);
+  assert.deepEqual(activeRegionIds(["LeftThumbstick"]), ["gamepad.stick.left"]);
+  assert.deepEqual(activeRegionIds(["RightThumbstick"]), ["gamepad.stick.right"]);
 
   const regionCenter = (id) => {
     const region = regionsById.get(id);

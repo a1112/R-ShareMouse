@@ -30,7 +30,9 @@
           "A",
           "South",
           "ButtonSouth",
-          "ButtonA"
+          "ButtonA",
+          "FaceDown",
+          "Cross"
         ]
       },
       "shape": {
@@ -51,7 +53,9 @@
           "B",
           "East",
           "ButtonEast",
-          "ButtonB"
+          "ButtonB",
+          "FaceRight",
+          "Circle"
         ]
       },
       "shape": {
@@ -72,7 +76,9 @@
           "X",
           "West",
           "ButtonWest",
-          "ButtonX"
+          "ButtonX",
+          "FaceLeft",
+          "Square"
         ]
       },
       "shape": {
@@ -93,7 +99,9 @@
           "Y",
           "North",
           "ButtonNorth",
-          "ButtonY"
+          "ButtonY",
+          "FaceUp",
+          "Triangle"
         ]
       },
       "shape": {
@@ -381,6 +389,7 @@
         "buttons": [
           "LeftStick",
           "LeftThumb",
+          "LeftThumbstick",
           "LS",
           "L3"
         ]
@@ -402,6 +411,7 @@
         "buttons": [
           "RightStick",
           "RightThumb",
+          "RightThumbstick",
           "RS",
           "R3"
         ]
@@ -423,7 +433,8 @@
         "buttons": [
           "Select",
           "Back",
-          "View"
+          "View",
+          "Share"
         ]
       },
       "shape": {
@@ -442,7 +453,8 @@
         "kind": "gamepad_button",
         "buttons": [
           "Start",
-          "Menu"
+          "Menu",
+          "Options"
         ]
       },
       "shape": {
@@ -462,7 +474,8 @@
         "buttons": [
           "Guide",
           "Mode",
-          "Home"
+          "Home",
+          "Xbox"
         ]
       },
       "shape": {
