@@ -433,6 +433,30 @@ fn default_status_snapshot_starts_empty_and_healthy() {
 }
 
 #[test]
+fn latency_feedback_defaults_to_safe_unavailable_state() {
+    let snapshot: rshare_core::ServiceStatusSnapshot = serde_json::from_str(
+        r#"{
+            "device_id":"00000000-0000-0000-0000-000000000000",
+            "device_name":"desktop",
+            "hostname":"desktop-host",
+            "bind_address":"0.0.0.0:27431",
+            "discovery_port":27432,
+            "pid":42,
+            "discovered_devices":0,
+            "connected_devices":0,
+            "healthy":true
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot.latency_feedback.transport.status,
+        rshare_core::LatencyFeedbackStatus::Unavailable
+    );
+    assert!(snapshot.latency_feedback.remote_latency.devices.is_empty());
+}
+
+#[test]
 fn default_status_snapshot_reports_daemon_owned_background_runtime() {
     let snapshot = ServiceStatusSnapshot::new(
         Uuid::nil(),
