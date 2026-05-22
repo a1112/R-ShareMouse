@@ -787,6 +787,7 @@ function buildDaemonRemoteLatencySummary(daemonFeedback) {
       state: status === "healthy" ? "pass" : "warn",
       message: daemonFeedback.summary ?? "Latency ACK received",
       ...metrics,
+      sequence: numberOrNull(daemonFeedback.latest_sequence),
       timestampMs,
     };
   }
@@ -800,6 +801,7 @@ function buildDaemonRemoteLatencySummary(daemonFeedback) {
       rawRoundTripMs: null,
       remoteProcessingMs: null,
       direction: daemonFeedback.direction ?? null,
+      sequence: numberOrNull(daemonFeedback.latest_sequence),
       timestampMs: numberOrNull(daemonFeedback.last_probe_sent_ms),
     };
   }
@@ -817,6 +819,7 @@ function buildDaemonRemoteLatencySummary(daemonFeedback) {
       rawRoundTripMs: null,
       remoteProcessingMs: null,
       direction: daemonFeedback.direction ?? null,
+      sequence: numberOrNull(daemonFeedback.latest_sequence),
       timestampMs: numberOrNull(daemonFeedback.last_probe_sent_ms),
     };
   }
@@ -830,6 +833,7 @@ function buildDaemonRemoteLatencySummary(daemonFeedback) {
       rawRoundTripMs: null,
       remoteProcessingMs: null,
       direction: daemonFeedback.direction ?? null,
+      sequence: numberOrNull(daemonFeedback.latest_sequence),
       timestampMs: null,
     };
   }
@@ -842,6 +846,7 @@ function buildDaemonRemoteLatencySummary(daemonFeedback) {
     rawRoundTripMs: null,
     remoteProcessingMs: null,
     direction: daemonFeedback.direction ?? null,
+    sequence: numberOrNull(daemonFeedback.latest_sequence),
     timestampMs: null,
   };
 }
@@ -853,6 +858,11 @@ function eventSummaryIsNewerThanDaemon(eventSummary, daemonFeedback, snapshot) {
   const eventTimestampMs = numberOrNull(eventSummary.timestampMs);
   if (eventTimestampMs == null) {
     return false;
+  }
+  const eventSequence = numberOrNull(eventSummary.sequence);
+  const daemonSequence = numberOrNull(daemonFeedback.latest_sequence);
+  if (eventSequence != null && daemonSequence != null) {
+    return eventSequence > daemonSequence;
   }
   const generatedAtMs = numberOrNull(snapshot?.latency_feedback?.generated_at_ms);
   const daemonTimestampMs =
@@ -877,6 +887,7 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
       rawRoundTripMs: null,
       remoteProcessingMs: null,
       direction: sent.payload?.direction ?? null,
+      sequence: numberOrNull(sent.sequence),
       timestampMs: numberOrNull(sent.timestamp_ms),
     };
   }
@@ -899,6 +910,7 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
       rawRoundTripMs,
       remoteProcessingMs,
       direction: payload.direction ?? null,
+      sequence: numberOrNull(ack.sequence),
       timestampMs: numberOrNull(ack.timestamp_ms),
     };
   }
@@ -912,6 +924,7 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
       rawRoundTripMs: null,
       remoteProcessingMs: null,
       direction: sent.payload?.direction ?? null,
+      sequence: numberOrNull(sent.sequence),
       timestampMs: numberOrNull(sent.timestamp_ms),
     };
   }
@@ -924,6 +937,7 @@ function buildRemoteLatencyEventSummary(snapshot, deviceId) {
     rawRoundTripMs: null,
     remoteProcessingMs: null,
     direction: null,
+    sequence: null,
     timestampMs: null,
   };
 }

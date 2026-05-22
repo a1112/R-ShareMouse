@@ -215,6 +215,8 @@ pub struct RemoteDeviceLatencyFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe_sent_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ack_ms: Option<u64>,

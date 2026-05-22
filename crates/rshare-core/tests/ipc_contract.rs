@@ -482,6 +482,7 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
             device_id: Uuid::nil(),
             status: rshare_core::LatencyFeedbackStatus::Healthy,
             device_name: Some("laptop".to_string()),
+            latest_sequence: Some(9),
             last_probe_sent_ms: Some(100),
             last_ack_ms: Some(112),
             pending_duration_ms: None,

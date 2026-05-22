@@ -533,6 +533,7 @@ test("buildRemoteLatencySummary lets newer event override daemon ACK timestamp s
             {
               device_id: deviceId,
               status: "Healthy",
+              latest_sequence: 20,
               last_ack_ms: 9000,
               network_round_trip_ms: 24,
             },
@@ -560,6 +561,49 @@ test("buildRemoteLatencySummary lets newer event override daemon ACK timestamp s
   assert.equal(summary.state, "pending");
   assert.equal(summary.networkRoundTripMs, null);
   assert.equal(summary.timestampMs, 1100);
+});
+
+test("buildRemoteLatencySummary lets fresh mirrored ACK override stale daemon pending by sequence", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 5000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Pending",
+              latest_sequence: 29,
+              last_probe_sent_ms: 4900,
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 30,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            remote_device_id: deviceId,
+            origin_probe_sequence: "30",
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.direction, "endpoint_to_origin");
 });
 
 test("buildRemoteLatencySummary shows newer sent event instead of older ACK metrics", () => {

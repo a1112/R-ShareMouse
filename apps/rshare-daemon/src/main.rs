@@ -532,6 +532,7 @@ impl DaemonState {
                     device_id: device.id,
                     status: LatencyFeedbackStatus::Unavailable,
                     device_name: Some(device.name.clone()),
+                    latest_sequence: None,
                     last_probe_sent_ms: None,
                     last_ack_ms: None,
                     pending_duration_ms: None,
@@ -575,6 +576,7 @@ impl DaemonState {
                         } else {
                             LatencyFeedbackStatus::Pending
                         };
+                        feedback.latest_sequence = Some(*pending_sequence);
                         feedback.last_probe_sent_ms = Some(pending.sent_at_ms);
                         feedback.pending_duration_ms = Some(pending_duration_ms);
                         return feedback;
@@ -592,6 +594,7 @@ impl DaemonState {
                         } else {
                             LatencyFeedbackStatus::Degraded
                         };
+                    feedback.latest_sequence = Some(ack.sequence);
                     feedback.last_ack_ms = Some(ack.timestamp_ms);
                     feedback.network_round_trip_ms = network_round_trip_ms;
                     feedback.raw_round_trip_ms = parse_latency_payload_u64(
@@ -6958,6 +6961,7 @@ mod tests {
         let device = &feedback.devices[0];
         assert_eq!(device.device_id, remote_id);
         assert_eq!(device.status, LatencyFeedbackStatus::Pending);
+        assert_eq!(device.latest_sequence, Some(7));
         assert_eq!(device.last_probe_sent_ms, Some(1000));
         assert_eq!(device.pending_duration_ms, Some(250));
     }
@@ -7220,6 +7224,7 @@ mod tests {
         assert_eq!(feedback.devices.len(), 1);
         let device = &feedback.devices[0];
         assert_eq!(device.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(device.latest_sequence, Some(event.sequence));
         assert_eq!(device.last_ack_ms, Some(event.timestamp_ms));
         assert_eq!(device.network_round_trip_ms, Some(24));
         assert_eq!(device.raw_round_trip_ms, Some(30));
