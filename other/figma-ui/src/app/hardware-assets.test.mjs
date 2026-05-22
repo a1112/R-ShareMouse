@@ -271,6 +271,38 @@ test("normalizeHardwareAssetManifest preserves polygon region points", () => {
   assert.deepEqual(asset.regions[0].shape.points[1], { x: 0.77, y: 0.52 });
 });
 
+test("resolveActiveHardwareRegions returns polygon shapes for active buttons", () => {
+  const asset = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.mouse.precise",
+    name: "Precise Mouse",
+    kind: "mouse",
+    base_size: { width: 600, height: 1000 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "mouse.left",
+        label: "Left",
+        action: { kind: "mouse_button", buttons: ["Left"] },
+        shape: {
+          kind: "polygon",
+          points: [
+            { x: 0.2, y: 0.08 },
+            { x: 0.48, y: 0.08 },
+            { x: 0.43, y: 0.42 },
+            { x: 0.23, y: 0.48 },
+          ],
+        },
+      },
+    ],
+  });
+
+  const active = resolveActiveHardwareRegions(asset, { leftDown: true });
+
+  assert.equal(active[0].shape.kind, "polygon");
+  assert.equal(active[0].shape.points.length, 4);
+});
+
 test("resolveActiveHardwareRegions matches gamepad button aliases", () => {
   const asset = normalizeHardwareAssetManifest({
     schema_version: 1,

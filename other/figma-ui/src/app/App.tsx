@@ -3717,6 +3717,20 @@ type HardwareRigLayerDefinition = {
   opacity?: number;
 };
 
+type HardwareRigRegionShape =
+  | {
+      kind: "rect";
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      radius?: number;
+    }
+  | {
+      kind: "polygon";
+      points: Array<{ x: number; y: number }>;
+    };
+
 type HardwareRigRegion = {
   id: string;
   label: string;
@@ -3725,14 +3739,7 @@ type HardwareRigRegion = {
     codes?: string[];
     buttons?: string[];
   };
-  shape: {
-    kind: string;
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    radius?: number;
-  };
+  shape: HardwareRigRegionShape;
 };
 
 type HardwareRigDefinition = {
@@ -4352,6 +4359,65 @@ function HardwareHotspotOverlay({
   );
 }
 
+function HardwarePolygonOverlay({
+  points,
+  active,
+  label,
+  accent,
+  theme,
+  compact = false,
+}: {
+  points: Array<{ x: number; y: number }>;
+  active: boolean;
+  label?: string;
+  accent: string;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  compact?: boolean;
+}) {
+  if (!active || points.length < 3) {
+    return null;
+  }
+  const polygon = points
+    .map((point) => `${point.x * 100}% ${point.y * 100}%`)
+    .join(", ");
+  const center = points.reduce(
+    (sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }),
+    { x: 0, y: 0 },
+  );
+  const centerX = (center.x / points.length) * 100;
+  const centerY = (center.y / points.length) * 100;
+
+  return (
+    <span
+      className="pointer-events-none absolute inset-0 hardware-press-flash transition-all duration-75"
+      style={{
+        clipPath: `polygon(${polygon})`,
+        background: `radial-gradient(circle at ${centerX}% ${centerY}%, rgba(255,255,255,0.62), ${accent}cc 28%, ${accent}66 66%, transparent 100%)`,
+        border: `1px solid ${accent}`,
+        color: theme.text,
+        boxShadow: `0 0 28px ${accent}aa`,
+        mixBlendMode: "screen",
+      }}
+    >
+      {label ? (
+        <span
+          className="absolute hardware-legend-glow font-semibold"
+          style={{
+            left: `${centerX}%`,
+            top: `${centerY}%`,
+            transform: "translate(-50%, -50%)",
+            color: "#ffffff",
+            fontSize: compact ? 8 : 10,
+            textShadow: "0 0 8px rgba(255,255,255,0.75)",
+          }}
+        >
+          {label}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function HardwareRigRegionOverlays({
   asset,
   activity,
@@ -4371,24 +4437,37 @@ function HardwareRigRegionOverlays({
     <>
       {regions.map((region) => {
         const shape = region.shape;
-        if (shape.kind !== "rect") {
-          return null;
+        if (shape.kind === "polygon") {
+          return (
+            <HardwarePolygonOverlay
+              key={region.id}
+              points={shape.points}
+              active
+              label={hardwareRegionLabel(region, activity, compact)}
+              accent={accent}
+              theme={theme}
+              compact={compact}
+            />
+          );
         }
-        return (
-          <HardwareHotspotOverlay
-            key={region.id}
-            x={shape.x}
-            y={shape.y}
-            w={shape.w}
-            h={shape.h}
-            radius={shape.radius ?? 7}
-            active
-            label={hardwareRegionLabel(region, activity, compact)}
-            accent={accent}
-            theme={theme}
-            compact={compact}
-          />
-        );
+        if (shape.kind === "rect") {
+          return (
+            <HardwareHotspotOverlay
+              key={region.id}
+              x={shape.x}
+              y={shape.y}
+              w={shape.w}
+              h={shape.h}
+              radius={shape.radius ?? 7}
+              active
+              label={hardwareRegionLabel(region, activity, compact)}
+              accent={accent}
+              theme={theme}
+              compact={compact}
+            />
+          );
+        }
+        return null;
       })}
     </>
   );
