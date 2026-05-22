@@ -17,12 +17,13 @@ use rshare_core::{
     EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
     EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
     EndpointInjectTarget, FeatureConfig, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LatencyFeedbackStatus,
     LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
     LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
     NetworkTransportSnapshot, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
-    ServiceStatusSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult,
+    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
     UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
     UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
@@ -1279,6 +1280,9 @@ fn timestamp_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+const LATENCY_HEALTHY_RTT_MS: u64 = 50;
+const LATENCY_DEGRADED_RTT_MS: u64 = 120;
+
 fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkTransportSnapshot {
     let mut snapshot = NetworkTransportSnapshot {
         datagram_available: connections
@@ -1316,6 +1320,43 @@ fn network_snapshot_from_connections(connections: &[ConnectionInfo]) -> NetworkT
     }
 
     snapshot
+}
+
+fn transport_feedback_from_network(
+    network: &NetworkTransportSnapshot,
+    connected_devices: usize,
+) -> TransportFeedback {
+    let status = if connected_devices == 0 {
+        LatencyFeedbackStatus::Unavailable
+    } else if network.realtime_degraded
+        || !network.datagram_available
+        || network.datagram_tx_dropped > 0
+        || network.reliable_stream_reset_count > 0
+        || network
+            .rtt_ms
+            .is_some_and(|rtt| rtt >= LATENCY_DEGRADED_RTT_MS)
+    {
+        LatencyFeedbackStatus::Degraded
+    } else if network
+        .rtt_ms
+        .is_some_and(|rtt| rtt > LATENCY_HEALTHY_RTT_MS)
+    {
+        LatencyFeedbackStatus::Degraded
+    } else {
+        LatencyFeedbackStatus::Healthy
+    };
+
+    TransportFeedback {
+        status,
+        transport: network.transport.clone(),
+        datagram_available: network.datagram_available,
+        realtime_degraded: network.realtime_degraded,
+        rtt_ms: network.rtt_ms,
+        last_datagram_rx_ms: network.last_datagram_rx_ms,
+        datagram_tx_dropped: network.datagram_tx_dropped,
+        reliable_stream_reset_count: network.reliable_stream_reset_count,
+        cert_trust_state: network.cert_trust_state.clone(),
+    }
 }
 
 fn diagnostic_message(local_device_id: DeviceId, event: LocalInputDiagnosticEvent) -> Message {
@@ -6573,6 +6614,44 @@ mod tests {
             payload.get("remote_processing_ms").map(String::as_str),
             Some("6")
         );
+    }
+
+    #[test]
+    fn transport_feedback_reports_unavailable_without_connections() {
+        let network = network_snapshot_from_connections(&[]);
+        let feedback = transport_feedback_from_network(&network, 0);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Unavailable);
+        assert!(feedback.realtime_degraded);
+    }
+
+    #[test]
+    fn transport_feedback_reports_healthy_realtime_connection() {
+        let network = NetworkTransportSnapshot {
+            datagram_available: true,
+            realtime_degraded: false,
+            rtt_ms: Some(12),
+            ..NetworkTransportSnapshot::default()
+        };
+
+        let feedback = transport_feedback_from_network(&network, 1);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.rtt_ms, Some(12));
+    }
+
+    #[test]
+    fn transport_feedback_degrades_when_realtime_is_degraded() {
+        let network = NetworkTransportSnapshot {
+            datagram_available: false,
+            realtime_degraded: true,
+            rtt_ms: Some(22),
+            ..NetworkTransportSnapshot::default()
+        };
+
+        let feedback = transport_feedback_from_network(&network, 1);
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Degraded);
     }
 
     #[test]
