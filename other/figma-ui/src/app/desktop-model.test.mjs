@@ -522,6 +522,46 @@ test("buildRemoteLatencySummary shows ACK event newer than stale daemon pending 
   assert.equal(summary.timestampMs, 1600);
 });
 
+test("buildRemoteLatencySummary lets newer event override daemon ACK timestamp skew", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        generated_at_ms: 1000,
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Healthy",
+              last_ack_ms: 9000,
+              network_round_trip_ms: 24,
+            },
+          ],
+        },
+      },
+      recent_events: [
+        {
+          sequence: 21,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_probe_sent",
+          summary: "Latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "21",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pending");
+  assert.equal(summary.networkRoundTripMs, null);
+  assert.equal(summary.timestampMs, 1100);
+});
+
 test("buildRemoteLatencySummary shows newer sent event instead of older ACK metrics", () => {
   const deviceId = "00000000-0000-0000-0000-000000000001";
   const summary = buildRemoteLatencySummary(
@@ -560,6 +600,50 @@ test("buildRemoteLatencySummary shows newer sent event instead of older ACK metr
   assert.equal(summary.state, "pending");
   assert.equal(summary.networkRoundTripMs, null);
   assert.equal(summary.timestampMs, 1100);
+});
+
+test("buildRemoteLatencySummary treats endpoint switch sent and ACK origin sequence consistently", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      recent_events: [
+        {
+          sequence: 99,
+          timestamp_ms: 1000,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_sent",
+          summary: "Endpoint switched latency probe sent",
+          device_id: deviceId,
+          payload: {
+            target_device_id: deviceId,
+            probe_sequence: "99",
+            origin_probe_sequence: "7",
+          },
+        },
+        {
+          sequence: 100,
+          timestamp_ms: 1100,
+          device_kind: "Backend",
+          event_kind: "latency_endpoint_switch_ack",
+          summary: "Endpoint-side latency to remote: 24 ms RTT / ~12 ms one-way",
+          device_id: deviceId,
+          payload: {
+            origin_device_id: deviceId,
+            probe_sequence: "99",
+            origin_probe_sequence: "7",
+            network_round_trip_ms: "24",
+            estimated_one_way_ms: "12",
+            direction: "endpoint_to_origin",
+          },
+        },
+      ],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.direction, "endpoint_to_origin");
 });
 
 test("buildRemoteLatencySummary uses local sequence when ACK timestamp is skewed ahead", () => {

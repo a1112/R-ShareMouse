@@ -720,7 +720,10 @@ function isRemoteLatencySent(event) {
 
 function remoteLatencyProbeSequence(event) {
   const payload = event?.payload ?? {};
-  if (event?.event_kind === "latency_endpoint_switch_ack") {
+  if (
+    event?.event_kind === "latency_endpoint_switch_ack" ||
+    event?.event_kind === "latency_endpoint_switch_sent"
+  ) {
     return numberOrNull(payload.origin_probe_sequence) ?? numberOrNull(payload.probe_sequence);
   }
   return numberOrNull(payload.probe_sequence) ?? numberOrNull(payload.origin_probe_sequence);
@@ -851,12 +854,12 @@ function eventSummaryIsNewerThanDaemon(eventSummary, daemonFeedback, snapshot) {
   if (eventTimestampMs == null) {
     return false;
   }
-  const daemonTimestampMs = maxTimestampMs(
-    snapshot?.latency_feedback?.generated_at_ms,
-    daemonFeedback.last_ack_ms,
-    daemonFeedback.last_probe_sent_ms,
-  );
-  return daemonTimestampMs == null || eventTimestampMs > daemonTimestampMs;
+  const generatedAtMs = numberOrNull(snapshot?.latency_feedback?.generated_at_ms);
+  const daemonTimestampMs =
+    generatedAtMs != null && generatedAtMs > 0
+      ? generatedAtMs
+      : maxTimestampMs(daemonFeedback.last_ack_ms, daemonFeedback.last_probe_sent_ms);
+  return daemonTimestampMs == null || eventTimestampMs >= daemonTimestampMs;
 }
 
 function buildRemoteLatencyEventSummary(snapshot, deviceId) {
