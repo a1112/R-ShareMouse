@@ -5,6 +5,8 @@
 Cargo.lock
 
 # IDEs
+.worktrees
+.worktrees/
 .idea/
 .vscode/
 *.swp
