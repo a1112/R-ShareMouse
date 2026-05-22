@@ -125,6 +125,26 @@ test("checked-in office mouse manifest has mapped button regions", () => {
   );
 });
 
+test("checked-in mouse manifests use precision polygon regions", () => {
+  for (const relative of [
+    "../../public/assets/hardware/live2d/mouse/manifest.json",
+    "../../public/assets/hardware/live2d/mouse/gaming/manifest.json",
+  ]) {
+    const raw = JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
+    const asset = normalizeHardwareAssetManifest(
+      raw,
+      "/assets/hardware/live2d/mouse/",
+    );
+    const primary = asset.regions.filter((region) =>
+      ["mouse.left", "mouse.right", "mouse.middle"].includes(region.id),
+    );
+
+    assert.equal(primary.length, 3);
+    assert.ok(primary.every((region) => region.shape.kind === "polygon"));
+    assert.ok(asset.regions.every((region) => region.shape.kind === "polygon"));
+  }
+});
+
 test("checked-in xbox style gamepad manifest has mapped button regions", () => {
   const raw = JSON.parse(
     readFileSync(
