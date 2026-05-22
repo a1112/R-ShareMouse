@@ -125,9 +125,96 @@ test("checked-in xbox style gamepad manifest has mapped button regions", () => {
   assert.equal(asset.id, "builtin.gamepad.xbox");
   assert.equal(asset.kind, "gamepad");
   assert.ok(asset.layers.some((layer) => layer.src.endsWith("/base.png")));
-  assert.ok(asset.regions.some((region) => region.id === "gamepad.button.a"));
-  assert.ok(asset.regions.some((region) => region.id === "gamepad.dpad.up"));
-  assert.ok(asset.regions.some((region) => region.id === "gamepad.trigger.left"));
+  const expectedRegionIds = [
+    "gamepad.button.a",
+    "gamepad.button.b",
+    "gamepad.button.x",
+    "gamepad.button.y",
+    "gamepad.dpad.up",
+    "gamepad.dpad.down",
+    "gamepad.dpad.left",
+    "gamepad.dpad.right",
+    "gamepad.bumper.left",
+    "gamepad.bumper.right",
+    "gamepad.trigger.left",
+    "gamepad.trigger.right",
+    "gamepad.stick.left",
+    "gamepad.stick.right",
+    "gamepad.button.select",
+    "gamepad.button.start",
+    "gamepad.button.guide",
+  ];
+  const regionsById = new Map(
+    asset.regions.map((region) => [region.id, region]),
+  );
+
+  assert.deepEqual(
+    asset.regions.map((region) => region.id).sort(),
+    [...expectedRegionIds].sort(),
+  );
+  for (const region of asset.regions) {
+    assert.equal(region.action.kind, "gamepad_button");
+  }
+
+  const activeRegionIds = (pressedButtons) =>
+    resolveActiveHardwareRegions(asset, { pressedButtons }).map(
+      (region) => region.id,
+    );
+
+  assert.deepEqual(activeRegionIds(["South"]), ["gamepad.button.a"]);
+  assert.deepEqual(activeRegionIds(["DPadUp"]), ["gamepad.dpad.up"]);
+  assert.deepEqual(activeRegionIds(["LeftTrigger"]), ["gamepad.trigger.left"]);
+
+  const regionCenter = (id) => {
+    const region = regionsById.get(id);
+    assert.ok(region, `missing ${id}`);
+    if (region.shape.kind === "rect") {
+      return {
+        x: (region.shape.x + region.shape.w / 2) * asset.baseSize.width,
+        y: (region.shape.y + region.shape.h / 2) * asset.baseSize.height,
+      };
+    }
+    assert.equal(region.shape.kind, "polygon");
+    return {
+      x:
+        (region.shape.points.reduce((sum, point) => sum + point.x, 0) /
+          region.shape.points.length) *
+        asset.baseSize.width,
+      y:
+        (region.shape.points.reduce((sum, point) => sum + point.y, 0) /
+          region.shape.points.length) *
+        asset.baseSize.height,
+    };
+  };
+  const assertRegionCenter = (id, expected, tolerance = 34) => {
+    const actual = regionCenter(id);
+    assert.ok(
+      Math.abs(actual.x - expected.x) <= tolerance,
+      `${id} center x ${actual.x} differs from ${expected.x}`,
+    );
+    assert.ok(
+      Math.abs(actual.y - expected.y) <= tolerance,
+      `${id} center y ${actual.y} differs from ${expected.y}`,
+    );
+  };
+
+  assertRegionCenter("gamepad.button.y", { x: 913, y: 188 });
+  assertRegionCenter("gamepad.button.x", { x: 834, y: 263 });
+  assertRegionCenter("gamepad.button.b", { x: 993, y: 263 });
+  assertRegionCenter("gamepad.button.a", { x: 914, y: 339 });
+  assertRegionCenter("gamepad.dpad.up", { x: 451, y: 388 });
+  assertRegionCenter("gamepad.dpad.down", { x: 451, y: 506 });
+  assertRegionCenter("gamepad.dpad.left", { x: 389, y: 447 });
+  assertRegionCenter("gamepad.dpad.right", { x: 513, y: 447 });
+  assertRegionCenter("gamepad.stick.left", { x: 287, y: 264 });
+  assertRegionCenter("gamepad.stick.right", { x: 745, y: 443 });
+  assertRegionCenter("gamepad.button.guide", { x: 606, y: 146 });
+  assertRegionCenter("gamepad.button.select", { x: 459, y: 163 });
+  assertRegionCenter("gamepad.button.start", { x: 747, y: 163 });
+  assertRegionCenter("gamepad.bumper.left", { x: 303, y: 67 }, 46);
+  assertRegionCenter("gamepad.bumper.right", { x: 902, y: 67 }, 46);
+  assertRegionCenter("gamepad.trigger.left", { x: 300, y: 35 }, 46);
+  assertRegionCenter("gamepad.trigger.right", { x: 905, y: 35 }, 46);
 });
 
 test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
