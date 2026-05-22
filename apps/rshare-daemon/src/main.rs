@@ -20,8 +20,8 @@ use rshare_core::{
     LatencyFeedbackStatus,
     LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
     NetworkTransportSnapshot, RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo,
     ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
     UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
@@ -419,6 +419,53 @@ impl DaemonState {
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
         self.local_controls.clone()
+    }
+
+    // Staged for Task 5 status snapshot wiring.
+    #[allow(dead_code)]
+    fn local_input_feedback(&self) -> LocalInputFeedback {
+        let event_count =
+            self.local_controls.keyboard.event_count + self.local_controls.mouse.event_count;
+
+        if !self.backend_state.has_end_to_end_path() {
+            return LocalInputFeedback {
+                status: LatencyFeedbackStatus::Unavailable,
+                event_count,
+                ..LocalInputFeedback::default()
+            };
+        }
+
+        let latest_event = self
+            .local_controls
+            .recent_events
+            .iter()
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_keyboard = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| event.device_kind == LocalInputDeviceKind::Keyboard)
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_mouse = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| event.device_kind == LocalInputDeviceKind::Mouse)
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
+
+        LocalInputFeedback {
+            status: if event_count == 0 {
+                LatencyFeedbackStatus::Idle
+            } else {
+                LatencyFeedbackStatus::Healthy
+            },
+            event_count,
+            latest_sequence: latest_event.map(|event| event.sequence),
+            latest_event_ms: latest_event.map(|event| event.timestamp_ms),
+            latest_keyboard_event_ms: latest_keyboard.map(|event| event.timestamp_ms),
+            latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
+            capture_path: latest_event.and_then(|event| event.capture_path.clone()),
+        }
     }
 
     fn sync_endpoint_events_from_recent(&mut self) {
@@ -6721,6 +6768,36 @@ mod tests {
         ));
         assert!(state.local_controls.keyboard.pressed_keys.is_empty());
         assert_eq!(state.local_controls.keyboard.event_count, 2);
+    }
+
+    #[test]
+    fn local_input_feedback_is_idle_when_backend_is_healthy_without_events() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Idle);
+        assert_eq!(feedback.event_count, 0);
+    }
+
+    #[test]
+    fn local_input_feedback_uses_latest_keyboard_and_mouse_events() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+        state.record_local_input_event(&rshare_input::InputEvent::mouse_move(10, 20));
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 2);
+        assert_eq!(feedback.latest_sequence, Some(2));
+        assert!(feedback.latest_keyboard_event_ms.is_some());
+        assert!(feedback.latest_mouse_event_ms.is_some());
     }
 
     #[test]
