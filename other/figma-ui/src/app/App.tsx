@@ -2682,7 +2682,6 @@ function DevicesPageWithLocalControls({
   const setHardwareRigVariant = (variant: HardwareRigVariant) => {
     setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
     setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
-    setSelectedId("gamepad", "builtin.gamepad.xbox");
   };
 
   useEffect(() => {
