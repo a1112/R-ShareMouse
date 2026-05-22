@@ -85,6 +85,36 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
   assert.deepEqual(overview.devices, []);
 });
 
+test("buildDesktopViewModel exposes daemon latency feedback when present", () => {
+  const latencyFeedback = {
+    status: "Degraded",
+    remote_latency: {
+      status: "Degraded",
+      devices: [
+        {
+          device_id: "remote-1",
+          status: "Timeout",
+          pending_duration_ms: 2000,
+        },
+      ],
+    },
+  };
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Local",
+      hostname: "local-host",
+      bind_address: "0.0.0.0:27431",
+      discovery_port: 27432,
+      healthy: false,
+      latency_feedback: latencyFeedback,
+    },
+    devices: [],
+  });
+
+  assert.equal(model.latencyFeedback, latencyFeedback);
+});
+
 test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {
   const model = buildLocalControlsViewModel(
     {

@@ -1473,6 +1473,7 @@ export function buildDesktopViewModel(payload) {
     service,
     layout,
     devices: remoteDevices,
+    latencyFeedback: status?.latency_feedback ?? null,
     capabilities,
     settings: {
       localDevice: {
