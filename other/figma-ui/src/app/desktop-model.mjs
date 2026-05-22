@@ -725,6 +725,84 @@ function sortNewestEvent(left, right) {
 }
 
 export function buildRemoteLatencySummary(snapshot, deviceId) {
+  const daemonFeedback = snapshot?.latency_feedback?.remote_latency?.devices?.find(
+    (device) => device?.device_id === deviceId,
+  );
+  if (daemonFeedback) {
+    const status = String(daemonFeedback.status ?? "").toLowerCase();
+    const timestampMs = numberOrNull(daemonFeedback.last_ack_ms);
+    const metrics = {
+      networkRoundTripMs: numberOrNull(daemonFeedback.network_round_trip_ms),
+      estimatedOneWayMs: numberOrNull(daemonFeedback.estimated_one_way_ms),
+      rawRoundTripMs: numberOrNull(daemonFeedback.raw_round_trip_ms),
+      remoteProcessingMs: numberOrNull(daemonFeedback.remote_processing_ms),
+      direction: daemonFeedback.direction ?? null,
+    };
+
+    if (status === "healthy" || status === "degraded") {
+      return {
+        state: status === "healthy" ? "pass" : "warn",
+        message: daemonFeedback.summary ?? "Latency ACK received",
+        ...metrics,
+        timestampMs,
+      };
+    }
+
+    if (status === "pending") {
+      return {
+        state: "pending",
+        message: "等待远端 latency ACK",
+        networkRoundTripMs: null,
+        estimatedOneWayMs: null,
+        rawRoundTripMs: null,
+        remoteProcessingMs: null,
+        direction: daemonFeedback.direction ?? null,
+        timestampMs: numberOrNull(daemonFeedback.last_probe_sent_ms),
+      };
+    }
+
+    if (status === "timeout") {
+      const pendingDurationMs = numberOrNull(daemonFeedback.pending_duration_ms);
+      return {
+        state: "fail",
+        message:
+          pendingDurationMs == null
+            ? "远端 latency ACK 超时"
+            : `远端 latency ACK 超时：${pendingDurationMs} ms`,
+        networkRoundTripMs: null,
+        estimatedOneWayMs: null,
+        rawRoundTripMs: null,
+        remoteProcessingMs: null,
+        direction: daemonFeedback.direction ?? null,
+        timestampMs: numberOrNull(daemonFeedback.last_probe_sent_ms),
+      };
+    }
+
+    if (status === "unavailable") {
+      return {
+        state: "fail",
+        message: "远端 latency 不可用",
+        networkRoundTripMs: null,
+        estimatedOneWayMs: null,
+        rawRoundTripMs: null,
+        remoteProcessingMs: null,
+        direction: daemonFeedback.direction ?? null,
+        timestampMs: null,
+      };
+    }
+
+    return {
+      state: "idle",
+      message: "尚未运行网络延时探测",
+      networkRoundTripMs: null,
+      estimatedOneWayMs: null,
+      rawRoundTripMs: null,
+      remoteProcessingMs: null,
+      direction: daemonFeedback.direction ?? null,
+      timestampMs: null,
+    };
+  }
+
   const events = [...(snapshot?.recent_events ?? [])].filter(
     (event) => remoteLatencyEventTarget(event) === deviceId,
   );

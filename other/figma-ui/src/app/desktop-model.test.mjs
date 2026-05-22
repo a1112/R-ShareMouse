@@ -321,6 +321,101 @@ test("buildEndpointInjectSummary reports scoped latency for the selected device 
   assert.equal(summary.message, "Endpoint 注入完成：2/2 成功，平均 15 ms，最大 18 ms");
 });
 
+test("buildRemoteLatencySummary prefers daemon latency feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const snapshot = {
+    latency_feedback: {
+      remote_latency: {
+        devices: [
+          {
+            device_id: deviceId,
+            status: "Healthy",
+            summary: "Latency to remote: 24 ms RTT / ~12 ms one-way",
+            network_round_trip_ms: 24,
+            estimated_one_way_ms: 12,
+            raw_round_trip_ms: 30,
+            remote_processing_ms: 6,
+            direction: "origin_to_endpoint",
+            last_ack_ms: 1000,
+          },
+        ],
+      },
+    },
+    recent_events: [
+      {
+        device_kind: "Backend",
+        event_kind: "latency_probe_ack",
+        timestamp_ms: 900,
+        device_id: deviceId,
+        payload: { network_round_trip_ms: "99" },
+      },
+    ],
+  };
+
+  const summary = buildRemoteLatencySummary(snapshot, deviceId);
+
+  assert.equal(summary.state, "pass");
+  assert.equal(summary.networkRoundTripMs, 24);
+  assert.equal(summary.estimatedOneWayMs, 12);
+});
+
+test("buildRemoteLatencySummary maps daemon timeout feedback", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "Timeout",
+              pending_duration_ms: 1800,
+            },
+          ],
+        },
+      },
+      recent_events: [],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "fail");
+  assert.match(summary.message, /超时/);
+});
+
+test("buildRemoteLatencySummary maps daemon degraded feedback with metrics", () => {
+  const deviceId = "00000000-0000-0000-0000-000000000001";
+  const summary = buildRemoteLatencySummary(
+    {
+      latency_feedback: {
+        remote_latency: {
+          devices: [
+            {
+              device_id: deviceId,
+              status: "degraded",
+              network_round_trip_ms: "42",
+              estimated_one_way_ms: "21",
+              raw_round_trip_ms: "48",
+              remote_processing_ms: "6",
+              direction: "endpoint_to_origin",
+              last_ack_ms: "2000",
+            },
+          ],
+        },
+      },
+      recent_events: [],
+    },
+    deviceId,
+  );
+
+  assert.equal(summary.state, "warn");
+  assert.equal(summary.networkRoundTripMs, 42);
+  assert.equal(summary.estimatedOneWayMs, 21);
+  assert.equal(summary.rawRoundTripMs, 48);
+  assert.equal(summary.remoteProcessingMs, 6);
+  assert.equal(summary.direction, "endpoint_to_origin");
+});
+
 test("buildRemoteLatencySummary extracts the latest RTT for a selected remote device", () => {
   const summary = buildRemoteLatencySummary(
     {
