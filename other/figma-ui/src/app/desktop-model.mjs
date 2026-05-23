@@ -693,6 +693,100 @@ function numberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const LOCAL_FEEDBACK_LABELS = Object.freeze({
+  keyboard: "键盘",
+  mouse: "鼠标",
+  gamepad: "手柄",
+  transport: "QUIC",
+});
+
+function latencyStatusState(status) {
+  switch (String(status ?? "").toLowerCase()) {
+    case "healthy":
+      return "pass";
+    case "degraded":
+    case "pending":
+      return "warn";
+    case "timeout":
+    case "unavailable":
+      return "block";
+    case "idle":
+    default:
+      return "idle";
+  }
+}
+
+function eventTimestampDetail(timestampMs, fallback) {
+  const value = numberOrNull(timestampMs);
+  if (value == null || value <= 0) {
+    return fallback;
+  }
+  return `event @ ${value} ms`;
+}
+
+function timestampState(timestampMs, status) {
+  const value = numberOrNull(timestampMs);
+  return value == null || value <= 0 ? "idle" : latencyStatusState(status);
+}
+
+export function buildLocalLatencyFeedbackRows(feedback) {
+  const local = feedback?.local_input ?? {};
+  const transport = feedback?.transport ?? {};
+  const keyboardState = timestampState(local.latest_keyboard_event_ms, local.status);
+  const mouseState = timestampState(local.latest_mouse_event_ms, local.status);
+  const gamepadState = timestampState(local.latest_gamepad_event_ms, local.status);
+  const gamepadTimestamp = numberOrNull(local.latest_gamepad_event_ms);
+  const transportStatus = transport.status ?? "Unavailable";
+  const transportRttMs = numberOrNull(transport.rtt_ms);
+  const gamepadParts = [
+    local.latest_gamepad_id == null ? null : `gamepad ${local.latest_gamepad_id}`,
+    local.latest_gamepad_event_kind,
+    local.latest_gamepad_button,
+    local.latest_gamepad_axis,
+  ].filter(Boolean);
+  const transportParts =
+    feedback?.transport == null
+      ? ["transport unavailable"]
+      : [
+          transport.transport ?? "quic",
+          transportRttMs == null ? null : `${transportRttMs} ms RTT`,
+          transport.datagram_available ? "datagram" : "no datagram",
+        ].filter(Boolean);
+
+  return [
+    {
+      key: "keyboard",
+      label: LOCAL_FEEDBACK_LABELS.keyboard,
+      state: keyboardState,
+      metric: String(local.event_count ?? 0),
+      detail: eventTimestampDetail(local.latest_keyboard_event_ms, "waiting for keyboard"),
+    },
+    {
+      key: "mouse",
+      label: LOCAL_FEEDBACK_LABELS.mouse,
+      state: mouseState,
+      metric: String(local.event_count ?? 0),
+      detail: eventTimestampDetail(local.latest_mouse_event_ms, "waiting for mouse"),
+    },
+    {
+      key: "gamepad",
+      label: LOCAL_FEEDBACK_LABELS.gamepad,
+      state: gamepadState,
+      metric: String(local.event_count ?? 0),
+      detail: gamepadTimestamp != null && gamepadTimestamp > 0 && gamepadParts.length
+        ? gamepadParts.join(", ")
+        : eventTimestampDetail(local.latest_gamepad_event_ms, "waiting for gamepad"),
+    },
+    {
+      key: "transport",
+      label: LOCAL_FEEDBACK_LABELS.transport,
+      state: latencyStatusState(transportStatus),
+      metric: transportStatus,
+      detail: transportParts.join(", "),
+    },
+  ];
+}
+
 function remoteLatencyEventMatchesDevice(event, deviceId) {
   return [
     event?.payload?.target_device_id,

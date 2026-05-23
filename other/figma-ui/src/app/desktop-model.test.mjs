@@ -8,6 +8,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildEndpointInjectSummary,
+  buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
   buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
@@ -113,6 +114,123 @@ test("buildDesktopViewModel exposes daemon latency feedback when present", () =>
   });
 
   assert.equal(model.latencyFeedback, latencyFeedback);
+});
+
+test("buildLocalLatencyFeedbackRows maps daemon keyboard mouse and gamepad feedback", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 7,
+      latest_sequence: 12,
+      latest_keyboard_event_ms: 1000,
+      latest_mouse_event_ms: 1100,
+      latest_gamepad_event_ms: 1200,
+      latest_gamepad_id: 0,
+      latest_gamepad_event_kind: "state",
+      latest_gamepad_button: "South pressed",
+      latest_gamepad_axis: "left_stick",
+    },
+    transport: {
+      status: "Healthy",
+      transport: "quic",
+      datagram_available: true,
+      realtime_degraded: false,
+      rtt_ms: 12,
+    },
+  });
+
+  assert.deepEqual(
+    rows.map((row) => row.key),
+    ["keyboard", "mouse", "gamepad", "transport"],
+  );
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "pass");
+  assert.match(rows.find((row) => row.key === "gamepad").detail, /South pressed/);
+  assert.match(rows.find((row) => row.key === "transport").detail, /12 ms RTT/);
+  assert.match(rows.find((row) => row.key === "keyboard").detail, /event @ 1000 ms/);
+});
+
+test("buildLocalLatencyFeedbackRows marks missing gamepad as idle without breaking input status", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Idle",
+      event_count: 0,
+    },
+    transport: {
+      status: "Unavailable",
+      transport: "quic",
+      datagram_available: false,
+      realtime_degraded: true,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "idle");
+  assert.match(rows.find((row) => row.key === "gamepad").detail, /waiting/i);
+});
+
+test("buildLocalLatencyFeedbackRows keeps keyboard idle for mouse-only aggregate health", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 3,
+      latest_mouse_event_ms: 2100,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "idle");
+  assert.match(rows.find((row) => row.key === "keyboard").detail, /waiting for keyboard/);
+  assert.equal(rows.find((row) => row.key === "mouse").state, "pass");
+  assert.match(rows.find((row) => row.key === "mouse").detail, /event @ 2100 ms/);
+});
+
+test("buildLocalLatencyFeedbackRows keeps mouse idle for keyboard-only aggregate warning", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Degraded",
+      event_count: 4,
+      latest_keyboard_event_ms: 2200,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "warn");
+  assert.equal(rows.find((row) => row.key === "mouse").state, "idle");
+  assert.match(rows.find((row) => row.key === "mouse").detail, /waiting for mouse/);
+});
+
+test("buildLocalLatencyFeedbackRows ignores invalid RTT and timestamps", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 5,
+      latest_keyboard_event_ms: "not-a-timestamp",
+      latest_gamepad_event_ms: "not-a-timestamp",
+      latest_gamepad_button: "South pressed",
+    },
+    transport: {
+      status: "Healthy",
+      transport: "quic",
+      datagram_available: true,
+      rtt_ms: "not-a-number",
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "idle");
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "idle");
+  assert.doesNotMatch(rows.find((row) => row.key === "transport").detail, /NaN/);
+  assert.doesNotMatch(rows.find((row) => row.key === "transport").detail, /RTT/);
+});
+
+test("buildLocalLatencyFeedbackRows treats missing transport as unavailable", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Idle",
+      event_count: 0,
+    },
+  });
+
+  const transport = rows.find((row) => row.key === "transport");
+  assert.equal(transport.state, "block");
+  assert.equal(transport.metric, "Unavailable");
+  assert.match(transport.detail, /unavailable/i);
 });
 
 test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {
