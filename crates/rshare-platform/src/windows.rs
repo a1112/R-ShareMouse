@@ -8,7 +8,23 @@ cfg_if::cfg_if! {
 
 #[cfg(windows)]
 mod windows_impl {
-    use ::windows::{
+    use anyhow::{Context, Result};
+    use rshare_core::{
+        DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities, LocalAudioInputDevice,
+        LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
+        LocalHardwareDevice,
+    };
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt;
+    use std::mem::size_of;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+    use windows::{
         core::{BSTR, HSTRING, PWSTR},
         Win32::{
             Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -23,19 +39,6 @@ mod windows_impl {
             },
         },
     };
-    use anyhow::{Context, Result};
-    use rshare_core::{
-        LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalHardwareDevice,
-    };
-    use std::cell::RefCell;
-    use std::fmt;
-    use std::mem::size_of;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    };
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
 
     type WindowsInputCallback = Arc<dyn Fn(WindowsInputEvent) + Send + Sync + 'static>;
 
@@ -1562,6 +1565,15 @@ mod windows_impl {
     const XBUTTON1: u16 = 1;
     const XBUTTON2: u16 = 2;
     const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
+    const CCHDEVICENAME: usize = 32;
+    const CCHFORMNAME: usize = 32;
+    const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
+    const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
+    const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
+    const DMDO_DEFAULT: u32 = 0;
+    const DMDO_90: u32 = 1;
+    const DMDO_180: u32 = 2;
+    const DMDO_270: u32 = 3;
     const RIM_TYPEMOUSE: u32 = 0;
     const RIM_TYPEKEYBOARD: u32 = 1;
     const RIDI_DEVICENAME: u32 = 0x20000007;
@@ -1572,6 +1584,94 @@ mod windows_impl {
 
     fn wide_null(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn fixed_wide_to_string(value: &[u16]) -> Option<String> {
+        let len = value.iter().position(|ch| *ch == 0).unwrap_or(value.len());
+        let text = String::from_utf16_lossy(&value[..len]).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn display_orientation_from_devmode(value: u32) -> DisplayOrientation {
+        match value {
+            DMDO_DEFAULT => DisplayOrientation::Landscape,
+            DMDO_90 => DisplayOrientation::Portrait,
+            DMDO_180 => DisplayOrientation::LandscapeFlipped,
+            DMDO_270 => DisplayOrientation::PortraitFlipped,
+            _ => DisplayOrientation::Landscape,
+        }
+    }
+
+    fn refresh_rate_to_millihz(refresh_rate_hz: u32) -> Option<u32> {
+        if refresh_rate_hz == 0 {
+            None
+        } else {
+            refresh_rate_hz.checked_mul(1_000)
+        }
+    }
+
+    fn stable_display_id(
+        device_name: &str,
+        target_id: Option<&str>,
+        friendly_name: Option<&str>,
+        adapter_id: Option<&str>,
+    ) -> String {
+        let mut hash = 0xcbf29ce484222325u64;
+        let identity_parts = [target_id, adapter_id, friendly_name];
+        let has_stable_identity = identity_parts
+            .iter()
+            .any(|part| part.map(|value| !value.trim().is_empty()).unwrap_or(false));
+        let gdi_fallback = if has_stable_identity {
+            None
+        } else {
+            Some(device_name)
+        };
+
+        for part in identity_parts.into_iter().chain([gdi_fallback]).flatten() {
+            for byte in part.as_bytes() {
+                hash ^= u64::from(byte.to_ascii_lowercase());
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+
+        format!("windows-display-{hash:016x}")
+    }
+
+    fn devmode_with_size() -> DevModeW {
+        let mut mode = DevModeW::default();
+        mode.size = size_of::<DevModeW>() as u16;
+        mode
+    }
+
+    #[derive(Clone)]
+    struct MonitorSnapshot {
+        handle: isize,
+        rect: Rect,
+        work: Rect,
+        primary: bool,
+        device_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DisplayDeviceSnapshot {
+        adapter_id: Option<String>,
+        target_id: Option<String>,
+        friendly_name: Option<String>,
+        active: bool,
+        primary: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CurrentDisplayMode {
+        x: i32,
+        y: i32,
+        mode: DisplayModeInfo,
     }
 
     fn driver_device_kind_code(kind: WindowsDriverDeviceKind) -> u32 {
@@ -1731,6 +1831,127 @@ mod windows_impl {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MonitorInfoEx {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+        device: [u16; CCHDEVICENAME],
+    }
+
+    impl Default for MonitorInfoEx {
+        fn default() -> Self {
+            Self {
+                cb_size: size_of::<MonitorInfoEx>() as u32,
+                rc_monitor: Rect::default(),
+                rc_work: Rect::default(),
+                flags: 0,
+                device: [0; CCHDEVICENAME],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayDeviceW {
+        cb: u32,
+        device_name: [u16; CCHDEVICENAME],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    impl Default for DisplayDeviceW {
+        fn default() -> Self {
+            Self {
+                cb: size_of::<DisplayDeviceW>() as u32,
+                device_name: [0; CCHDEVICENAME],
+                device_string: [0; 128],
+                state_flags: 0,
+                device_id: [0; 128],
+                device_key: [0; 128],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct PointL {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModePrinterFields {
+        orientation: i16,
+        paper_size: i16,
+        paper_length: i16,
+        paper_width: i16,
+        scale: i16,
+        copies: i16,
+        default_source: i16,
+        print_quality: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModeDisplayFields {
+        position: PointL,
+        display_orientation: u32,
+        display_fixed_output: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union DevModeFields {
+        printer: DevModePrinterFields,
+        display: DevModeDisplayFields,
+    }
+
+    impl Default for DevModeFields {
+        fn default() -> Self {
+            Self {
+                display: DevModeDisplayFields::default(),
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModeW {
+        device_name: [u16; CCHDEVICENAME],
+        spec_version: u16,
+        driver_version: u16,
+        size: u16,
+        driver_extra: u16,
+        fields: u32,
+        fields_union: DevModeFields,
+        color: i16,
+        duplex: i16,
+        y_resolution: i16,
+        tt_option: i16,
+        collate: i16,
+        form_name: [u16; CCHFORMNAME],
+        log_pixels: u16,
+        bits_per_pel: u32,
+        pels_width: u32,
+        pels_height: u32,
+        display_flags: u32,
+        display_frequency: u32,
+        icm_method: u32,
+        icm_intent: u32,
+        media_type: u32,
+        dither_type: u32,
+        reserved1: u32,
+        reserved2: u32,
+        panning_width: u32,
+        panning_height: u32,
+    }
+
+    #[repr(C)]
     #[derive(Default)]
     struct Message {
         hwnd: isize,
@@ -1832,7 +2053,18 @@ mod windows_impl {
             lpfn_enum: Option<MonitorEnumProc>,
             dw_data: isize,
         ) -> i32;
-        fn GetMonitorInfoW(h_monitor: isize, lpmi: *mut MonitorInfo) -> i32;
+        fn GetMonitorInfoW(h_monitor: isize, lpmi: *mut std::ffi::c_void) -> i32;
+        fn EnumDisplayDevicesW(
+            lp_device: *const u16,
+            i_dev_num: u32,
+            lp_display_device: *mut DisplayDeviceW,
+            dw_flags: u32,
+        ) -> i32;
+        fn EnumDisplaySettingsW(
+            lpsz_device_name: *const u16,
+            i_mode_num: u32,
+            lp_dev_mode: *mut DevModeW,
+        ) -> i32;
         fn CreateFileW(
             lp_file_name: *const u16,
             dw_desired_access: u32,
@@ -1852,6 +2084,16 @@ mod windows_impl {
             n_out_buffer_size: u32,
             lp_bytes_returned: *mut u32,
             lp_overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "Shcore")]
+    extern "system" {
+        fn GetDpiForMonitor(
+            hmonitor: isize,
+            dpi_type: i32,
+            dpi_x: *mut u32,
+            dpi_y: *mut u32,
         ) -> i32;
     }
 
@@ -1977,6 +2219,355 @@ mod windows_impl {
         send_input(&input, "keyboard")
     }
 
+    pub fn query_display_state() -> Result<LocalDisplayState> {
+        let monitors = enumerate_monitor_snapshots()?;
+        if monitors.is_empty() {
+            anyhow::bail!("EnumDisplayMonitors returned no monitors");
+        }
+
+        let devices = enumerate_display_devices();
+        let mut displays = Vec::with_capacity(monitors.len());
+
+        for (index, monitor) in monitors.iter().enumerate() {
+            let device = monitor
+                .device_name
+                .as_deref()
+                .and_then(|name| devices.get(name));
+            let mode = monitor
+                .device_name
+                .as_deref()
+                .and_then(current_display_mode);
+            let (dpi_x, dpi_y, raw_dpi_x, raw_dpi_y, scale_percent) =
+                monitor_dpi_state(monitor.handle);
+
+            let gdi_device_name = monitor
+                .device_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("monitor-{}", index + 1));
+            let display_id = stable_display_id(
+                &gdi_device_name,
+                device.and_then(|device| device.target_id.as_deref()),
+                device.and_then(|device| device.friendly_name.as_deref()),
+                device.and_then(|device| device.adapter_id.as_deref()),
+            );
+            let (x, y, width, height) =
+                display_geometry_from_monitor_and_mode(monitor.rect, mode.as_ref());
+            let primary = monitor.primary || device.map(|device| device.primary).unwrap_or(false);
+
+            displays.push(LocalDisplayInfo {
+                display_id: display_id.clone(),
+                adapter_id: device.and_then(|device| device.adapter_id.clone()),
+                target_id: device.and_then(|device| device.target_id.clone()),
+                device_name: Some(gdi_device_name.clone()),
+                friendly_name: device
+                    .and_then(|device| device.friendly_name.clone())
+                    .or_else(|| Some(gdi_device_name.clone())),
+                x,
+                y,
+                width,
+                height,
+                work_x: monitor.work.left,
+                work_y: monitor.work.top,
+                work_width: rect_width(monitor.work),
+                work_height: rect_height(monitor.work),
+                primary,
+                orientation: mode
+                    .as_ref()
+                    .map(|mode| mode.mode.orientation)
+                    .unwrap_or_default(),
+                scale_percent,
+                dpi_x,
+                dpi_y,
+                raw_dpi_x,
+                raw_dpi_y,
+                refresh_rate_millihz: mode
+                    .as_ref()
+                    .and_then(|mode| mode.mode.refresh_rate_millihz),
+                bits_per_pixel: mode.as_ref().and_then(|mode| mode.mode.bits_per_pixel),
+                active: device.map(|device| device.active).unwrap_or(true),
+                modes: monitor
+                    .device_name
+                    .as_deref()
+                    .map(display_modes)
+                    .unwrap_or_default(),
+                write_capabilities: DisplayWriteCapabilities::default(),
+            });
+        }
+
+        displays.sort_by_key(|display| (!display.primary, display.x, display.y));
+        let min_x = displays.iter().map(|display| display.x).min().unwrap_or(0);
+        let min_y = displays.iter().map(|display| display.y).min().unwrap_or(0);
+        let max_x = displays
+            .iter()
+            .map(|display| display.x.saturating_add(display.width as i32))
+            .max()
+            .unwrap_or(0);
+        let max_y = displays
+            .iter()
+            .map(|display| display.y.saturating_add(display.height as i32))
+            .max()
+            .unwrap_or(0);
+        let primary = displays
+            .iter()
+            .find(|display| display.primary)
+            .unwrap_or(&displays[0]);
+
+        Ok(LocalDisplayState {
+            display_count: displays.len(),
+            virtual_x: min_x,
+            virtual_y: min_y,
+            primary_width: primary.width,
+            primary_height: primary.height,
+            layout_width: max_x.saturating_sub(min_x).max(0) as u32,
+            layout_height: max_y.saturating_sub(min_y).max(0) as u32,
+            displays,
+        })
+    }
+
+    fn enumerate_monitor_snapshots() -> Result<Vec<MonitorSnapshot>> {
+        unsafe extern "system" fn collect_monitor(
+            monitor: isize,
+            _hdc: isize,
+            _rect: *mut Rect,
+            data: isize,
+        ) -> i32 {
+            let monitors = &mut *(data as *mut Vec<MonitorSnapshot>);
+            let mut info = MonitorInfoEx::default();
+
+            if GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfoEx).cast()) == 0 {
+                return 1;
+            }
+
+            if rect_width(info.rc_monitor) == 0 || rect_height(info.rc_monitor) == 0 {
+                return 1;
+            }
+
+            monitors.push(MonitorSnapshot {
+                handle: monitor,
+                rect: info.rc_monitor,
+                work: info.rc_work,
+                primary: info.flags & MONITORINFOF_PRIMARY != 0,
+                device_name: fixed_wide_to_string(&info.device),
+            });
+            1
+        }
+
+        let mut monitors = Vec::new();
+        let ok = unsafe {
+            EnumDisplayMonitors(
+                0,
+                std::ptr::null(),
+                Some(collect_monitor),
+                &mut monitors as *mut _ as isize,
+            )
+        };
+        if ok == 0 {
+            anyhow::bail!(
+                "EnumDisplayMonitors failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok(monitors)
+    }
+
+    fn enumerate_display_devices() -> BTreeMap<String, DisplayDeviceSnapshot> {
+        let mut devices = BTreeMap::new();
+        let mut index = 0u32;
+
+        loop {
+            let mut adapter = DisplayDeviceW::default();
+            let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut adapter, 0) };
+            if ok == 0 {
+                break;
+            }
+            index = index.saturating_add(1);
+
+            let Some(device_name) = fixed_wide_to_string(&adapter.device_name) else {
+                continue;
+            };
+            let monitor = display_monitor_device(&adapter.device_name);
+            let friendly_name = monitor
+                .as_ref()
+                .and_then(|monitor| fixed_wide_to_string(&monitor.device_string))
+                .or_else(|| fixed_wide_to_string(&adapter.device_string));
+            let target_id = monitor
+                .as_ref()
+                .and_then(|monitor| fixed_wide_to_string(&monitor.device_id));
+
+            devices.insert(
+                device_name.clone(),
+                DisplayDeviceSnapshot {
+                    adapter_id: fixed_wide_to_string(&adapter.device_id),
+                    target_id,
+                    friendly_name,
+                    active: adapter.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0,
+                    primary: adapter.state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0,
+                },
+            );
+        }
+
+        devices
+    }
+
+    fn display_monitor_device(adapter_name: &[u16; CCHDEVICENAME]) -> Option<DisplayDeviceW> {
+        let mut index = 0u32;
+
+        loop {
+            let mut monitor = DisplayDeviceW::default();
+            let ok = unsafe { EnumDisplayDevicesW(adapter_name.as_ptr(), index, &mut monitor, 0) };
+            if ok == 0 {
+                return None;
+            }
+            index = index.saturating_add(1);
+
+            if monitor.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0 {
+                return Some(monitor);
+            }
+        }
+    }
+
+    fn current_display_mode(device_name: &str) -> Option<CurrentDisplayMode> {
+        let mut mode = devmode_with_size();
+        let device_name = wide_null(device_name);
+        let ok =
+            unsafe { EnumDisplaySettingsW(device_name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) };
+        if ok == 0 {
+            None
+        } else {
+            Some(current_display_mode_from_devmode(&mode))
+        }
+    }
+
+    fn display_modes(device_name: &str) -> Vec<DisplayModeInfo> {
+        let device_name = wide_null(device_name);
+        let mut modes = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut index = 0u32;
+
+        loop {
+            let mut mode = devmode_with_size();
+            let ok = unsafe { EnumDisplaySettingsW(device_name.as_ptr(), index, &mut mode) };
+            if ok == 0 {
+                break;
+            }
+            index = index.saturating_add(1);
+
+            let mode = display_mode_from_devmode(&mode);
+            let key = (
+                mode.width,
+                mode.height,
+                mode.refresh_rate_millihz,
+                orientation_rank(mode.orientation),
+                mode.bits_per_pixel,
+            );
+            if seen.insert(key) {
+                modes.push(mode);
+            }
+        }
+
+        modes.sort_by_key(|mode| {
+            (
+                mode.width,
+                mode.height,
+                mode.refresh_rate_millihz.unwrap_or(0),
+                mode.bits_per_pixel.unwrap_or(0),
+                orientation_rank(mode.orientation),
+            )
+        });
+        modes
+    }
+
+    fn display_mode_from_devmode(mode: &DevModeW) -> DisplayModeInfo {
+        let display = unsafe { mode.fields_union.display };
+        DisplayModeInfo {
+            width: mode.pels_width,
+            height: mode.pels_height,
+            refresh_rate_millihz: refresh_rate_to_millihz(mode.display_frequency),
+            orientation: display_orientation_from_devmode(display.display_orientation),
+            bits_per_pixel: if mode.bits_per_pel == 0 {
+                None
+            } else {
+                Some(mode.bits_per_pel)
+            },
+        }
+    }
+
+    fn current_display_mode_from_devmode(mode: &DevModeW) -> CurrentDisplayMode {
+        let display = unsafe { mode.fields_union.display };
+        CurrentDisplayMode {
+            x: display.position.x,
+            y: display.position.y,
+            mode: display_mode_from_devmode(mode),
+        }
+    }
+
+    fn display_geometry_from_monitor_and_mode(
+        monitor_rect: Rect,
+        mode: Option<&CurrentDisplayMode>,
+    ) -> (i32, i32, u32, u32) {
+        if let Some(mode) = mode {
+            if mode.mode.width > 0 && mode.mode.height > 0 {
+                return (mode.x, mode.y, mode.mode.width, mode.mode.height);
+            }
+        }
+
+        (
+            monitor_rect.left,
+            monitor_rect.top,
+            rect_width(monitor_rect),
+            rect_height(monitor_rect),
+        )
+    }
+
+    fn monitor_dpi_state(
+        monitor: isize,
+    ) -> (
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    ) {
+        const MDT_EFFECTIVE_DPI: i32 = 0;
+        const MDT_RAW_DPI: i32 = 2;
+
+        let (dpi_x, dpi_y) = dpi_for_monitor(monitor, MDT_EFFECTIVE_DPI);
+        let (raw_dpi_x, raw_dpi_y) = dpi_for_monitor(monitor, MDT_RAW_DPI);
+        let scale_percent = dpi_x.map(|dpi| dpi.saturating_mul(100).saturating_add(48) / 96);
+
+        (dpi_x, dpi_y, raw_dpi_x, raw_dpi_y, scale_percent)
+    }
+
+    fn dpi_for_monitor(monitor: isize, dpi_type: i32) -> (Option<u32>, Option<u32>) {
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        let hr = unsafe { GetDpiForMonitor(monitor, dpi_type, &mut dpi_x, &mut dpi_y) };
+        if hr < 0 || dpi_x == 0 || dpi_y == 0 {
+            (None, None)
+        } else {
+            (Some(dpi_x), Some(dpi_y))
+        }
+    }
+
+    fn rect_width(rect: Rect) -> u32 {
+        rect.right.saturating_sub(rect.left).max(0) as u32
+    }
+
+    fn rect_height(rect: Rect) -> u32 {
+        rect.bottom.saturating_sub(rect.top).max(0) as u32
+    }
+
+    fn orientation_rank(orientation: DisplayOrientation) -> u8 {
+        match orientation {
+            DisplayOrientation::Landscape => 0,
+            DisplayOrientation::Portrait => 1,
+            DisplayOrientation::LandscapeFlipped => 2,
+            DisplayOrientation::PortraitFlipped => 3,
+        }
+    }
+
     /// Get all screen information (multi-monitor support)
     pub fn get_all_screens() -> Vec<ScreenInfo> {
         unsafe extern "system" fn collect_monitor(
@@ -1993,7 +2584,7 @@ mod windows_impl {
                 flags: 0,
             };
 
-            if GetMonitorInfoW(monitor, &mut info) == 0 {
+            if GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfo).cast()) == 0 {
                 return 1;
             }
 
@@ -2134,7 +2725,112 @@ mod windows_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use rshare_core::DisplayOrientation;
         use std::mem::{align_of, offset_of, size_of};
+
+        #[test]
+        fn windows_orientation_mapping_is_stable() {
+            assert_eq!(
+                display_orientation_from_devmode(0),
+                DisplayOrientation::Landscape
+            );
+            assert_eq!(
+                display_orientation_from_devmode(1),
+                DisplayOrientation::Portrait
+            );
+            assert_eq!(
+                display_orientation_from_devmode(2),
+                DisplayOrientation::LandscapeFlipped
+            );
+            assert_eq!(
+                display_orientation_from_devmode(3),
+                DisplayOrientation::PortraitFlipped
+            );
+        }
+
+        #[test]
+        fn refresh_rate_converts_to_millihz() {
+            assert_eq!(refresh_rate_to_millihz(60), Some(60_000));
+            assert_eq!(refresh_rate_to_millihz(0), None);
+        }
+
+        #[test]
+        fn display_geometry_prefers_devmode_physical_geometry() {
+            let monitor_rect = Rect {
+                left: 0,
+                top: 0,
+                right: 1536,
+                bottom: 864,
+            };
+            let mode = CurrentDisplayMode {
+                x: -1920,
+                y: 0,
+                mode: DisplayModeInfo {
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate_millihz: Some(60_000),
+                    orientation: DisplayOrientation::Landscape,
+                    bits_per_pixel: Some(32),
+                },
+            };
+
+            assert_eq!(
+                display_geometry_from_monitor_and_mode(monitor_rect, Some(&mode)),
+                (-1920, 0, 1920, 1080)
+            );
+            assert_eq!(
+                display_geometry_from_monitor_and_mode(monitor_rect, None),
+                (0, 0, 1536, 864)
+            );
+        }
+
+        #[test]
+        fn stable_display_id_is_deterministic_and_not_raw_gdi_name() {
+            let first = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+            let second = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+
+            assert_eq!(first, second);
+            assert_ne!(first, r"\\.\DISPLAY1");
+            assert!(first.starts_with("windows-display-"));
+        }
+
+        #[test]
+        fn stable_display_id_ignores_gdi_name_when_better_identity_exists() {
+            let first = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+            let second = stable_display_id(
+                r"\\.\DISPLAY2",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        fn stable_display_id_falls_back_to_gdi_name() {
+            let first = stable_display_id(r"\\.\DISPLAY1", None, None, None);
+            let second = stable_display_id(r"\\.\DISPLAY2", None, None, None);
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("windows-display-"));
+            assert!(second.starts_with("windows-display-"));
+        }
 
         #[test]
         fn send_input_layout_matches_windows_64bit_abi() {

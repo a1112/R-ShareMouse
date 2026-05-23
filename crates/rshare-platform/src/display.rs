@@ -5,6 +5,12 @@ use rshare_core::{
     LocalDisplayState,
 };
 
+#[cfg(windows)]
+pub fn query_display_state() -> Result<LocalDisplayState> {
+    crate::windows::query_display_state()
+}
+
+#[cfg(not(windows))]
 pub fn query_display_state() -> Result<LocalDisplayState> {
     Ok(LocalDisplayState::default())
 }

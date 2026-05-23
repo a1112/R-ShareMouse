@@ -1036,9 +1036,23 @@ fn refresh_platform_local_controls(
 ) {
     #[cfg(windows)]
     {
-        let screens = rshare_platform::windows::get_all_screens();
-        if !screens.is_empty() {
-            snapshot.display = display_state_from_windows_screens(&screens);
+        match rshare_platform::display::query_display_state() {
+            Ok(display) if !display.displays.is_empty() => {
+                snapshot.display = display;
+            }
+            Ok(_) => {
+                let screens = rshare_platform::windows::get_all_screens();
+                if !screens.is_empty() {
+                    snapshot.display = display_state_from_windows_screens(&screens);
+                }
+            }
+            Err(error) => {
+                let screens = rshare_platform::windows::get_all_screens();
+                if !screens.is_empty() {
+                    snapshot.display = display_state_from_windows_screens(&screens);
+                }
+                snapshot.last_error = Some(format!("Display enumeration failed: {error}"));
+            }
         }
         snapshot.driver = rshare_platform::windows::probe_rshare_driver();
         if snapshot.driver.status == "available" {
@@ -1115,6 +1129,7 @@ fn fallback_display_state(width: u32, height: u32) -> LocalDisplayState {
             width,
             height,
             primary: true,
+            active: true,
             ..LocalDisplayInfo::default()
         }],
     }
@@ -1166,6 +1181,7 @@ fn display_state_from_windows_screens(
                 width: screen.width,
                 height: screen.height,
                 primary: screen.x == 0 && screen.y == 0,
+                active: true,
                 ..LocalDisplayInfo::default()
             })
             .collect(),
@@ -1181,6 +1197,7 @@ fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<Di
             width: display.primary_width.max(1),
             height: display.primary_height.max(1),
             primary: true,
+            active: true,
             ..LocalDisplayInfo::default()
         }]
     } else {
@@ -6828,6 +6845,16 @@ fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
 fn current_primary_screen_info() -> ScreenInfo {
     #[cfg(windows)]
     {
+        if let Ok(display) = rshare_platform::display::query_display_state() {
+            if let Some(primary) = display
+                .displays
+                .iter()
+                .find(|display| display.primary)
+                .or_else(|| display.displays.first())
+            {
+                return ScreenInfo::new(0, 0, primary.width, primary.height);
+            }
+        }
         let screen = rshare_platform::WindowsInputListener::get_screen_info();
         return ScreenInfo::new(0, 0, screen.width, screen.height);
     }
@@ -8200,6 +8227,14 @@ mod tests {
         assert_eq!(local_node.displays[1].display_id, "display-2");
         assert_eq!(local_node.displays[1].x, 2560);
         assert_eq!(local_node.displays[1].height, 1440);
+    }
+
+    #[test]
+    fn fallback_display_state_marks_primary_display_active() {
+        let display = fallback_display_state(1920, 1080);
+
+        assert_eq!(display.displays.len(), 1);
+        assert!(display.displays[0].active);
     }
 
     #[test]
