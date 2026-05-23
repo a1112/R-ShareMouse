@@ -1113,6 +1113,7 @@ fn fallback_display_state(width: u32, height: u32) -> LocalDisplayState {
             width,
             height,
             primary: true,
+            ..LocalDisplayInfo::default()
         }],
     }
 }
@@ -1163,6 +1164,7 @@ fn display_state_from_windows_screens(
                 width: screen.width,
                 height: screen.height,
                 primary: screen.x == 0 && screen.y == 0,
+                ..LocalDisplayInfo::default()
             })
             .collect(),
     }
@@ -1177,6 +1179,7 @@ fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<Di
             width: display.primary_width.max(1),
             height: display.primary_height.max(1),
             primary: true,
+            ..LocalDisplayInfo::default()
         }]
     } else {
         display.displays.clone()
@@ -8040,6 +8043,7 @@ mod tests {
                     width: 1280,
                     height: 720,
                     primary: false,
+                    ..LocalDisplayInfo::default()
                 },
                 LocalDisplayInfo {
                     display_id: "primary".to_string(),
@@ -8048,6 +8052,7 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     primary: true,
+                    ..LocalDisplayInfo::default()
                 },
             ],
         };
@@ -8134,6 +8139,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     primary: true,
+                    ..LocalDisplayInfo::default()
                 },
                 LocalDisplayInfo {
                     display_id: "display-2".to_string(),
@@ -8142,6 +8148,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     primary: false,
+                    ..LocalDisplayInfo::default()
                 },
             ],
         };

@@ -521,6 +521,119 @@ fn pressed_gamepad_buttons(buttons: &[GamepadButtonState]) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayOperationStatus {
+    Success,
+    Unsupported,
+    PermissionDenied,
+    InvalidDisplay,
+    InvalidMode,
+    RequiresSystemSettings,
+    ApplyFailed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayOrientation {
+    #[default]
+    Landscape,
+    Portrait,
+    LandscapeFlipped,
+    PortraitFlipped,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayWriteCapabilities {
+    #[serde(default)]
+    pub resolution: bool,
+    #[serde(default)]
+    pub refresh_rate: bool,
+    #[serde(default)]
+    pub orientation: bool,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub position: bool,
+    #[serde(default)]
+    pub scale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayModeInfo {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub refresh_rate_millihz: Option<u32>,
+    #[serde(default)]
+    pub orientation: DisplayOrientation,
+    #[serde(default)]
+    pub bits_per_pixel: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayCaptureRequest {
+    pub display_id: String,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayCaptureResult {
+    pub status: DisplayOperationStatus,
+    #[serde(default)]
+    pub display_id: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayIdentifyRequest {
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayIdentifyResult {
+    pub status: DisplayOperationStatus,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplaySettingsUpdateRequest {
+    pub display_id: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub refresh_rate_millihz: Option<u32>,
+    #[serde(default)]
+    pub orientation: Option<DisplayOrientation>,
+    #[serde(default)]
+    pub primary: Option<bool>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub scale_percent: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplaySettingsUpdateResult {
+    pub status: DisplayOperationStatus,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalDisplayState {
     #[serde(default)]
     pub display_count: usize,
@@ -555,9 +668,17 @@ impl Default for LocalDisplayState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalDisplayInfo {
     pub display_id: String,
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub friendly_name: Option<String>,
     #[serde(default)]
     pub x: i32,
     #[serde(default)]
@@ -567,7 +688,37 @@ pub struct LocalDisplayInfo {
     #[serde(default)]
     pub height: u32,
     #[serde(default)]
+    pub work_x: i32,
+    #[serde(default)]
+    pub work_y: i32,
+    #[serde(default)]
+    pub work_width: u32,
+    #[serde(default)]
+    pub work_height: u32,
+    #[serde(default)]
     pub primary: bool,
+    #[serde(default)]
+    pub orientation: DisplayOrientation,
+    #[serde(default)]
+    pub scale_percent: Option<u32>,
+    #[serde(default)]
+    pub dpi_x: Option<u32>,
+    #[serde(default)]
+    pub dpi_y: Option<u32>,
+    #[serde(default)]
+    pub raw_dpi_x: Option<u32>,
+    #[serde(default)]
+    pub raw_dpi_y: Option<u32>,
+    #[serde(default)]
+    pub refresh_rate_millihz: Option<u32>,
+    #[serde(default)]
+    pub bits_per_pixel: Option<u32>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub modes: Vec<DisplayModeInfo>,
+    #[serde(default)]
+    pub write_capabilities: DisplayWriteCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
