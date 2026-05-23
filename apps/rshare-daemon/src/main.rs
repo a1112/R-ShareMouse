@@ -2077,6 +2077,125 @@ fn record_usb_diagnostic_event(
     event
 }
 
+fn display_capture_response_from_result(
+    request: &rshare_core::DisplayCaptureRequest,
+    result: Result<DisplayCaptureResult>,
+) -> DaemonResponse {
+    DaemonResponse::DisplayCapture(result.unwrap_or_else(|error| DisplayCaptureResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        display_id: request.display_id.clone(),
+        mime_type: None,
+        width: None,
+        height: None,
+        bytes: Vec::new(),
+        message: Some(error.to_string()),
+    }))
+}
+
+fn display_identify_response_from_result(result: Result<DisplayIdentifyResult>) -> DaemonResponse {
+    DaemonResponse::DisplayIdentify(result.unwrap_or_else(|error| DisplayIdentifyResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        message: Some(error.to_string()),
+    }))
+}
+
+fn display_settings_update_response_from_result(
+    state: &mut DaemonState,
+    request: &rshare_core::DisplaySettingsUpdateRequest,
+    result: Result<DisplaySettingsUpdateResult>,
+    refreshed_display: Result<LocalDisplayState>,
+) -> (DaemonResponse, LocalInputDiagnosticEvent) {
+    let result = result.unwrap_or_else(|error| DisplaySettingsUpdateResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        message: Some(error.to_string()),
+    });
+
+    apply_refreshed_display_state(state, refreshed_display);
+    let layout_changed = state.reconcile_local_layout_geometry();
+    let event = record_display_settings_update_event(state, request, &result, layout_changed);
+
+    (DaemonResponse::DisplaySettingsUpdated(result), event)
+}
+
+fn apply_refreshed_display_state(
+    state: &mut DaemonState,
+    refreshed_display: Result<LocalDisplayState>,
+) {
+    match refreshed_display {
+        Ok(display) if !display.displays.is_empty() => {
+            state.local_controls.display = display;
+            update_mouse_display_position(&mut state.local_controls);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            state.local_controls.last_error = Some(format!("Display enumeration failed: {error}"));
+        }
+    }
+}
+
+fn record_display_settings_update_event(
+    state: &mut DaemonState,
+    request: &rshare_core::DisplaySettingsUpdateRequest,
+    result: &DisplaySettingsUpdateResult,
+    layout_changed: bool,
+) -> LocalInputDiagnosticEvent {
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+
+    let mut payload = BTreeMap::new();
+    payload.insert("display_id".to_string(), request.display_id.clone());
+    payload.insert("status".to_string(), format!("{:?}", result.status));
+    payload.insert("layout_changed".to_string(), layout_changed.to_string());
+    if let Some(message) = &result.message {
+        payload.insert("message".to_string(), message.clone());
+    }
+    if let Some(width) = request.width {
+        payload.insert("width".to_string(), width.to_string());
+    }
+    if let Some(height) = request.height {
+        payload.insert("height".to_string(), height.to_string());
+    }
+    if let Some(refresh_rate_millihz) = request.refresh_rate_millihz {
+        payload.insert(
+            "refresh_rate_millihz".to_string(),
+            refresh_rate_millihz.to_string(),
+        );
+    }
+    if let Some(orientation) = request.orientation {
+        payload.insert("orientation".to_string(), format!("{:?}", orientation));
+    }
+    if let Some(primary) = request.primary {
+        payload.insert("primary".to_string(), primary.to_string());
+    }
+    if let Some(x) = request.x {
+        payload.insert("x".to_string(), x.to_string());
+    }
+    if let Some(y) = request.y {
+        payload.insert("y".to_string(), y.to_string());
+    }
+    if let Some(scale_percent) = request.scale_percent {
+        payload.insert("scale_percent".to_string(), scale_percent.to_string());
+    }
+
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms: timestamp_ms_now(),
+        device_kind: LocalInputDeviceKind::Display,
+        event_kind: "settings_update".to_string(),
+        summary: format!(
+            "Display settings update for {}: {:?}",
+            request.display_id, result.status
+        ),
+        device_id: None,
+        device_instance_id: Some(request.display_id.clone()),
+        capture_path: Some("display-settings".to_string()),
+        source: LocalInputEventSource::System,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
+}
+
 fn upsert_remote_usb_device(
     state: &mut DaemonState,
     from: DeviceId,
@@ -6789,40 +6908,34 @@ async fn handle_ipc_client(
             DaemonResponse::LocalAudioTest(run_audio_test(&state).await)
         }
         DaemonRequest::CaptureDisplay(request) => {
-            DaemonResponse::DisplayCapture(DisplayCaptureResult {
-                status: DisplayOperationStatus::Unsupported,
-                display_id: request.display_id,
-                mime_type: None,
-                width: None,
-                height: None,
-                bytes: Vec::new(),
-                message: Some(
-                    "Display capture IPC is registered but daemon handling is not implemented yet."
-                        .to_string(),
-                ),
-            })
+            let result = rshare_platform::display::capture_display(&request);
+            display_capture_response_from_result(&request, result)
         }
-        DaemonRequest::IdentifyDisplays(_request) => {
-            DaemonResponse::DisplayIdentify(DisplayIdentifyResult {
-                status: DisplayOperationStatus::Unsupported,
-                message: Some(
-                    "Display identify IPC is registered but daemon handling is not implemented yet."
-                        .to_string(),
-                ),
-            })
+        DaemonRequest::IdentifyDisplays(request) => {
+            let result = rshare_platform::display::identify_displays(&request);
+            display_identify_response_from_result(result)
         }
-        DaemonRequest::UpdateDisplaySettings(_request) => {
-            DaemonResponse::DisplaySettingsUpdated(DisplaySettingsUpdateResult {
-                status: DisplayOperationStatus::Unsupported,
-                message: Some(
-                    "Display settings IPC is registered but daemon handling is not implemented yet."
-                        .to_string(),
-                ),
-            })
+        DaemonRequest::UpdateDisplaySettings(request) => {
+            let result = rshare_platform::display::update_display_settings(&request);
+            let refreshed_display = rshare_platform::display::query_display_state();
+            let (response, event) = {
+                let mut state = state.write().await;
+                display_settings_update_response_from_result(
+                    &mut state,
+                    &request,
+                    result,
+                    refreshed_display,
+                )
+            };
+            let _ = local_events_tx.send(event);
+            response
         }
-        DaemonRequest::OpenDisplaySettings => DaemonResponse::Error(
-            "Opening display settings is not implemented in the daemon yet.".to_string(),
-        ),
+        DaemonRequest::OpenDisplaySettings => {
+            match rshare_platform::display::open_display_settings() {
+                Ok(()) => DaemonResponse::Ack,
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
         DaemonRequest::SubscribeEndpointEvents { .. } => {
             unreachable!("handled before response match")
@@ -7123,6 +7236,119 @@ mod tests {
                 .map(String::as_str),
             Some("primary:2560x1440@1920,0:primary;remote-left:1920x1080@0,0")
         );
+    }
+
+    #[test]
+    fn display_scale_update_result_is_nonfatal_and_refreshes_layout() {
+        let mut state = test_daemon_state();
+        let request = rshare_core::DisplaySettingsUpdateRequest {
+            display_id: "primary".to_string(),
+            width: None,
+            height: None,
+            refresh_rate_millihz: None,
+            orientation: None,
+            primary: None,
+            x: None,
+            y: None,
+            scale_percent: Some(125),
+        };
+
+        let refreshed_display = LocalDisplayState {
+            display_count: 2,
+            virtual_x: 0,
+            virtual_y: 0,
+            primary_width: 1920,
+            primary_height: 1080,
+            layout_width: 3200,
+            layout_height: 1080,
+            displays: vec![
+                LocalDisplayInfo {
+                    display_id: "primary".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                    active: true,
+                    ..LocalDisplayInfo::default()
+                },
+                LocalDisplayInfo {
+                    display_id: "right".to_string(),
+                    x: 1920,
+                    width: 1280,
+                    height: 720,
+                    active: true,
+                    ..LocalDisplayInfo::default()
+                },
+            ],
+        };
+
+        let (response, event) = display_settings_update_response_from_result(
+            &mut state,
+            &request,
+            Ok(DisplaySettingsUpdateResult {
+                status: DisplayOperationStatus::RequiresSystemSettings,
+                message: Some("scale requires system settings".to_string()),
+            }),
+            Ok(refreshed_display),
+        );
+
+        match response {
+            DaemonResponse::DisplaySettingsUpdated(result) => {
+                assert_eq!(
+                    result.status,
+                    DisplayOperationStatus::RequiresSystemSettings
+                );
+            }
+            other => panic!("expected display settings result, got {other:?}"),
+        }
+        let local_node = state
+            .layout
+            .get_node(state.status.device_id)
+            .expect("local layout node");
+        assert_eq!(local_node.displays.len(), 2);
+        assert_eq!(local_node.displays[1].display_id, "right");
+        assert_eq!(event.device_kind, LocalInputDeviceKind::Display);
+        assert_eq!(event.event_kind, "settings_update");
+        assert_eq!(
+            event.payload.get("status").map(String::as_str),
+            Some("RequiresSystemSettings")
+        );
+    }
+
+    #[test]
+    fn display_capture_platform_error_returns_structured_result() {
+        let request = rshare_core::DisplayCaptureRequest {
+            display_id: "display-1".to_string(),
+            max_width: Some(640),
+        };
+
+        let response = display_capture_response_from_result(
+            &request,
+            Err(anyhow::anyhow!("capture backend failed")),
+        );
+
+        match response {
+            DaemonResponse::DisplayCapture(result) => {
+                assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
+                assert_eq!(result.display_id, "display-1");
+                assert!(result.bytes.is_empty());
+                assert_eq!(result.message.as_deref(), Some("capture backend failed"));
+            }
+            other => panic!("expected display capture result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_displays_platform_error_returns_structured_result() {
+        let response =
+            display_identify_response_from_result(Err(anyhow::anyhow!("overlay backend failed")));
+
+        match response {
+            DaemonResponse::DisplayIdentify(result) => {
+                assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
+                assert_eq!(result.message.as_deref(), Some("overlay backend failed"));
+            }
+            other => panic!("expected display identify result, got {other:?}"),
+        }
     }
 
     #[test]
