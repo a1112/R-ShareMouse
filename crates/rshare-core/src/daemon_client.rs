@@ -13,9 +13,11 @@ use tokio_tungstenite::{
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
     CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
-    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestRequest,
-    LocalInputTestResult, ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDeviceDescriptor,
+    DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
+    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -168,6 +170,44 @@ pub async fn request_set_layout(layout: LayoutGraph) -> Result<()> {
 pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
     match send_request(DaemonRequest::LocalControls).await? {
         DaemonResponse::LocalControls(snapshot) => Ok(snapshot),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_display_capture(
+    request: DisplayCaptureRequest,
+) -> Result<DisplayCaptureResult> {
+    match send_request(DaemonRequest::CaptureDisplay(request)).await? {
+        DaemonResponse::DisplayCapture(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_identify_displays(
+    request: DisplayIdentifyRequest,
+) -> Result<DisplayIdentifyResult> {
+    match send_request(DaemonRequest::IdentifyDisplays(request)).await? {
+        DaemonResponse::DisplayIdentify(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_update_display_settings(
+    request: DisplaySettingsUpdateRequest,
+) -> Result<DisplaySettingsUpdateResult> {
+    match send_request(DaemonRequest::UpdateDisplaySettings(request)).await? {
+        DaemonResponse::DisplaySettingsUpdated(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_open_display_settings() -> Result<()> {
+    match send_request(DaemonRequest::OpenDisplaySettings).await? {
+        DaemonResponse::Ack => Ok(()),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

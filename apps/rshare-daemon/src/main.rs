@@ -13,19 +13,21 @@ use rshare_core::{
     remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction, DisplayNode,
-    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
-    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
-    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
-    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, LocalInputTestStatus, Message, NetworkTransportSnapshot,
-    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode,
-    ScreenInfo, ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
-    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
+    DisplayCaptureResult, DisplayIdentifyResult, DisplayNode, DisplayOperationStatus,
+    DisplaySettingsUpdateResult, EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent,
+    EndpointEventFilter, EndpointEventStore, EndpointInjectError, EndpointInjectRequest,
+    EndpointInjectResult, EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot,
+    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
+    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -6769,6 +6771,41 @@ async fn handle_ipc_client(
         DaemonRequest::RunAudioTest { test: _ } => {
             DaemonResponse::LocalAudioTest(run_audio_test(&state).await)
         }
+        DaemonRequest::CaptureDisplay(request) => {
+            DaemonResponse::DisplayCapture(DisplayCaptureResult {
+                status: DisplayOperationStatus::Unsupported,
+                display_id: request.display_id,
+                mime_type: None,
+                width: None,
+                height: None,
+                bytes: Vec::new(),
+                message: Some(
+                    "Display capture IPC is registered but daemon handling is not implemented yet."
+                        .to_string(),
+                ),
+            })
+        }
+        DaemonRequest::IdentifyDisplays(_request) => {
+            DaemonResponse::DisplayIdentify(DisplayIdentifyResult {
+                status: DisplayOperationStatus::Unsupported,
+                message: Some(
+                    "Display identify IPC is registered but daemon handling is not implemented yet."
+                        .to_string(),
+                ),
+            })
+        }
+        DaemonRequest::UpdateDisplaySettings(_request) => {
+            DaemonResponse::DisplaySettingsUpdated(DisplaySettingsUpdateResult {
+                status: DisplayOperationStatus::Unsupported,
+                message: Some(
+                    "Display settings IPC is registered but daemon handling is not implemented yet."
+                        .to_string(),
+                ),
+            })
+        }
+        DaemonRequest::OpenDisplaySettings => DaemonResponse::Error(
+            "Opening display settings is not implemented in the daemon yet.".to_string(),
+        ),
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
         DaemonRequest::SubscribeEndpointEvents { .. } => {
             unreachable!("handled before response match")
