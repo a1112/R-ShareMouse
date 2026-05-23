@@ -81,6 +81,18 @@ fn local_input_latency_feedback_value(feedback: &rshare_core::LocalInputFeedback
     if let Some(sequence) = feedback.latest_sequence {
         parts.push(format!("seq {sequence}"));
     }
+    if let Some(gamepad_id) = feedback.latest_gamepad_id {
+        parts.push(format!("gamepad {gamepad_id}"));
+    }
+    if let Some(kind) = non_empty(feedback.latest_gamepad_event_kind.as_deref()) {
+        parts.push(format!("gamepad {kind}"));
+    }
+    if let Some(button) = non_empty(feedback.latest_gamepad_button.as_deref()) {
+        parts.push(format!("button {button}"));
+    }
+    if let Some(axis) = non_empty(feedback.latest_gamepad_axis.as_deref()) {
+        parts.push(format!("axis {axis}"));
+    }
 
     parts.join(", ")
 }
@@ -366,6 +378,38 @@ mod tests {
                 && value.contains("quic")
                 && value.contains("18 ms RTT")
         }));
+    }
+
+    #[test]
+    fn latency_feedback_lines_include_gamepad_local_details() {
+        let feedback = rshare_core::LatencyFeedbackSnapshot {
+            local_input: rshare_core::LocalInputFeedback {
+                status: rshare_core::LatencyFeedbackStatus::Healthy,
+                event_count: 4,
+                latest_sequence: Some(9),
+                latest_event_ms: Some(1_200),
+                latest_keyboard_event_ms: None,
+                latest_mouse_event_ms: None,
+                latest_gamepad_event_ms: Some(1_200),
+                latest_gamepad_id: Some(0),
+                latest_gamepad_event_kind: Some("state".to_string()),
+                latest_gamepad_button: Some("South pressed".to_string()),
+                latest_gamepad_axis: Some("left_stick".to_string()),
+                capture_path: None,
+            },
+            ..rshare_core::LatencyFeedbackSnapshot::default()
+        };
+
+        let lines = latency_feedback_lines(&feedback);
+        let local = lines
+            .iter()
+            .find(|(key, _)| key == "Local Input")
+            .map(|(_, value)| value)
+            .unwrap();
+
+        assert!(local.contains("gamepad 0"));
+        assert!(local.contains("South pressed"));
+        assert!(local.contains("left_stick"));
     }
 }
 
