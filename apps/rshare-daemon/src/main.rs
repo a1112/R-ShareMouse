@@ -465,7 +465,8 @@ impl DaemonState {
             .local_controls
             .keyboard
             .event_count
-            .saturating_add(self.local_controls.mouse.event_count);
+            .saturating_add(self.local_controls.mouse.event_count)
+            .saturating_add(local_gamepad_event_count(&self.local_controls));
 
         if self.backend_state.selected_mode.is_none() {
             return LocalInputFeedback {
@@ -499,6 +500,15 @@ impl DaemonState {
                     && event.device_kind == LocalInputDeviceKind::Mouse
             })
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_gamepad = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Gamepad
+            })
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
 
         LocalInputFeedback {
             status: if matches!(
@@ -516,11 +526,22 @@ impl DaemonState {
             latest_event_ms: latest_event.map(|event| event.timestamp_ms),
             latest_keyboard_event_ms: latest_keyboard.map(|event| event.timestamp_ms),
             latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
-            latest_gamepad_event_ms: None,
-            latest_gamepad_id: None,
-            latest_gamepad_event_kind: None,
-            latest_gamepad_button: None,
-            latest_gamepad_axis: None,
+            latest_gamepad_event_ms: latest_gamepad.map(|event| event.timestamp_ms),
+            latest_gamepad_id: latest_gamepad
+                .and_then(|event| event.payload.get("gamepad_id"))
+                .and_then(|value| value.parse::<u8>().ok()),
+            latest_gamepad_event_kind: latest_gamepad.map(|event| event.event_kind.clone()),
+            latest_gamepad_button: latest_gamepad
+                .and_then(|event| {
+                    event
+                        .payload
+                        .get("last_button")
+                        .or_else(|| event.payload.get("button"))
+                })
+                .cloned(),
+            latest_gamepad_axis: latest_gamepad
+                .and_then(|event| event.payload.get("last_axis"))
+                .cloned(),
             capture_path: latest_event.and_then(|event| event.capture_path.clone()),
         }
     }
@@ -974,10 +995,18 @@ impl DaemonState {
     }
 }
 
+fn local_gamepad_event_count(snapshot: &LocalControlDeviceSnapshot) -> u64 {
+    snapshot.gamepads.iter().fold(0_u64, |sum, gamepad| {
+        sum.saturating_add(gamepad.event_count)
+    })
+}
+
 fn is_eligible_local_input_feedback_event(event: &LocalInputDiagnosticEvent) -> bool {
     matches!(
         event.device_kind,
-        LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
+        LocalInputDeviceKind::Keyboard
+            | LocalInputDeviceKind::Mouse
+            | LocalInputDeviceKind::Gamepad
     ) && !event.payload.contains_key("remote_device_id")
         && !event.payload.contains_key("origin_event_device_id")
         && event.capture_path.as_deref() != Some("remote-daemon")
@@ -7696,6 +7725,72 @@ mod tests {
     }
 
     #[test]
+    fn local_input_feedback_uses_latest_gamepad_event() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        let mut gamepad = rshare_core::GamepadState::neutral(0, 1, timestamp_ms_now());
+        gamepad.buttons.push(rshare_core::GamepadButtonState {
+            button: rshare_core::GamepadButton::South,
+            pressed: true,
+        });
+
+        let event =
+            state.record_local_input_event(&rshare_input::InputEvent::gamepad_state(gamepad));
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(event.sequence));
+        assert_eq!(feedback.latest_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_gamepad_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_gamepad_id, Some(0));
+        assert_eq!(feedback.latest_gamepad_event_kind.as_deref(), Some("state"));
+        assert!(feedback
+            .latest_gamepad_button
+            .as_deref()
+            .is_some_and(|value| { value.contains("South") }));
+    }
+
+    #[test]
+    fn local_input_feedback_event_count_includes_gamepads() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.local_controls.keyboard.event_count = 2;
+        state.local_controls.mouse.event_count = 3;
+        let mut gamepad = rshare_core::LocalGamepadState {
+            gamepad_id: 0,
+            name: "Pad 0".to_string(),
+            connected: true,
+            buttons: Vec::new(),
+            pressed_buttons: Vec::new(),
+            last_button: None,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            event_count: 4,
+            button_event_count: 0,
+            button_press_count: 0,
+            button_release_count: 0,
+            axis_event_count: 0,
+            trigger_event_count: 0,
+            last_axis: None,
+            last_seen_ms: 0,
+        };
+        state.local_controls.gamepads.push(gamepad.clone());
+        gamepad.gamepad_id = 1;
+        gamepad.name = "Pad 1".to_string();
+        gamepad.event_count = 5;
+        state.local_controls.gamepads.push(gamepad);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.event_count, 14);
+    }
+
+    #[test]
     fn local_input_feedback_ignores_later_backend_diagnostic_for_latest_input() {
         let mut state = test_daemon_state();
         state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
@@ -7815,8 +7910,33 @@ mod tests {
     fn local_input_feedback_saturates_event_count() {
         let mut state = test_daemon_state();
         state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
-        state.local_controls.keyboard.event_count = u64::MAX;
+        state.local_controls.keyboard.event_count = 1;
         state.local_controls.mouse.event_count = 1;
+        state
+            .local_controls
+            .gamepads
+            .push(rshare_core::LocalGamepadState {
+                gamepad_id: 0,
+                name: "Pad".to_string(),
+                connected: true,
+                buttons: Vec::new(),
+                pressed_buttons: Vec::new(),
+                last_button: None,
+                left_stick_x: 0,
+                left_stick_y: 0,
+                right_stick_x: 0,
+                right_stick_y: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                event_count: u64::MAX,
+                button_event_count: 0,
+                button_press_count: 0,
+                button_release_count: 0,
+                axis_event_count: 0,
+                trigger_event_count: 0,
+                last_axis: None,
+                last_seen_ms: 0,
+            });
 
         let feedback = state.local_input_feedback();
 
