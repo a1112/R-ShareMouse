@@ -38,6 +38,7 @@ import {
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
+  buildLocalLatencyFeedbackRows,
   buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
@@ -2738,6 +2739,7 @@ function DevicesPageWithLocalControls({
           ...(localControls ?? {}),
           latency_feedback: latencyFeedback,
         } as LocalControlsSnapshot);
+  const localLatencyRows = buildLocalLatencyFeedbackRows(latencyFeedback);
   const selectedRemoteLatency = selectedRemoteDevice
     ? (buildRemoteLatencySummary(
         latencyFeedbackSnapshot,
@@ -3098,6 +3100,7 @@ function DevicesPageWithLocalControls({
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+        <LocalLatencyFeedbackStrip rows={localLatencyRows} theme={theme} />
         {selectedRemoteDevice ? (
           <RemoteLatencyPanel
             device={selectedRemoteDevice}
@@ -3253,6 +3256,64 @@ function DevicesPageWithLocalControls({
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function LocalLatencyFeedbackStrip({
+  rows,
+  theme,
+}: {
+  rows: Array<{
+    key: string;
+    label: string;
+    state: string;
+    metric: string;
+    detail: string;
+  }>;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const tone = (state: string) => {
+    switch (state) {
+      case "pass":
+        return theme.success;
+      case "warn":
+        return "#d6a64b";
+      case "block":
+        return theme.danger;
+      default:
+        return theme.textMuted;
+    }
+  };
+
+  return (
+    <div className="grid shrink-0 grid-cols-2 gap-2 lg:grid-cols-4">
+      {rows.map((row) => (
+        <div
+          key={row.key}
+          className="min-w-0 rounded-md px-3 py-2"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: "rgba(255,255,255,0.035)",
+          }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate text-xs" style={{ color: theme.textMuted }}>
+              {row.label}
+            </span>
+            <span
+              className="h-1.5 w-1.5 shrink-0 rounded-full"
+              style={{ background: tone(row.state) }}
+            />
+          </div>
+          <div className="mt-1 truncate text-sm font-semibold" style={{ color: theme.text }}>
+            {row.metric}
+          </div>
+          <div className="mt-1 truncate text-[11px]" style={{ color: theme.textMuted }} title={row.detail}>
+            {row.detail}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
