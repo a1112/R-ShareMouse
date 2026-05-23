@@ -516,6 +516,11 @@ impl DaemonState {
             latest_event_ms: latest_event.map(|event| event.timestamp_ms),
             latest_keyboard_event_ms: latest_keyboard.map(|event| event.timestamp_ms),
             latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
+            latest_gamepad_event_ms: None,
+            latest_gamepad_id: None,
+            latest_gamepad_event_kind: None,
+            latest_gamepad_button: None,
+            latest_gamepad_axis: None,
             capture_path: latest_event.and_then(|event| event.capture_path.clone()),
         }
     }

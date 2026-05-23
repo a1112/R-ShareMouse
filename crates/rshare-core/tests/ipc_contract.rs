@@ -476,6 +476,23 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
         .latency_feedback
         .local_input
         .latest_keyboard_event_ms = Some(109);
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_event_ms = Some(115);
+    snapshot.latency_feedback.local_input.latest_gamepad_id = Some(0);
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_event_kind = Some("state".to_string());
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_button = Some("South pressed".to_string());
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_axis = Some("left_stick".to_string());
     snapshot.latency_feedback.local_input.capture_path = Some("portable".to_string());
     snapshot.latency_feedback.remote_latency.devices.push(
         rshare_core::RemoteDeviceLatencyFeedback {
@@ -506,6 +523,45 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
     let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
+
+    let DaemonResponse::Status(decoded_snapshot) = &decoded else {
+        panic!("expected status response");
+    };
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_event_ms,
+        Some(115)
+    );
+    assert_eq!(
+        decoded_snapshot.latency_feedback.local_input.latest_gamepad_id,
+        Some(0)
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_event_kind
+            .as_deref(),
+        Some("state")
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_button
+            .as_deref(),
+        Some("South pressed")
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_axis
+            .as_deref(),
+        Some("left_stick")
+    );
 }
 
 #[test]

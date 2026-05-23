@@ -334,6 +334,11 @@ mod tests {
                 latest_event_ms: None,
                 latest_keyboard_event_ms: None,
                 latest_mouse_event_ms: None,
+                latest_gamepad_event_ms: None,
+                latest_gamepad_id: None,
+                latest_gamepad_event_kind: None,
+                latest_gamepad_button: None,
+                latest_gamepad_axis: None,
                 capture_path: Some("portable".to_string()),
             },
             transport: rshare_core::TransportFeedback {

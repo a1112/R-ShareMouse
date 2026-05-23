@@ -173,6 +173,16 @@ pub struct LocalInputFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_mouse_event_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gamepad_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gamepad_id: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gamepad_event_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gamepad_button: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gamepad_axis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_path: Option<String>,
 }
 
@@ -185,6 +195,11 @@ impl Default for LocalInputFeedback {
             latest_event_ms: None,
             latest_keyboard_event_ms: None,
             latest_mouse_event_ms: None,
+            latest_gamepad_event_ms: None,
+            latest_gamepad_id: None,
+            latest_gamepad_event_kind: None,
+            latest_gamepad_button: None,
+            latest_gamepad_axis: None,
             capture_path: None,
         }
     }
