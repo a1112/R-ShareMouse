@@ -29,6 +29,14 @@ pub fn identify_displays(_request: &DisplayIdentifyRequest) -> Result<DisplayIde
     })
 }
 
+#[cfg(windows)]
+pub fn update_display_settings(
+    request: &DisplaySettingsUpdateRequest,
+) -> Result<DisplaySettingsUpdateResult> {
+    crate::windows::update_display_settings(request)
+}
+
+#[cfg(not(windows))]
 pub fn update_display_settings(
     request: &DisplaySettingsUpdateRequest,
 ) -> Result<DisplaySettingsUpdateResult> {
@@ -101,6 +109,7 @@ fn unsupported_capture(display_id: &str, message: impl Into<String>) -> DisplayC
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn scale_requires_system_settings() -> DisplaySettingsUpdateResult {
     DisplaySettingsUpdateResult {
         status: DisplayOperationStatus::RequiresSystemSettings,

@@ -10,7 +10,8 @@ cfg_if::cfg_if! {
 mod windows_impl {
     use anyhow::{Context, Result};
     use rshare_core::{
-        DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities, LocalAudioInputDevice,
+        DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
+        DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioInputDevice,
         LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
         LocalHardwareDevice,
     };
@@ -1570,10 +1571,26 @@ mod windows_impl {
     const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
     const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
     const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
+    const DM_DISPLAYORIENTATION: u32 = 0x0000_0080;
+    const DM_BITSPERPEL: u32 = 0x0004_0000;
+    const DM_PELSWIDTH: u32 = 0x0008_0000;
+    const DM_PELSHEIGHT: u32 = 0x0010_0000;
+    const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
     const DMDO_DEFAULT: u32 = 0;
     const DMDO_90: u32 = 1;
     const DMDO_180: u32 = 2;
     const DMDO_270: u32 = 3;
+    const CDS_UPDATEREGISTRY: u32 = 0x0000_0001;
+    const CDS_TEST: u32 = 0x0000_0002;
+    const CDS_NORESET: u32 = 0x1000_0000;
+    const DISP_CHANGE_SUCCESSFUL: i32 = 0;
+    const DISP_CHANGE_RESTART: i32 = 1;
+    const DISP_CHANGE_FAILED: i32 = -1;
+    const DISP_CHANGE_BADMODE: i32 = -2;
+    const DISP_CHANGE_NOTUPDATED: i32 = -3;
+    const DISP_CHANGE_BADFLAGS: i32 = -4;
+    const DISP_CHANGE_BADPARAM: i32 = -5;
+    const DISP_CHANGE_BADDUALVIEW: i32 = -6;
     const RIM_TYPEMOUSE: u32 = 0;
     const RIM_TYPEKEYBOARD: u32 = 1;
     const RIDI_DEVICENAME: u32 = 0x20000007;
@@ -1603,6 +1620,15 @@ mod windows_impl {
             DMDO_180 => DisplayOrientation::LandscapeFlipped,
             DMDO_270 => DisplayOrientation::PortraitFlipped,
             _ => DisplayOrientation::Landscape,
+        }
+    }
+
+    fn display_orientation_to_devmode(value: DisplayOrientation) -> u32 {
+        match value {
+            DisplayOrientation::Landscape => DMDO_DEFAULT,
+            DisplayOrientation::Portrait => DMDO_90,
+            DisplayOrientation::LandscapeFlipped => DMDO_180,
+            DisplayOrientation::PortraitFlipped => DMDO_270,
         }
     }
 
@@ -2065,6 +2091,13 @@ mod windows_impl {
             i_mode_num: u32,
             lp_dev_mode: *mut DevModeW,
         ) -> i32;
+        fn ChangeDisplaySettingsExW(
+            lpsz_device_name: *const u16,
+            lp_dev_mode: *mut DevModeW,
+            hwnd: isize,
+            dwflags: u32,
+            l_param: *mut std::ffi::c_void,
+        ) -> i32;
         fn CreateFileW(
             lp_file_name: *const u16,
             dw_desired_access: u32,
@@ -2291,11 +2324,19 @@ mod windows_impl {
                     .as_deref()
                     .map(display_modes)
                     .unwrap_or_default(),
-                write_capabilities: DisplayWriteCapabilities::default(),
+                write_capabilities: DisplayWriteCapabilities {
+                    resolution: true,
+                    refresh_rate: true,
+                    orientation: true,
+                    primary: false,
+                    position: false,
+                    scale: false,
+                },
             });
         }
 
         displays.sort_by_key(|display| (!display.primary, display.x, display.y));
+        disambiguate_duplicate_display_ids(&mut displays);
         let min_x = displays.iter().map(|display| display.x).min().unwrap_or(0);
         let min_y = displays.iter().map(|display| display.y).min().unwrap_or(0);
         let max_x = displays
@@ -2323,6 +2364,346 @@ mod windows_impl {
             layout_height: max_y.saturating_sub(min_y).max(0) as u32,
             displays,
         })
+    }
+
+    pub fn update_display_settings(
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Result<DisplaySettingsUpdateResult> {
+        if request.scale_percent.is_some() {
+            return Ok(display_update_result(
+                DisplayOperationStatus::RequiresSystemSettings,
+                "display scale changes require Windows system display settings",
+            ));
+        }
+
+        let state = query_display_state()?;
+        let validation = validate_display_settings_update(&state, request);
+        if validation.status != DisplayOperationStatus::Success {
+            return Ok(validation);
+        }
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "display was not found after validation",
+            ));
+        };
+
+        if !display_settings_update_has_changes(request) {
+            return Ok(display_update_result(
+                DisplayOperationStatus::Success,
+                "no display settings changes requested",
+            ));
+        }
+
+        apply_display_settings_update(display, request)
+    }
+
+    fn validate_display_settings_update(
+        state: &LocalDisplayState,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> DisplaySettingsUpdateResult {
+        if request.scale_percent.is_some() {
+            return display_update_result(
+                DisplayOperationStatus::RequiresSystemSettings,
+                "display scale changes require Windows system display settings",
+            );
+        }
+
+        if request.primary.is_some() || request.x.is_some() || request.y.is_some() {
+            return display_update_result(
+                DisplayOperationStatus::Unsupported,
+                "primary and position display writes are not supported until topology rebasing is implemented",
+            );
+        }
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "requested display was not found",
+            );
+        };
+
+        if !display.active {
+            return display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "requested display is not active",
+            );
+        }
+
+        if request.orientation.is_some() && (request.width.is_none() || request.height.is_none()) {
+            return display_update_result(
+                DisplayOperationStatus::InvalidMode,
+                "orientation changes require explicit width and height",
+            );
+        }
+
+        if display_settings_update_has_mode_changes(request)
+            && supported_display_mode(display, request).is_none()
+        {
+            return display_update_result(
+                DisplayOperationStatus::InvalidMode,
+                "requested display mode is not advertised by the target display",
+            );
+        }
+
+        display_update_result(
+            DisplayOperationStatus::Success,
+            "display update request is valid",
+        )
+    }
+
+    fn disambiguate_duplicate_display_ids(displays: &mut [LocalDisplayInfo]) {
+        let mut groups: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+        for (index, display) in displays.iter().enumerate() {
+            let sort_key = format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+                display.device_name.as_deref().unwrap_or_default(),
+                display.target_id.as_deref().unwrap_or_default(),
+                display.adapter_id.as_deref().unwrap_or_default(),
+                display.friendly_name.as_deref().unwrap_or_default(),
+                display.x,
+                display.y,
+                display.width,
+                display.height,
+                index
+            );
+            groups
+                .entry(display.display_id.clone())
+                .or_default()
+                .push((sort_key, index));
+        }
+
+        for (base_id, mut entries) in groups {
+            if entries.len() <= 1 {
+                continue;
+            }
+
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (ordinal, (_, index)) in entries.into_iter().enumerate() {
+                if ordinal == 0 {
+                    displays[index].display_id = base_id.clone();
+                } else {
+                    displays[index].display_id = format!("{}-{}", base_id, ordinal + 1);
+                }
+            }
+        }
+    }
+
+    fn apply_display_settings_update(
+        display: &LocalDisplayInfo,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Result<DisplaySettingsUpdateResult> {
+        let Some(device_name) = display
+            .device_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "display does not expose a Windows GDI device name",
+            ));
+        };
+
+        let device_name_wide = wide_null(device_name);
+        let mut mode = devmode_with_size();
+        let ok = unsafe {
+            EnumDisplaySettingsW(device_name_wide.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode)
+        };
+        if ok == 0 {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "Windows could not read the current display mode",
+            ));
+        }
+
+        let mut fields = 0u32;
+
+        if display_settings_update_has_mode_changes(request) {
+            if let Some(width) = request.width {
+                mode.pels_width = width;
+                fields |= DM_PELSWIDTH;
+            }
+            if let Some(height) = request.height {
+                mode.pels_height = height;
+                fields |= DM_PELSHEIGHT;
+            }
+            if let Some(refresh_rate_millihz) = request.refresh_rate_millihz {
+                mode.display_frequency = refresh_rate_millihz / 1_000;
+                fields |= DM_DISPLAYFREQUENCY;
+            }
+            if let Some(orientation) = request.orientation {
+                mode.fields_union.display.display_orientation =
+                    display_orientation_to_devmode(orientation);
+                fields |= DM_DISPLAYORIENTATION;
+            }
+
+            if let Some(mode_info) = supported_display_mode(display, request) {
+                if let Some(bits_per_pixel) = mode_info.bits_per_pixel {
+                    mode.bits_per_pel = bits_per_pixel;
+                    fields |= DM_BITSPERPEL;
+                }
+            }
+        }
+
+        if request.x.is_some() || request.y.is_some() || request.primary.is_some() {
+            return Ok(display_update_result(
+                DisplayOperationStatus::Unsupported,
+                "primary and position display writes are not supported until topology rebasing is implemented",
+            ));
+        }
+
+        mode.fields = fields;
+
+        let flags = CDS_UPDATEREGISTRY;
+
+        let test_code = unsafe {
+            ChangeDisplaySettingsExW(
+                device_name_wide.as_ptr(),
+                &mut mode,
+                0,
+                flags | CDS_TEST,
+                std::ptr::null_mut(),
+            )
+        };
+        if test_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                test_code,
+                "Windows rejected display update test",
+            ));
+        }
+
+        let apply_code = unsafe {
+            ChangeDisplaySettingsExW(
+                device_name_wide.as_ptr(),
+                &mut mode,
+                0,
+                flags | CDS_NORESET,
+                std::ptr::null_mut(),
+            )
+        };
+        if apply_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                apply_code,
+                "Windows display update failed",
+            ));
+        }
+
+        let commit_code = unsafe {
+            ChangeDisplaySettingsExW(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if commit_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                commit_code,
+                "Windows display update commit failed",
+            ));
+        }
+
+        Ok(display_update_result(
+            DisplayOperationStatus::Success,
+            "display settings updated",
+        ))
+    }
+
+    fn display_settings_update_has_changes(request: &DisplaySettingsUpdateRequest) -> bool {
+        display_settings_update_has_mode_changes(request)
+            || request.primary.is_some()
+            || request.x.is_some()
+            || request.y.is_some()
+            || request.scale_percent.is_some()
+    }
+
+    fn display_settings_update_has_mode_changes(request: &DisplaySettingsUpdateRequest) -> bool {
+        request.width.is_some()
+            || request.height.is_some()
+            || request.refresh_rate_millihz.is_some()
+            || request.orientation.is_some()
+    }
+
+    fn supported_display_mode<'a>(
+        display: &'a LocalDisplayInfo,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Option<&'a DisplayModeInfo> {
+        let width = request.width.unwrap_or(display.width);
+        let height = request.height.unwrap_or(display.height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let orientation = request.orientation.unwrap_or(display.orientation);
+        display.modes.iter().find(|mode| {
+            mode.width == width
+                && mode.height == height
+                && mode.orientation == orientation
+                && request
+                    .refresh_rate_millihz
+                    .map(|refresh| mode.refresh_rate_millihz == Some(refresh))
+                    .unwrap_or(true)
+        })
+    }
+
+    fn display_update_result(
+        status: DisplayOperationStatus,
+        message: impl Into<String>,
+    ) -> DisplaySettingsUpdateResult {
+        DisplaySettingsUpdateResult {
+            status,
+            message: Some(message.into()),
+        }
+    }
+
+    fn display_apply_result(code: i32, context: &str) -> DisplaySettingsUpdateResult {
+        let (status, detail) = match code {
+            DISP_CHANGE_SUCCESSFUL => (DisplayOperationStatus::Success, "successful"),
+            DISP_CHANGE_RESTART => (
+                DisplayOperationStatus::ApplyFailed,
+                "restart is required before the display change can take effect",
+            ),
+            DISP_CHANGE_BADMODE => (
+                DisplayOperationStatus::InvalidMode,
+                "the requested mode is not supported by Windows",
+            ),
+            DISP_CHANGE_BADPARAM => (
+                DisplayOperationStatus::InvalidDisplay,
+                "Windows rejected the display parameters",
+            ),
+            DISP_CHANGE_BADFLAGS => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows rejected the display change flags",
+            ),
+            DISP_CHANGE_NOTUPDATED => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows could not write the display settings",
+            ),
+            DISP_CHANGE_BADDUALVIEW => (
+                DisplayOperationStatus::Unsupported,
+                "Windows DualView configuration does not support this change",
+            ),
+            DISP_CHANGE_FAILED => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows failed to apply the display change",
+            ),
+            _ => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows returned an unknown display change status",
+            ),
+        };
+
+        display_update_result(status, format!("{context}: {detail} ({code})"))
     }
 
     fn enumerate_monitor_snapshots() -> Result<Vec<MonitorSnapshot>> {
@@ -2725,8 +3106,246 @@ mod windows_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use rshare_core::DisplayOrientation;
+        use rshare_core::{
+            DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
+        };
         use std::mem::{align_of, offset_of, size_of};
+
+        #[test]
+        fn display_update_with_only_scale_requires_system_settings() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                scale_percent: Some(150),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(
+                result.status,
+                DisplayOperationStatus::RequiresSystemSettings
+            );
+            assert!(result.message.unwrap().contains("system display settings"));
+        }
+
+        #[test]
+        fn display_update_with_scale_and_mode_requires_system_settings() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1024),
+                height: Some(768),
+                scale_percent: Some(150),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(
+                result.status,
+                DisplayOperationStatus::RequiresSystemSettings
+            );
+        }
+
+        #[test]
+        fn display_update_rejects_unsupported_mode_before_apply() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1024),
+                height: Some(768),
+                refresh_rate_millihz: Some(75_000),
+                orientation: Some(DisplayOrientation::Landscape),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidMode);
+        }
+
+        #[test]
+        fn display_update_rejects_primary_write_as_unsupported() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                primary: Some(true),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Unsupported);
+            assert!(result.message.unwrap().contains("primary"));
+        }
+
+        #[test]
+        fn display_update_rejects_position_write_as_unsupported() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                x: Some(0),
+                y: Some(0),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Unsupported);
+            assert!(result.message.unwrap().contains("position"));
+        }
+
+        #[test]
+        fn display_update_rejects_orientation_without_explicit_dimensions() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                orientation: Some(DisplayOrientation::Portrait),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidMode);
+            assert!(result.message.unwrap().contains("width and height"));
+        }
+
+        #[test]
+        fn display_update_accepts_supported_mode() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(2560),
+                height: Some(1440),
+                refresh_rate_millihz: Some(144_000),
+                orientation: Some(DisplayOrientation::Landscape),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_accepts_orientation_with_explicit_supported_dimensions() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1080),
+                height: Some(1920),
+                orientation: Some(DisplayOrientation::Portrait),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_noop_is_accepted() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_unknown_display_is_invalid() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "missing-display".to_string(),
+                width: Some(1920),
+                height: Some(1080),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidDisplay);
+        }
+
+        #[test]
+        fn duplicate_display_ids_are_disambiguated_by_device_name() {
+            let mut displays = vec![
+                LocalDisplayInfo {
+                    display_id: "windows-display-same".to_string(),
+                    device_name: Some(r"\\.\DISPLAY2".to_string()),
+                    ..LocalDisplayInfo::default()
+                },
+                LocalDisplayInfo {
+                    display_id: "windows-display-same".to_string(),
+                    device_name: Some(r"\\.\DISPLAY1".to_string()),
+                    ..LocalDisplayInfo::default()
+                },
+            ];
+
+            disambiguate_duplicate_display_ids(&mut displays);
+
+            assert_eq!(displays[0].display_id, "windows-display-same-2");
+            assert_eq!(displays[1].display_id, "windows-display-same");
+        }
+
+        fn display_update_test_state() -> LocalDisplayState {
+            LocalDisplayState {
+                display_count: 1,
+                displays: vec![LocalDisplayInfo {
+                    display_id: "display-1".to_string(),
+                    device_name: Some(r"\\.\DISPLAY1".to_string()),
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate_millihz: Some(60_000),
+                    orientation: DisplayOrientation::Landscape,
+                    active: true,
+                    modes: vec![
+                        DisplayModeInfo {
+                            width: 1920,
+                            height: 1080,
+                            refresh_rate_millihz: Some(60_000),
+                            orientation: DisplayOrientation::Landscape,
+                            bits_per_pixel: Some(32),
+                        },
+                        DisplayModeInfo {
+                            width: 1080,
+                            height: 1920,
+                            refresh_rate_millihz: Some(60_000),
+                            orientation: DisplayOrientation::Portrait,
+                            bits_per_pixel: Some(32),
+                        },
+                        DisplayModeInfo {
+                            width: 2560,
+                            height: 1440,
+                            refresh_rate_millihz: Some(144_000),
+                            orientation: DisplayOrientation::Landscape,
+                            bits_per_pixel: Some(32),
+                        },
+                    ],
+                    ..LocalDisplayInfo::default()
+                }],
+                ..LocalDisplayState::default()
+            }
+        }
+
+        fn display_update_request() -> DisplaySettingsUpdateRequest {
+            DisplaySettingsUpdateRequest {
+                display_id: String::new(),
+                width: None,
+                height: None,
+                refresh_rate_millihz: None,
+                orientation: None,
+                primary: None,
+                x: None,
+                y: None,
+                scale_percent: None,
+            }
+        }
 
         #[test]
         fn windows_orientation_mapping_is_stable() {
