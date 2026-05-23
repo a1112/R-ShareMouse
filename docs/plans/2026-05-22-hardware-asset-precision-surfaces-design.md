@@ -205,4 +205,3 @@ After polygon support lands, add optional mask raster rendering:
 2. For each active region, resolve the channel value for that `region_id`.
 3. Render an alpha highlight clipped by that channel.
 4. Prefer mask highlight over polygon when the mask loads successfully.
-

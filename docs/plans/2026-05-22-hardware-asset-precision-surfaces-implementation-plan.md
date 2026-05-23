@@ -1405,4 +1405,3 @@ git status --short
 ```
 
 Expected: clean except for unrelated pre-existing user changes.
-
