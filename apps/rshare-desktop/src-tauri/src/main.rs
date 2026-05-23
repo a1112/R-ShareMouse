@@ -4,9 +4,11 @@ use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode,
     CapabilityRegistrySnapshot, Config, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
-    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestKind,
-    LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
+    DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
+    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    ServiceStatusSnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -210,6 +212,45 @@ async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
     daemon_client::request_local_controls()
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn capture_display(
+    display_id: String,
+    max_width: Option<u32>,
+) -> Result<DisplayCaptureResult, String> {
+    daemon_client::request_display_capture(DisplayCaptureRequest {
+        display_id,
+        max_width,
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn identify_displays(duration_ms: Option<u32>) -> Result<DisplayIdentifyResult, String> {
+    daemon_client::request_identify_displays(DisplayIdentifyRequest { duration_ms })
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn update_display_settings(
+    request: DisplaySettingsUpdateRequest,
+) -> Result<DisplaySettingsUpdateResult, String> {
+    daemon_client::request_update_display_settings(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn open_display_settings() -> Result<(), String> {
+    match daemon_client::request_open_display_settings().await {
+        Ok(()) => Ok(()),
+        Err(err) if is_ipc_unavailable(&err) => rshare_platform::display::open_display_settings()
+            .map_err(|fallback_err| fallback_err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -655,6 +696,10 @@ fn main() {
             connect_device,
             disconnect_device,
             local_controls_state,
+            capture_display,
+            identify_displays,
+            update_display_settings,
+            open_display_settings,
             endpoint_events_state,
             inject_endpoint_event,
             start_local_controls_stream,

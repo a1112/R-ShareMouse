@@ -53,6 +53,23 @@
           <div id="screenStage" class="screen-stage"></div>
         </section>
 
+        <section class="display-panel" aria-labelledby="displayPanelTitle">
+          <div class="display-panel-head">
+            <div>
+              <p class="eyebrow">Local Displays</p>
+              <h2 id="displayPanelTitle">Monitor Operations</h2>
+              <p id="displaySummary" class="muted">Waiting for local controls</p>
+            </div>
+            <div class="workspace-actions">
+              <button id="identifyDisplaysBtn" class="toolbar-btn">Identify</button>
+              <button id="displayRefreshBtn" class="toolbar-btn">Refresh</button>
+              <button id="openDisplaySettingsBtn" class="toolbar-btn">Open Settings</button>
+            </div>
+          </div>
+          <p id="displayOperationStatus" class="display-status">Display state not loaded.</p>
+          <div id="displayList" class="display-list"></div>
+        </section>
+
         <section class="footer-strip">
           <div class="footer-block">
             <span class="footer-label">Service</span>

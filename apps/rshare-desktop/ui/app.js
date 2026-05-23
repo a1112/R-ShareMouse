@@ -1,4 +1,5 @@
 import { buildScreenLayout, buildStatusBanner } from './layout.mjs';
+import { buildDisplayOperationStatus, buildDisplayView } from './display.mjs';
 
 const tauri = window.__TAURI__;
 const invoke = tauri?.core?.invoke;
@@ -97,6 +98,9 @@ const state = {
   status: null,
   devices: [],
   config: null,
+  localControls: null,
+  displayControlsAvailable: false,
+  displayStatus: 'Display state not loaded.',
 };
 
 const heroTitle = document.getElementById('heroTitle');
@@ -108,6 +112,12 @@ const networkDetail = document.getElementById('networkDetail');
 const devicesMetric = document.getElementById('devicesMetric');
 const devicesDetail = document.getElementById('devicesDetail');
 const screenStage = document.getElementById('screenStage');
+const displayList = document.getElementById('displayList');
+const displaySummary = document.getElementById('displaySummary');
+const displayOperationStatus = document.getElementById('displayOperationStatus');
+const displayRefreshBtn = document.getElementById('displayRefreshBtn');
+const identifyDisplaysBtn = document.getElementById('identifyDisplaysBtn');
+const openDisplaySettingsBtn = document.getElementById('openDisplaySettingsBtn');
 const serviceToggleBtn = document.getElementById('serviceToggleBtn');
 const settingsToggleBtn = document.getElementById('settingsToggleBtn');
 const settingsCloseBtn = document.getElementById('settingsCloseBtn');
@@ -201,6 +211,95 @@ function renderStage() {
   screenStage.innerHTML = `${cards}${emptyHint}`;
 }
 
+function setDisplayStatus(text, tone = '') {
+  state.displayStatus = text;
+  if (!displayOperationStatus) {
+    return;
+  }
+  displayOperationStatus.textContent = text;
+  displayOperationStatus.dataset.tone = tone;
+}
+
+function renderLocalDisplays() {
+  if (!displayList || !displaySummary) {
+    return;
+  }
+
+  const view = buildDisplayView(state.localControls?.display, {
+    controlsAvailable: state.displayControlsAvailable,
+  });
+  displaySummary.textContent = !state.displayControlsAvailable
+    ? 'Daemon offline'
+    : state.localControls
+      ? `${view.countLabel} reported by local controls`
+      : 'Waiting for local controls';
+  if (identifyDisplaysBtn) {
+    identifyDisplaysBtn.disabled = !state.displayControlsAvailable;
+  }
+
+  if (view.empty) {
+    displayList.innerHTML = `<div class="display-empty">${escapeHtml(view.emptyMessage)}</div>`;
+    return;
+  }
+
+  displayList.innerHTML = view.rows
+    .map((row) => {
+      const markerHtml = row.markers
+        .map((marker) => `<span class="display-marker">${escapeHtml(marker)}</span>`)
+        .join('');
+      const unsupportedHtml = row.unsupportedControls.length
+        ? `<p class="display-note">System settings required: ${escapeHtml(
+            row.unsupportedControls.join(', '),
+          )}</p>`
+        : '';
+      const scaleControl = row.scaleControl;
+      const daemonDisabled = row.controlsDisabled ? 'disabled' : '';
+      const canMakePrimary = row.source?.write_capabilities?.primary === true && !row.primary;
+      const scaleSettingsButton =
+        scaleControl.action === 'open-system-settings'
+          ? `<button class="toolbar-btn compact" data-display-action="scale-settings" data-display-id="${escapeHtml(
+              row.id,
+            )}">Open settings</button>`
+          : '';
+
+      return `
+        <article class="display-card">
+          <div class="display-card-head">
+            <div>
+              <h3>${escapeHtml(row.title)}</h3>
+              <p>${escapeHtml(row.friendlyName || row.id)}</p>
+            </div>
+            <div class="display-markers">${markerHtml}</div>
+          </div>
+          <div class="display-facts">
+            <span><strong>${escapeHtml(row.resolution)}</strong> Resolution</span>
+            <span><strong>${escapeHtml(row.refreshRate)}</strong> Refresh</span>
+            <span><strong>${escapeHtml(row.scale)}</strong> Scale</span>
+          </div>
+          <div class="display-controls">
+            <button class="toolbar-btn compact" data-display-action="capture" data-display-id="${escapeHtml(
+              row.id,
+            )}" ${daemonDisabled}>Capture</button>
+            <button class="toolbar-btn compact" data-display-action="primary" data-display-id="${escapeHtml(
+              row.id,
+            )}" ${!row.controlsDisabled && canMakePrimary ? '' : 'disabled'}>Make primary</button>
+            <span class="display-readonly">${escapeHtml(scaleControl.label)} ${escapeHtml(
+              scaleControl.value,
+            )}</span>
+            ${scaleSettingsButton}
+          </div>
+          ${
+            row.controlsDisabled
+              ? `<p class="display-note">${escapeHtml(row.controlsDisabledReason)}</p>`
+              : ''
+          }
+          ${unsupportedHtml}
+        </article>
+      `;
+    })
+    .join('');
+}
+
 function renderDashboard() {
   const deviceList = Array.isArray(state.devices) ? state.devices : [];
   const banner = buildStatusBanner(state.status, deviceList);
@@ -226,6 +325,7 @@ function renderDashboard() {
     : 'Only the local screen is visible right now';
 
   renderStage();
+  renderLocalDisplays();
 }
 
 function renderSettings() {
@@ -307,14 +407,114 @@ async function refreshDashboard() {
     state.status = snapshot.status;
     state.devices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
     state.serviceRunning = Boolean(snapshot.status);
+    if (!state.serviceRunning) {
+      state.localControls = null;
+      state.displayControlsAvailable = false;
+    }
     renderDashboard();
+    if (state.serviceRunning) {
+      await loadLocalControls({ silent: true });
+    }
   } catch (error) {
     state.status = null;
     state.devices = [];
     state.serviceRunning = false;
+    state.localControls = null;
+    state.displayControlsAvailable = false;
     renderDashboard();
+    setDisplayStatus('Daemon offline; display controls disabled.', 'warning');
     heroTitle.textContent = 'Refresh failed';
     heroSubtitle.textContent = String(error);
+  }
+}
+
+async function loadLocalControls(options = {}) {
+  if (!invoke) {
+    setDisplayStatus('Display controls unavailable outside Tauri.', 'error');
+    return;
+  }
+
+  try {
+    state.localControls = await invoke('local_controls_state');
+    state.displayControlsAvailable = true;
+    renderLocalDisplays();
+    if (!options.silent) {
+      setDisplayStatus('Display state refreshed.', 'ok');
+    } else if (state.displayStatus === 'Display state not loaded.') {
+      setDisplayStatus('Display state loaded.', 'ok');
+    }
+  } catch (error) {
+    state.localControls = null;
+    state.displayControlsAvailable = false;
+    renderLocalDisplays();
+    setDisplayStatus(`Display controls disabled: ${error}`, 'warning');
+  }
+}
+
+function firstDisplayRow() {
+  const view = buildDisplayView(state.localControls?.display);
+  return view.rows.find((row) => row.primary) ?? view.rows[0] ?? null;
+}
+
+async function identifyDisplays() {
+  setDisplayStatus('Identifying displays...');
+  try {
+    const result = await invoke('identify_displays', { durationMs: 2500 });
+    const status = buildDisplayOperationStatus(result, 'Identify displays');
+    setDisplayStatus(status.text, status.tone);
+  } catch (error) {
+    setDisplayStatus(String(error), 'error');
+  }
+}
+
+async function captureDisplay(displayId = firstDisplayRow()?.id) {
+  if (!displayId) {
+    setDisplayStatus('No display available to capture.', 'error');
+    return;
+  }
+
+  setDisplayStatus('Capturing display...');
+  try {
+    const result = await invoke('capture_display', { displayId, maxWidth: 640 });
+    const size = result.width && result.height ? ` ${result.width} x ${result.height}` : '';
+    const status = buildDisplayOperationStatus(
+      {
+        ...result,
+        message: result.message || `Capture: ${result.status}${size}`,
+      },
+      'Capture',
+    );
+    setDisplayStatus(status.text, status.tone);
+  } catch (error) {
+    setDisplayStatus(String(error), 'error');
+  }
+}
+
+async function makePrimaryDisplay(displayId) {
+  if (!displayId) {
+    return;
+  }
+
+  setDisplayStatus('Updating display settings...');
+  try {
+    const result = await invoke('update_display_settings', {
+      request: { display_id: displayId, primary: true },
+    });
+    const status = buildDisplayOperationStatus(result, 'Display update');
+    setDisplayStatus(status.text, status.tone);
+    await loadLocalControls({ silent: true });
+  } catch (error) {
+    setDisplayStatus(String(error), 'error');
+  }
+}
+
+async function openSystemDisplaySettings() {
+  setDisplayStatus('Opening system display settings...');
+  try {
+    await invoke('open_display_settings');
+    setDisplayStatus('System display settings opened.', 'ok');
+  } catch (error) {
+    setDisplayStatus(String(error), 'error');
   }
 }
 
@@ -347,6 +547,24 @@ function wireWindowControls() {
 function wireActions() {
   serviceToggleBtn.addEventListener('click', toggleService);
   document.getElementById('refreshDevicesBtn').addEventListener('click', refreshDashboard);
+  displayRefreshBtn?.addEventListener('click', () => loadLocalControls());
+  identifyDisplaysBtn?.addEventListener('click', identifyDisplays);
+  openDisplaySettingsBtn?.addEventListener('click', openSystemDisplaySettings);
+  displayList?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-display-action]');
+    if (!button || button.disabled) {
+      return;
+    }
+
+    const displayId = button.dataset.displayId;
+    if (button.dataset.displayAction === 'capture') {
+      captureDisplay(displayId);
+    } else if (button.dataset.displayAction === 'primary') {
+      makePrimaryDisplay(displayId);
+    } else if (button.dataset.displayAction === 'scale-settings') {
+      openSystemDisplaySettings();
+    }
+  });
   settingsToggleBtn.addEventListener('click', () => toggleSettings());
   settingsCloseBtn.addEventListener('click', () => toggleSettings(false));
   settingsSwitches.addEventListener('change', (event) => {
@@ -366,6 +584,7 @@ function boot() {
   renderDashboard();
   renderSettings();
   loadConfig();
+  loadLocalControls();
   refreshDashboard();
   setInterval(refreshDashboard, 1500);
 }
