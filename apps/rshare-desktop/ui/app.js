@@ -1,5 +1,10 @@
 import { buildScreenLayout, buildStatusBanner } from './layout.mjs';
-import { buildDisplayOperationStatus, buildDisplayView } from './display.mjs';
+import {
+  buildDisplayOperationStatus,
+  buildDisplaySettingsRequest,
+  buildDisplayView,
+  updateDisplayPreviewState,
+} from './display.mjs';
 
 const tauri = window.__TAURI__;
 const invoke = tauri?.core?.invoke;
@@ -101,6 +106,7 @@ const state = {
   localControls: null,
   displayControlsAvailable: false,
   displayStatus: 'Display state not loaded.',
+  displayPreviews: new Map(),
 };
 
 const heroTitle = document.getElementById('heroTitle');
@@ -220,6 +226,67 @@ function setDisplayStatus(text, tone = '') {
   displayOperationStatus.dataset.tone = tone;
 }
 
+function revokeDisplayPreview(preview) {
+  if (preview?.url && window.URL?.revokeObjectURL) {
+    window.URL.revokeObjectURL(preview.url);
+  }
+}
+
+function pruneDisplayPreviews(rows) {
+  const displayIds = new Set(rows.map((row) => row.id));
+  for (const [displayId, preview] of state.displayPreviews.entries()) {
+    if (!displayIds.has(displayId)) {
+      revokeDisplayPreview(preview);
+      state.displayPreviews.delete(displayId);
+    }
+  }
+}
+
+function selectOptionsHtml(options, selectedValue) {
+  return options
+    .map(
+      (option) => `
+        <option value="${escapeHtml(option.value)}" ${
+          option.value === selectedValue ? 'selected' : ''
+        }>${escapeHtml(option.label)}</option>
+      `,
+    )
+    .join('');
+}
+
+function renderDisplayModeControls(row) {
+  const controls = row.modeControls;
+  const disabled = controls.disabled || row.controlsDisabled ? 'disabled' : '';
+  const disabledReason = row.controlsDisabled ? row.controlsDisabledReason : controls.disabledReason;
+
+  return `
+    <div class="display-mode-controls">
+      <label>
+        <span>Resolution</span>
+        <select data-display-setting="resolution" ${disabled}>
+          ${selectOptionsHtml(controls.resolutionOptions, controls.selected.resolution)}
+        </select>
+      </label>
+      <label>
+        <span>Refresh</span>
+        <select data-display-setting="refreshRateMillihz" ${disabled}>
+          ${selectOptionsHtml(controls.refreshRateOptions, controls.selected.refreshRateMillihz)}
+        </select>
+      </label>
+      <label>
+        <span>Orientation</span>
+        <select data-display-setting="orientation" ${disabled}>
+          ${selectOptionsHtml(controls.orientationOptions, controls.selected.orientation)}
+        </select>
+      </label>
+      <button class="toolbar-btn compact" data-display-action="apply-mode" data-display-id="${escapeHtml(
+        row.id,
+      )}" ${disabled || !controls.canApply ? 'disabled' : ''}>Apply</button>
+    </div>
+    ${disabledReason ? `<p class="display-note">${escapeHtml(disabledReason)}</p>` : ''}
+  `;
+}
+
 function renderLocalDisplays() {
   if (!displayList || !displaySummary) {
     return;
@@ -233,6 +300,7 @@ function renderLocalDisplays() {
     : state.localControls
       ? `${view.countLabel} reported by local controls`
       : 'Waiting for local controls';
+  pruneDisplayPreviews(view.rows);
   if (identifyDisplaysBtn) {
     identifyDisplaysBtn.disabled = !state.displayControlsAvailable;
   }
@@ -248,22 +316,32 @@ function renderLocalDisplays() {
         .map((marker) => `<span class="display-marker">${escapeHtml(marker)}</span>`)
         .join('');
       const unsupportedHtml = row.unsupportedControls.length
-        ? `<p class="display-note">System settings required: ${escapeHtml(
+        ? `<p class="display-note">Unsupported controls: ${escapeHtml(
             row.unsupportedControls.join(', '),
           )}</p>`
         : '';
       const scaleControl = row.scaleControl;
       const daemonDisabled = row.controlsDisabled ? 'disabled' : '';
-      const canMakePrimary = row.source?.write_capabilities?.primary === true && !row.primary;
       const scaleSettingsButton =
         scaleControl.action === 'open-system-settings'
           ? `<button class="toolbar-btn compact" data-display-action="scale-settings" data-display-id="${escapeHtml(
               row.id,
             )}">Open settings</button>`
           : '';
+      const preview = state.displayPreviews.get(row.id);
+      const previewSize =
+        preview?.width && preview?.height ? `${preview.width} x ${preview.height}` : 'latest';
+      const previewHtml = preview
+        ? `
+          <figure class="display-preview">
+            <img src="${escapeHtml(preview.url)}" alt="${escapeHtml(row.title)} preview" />
+            <figcaption>${escapeHtml(previewSize)} preview</figcaption>
+          </figure>
+        `
+        : '';
 
       return `
-        <article class="display-card">
+        <article class="display-card" data-display-id="${escapeHtml(row.id)}">
           <div class="display-card-head">
             <div>
               <h3>${escapeHtml(row.title)}</h3>
@@ -276,23 +354,17 @@ function renderLocalDisplays() {
             <span><strong>${escapeHtml(row.refreshRate)}</strong> Refresh</span>
             <span><strong>${escapeHtml(row.scale)}</strong> Scale</span>
           </div>
+          ${previewHtml}
           <div class="display-controls">
             <button class="toolbar-btn compact" data-display-action="capture" data-display-id="${escapeHtml(
               row.id,
             )}" ${daemonDisabled}>Capture</button>
-            <button class="toolbar-btn compact" data-display-action="primary" data-display-id="${escapeHtml(
-              row.id,
-            )}" ${!row.controlsDisabled && canMakePrimary ? '' : 'disabled'}>Make primary</button>
             <span class="display-readonly">${escapeHtml(scaleControl.label)} ${escapeHtml(
               scaleControl.value,
             )}</span>
             ${scaleSettingsButton}
           </div>
-          ${
-            row.controlsDisabled
-              ? `<p class="display-note">${escapeHtml(row.controlsDisabledReason)}</p>`
-              : ''
-          }
+          ${renderDisplayModeControls(row)}
           ${unsupportedHtml}
         </article>
       `;
@@ -456,6 +528,13 @@ function firstDisplayRow() {
   return view.rows.find((row) => row.primary) ?? view.rows[0] ?? null;
 }
 
+function displayRowById(displayId) {
+  const view = buildDisplayView(state.localControls?.display, {
+    controlsAvailable: state.displayControlsAvailable,
+  });
+  return view.rows.find((row) => row.id === displayId) ?? null;
+}
+
 async function identifyDisplays() {
   setDisplayStatus('Identifying displays...');
   try {
@@ -476,6 +555,7 @@ async function captureDisplay(displayId = firstDisplayRow()?.id) {
   setDisplayStatus('Capturing display...');
   try {
     const result = await invoke('capture_display', { displayId, maxWidth: 640 });
+    state.displayPreviews = updateDisplayPreviewState(state.displayPreviews, result);
     const size = result.width && result.height ? ` ${result.width} x ${result.height}` : '';
     const status = buildDisplayOperationStatus(
       {
@@ -485,20 +565,43 @@ async function captureDisplay(displayId = firstDisplayRow()?.id) {
       'Capture',
     );
     setDisplayStatus(status.text, status.tone);
+    renderLocalDisplays();
   } catch (error) {
     setDisplayStatus(String(error), 'error');
   }
 }
 
-async function makePrimaryDisplay(displayId) {
-  if (!displayId) {
+async function applyDisplayMode(displayId, card) {
+  const row = displayRowById(displayId);
+  if (!row || !card) {
+    return;
+  }
+
+  const selections = {
+    resolution: card.querySelector('[data-display-setting="resolution"]')?.value,
+    refreshRateMillihz: card.querySelector('[data-display-setting="refreshRateMillihz"]')?.value,
+    orientation: card.querySelector('[data-display-setting="orientation"]')?.value,
+  };
+  const update = buildDisplaySettingsRequest(row.source, selections);
+  if (update.error) {
+    setDisplayStatus(update.error, 'warning');
+    return;
+  }
+
+  const confirmed =
+    window.confirm?.(
+      `Apply ${update.request.width} x ${update.request.height} at ${Math.round(
+        update.request.refresh_rate_millihz / 1000,
+      )} Hz to ${row.title}?`,
+    ) ?? true;
+  if (!confirmed) {
     return;
   }
 
   setDisplayStatus('Updating display settings...');
   try {
     const result = await invoke('update_display_settings', {
-      request: { display_id: displayId, primary: true },
+      request: update.request,
     });
     const status = buildDisplayOperationStatus(result, 'Display update');
     setDisplayStatus(status.text, status.tone);
@@ -559,8 +662,8 @@ function wireActions() {
     const displayId = button.dataset.displayId;
     if (button.dataset.displayAction === 'capture') {
       captureDisplay(displayId);
-    } else if (button.dataset.displayAction === 'primary') {
-      makePrimaryDisplay(displayId);
+    } else if (button.dataset.displayAction === 'apply-mode') {
+      applyDisplayMode(displayId, button.closest('.display-card'));
     } else if (button.dataset.displayAction === 'scale-settings') {
       openSystemDisplaySettings();
     }
