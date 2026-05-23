@@ -1,8 +1,9 @@
 use anyhow::Result;
+#[cfg(any(not(windows), test))]
+use rshare_core::DisplayOperationStatus;
 use rshare_core::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-    DisplayOperationStatus, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
-    LocalDisplayState,
+    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, LocalDisplayState,
 };
 
 #[cfg(windows)]
@@ -15,6 +16,12 @@ pub fn query_display_state() -> Result<LocalDisplayState> {
     Ok(LocalDisplayState::default())
 }
 
+#[cfg(windows)]
+pub fn capture_display(request: &DisplayCaptureRequest) -> Result<DisplayCaptureResult> {
+    crate::windows::capture_display(request)
+}
+
+#[cfg(not(windows))]
 pub fn capture_display(request: &DisplayCaptureRequest) -> Result<DisplayCaptureResult> {
     Ok(unsupported_capture(
         &request.display_id,
@@ -22,6 +29,12 @@ pub fn capture_display(request: &DisplayCaptureRequest) -> Result<DisplayCapture
     ))
 }
 
+#[cfg(windows)]
+pub fn identify_displays(request: &DisplayIdentifyRequest) -> Result<DisplayIdentifyResult> {
+    crate::windows::identify_displays(request)
+}
+
+#[cfg(not(windows))]
 pub fn identify_displays(_request: &DisplayIdentifyRequest) -> Result<DisplayIdentifyResult> {
     Ok(DisplayIdentifyResult {
         status: DisplayOperationStatus::Unsupported,
@@ -97,6 +110,7 @@ pub fn get_dpi_scaling() -> f64 {
     1.0
 }
 
+#[cfg(any(not(windows), test))]
 fn unsupported_capture(display_id: &str, message: impl Into<String>) -> DisplayCaptureResult {
     DisplayCaptureResult {
         status: DisplayOperationStatus::Unsupported,
@@ -107,6 +121,29 @@ fn unsupported_capture(display_id: &str, message: impl Into<String>) -> DisplayC
         bytes: Vec::new(),
         message: Some(message.into()),
     }
+}
+
+pub(crate) fn fit_thumbnail_size(width: u32, height: u32, max_width: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_width == 0 {
+        return (0, 0);
+    }
+
+    if width <= max_width {
+        return (width, height);
+    }
+
+    let scaled_width = max_width;
+    let scaled_height = scale_dimension(height, max_width, width);
+    (scaled_width.max(1), scaled_height.max(1))
+}
+
+pub(crate) fn clamp_identify_duration_ms(duration_ms: Option<u32>) -> u32 {
+    duration_ms.unwrap_or(2500).clamp(500, 10_000)
+}
+
+fn scale_dimension(value: u32, numerator: u32, denominator: u32) -> u32 {
+    ((u64::from(value) * u64::from(numerator) + u64::from(denominator / 2))
+        / u64::from(denominator)) as u32
 }
 
 #[cfg(any(not(windows), test))]
@@ -139,5 +176,30 @@ mod tests {
             result.status,
             DisplayOperationStatus::RequiresSystemSettings
         );
+    }
+
+    #[test]
+    fn thumbnail_size_fits_landscape_display_to_max_width() {
+        assert_eq!(fit_thumbnail_size(3840, 2160, 640), (640, 360));
+    }
+
+    #[test]
+    fn thumbnail_size_fits_portrait_display_to_max_width() {
+        assert_eq!(fit_thumbnail_size(1080, 1920, 480), (480, 853));
+    }
+
+    #[test]
+    fn identify_duration_defaults_to_2500_ms() {
+        assert_eq!(clamp_identify_duration_ms(None), 2500);
+    }
+
+    #[test]
+    fn identify_duration_has_500_ms_minimum() {
+        assert_eq!(clamp_identify_duration_ms(Some(100)), 500);
+    }
+
+    #[test]
+    fn identify_duration_has_10000_ms_maximum() {
+        assert_eq!(clamp_identify_duration_ms(Some(30_000)), 10_000);
     }
 }

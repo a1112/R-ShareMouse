@@ -8,8 +8,10 @@ cfg_if::cfg_if! {
 
 #[cfg(windows)]
 mod windows_impl {
+    use crate::display::{clamp_identify_duration_ms, fit_thumbnail_size};
     use anyhow::{Context, Result};
     use rshare_core::{
+        DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
         DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
         DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioInputDevice,
         LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
@@ -21,7 +23,7 @@ mod windows_impl {
     use std::mem::size_of;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex, OnceLock,
     };
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -44,6 +46,7 @@ mod windows_impl {
     type WindowsInputCallback = Arc<dyn Fn(WindowsInputEvent) + Send + Sync + 'static>;
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+    static PROCESS_DPI_AWARENESS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
     thread_local! {
         static WINDOWS_HOOK_CALLBACK: RefCell<Option<WindowsInputCallback>> = RefCell::new(None);
@@ -934,7 +937,7 @@ mod windows_impl {
 
         /// Get primary screen info (physical resolution, not DPI-scaled)
         pub fn get_screen_info() -> ScreenInfo {
-            extern "C" {
+            extern "system" {
                 fn GetSystemMetrics(nIndex: i32) -> i32;
                 fn GetDC(hwnd: isize) -> isize;
                 fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
@@ -1297,7 +1300,7 @@ mod windows_impl {
 
     impl WindowsInputEmulator {
         pub fn new() -> Self {
-            extern "C" {
+            extern "system" {
                 fn GetSystemMetrics(nIndex: i32) -> i32;
             }
 
@@ -1594,6 +1597,20 @@ mod windows_impl {
     const RIM_TYPEMOUSE: u32 = 0;
     const RIM_TYPEKEYBOARD: u32 = 1;
     const RIDI_DEVICENAME: u32 = 0x20000007;
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
+    const SRCCOPY: u32 = 0x00CC_0020;
+    const HALFTONE: i32 = 4;
+    const WS_EX_TOPMOST: u32 = 0x0000_0008;
+    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const SS_CENTER: u32 = 0x0000_0001;
+    const SS_CENTERIMAGE: u32 = 0x0000_0200;
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
         (device_type << 16) | (access << 14) | (function << 2) | method
@@ -1698,6 +1715,64 @@ mod windows_impl {
         x: i32,
         y: i32,
         mode: DisplayModeInfo,
+    }
+
+    #[derive(Debug, Default)]
+    struct IdentifyOverlayOwnerState {
+        next_generation: u64,
+        active_generation: Option<u64>,
+    }
+
+    impl IdentifyOverlayOwnerState {
+        fn next_generation(&mut self) -> u64 {
+            self.next_generation = self.next_generation.saturating_add(1);
+            self.active_generation = Some(self.next_generation);
+            self.next_generation
+        }
+
+        fn finish_generation(&mut self, generation: u64) {
+            if self.active_generation == Some(generation) {
+                self.active_generation = None;
+            }
+        }
+
+        fn cancel_active(&mut self) {
+            self.active_generation = None;
+        }
+
+        fn active_generation(&self) -> Option<u64> {
+            self.active_generation
+        }
+    }
+
+    #[derive(Default)]
+    struct IdentifyOverlayOwner {
+        state: IdentifyOverlayOwnerState,
+        active_cancel: Option<mpsc::Sender<()>>,
+    }
+
+    impl IdentifyOverlayOwner {
+        fn replace_active(&mut self, cancel_sender: mpsc::Sender<()>) -> u64 {
+            self.cancel_active();
+
+            let generation = self.state.next_generation();
+            self.active_cancel = Some(cancel_sender);
+            generation
+        }
+
+        fn finish_generation(&mut self, generation: u64) {
+            if self.state.active_generation() == Some(generation) {
+                self.active_cancel = None;
+            }
+            self.state.finish_generation(generation);
+        }
+
+        fn cancel_active(&mut self) {
+            if let Some(cancel) = self.active_cancel.take() {
+                let _ = cancel.send(());
+            }
+            self.state.cancel_active();
+        }
     }
 
     fn driver_device_kind_code(kind: WindowsDriverDeviceKind) -> u32 {
@@ -1845,6 +1920,47 @@ mod windows_impl {
         top: i32,
         right: i32,
         bottom: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct BitmapInfoHeader {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_pels_per_meter: i32,
+        y_pels_per_meter: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RgbQuad {
+        blue: u8,
+        green: u8,
+        red: u8,
+        reserved: u8,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BitmapInfo {
+        header: BitmapInfoHeader,
+        colors: [RgbQuad; 1],
+    }
+
+    impl Default for BitmapInfo {
+        fn default() -> Self {
+            Self {
+                header: BitmapInfoHeader::default(),
+                colors: [RgbQuad::default()],
+            }
+        }
     }
 
     #[repr(C)]
@@ -2062,6 +2178,27 @@ mod windows_impl {
         ) -> i32;
         fn PostThreadMessageW(thread_id: u32, msg: u32, w_param: usize, l_param: isize) -> i32;
         fn GetCurrentThreadId() -> u32;
+        fn GetDC(hwnd: isize) -> isize;
+        fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        fn SetThreadDpiAwarenessContext(value: isize) -> isize;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            h_wnd_parent: isize,
+            h_menu: isize,
+            h_instance: isize,
+            lp_param: *mut std::ffi::c_void,
+        ) -> isize;
+        fn DestroyWindow(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+        fn UpdateWindow(hwnd: isize) -> i32;
         fn GetRawInputDeviceList(
             p_raw_input_device_list: *mut RawInputDeviceList,
             pui_num_devices: *mut u32,
@@ -2118,6 +2255,47 @@ mod windows_impl {
             lp_bytes_returned: *mut u32,
             lp_overlapped: *mut std::ffi::c_void,
         ) -> i32;
+    }
+
+    #[link(name = "Gdi32")]
+    extern "system" {
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn CreateDIBSection(
+            hdc: isize,
+            pbmi: *const BitmapInfo,
+            usage: u32,
+            ppv_bits: *mut *mut std::ffi::c_void,
+            section: isize,
+            offset: u32,
+        ) -> isize;
+        fn SelectObject(hdc: isize, hgdiobj: isize) -> isize;
+        fn DeleteObject(ho: isize) -> i32;
+        fn BitBlt(
+            hdc: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            hdc_src: isize,
+            x1: i32,
+            y1: i32,
+            rop: u32,
+        ) -> i32;
+        fn StretchBlt(
+            hdc_dest: isize,
+            x_dest: i32,
+            y_dest: i32,
+            w_dest: i32,
+            h_dest: i32,
+            hdc_src: isize,
+            x_src: i32,
+            y_src: i32,
+            w_src: i32,
+            h_src: i32,
+            rop: u32,
+        ) -> i32;
+        fn SetStretchBltMode(hdc: isize, mode: i32) -> i32;
     }
 
     #[link(name = "Shcore")]
@@ -2252,7 +2430,31 @@ mod windows_impl {
         send_input(&input, "keyboard")
     }
 
+    fn claim_process_dpi_awareness_attempt(attempted: &AtomicBool) -> bool {
+        attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn ensure_display_dpi_awareness() {
+        if claim_process_dpi_awareness_attempt(&PROCESS_DPI_AWARENESS_ATTEMPTED) {
+            unsafe {
+                if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+                    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+                }
+            }
+        }
+
+        unsafe {
+            if SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            }
+        }
+    }
+
     pub fn query_display_state() -> Result<LocalDisplayState> {
+        ensure_display_dpi_awareness();
+
         let monitors = enumerate_monitor_snapshots()?;
         if monitors.is_empty() {
             anyhow::bail!("EnumDisplayMonitors returned no monitors");
@@ -2364,6 +2566,158 @@ mod windows_impl {
             layout_height: max_y.saturating_sub(min_y).max(0) as u32,
             displays,
         })
+    }
+
+    pub fn capture_display(request: &DisplayCaptureRequest) -> Result<DisplayCaptureResult> {
+        ensure_display_dpi_awareness();
+
+        let state = match query_display_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(display_capture_error(
+                    DisplayOperationStatus::ApplyFailed,
+                    &request.display_id,
+                    format!("Windows display enumeration failed: {error}"),
+                ));
+            }
+        };
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidDisplay,
+                &request.display_id,
+                "requested display was not found",
+            ));
+        };
+
+        if !display.active || display.width == 0 || display.height == 0 {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidDisplay,
+                &display.display_id,
+                "requested display is not active or has no capture area",
+            ));
+        }
+
+        let (capture_width, capture_height) = request
+            .max_width
+            .map(|max_width| fit_thumbnail_size(display.width, display.height, max_width))
+            .unwrap_or((display.width, display.height));
+        if capture_width == 0 || capture_height == 0 {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidMode,
+                &display.display_id,
+                "requested thumbnail size is empty",
+            ));
+        }
+
+        match unsafe { capture_display_bmp(display, capture_width, capture_height) } {
+            Ok(bytes) => Ok(DisplayCaptureResult {
+                status: DisplayOperationStatus::Success,
+                display_id: display.display_id.clone(),
+                mime_type: Some("image/bmp".to_string()),
+                width: Some(capture_width),
+                height: Some(capture_height),
+                bytes,
+                message: Some("display captured".to_string()),
+            }),
+            Err(error) => Ok(display_capture_error(
+                DisplayOperationStatus::ApplyFailed,
+                &display.display_id,
+                format!("Windows display capture failed: {error}"),
+            )),
+        }
+    }
+
+    pub fn identify_displays(request: &DisplayIdentifyRequest) -> Result<DisplayIdentifyResult> {
+        ensure_display_dpi_awareness();
+
+        let duration_ms = clamp_identify_duration_ms(request.duration_ms);
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let generation = register_identify_overlay(cancel_sender);
+        let state = match query_display_state() {
+            Ok(state) => state,
+            Err(error) => {
+                finish_identify_overlay(generation);
+                return Ok(display_identify_result(
+                    DisplayOperationStatus::ApplyFailed,
+                    format!("Windows display enumeration failed: {error}"),
+                ));
+            }
+        };
+        let displays = state
+            .displays
+            .into_iter()
+            .filter(|display| display.active && display.width > 0 && display.height > 0)
+            .collect::<Vec<_>>();
+
+        if displays.is_empty() {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "no active displays are available to identify",
+            ));
+        }
+
+        if cancel_receiver.try_recv().is_ok() {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                "display identification request was superseded",
+            ));
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let spawn_result = thread::Builder::new()
+            .name("rshare-display-identify".to_string())
+            .spawn(move || {
+                ensure_display_dpi_awareness();
+                let windows = unsafe { create_identify_overlay_windows(&displays) };
+                match windows {
+                    Ok(windows) => {
+                        let count = windows.len();
+                        let _ = sender.send(Ok(count));
+                        let _ = cancel_receiver
+                            .recv_timeout(Duration::from_millis(u64::from(duration_ms)));
+                        for hwnd in windows {
+                            unsafe {
+                                DestroyWindow(hwnd);
+                            }
+                        }
+                        finish_identify_overlay(generation);
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        finish_identify_overlay(generation);
+                    }
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("failed to start display identification thread: {error}"),
+            ));
+        }
+
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(count)) => Ok(display_identify_result(
+                DisplayOperationStatus::Success,
+                format!("identifying {count} display(s) for {duration_ms} ms"),
+            )),
+            Ok(Err(error)) => Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("Windows display identification failed: {error}"),
+            )),
+            Err(error) => Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("display identification did not start: {error}"),
+            )),
+        }
     }
 
     pub fn update_display_settings(
@@ -2706,6 +3060,327 @@ mod windows_impl {
         display_update_result(status, format!("{context}: {detail} ({code})"))
     }
 
+    fn display_capture_error(
+        status: DisplayOperationStatus,
+        display_id: &str,
+        message: impl Into<String>,
+    ) -> DisplayCaptureResult {
+        DisplayCaptureResult {
+            status,
+            display_id: display_id.to_string(),
+            mime_type: None,
+            width: None,
+            height: None,
+            bytes: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+
+    fn display_identify_result(
+        status: DisplayOperationStatus,
+        message: impl Into<String>,
+    ) -> DisplayIdentifyResult {
+        DisplayIdentifyResult {
+            status,
+            message: Some(message.into()),
+        }
+    }
+
+    fn identify_overlay_owner() -> &'static Mutex<IdentifyOverlayOwner> {
+        static OWNER: OnceLock<Mutex<IdentifyOverlayOwner>> = OnceLock::new();
+        OWNER.get_or_init(|| Mutex::new(IdentifyOverlayOwner::default()))
+    }
+
+    fn register_identify_overlay(cancel_sender: mpsc::Sender<()>) -> u64 {
+        let mut owner = identify_overlay_owner()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.replace_active(cancel_sender)
+    }
+
+    fn finish_identify_overlay(generation: u64) {
+        let mut owner = identify_overlay_owner()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.finish_generation(generation);
+    }
+
+    unsafe fn capture_display_bmp(
+        display: &LocalDisplayInfo,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<Vec<u8>> {
+        let source_width = i32_from_u32(display.width, "source display width")?;
+        let source_height = i32_from_u32(display.height, "source display height")?;
+        let target_width_i32 = i32_from_u32(target_width, "target capture width")?;
+        let target_height_i32 = i32_from_u32(target_height, "target capture height")?;
+        let bitmap_info = bitmap_info(target_width, target_height)?;
+
+        let screen_dc = WindowDc::acquire(0)?;
+        let memory_dc = MemoryDc::create(screen_dc.hdc)?;
+
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(memory_dc.hdc, &bitmap_info, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if bitmap == 0 || bits.is_null() {
+            anyhow::bail!(
+                "CreateDIBSection failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let _bitmap_guard = GdiObject(bitmap);
+
+        let previous_object = SelectObject(memory_dc.hdc, bitmap);
+        if previous_object == 0 {
+            anyhow::bail!("SelectObject failed: {}", std::io::Error::last_os_error());
+        }
+        let _selection_guard = SelectedGdiObject {
+            hdc: memory_dc.hdc,
+            previous_object,
+        };
+
+        let copied = if target_width == display.width && target_height == display.height {
+            BitBlt(
+                memory_dc.hdc,
+                0,
+                0,
+                target_width_i32,
+                target_height_i32,
+                screen_dc.hdc,
+                display.x,
+                display.y,
+                SRCCOPY,
+            )
+        } else {
+            SetStretchBltMode(memory_dc.hdc, HALFTONE);
+            StretchBlt(
+                memory_dc.hdc,
+                0,
+                0,
+                target_width_i32,
+                target_height_i32,
+                screen_dc.hdc,
+                display.x,
+                display.y,
+                source_width,
+                source_height,
+                SRCCOPY,
+            )
+        };
+
+        if copied == 0 {
+            anyhow::bail!(
+                "BitBlt/StretchBlt failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let pixel_len = bitmap_pixel_len(target_width, target_height)?;
+        let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), pixel_len);
+        encode_bmp(target_width, target_height, pixels)
+    }
+
+    unsafe fn create_identify_overlay_windows(displays: &[LocalDisplayInfo]) -> Result<Vec<isize>> {
+        let class_name = wide_null("STATIC");
+        let mut windows = Vec::with_capacity(displays.len());
+
+        for (index, display) in displays.iter().enumerate() {
+            let label = identify_display_label(index, display);
+            let label_wide = wide_null(&label);
+            let width = i32_from_u32(display.width, "identify overlay width")?;
+            let height = i32_from_u32(display.height, "identify overlay height")?;
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class_name.as_ptr(),
+                label_wide.as_ptr(),
+                WS_POPUP | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+                display.x,
+                display.y,
+                width,
+                height,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+            );
+
+            if hwnd == 0 {
+                for existing in windows {
+                    DestroyWindow(existing);
+                }
+                anyhow::bail!(
+                    "CreateWindowExW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            windows.push(hwnd);
+        }
+
+        Ok(windows)
+    }
+
+    fn identify_display_label(index: usize, display: &LocalDisplayInfo) -> String {
+        let name = display
+            .friendly_name
+            .as_deref()
+            .or(display.device_name.as_deref())
+            .unwrap_or(&display.display_id);
+        format!("Display {}\r\n{}", index + 1, name)
+    }
+
+    fn bitmap_info(width: u32, height: u32) -> Result<BitmapInfo> {
+        let width_i32 = i32_from_u32(width, "bitmap width")?;
+        let height_i32 = i32_from_u32(height, "bitmap height")?;
+        let size_image = u32::try_from(bitmap_pixel_len(width, height)?)
+            .context("bitmap pixel data is too large")?;
+
+        Ok(BitmapInfo {
+            header: BitmapInfoHeader {
+                size: size_of::<BitmapInfoHeader>() as u32,
+                width: width_i32,
+                height: -height_i32,
+                planes: 1,
+                bit_count: 32,
+                compression: BI_RGB,
+                size_image,
+                x_pels_per_meter: 0,
+                y_pels_per_meter: 0,
+                clr_used: 0,
+                clr_important: 0,
+            },
+            colors: [RgbQuad::default()],
+        })
+    }
+
+    fn encode_bmp(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>> {
+        let pixel_len = bitmap_pixel_len(width, height)?;
+        if pixels.len() != pixel_len {
+            anyhow::bail!(
+                "unexpected bitmap pixel length: got {}, expected {}",
+                pixels.len(),
+                pixel_len
+            );
+        }
+
+        let header_len = 14usize + size_of::<BitmapInfoHeader>();
+        let file_len = header_len
+            .checked_add(pixel_len)
+            .context("BMP file is too large")?;
+        let file_len_u32 = u32::try_from(file_len).context("BMP file is too large")?;
+        let pixel_offset = u32::try_from(header_len).context("BMP header is too large")?;
+        let width_i32 = i32_from_u32(width, "BMP width")?;
+        let height_i32 = i32_from_u32(height, "BMP height")?;
+        let size_image = u32::try_from(pixel_len).context("BMP pixel data is too large")?;
+
+        let mut bytes = Vec::with_capacity(file_len);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&file_len_u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&pixel_offset.to_le_bytes());
+        bytes.extend_from_slice(&(size_of::<BitmapInfoHeader>() as u32).to_le_bytes());
+        bytes.extend_from_slice(&width_i32.to_le_bytes());
+        bytes.extend_from_slice(&(-height_i32).to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&BI_RGB.to_le_bytes());
+        bytes.extend_from_slice(&size_image.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(pixels);
+
+        Ok(bytes)
+    }
+
+    fn bitmap_pixel_len(width: u32, height: u32) -> Result<usize> {
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("bitmap dimensions are too large")?;
+        usize::try_from(pixels).context("bitmap dimensions are too large")
+    }
+
+    fn i32_from_u32(value: u32, context: &str) -> Result<i32> {
+        i32::try_from(value).with_context(|| format!("{context} exceeds i32 range"))
+    }
+
+    struct WindowDc {
+        hwnd: isize,
+        hdc: isize,
+    }
+
+    impl WindowDc {
+        unsafe fn acquire(hwnd: isize) -> Result<Self> {
+            let hdc = GetDC(hwnd);
+            if hdc == 0 {
+                anyhow::bail!("GetDC failed: {}", std::io::Error::last_os_error());
+            }
+
+            Ok(Self { hwnd, hdc })
+        }
+    }
+
+    impl Drop for WindowDc {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseDC(self.hwnd, self.hdc);
+            }
+        }
+    }
+
+    struct MemoryDc {
+        hdc: isize,
+    }
+
+    impl MemoryDc {
+        unsafe fn create(source_hdc: isize) -> Result<Self> {
+            let hdc = CreateCompatibleDC(source_hdc);
+            if hdc == 0 {
+                anyhow::bail!(
+                    "CreateCompatibleDC failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            Ok(Self { hdc })
+        }
+    }
+
+    impl Drop for MemoryDc {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteDC(self.hdc);
+            }
+        }
+    }
+
+    struct GdiObject(isize);
+
+    impl Drop for GdiObject {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteObject(self.0);
+            }
+        }
+    }
+
+    struct SelectedGdiObject {
+        hdc: isize,
+        previous_object: isize,
+    }
+
+    impl Drop for SelectedGdiObject {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.hdc, self.previous_object);
+            }
+        }
+    }
+
     fn enumerate_monitor_snapshots() -> Result<Vec<MonitorSnapshot>> {
         unsafe extern "system" fn collect_monitor(
             monitor: isize,
@@ -3027,7 +3702,7 @@ mod windows_impl {
 
     /// Get DPI scaling factor for the primary monitor
     pub fn get_dpi_scaling() -> f64 {
-        extern "C" {
+        extern "system" {
             fn GetDC(hwnd: isize) -> isize;
             fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
             fn GetDeviceCaps(hdc: isize, nIndex: i32) -> i32;
@@ -3291,6 +3966,45 @@ mod windows_impl {
 
             assert_eq!(displays[0].display_id, "windows-display-same-2");
             assert_eq!(displays[1].display_id, "windows-display-same");
+        }
+
+        #[test]
+        fn identify_overlay_owner_ignores_stale_finish() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            let first = owner.next_generation();
+            let second = owner.next_generation();
+
+            owner.finish_generation(first);
+
+            assert_eq!(owner.active_generation(), Some(second));
+        }
+
+        #[test]
+        fn identify_overlay_owner_clears_current_finish() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            let generation = owner.next_generation();
+
+            owner.finish_generation(generation);
+
+            assert_eq!(owner.active_generation(), None);
+        }
+
+        #[test]
+        fn identify_overlay_owner_cancel_active_clears_generation() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            owner.next_generation();
+
+            owner.cancel_active();
+
+            assert_eq!(owner.active_generation(), None);
+        }
+
+        #[test]
+        fn dpi_awareness_process_attempt_is_claimed_once() {
+            let attempted = AtomicBool::new(false);
+
+            assert!(claim_process_dpi_awareness_attempt(&attempted));
+            assert!(!claim_process_dpi_awareness_attempt(&attempted));
         }
 
         fn display_update_test_state() -> LocalDisplayState {
