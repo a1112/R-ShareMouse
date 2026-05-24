@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildFooterStatus,
   getHeaderMetrics,
+  getHardwareAssetPresetOptions,
   getPageLabels,
   getThemeModeOptions,
 } from "./desktop-shell.mjs";
@@ -62,6 +63,13 @@ test("getThemeModeOptions exposes light dark and system in Chinese", () => {
     { key: "light", label: "浅色" },
     { key: "dark", label: "深色" },
     { key: "system", label: "系统" },
+  ]);
+});
+
+test("getHardwareAssetPresetOptions keeps hardware texture presets in settings copy", () => {
+  assert.deepEqual(getHardwareAssetPresetOptions(), [
+    { key: "office", label: "办公" },
+    { key: "gaming", label: "游戏" },
   ]);
 });
 

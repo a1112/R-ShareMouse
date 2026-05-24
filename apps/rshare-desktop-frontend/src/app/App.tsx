@@ -46,6 +46,7 @@ import {
 import {
   buildFooterStatus,
   getHeaderMetrics,
+  getHardwareAssetPresetOptions,
   getPageLabels,
   getThemeModeOptions,
 } from "./desktop-shell.mjs";
@@ -2762,12 +2763,6 @@ function DevicesPageWithLocalControls({
   const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
   const [expandedRemoteDevices, setExpandedRemoteDevices] = useState<Record<string, boolean>>({});
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
-  const { selectedIds, setSelectedId } = useHardwareAssetCatalog();
-  const hardwareRigVariant = hardwareRigVariantForManifest(selectedIds.keyboard);
-  const setHardwareRigVariant = (variant: HardwareRigVariant) => {
-    setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
-    setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2994,33 +2989,6 @@ function DevicesPageWithLocalControls({
                 ))}
               </div>
             ) : null}
-            <div className="mt-3">
-              <div className="mb-1 text-[11px]" style={{ color: theme.textMuted }}>
-                硬件贴图
-              </div>
-              <div className="grid grid-cols-2 gap-1 rounded-md p-1" style={{ background: "rgba(255,255,255,0.04)" }}>
-                {(["office", "gaming"] as HardwareRigVariant[]).map((variant) => {
-                  const active =
-                    selectedIds.keyboard === builtinHardwareAssetId("keyboard", variant) &&
-                    selectedIds.mouse === builtinHardwareAssetId("mouse", variant);
-                  return (
-                    <button
-                      key={variant}
-                      type="button"
-                      className="rounded px-2 py-1 text-xs transition"
-                      style={{
-                        border: `1px solid ${active ? theme.accent : "transparent"}`,
-                        background: active ? theme.accentSoft : "transparent",
-                        color: active ? theme.text : theme.textMuted,
-                      }}
-                      onClick={() => setHardwareRigVariant(variant)}
-                    >
-                      {HARDWARE_RIG_VARIANT_LABELS[variant]}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
           </div>
 
           <div className="flex flex-col gap-1">
@@ -3988,11 +3956,6 @@ const HardwareAssetContext = createContext<HardwareAssetContextValue>(
 function useHardwareAssetCatalog() {
   return useContext(HardwareAssetContext);
 }
-
-const HARDWARE_RIG_VARIANT_LABELS: Record<HardwareRigVariant, string> = {
-  office: "办公",
-  gaming: "游戏",
-};
 
 const HARDWARE_RIGS: Record<HardwareRigKind, Record<HardwareRigVariant, HardwareRigDefinition>> = {
   keyboard: {
@@ -8011,6 +7974,14 @@ function HardwareAssetSettingsPanel({
     "gamepad",
     selectedIds.gamepad,
   ) as HardwareRigDefinition | null;
+  const presetOptions = getHardwareAssetPresetOptions() as Array<{
+    key: HardwareRigVariant;
+    label: string;
+  }>;
+  const setHardwareRigVariant = (variant: HardwareRigVariant) => {
+    setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
+    setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
+  };
 
   const handleImportFile = async (file: File | null | undefined) => {
     if (!file) {
@@ -8101,6 +8072,38 @@ function HardwareAssetSettingsPanel({
           <p className="text-sm" style={{ color: theme.textMuted }}>
             贴图、按键区域和导入包状态。
           </p>
+        </div>
+      </div>
+
+      <div
+        className="mb-4 rounded-md p-3"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.frame,
+        }}
+      >
+        <div className="mb-2 text-sm font-medium">贴图设置</div>
+        <div className="grid w-full max-w-[260px] grid-cols-2 gap-1 rounded-md p-1" style={{ background: "rgba(255,255,255,0.04)" }}>
+          {presetOptions.map((option) => {
+            const active =
+              selectedIds.keyboard === builtinHardwareAssetId("keyboard", option.key) &&
+              selectedIds.mouse === builtinHardwareAssetId("mouse", option.key);
+            return (
+              <button
+                key={option.key}
+                type="button"
+                className="rounded px-2 py-1.5 text-xs transition"
+                style={{
+                  border: `1px solid ${active ? theme.accent : "transparent"}`,
+                  background: active ? theme.accentSoft : "transparent",
+                  color: active ? theme.text : theme.textMuted,
+                }}
+                onClick={() => setHardwareRigVariant(option.key)}
+              >
+                {option.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 

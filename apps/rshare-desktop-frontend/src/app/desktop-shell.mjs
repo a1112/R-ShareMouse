@@ -15,6 +15,13 @@ export function getThemeModeOptions() {
   ];
 }
 
+export function getHardwareAssetPresetOptions() {
+  return [
+    { key: "office", label: "办公" },
+    { key: "gaming", label: "游戏" },
+  ];
+}
+
 export function getHeaderMetrics() {
   return {
     headerHeight: 40,
