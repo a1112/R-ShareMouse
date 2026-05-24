@@ -1644,6 +1644,63 @@ test("buildDesktopViewModel draws local displays from physical DPI while preserv
   assert.equal(Math.round(portrait.y + portrait.h), Math.round(primary.y + primary.h));
 });
 
+test("buildDesktopViewModel keeps physical local display adjacency from Windows coordinates", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "left", x: -1920, y: 0, width: 1920, height: 1080, primary: false },
+              { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "portrait", x: 2560, y: -4800, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 3,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 6640,
+        layout_height: 3840,
+        displays: [
+          { display_id: "left", friendly_name: "GZB0 (DISPLAY1)", x: -2560, y: 0, width: 2560, height: 1440, raw_dpi_x: null, raw_dpi_y: null, primary: false },
+          { display_id: "primary", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, raw_dpi_x: 93, raw_dpi_y: 93, primary: true },
+          { display_id: "portrait", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2415, width: 2160, height: 3840, raw_dpi_x: 163, raw_dpi_y: 163, primary: false },
+        ],
+      },
+    },
+  );
+
+  const left = model.layout.monitors.find((monitor) => monitor.displayId === "left");
+  const primary = model.layout.monitors.find((monitor) => monitor.displayId === "primary");
+  const portrait = model.layout.monitors.find((monitor) => monitor.displayId === "portrait");
+
+  assert.equal(Math.round(left.x + left.w), Math.round(primary.x));
+  assert.equal(Math.round(primary.x + primary.w), Math.round(portrait.x));
+  assert.equal(Math.round(left.y + left.h), Math.round(primary.y + primary.h));
+  assert.equal(Math.round(portrait.y + portrait.h), Math.round(primary.y + primary.h));
+});
+
 test("buildDesktopViewModel snaps visible layout monitor groups before rendering", () => {
   const model = buildDesktopViewModel({
     status: {

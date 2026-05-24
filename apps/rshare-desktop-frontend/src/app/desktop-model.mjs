@@ -271,6 +271,40 @@ function buildLocalDisplayInfoLookup(localControls) {
   );
 }
 
+function localNodeDisplays(node, localDisplayInfo) {
+  const actualDisplays = [...localDisplayInfo.values()];
+  if (!actualDisplays.length) {
+    return node.displays ?? [];
+  }
+
+  const visibleById = new Map(
+    (node.displays ?? []).map((display) => [display.display_id ?? "primary", display]),
+  );
+  const actualIds = new Set();
+  const mergedDisplays = actualDisplays.map((actualDisplay, index) => {
+    const displayId = actualDisplay.display_id ?? (index === 0 ? "primary" : `display-${index + 1}`);
+    const visibleDisplay = visibleById.get(displayId) ?? {};
+    actualIds.add(displayId);
+    return {
+      ...visibleDisplay,
+      ...actualDisplay,
+      display_id: displayId,
+      x: Number(actualDisplay.x ?? visibleDisplay.x ?? 0),
+      y: Number(actualDisplay.y ?? visibleDisplay.y ?? 0),
+      width: Number(actualDisplay.width ?? visibleDisplay.width ?? 1920),
+      height: Number(actualDisplay.height ?? visibleDisplay.height ?? 1080),
+      primary: Boolean(actualDisplay.primary ?? visibleDisplay.primary),
+    };
+  });
+
+  return [
+    ...mergedDisplays,
+    ...(node.displays ?? [])
+      .filter((display) => !actualIds.has(display.display_id ?? "primary"))
+      .map((display) => ({ ...display })),
+  ];
+}
+
 function physicalCanvasScale(localDisplayInfo) {
   const displays = [...localDisplayInfo.values()];
   const primaryDisplay = displays.find((display) => display.primary) ?? displays[0];
@@ -298,6 +332,145 @@ function physicalCanvasSize(display, localDisplayInfo, displayScale) {
     h: Math.max(64, Math.round((height / rawDpiY) * displayScale)),
     physical: true,
   };
+}
+
+function displayGeometry(display, localDisplayInfo, displayScale) {
+  const width = Number(display.width ?? 1920);
+  const height = Number(display.height ?? 1080);
+  const left = Number(display.x ?? 0);
+  const top = Number(display.y ?? 0);
+  return {
+    display,
+    displayId: display.display_id ?? "primary",
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    size: physicalCanvasSize(display, localDisplayInfo, displayScale),
+  };
+}
+
+function displayEdgeAligned(a, b) {
+  return Math.abs(Number(a) - Number(b)) <= LAYOUT_COMMIT_SNAP_DISTANCE;
+}
+
+function physicalYRelativeToAnchor(target, anchor, anchorLayout) {
+  if (displayEdgeAligned(target.bottom, anchor.bottom)) {
+    return anchorLayout.y + anchorLayout.h - target.size.h;
+  }
+  if (displayEdgeAligned(target.top, anchor.top)) {
+    return anchorLayout.y;
+  }
+  return anchorLayout.y + (target.top - anchor.top) * LAYOUT_SCALE;
+}
+
+function physicalXRelativeToAnchor(target, anchor, anchorLayout) {
+  if (displayEdgeAligned(target.right, anchor.right)) {
+    return anchorLayout.x + anchorLayout.w - target.size.w;
+  }
+  if (displayEdgeAligned(target.left, anchor.left)) {
+    return anchorLayout.x;
+  }
+  return anchorLayout.x + (target.left - anchor.left) * LAYOUT_SCALE;
+}
+
+function localPhysicalDisplayCandidate(target, anchor, anchorLayout) {
+  const candidates = [];
+  if (rangesOverlap(target.top, target.bottom, anchor.top, anchor.bottom)) {
+    if (target.left >= anchor.right) {
+      const gap = target.left - anchor.right;
+      candidates.push({
+        x: anchorLayout.x + anchorLayout.w + gap * LAYOUT_SCALE,
+        y: physicalYRelativeToAnchor(target, anchor, anchorLayout),
+        score: gap,
+      });
+    }
+    if (anchor.left >= target.right) {
+      const gap = anchor.left - target.right;
+      candidates.push({
+        x: anchorLayout.x - target.size.w - gap * LAYOUT_SCALE,
+        y: physicalYRelativeToAnchor(target, anchor, anchorLayout),
+        score: gap,
+      });
+    }
+  }
+
+  if (rangesOverlap(target.left, target.right, anchor.left, anchor.right)) {
+    if (target.top >= anchor.bottom) {
+      const gap = target.top - anchor.bottom;
+      candidates.push({
+        x: physicalXRelativeToAnchor(target, anchor, anchorLayout),
+        y: anchorLayout.y + anchorLayout.h + gap * LAYOUT_SCALE,
+        score: gap,
+      });
+    }
+    if (anchor.top >= target.bottom) {
+      const gap = anchor.top - target.bottom;
+      candidates.push({
+        x: physicalXRelativeToAnchor(target, anchor, anchorLayout),
+        y: anchorLayout.y - target.size.h - gap * LAYOUT_SCALE,
+        score: gap,
+      });
+    }
+  }
+
+  return candidates.sort((left, right) => left.score - right.score)[0] ?? null;
+}
+
+function buildLocalPhysicalDisplayLayout(displays, localDisplayInfo, displayScale) {
+  const entries = (displays ?? []).map((display) =>
+    displayGeometry(display, localDisplayInfo, displayScale),
+  );
+  if (!entries.length) {
+    return null;
+  }
+
+  const primary = entries.find((entry) => entry.display.primary) ?? entries[0];
+  const placed = new Map();
+  placed.set(primary.displayId, {
+    entry: primary,
+    x: CANVAS_ORIGIN_X + primary.right * LAYOUT_SCALE - primary.size.w,
+    y: CANVAS_ORIGIN_Y + primary.bottom * LAYOUT_SCALE - primary.size.h,
+    w: primary.size.w,
+    h: primary.size.h,
+  });
+
+  let changed = true;
+  while (placed.size < entries.length && changed) {
+    changed = false;
+    for (const target of entries) {
+      if (placed.has(target.displayId)) {
+        continue;
+      }
+
+      const bestCandidate = [...placed.values()]
+        .map((anchorLayout) => ({
+          anchor: anchorLayout,
+          candidate: localPhysicalDisplayCandidate(target, anchorLayout.entry, anchorLayout),
+        }))
+        .filter((item) => item.candidate)
+        .sort((left, right) => left.candidate.score - right.candidate.score)[0];
+
+      if (bestCandidate) {
+        placed.set(target.displayId, {
+          entry: target,
+          x: bestCandidate.candidate.x,
+          y: bestCandidate.candidate.y,
+          w: target.size.w,
+          h: target.size.h,
+        });
+        changed = true;
+      }
+    }
+  }
+
+  if (placed.size !== entries.length) {
+    return null;
+  }
+
+  return placed;
 }
 
 function layoutDisplayName(device, displayId, localDisplayNames) {
@@ -342,14 +515,29 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
     if (!device) {
       continue;
     }
+    const nodeDisplays =
+      device.kind === "local"
+        ? localNodeDisplays(node, localDisplayInfo)
+        : node.displays ?? [];
+    const localPhysicalLayout =
+      device.kind === "local"
+        ? buildLocalPhysicalDisplayLayout(
+            nodeDisplays,
+            localDisplayInfo,
+            localPhysicalScale,
+          )
+        : null;
 
-    for (const display of node.displays ?? []) {
+    for (const display of nodeDisplays) {
       const monitorIndex = layoutMonitors.length;
       const width = Number(display.width ?? 1920);
       const height = Number(display.height ?? 1080);
       const displayId = display.display_id ?? "primary";
+      const localPhysicalDisplay = localPhysicalLayout?.get(displayId);
       const canvasSize =
-        device.kind === "local"
+        localPhysicalDisplay
+          ? localPhysicalDisplay
+          : device.kind === "local"
           ? physicalCanvasSize(display, localDisplayInfo, localPhysicalScale)
           : {
               w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
@@ -377,8 +565,12 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         resWidth: width,
         resHeight: height,
         color: device.color,
-        x: canvasSize.physical ? canvasRight - canvasSize.w : canvasX,
-        y: canvasSize.physical ? canvasBottom - canvasSize.h : canvasY,
+        x: localPhysicalDisplay
+          ? localPhysicalDisplay.x
+          : canvasSize.physical ? canvasRight - canvasSize.w : canvasX,
+        y: localPhysicalDisplay
+          ? localPhysicalDisplay.y
+          : canvasSize.physical ? canvasBottom - canvasSize.h : canvasY,
         w: canvasSize.w,
         h: canvasSize.h,
         primary: Boolean(display.primary),
