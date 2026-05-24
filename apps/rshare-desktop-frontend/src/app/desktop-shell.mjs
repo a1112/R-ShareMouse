@@ -22,6 +22,13 @@ export function getHardwareAssetPresetOptions() {
   ];
 }
 
+export function getDeviceConsoleSections() {
+  return {
+    endpointAcceptance: true,
+    localLatencyFeedback: false,
+  };
+}
+
 export function getHeaderMetrics() {
   return {
     headerHeight: 40,

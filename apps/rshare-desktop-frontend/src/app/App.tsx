@@ -38,13 +38,13 @@ import {
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
-  buildLocalLatencyFeedbackRows,
   buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 import {
   buildFooterStatus,
+  getDeviceConsoleSections,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
   getPageLabels,
@@ -64,6 +64,8 @@ import {
 } from "./hardware-assets.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
+
+const DEVICE_CONSOLE_SECTIONS = getDeviceConsoleSections();
 
 function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
@@ -2763,6 +2765,8 @@ function DevicesPageWithLocalControls({
   const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
   const [expandedRemoteDevices, setExpandedRemoteDevices] = useState<Record<string, boolean>>({});
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
+  const { selectedIds } = useHardwareAssetCatalog();
+  const hardwareRigVariant = hardwareRigVariantForManifest(selectedIds.keyboard);
 
   useEffect(() => {
     let cancelled = false;
@@ -2818,7 +2822,6 @@ function DevicesPageWithLocalControls({
           ...(localControls ?? {}),
           latency_feedback: latencyFeedback,
         } as LocalControlsSnapshot);
-  const localLatencyRows = buildLocalLatencyFeedbackRows(latencyFeedback);
   const selectedRemoteLatency = selectedRemoteDevice
     ? (buildRemoteLatencySummary(
         latencyFeedbackSnapshot,
@@ -3156,8 +3159,9 @@ function DevicesPageWithLocalControls({
       </div>
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-        <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
-        <LocalLatencyFeedbackStrip rows={localLatencyRows} theme={theme} />
+        {DEVICE_CONSOLE_SECTIONS.endpointAcceptance ? (
+          <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+        ) : null}
         {selectedRemoteDevice ? (
           <RemoteLatencyPanel
             device={selectedRemoteDevice}
@@ -3314,69 +3318,6 @@ function DevicesPageWithLocalControls({
           </div>
         )}
       </section>
-    </div>
-  );
-}
-
-function LocalLatencyFeedbackStrip({
-  rows,
-  theme,
-}: {
-  rows: Array<{
-    key: string;
-    label: string;
-    state: string;
-    metric: string;
-    detail: string;
-  }>;
-  theme: typeof FIGMA_DESKTOP_THEME;
-}) {
-  const tone = (state: string) => {
-    switch (state) {
-      case "pass":
-        return theme.success;
-      case "warn":
-        return "#d6a64b";
-      case "block":
-        return theme.danger;
-      default:
-        return theme.textMuted;
-    }
-  };
-
-  return (
-    <div
-      className="grid shrink-0 gap-2 px-3 py-2"
-      style={{
-        gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))",
-      }}
-    >
-      {rows.map((row) => (
-        <div
-          key={row.key}
-          className="min-w-0 rounded-md px-3 py-2"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.035)",
-          }}
-        >
-          <div className="flex items-center justify-between gap-2">
-            <span className="truncate text-xs" style={{ color: theme.textMuted }}>
-              {row.label}
-            </span>
-            <span
-              className="h-1.5 w-1.5 shrink-0 rounded-full"
-              style={{ background: tone(row.state) }}
-            />
-          </div>
-          <div className="mt-1 truncate text-sm font-semibold" style={{ color: theme.text }}>
-            {row.metric}
-          </div>
-          <div className="mt-1 truncate text-[11px]" style={{ color: theme.textMuted }} title={row.detail}>
-            {row.detail}
-          </div>
-        </div>
-      ))}
     </div>
   );
 }

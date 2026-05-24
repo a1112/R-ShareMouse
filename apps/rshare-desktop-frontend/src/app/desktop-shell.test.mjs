@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildFooterStatus,
+  getDeviceConsoleSections,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
   getPageLabels,
@@ -71,6 +72,13 @@ test("getHardwareAssetPresetOptions keeps hardware texture presets in settings c
     { key: "office", label: "办公" },
     { key: "gaming", label: "游戏" },
   ]);
+});
+
+test("getDeviceConsoleSections hides the local latency feedback strip by default", () => {
+  assert.deepEqual(getDeviceConsoleSections(), {
+    endpointAcceptance: true,
+    localLatencyFeedback: false,
+  });
 });
 
 test("getHeaderMetrics tightens titlebar padding and button density", () => {
