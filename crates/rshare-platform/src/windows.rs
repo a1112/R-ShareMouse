@@ -1729,9 +1729,7 @@ mod windows_impl {
                 .iter()
                 .position(|byte| *byte == b'\n' || *byte == b'\r' || *byte == 0)
                 .unwrap_or(raw_name.len());
-            let name = String::from_utf8_lossy(&raw_name[..end])
-                .trim()
-                .to_string();
+            let name = String::from_utf8_lossy(&raw_name[..end]).trim().to_string();
             if !name.is_empty() {
                 return Some(name);
             }
@@ -4119,8 +4117,7 @@ mod windows_impl {
             edid[descriptor + 2] = 0x00;
             edid[descriptor + 3] = 0xfc;
             edid[descriptor + 4] = 0x00;
-            edid[descriptor + 5..descriptor + 18]
-                .copy_from_slice(b"Studio 27Q  \n");
+            edid[descriptor + 5..descriptor + 18].copy_from_slice(b"Studio 27Q  \n");
 
             assert_eq!(monitor_name_from_edid(&edid).as_deref(), Some("Studio 27Q"));
         }
@@ -4158,8 +4155,13 @@ mod windows_impl {
         #[test]
         fn display_friendly_name_uses_hardware_id_when_name_is_generic() {
             assert_eq!(
-                display_friendly_name(r"\\.\DISPLAY3", Some("Generic PnP Monitor"), Some("INN3200"), None)
-                    .as_deref(),
+                display_friendly_name(
+                    r"\\.\DISPLAY3",
+                    Some("Generic PnP Monitor"),
+                    Some("INN3200"),
+                    None
+                )
+                .as_deref(),
                 Some("INN3200 (DISPLAY3)")
             );
         }

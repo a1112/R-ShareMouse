@@ -588,14 +588,8 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
         .latency_feedback
         .local_input
         .latest_gamepad_event_kind = Some("state".to_string());
-    snapshot
-        .latency_feedback
-        .local_input
-        .latest_gamepad_button = Some("South pressed".to_string());
-    snapshot
-        .latency_feedback
-        .local_input
-        .latest_gamepad_axis = Some("left_stick".to_string());
+    snapshot.latency_feedback.local_input.latest_gamepad_button = Some("South pressed".to_string());
+    snapshot.latency_feedback.local_input.latest_gamepad_axis = Some("left_stick".to_string());
     snapshot.latency_feedback.local_input.capture_path = Some("portable".to_string());
     snapshot.latency_feedback.remote_latency.devices.push(
         rshare_core::RemoteDeviceLatencyFeedback {
@@ -638,7 +632,10 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
         Some(115)
     );
     assert_eq!(
-        decoded_snapshot.latency_feedback.local_input.latest_gamepad_id,
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_id,
         Some(0)
     );
     assert_eq!(

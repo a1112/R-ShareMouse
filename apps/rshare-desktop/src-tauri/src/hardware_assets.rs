@@ -256,7 +256,10 @@ mod tests {
         let installed = list_installed_hardware_assets(temp.path()).unwrap();
 
         assert_eq!(installed[0].manifest.id, "user.keyboard.sample");
-        assert_eq!(installed[0].manifest.layers[0].src.as_deref(), Some("base.png"));
+        assert_eq!(
+            installed[0].manifest.layers[0].src.as_deref(),
+            Some("base.png")
+        );
     }
 
     #[test]
