@@ -8,7 +8,27 @@ cfg_if::cfg_if! {
 
 #[cfg(windows)]
 mod windows_impl {
-    use ::windows::{
+    use crate::display::{clamp_identify_duration_ms, fit_thumbnail_size};
+    use anyhow::{Context, Result};
+    use rshare_core::{
+        DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
+        DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
+        DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioInputDevice,
+        LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
+        LocalHardwareDevice,
+    };
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt;
+    use std::mem::size_of;
+    use std::os::windows::process::CommandExt;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+    use windows::{
         core::{BSTR, HSTRING, PWSTR},
         Win32::{
             Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -23,23 +43,11 @@ mod windows_impl {
             },
         },
     };
-    use anyhow::{Context, Result};
-    use rshare_core::{
-        LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalHardwareDevice,
-    };
-    use std::cell::RefCell;
-    use std::fmt;
-    use std::mem::size_of;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    };
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
 
     type WindowsInputCallback = Arc<dyn Fn(WindowsInputEvent) + Send + Sync + 'static>;
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+    static PROCESS_DPI_AWARENESS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
     thread_local! {
         static WINDOWS_HOOK_CALLBACK: RefCell<Option<WindowsInputCallback>> = RefCell::new(None);
@@ -930,7 +938,7 @@ mod windows_impl {
 
         /// Get primary screen info (physical resolution, not DPI-scaled)
         pub fn get_screen_info() -> ScreenInfo {
-            extern "C" {
+            extern "system" {
                 fn GetSystemMetrics(nIndex: i32) -> i32;
                 fn GetDC(hwnd: isize) -> isize;
                 fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
@@ -1293,7 +1301,7 @@ mod windows_impl {
 
     impl WindowsInputEmulator {
         pub fn new() -> Self {
-            extern "C" {
+            extern "system" {
                 fn GetSystemMetrics(nIndex: i32) -> i32;
             }
 
@@ -1562,9 +1570,49 @@ mod windows_impl {
     const XBUTTON1: u16 = 1;
     const XBUTTON2: u16 = 2;
     const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
+    const CCHDEVICENAME: usize = 32;
+    const CCHFORMNAME: usize = 32;
+    const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
+    const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
+    const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
+    const DM_DISPLAYORIENTATION: u32 = 0x0000_0080;
+    const DM_BITSPERPEL: u32 = 0x0004_0000;
+    const DM_PELSWIDTH: u32 = 0x0008_0000;
+    const DM_PELSHEIGHT: u32 = 0x0010_0000;
+    const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
+    const DMDO_DEFAULT: u32 = 0;
+    const DMDO_90: u32 = 1;
+    const DMDO_180: u32 = 2;
+    const DMDO_270: u32 = 3;
+    const CDS_UPDATEREGISTRY: u32 = 0x0000_0001;
+    const CDS_TEST: u32 = 0x0000_0002;
+    const CDS_NORESET: u32 = 0x1000_0000;
+    const DISP_CHANGE_SUCCESSFUL: i32 = 0;
+    const DISP_CHANGE_RESTART: i32 = 1;
+    const DISP_CHANGE_FAILED: i32 = -1;
+    const DISP_CHANGE_BADMODE: i32 = -2;
+    const DISP_CHANGE_NOTUPDATED: i32 = -3;
+    const DISP_CHANGE_BADFLAGS: i32 = -4;
+    const DISP_CHANGE_BADPARAM: i32 = -5;
+    const DISP_CHANGE_BADDUALVIEW: i32 = -6;
     const RIM_TYPEMOUSE: u32 = 0;
     const RIM_TYPEKEYBOARD: u32 = 1;
     const RIDI_DEVICENAME: u32 = 0x20000007;
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
+    const SRCCOPY: u32 = 0x00CC_0020;
+    const HALFTONE: i32 = 4;
+    const WS_EX_TOPMOST: u32 = 0x0000_0008;
+    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const SS_CENTER: u32 = 0x0000_0001;
+    const SS_CENTERIMAGE: u32 = 0x0000_0200;
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
         (device_type << 16) | (access << 14) | (function << 2) | method
@@ -1572,6 +1620,280 @@ mod windows_impl {
 
     fn wide_null(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn fixed_wide_to_string(value: &[u16]) -> Option<String> {
+        let len = value.iter().position(|ch| *ch == 0).unwrap_or(value.len());
+        let text = String::from_utf16_lossy(&value[..len]).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn display_orientation_from_devmode(value: u32) -> DisplayOrientation {
+        match value {
+            DMDO_DEFAULT => DisplayOrientation::Landscape,
+            DMDO_90 => DisplayOrientation::Portrait,
+            DMDO_180 => DisplayOrientation::LandscapeFlipped,
+            DMDO_270 => DisplayOrientation::PortraitFlipped,
+            _ => DisplayOrientation::Landscape,
+        }
+    }
+
+    fn display_orientation_to_devmode(value: DisplayOrientation) -> u32 {
+        match value {
+            DisplayOrientation::Landscape => DMDO_DEFAULT,
+            DisplayOrientation::Portrait => DMDO_90,
+            DisplayOrientation::LandscapeFlipped => DMDO_180,
+            DisplayOrientation::PortraitFlipped => DMDO_270,
+        }
+    }
+
+    fn refresh_rate_to_millihz(refresh_rate_hz: u32) -> Option<u32> {
+        if refresh_rate_hz == 0 {
+            None
+        } else {
+            refresh_rate_hz.checked_mul(1_000)
+        }
+    }
+
+    fn stable_display_id(
+        device_name: &str,
+        target_id: Option<&str>,
+        friendly_name: Option<&str>,
+        adapter_id: Option<&str>,
+    ) -> String {
+        let mut hash = 0xcbf29ce484222325u64;
+        let identity_parts = [target_id, adapter_id, friendly_name];
+        let has_stable_identity = identity_parts
+            .iter()
+            .any(|part| part.map(|value| !value.trim().is_empty()).unwrap_or(false));
+        let gdi_fallback = if has_stable_identity {
+            None
+        } else {
+            Some(device_name)
+        };
+
+        for part in identity_parts.into_iter().chain([gdi_fallback]).flatten() {
+            for byte in part.as_bytes() {
+                hash ^= u64::from(byte.to_ascii_lowercase());
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+
+        format!("windows-display-{hash:016x}")
+    }
+
+    fn gdi_display_number(device_name: &str) -> Option<u32> {
+        let display_pos = device_name.rfind("DISPLAY")?;
+        let number = &device_name[display_pos + "DISPLAY".len()..];
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        number.parse().ok()
+    }
+
+    fn monitor_hardware_id_from_target_id(target_id: &str) -> Option<String> {
+        let mut parts = target_id.split('\\');
+        if !parts
+            .next()
+            .map(|part| part.eq_ignore_ascii_case("MONITOR"))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let hardware_id = parts.next()?.trim();
+        if hardware_id.is_empty() {
+            None
+        } else {
+            Some(hardware_id.to_string())
+        }
+    }
+
+    fn monitor_name_from_edid(edid: &[u8]) -> Option<String> {
+        for descriptor in [54usize, 72, 90, 108] {
+            if edid.len() < descriptor + 18 {
+                continue;
+            }
+            if edid[descriptor..descriptor + 5] != [0x00, 0x00, 0x00, 0xfc, 0x00] {
+                continue;
+            }
+
+            let raw_name = &edid[descriptor + 5..descriptor + 18];
+            let end = raw_name
+                .iter()
+                .position(|byte| *byte == b'\n' || *byte == b'\r' || *byte == 0)
+                .unwrap_or(raw_name.len());
+            let name = String::from_utf8_lossy(&raw_name[..end]).trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+
+        None
+    }
+
+    fn normalize_display_name(name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("Generic PnP Monitor") {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    fn display_friendly_name(
+        device_name: &str,
+        windows_friendly_name: Option<&str>,
+        hardware_id: Option<&str>,
+        edid_name: Option<&str>,
+    ) -> Option<String> {
+        let base_name = edid_name
+            .and_then(normalize_display_name)
+            .or_else(|| windows_friendly_name.and_then(normalize_display_name))
+            .or_else(|| hardware_id.and_then(normalize_display_name))?;
+        let display_number = gdi_display_number(device_name);
+
+        match display_number {
+            Some(number) => Some(format!("{base_name} (DISPLAY{number})")),
+            None => Some(base_name),
+        }
+    }
+
+    fn monitor_name_from_registry(target_id: Option<&str>) -> Option<String> {
+        let hardware_id = monitor_hardware_id_from_target_id(target_id?)?;
+        let registry_path = format!(r"HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\{hardware_id}");
+        let output = std::process::Command::new("reg")
+            .args(["query", &registry_path, "/s", "/v", "EDID"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let Some((_, raw_hex)) = line.split_once("REG_BINARY") else {
+                continue;
+            };
+            let hex = raw_hex.trim();
+            let bytes = hex_bytes(hex);
+            if let Some(name) = monitor_name_from_edid(&bytes) {
+                return Some(name);
+            }
+        }
+
+        None
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let digits: Vec<u8> = hex
+            .bytes()
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .collect();
+        digits
+            .chunks_exact(2)
+            .filter_map(|chunk| {
+                let text = std::str::from_utf8(chunk).ok()?;
+                u8::from_str_radix(text, 16).ok()
+            })
+            .collect()
+    }
+
+    fn devmode_with_size() -> DevModeW {
+        let mut mode = DevModeW::default();
+        mode.size = size_of::<DevModeW>() as u16;
+        mode
+    }
+
+    #[derive(Clone)]
+    struct MonitorSnapshot {
+        handle: isize,
+        rect: Rect,
+        work: Rect,
+        primary: bool,
+        device_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DisplayDeviceSnapshot {
+        adapter_id: Option<String>,
+        target_id: Option<String>,
+        friendly_name: Option<String>,
+        active: bool,
+        primary: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CurrentDisplayMode {
+        x: i32,
+        y: i32,
+        mode: DisplayModeInfo,
+    }
+
+    #[derive(Debug, Default)]
+    struct IdentifyOverlayOwnerState {
+        next_generation: u64,
+        active_generation: Option<u64>,
+    }
+
+    impl IdentifyOverlayOwnerState {
+        fn next_generation(&mut self) -> u64 {
+            self.next_generation = self.next_generation.saturating_add(1);
+            self.active_generation = Some(self.next_generation);
+            self.next_generation
+        }
+
+        fn finish_generation(&mut self, generation: u64) {
+            if self.active_generation == Some(generation) {
+                self.active_generation = None;
+            }
+        }
+
+        fn cancel_active(&mut self) {
+            self.active_generation = None;
+        }
+
+        fn active_generation(&self) -> Option<u64> {
+            self.active_generation
+        }
+    }
+
+    #[derive(Default)]
+    struct IdentifyOverlayOwner {
+        state: IdentifyOverlayOwnerState,
+        active_cancel: Option<mpsc::Sender<()>>,
+    }
+
+    impl IdentifyOverlayOwner {
+        fn replace_active(&mut self, cancel_sender: mpsc::Sender<()>) -> u64 {
+            self.cancel_active();
+
+            let generation = self.state.next_generation();
+            self.active_cancel = Some(cancel_sender);
+            generation
+        }
+
+        fn finish_generation(&mut self, generation: u64) {
+            if self.state.active_generation() == Some(generation) {
+                self.active_cancel = None;
+            }
+            self.state.finish_generation(generation);
+        }
+
+        fn cancel_active(&mut self) {
+            if let Some(cancel) = self.active_cancel.take() {
+                let _ = cancel.send(());
+            }
+            self.state.cancel_active();
+        }
     }
 
     fn driver_device_kind_code(kind: WindowsDriverDeviceKind) -> u32 {
@@ -1722,12 +2044,174 @@ mod windows_impl {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct BitmapInfoHeader {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_pels_per_meter: i32,
+        y_pels_per_meter: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RgbQuad {
+        blue: u8,
+        green: u8,
+        red: u8,
+        reserved: u8,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BitmapInfo {
+        header: BitmapInfoHeader,
+        colors: [RgbQuad; 1],
+    }
+
+    impl Default for BitmapInfo {
+        fn default() -> Self {
+            Self {
+                header: BitmapInfoHeader::default(),
+                colors: [RgbQuad::default()],
+            }
+        }
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy)]
     struct MonitorInfo {
         cb_size: u32,
         rc_monitor: Rect,
         rc_work: Rect,
         flags: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MonitorInfoEx {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+        device: [u16; CCHDEVICENAME],
+    }
+
+    impl Default for MonitorInfoEx {
+        fn default() -> Self {
+            Self {
+                cb_size: size_of::<MonitorInfoEx>() as u32,
+                rc_monitor: Rect::default(),
+                rc_work: Rect::default(),
+                flags: 0,
+                device: [0; CCHDEVICENAME],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DisplayDeviceW {
+        cb: u32,
+        device_name: [u16; CCHDEVICENAME],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    impl Default for DisplayDeviceW {
+        fn default() -> Self {
+            Self {
+                cb: size_of::<DisplayDeviceW>() as u32,
+                device_name: [0; CCHDEVICENAME],
+                device_string: [0; 128],
+                state_flags: 0,
+                device_id: [0; 128],
+                device_key: [0; 128],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct PointL {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModePrinterFields {
+        orientation: i16,
+        paper_size: i16,
+        paper_length: i16,
+        paper_width: i16,
+        scale: i16,
+        copies: i16,
+        default_source: i16,
+        print_quality: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModeDisplayFields {
+        position: PointL,
+        display_orientation: u32,
+        display_fixed_output: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union DevModeFields {
+        printer: DevModePrinterFields,
+        display: DevModeDisplayFields,
+    }
+
+    impl Default for DevModeFields {
+        fn default() -> Self {
+            Self {
+                display: DevModeDisplayFields::default(),
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DevModeW {
+        device_name: [u16; CCHDEVICENAME],
+        spec_version: u16,
+        driver_version: u16,
+        size: u16,
+        driver_extra: u16,
+        fields: u32,
+        fields_union: DevModeFields,
+        color: i16,
+        duplex: i16,
+        y_resolution: i16,
+        tt_option: i16,
+        collate: i16,
+        form_name: [u16; CCHFORMNAME],
+        log_pixels: u16,
+        bits_per_pel: u32,
+        pels_width: u32,
+        pels_height: u32,
+        display_flags: u32,
+        display_frequency: u32,
+        icm_method: u32,
+        icm_intent: u32,
+        media_type: u32,
+        dither_type: u32,
+        reserved1: u32,
+        reserved2: u32,
+        panning_width: u32,
+        panning_height: u32,
     }
 
     #[repr(C)]
@@ -1815,6 +2299,27 @@ mod windows_impl {
         ) -> i32;
         fn PostThreadMessageW(thread_id: u32, msg: u32, w_param: usize, l_param: isize) -> i32;
         fn GetCurrentThreadId() -> u32;
+        fn GetDC(hwnd: isize) -> isize;
+        fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        fn SetThreadDpiAwarenessContext(value: isize) -> isize;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            h_wnd_parent: isize,
+            h_menu: isize,
+            h_instance: isize,
+            lp_param: *mut std::ffi::c_void,
+        ) -> isize;
+        fn DestroyWindow(hwnd: isize) -> i32;
+        fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+        fn UpdateWindow(hwnd: isize) -> i32;
         fn GetRawInputDeviceList(
             p_raw_input_device_list: *mut RawInputDeviceList,
             pui_num_devices: *mut u32,
@@ -1832,7 +2337,25 @@ mod windows_impl {
             lpfn_enum: Option<MonitorEnumProc>,
             dw_data: isize,
         ) -> i32;
-        fn GetMonitorInfoW(h_monitor: isize, lpmi: *mut MonitorInfo) -> i32;
+        fn GetMonitorInfoW(h_monitor: isize, lpmi: *mut std::ffi::c_void) -> i32;
+        fn EnumDisplayDevicesW(
+            lp_device: *const u16,
+            i_dev_num: u32,
+            lp_display_device: *mut DisplayDeviceW,
+            dw_flags: u32,
+        ) -> i32;
+        fn EnumDisplaySettingsW(
+            lpsz_device_name: *const u16,
+            i_mode_num: u32,
+            lp_dev_mode: *mut DevModeW,
+        ) -> i32;
+        fn ChangeDisplaySettingsExW(
+            lpsz_device_name: *const u16,
+            lp_dev_mode: *mut DevModeW,
+            hwnd: isize,
+            dwflags: u32,
+            l_param: *mut std::ffi::c_void,
+        ) -> i32;
         fn CreateFileW(
             lp_file_name: *const u16,
             dw_desired_access: u32,
@@ -1852,6 +2375,57 @@ mod windows_impl {
             n_out_buffer_size: u32,
             lp_bytes_returned: *mut u32,
             lp_overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "Gdi32")]
+    extern "system" {
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn CreateDIBSection(
+            hdc: isize,
+            pbmi: *const BitmapInfo,
+            usage: u32,
+            ppv_bits: *mut *mut std::ffi::c_void,
+            section: isize,
+            offset: u32,
+        ) -> isize;
+        fn SelectObject(hdc: isize, hgdiobj: isize) -> isize;
+        fn DeleteObject(ho: isize) -> i32;
+        fn BitBlt(
+            hdc: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            hdc_src: isize,
+            x1: i32,
+            y1: i32,
+            rop: u32,
+        ) -> i32;
+        fn StretchBlt(
+            hdc_dest: isize,
+            x_dest: i32,
+            y_dest: i32,
+            w_dest: i32,
+            h_dest: i32,
+            hdc_src: isize,
+            x_src: i32,
+            y_src: i32,
+            w_src: i32,
+            h_src: i32,
+            rop: u32,
+        ) -> i32;
+        fn SetStretchBltMode(hdc: isize, mode: i32) -> i32;
+    }
+
+    #[link(name = "Shcore")]
+    extern "system" {
+        fn GetDpiForMonitor(
+            hmonitor: isize,
+            dpi_type: i32,
+            dpi_x: *mut u32,
+            dpi_y: *mut u32,
         ) -> i32;
     }
 
@@ -1977,6 +2551,1210 @@ mod windows_impl {
         send_input(&input, "keyboard")
     }
 
+    fn claim_process_dpi_awareness_attempt(attempted: &AtomicBool) -> bool {
+        attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn ensure_display_dpi_awareness() {
+        if claim_process_dpi_awareness_attempt(&PROCESS_DPI_AWARENESS_ATTEMPTED) {
+            unsafe {
+                if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+                    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+                }
+            }
+        }
+
+        unsafe {
+            if SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            }
+        }
+    }
+
+    pub fn query_display_state() -> Result<LocalDisplayState> {
+        ensure_display_dpi_awareness();
+
+        let monitors = enumerate_monitor_snapshots()?;
+        if monitors.is_empty() {
+            anyhow::bail!("EnumDisplayMonitors returned no monitors");
+        }
+
+        let devices = enumerate_display_devices();
+        let mut displays = Vec::with_capacity(monitors.len());
+
+        for (index, monitor) in monitors.iter().enumerate() {
+            let device = monitor
+                .device_name
+                .as_deref()
+                .and_then(|name| devices.get(name));
+            let mode = monitor
+                .device_name
+                .as_deref()
+                .and_then(current_display_mode);
+            let (dpi_x, dpi_y, raw_dpi_x, raw_dpi_y, scale_percent) =
+                monitor_dpi_state(monitor.handle);
+
+            let gdi_device_name = monitor
+                .device_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("monitor-{}", index + 1));
+            let display_id = stable_display_id(
+                &gdi_device_name,
+                device.and_then(|device| device.target_id.as_deref()),
+                device.and_then(|device| device.friendly_name.as_deref()),
+                device.and_then(|device| device.adapter_id.as_deref()),
+            );
+            let target_id = device.and_then(|device| device.target_id.clone());
+            let hardware_id = target_id
+                .as_deref()
+                .and_then(monitor_hardware_id_from_target_id);
+            let edid_name = monitor_name_from_registry(target_id.as_deref());
+            let friendly_name = display_friendly_name(
+                &gdi_device_name,
+                device.and_then(|device| device.friendly_name.as_deref()),
+                hardware_id.as_deref(),
+                edid_name.as_deref(),
+            )
+            .or_else(|| Some(gdi_device_name.clone()));
+            let (x, y, width, height) =
+                display_geometry_from_monitor_and_mode(monitor.rect, mode.as_ref());
+            let primary = monitor.primary || device.map(|device| device.primary).unwrap_or(false);
+
+            displays.push(LocalDisplayInfo {
+                display_id: display_id.clone(),
+                adapter_id: device.and_then(|device| device.adapter_id.clone()),
+                target_id,
+                device_name: Some(gdi_device_name.clone()),
+                friendly_name,
+                x,
+                y,
+                width,
+                height,
+                work_x: monitor.work.left,
+                work_y: monitor.work.top,
+                work_width: rect_width(monitor.work),
+                work_height: rect_height(monitor.work),
+                primary,
+                orientation: mode
+                    .as_ref()
+                    .map(|mode| mode.mode.orientation)
+                    .unwrap_or_default(),
+                scale_percent,
+                dpi_x,
+                dpi_y,
+                raw_dpi_x,
+                raw_dpi_y,
+                refresh_rate_millihz: mode
+                    .as_ref()
+                    .and_then(|mode| mode.mode.refresh_rate_millihz),
+                bits_per_pixel: mode.as_ref().and_then(|mode| mode.mode.bits_per_pixel),
+                active: device.map(|device| device.active).unwrap_or(true),
+                modes: monitor
+                    .device_name
+                    .as_deref()
+                    .map(display_modes)
+                    .unwrap_or_default(),
+                write_capabilities: DisplayWriteCapabilities {
+                    resolution: true,
+                    refresh_rate: true,
+                    orientation: true,
+                    primary: false,
+                    position: false,
+                    scale: false,
+                },
+            });
+        }
+
+        displays.sort_by_key(|display| (!display.primary, display.x, display.y));
+        disambiguate_duplicate_display_ids(&mut displays);
+        let min_x = displays.iter().map(|display| display.x).min().unwrap_or(0);
+        let min_y = displays.iter().map(|display| display.y).min().unwrap_or(0);
+        let max_x = displays
+            .iter()
+            .map(|display| display.x.saturating_add(display.width as i32))
+            .max()
+            .unwrap_or(0);
+        let max_y = displays
+            .iter()
+            .map(|display| display.y.saturating_add(display.height as i32))
+            .max()
+            .unwrap_or(0);
+        let primary = displays
+            .iter()
+            .find(|display| display.primary)
+            .unwrap_or(&displays[0]);
+
+        Ok(LocalDisplayState {
+            display_count: displays.len(),
+            virtual_x: min_x,
+            virtual_y: min_y,
+            primary_width: primary.width,
+            primary_height: primary.height,
+            layout_width: max_x.saturating_sub(min_x).max(0) as u32,
+            layout_height: max_y.saturating_sub(min_y).max(0) as u32,
+            displays,
+        })
+    }
+
+    pub fn capture_display(request: &DisplayCaptureRequest) -> Result<DisplayCaptureResult> {
+        ensure_display_dpi_awareness();
+
+        let state = match query_display_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(display_capture_error(
+                    DisplayOperationStatus::ApplyFailed,
+                    &request.display_id,
+                    format!("Windows display enumeration failed: {error}"),
+                ));
+            }
+        };
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidDisplay,
+                &request.display_id,
+                "requested display was not found",
+            ));
+        };
+
+        if !display.active || display.width == 0 || display.height == 0 {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidDisplay,
+                &display.display_id,
+                "requested display is not active or has no capture area",
+            ));
+        }
+
+        let (capture_width, capture_height) = request
+            .max_width
+            .map(|max_width| fit_thumbnail_size(display.width, display.height, max_width))
+            .unwrap_or((display.width, display.height));
+        if capture_width == 0 || capture_height == 0 {
+            return Ok(display_capture_error(
+                DisplayOperationStatus::InvalidMode,
+                &display.display_id,
+                "requested thumbnail size is empty",
+            ));
+        }
+
+        match unsafe { capture_display_bmp(display, capture_width, capture_height) } {
+            Ok(bytes) => Ok(DisplayCaptureResult {
+                status: DisplayOperationStatus::Success,
+                display_id: display.display_id.clone(),
+                mime_type: Some("image/bmp".to_string()),
+                width: Some(capture_width),
+                height: Some(capture_height),
+                bytes,
+                message: Some("display captured".to_string()),
+            }),
+            Err(error) => Ok(display_capture_error(
+                DisplayOperationStatus::ApplyFailed,
+                &display.display_id,
+                format!("Windows display capture failed: {error}"),
+            )),
+        }
+    }
+
+    pub fn identify_displays(request: &DisplayIdentifyRequest) -> Result<DisplayIdentifyResult> {
+        ensure_display_dpi_awareness();
+
+        let duration_ms = clamp_identify_duration_ms(request.duration_ms);
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let generation = register_identify_overlay(cancel_sender);
+        let state = match query_display_state() {
+            Ok(state) => state,
+            Err(error) => {
+                finish_identify_overlay(generation);
+                return Ok(display_identify_result(
+                    DisplayOperationStatus::ApplyFailed,
+                    format!("Windows display enumeration failed: {error}"),
+                ));
+            }
+        };
+        let displays = state
+            .displays
+            .into_iter()
+            .filter(|display| display.active && display.width > 0 && display.height > 0)
+            .collect::<Vec<_>>();
+
+        if displays.is_empty() {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "no active displays are available to identify",
+            ));
+        }
+
+        if cancel_receiver.try_recv().is_ok() {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                "display identification request was superseded",
+            ));
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let spawn_result = thread::Builder::new()
+            .name("rshare-display-identify".to_string())
+            .spawn(move || {
+                ensure_display_dpi_awareness();
+                let windows = unsafe { create_identify_overlay_windows(&displays) };
+                match windows {
+                    Ok(windows) => {
+                        let count = windows.len();
+                        let _ = sender.send(Ok(count));
+                        let _ = cancel_receiver
+                            .recv_timeout(Duration::from_millis(u64::from(duration_ms)));
+                        for hwnd in windows {
+                            unsafe {
+                                DestroyWindow(hwnd);
+                            }
+                        }
+                        finish_identify_overlay(generation);
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        finish_identify_overlay(generation);
+                    }
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            finish_identify_overlay(generation);
+            return Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("failed to start display identification thread: {error}"),
+            ));
+        }
+
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(count)) => Ok(display_identify_result(
+                DisplayOperationStatus::Success,
+                format!("identifying {count} display(s) for {duration_ms} ms"),
+            )),
+            Ok(Err(error)) => Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("Windows display identification failed: {error}"),
+            )),
+            Err(error) => Ok(display_identify_result(
+                DisplayOperationStatus::ApplyFailed,
+                format!("display identification did not start: {error}"),
+            )),
+        }
+    }
+
+    pub fn update_display_settings(
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Result<DisplaySettingsUpdateResult> {
+        if request.scale_percent.is_some() {
+            return Ok(display_update_result(
+                DisplayOperationStatus::RequiresSystemSettings,
+                "display scale changes require Windows system display settings",
+            ));
+        }
+
+        let state = query_display_state()?;
+        let validation = validate_display_settings_update(&state, request);
+        if validation.status != DisplayOperationStatus::Success {
+            return Ok(validation);
+        }
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "display was not found after validation",
+            ));
+        };
+
+        if !display_settings_update_has_changes(request) {
+            return Ok(display_update_result(
+                DisplayOperationStatus::Success,
+                "no display settings changes requested",
+            ));
+        }
+
+        apply_display_settings_update(display, request)
+    }
+
+    fn validate_display_settings_update(
+        state: &LocalDisplayState,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> DisplaySettingsUpdateResult {
+        if request.scale_percent.is_some() {
+            return display_update_result(
+                DisplayOperationStatus::RequiresSystemSettings,
+                "display scale changes require Windows system display settings",
+            );
+        }
+
+        if request.primary.is_some() || request.x.is_some() || request.y.is_some() {
+            return display_update_result(
+                DisplayOperationStatus::Unsupported,
+                "primary and position display writes are not supported until topology rebasing is implemented",
+            );
+        }
+
+        let Some(display) = state
+            .displays
+            .iter()
+            .find(|display| display.display_id == request.display_id)
+        else {
+            return display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "requested display was not found",
+            );
+        };
+
+        if !display.active {
+            return display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "requested display is not active",
+            );
+        }
+
+        if request.orientation.is_some() && (request.width.is_none() || request.height.is_none()) {
+            return display_update_result(
+                DisplayOperationStatus::InvalidMode,
+                "orientation changes require explicit width and height",
+            );
+        }
+
+        if display_settings_update_has_mode_changes(request)
+            && supported_display_mode(display, request).is_none()
+        {
+            return display_update_result(
+                DisplayOperationStatus::InvalidMode,
+                "requested display mode is not advertised by the target display",
+            );
+        }
+
+        display_update_result(
+            DisplayOperationStatus::Success,
+            "display update request is valid",
+        )
+    }
+
+    fn disambiguate_duplicate_display_ids(displays: &mut [LocalDisplayInfo]) {
+        let mut groups: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+        for (index, display) in displays.iter().enumerate() {
+            let sort_key = format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+                display.device_name.as_deref().unwrap_or_default(),
+                display.target_id.as_deref().unwrap_or_default(),
+                display.adapter_id.as_deref().unwrap_or_default(),
+                display.friendly_name.as_deref().unwrap_or_default(),
+                display.x,
+                display.y,
+                display.width,
+                display.height,
+                index
+            );
+            groups
+                .entry(display.display_id.clone())
+                .or_default()
+                .push((sort_key, index));
+        }
+
+        for (base_id, mut entries) in groups {
+            if entries.len() <= 1 {
+                continue;
+            }
+
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (ordinal, (_, index)) in entries.into_iter().enumerate() {
+                if ordinal == 0 {
+                    displays[index].display_id = base_id.clone();
+                } else {
+                    displays[index].display_id = format!("{}-{}", base_id, ordinal + 1);
+                }
+            }
+        }
+    }
+
+    fn apply_display_settings_update(
+        display: &LocalDisplayInfo,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Result<DisplaySettingsUpdateResult> {
+        let Some(device_name) = display
+            .device_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "display does not expose a Windows GDI device name",
+            ));
+        };
+
+        let device_name_wide = wide_null(device_name);
+        let mut mode = devmode_with_size();
+        let ok = unsafe {
+            EnumDisplaySettingsW(device_name_wide.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode)
+        };
+        if ok == 0 {
+            return Ok(display_update_result(
+                DisplayOperationStatus::InvalidDisplay,
+                "Windows could not read the current display mode",
+            ));
+        }
+
+        let mut fields = 0u32;
+
+        if display_settings_update_has_mode_changes(request) {
+            if let Some(width) = request.width {
+                mode.pels_width = width;
+                fields |= DM_PELSWIDTH;
+            }
+            if let Some(height) = request.height {
+                mode.pels_height = height;
+                fields |= DM_PELSHEIGHT;
+            }
+            if let Some(refresh_rate_millihz) = request.refresh_rate_millihz {
+                mode.display_frequency = refresh_rate_millihz / 1_000;
+                fields |= DM_DISPLAYFREQUENCY;
+            }
+            if let Some(orientation) = request.orientation {
+                mode.fields_union.display.display_orientation =
+                    display_orientation_to_devmode(orientation);
+                fields |= DM_DISPLAYORIENTATION;
+            }
+
+            if let Some(mode_info) = supported_display_mode(display, request) {
+                if let Some(bits_per_pixel) = mode_info.bits_per_pixel {
+                    mode.bits_per_pel = bits_per_pixel;
+                    fields |= DM_BITSPERPEL;
+                }
+            }
+        }
+
+        if request.x.is_some() || request.y.is_some() || request.primary.is_some() {
+            return Ok(display_update_result(
+                DisplayOperationStatus::Unsupported,
+                "primary and position display writes are not supported until topology rebasing is implemented",
+            ));
+        }
+
+        mode.fields = fields;
+
+        let flags = CDS_UPDATEREGISTRY;
+
+        let test_code = unsafe {
+            ChangeDisplaySettingsExW(
+                device_name_wide.as_ptr(),
+                &mut mode,
+                0,
+                flags | CDS_TEST,
+                std::ptr::null_mut(),
+            )
+        };
+        if test_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                test_code,
+                "Windows rejected display update test",
+            ));
+        }
+
+        let apply_code = unsafe {
+            ChangeDisplaySettingsExW(
+                device_name_wide.as_ptr(),
+                &mut mode,
+                0,
+                flags | CDS_NORESET,
+                std::ptr::null_mut(),
+            )
+        };
+        if apply_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                apply_code,
+                "Windows display update failed",
+            ));
+        }
+
+        let commit_code = unsafe {
+            ChangeDisplaySettingsExW(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if commit_code != DISP_CHANGE_SUCCESSFUL {
+            return Ok(display_apply_result(
+                commit_code,
+                "Windows display update commit failed",
+            ));
+        }
+
+        Ok(display_update_result(
+            DisplayOperationStatus::Success,
+            "display settings updated",
+        ))
+    }
+
+    fn display_settings_update_has_changes(request: &DisplaySettingsUpdateRequest) -> bool {
+        display_settings_update_has_mode_changes(request)
+            || request.primary.is_some()
+            || request.x.is_some()
+            || request.y.is_some()
+            || request.scale_percent.is_some()
+    }
+
+    fn display_settings_update_has_mode_changes(request: &DisplaySettingsUpdateRequest) -> bool {
+        request.width.is_some()
+            || request.height.is_some()
+            || request.refresh_rate_millihz.is_some()
+            || request.orientation.is_some()
+    }
+
+    fn supported_display_mode<'a>(
+        display: &'a LocalDisplayInfo,
+        request: &DisplaySettingsUpdateRequest,
+    ) -> Option<&'a DisplayModeInfo> {
+        let width = request.width.unwrap_or(display.width);
+        let height = request.height.unwrap_or(display.height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let orientation = request.orientation.unwrap_or(display.orientation);
+        display.modes.iter().find(|mode| {
+            mode.width == width
+                && mode.height == height
+                && mode.orientation == orientation
+                && request
+                    .refresh_rate_millihz
+                    .map(|refresh| mode.refresh_rate_millihz == Some(refresh))
+                    .unwrap_or(true)
+        })
+    }
+
+    fn display_update_result(
+        status: DisplayOperationStatus,
+        message: impl Into<String>,
+    ) -> DisplaySettingsUpdateResult {
+        DisplaySettingsUpdateResult {
+            status,
+            message: Some(message.into()),
+        }
+    }
+
+    fn display_apply_result(code: i32, context: &str) -> DisplaySettingsUpdateResult {
+        let (status, detail) = match code {
+            DISP_CHANGE_SUCCESSFUL => (DisplayOperationStatus::Success, "successful"),
+            DISP_CHANGE_RESTART => (
+                DisplayOperationStatus::ApplyFailed,
+                "restart is required before the display change can take effect",
+            ),
+            DISP_CHANGE_BADMODE => (
+                DisplayOperationStatus::InvalidMode,
+                "the requested mode is not supported by Windows",
+            ),
+            DISP_CHANGE_BADPARAM => (
+                DisplayOperationStatus::InvalidDisplay,
+                "Windows rejected the display parameters",
+            ),
+            DISP_CHANGE_BADFLAGS => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows rejected the display change flags",
+            ),
+            DISP_CHANGE_NOTUPDATED => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows could not write the display settings",
+            ),
+            DISP_CHANGE_BADDUALVIEW => (
+                DisplayOperationStatus::Unsupported,
+                "Windows DualView configuration does not support this change",
+            ),
+            DISP_CHANGE_FAILED => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows failed to apply the display change",
+            ),
+            _ => (
+                DisplayOperationStatus::ApplyFailed,
+                "Windows returned an unknown display change status",
+            ),
+        };
+
+        display_update_result(status, format!("{context}: {detail} ({code})"))
+    }
+
+    fn display_capture_error(
+        status: DisplayOperationStatus,
+        display_id: &str,
+        message: impl Into<String>,
+    ) -> DisplayCaptureResult {
+        DisplayCaptureResult {
+            status,
+            display_id: display_id.to_string(),
+            mime_type: None,
+            width: None,
+            height: None,
+            bytes: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+
+    fn display_identify_result(
+        status: DisplayOperationStatus,
+        message: impl Into<String>,
+    ) -> DisplayIdentifyResult {
+        DisplayIdentifyResult {
+            status,
+            message: Some(message.into()),
+        }
+    }
+
+    fn identify_overlay_owner() -> &'static Mutex<IdentifyOverlayOwner> {
+        static OWNER: OnceLock<Mutex<IdentifyOverlayOwner>> = OnceLock::new();
+        OWNER.get_or_init(|| Mutex::new(IdentifyOverlayOwner::default()))
+    }
+
+    fn register_identify_overlay(cancel_sender: mpsc::Sender<()>) -> u64 {
+        let mut owner = identify_overlay_owner()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.replace_active(cancel_sender)
+    }
+
+    fn finish_identify_overlay(generation: u64) {
+        let mut owner = identify_overlay_owner()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.finish_generation(generation);
+    }
+
+    unsafe fn capture_display_bmp(
+        display: &LocalDisplayInfo,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<Vec<u8>> {
+        let source_width = i32_from_u32(display.width, "source display width")?;
+        let source_height = i32_from_u32(display.height, "source display height")?;
+        let target_width_i32 = i32_from_u32(target_width, "target capture width")?;
+        let target_height_i32 = i32_from_u32(target_height, "target capture height")?;
+        let bitmap_info = bitmap_info(target_width, target_height)?;
+
+        let screen_dc = WindowDc::acquire(0)?;
+        let memory_dc = MemoryDc::create(screen_dc.hdc)?;
+
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(memory_dc.hdc, &bitmap_info, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if bitmap == 0 || bits.is_null() {
+            anyhow::bail!(
+                "CreateDIBSection failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let _bitmap_guard = GdiObject(bitmap);
+
+        let previous_object = SelectObject(memory_dc.hdc, bitmap);
+        if previous_object == 0 {
+            anyhow::bail!("SelectObject failed: {}", std::io::Error::last_os_error());
+        }
+        let _selection_guard = SelectedGdiObject {
+            hdc: memory_dc.hdc,
+            previous_object,
+        };
+
+        let copied = if target_width == display.width && target_height == display.height {
+            BitBlt(
+                memory_dc.hdc,
+                0,
+                0,
+                target_width_i32,
+                target_height_i32,
+                screen_dc.hdc,
+                display.x,
+                display.y,
+                SRCCOPY,
+            )
+        } else {
+            SetStretchBltMode(memory_dc.hdc, HALFTONE);
+            StretchBlt(
+                memory_dc.hdc,
+                0,
+                0,
+                target_width_i32,
+                target_height_i32,
+                screen_dc.hdc,
+                display.x,
+                display.y,
+                source_width,
+                source_height,
+                SRCCOPY,
+            )
+        };
+
+        if copied == 0 {
+            anyhow::bail!(
+                "BitBlt/StretchBlt failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let pixel_len = bitmap_pixel_len(target_width, target_height)?;
+        let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), pixel_len);
+        encode_bmp(target_width, target_height, pixels)
+    }
+
+    unsafe fn create_identify_overlay_windows(displays: &[LocalDisplayInfo]) -> Result<Vec<isize>> {
+        let class_name = wide_null("STATIC");
+        let mut windows = Vec::with_capacity(displays.len());
+
+        for (index, display) in displays.iter().enumerate() {
+            let label = identify_display_label(index, display);
+            let label_wide = wide_null(&label);
+            let width = i32_from_u32(display.width, "identify overlay width")?;
+            let height = i32_from_u32(display.height, "identify overlay height")?;
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class_name.as_ptr(),
+                label_wide.as_ptr(),
+                WS_POPUP | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+                display.x,
+                display.y,
+                width,
+                height,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+            );
+
+            if hwnd == 0 {
+                for existing in windows {
+                    DestroyWindow(existing);
+                }
+                anyhow::bail!(
+                    "CreateWindowExW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            windows.push(hwnd);
+        }
+
+        Ok(windows)
+    }
+
+    fn identify_display_label(index: usize, display: &LocalDisplayInfo) -> String {
+        let name = display
+            .friendly_name
+            .as_deref()
+            .or(display.device_name.as_deref())
+            .unwrap_or(&display.display_id);
+        format!("Display {}\r\n{}", index + 1, name)
+    }
+
+    fn bitmap_info(width: u32, height: u32) -> Result<BitmapInfo> {
+        let width_i32 = i32_from_u32(width, "bitmap width")?;
+        let height_i32 = i32_from_u32(height, "bitmap height")?;
+        let size_image = u32::try_from(bitmap_pixel_len(width, height)?)
+            .context("bitmap pixel data is too large")?;
+
+        Ok(BitmapInfo {
+            header: BitmapInfoHeader {
+                size: size_of::<BitmapInfoHeader>() as u32,
+                width: width_i32,
+                height: -height_i32,
+                planes: 1,
+                bit_count: 32,
+                compression: BI_RGB,
+                size_image,
+                x_pels_per_meter: 0,
+                y_pels_per_meter: 0,
+                clr_used: 0,
+                clr_important: 0,
+            },
+            colors: [RgbQuad::default()],
+        })
+    }
+
+    fn encode_bmp(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>> {
+        let pixel_len = bitmap_pixel_len(width, height)?;
+        if pixels.len() != pixel_len {
+            anyhow::bail!(
+                "unexpected bitmap pixel length: got {}, expected {}",
+                pixels.len(),
+                pixel_len
+            );
+        }
+
+        let header_len = 14usize + size_of::<BitmapInfoHeader>();
+        let file_len = header_len
+            .checked_add(pixel_len)
+            .context("BMP file is too large")?;
+        let file_len_u32 = u32::try_from(file_len).context("BMP file is too large")?;
+        let pixel_offset = u32::try_from(header_len).context("BMP header is too large")?;
+        let width_i32 = i32_from_u32(width, "BMP width")?;
+        let height_i32 = i32_from_u32(height, "BMP height")?;
+        let size_image = u32::try_from(pixel_len).context("BMP pixel data is too large")?;
+
+        let mut bytes = Vec::with_capacity(file_len);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&file_len_u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&pixel_offset.to_le_bytes());
+        bytes.extend_from_slice(&(size_of::<BitmapInfoHeader>() as u32).to_le_bytes());
+        bytes.extend_from_slice(&width_i32.to_le_bytes());
+        bytes.extend_from_slice(&(-height_i32).to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&BI_RGB.to_le_bytes());
+        bytes.extend_from_slice(&size_image.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(pixels);
+
+        Ok(bytes)
+    }
+
+    fn bitmap_pixel_len(width: u32, height: u32) -> Result<usize> {
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("bitmap dimensions are too large")?;
+        usize::try_from(pixels).context("bitmap dimensions are too large")
+    }
+
+    fn i32_from_u32(value: u32, context: &str) -> Result<i32> {
+        i32::try_from(value).with_context(|| format!("{context} exceeds i32 range"))
+    }
+
+    struct WindowDc {
+        hwnd: isize,
+        hdc: isize,
+    }
+
+    impl WindowDc {
+        unsafe fn acquire(hwnd: isize) -> Result<Self> {
+            let hdc = GetDC(hwnd);
+            if hdc == 0 {
+                anyhow::bail!("GetDC failed: {}", std::io::Error::last_os_error());
+            }
+
+            Ok(Self { hwnd, hdc })
+        }
+    }
+
+    impl Drop for WindowDc {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseDC(self.hwnd, self.hdc);
+            }
+        }
+    }
+
+    struct MemoryDc {
+        hdc: isize,
+    }
+
+    impl MemoryDc {
+        unsafe fn create(source_hdc: isize) -> Result<Self> {
+            let hdc = CreateCompatibleDC(source_hdc);
+            if hdc == 0 {
+                anyhow::bail!(
+                    "CreateCompatibleDC failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            Ok(Self { hdc })
+        }
+    }
+
+    impl Drop for MemoryDc {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteDC(self.hdc);
+            }
+        }
+    }
+
+    struct GdiObject(isize);
+
+    impl Drop for GdiObject {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteObject(self.0);
+            }
+        }
+    }
+
+    struct SelectedGdiObject {
+        hdc: isize,
+        previous_object: isize,
+    }
+
+    impl Drop for SelectedGdiObject {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.hdc, self.previous_object);
+            }
+        }
+    }
+
+    fn enumerate_monitor_snapshots() -> Result<Vec<MonitorSnapshot>> {
+        unsafe extern "system" fn collect_monitor(
+            monitor: isize,
+            _hdc: isize,
+            _rect: *mut Rect,
+            data: isize,
+        ) -> i32 {
+            let monitors = &mut *(data as *mut Vec<MonitorSnapshot>);
+            let mut info = MonitorInfoEx::default();
+
+            if GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfoEx).cast()) == 0 {
+                return 1;
+            }
+
+            if rect_width(info.rc_monitor) == 0 || rect_height(info.rc_monitor) == 0 {
+                return 1;
+            }
+
+            monitors.push(MonitorSnapshot {
+                handle: monitor,
+                rect: info.rc_monitor,
+                work: info.rc_work,
+                primary: info.flags & MONITORINFOF_PRIMARY != 0,
+                device_name: fixed_wide_to_string(&info.device),
+            });
+            1
+        }
+
+        let mut monitors = Vec::new();
+        let ok = unsafe {
+            EnumDisplayMonitors(
+                0,
+                std::ptr::null(),
+                Some(collect_monitor),
+                &mut monitors as *mut _ as isize,
+            )
+        };
+        if ok == 0 {
+            anyhow::bail!(
+                "EnumDisplayMonitors failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok(monitors)
+    }
+
+    fn enumerate_display_devices() -> BTreeMap<String, DisplayDeviceSnapshot> {
+        let mut devices = BTreeMap::new();
+        let mut index = 0u32;
+
+        loop {
+            let mut adapter = DisplayDeviceW::default();
+            let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut adapter, 0) };
+            if ok == 0 {
+                break;
+            }
+            index = index.saturating_add(1);
+
+            let Some(device_name) = fixed_wide_to_string(&adapter.device_name) else {
+                continue;
+            };
+            let monitor = display_monitor_device(&adapter.device_name);
+            let friendly_name = monitor
+                .as_ref()
+                .and_then(|monitor| fixed_wide_to_string(&monitor.device_string))
+                .or_else(|| fixed_wide_to_string(&adapter.device_string));
+            let target_id = monitor
+                .as_ref()
+                .and_then(|monitor| fixed_wide_to_string(&monitor.device_id));
+
+            devices.insert(
+                device_name.clone(),
+                DisplayDeviceSnapshot {
+                    adapter_id: fixed_wide_to_string(&adapter.device_id),
+                    target_id,
+                    friendly_name,
+                    active: adapter.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0,
+                    primary: adapter.state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0,
+                },
+            );
+        }
+
+        devices
+    }
+
+    fn display_monitor_device(adapter_name: &[u16; CCHDEVICENAME]) -> Option<DisplayDeviceW> {
+        let mut index = 0u32;
+
+        loop {
+            let mut monitor = DisplayDeviceW::default();
+            let ok = unsafe { EnumDisplayDevicesW(adapter_name.as_ptr(), index, &mut monitor, 0) };
+            if ok == 0 {
+                return None;
+            }
+            index = index.saturating_add(1);
+
+            if monitor.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0 {
+                return Some(monitor);
+            }
+        }
+    }
+
+    fn current_display_mode(device_name: &str) -> Option<CurrentDisplayMode> {
+        let mut mode = devmode_with_size();
+        let device_name = wide_null(device_name);
+        let ok =
+            unsafe { EnumDisplaySettingsW(device_name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) };
+        if ok == 0 {
+            None
+        } else {
+            Some(current_display_mode_from_devmode(&mode))
+        }
+    }
+
+    fn display_modes(device_name: &str) -> Vec<DisplayModeInfo> {
+        let device_name = wide_null(device_name);
+        let mut modes = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut index = 0u32;
+
+        loop {
+            let mut mode = devmode_with_size();
+            let ok = unsafe { EnumDisplaySettingsW(device_name.as_ptr(), index, &mut mode) };
+            if ok == 0 {
+                break;
+            }
+            index = index.saturating_add(1);
+
+            let mode = display_mode_from_devmode(&mode);
+            let key = (
+                mode.width,
+                mode.height,
+                mode.refresh_rate_millihz,
+                orientation_rank(mode.orientation),
+                mode.bits_per_pixel,
+            );
+            if seen.insert(key) {
+                modes.push(mode);
+            }
+        }
+
+        modes.sort_by_key(|mode| {
+            (
+                mode.width,
+                mode.height,
+                mode.refresh_rate_millihz.unwrap_or(0),
+                mode.bits_per_pixel.unwrap_or(0),
+                orientation_rank(mode.orientation),
+            )
+        });
+        modes
+    }
+
+    fn display_mode_from_devmode(mode: &DevModeW) -> DisplayModeInfo {
+        let display = unsafe { mode.fields_union.display };
+        DisplayModeInfo {
+            width: mode.pels_width,
+            height: mode.pels_height,
+            refresh_rate_millihz: refresh_rate_to_millihz(mode.display_frequency),
+            orientation: display_orientation_from_devmode(display.display_orientation),
+            bits_per_pixel: if mode.bits_per_pel == 0 {
+                None
+            } else {
+                Some(mode.bits_per_pel)
+            },
+        }
+    }
+
+    fn current_display_mode_from_devmode(mode: &DevModeW) -> CurrentDisplayMode {
+        let display = unsafe { mode.fields_union.display };
+        CurrentDisplayMode {
+            x: display.position.x,
+            y: display.position.y,
+            mode: display_mode_from_devmode(mode),
+        }
+    }
+
+    fn display_geometry_from_monitor_and_mode(
+        monitor_rect: Rect,
+        mode: Option<&CurrentDisplayMode>,
+    ) -> (i32, i32, u32, u32) {
+        if let Some(mode) = mode {
+            if mode.mode.width > 0 && mode.mode.height > 0 {
+                return (mode.x, mode.y, mode.mode.width, mode.mode.height);
+            }
+        }
+
+        (
+            monitor_rect.left,
+            monitor_rect.top,
+            rect_width(monitor_rect),
+            rect_height(monitor_rect),
+        )
+    }
+
+    fn monitor_dpi_state(
+        monitor: isize,
+    ) -> (
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    ) {
+        const MDT_EFFECTIVE_DPI: i32 = 0;
+        const MDT_RAW_DPI: i32 = 2;
+
+        let (dpi_x, dpi_y) = dpi_for_monitor(monitor, MDT_EFFECTIVE_DPI);
+        let (raw_dpi_x, raw_dpi_y) = dpi_for_monitor(monitor, MDT_RAW_DPI);
+        let scale_percent = dpi_x.map(|dpi| dpi.saturating_mul(100).saturating_add(48) / 96);
+
+        (dpi_x, dpi_y, raw_dpi_x, raw_dpi_y, scale_percent)
+    }
+
+    fn dpi_for_monitor(monitor: isize, dpi_type: i32) -> (Option<u32>, Option<u32>) {
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        let hr = unsafe { GetDpiForMonitor(monitor, dpi_type, &mut dpi_x, &mut dpi_y) };
+        if hr < 0 || dpi_x == 0 || dpi_y == 0 {
+            (None, None)
+        } else {
+            (Some(dpi_x), Some(dpi_y))
+        }
+    }
+
+    fn rect_width(rect: Rect) -> u32 {
+        rect.right.saturating_sub(rect.left).max(0) as u32
+    }
+
+    fn rect_height(rect: Rect) -> u32 {
+        rect.bottom.saturating_sub(rect.top).max(0) as u32
+    }
+
+    fn orientation_rank(orientation: DisplayOrientation) -> u8 {
+        match orientation {
+            DisplayOrientation::Landscape => 0,
+            DisplayOrientation::Portrait => 1,
+            DisplayOrientation::LandscapeFlipped => 2,
+            DisplayOrientation::PortraitFlipped => 3,
+        }
+    }
+
     /// Get all screen information (multi-monitor support)
     pub fn get_all_screens() -> Vec<ScreenInfo> {
         unsafe extern "system" fn collect_monitor(
@@ -1993,7 +3771,7 @@ mod windows_impl {
                 flags: 0,
             };
 
-            if GetMonitorInfoW(monitor, &mut info) == 0 {
+            if GetMonitorInfoW(monitor, (&mut info as *mut MonitorInfo).cast()) == 0 {
                 return 1;
             }
 
@@ -2055,7 +3833,7 @@ mod windows_impl {
 
     /// Get DPI scaling factor for the primary monitor
     pub fn get_dpi_scaling() -> f64 {
-        extern "C" {
+        extern "system" {
             fn GetDC(hwnd: isize) -> isize;
             fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
             fn GetDeviceCaps(hdc: isize, nIndex: i32) -> i32;
@@ -2134,7 +3912,456 @@ mod windows_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use rshare_core::{
+            DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
+        };
         use std::mem::{align_of, offset_of, size_of};
+
+        #[test]
+        fn display_update_with_only_scale_requires_system_settings() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                scale_percent: Some(150),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(
+                result.status,
+                DisplayOperationStatus::RequiresSystemSettings
+            );
+            assert!(result.message.unwrap().contains("system display settings"));
+        }
+
+        #[test]
+        fn display_update_with_scale_and_mode_requires_system_settings() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1024),
+                height: Some(768),
+                scale_percent: Some(150),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(
+                result.status,
+                DisplayOperationStatus::RequiresSystemSettings
+            );
+        }
+
+        #[test]
+        fn display_update_rejects_unsupported_mode_before_apply() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1024),
+                height: Some(768),
+                refresh_rate_millihz: Some(75_000),
+                orientation: Some(DisplayOrientation::Landscape),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidMode);
+        }
+
+        #[test]
+        fn display_update_rejects_primary_write_as_unsupported() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                primary: Some(true),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Unsupported);
+            assert!(result.message.unwrap().contains("primary"));
+        }
+
+        #[test]
+        fn display_update_rejects_position_write_as_unsupported() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                x: Some(0),
+                y: Some(0),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Unsupported);
+            assert!(result.message.unwrap().contains("position"));
+        }
+
+        #[test]
+        fn display_update_rejects_orientation_without_explicit_dimensions() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                orientation: Some(DisplayOrientation::Portrait),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidMode);
+            assert!(result.message.unwrap().contains("width and height"));
+        }
+
+        #[test]
+        fn display_update_accepts_supported_mode() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(2560),
+                height: Some(1440),
+                refresh_rate_millihz: Some(144_000),
+                orientation: Some(DisplayOrientation::Landscape),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_accepts_orientation_with_explicit_supported_dimensions() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                width: Some(1080),
+                height: Some(1920),
+                orientation: Some(DisplayOrientation::Portrait),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_noop_is_accepted() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "display-1".to_string(),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::Success);
+        }
+
+        #[test]
+        fn display_update_unknown_display_is_invalid() {
+            let state = display_update_test_state();
+            let request = DisplaySettingsUpdateRequest {
+                display_id: "missing-display".to_string(),
+                width: Some(1920),
+                height: Some(1080),
+                ..display_update_request()
+            };
+
+            let result = validate_display_settings_update(&state, &request);
+
+            assert_eq!(result.status, DisplayOperationStatus::InvalidDisplay);
+        }
+
+        #[test]
+        fn duplicate_display_ids_are_disambiguated_by_device_name() {
+            let mut displays = vec![
+                LocalDisplayInfo {
+                    display_id: "windows-display-same".to_string(),
+                    device_name: Some(r"\\.\DISPLAY2".to_string()),
+                    ..LocalDisplayInfo::default()
+                },
+                LocalDisplayInfo {
+                    display_id: "windows-display-same".to_string(),
+                    device_name: Some(r"\\.\DISPLAY1".to_string()),
+                    ..LocalDisplayInfo::default()
+                },
+            ];
+
+            disambiguate_duplicate_display_ids(&mut displays);
+
+            assert_eq!(displays[0].display_id, "windows-display-same-2");
+            assert_eq!(displays[1].display_id, "windows-display-same");
+        }
+
+        #[test]
+        fn gdi_display_number_is_parsed_from_device_name() {
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY12"), Some(12));
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY3"), Some(3));
+            assert_eq!(gdi_display_number("DISPLAY7"), Some(7));
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY"), None);
+            assert_eq!(gdi_display_number(r"\\.\OTHER1"), None);
+        }
+
+        #[test]
+        fn edid_descriptor_extracts_monitor_name() {
+            let mut edid = [0u8; 128];
+            let descriptor = 54;
+            edid[descriptor] = 0x00;
+            edid[descriptor + 1] = 0x00;
+            edid[descriptor + 2] = 0x00;
+            edid[descriptor + 3] = 0xfc;
+            edid[descriptor + 4] = 0x00;
+            edid[descriptor + 5..descriptor + 18].copy_from_slice(b"Studio 27Q  \n");
+
+            assert_eq!(monitor_name_from_edid(&edid).as_deref(), Some("Studio 27Q"));
+        }
+
+        #[test]
+        fn target_id_extracts_monitor_hardware_id() {
+            assert_eq!(
+                monitor_hardware_id_from_target_id(
+                    r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"
+                )
+                .as_deref(),
+                Some("DEL4098")
+            );
+            assert_eq!(
+                monitor_hardware_id_from_target_id(r"MONITOR\STD2700\foo").as_deref(),
+                Some("STD2700")
+            );
+            assert_eq!(monitor_hardware_id_from_target_id("bad-target"), None);
+        }
+
+        #[test]
+        fn display_friendly_name_prefers_edid_over_generic_pnp_name() {
+            assert_eq!(
+                display_friendly_name(
+                    r"\\.\DISPLAY2",
+                    Some("Generic PnP Monitor"),
+                    Some("STD2700"),
+                    Some("Studio Display 27")
+                )
+                .as_deref(),
+                Some("Studio Display 27 (DISPLAY2)")
+            );
+        }
+
+        #[test]
+        fn display_friendly_name_uses_hardware_id_when_name_is_generic() {
+            assert_eq!(
+                display_friendly_name(
+                    r"\\.\DISPLAY3",
+                    Some("Generic PnP Monitor"),
+                    Some("INN3200"),
+                    None
+                )
+                .as_deref(),
+                Some("INN3200 (DISPLAY3)")
+            );
+        }
+
+        #[test]
+        fn identify_overlay_owner_ignores_stale_finish() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            let first = owner.next_generation();
+            let second = owner.next_generation();
+
+            owner.finish_generation(first);
+
+            assert_eq!(owner.active_generation(), Some(second));
+        }
+
+        #[test]
+        fn identify_overlay_owner_clears_current_finish() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            let generation = owner.next_generation();
+
+            owner.finish_generation(generation);
+
+            assert_eq!(owner.active_generation(), None);
+        }
+
+        #[test]
+        fn identify_overlay_owner_cancel_active_clears_generation() {
+            let mut owner = IdentifyOverlayOwnerState::default();
+            owner.next_generation();
+
+            owner.cancel_active();
+
+            assert_eq!(owner.active_generation(), None);
+        }
+
+        #[test]
+        fn dpi_awareness_process_attempt_is_claimed_once() {
+            let attempted = AtomicBool::new(false);
+
+            assert!(claim_process_dpi_awareness_attempt(&attempted));
+            assert!(!claim_process_dpi_awareness_attempt(&attempted));
+        }
+
+        fn display_update_test_state() -> LocalDisplayState {
+            LocalDisplayState {
+                display_count: 1,
+                displays: vec![LocalDisplayInfo {
+                    display_id: "display-1".to_string(),
+                    device_name: Some(r"\\.\DISPLAY1".to_string()),
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate_millihz: Some(60_000),
+                    orientation: DisplayOrientation::Landscape,
+                    active: true,
+                    modes: vec![
+                        DisplayModeInfo {
+                            width: 1920,
+                            height: 1080,
+                            refresh_rate_millihz: Some(60_000),
+                            orientation: DisplayOrientation::Landscape,
+                            bits_per_pixel: Some(32),
+                        },
+                        DisplayModeInfo {
+                            width: 1080,
+                            height: 1920,
+                            refresh_rate_millihz: Some(60_000),
+                            orientation: DisplayOrientation::Portrait,
+                            bits_per_pixel: Some(32),
+                        },
+                        DisplayModeInfo {
+                            width: 2560,
+                            height: 1440,
+                            refresh_rate_millihz: Some(144_000),
+                            orientation: DisplayOrientation::Landscape,
+                            bits_per_pixel: Some(32),
+                        },
+                    ],
+                    ..LocalDisplayInfo::default()
+                }],
+                ..LocalDisplayState::default()
+            }
+        }
+
+        fn display_update_request() -> DisplaySettingsUpdateRequest {
+            DisplaySettingsUpdateRequest {
+                display_id: String::new(),
+                width: None,
+                height: None,
+                refresh_rate_millihz: None,
+                orientation: None,
+                primary: None,
+                x: None,
+                y: None,
+                scale_percent: None,
+            }
+        }
+
+        #[test]
+        fn windows_orientation_mapping_is_stable() {
+            assert_eq!(
+                display_orientation_from_devmode(0),
+                DisplayOrientation::Landscape
+            );
+            assert_eq!(
+                display_orientation_from_devmode(1),
+                DisplayOrientation::Portrait
+            );
+            assert_eq!(
+                display_orientation_from_devmode(2),
+                DisplayOrientation::LandscapeFlipped
+            );
+            assert_eq!(
+                display_orientation_from_devmode(3),
+                DisplayOrientation::PortraitFlipped
+            );
+        }
+
+        #[test]
+        fn refresh_rate_converts_to_millihz() {
+            assert_eq!(refresh_rate_to_millihz(60), Some(60_000));
+            assert_eq!(refresh_rate_to_millihz(0), None);
+        }
+
+        #[test]
+        fn display_geometry_prefers_devmode_physical_geometry() {
+            let monitor_rect = Rect {
+                left: 0,
+                top: 0,
+                right: 1536,
+                bottom: 864,
+            };
+            let mode = CurrentDisplayMode {
+                x: -1920,
+                y: 0,
+                mode: DisplayModeInfo {
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate_millihz: Some(60_000),
+                    orientation: DisplayOrientation::Landscape,
+                    bits_per_pixel: Some(32),
+                },
+            };
+
+            assert_eq!(
+                display_geometry_from_monitor_and_mode(monitor_rect, Some(&mode)),
+                (-1920, 0, 1920, 1080)
+            );
+            assert_eq!(
+                display_geometry_from_monitor_and_mode(monitor_rect, None),
+                (0, 0, 1536, 864)
+            );
+        }
+
+        #[test]
+        fn stable_display_id_is_deterministic_and_not_raw_gdi_name() {
+            let first = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+            let second = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+
+            assert_eq!(first, second);
+            assert_ne!(first, r"\\.\DISPLAY1");
+            assert!(first.starts_with("windows-display-"));
+        }
+
+        #[test]
+        fn stable_display_id_ignores_gdi_name_when_better_identity_exists() {
+            let first = stable_display_id(
+                r"\\.\DISPLAY1",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+            let second = stable_display_id(
+                r"\\.\DISPLAY2",
+                Some(r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"),
+                Some("Dell U2720Q"),
+                Some(r"PCI\VEN_10DE&DEV_2684&SUBSYS_409B1458"),
+            );
+
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        fn stable_display_id_falls_back_to_gdi_name() {
+            let first = stable_display_id(r"\\.\DISPLAY1", None, None, None);
+            let second = stable_display_id(r"\\.\DISPLAY2", None, None, None);
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("windows-display-"));
+            assert!(second.starts_with("windows-display-"));
+        }
 
         #[test]
         fn send_input_layout_matches_windows_64bit_abi() {

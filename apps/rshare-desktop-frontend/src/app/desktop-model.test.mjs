@@ -8,6 +8,8 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildEndpointInjectSummary,
+  buildDisplaySettingsViewModel,
+  buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
   buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
@@ -85,6 +87,72 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
   assert.deepEqual(overview.devices, []);
 });
 
+test("buildDisplaySettingsViewModel exposes Windows-style display settings", () => {
+  const view = buildDisplaySettingsViewModel(
+    {
+      display: {
+        display_count: 2,
+        virtual_x: -1920,
+        virtual_y: 0,
+        primary_width: 2560,
+        primary_height: 1440,
+        displays: [
+          {
+            display_id: "left",
+            friendly_name: "C32SQ-PLUS (DISPLAY3)",
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: false,
+            scale_percent: 125,
+            refresh_rate_millihz: 60_000,
+            raw_dpi_x: 92,
+            raw_dpi_y: 92,
+            modes: [
+              { width: 1920, height: 1080, refresh_rate_millihz: 60_000 },
+              { width: 1920, height: 1080, refresh_rate_millihz: 144_000 },
+              { width: 1280, height: 720, refresh_rate_millihz: 60_000 },
+            ],
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+          },
+          {
+            display_id: "primary",
+            friendly_name: "GZB0 (DISPLAY1)",
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            primary: true,
+            scale_percent: 150,
+            refresh_rate_millihz: 144_000,
+            modes: [{ width: 2560, height: 1440, refresh_rate_millihz: 144_000 }],
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+          },
+        ],
+      },
+    },
+    "left",
+  );
+
+  assert.equal(view.selectedDisplay.id, "left");
+  assert.equal(view.selectedDisplay.title, "显示器 1");
+  assert.equal(view.selectedDisplay.name, "C32SQ-PLUS (DISPLAY3)");
+  assert.equal(view.selectedDisplay.resolutionLabel, "1920 × 1080");
+  assert.equal(view.selectedDisplay.refreshRateLabel, "60 Hz");
+  assert.equal(view.selectedDisplay.scaleLabel, "125%");
+  assert.deepEqual(view.bounds, { minX: -1920, minY: 0, maxX: 2560, maxY: 1440, width: 4480, height: 1440 });
+  assert.deepEqual(
+    view.selectedDisplay.resolutionOptions.map((option) => option.label),
+    ["1920 × 1080", "1280 × 720"],
+  );
+  assert.deepEqual(
+    view.selectedDisplay.refreshRateOptions.map((option) => option.label),
+    ["60 Hz", "144 Hz"],
+  );
+  assert.equal(view.selectedDisplay.writeCapabilities.scale, false);
+});
+
 test("buildDesktopViewModel exposes daemon latency feedback when present", () => {
   const latencyFeedback = {
     status: "Degraded",
@@ -113,6 +181,123 @@ test("buildDesktopViewModel exposes daemon latency feedback when present", () =>
   });
 
   assert.equal(model.latencyFeedback, latencyFeedback);
+});
+
+test("buildLocalLatencyFeedbackRows maps daemon keyboard mouse and gamepad feedback", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 7,
+      latest_sequence: 12,
+      latest_keyboard_event_ms: 1000,
+      latest_mouse_event_ms: 1100,
+      latest_gamepad_event_ms: 1200,
+      latest_gamepad_id: 0,
+      latest_gamepad_event_kind: "state",
+      latest_gamepad_button: "South pressed",
+      latest_gamepad_axis: "left_stick",
+    },
+    transport: {
+      status: "Healthy",
+      transport: "quic",
+      datagram_available: true,
+      realtime_degraded: false,
+      rtt_ms: 12,
+    },
+  });
+
+  assert.deepEqual(
+    rows.map((row) => row.key),
+    ["keyboard", "mouse", "gamepad", "transport"],
+  );
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "pass");
+  assert.match(rows.find((row) => row.key === "gamepad").detail, /South pressed/);
+  assert.match(rows.find((row) => row.key === "transport").detail, /12 ms RTT/);
+  assert.match(rows.find((row) => row.key === "keyboard").detail, /event @ 1000 ms/);
+});
+
+test("buildLocalLatencyFeedbackRows marks missing gamepad as idle without breaking input status", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Idle",
+      event_count: 0,
+    },
+    transport: {
+      status: "Unavailable",
+      transport: "quic",
+      datagram_available: false,
+      realtime_degraded: true,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "idle");
+  assert.match(rows.find((row) => row.key === "gamepad").detail, /waiting/i);
+});
+
+test("buildLocalLatencyFeedbackRows keeps keyboard idle for mouse-only aggregate health", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 3,
+      latest_mouse_event_ms: 2100,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "idle");
+  assert.match(rows.find((row) => row.key === "keyboard").detail, /waiting for keyboard/);
+  assert.equal(rows.find((row) => row.key === "mouse").state, "pass");
+  assert.match(rows.find((row) => row.key === "mouse").detail, /event @ 2100 ms/);
+});
+
+test("buildLocalLatencyFeedbackRows keeps mouse idle for keyboard-only aggregate warning", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Degraded",
+      event_count: 4,
+      latest_keyboard_event_ms: 2200,
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "warn");
+  assert.equal(rows.find((row) => row.key === "mouse").state, "idle");
+  assert.match(rows.find((row) => row.key === "mouse").detail, /waiting for mouse/);
+});
+
+test("buildLocalLatencyFeedbackRows ignores invalid RTT and timestamps", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Healthy",
+      event_count: 5,
+      latest_keyboard_event_ms: "not-a-timestamp",
+      latest_gamepad_event_ms: "not-a-timestamp",
+      latest_gamepad_button: "South pressed",
+    },
+    transport: {
+      status: "Healthy",
+      transport: "quic",
+      datagram_available: true,
+      rtt_ms: "not-a-number",
+    },
+  });
+
+  assert.equal(rows.find((row) => row.key === "keyboard").state, "idle");
+  assert.equal(rows.find((row) => row.key === "gamepad").state, "idle");
+  assert.doesNotMatch(rows.find((row) => row.key === "transport").detail, /NaN/);
+  assert.doesNotMatch(rows.find((row) => row.key === "transport").detail, /RTT/);
+});
+
+test("buildLocalLatencyFeedbackRows treats missing transport as unavailable", () => {
+  const rows = buildLocalLatencyFeedbackRows({
+    local_input: {
+      status: "Idle",
+      event_count: 0,
+    },
+  });
+
+  const transport = rows.find((row) => row.key === "transport");
+  assert.equal(transport.state, "block");
+  assert.equal(transport.metric, "Unavailable");
+  assert.match(transport.detail, /unavailable/i);
 });
 
 test("buildLocalControlsViewModel maps keyboard mouse gamepad and display panels", () => {
@@ -1353,6 +1538,167 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
   assert.equal(model.layout.monitors[1].resWidth, 1024);
   assert.equal(model.layout.monitors[1].x, 233.6);
   assert.equal(model.layout.remembered.nodes.length, 3);
+});
+
+test("buildDesktopViewModel labels local visible displays from local controls names", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "left", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "right", x: 2560, y: 0, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 2,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 4720,
+        layout_height: 3840,
+        displays: [
+          { display_id: "left", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+          { display_id: "right", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2385, width: 2160, height: 3840, primary: false },
+        ],
+      },
+    },
+  );
+
+  assert.equal(model.layout.monitors[0].name, "C32SQ-PLUS (DISPLAY3)");
+  assert.equal(model.layout.monitors[1].name, "GX217UR (DISPLAY2)");
+});
+
+test("buildDesktopViewModel draws local displays from physical DPI while preserving bottom alignment", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "portrait", x: 2560, y: -2400, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 2,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 4720,
+        layout_height: 3840,
+        displays: [
+          { display_id: "primary", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, raw_dpi_x: 93, raw_dpi_y: 93, primary: true },
+          { display_id: "portrait", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2400, width: 2160, height: 3840, raw_dpi_x: 163, raw_dpi_y: 163, primary: false },
+        ],
+      },
+    },
+  );
+
+  const primary = model.layout.monitors.find((monitor) => monitor.displayId === "primary");
+  const portrait = model.layout.monitors.find((monitor) => monitor.displayId === "portrait");
+
+  assert.equal(primary.w, 307);
+  assert.equal(primary.h, 173);
+  assert.equal(portrait.w, 148);
+  assert.equal(portrait.h, 263);
+  assert.equal(Math.round(portrait.y + portrait.h), Math.round(primary.y + primary.h));
+});
+
+test("buildDesktopViewModel keeps physical local display adjacency from Windows coordinates", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "left", x: -1920, y: 0, width: 1920, height: 1080, primary: false },
+              { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "portrait", x: 2560, y: -4800, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 3,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 6640,
+        layout_height: 3840,
+        displays: [
+          { display_id: "left", friendly_name: "GZB0 (DISPLAY1)", x: -2560, y: 0, width: 2560, height: 1440, raw_dpi_x: null, raw_dpi_y: null, primary: false },
+          { display_id: "primary", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, raw_dpi_x: 93, raw_dpi_y: 93, primary: true },
+          { display_id: "portrait", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2415, width: 2160, height: 3840, raw_dpi_x: 163, raw_dpi_y: 163, primary: false },
+        ],
+      },
+    },
+  );
+
+  const left = model.layout.monitors.find((monitor) => monitor.displayId === "left");
+  const primary = model.layout.monitors.find((monitor) => monitor.displayId === "primary");
+  const portrait = model.layout.monitors.find((monitor) => monitor.displayId === "portrait");
+
+  assert.equal(Math.round(left.x + left.w), Math.round(primary.x));
+  assert.equal(Math.round(primary.x + primary.w), Math.round(portrait.x));
+  assert.equal(Math.round(left.y + left.h), Math.round(primary.y + primary.h));
+  assert.equal(Math.round(portrait.y + portrait.h), Math.round(primary.y + primary.h));
 });
 
 test("buildDesktopViewModel snaps visible layout monitor groups before rendering", () => {

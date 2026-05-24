@@ -13,19 +13,21 @@ use rshare_core::{
     remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
     BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
     CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction, DisplayNode,
-    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
-    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LayoutGraph, LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus,
-    LocalAudioTestResult, LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo,
-    LocalDisplayState, LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, LocalInputTestStatus, Message, NetworkTransportSnapshot,
-    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode,
-    ScreenInfo, ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor,
-    UsbDeviceSpeed, UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
+    DisplayCaptureResult, DisplayIdentifyResult, DisplayNode, DisplayOperationStatus,
+    DisplaySettingsUpdateResult, EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent,
+    EndpointEventFilter, EndpointEventStore, EndpointInjectError, EndpointInjectRequest,
+    EndpointInjectResult, EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot,
+    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
+    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -465,7 +467,8 @@ impl DaemonState {
             .local_controls
             .keyboard
             .event_count
-            .saturating_add(self.local_controls.mouse.event_count);
+            .saturating_add(self.local_controls.mouse.event_count)
+            .saturating_add(local_gamepad_event_count(&self.local_controls));
 
         if self.backend_state.selected_mode.is_none() {
             return LocalInputFeedback {
@@ -499,6 +502,15 @@ impl DaemonState {
                     && event.device_kind == LocalInputDeviceKind::Mouse
             })
             .max_by_key(|event| (event.timestamp_ms, event.sequence));
+        let latest_gamepad = self
+            .local_controls
+            .recent_events
+            .iter()
+            .filter(|event| {
+                is_eligible_local_input_feedback_event(event)
+                    && event.device_kind == LocalInputDeviceKind::Gamepad
+            })
+            .max_by_key(|event| (event.timestamp_ms, event.sequence));
 
         LocalInputFeedback {
             status: if matches!(
@@ -516,6 +528,22 @@ impl DaemonState {
             latest_event_ms: latest_event.map(|event| event.timestamp_ms),
             latest_keyboard_event_ms: latest_keyboard.map(|event| event.timestamp_ms),
             latest_mouse_event_ms: latest_mouse.map(|event| event.timestamp_ms),
+            latest_gamepad_event_ms: latest_gamepad.map(|event| event.timestamp_ms),
+            latest_gamepad_id: latest_gamepad
+                .and_then(|event| event.payload.get("gamepad_id"))
+                .and_then(|value| value.parse::<u8>().ok()),
+            latest_gamepad_event_kind: latest_gamepad.map(|event| event.event_kind.clone()),
+            latest_gamepad_button: latest_gamepad
+                .and_then(|event| {
+                    event
+                        .payload
+                        .get("last_button")
+                        .or_else(|| event.payload.get("button"))
+                })
+                .cloned(),
+            latest_gamepad_axis: latest_gamepad
+                .and_then(|event| event.payload.get("last_axis"))
+                .cloned(),
             capture_path: latest_event.and_then(|event| event.capture_path.clone()),
         }
     }
@@ -969,10 +997,18 @@ impl DaemonState {
     }
 }
 
+fn local_gamepad_event_count(snapshot: &LocalControlDeviceSnapshot) -> u64 {
+    snapshot.gamepads.iter().fold(0_u64, |sum, gamepad| {
+        sum.saturating_add(gamepad.event_count)
+    })
+}
+
 fn is_eligible_local_input_feedback_event(event: &LocalInputDiagnosticEvent) -> bool {
     matches!(
         event.device_kind,
-        LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse
+        LocalInputDeviceKind::Keyboard
+            | LocalInputDeviceKind::Mouse
+            | LocalInputDeviceKind::Gamepad
     ) && !event.payload.contains_key("remote_device_id")
         && !event.payload.contains_key("origin_event_device_id")
         && event.capture_path.as_deref() != Some("remote-daemon")
@@ -1000,9 +1036,23 @@ fn refresh_platform_local_controls(
 ) {
     #[cfg(windows)]
     {
-        let screens = rshare_platform::windows::get_all_screens();
-        if !screens.is_empty() {
-            snapshot.display = display_state_from_windows_screens(&screens);
+        match rshare_platform::display::query_display_state() {
+            Ok(display) if !display.displays.is_empty() => {
+                snapshot.display = display;
+            }
+            Ok(_) => {
+                let screens = rshare_platform::windows::get_all_screens();
+                if !screens.is_empty() {
+                    snapshot.display = display_state_from_windows_screens(&screens);
+                }
+            }
+            Err(error) => {
+                let screens = rshare_platform::windows::get_all_screens();
+                if !screens.is_empty() {
+                    snapshot.display = display_state_from_windows_screens(&screens);
+                }
+                snapshot.last_error = Some(format!("Display enumeration failed: {error}"));
+            }
         }
         snapshot.driver = rshare_platform::windows::probe_rshare_driver();
         if snapshot.driver.status == "available" {
@@ -1079,6 +1129,8 @@ fn fallback_display_state(width: u32, height: u32) -> LocalDisplayState {
             width,
             height,
             primary: true,
+            active: true,
+            ..LocalDisplayInfo::default()
         }],
     }
 }
@@ -1129,6 +1181,8 @@ fn display_state_from_windows_screens(
                 width: screen.width,
                 height: screen.height,
                 primary: screen.x == 0 && screen.y == 0,
+                active: true,
+                ..LocalDisplayInfo::default()
             })
             .collect(),
     }
@@ -1143,6 +1197,8 @@ fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<Di
             width: display.primary_width.max(1),
             height: display.primary_height.max(1),
             primary: true,
+            active: true,
+            ..LocalDisplayInfo::default()
         }]
     } else {
         display.displays.clone()
@@ -2014,6 +2070,125 @@ fn record_usb_diagnostic_event(
         device_id: device_id.map(|value| value.to_string()),
         device_instance_id: None,
         capture_path: Some("usb-forwarding".to_string()),
+        source: LocalInputEventSource::System,
+        payload,
+    };
+    push_recent_local_event(&mut state.local_controls, event.clone());
+    event
+}
+
+fn display_capture_response_from_result(
+    request: &rshare_core::DisplayCaptureRequest,
+    result: Result<DisplayCaptureResult>,
+) -> DaemonResponse {
+    DaemonResponse::DisplayCapture(result.unwrap_or_else(|error| DisplayCaptureResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        display_id: request.display_id.clone(),
+        mime_type: None,
+        width: None,
+        height: None,
+        bytes: Vec::new(),
+        message: Some(error.to_string()),
+    }))
+}
+
+fn display_identify_response_from_result(result: Result<DisplayIdentifyResult>) -> DaemonResponse {
+    DaemonResponse::DisplayIdentify(result.unwrap_or_else(|error| DisplayIdentifyResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        message: Some(error.to_string()),
+    }))
+}
+
+fn display_settings_update_response_from_result(
+    state: &mut DaemonState,
+    request: &rshare_core::DisplaySettingsUpdateRequest,
+    result: Result<DisplaySettingsUpdateResult>,
+    refreshed_display: Result<LocalDisplayState>,
+) -> (DaemonResponse, LocalInputDiagnosticEvent) {
+    let result = result.unwrap_or_else(|error| DisplaySettingsUpdateResult {
+        status: DisplayOperationStatus::ApplyFailed,
+        message: Some(error.to_string()),
+    });
+
+    apply_refreshed_display_state(state, refreshed_display);
+    let layout_changed = state.reconcile_local_layout_geometry();
+    let event = record_display_settings_update_event(state, request, &result, layout_changed);
+
+    (DaemonResponse::DisplaySettingsUpdated(result), event)
+}
+
+fn apply_refreshed_display_state(
+    state: &mut DaemonState,
+    refreshed_display: Result<LocalDisplayState>,
+) {
+    match refreshed_display {
+        Ok(display) if !display.displays.is_empty() => {
+            state.local_controls.display = display;
+            update_mouse_display_position(&mut state.local_controls);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            state.local_controls.last_error = Some(format!("Display enumeration failed: {error}"));
+        }
+    }
+}
+
+fn record_display_settings_update_event(
+    state: &mut DaemonState,
+    request: &rshare_core::DisplaySettingsUpdateRequest,
+    result: &DisplaySettingsUpdateResult,
+    layout_changed: bool,
+) -> LocalInputDiagnosticEvent {
+    let sequence = state.local_controls.sequence.saturating_add(1);
+    state.local_controls.sequence = sequence;
+
+    let mut payload = BTreeMap::new();
+    payload.insert("display_id".to_string(), request.display_id.clone());
+    payload.insert("status".to_string(), format!("{:?}", result.status));
+    payload.insert("layout_changed".to_string(), layout_changed.to_string());
+    if let Some(message) = &result.message {
+        payload.insert("message".to_string(), message.clone());
+    }
+    if let Some(width) = request.width {
+        payload.insert("width".to_string(), width.to_string());
+    }
+    if let Some(height) = request.height {
+        payload.insert("height".to_string(), height.to_string());
+    }
+    if let Some(refresh_rate_millihz) = request.refresh_rate_millihz {
+        payload.insert(
+            "refresh_rate_millihz".to_string(),
+            refresh_rate_millihz.to_string(),
+        );
+    }
+    if let Some(orientation) = request.orientation {
+        payload.insert("orientation".to_string(), format!("{:?}", orientation));
+    }
+    if let Some(primary) = request.primary {
+        payload.insert("primary".to_string(), primary.to_string());
+    }
+    if let Some(x) = request.x {
+        payload.insert("x".to_string(), x.to_string());
+    }
+    if let Some(y) = request.y {
+        payload.insert("y".to_string(), y.to_string());
+    }
+    if let Some(scale_percent) = request.scale_percent {
+        payload.insert("scale_percent".to_string(), scale_percent.to_string());
+    }
+
+    let event = LocalInputDiagnosticEvent {
+        sequence,
+        timestamp_ms: timestamp_ms_now(),
+        device_kind: LocalInputDeviceKind::Display,
+        event_kind: "settings_update".to_string(),
+        summary: format!(
+            "Display settings update for {}: {:?}",
+            request.display_id, result.status
+        ),
+        device_id: None,
+        device_instance_id: Some(request.display_id.clone()),
+        capture_path: Some("display-settings".to_string()),
         source: LocalInputEventSource::System,
         payload,
     };
@@ -6489,7 +6664,6 @@ async fn handle_ipc_client(
         request_remote_endpoint_events(&network_manager, &state, filter).await;
         let events = {
             let mut state = state.write().await;
-            state.refresh_local_controls_platform();
             state.endpoint_events(filter, None, Some(128))
         };
         write_json_line(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
@@ -6648,7 +6822,6 @@ async fn handle_ipc_client(
         } => {
             request_remote_endpoint_events(&network_manager, &state, &filter).await;
             let mut state = state.write().await;
-            state.refresh_local_controls_platform();
             DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))
         }
         DaemonRequest::InjectEndpointEvent { target, request } => {
@@ -6732,6 +6905,35 @@ async fn handle_ipc_client(
         DaemonRequest::RunAudioTest { test: _ } => {
             DaemonResponse::LocalAudioTest(run_audio_test(&state).await)
         }
+        DaemonRequest::CaptureDisplay(request) => {
+            let result = rshare_platform::display::capture_display(&request);
+            display_capture_response_from_result(&request, result)
+        }
+        DaemonRequest::IdentifyDisplays(request) => {
+            let result = rshare_platform::display::identify_displays(&request);
+            display_identify_response_from_result(result)
+        }
+        DaemonRequest::UpdateDisplaySettings(request) => {
+            let result = rshare_platform::display::update_display_settings(&request);
+            let refreshed_display = rshare_platform::display::query_display_state();
+            let (response, event) = {
+                let mut state = state.write().await;
+                display_settings_update_response_from_result(
+                    &mut state,
+                    &request,
+                    result,
+                    refreshed_display,
+                )
+            };
+            let _ = local_events_tx.send(event);
+            response
+        }
+        DaemonRequest::OpenDisplaySettings => {
+            match rshare_platform::display::open_display_settings() {
+                Ok(()) => DaemonResponse::Ack,
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
         DaemonRequest::SubscribeEndpointEvents { .. } => {
             unreachable!("handled before response match")
@@ -6754,6 +6956,16 @@ fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
 fn current_primary_screen_info() -> ScreenInfo {
     #[cfg(windows)]
     {
+        if let Ok(display) = rshare_platform::display::query_display_state() {
+            if let Some(primary) = display
+                .displays
+                .iter()
+                .find(|display| display.primary)
+                .or_else(|| display.displays.first())
+            {
+                return ScreenInfo::new(0, 0, primary.width, primary.height);
+            }
+        }
         let screen = rshare_platform::WindowsInputListener::get_screen_info();
         return ScreenInfo::new(0, 0, screen.width, screen.height);
     }
@@ -7022,6 +7234,119 @@ mod tests {
                 .map(String::as_str),
             Some("primary:2560x1440@1920,0:primary;remote-left:1920x1080@0,0")
         );
+    }
+
+    #[test]
+    fn display_scale_update_result_is_nonfatal_and_refreshes_layout() {
+        let mut state = test_daemon_state();
+        let request = rshare_core::DisplaySettingsUpdateRequest {
+            display_id: "primary".to_string(),
+            width: None,
+            height: None,
+            refresh_rate_millihz: None,
+            orientation: None,
+            primary: None,
+            x: None,
+            y: None,
+            scale_percent: Some(125),
+        };
+
+        let refreshed_display = LocalDisplayState {
+            display_count: 2,
+            virtual_x: 0,
+            virtual_y: 0,
+            primary_width: 1920,
+            primary_height: 1080,
+            layout_width: 3200,
+            layout_height: 1080,
+            displays: vec![
+                LocalDisplayInfo {
+                    display_id: "primary".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                    active: true,
+                    ..LocalDisplayInfo::default()
+                },
+                LocalDisplayInfo {
+                    display_id: "right".to_string(),
+                    x: 1920,
+                    width: 1280,
+                    height: 720,
+                    active: true,
+                    ..LocalDisplayInfo::default()
+                },
+            ],
+        };
+
+        let (response, event) = display_settings_update_response_from_result(
+            &mut state,
+            &request,
+            Ok(DisplaySettingsUpdateResult {
+                status: DisplayOperationStatus::RequiresSystemSettings,
+                message: Some("scale requires system settings".to_string()),
+            }),
+            Ok(refreshed_display),
+        );
+
+        match response {
+            DaemonResponse::DisplaySettingsUpdated(result) => {
+                assert_eq!(
+                    result.status,
+                    DisplayOperationStatus::RequiresSystemSettings
+                );
+            }
+            other => panic!("expected display settings result, got {other:?}"),
+        }
+        let local_node = state
+            .layout
+            .get_node(state.status.device_id)
+            .expect("local layout node");
+        assert_eq!(local_node.displays.len(), 2);
+        assert_eq!(local_node.displays[1].display_id, "right");
+        assert_eq!(event.device_kind, LocalInputDeviceKind::Display);
+        assert_eq!(event.event_kind, "settings_update");
+        assert_eq!(
+            event.payload.get("status").map(String::as_str),
+            Some("RequiresSystemSettings")
+        );
+    }
+
+    #[test]
+    fn display_capture_platform_error_returns_structured_result() {
+        let request = rshare_core::DisplayCaptureRequest {
+            display_id: "display-1".to_string(),
+            max_width: Some(640),
+        };
+
+        let response = display_capture_response_from_result(
+            &request,
+            Err(anyhow::anyhow!("capture backend failed")),
+        );
+
+        match response {
+            DaemonResponse::DisplayCapture(result) => {
+                assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
+                assert_eq!(result.display_id, "display-1");
+                assert!(result.bytes.is_empty());
+                assert_eq!(result.message.as_deref(), Some("capture backend failed"));
+            }
+            other => panic!("expected display capture result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_displays_platform_error_returns_structured_result() {
+        let response =
+            display_identify_response_from_result(Err(anyhow::anyhow!("overlay backend failed")));
+
+        match response {
+            DaemonResponse::DisplayIdentify(result) => {
+                assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
+                assert_eq!(result.message.as_deref(), Some("overlay backend failed"));
+            }
+            other => panic!("expected display identify result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7691,6 +8016,72 @@ mod tests {
     }
 
     #[test]
+    fn local_input_feedback_uses_latest_gamepad_event() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        let mut gamepad = rshare_core::GamepadState::neutral(0, 1, timestamp_ms_now());
+        gamepad.buttons.push(rshare_core::GamepadButtonState {
+            button: rshare_core::GamepadButton::South,
+            pressed: true,
+        });
+
+        let event =
+            state.record_local_input_event(&rshare_input::InputEvent::gamepad_state(gamepad));
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.status, LatencyFeedbackStatus::Healthy);
+        assert_eq!(feedback.event_count, 1);
+        assert_eq!(feedback.latest_sequence, Some(event.sequence));
+        assert_eq!(feedback.latest_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_gamepad_event_ms, Some(event.timestamp_ms));
+        assert_eq!(feedback.latest_gamepad_id, Some(0));
+        assert_eq!(feedback.latest_gamepad_event_kind.as_deref(), Some("state"));
+        assert!(feedback
+            .latest_gamepad_button
+            .as_deref()
+            .is_some_and(|value| { value.contains("South") }));
+    }
+
+    #[test]
+    fn local_input_feedback_event_count_includes_gamepads() {
+        let mut state = test_daemon_state();
+        state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
+        state.local_controls.keyboard.event_count = 2;
+        state.local_controls.mouse.event_count = 3;
+        let mut gamepad = rshare_core::LocalGamepadState {
+            gamepad_id: 0,
+            name: "Pad 0".to_string(),
+            connected: true,
+            buttons: Vec::new(),
+            pressed_buttons: Vec::new(),
+            last_button: None,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            event_count: 4,
+            button_event_count: 0,
+            button_press_count: 0,
+            button_release_count: 0,
+            axis_event_count: 0,
+            trigger_event_count: 0,
+            last_axis: None,
+            last_seen_ms: 0,
+        };
+        state.local_controls.gamepads.push(gamepad.clone());
+        gamepad.gamepad_id = 1;
+        gamepad.name = "Pad 1".to_string();
+        gamepad.event_count = 5;
+        state.local_controls.gamepads.push(gamepad);
+
+        let feedback = state.local_input_feedback();
+
+        assert_eq!(feedback.event_count, 14);
+    }
+
+    #[test]
     fn local_input_feedback_ignores_later_backend_diagnostic_for_latest_input() {
         let mut state = test_daemon_state();
         state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
@@ -7810,8 +8201,33 @@ mod tests {
     fn local_input_feedback_saturates_event_count() {
         let mut state = test_daemon_state();
         state.backend_state.selected_mode = Some(ResolvedInputMode::Portable);
-        state.local_controls.keyboard.event_count = u64::MAX;
+        state.local_controls.keyboard.event_count = 1;
         state.local_controls.mouse.event_count = 1;
+        state
+            .local_controls
+            .gamepads
+            .push(rshare_core::LocalGamepadState {
+                gamepad_id: 0,
+                name: "Pad".to_string(),
+                connected: true,
+                buttons: Vec::new(),
+                pressed_buttons: Vec::new(),
+                last_button: None,
+                left_stick_x: 0,
+                left_stick_y: 0,
+                right_stick_x: 0,
+                right_stick_y: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                event_count: u64::MAX,
+                button_event_count: 0,
+                button_press_count: 0,
+                button_release_count: 0,
+                axis_event_count: 0,
+                trigger_event_count: 0,
+                last_axis: None,
+                last_seen_ms: 0,
+            });
 
         let feedback = state.local_input_feedback();
 
@@ -7915,6 +8331,7 @@ mod tests {
                     width: 1280,
                     height: 720,
                     primary: false,
+                    ..LocalDisplayInfo::default()
                 },
                 LocalDisplayInfo {
                     display_id: "primary".to_string(),
@@ -7923,6 +8340,7 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     primary: true,
+                    ..LocalDisplayInfo::default()
                 },
             ],
         };
@@ -8009,6 +8427,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     primary: true,
+                    ..LocalDisplayInfo::default()
                 },
                 LocalDisplayInfo {
                     display_id: "display-2".to_string(),
@@ -8017,6 +8436,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     primary: false,
+                    ..LocalDisplayInfo::default()
                 },
             ],
         };
@@ -8031,6 +8451,14 @@ mod tests {
         assert_eq!(local_node.displays[1].display_id, "display-2");
         assert_eq!(local_node.displays[1].x, 2560);
         assert_eq!(local_node.displays[1].height, 1440);
+    }
+
+    #[test]
+    fn fallback_display_state_marks_primary_display_active() {
+        let display = fallback_display_state(1920, 1080);
+
+        assert_eq!(display.displays.len(), 1);
+        assert!(display.displays[0].active);
     }
 
     #[test]

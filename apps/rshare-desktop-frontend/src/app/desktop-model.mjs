@@ -29,6 +29,179 @@ function buildLocalDevice(status) {
   };
 }
 
+function displayTitle(display, index) {
+  if (display.primary) {
+    return "主显示器";
+  }
+  return `显示器 ${index + 1}`;
+}
+
+function displayName(display, index) {
+  return (
+    display.friendly_name ??
+    display.name ??
+    display.device_name ??
+    displayTitle(display, index)
+  );
+}
+
+function formatDisplayRefreshRate(refreshRateMillihz) {
+  const refresh = Number(refreshRateMillihz ?? 0);
+  if (!Number.isFinite(refresh) || refresh <= 0) {
+    return "未知";
+  }
+  const hertz = refresh / 1000;
+  return `${Number.isInteger(hertz) ? hertz : hertz.toFixed(2)} Hz`;
+}
+
+function displayResolutionOptions(display) {
+  const seen = new Set();
+  return [
+    ...(display.modes ?? []),
+    { width: display.width, height: display.height },
+  ]
+    .filter((mode) => Number(mode.width) > 0 && Number(mode.height) > 0)
+    .filter((mode) => {
+      const key = `${mode.width}x${mode.height}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => Number(right.width) * Number(right.height) - Number(left.width) * Number(left.height))
+    .map((mode) => ({
+      value: `${mode.width}x${mode.height}`,
+      label: `${mode.width} × ${mode.height}`,
+      width: Number(mode.width),
+      height: Number(mode.height),
+    }));
+}
+
+function displayRefreshRateOptions(display) {
+  const seen = new Set();
+  return [
+    ...(display.modes ?? []),
+    { refresh_rate_millihz: display.refresh_rate_millihz },
+  ]
+    .map((mode) => Number(mode.refresh_rate_millihz ?? 0))
+    .filter((refresh) => Number.isFinite(refresh) && refresh > 0)
+    .filter((refresh) => {
+      if (seen.has(refresh)) {
+        return false;
+      }
+      seen.add(refresh);
+      return true;
+    })
+    .sort((left, right) => left - right)
+    .map((refresh) => ({
+      value: String(refresh),
+      label: formatDisplayRefreshRate(refresh),
+      refreshRateMillihz: refresh,
+    }));
+}
+
+function displayBounds(displays) {
+  const minX = Math.min(...displays.map((display) => Number(display.x ?? 0)));
+  const minY = Math.min(...displays.map((display) => Number(display.y ?? 0)));
+  const maxX = Math.max(
+    ...displays.map((display) => Number(display.x ?? 0) + Number(display.width ?? 0)),
+  );
+  const maxY = Math.max(
+    ...displays.map((display) => Number(display.y ?? 0) + Number(display.height ?? 0)),
+  );
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY),
+  };
+}
+
+function fallbackDisplay(snapshot) {
+  const display = snapshot?.display ?? {};
+  return {
+    display_id: "primary",
+    x: Number(display.virtual_x ?? 0),
+    y: Number(display.virtual_y ?? 0),
+    width: Number(display.primary_width ?? 1920),
+    height: Number(display.primary_height ?? 1080),
+    primary: true,
+    active: Boolean(display.display_count ?? 1),
+    modes: [],
+    write_capabilities: {},
+  };
+}
+
+export function buildDisplaySettingsViewModel(snapshot, selectedDisplayId) {
+  const rawDisplays = snapshot?.display?.displays?.length
+    ? snapshot.display.displays
+    : [fallbackDisplay(snapshot)];
+  const displays = rawDisplays.map((display, index) => {
+    const id = display.display_id || `display-${index + 1}`;
+    const width = Number(display.width ?? 0);
+    const height = Number(display.height ?? 0);
+    const scalePercent = display.scale_percent == null ? null : Number(display.scale_percent);
+    const refreshRateMillihz =
+      display.refresh_rate_millihz == null ? null : Number(display.refresh_rate_millihz);
+    const writeCapabilities = {
+      resolution: Boolean(display.write_capabilities?.resolution),
+      refreshRate: Boolean(display.write_capabilities?.refresh_rate),
+      orientation: Boolean(display.write_capabilities?.orientation),
+      primary: Boolean(display.write_capabilities?.primary),
+      position: Boolean(display.write_capabilities?.position),
+      scale: Boolean(display.write_capabilities?.scale),
+    };
+    return {
+      id,
+      index,
+      title: displayTitle(display, index),
+      name: displayName(display, index),
+      deviceName: display.device_name ?? null,
+      x: Number(display.x ?? 0),
+      y: Number(display.y ?? 0),
+      width,
+      height,
+      workArea: {
+        x: Number(display.work_x ?? display.x ?? 0),
+        y: Number(display.work_y ?? display.y ?? 0),
+        width: Number(display.work_width ?? width),
+        height: Number(display.work_height ?? height),
+      },
+      primary: Boolean(display.primary),
+      active: display.active !== false,
+      orientation: display.orientation ?? "Landscape",
+      scalePercent,
+      refreshRateMillihz,
+      bitsPerPixel: display.bits_per_pixel ?? null,
+      dpi: {
+        x: display.dpi_x ?? null,
+        y: display.dpi_y ?? null,
+        rawX: display.raw_dpi_x ?? null,
+        rawY: display.raw_dpi_y ?? null,
+      },
+      resolutionLabel: `${width} × ${height}`,
+      scaleLabel: scalePercent ? `${scalePercent}%` : "未知",
+      refreshRateLabel: formatDisplayRefreshRate(refreshRateMillihz),
+      resolutionOptions: displayResolutionOptions({ ...display, width, height }),
+      refreshRateOptions: displayRefreshRateOptions(display),
+      writeCapabilities,
+    };
+  });
+  const selectedDisplay =
+    displays.find((display) => display.id === selectedDisplayId) ??
+    displays.find((display) => display.primary) ??
+    displays[0];
+  return {
+    displays,
+    selectedDisplay,
+    selectedDisplayId: selectedDisplay?.id ?? null,
+    bounds: displayBounds(displays),
+  };
+}
+
 function buildRemoteDevice(device, index) {
   const isLaptop = /book|laptop/i.test(device.name) || /macbook/i.test(device.hostname ?? "");
 
@@ -78,7 +251,237 @@ function findRememberedDisplay(rememberedLayout, deviceId, displayId) {
     ?.displays?.find((display) => (display.display_id ?? "primary") === displayId);
 }
 
-function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices) {
+function buildLocalDisplayNameLookup(localControls) {
+  return new Map(
+    (localControls?.display?.displays ?? [])
+      .map((display) => [
+        display.display_id ?? "primary",
+        display.friendly_name ?? display.name ?? display.device_name ?? null,
+      ])
+      .filter((entry) => entry[1]),
+  );
+}
+
+function buildLocalDisplayInfoLookup(localControls) {
+  return new Map(
+    (localControls?.display?.displays ?? []).map((display) => [
+      display.display_id ?? "primary",
+      display,
+    ]),
+  );
+}
+
+function localNodeDisplays(node, localDisplayInfo) {
+  const actualDisplays = [...localDisplayInfo.values()];
+  if (!actualDisplays.length) {
+    return node.displays ?? [];
+  }
+
+  const visibleById = new Map(
+    (node.displays ?? []).map((display) => [display.display_id ?? "primary", display]),
+  );
+  const actualIds = new Set();
+  const mergedDisplays = actualDisplays.map((actualDisplay, index) => {
+    const displayId = actualDisplay.display_id ?? (index === 0 ? "primary" : `display-${index + 1}`);
+    const visibleDisplay = visibleById.get(displayId) ?? {};
+    actualIds.add(displayId);
+    return {
+      ...visibleDisplay,
+      ...actualDisplay,
+      display_id: displayId,
+      x: Number(actualDisplay.x ?? visibleDisplay.x ?? 0),
+      y: Number(actualDisplay.y ?? visibleDisplay.y ?? 0),
+      width: Number(actualDisplay.width ?? visibleDisplay.width ?? 1920),
+      height: Number(actualDisplay.height ?? visibleDisplay.height ?? 1080),
+      primary: Boolean(actualDisplay.primary ?? visibleDisplay.primary),
+    };
+  });
+
+  return [
+    ...mergedDisplays,
+    ...(node.displays ?? [])
+      .filter((display) => !actualIds.has(display.display_id ?? "primary"))
+      .map((display) => ({ ...display })),
+  ];
+}
+
+function physicalCanvasScale(localDisplayInfo) {
+  const displays = [...localDisplayInfo.values()];
+  const primaryDisplay = displays.find((display) => display.primary) ?? displays[0];
+  const rawDpiX = Number(primaryDisplay?.raw_dpi_x ?? primaryDisplay?.dpi_x ?? 0);
+  return rawDpiX > 0 ? rawDpiX * LAYOUT_SCALE : 96 * LAYOUT_SCALE;
+}
+
+function physicalCanvasSize(display, localDisplayInfo, displayScale) {
+  const physicalDisplay = localDisplayInfo.get(display.display_id ?? "primary");
+  const rawDpiX = Number(physicalDisplay?.raw_dpi_x ?? physicalDisplay?.dpi_x ?? 0);
+  const rawDpiY = Number(physicalDisplay?.raw_dpi_y ?? physicalDisplay?.dpi_y ?? 0);
+  const width = Number(display.width ?? 1920);
+  const height = Number(display.height ?? 1080);
+
+  if (rawDpiX <= 0 || rawDpiY <= 0) {
+    return {
+      w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+      h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+      physical: false,
+    };
+  }
+
+  return {
+    w: Math.max(96, Math.round((width / rawDpiX) * displayScale)),
+    h: Math.max(64, Math.round((height / rawDpiY) * displayScale)),
+    physical: true,
+  };
+}
+
+function displayGeometry(display, localDisplayInfo, displayScale) {
+  const width = Number(display.width ?? 1920);
+  const height = Number(display.height ?? 1080);
+  const left = Number(display.x ?? 0);
+  const top = Number(display.y ?? 0);
+  return {
+    display,
+    displayId: display.display_id ?? "primary",
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    size: physicalCanvasSize(display, localDisplayInfo, displayScale),
+  };
+}
+
+function displayEdgeAligned(a, b) {
+  return Math.abs(Number(a) - Number(b)) <= LAYOUT_COMMIT_SNAP_DISTANCE;
+}
+
+function physicalYRelativeToAnchor(target, anchor, anchorLayout) {
+  if (displayEdgeAligned(target.bottom, anchor.bottom)) {
+    return anchorLayout.y + anchorLayout.h - target.size.h;
+  }
+  if (displayEdgeAligned(target.top, anchor.top)) {
+    return anchorLayout.y;
+  }
+  return anchorLayout.y + (target.top - anchor.top) * LAYOUT_SCALE;
+}
+
+function physicalXRelativeToAnchor(target, anchor, anchorLayout) {
+  if (displayEdgeAligned(target.right, anchor.right)) {
+    return anchorLayout.x + anchorLayout.w - target.size.w;
+  }
+  if (displayEdgeAligned(target.left, anchor.left)) {
+    return anchorLayout.x;
+  }
+  return anchorLayout.x + (target.left - anchor.left) * LAYOUT_SCALE;
+}
+
+function localPhysicalDisplayCandidate(target, anchor, anchorLayout) {
+  const candidates = [];
+  if (rangesOverlap(target.top, target.bottom, anchor.top, anchor.bottom)) {
+    if (target.left >= anchor.right) {
+      const gap = target.left - anchor.right;
+      candidates.push({
+        x: anchorLayout.x + anchorLayout.w + gap * LAYOUT_SCALE,
+        y: physicalYRelativeToAnchor(target, anchor, anchorLayout),
+        score: gap,
+      });
+    }
+    if (anchor.left >= target.right) {
+      const gap = anchor.left - target.right;
+      candidates.push({
+        x: anchorLayout.x - target.size.w - gap * LAYOUT_SCALE,
+        y: physicalYRelativeToAnchor(target, anchor, anchorLayout),
+        score: gap,
+      });
+    }
+  }
+
+  if (rangesOverlap(target.left, target.right, anchor.left, anchor.right)) {
+    if (target.top >= anchor.bottom) {
+      const gap = target.top - anchor.bottom;
+      candidates.push({
+        x: physicalXRelativeToAnchor(target, anchor, anchorLayout),
+        y: anchorLayout.y + anchorLayout.h + gap * LAYOUT_SCALE,
+        score: gap,
+      });
+    }
+    if (anchor.top >= target.bottom) {
+      const gap = anchor.top - target.bottom;
+      candidates.push({
+        x: physicalXRelativeToAnchor(target, anchor, anchorLayout),
+        y: anchorLayout.y - target.size.h - gap * LAYOUT_SCALE,
+        score: gap,
+      });
+    }
+  }
+
+  return candidates.sort((left, right) => left.score - right.score)[0] ?? null;
+}
+
+function buildLocalPhysicalDisplayLayout(displays, localDisplayInfo, displayScale) {
+  const entries = (displays ?? []).map((display) =>
+    displayGeometry(display, localDisplayInfo, displayScale),
+  );
+  if (!entries.length) {
+    return null;
+  }
+
+  const primary = entries.find((entry) => entry.display.primary) ?? entries[0];
+  const placed = new Map();
+  placed.set(primary.displayId, {
+    entry: primary,
+    x: CANVAS_ORIGIN_X + primary.right * LAYOUT_SCALE - primary.size.w,
+    y: CANVAS_ORIGIN_Y + primary.bottom * LAYOUT_SCALE - primary.size.h,
+    w: primary.size.w,
+    h: primary.size.h,
+  });
+
+  let changed = true;
+  while (placed.size < entries.length && changed) {
+    changed = false;
+    for (const target of entries) {
+      if (placed.has(target.displayId)) {
+        continue;
+      }
+
+      const bestCandidate = [...placed.values()]
+        .map((anchorLayout) => ({
+          anchor: anchorLayout,
+          candidate: localPhysicalDisplayCandidate(target, anchorLayout.entry, anchorLayout),
+        }))
+        .filter((item) => item.candidate)
+        .sort((left, right) => left.candidate.score - right.candidate.score)[0];
+
+      if (bestCandidate) {
+        placed.set(target.displayId, {
+          entry: target,
+          x: bestCandidate.candidate.x,
+          y: bestCandidate.candidate.y,
+          w: target.size.w,
+          h: target.size.h,
+        });
+        changed = true;
+      }
+    }
+  }
+
+  if (placed.size !== entries.length) {
+    return null;
+  }
+
+  return placed;
+}
+
+function layoutDisplayName(device, displayId, localDisplayNames) {
+  if (device.kind === "local") {
+    return localDisplayNames.get(displayId) ?? `${device.name} 显示器`;
+  }
+
+  return `${device.name} 屏幕`;
+}
+
+function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices, localControls) {
   if (!visibleLayout?.nodes?.length) {
     return null;
   }
@@ -95,6 +498,9 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
     return null;
   }
 
+  const localDisplayNames = buildLocalDisplayNameLookup(localControls);
+  const localDisplayInfo = buildLocalDisplayInfoLookup(localControls);
+  const localPhysicalScale = physicalCanvasScale(localDisplayInfo);
   const visibleNodes = snapVisibleDeviceGroupsEdgeToEdge(
     visibleLayout.nodes.map((node) => ({
       ...node,
@@ -109,12 +515,38 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
     if (!device) {
       continue;
     }
+    const nodeDisplays =
+      device.kind === "local"
+        ? localNodeDisplays(node, localDisplayInfo)
+        : node.displays ?? [];
+    const localPhysicalLayout =
+      device.kind === "local"
+        ? buildLocalPhysicalDisplayLayout(
+            nodeDisplays,
+            localDisplayInfo,
+            localPhysicalScale,
+          )
+        : null;
 
-    for (const display of node.displays ?? []) {
+    for (const display of nodeDisplays) {
       const monitorIndex = layoutMonitors.length;
       const width = Number(display.width ?? 1920);
       const height = Number(display.height ?? 1080);
       const displayId = display.display_id ?? "primary";
+      const localPhysicalDisplay = localPhysicalLayout?.get(displayId);
+      const canvasSize =
+        localPhysicalDisplay
+          ? localPhysicalDisplay
+          : device.kind === "local"
+          ? physicalCanvasSize(display, localDisplayInfo, localPhysicalScale)
+          : {
+              w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+              h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+            };
+      const canvasRight = CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE + width * LAYOUT_SCALE;
+      const canvasBottom = CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE + height * LAYOUT_SCALE;
+      const canvasX = CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE;
+      const canvasY = CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE;
       const rememberedDisplay = findRememberedDisplay(
         rememberedLayout,
         node.device_id,
@@ -129,17 +561,18 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         visibleX: Number(display.x ?? 0),
         visibleY: Number(display.y ?? 0),
         label: String.fromCharCode(65 + monitorIndex),
-        name:
-          device.kind === "local"
-            ? `${device.name} 显示器`
-            : `${device.name} 屏幕`,
+        name: layoutDisplayName(device, displayId, localDisplayNames),
         resWidth: width,
         resHeight: height,
         color: device.color,
-        x: CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE,
-        y: CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE,
-        w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
-        h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+        x: localPhysicalDisplay
+          ? localPhysicalDisplay.x
+          : canvasSize.physical ? canvasRight - canvasSize.w : canvasX,
+        y: localPhysicalDisplay
+          ? localPhysicalDisplay.y
+          : canvasSize.physical ? canvasBottom - canvasSize.h : canvasY,
+        w: canvasSize.w,
+        h: canvasSize.h,
         primary: Boolean(display.primary),
         enabled: true,
       });
@@ -691,6 +1124,100 @@ function numberOrNull(value) {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+const LOCAL_FEEDBACK_LABELS = Object.freeze({
+  keyboard: "键盘",
+  mouse: "鼠标",
+  gamepad: "手柄",
+  transport: "QUIC",
+});
+
+function latencyStatusState(status) {
+  switch (String(status ?? "").toLowerCase()) {
+    case "healthy":
+      return "pass";
+    case "degraded":
+    case "pending":
+      return "warn";
+    case "timeout":
+    case "unavailable":
+      return "block";
+    case "idle":
+    default:
+      return "idle";
+  }
+}
+
+function eventTimestampDetail(timestampMs, fallback) {
+  const value = numberOrNull(timestampMs);
+  if (value == null || value <= 0) {
+    return fallback;
+  }
+  return `event @ ${value} ms`;
+}
+
+function timestampState(timestampMs, status) {
+  const value = numberOrNull(timestampMs);
+  return value == null || value <= 0 ? "idle" : latencyStatusState(status);
+}
+
+export function buildLocalLatencyFeedbackRows(feedback) {
+  const local = feedback?.local_input ?? {};
+  const transport = feedback?.transport ?? {};
+  const keyboardState = timestampState(local.latest_keyboard_event_ms, local.status);
+  const mouseState = timestampState(local.latest_mouse_event_ms, local.status);
+  const gamepadState = timestampState(local.latest_gamepad_event_ms, local.status);
+  const gamepadTimestamp = numberOrNull(local.latest_gamepad_event_ms);
+  const transportStatus = transport.status ?? "Unavailable";
+  const transportRttMs = numberOrNull(transport.rtt_ms);
+  const gamepadParts = [
+    local.latest_gamepad_id == null ? null : `gamepad ${local.latest_gamepad_id}`,
+    local.latest_gamepad_event_kind,
+    local.latest_gamepad_button,
+    local.latest_gamepad_axis,
+  ].filter(Boolean);
+  const transportParts =
+    feedback?.transport == null
+      ? ["transport unavailable"]
+      : [
+          transport.transport ?? "quic",
+          transportRttMs == null ? null : `${transportRttMs} ms RTT`,
+          transport.datagram_available ? "datagram" : "no datagram",
+        ].filter(Boolean);
+
+  return [
+    {
+      key: "keyboard",
+      label: LOCAL_FEEDBACK_LABELS.keyboard,
+      state: keyboardState,
+      metric: String(local.event_count ?? 0),
+      detail: eventTimestampDetail(local.latest_keyboard_event_ms, "waiting for keyboard"),
+    },
+    {
+      key: "mouse",
+      label: LOCAL_FEEDBACK_LABELS.mouse,
+      state: mouseState,
+      metric: String(local.event_count ?? 0),
+      detail: eventTimestampDetail(local.latest_mouse_event_ms, "waiting for mouse"),
+    },
+    {
+      key: "gamepad",
+      label: LOCAL_FEEDBACK_LABELS.gamepad,
+      state: gamepadState,
+      metric: String(local.event_count ?? 0),
+      detail: gamepadTimestamp != null && gamepadTimestamp > 0 && gamepadParts.length
+        ? gamepadParts.join(", ")
+        : eventTimestampDetail(local.latest_gamepad_event_ms, "waiting for gamepad"),
+    },
+    {
+      key: "transport",
+      label: LOCAL_FEEDBACK_LABELS.transport,
+      state: latencyStatusState(transportStatus),
+      metric: transportStatus,
+      detail: transportParts.join(", "),
+    },
+  ];
 }
 
 function remoteLatencyEventMatchesDevice(event, deviceId) {
@@ -1537,7 +2064,7 @@ function buildAcceptance(payload, status, remoteDevices, layout, inputMode) {
   };
 }
 
-export function buildDesktopViewModel(payload) {
+export function buildDesktopViewModel(payload, localControls = null) {
   const status = payload?.status ?? null;
   const capabilities = buildCapabilityOverview(payload?.capabilities ?? null);
   const localDevice = buildLocalDevice(status);
@@ -1547,6 +2074,7 @@ export function buildDesktopViewModel(payload) {
     payload?.layout,
     localDevice,
     remoteDevices,
+    localControls,
   );
   const layoutUnavailable = Boolean(payload?.layout_error && status && !payload?.visible_layout);
   const fallbackDevices = layoutUnavailable ? [localDevice] : [localDevice, ...remoteDevices];

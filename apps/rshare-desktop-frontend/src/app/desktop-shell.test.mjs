@@ -3,8 +3,12 @@ import assert from "node:assert/strict";
 
 import {
   buildFooterStatus,
+  getDeviceConsoleSections,
+  getDeviceSimulatorChrome,
   getHeaderMetrics,
+  getHardwareAssetPresetOptions,
   getPageLabels,
+  getSettingsLayoutSections,
   getThemeModeOptions,
 } from "./desktop-shell.mjs";
 
@@ -62,6 +66,41 @@ test("getThemeModeOptions exposes light dark and system in Chinese", () => {
     { key: "light", label: "浅色" },
     { key: "dark", label: "深色" },
     { key: "system", label: "系统" },
+  ]);
+});
+
+test("getHardwareAssetPresetOptions keeps hardware texture presets in settings copy", () => {
+  assert.deepEqual(getHardwareAssetPresetOptions(), [
+    { key: "office", label: "办公" },
+    { key: "gaming", label: "游戏" },
+  ]);
+});
+
+test("getDeviceConsoleSections hides the local latency feedback strip by default", () => {
+  assert.deepEqual(getDeviceConsoleSections(), {
+    endpointAcceptance: true,
+    localLatencyFeedback: false,
+  });
+});
+
+test("getDeviceSimulatorChrome keeps simulator devices texture first and unframed", () => {
+  assert.deepEqual(getDeviceSimulatorChrome(), {
+    textureFirst: true,
+    deviceFrames: false,
+    annotationFrames: false,
+    frontFacingDisplays: true,
+    displayWindowTexture: true,
+  });
+});
+
+test("getSettingsLayoutSections exposes a left navigation order for settings", () => {
+  assert.deepEqual(getSettingsLayoutSections(), [
+    { key: "local", label: "本机信息", description: "设备名称、主机与监听端口" },
+    { key: "service", label: "服务状态", description: "守护进程运行状态" },
+    { key: "hardware", label: "硬件资产", description: "贴图和导入包" },
+    { key: "input", label: "输入后端", description: "捕获模式与健康度" },
+    { key: "appearance", label: "界面风格", description: "主题外观" },
+    { key: "acceptance", label: "实机验收", description: "联机前检查项" },
   ]);
 });
 

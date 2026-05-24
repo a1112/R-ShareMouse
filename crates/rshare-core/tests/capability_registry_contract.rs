@@ -107,6 +107,7 @@ fn local_display_topology_preserves_multiple_monitor_details() {
             width: 2560,
             height: 1440,
             primary: true,
+            ..LocalDisplayInfo::default()
         },
         LocalDisplayInfo {
             display_id: "right".to_string(),
@@ -115,6 +116,7 @@ fn local_display_topology_preserves_multiple_monitor_details() {
             width: 1920,
             height: 1080,
             primary: false,
+            ..LocalDisplayInfo::default()
         },
     ];
 

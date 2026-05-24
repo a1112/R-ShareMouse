@@ -5,17 +5,20 @@ use rshare_core::{
     },
     service::{pid_file_path, state_dir},
     BackgroundProcessOwner, BackgroundRunMode, CapabilityRegistrySnapshot, DeviceAttribution,
-    DeviceCapabilitySnapshot, EndpointCapabilityKind, EndpointCapabilitySnapshot,
-    EndpointDeviceRef, EndpointEvent, EndpointEventDirection, EndpointEventFilter,
-    EndpointEventKind, EndpointEventPayload, EndpointEventSource, EndpointInjectMode,
-    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice,
-    LocalAudioTestRequest, LocalControlDeviceSnapshot, LocalInputDeviceKind,
-    LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest,
-    TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor,
-    UsbDeviceSpeed,
+    DeviceCapabilitySnapshot, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
+    DisplayIdentifyResult, DisplayOperationStatus, DisplayOrientation,
+    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointCapabilityKind,
+    EndpointCapabilitySnapshot, EndpointDeviceRef, EndpointEvent, EndpointEventDirection,
+    EndpointEventFilter, EndpointEventKind, EndpointEventPayload, EndpointEventSource,
+    EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioInputDevice, LocalAudioInputKind,
+    LocalAudioOutputDevice, LocalAudioTestRequest, LocalControlDeviceSnapshot,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
+    LocalInputTestRequest, TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceDescriptor, UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
+use std::future::Future;
 use tokio::io::duplex;
 use uuid::Uuid;
 
@@ -88,6 +91,106 @@ async fn audio_control_requests_round_trip_over_json_lines() {
         let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
         assert_eq!(decoded, request);
     }
+}
+
+#[tokio::test]
+async fn ipc_contract_display_operation_requests_round_trip_over_json_lines() {
+    let requests = [
+        DaemonRequest::CaptureDisplay(DisplayCaptureRequest {
+            display_id: "primary".to_string(),
+            max_width: Some(480),
+        }),
+        DaemonRequest::IdentifyDisplays(DisplayIdentifyRequest {
+            duration_ms: Some(2500),
+        }),
+        DaemonRequest::UpdateDisplaySettings(DisplaySettingsUpdateRequest {
+            display_id: "display-1".to_string(),
+            width: Some(2560),
+            height: Some(1440),
+            refresh_rate_millihz: Some(144_000),
+            orientation: Some(DisplayOrientation::Landscape),
+            primary: Some(true),
+            x: Some(0),
+            y: Some(0),
+            scale_percent: Some(150),
+        }),
+        DaemonRequest::OpenDisplaySettings,
+    ];
+
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+}
+
+#[tokio::test]
+async fn ipc_contract_display_operation_responses_round_trip_over_json_lines() {
+    let responses = [
+        DaemonResponse::DisplayCapture(DisplayCaptureResult {
+            status: DisplayOperationStatus::Success,
+            display_id: "primary".to_string(),
+            mime_type: Some("image/png".to_string()),
+            width: Some(480),
+            height: Some(270),
+            bytes: vec![137, 80, 78, 71],
+            message: None,
+        }),
+        DaemonResponse::DisplayIdentify(DisplayIdentifyResult {
+            status: DisplayOperationStatus::Success,
+            message: Some("identify overlay shown".to_string()),
+        }),
+        DaemonResponse::DisplaySettingsUpdated(DisplaySettingsUpdateResult {
+            status: DisplayOperationStatus::RequiresSystemSettings,
+            message: Some("Open system settings to adjust display scale.".to_string()),
+        }),
+    ];
+
+    for response in responses {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, response);
+    }
+}
+
+#[test]
+fn ipc_contract_daemon_client_display_helpers_have_expected_signatures() {
+    fn assert_capture_helper<F, Fut>(_helper: F)
+    where
+        F: Fn(DisplayCaptureRequest) -> Fut,
+        Fut: Future<Output = anyhow::Result<DisplayCaptureResult>>,
+    {
+    }
+
+    fn assert_identify_helper<F, Fut>(_helper: F)
+    where
+        F: Fn(DisplayIdentifyRequest) -> Fut,
+        Fut: Future<Output = anyhow::Result<DisplayIdentifyResult>>,
+    {
+    }
+
+    fn assert_update_helper<F, Fut>(_helper: F)
+    where
+        F: Fn(DisplaySettingsUpdateRequest) -> Fut,
+        Fut: Future<Output = anyhow::Result<DisplaySettingsUpdateResult>>,
+    {
+    }
+
+    fn assert_open_helper<F, Fut>(_helper: F)
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+    }
+
+    assert_capture_helper(rshare_core::daemon_client::request_display_capture);
+    assert_identify_helper(rshare_core::daemon_client::request_identify_displays);
+    assert_update_helper(rshare_core::daemon_client::request_update_display_settings);
+    assert_open_helper(rshare_core::daemon_client::request_open_display_settings);
 }
 
 #[tokio::test]
@@ -476,6 +579,17 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
         .latency_feedback
         .local_input
         .latest_keyboard_event_ms = Some(109);
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_event_ms = Some(115);
+    snapshot.latency_feedback.local_input.latest_gamepad_id = Some(0);
+    snapshot
+        .latency_feedback
+        .local_input
+        .latest_gamepad_event_kind = Some("state".to_string());
+    snapshot.latency_feedback.local_input.latest_gamepad_button = Some("South pressed".to_string());
+    snapshot.latency_feedback.local_input.latest_gamepad_axis = Some("left_stick".to_string());
     snapshot.latency_feedback.local_input.capture_path = Some("portable".to_string());
     snapshot.latency_feedback.remote_latency.devices.push(
         rshare_core::RemoteDeviceLatencyFeedback {
@@ -506,6 +620,48 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
     let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
+
+    let DaemonResponse::Status(decoded_snapshot) = &decoded else {
+        panic!("expected status response");
+    };
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_event_ms,
+        Some(115)
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_id,
+        Some(0)
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_event_kind
+            .as_deref(),
+        Some("state")
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_button
+            .as_deref(),
+        Some("South pressed")
+    );
+    assert_eq!(
+        decoded_snapshot
+            .latency_feedback
+            .local_input
+            .latest_gamepad_axis
+            .as_deref(),
+        Some("left_stick")
+    );
 }
 
 #[test]

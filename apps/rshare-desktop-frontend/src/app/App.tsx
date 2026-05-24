@@ -35,6 +35,7 @@ import MonitorManager, {
 } from "./components/MonitorManager";
 import {
   buildDesktopViewModel,
+  buildDisplaySettingsViewModel,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
@@ -44,8 +45,12 @@ import {
 } from "./desktop-model.mjs";
 import {
   buildFooterStatus,
+  getDeviceConsoleSections,
+  getDeviceSimulatorChrome,
   getHeaderMetrics,
+  getHardwareAssetPresetOptions,
   getPageLabels,
+  getSettingsLayoutSections,
   getThemeModeOptions,
 } from "./desktop-shell.mjs";
 import {
@@ -62,6 +67,21 @@ import {
 } from "./hardware-assets.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
+type SettingsSectionKey =
+  | "local"
+  | "service"
+  | "hardware"
+  | "input"
+  | "appearance"
+  | "acceptance";
+
+const DEVICE_CONSOLE_SECTIONS = getDeviceConsoleSections();
+const DEVICE_SIMULATOR_CHROME = getDeviceSimulatorChrome();
+const SETTINGS_LAYOUT_SECTIONS = getSettingsLayoutSections() as Array<{
+  key: SettingsSectionKey;
+  label: string;
+  description: string;
+}>;
 
 function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
@@ -239,11 +259,31 @@ type LocalControlsSnapshot = {
     layout_height: number;
     displays?: Array<{
       display_id: string;
+      adapter_id?: string | null;
+      target_id?: string | null;
+      friendly_name?: string | null;
+      name?: string | null;
+      device_name?: string | null;
       x: number;
       y: number;
       width: number;
       height: number;
+      work_x?: number;
+      work_y?: number;
+      work_width?: number;
+      work_height?: number;
+      orientation?: DisplayOrientation;
+      scale_percent?: number | null;
+      dpi_x?: number | null;
+      dpi_y?: number | null;
+      raw_dpi_x?: number | null;
+      raw_dpi_y?: number | null;
+      refresh_rate_millihz?: number | null;
+      bits_per_pixel?: number | null;
+      active?: boolean;
       primary: boolean;
+      modes?: DisplayModeInfo[];
+      write_capabilities?: DisplayWriteCapabilities;
     }>;
   };
   capture_backend: Record<string, unknown>;
@@ -265,6 +305,93 @@ type LocalControlsSnapshot = {
   recent_events: LocalControlEvent[];
   latency_feedback?: unknown | null;
   last_error?: string | null;
+};
+
+type DisplayOrientation =
+  | "Landscape"
+  | "Portrait"
+  | "LandscapeFlipped"
+  | "PortraitFlipped";
+
+type DisplayWriteCapabilities = {
+  resolution?: boolean;
+  refresh_rate?: boolean;
+  orientation?: boolean;
+  primary?: boolean;
+  position?: boolean;
+  scale?: boolean;
+};
+
+type DisplayModeInfo = {
+  width: number;
+  height: number;
+  refresh_rate_millihz?: number | null;
+  orientation?: DisplayOrientation;
+  bits_per_pixel?: number | null;
+};
+
+type DisplayOperationStatus =
+  | "Success"
+  | "Unsupported"
+  | "PermissionDenied"
+  | "InvalidDisplay"
+  | "InvalidMode"
+  | "RequiresSystemSettings"
+  | "ApplyFailed";
+
+type DisplayCaptureResult = {
+  status: DisplayOperationStatus;
+  display_id?: string;
+  mime_type?: string | null;
+  width?: number | null;
+  height?: number | null;
+  bytes?: number[] | Uint8Array;
+  message?: string | null;
+};
+
+type DisplaySettingsUpdateResult = {
+  status: DisplayOperationStatus;
+  message?: string | null;
+};
+
+type DisplaySettingsDisplayView = {
+  id: string;
+  index: number;
+  title: string;
+  name: string;
+  deviceName: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  workArea: { x: number; y: number; width: number; height: number };
+  primary: boolean;
+  active: boolean;
+  orientation: DisplayOrientation;
+  scalePercent: number | null;
+  refreshRateMillihz: number | null;
+  bitsPerPixel: number | null;
+  dpi: { x: number | null; y: number | null; rawX: number | null; rawY: number | null };
+  resolutionLabel: string;
+  scaleLabel: string;
+  refreshRateLabel: string;
+  resolutionOptions: Array<{ value: string; label: string; width: number; height: number }>;
+  refreshRateOptions: Array<{ value: string; label: string; refreshRateMillihz: number }>;
+  writeCapabilities: {
+    resolution: boolean;
+    refreshRate: boolean;
+    orientation: boolean;
+    primary: boolean;
+    position: boolean;
+    scale: boolean;
+  };
+};
+
+type DisplaySettingsViewModel = {
+  displays: DisplaySettingsDisplayView[];
+  selectedDisplay: DisplaySettingsDisplayView;
+  selectedDisplayId: string | null;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number };
 };
 
 type LocalInputTestResult = {
@@ -405,7 +532,8 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
-const ENDPOINT_EVENT_POLL_MS = 80;
+const LOCAL_CONTROLS_POLL_INTERVAL_MS = 5000;
+const ENDPOINT_EVENT_POLL_MS = 750;
 const LOCAL_CONTROL_EVENT_FLUSH_MS = 8;
 const RECENT_HARDWARE_EVENT_WINDOW_MS = 900;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
@@ -415,6 +543,7 @@ const HARDWARE_ASSET_MOUSE_STORAGE_KEY = "rshare.hardwareAsset.mouse";
 const HARDWARE_ASSET_GAMEPAD_STORAGE_KEY = "rshare.hardwareAsset.gamepad";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
+const DAEMON_SERVICE_BRIDGE_ENDPOINT = "/__rshare/service";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
 const NETWORK_COMMANDS = new Set([
   "dashboard_state",
@@ -443,6 +572,10 @@ const NETWORK_COMMANDS = new Set([
   "start_audio_forwarding",
   "stop_audio_forwarding",
   "run_audio_test",
+  "capture_display",
+  "identify_displays",
+  "update_display_settings",
+  "open_display_settings",
 ]);
 const WEB_NOOP_COMMANDS = new Set([
   "minimize_window",
@@ -555,6 +688,37 @@ function daemonResponseValue<T>(response: unknown, variant: string): T {
 
 async function daemonRequestValue<T>(request: unknown, variant: string): Promise<T> {
   return daemonResponseValue<T>(await daemonIpcRequest(request), variant);
+}
+
+function isDaemonIpcUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("ECONNREFUSED") ||
+    message.includes("Connection refused") ||
+    message.includes("Failed to fetch")
+  );
+}
+
+async function daemonServiceRequest<T>(
+  action: "start" | "stop",
+  variant: string,
+): Promise<T> {
+  const response = await fetch(DAEMON_SERVICE_BRIDGE_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : `daemon 服务网关请求失败：HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return daemonResponseValue<T>(payload, variant);
 }
 
 function localInputTestKindForDaemon(
@@ -701,7 +865,17 @@ function endpointEventFilter(endpointId?: string | null) {
 }
 
 async function buildNetworkDashboardState(): Promise<DashboardPayload> {
-  const status = await daemonRequestValue<unknown>("Status", "Status");
+  let autoStarted = false;
+  let status: unknown;
+  try {
+    status = await daemonRequestValue<unknown>("Status", "Status");
+  } catch (error) {
+    if (!isDaemonIpcUnavailable(error)) {
+      throw error;
+    }
+    status = await daemonServiceRequest<unknown>("start", "Status");
+    autoStarted = true;
+  }
 
   let devices: DashboardPayload["devices"] = [];
   try {
@@ -724,7 +898,7 @@ async function buildNetworkDashboardState(): Promise<DashboardPayload> {
     layout,
     visible_layout: layout,
     layout_error: layoutError,
-    auto_started: false,
+    auto_started: autoStarted,
   };
 }
 
@@ -736,9 +910,9 @@ async function invokeNetworkCommand<T = unknown>(
     case "dashboard_state":
       return (await buildNetworkDashboardState()) as T;
     case "start_service":
-      return (await daemonRequestValue<unknown>("Status", "Status")) as T;
+      return (await daemonServiceRequest<unknown>("start", "Status")) as T;
     case "stop_service":
-      return await daemonRequestValue<T>("Shutdown", "Ack");
+      return await daemonServiceRequest<T>("stop", "Ack");
     case "get_logs": {
       const limit = Number(args?.limit ?? 1000);
       const response = await fetch(
@@ -882,6 +1056,34 @@ async function invokeNetworkCommand<T = unknown>(
         },
         "LocalAudioTest",
       );
+    case "capture_display":
+      return await daemonRequestValue<T>(
+        {
+          CaptureDisplay: {
+            display_id: args?.display_id ?? args?.displayId ?? "primary",
+            max_width: args?.max_width ?? args?.maxWidth ?? 640,
+          },
+        },
+        "DisplayCapture",
+      );
+    case "identify_displays":
+      return await daemonRequestValue<T>(
+        {
+          IdentifyDisplays: {
+            duration_ms: args?.duration_ms ?? args?.durationMs ?? 2500,
+          },
+        },
+        "DisplayIdentify",
+      );
+    case "update_display_settings":
+      return await daemonRequestValue<T>(
+        {
+          UpdateDisplaySettings: args?.request ?? args,
+        },
+        "DisplaySettingsUpdated",
+      );
+    case "open_display_settings":
+      return await daemonRequestValue<T>("OpenDisplaySettings", "Ack");
     case "start_local_controls_stream":
     case "stop_local_controls_stream":
     case "start_endpoint_events_stream":
@@ -905,6 +1107,7 @@ async function listenLocalControlEvent(
 
   if (typeof WebSocket !== "undefined") {
     const socket = new WebSocket(LOCAL_CONTROLS_WS_URL);
+    let intentionalClose = false;
     socket.addEventListener("message", (event) => {
       try {
         const payload =
@@ -915,15 +1118,30 @@ async function listenLocalControlEvent(
       }
     });
     socket.addEventListener("error", () => {
-      handler("本机输入实时 WebSocket 不可用");
+      if (!intentionalClose) {
+        handler("本机输入实时 WebSocket 不可用");
+      }
     });
     socket.addEventListener("close", (event) => {
-      if (event.code !== 1000) {
+      if (!intentionalClose && event.code !== 1000) {
         handler("本机输入实时 WebSocket 已断开");
       }
     });
+    const closeSocket = () => {
+      intentionalClose = true;
+      if (socket.readyState === WebSocket.CONNECTING) {
+        socket.addEventListener("open", () => socket.close(1000), { once: true });
+        return;
+      }
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CLOSING
+      ) {
+        socket.close(1000);
+      }
+    };
     return {
-      stop: () => socket.close(1000),
+      stop: closeSocket,
       usesTauriBridge: false,
     };
   }
@@ -1567,7 +1785,7 @@ export default function App() {
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
 
-  const model = buildDesktopViewModel(payload);
+  const model = buildDesktopViewModel(payload, localControls);
   const layoutDevices = getLayoutDevices(model.layout.devices);
   const layoutMonitors = getLayoutMonitors(model.layout.monitors, hiddenMonitorIds);
   const isDark = themeMode === "system" ? systemPrefersDark : themeMode === "dark";
@@ -1627,12 +1845,10 @@ export default function App() {
   }
 
   async function refreshAll() {
-    await Promise.allSettled([
-      refreshDashboard(),
-      refreshLocalControls(),
-      refreshHardwareAssets(),
-    ]);
+    await refreshDashboard();
     setRefreshTick((value) => value + 1);
+    void refreshLocalControls();
+    void refreshHardwareAssets();
   }
 
   function setSelectedHardwareAssetId(kind: HardwareRigKind, assetId: string) {
@@ -1672,16 +1888,27 @@ export default function App() {
   };
 
   useEffect(() => {
-    refreshDashboard();
-    refreshLocalControls();
+    let cancelled = false;
+    refreshDashboard().finally(() => {
+      if (!cancelled) {
+        void refreshLocalControls();
+      }
+    });
     refreshHardwareAssets();
-    const timer = window.setInterval(() => {
+    const dashboardTimer = window.setInterval(() => {
       refreshDashboard();
-      refreshLocalControls();
       setRefreshTick((value) => value + 1);
     }, POLL_INTERVAL_MS);
+    const localControlsTimer = window.setInterval(
+      refreshLocalControls,
+      LOCAL_CONTROLS_POLL_INTERVAL_MS,
+    );
 
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(dashboardTimer);
+      window.clearInterval(localControlsTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -1809,6 +2036,7 @@ export default function App() {
     let cancelled = false;
     let subscription: LocalControlSubscription | null = null;
     let timer: number | null = null;
+    let pollInFlight = false;
 
     const rememberSequences = (events: EndpointEvent[]) => {
       for (const event of events) {
@@ -1858,17 +2086,25 @@ export default function App() {
     }
 
     async function pollAllEndpoints() {
-      for (const endpointId of endpointIds) {
-        if (cancelled) {
-          return;
-        }
-        try {
-          await pollEndpoint(endpointId);
-        } catch (pollError) {
-          if (!cancelled) {
-            setLocalControlsError(String(pollError));
+      if (pollInFlight) {
+        return;
+      }
+      pollInFlight = true;
+      try {
+        for (const endpointId of endpointIds) {
+          if (cancelled) {
+            return;
+          }
+          try {
+            await pollEndpoint(endpointId);
+          } catch (pollError) {
+            if (!cancelled) {
+              setLocalControlsError(String(pollError));
+            }
           }
         }
+      } finally {
+        pollInFlight = false;
       }
     }
 
@@ -2677,12 +2913,8 @@ function DevicesPageWithLocalControls({
   const [localTreeExpanded, setLocalTreeExpanded] = useState(true);
   const [expandedRemoteDevices, setExpandedRemoteDevices] = useState<Record<string, boolean>>({});
   const [browserAudioOutputs, setBrowserAudioOutputs] = useState<AudioOutputDevice[]>([]);
-  const { selectedIds, setSelectedId } = useHardwareAssetCatalog();
+  const { selectedIds } = useHardwareAssetCatalog();
   const hardwareRigVariant = hardwareRigVariantForManifest(selectedIds.keyboard);
-  const setHardwareRigVariant = (variant: HardwareRigVariant) => {
-    setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
-    setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2853,9 +3085,14 @@ function DevicesPageWithLocalControls({
       : device.id === selectedMonitorDeviceId,
   );
   const capabilityChips = selectedCapabilityDevice?.capabilities?.slice(0, 5) ?? [];
+  const [deviceConsoleRef, deviceConsoleSize] = useElementSize<HTMLDivElement>();
+  const compactDeviceConsole = deviceConsoleSize.width > 0 && deviceConsoleSize.width < 980;
 
   return (
-    <div className="flex h-full min-h-0 overflow-hidden">
+    <div
+      ref={deviceConsoleRef}
+      className="flex h-full min-h-0 overflow-hidden"
+    >
       <div
         className="flex w-[250px] shrink-0 flex-col overflow-hidden"
         style={{
@@ -2903,33 +3140,6 @@ function DevicesPageWithLocalControls({
                 ))}
               </div>
             ) : null}
-            <div className="mt-3">
-              <div className="mb-1 text-[11px]" style={{ color: theme.textMuted }}>
-                硬件贴图
-              </div>
-              <div className="grid grid-cols-2 gap-1 rounded-md p-1" style={{ background: "rgba(255,255,255,0.04)" }}>
-                {(["office", "gaming"] as HardwareRigVariant[]).map((variant) => {
-                  const active =
-                    selectedIds.keyboard === builtinHardwareAssetId("keyboard", variant) &&
-                    selectedIds.mouse === builtinHardwareAssetId("mouse", variant);
-                  return (
-                    <button
-                      key={variant}
-                      type="button"
-                      className="rounded px-2 py-1 text-xs transition"
-                      style={{
-                        border: `1px solid ${active ? theme.accent : "transparent"}`,
-                        background: active ? theme.accentSoft : "transparent",
-                        color: active ? theme.text : theme.textMuted,
-                      }}
-                      onClick={() => setHardwareRigVariant(variant)}
-                    >
-                      {HARDWARE_RIG_VARIANT_LABELS[variant]}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
           </div>
 
           <div className="flex flex-col gap-1">
@@ -3096,8 +3306,10 @@ function DevicesPageWithLocalControls({
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {DEVICE_CONSOLE_SECTIONS.endpointAcceptance ? (
+          <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
+        ) : null}
         {selectedRemoteDevice ? (
           <RemoteLatencyPanel
             device={selectedRemoteDevice}
@@ -3108,7 +3320,7 @@ function DevicesPageWithLocalControls({
             theme={theme}
           />
         ) : null}
-        <div className="min-h-0 flex-1 overflow-hidden">
+        <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
           {selectedPage === "overview" ? (
             <AllDevicesOverview
               snapshot={monitorSnapshot}
@@ -3140,6 +3352,7 @@ function DevicesPageWithLocalControls({
                   : onRunLocalInputTest
               }
               hardwareRigVariant={hardwareRigVariant}
+              compactLayout={compactDeviceConsole}
               theme={theme}
             />
           )}
@@ -3560,7 +3773,7 @@ function AllDevicesOverview({
       ) : null}
       <div
         ref={canvasRef}
-        className="relative h-full min-h-[640px] overflow-hidden"
+        className="relative h-full min-h-[420px] overflow-hidden md:min-h-[520px] xl:min-h-[640px]"
         style={{
           cursor: panning ? "grabbing" : "grab",
           backgroundImage: `radial-gradient(circle, ${theme.gridDot} 1px, transparent 1px)`,
@@ -3832,11 +4045,6 @@ const HardwareAssetContext = createContext<HardwareAssetContextValue>(
 function useHardwareAssetCatalog() {
   return useContext(HardwareAssetContext);
 }
-
-const HARDWARE_RIG_VARIANT_LABELS: Record<HardwareRigVariant, string> = {
-  office: "办公",
-  gaming: "游戏",
-};
 
 const HARDWARE_RIGS: Record<HardwareRigKind, Record<HardwareRigVariant, HardwareRigDefinition>> = {
   keyboard: {
@@ -4754,36 +4962,129 @@ function PhysicalDeviceShape({
     const pointerLeft = clamp((Number(activity.pointerX ?? 0) / screenWidth) * 100, 2, 98);
     const pointerTop = clamp((Number(activity.pointerY ?? 0) / screenHeight) * 100, 2, 98);
     return (
-      <div className="relative h-full w-full">
+      <div
+        className="relative h-full w-full overflow-visible"
+        data-front-facing-display={DEVICE_SIMULATOR_CHROME.frontFacingDisplays ? "true" : "false"}
+        data-window-texture={DEVICE_SIMULATOR_CHROME.displayWindowTexture ? "true" : "false"}
+      >
         <div
-          className="absolute inset-x-0 top-0 h-[78%] rounded-xl border-2"
+          className="absolute inset-x-0 top-0 h-[76%] rounded-[18px] border-[3px]"
           style={{
-            borderColor: accent,
-            background: `linear-gradient(160deg, ${theme.sidebar}, ${theme.frame})`,
-            boxShadow: `0 0 0 1px ${accent}22, ${theme.panelShadow}`,
+            borderColor: "#1a2430",
+            background:
+              "linear-gradient(180deg, rgba(10,14,20,0.98), rgba(31,38,47,0.96))",
+            boxShadow: `0 0 0 1px ${accent}55, 0 22px 36px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.08)`,
           }}
         >
           {label}
           {liveDot}
           <div
-            className="absolute inset-8 top-14 rounded-md"
+            className="absolute inset-x-5 bottom-5 top-12 overflow-hidden rounded-xl"
             style={{
-              border: `1px solid ${theme.border}`,
+              border: `1px solid ${accent}55`,
               background:
-                "linear-gradient(135deg, rgba(91,139,214,0.18), rgba(255,255,255,0.04))",
+                "radial-gradient(circle at 18% 12%, rgba(99,163,255,0.22), transparent 34%), linear-gradient(135deg, rgba(20,38,56,0.98), rgba(12,18,27,0.96))",
+              boxShadow: "inset 0 0 32px rgba(0,0,0,0.42)",
             }}
           >
             <div
-              className="absolute inset-0 rounded-md opacity-70"
+              className="absolute inset-0 opacity-70"
               style={{
                 backgroundImage:
-                  "linear-gradient(rgba(255,255,255,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.055) 1px, transparent 1px)",
-                backgroundSize: "26px 26px",
+                  "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px)",
+                backgroundSize: "22px 22px",
               }}
             />
+            <div
+              className="absolute inset-x-0 top-0 flex h-6 items-center gap-1.5 px-3"
+              style={{
+                background: "rgba(5,10,16,0.72)",
+                borderBottom: "1px solid rgba(255,255,255,0.08)",
+              }}
+            >
+              {["#ff6b73", "#f6c861", "#4ed37d"].map((color) => (
+                <span
+                  key={color}
+                  className="h-2 w-2 rounded-full"
+                  style={{ background: color }}
+                />
+              ))}
+              <span className="ml-2 text-[9px]" style={{ color: theme.textMuted }}>
+                R-ShareMouse · Desktop
+              </span>
+            </div>
+            <div
+              className="absolute bottom-4 left-4 top-10 w-11 rounded-lg"
+              style={{
+                background: "rgba(255,255,255,0.055)",
+                border: "1px solid rgba(255,255,255,0.07)",
+              }}
+            >
+              {[0, 1, 2].map((index) => (
+                <span
+                  key={index}
+                  className="mx-auto mt-3 block h-2.5 w-6 rounded-full"
+                  style={{
+                    background: index === 0 ? `${accent}88` : "rgba(255,255,255,0.16)",
+                  }}
+                />
+              ))}
+            </div>
+            <div
+              className="absolute bottom-4 left-[72px] right-4 top-10 rounded-xl"
+              style={{
+                background:
+                  "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.035))",
+                border: "1px solid rgba(255,255,255,0.12)",
+                boxShadow: "0 12px 24px rgba(0,0,0,0.22)",
+              }}
+            >
+              <div
+                className="absolute inset-x-0 top-0 flex h-6 items-center justify-between rounded-t-xl px-3"
+                style={{
+                  background: "rgba(255,255,255,0.08)",
+                  borderBottom: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <span className="text-[9px]" style={{ color: theme.textSub }}>
+                  显示窗口
+                </span>
+                <span className="text-[9px]" style={{ color: theme.textMuted }}>
+                  {pointerVisible ? "Pointer live" : "Pointer idle"}
+                </span>
+              </div>
+              <div className="absolute left-4 right-4 top-10 grid grid-cols-[1.2fr_0.8fr] gap-3">
+                <div
+                  className="h-12 rounded-lg"
+                  style={{
+                    background: `linear-gradient(135deg, ${accent}55, rgba(255,255,255,0.05))`,
+                  }}
+                />
+                <div className="grid gap-2">
+                  <span className="h-3 rounded-full" style={{ background: "rgba(255,255,255,0.18)" }} />
+                  <span className="h-3 w-2/3 rounded-full" style={{ background: "rgba(255,255,255,0.12)" }} />
+                  <span className="h-3 w-4/5 rounded-full" style={{ background: `${accent}55` }} />
+                </div>
+              </div>
+              <div className="absolute bottom-4 left-4 right-4 grid grid-cols-3 gap-2">
+                {[0, 1, 2].map((index) => (
+                  <span
+                    key={index}
+                    className="h-9 rounded-lg"
+                    style={{
+                      background:
+                        index === 1
+                          ? `${accent}33`
+                          : "rgba(255,255,255,0.08)",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
             {pointerVisible ? (
               <span
-                className="absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
+                className="absolute z-10 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
                 style={{
                   left: `${pointerLeft}%`,
                   top: `${pointerTop}%`,
@@ -4792,10 +5093,10 @@ function PhysicalDeviceShape({
                 }}
               />
             ) : null}
-            <div className="absolute bottom-4 left-5 text-lg font-semibold" style={{ color: accent }}>
+            <div className="absolute bottom-4 left-5 z-10 text-lg font-semibold" style={{ color: accent }}>
               {item.detail}
             </div>
-            <div className="absolute right-5 top-4 text-[11px]" style={{ color: theme.textMuted }}>
+            <div className="absolute right-5 top-8 z-10 text-[11px]" style={{ color: theme.textMuted }}>
               {pointerVisible
                 ? `Pointer ${Math.round(Number(activity.pointerX ?? 0))}, ${Math.round(Number(activity.pointerY ?? 0))}`
                 : "Pointer idle"}
@@ -4803,12 +5104,19 @@ function PhysicalDeviceShape({
           </div>
         </div>
         <div
-          className="absolute bottom-8 left-1/2 h-10 w-16 -translate-x-1/2 rounded-b-lg"
-          style={{ background: theme.border }}
+          className="absolute bottom-11 left-1/2 h-11 w-20 -translate-x-1/2 rounded-b-lg"
+          style={{
+            background: "linear-gradient(180deg, rgba(78,88,102,0.9), rgba(38,44,53,0.98))",
+            boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.08)",
+          }}
         />
         <div
-          className="absolute bottom-4 left-1/2 h-4 w-44 -translate-x-1/2 rounded-full"
-          style={{ background: theme.sidebar, border: `1px solid ${theme.border}` }}
+          className="absolute bottom-7 left-1/2 h-5 w-52 -translate-x-1/2 rounded-full"
+          style={{
+            background: "linear-gradient(180deg, rgba(58,65,75,0.96), rgba(22,27,34,0.98))",
+            border: "1px solid rgba(255,255,255,0.12)",
+            boxShadow: "0 12px 18px rgba(0,0,0,0.28)",
+          }}
         />
       </div>
     );
@@ -4823,12 +5131,23 @@ function PhysicalDeviceShape({
       : [];
     return (
       <div
-        className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-2xl border p-4"
-        style={{
-          borderColor: item.live ? accent : theme.border,
-          background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
-          boxShadow: theme.panelShadow,
-        }}
+        className={
+          DEVICE_SIMULATOR_CHROME.deviceFrames
+            ? "relative flex h-full w-full items-center justify-center overflow-hidden rounded-2xl border p-4"
+            : "relative flex h-full w-full items-center justify-center overflow-visible p-3"
+        }
+        style={
+          DEVICE_SIMULATOR_CHROME.deviceFrames
+            ? {
+                borderColor: item.live ? accent : theme.border,
+                background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
+                boxShadow: theme.panelShadow,
+              }
+            : {
+                background: "transparent",
+                boxShadow: "none",
+              }
+        }
       >
         {label}
         {liveDot}
@@ -4841,12 +5160,23 @@ function PhysicalDeviceShape({
           compact
         />
         <div
-          className="absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.05)",
-            color: theme.textSub,
-          }}
+          className={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? "absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
+              : "absolute bottom-3 left-5 text-[11px]"
+          }
+          style={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? {
+                  border: `1px solid ${theme.border}`,
+                  background: "rgba(255,255,255,0.05)",
+                  color: theme.textSub,
+                }
+              : {
+                  color: theme.textSub,
+                  textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+                }
+          }
         >
           最后按键 <span style={{ color: accent }}>{lastKey ?? "等待输入"}</span>
         </div>
@@ -4901,12 +5231,23 @@ function PhysicalDeviceShape({
           {item.metric}
         </div>
         <div
-          className="absolute bottom-8 left-1/2 -translate-x-1/2 rounded-md px-2 py-1 text-center text-[10px]"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.05)",
-            color: theme.textSub,
-          }}
+          className={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? "absolute bottom-8 left-1/2 -translate-x-1/2 rounded-md px-2 py-1 text-center text-[10px]"
+              : "absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-[10px]"
+          }
+          style={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? {
+                  border: `1px solid ${theme.border}`,
+                  background: "rgba(255,255,255,0.05)",
+                  color: theme.textSub,
+                }
+              : {
+                  color: theme.textSub,
+                  textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+                }
+          }
         >
           <div>
             X {pointerX} · Y {pointerY}
@@ -4926,63 +5267,41 @@ function PhysicalDeviceShape({
       : [];
     const leftX = clamp(Number(activity.leftStickX ?? 0) / 32767, -1, 1);
     const leftY = clamp(Number(activity.leftStickY ?? 0) / 32767, -1, 1);
-    const leftTrigger = clamp(Number(activity.leftTrigger ?? 0) / 1023, 0, 1);
-    const rightTrigger = clamp(Number(activity.rightTrigger ?? 0) / 1023, 0, 1);
+    const rightX = clamp(Number(activity.rightStickX ?? 0) / 32767, -1, 1);
+    const rightY = clamp(Number(activity.rightStickY ?? 0) / 32767, -1, 1);
+    const leftTrigger = clamp(Number(activity.leftTrigger ?? 0) / 65535, 0, 1);
+    const rightTrigger = clamp(Number(activity.rightTrigger ?? 0) / 65535, 0, 1);
+    const rigPressedButtons = [
+      ...pressedButtons,
+      ...(leftTrigger > 0.02 ? ["LeftTrigger", "LT"] : []),
+      ...(rightTrigger > 0.02 ? ["RightTrigger", "RT"] : []),
+    ];
     return (
-      <div className="relative h-full w-full">
-        <div
-          className="absolute inset-x-4 bottom-3 top-12 rounded-[48px] border"
-          style={{
-            borderColor: item.live ? accent : theme.border,
-            background: `linear-gradient(145deg, ${theme.sidebar}, ${theme.frame})`,
-            boxShadow: theme.panelShadow,
-          }}
-        />
+      <div className="relative flex h-full w-full items-center justify-center overflow-visible p-3">
         {label}
         {liveDot}
+        <HardwareRigView
+          kind="gamepad"
+          variant={hardwareRigVariant}
+          activity={{ pressedButtons: rigPressedButtons }}
+          accent={accent}
+          theme={theme}
+          compact
+          fitToHeight
+          fitMaxHeight={Math.max(150, item.h - 72)}
+        />
         <div
-          className="absolute left-16 top-28 h-14 w-14 rounded-full border"
-          style={{ borderColor: accent, background: `${accent}10` }}
+          className="absolute bottom-5 left-5 text-[10px]"
+          style={{
+            color: theme.textSub,
+            textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+          }}
         >
-          <span
-            className="absolute left-1/2 top-1/2 h-4 w-4 rounded-full"
-            style={{
-              background: accent,
-              transform: `translate(calc(-50% + ${leftX * 15}px), calc(-50% + ${leftY * 15}px))`,
-              boxShadow: `0 0 10px ${accent}66`,
-            }}
-          />
+          L {Math.round(leftX * 100)}, {Math.round(leftY * 100)} · R {Math.round(rightX * 100)}, {Math.round(rightY * 100)}
+          <br />
+          LT {Math.round(leftTrigger * 100)}% · RT {Math.round(rightTrigger * 100)}%
         </div>
-        <div className="absolute right-16 top-24 grid grid-cols-2 gap-2">
-          {["Y", "B", "X", "A"].map((key) => (
-            <span
-              key={key}
-              className="flex h-8 w-8 items-center justify-center rounded-full text-xs font-semibold"
-              style={{
-                background: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? accent : `${accent}22`,
-                color: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? "#ffffff" : accent,
-                boxShadow: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? `0 0 12px ${accent}66` : "none",
-              }}
-            >
-              {key}
-            </span>
-          ))}
-        </div>
-        <div className="absolute left-14 top-20 flex gap-2 text-[10px]" style={{ color: theme.textSub }}>
-          <span
-            className="rounded px-3 py-1"
-            style={{ border: `1px solid ${theme.border}`, background: `${accent}${leftTrigger ? "33" : "12"}` }}
-          >
-            LT {Math.round(leftTrigger * 100)}%
-          </span>
-          <span
-            className="rounded px-3 py-1"
-            style={{ border: `1px solid ${theme.border}`, background: `${accent}${rightTrigger ? "33" : "12"}` }}
-          >
-            RT {Math.round(rightTrigger * 100)}%
-          </span>
-        </div>
-        <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-sm font-semibold" style={{ color: accent }}>
+        <div className="absolute bottom-5 right-5 text-sm font-semibold" style={{ color: accent }}>
           {item.metric}
         </div>
       </div>
@@ -5113,17 +5432,6 @@ function galleryKeyboardKeyCandidates(key: string) {
     candidates.push(key.toLowerCase(), key.toUpperCase());
   }
   return candidates;
-}
-
-function normalizeGamepadButtonToken(value: string) {
-  const normalized = normalizeKeyToken(value);
-  const aliasMap: Record<string, string> = {
-    south: "a",
-    east: "b",
-    west: "x",
-    north: "y",
-  };
-  return aliasMap[normalized] ?? normalized;
 }
 
 function latestLocalControlEvent(
@@ -6122,6 +6430,7 @@ function LocalControlDriverHub({
   onSelectedDeviceIdChange,
   onRunInputTest,
   hardwareRigVariant = "office",
+  compactLayout = false,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
@@ -6140,6 +6449,7 @@ function LocalControlDriverHub({
   onSelectedDeviceIdChange?: (deviceId: string) => void;
   onRunInputTest: (kind: string) => void;
   hardwareRigVariant?: HardwareRigVariant;
+  compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const selectedDevices = localDeviceItems(snapshot, selectedKind, audioOutputs);
@@ -6165,30 +6475,34 @@ function LocalControlDriverHub({
           background: theme.frame,
         }}
       >
-        <div className="mb-2 flex h-9 shrink-0 items-center gap-2">
-          {remoteDevice ? (
-            <div className="min-w-0 text-xs" style={{ color: theme.textMuted }}>
-              正在监听 {remoteDevice.name} · {remoteDevice.hostname}
-            </div>
-          ) : (
-            <DeviceSelector
-              items={selectedDevices}
-              selectedId={selectedDeviceId}
-              onChange={onSelectedDeviceIdChange}
-              theme={theme}
-            />
-          )}
-        </div>
+        {selectedKind === "display" ? null : (
+          <div className="mb-2 flex h-9 shrink-0 items-center gap-2">
+            {remoteDevice ? (
+              <div className="min-w-0 text-xs" style={{ color: theme.textMuted }}>
+                正在监听 {remoteDevice.name} · {remoteDevice.hostname}
+              </div>
+            ) : (
+              <DeviceSelector
+                items={selectedDevices}
+                selectedId={selectedDeviceId}
+                onChange={onSelectedDeviceIdChange}
+                theme={theme}
+              />
+            )}
+          </div>
+        )}
         <LocalControlDetail
           kind={selectedKind}
           snapshot={snapshot}
           selectedDeviceId={selectedDeviceId}
+          onSelectedDeviceIdChange={onSelectedDeviceIdChange}
           remoteDevice={remoteDevice}
           audioOutputs={audioOutputs}
           inputTestResult={inputTestResult}
           confirmingInputTest={confirmingInputTest}
           onRunInputTest={onRunInputTest}
           hardwareRigVariant={hardwareRigVariant}
+          compactLayout={compactLayout}
           theme={theme}
         />
       </div>
@@ -6263,7 +6577,9 @@ function LocalControlDetail({
   inputTestResult,
   confirmingInputTest,
   onRunInputTest,
+  onSelectedDeviceIdChange,
   hardwareRigVariant,
+  compactLayout = false,
   theme,
 }: {
   kind: LocalControlKind;
@@ -6278,7 +6594,9 @@ function LocalControlDetail({
   confirmingInputTest: string | null;
   selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
+  onSelectedDeviceIdChange?: (deviceId: string) => void;
   hardwareRigVariant: HardwareRigVariant;
+  compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const effectiveSelectedDeviceId = selectedLocalDeviceId(snapshot, kind, selectedDeviceId);
@@ -6310,8 +6628,14 @@ function LocalControlDetail({
         ? "再次点击执行 Shift 测试"
         : "真实注入测试";
     return (
-      <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3">
-        <div className="relative min-h-0">
+      <div
+        className={
+          compactLayout
+            ? "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto"
+            : "grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3"
+        }
+      >
+        <div className={compactLayout ? "relative min-h-[320px]" : "relative min-h-0"}>
           <SimulatedKeyboard pressedKeys={keyboardState.pressedKeys} lastKey={keyboardState.lastKey} recentEvents={recentEvents} eventCount={keyboardState.eventCount} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="键盘" theme={theme} />
@@ -6330,8 +6654,14 @@ function LocalControlDetail({
         ? "再次点击执行移动测试"
         : "真实注入测试";
     return (
-      <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="relative min-h-0">
+      <div
+        className={
+          compactLayout
+            ? "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto"
+            : "grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]"
+        }
+      >
+        <div className={compactLayout ? "relative min-h-[360px]" : "relative min-h-0"}>
           <SimulatedMouse x={mouseState.x} y={mouseState.y} pressedButtons={mouseState.pressedButtons} recentEvents={recentEvents} wheelDeltaX={mouseState.wheelDeltaX} wheelDeltaY={mouseState.wheelDeltaY} wheelTotalX={mouseState.wheelTotalX} wheelTotalY={mouseState.wheelTotalY} eventCount={mouseState.eventCount} moveCount={mouseState.moveCount} buttonPressCount={mouseState.buttonPressCount} buttonReleaseCount={mouseState.buttonReleaseCount} wheelEventCount={mouseState.wheelEventCount} displayRelativeX={mouseState.displayRelativeX} displayRelativeY={mouseState.displayRelativeY} currentDisplayIndex={mouseState.currentDisplayIndex} currentDisplayId={mouseState.currentDisplayId} displays={snapshot?.display.displays ?? []} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="鼠标" theme={theme} />
@@ -6349,7 +6679,474 @@ function LocalControlDetail({
   if (kind === "audio") {
     return <AudioDetail snapshot={snapshot} audioOutputs={audioOutputs} theme={theme} />;
   }
-  return <DisplayActivityPreview snapshot={snapshot} theme={theme} />;
+  return (
+    <DisplaySettingsDetail
+      snapshot={snapshot}
+      selectedDisplayId={effectiveSelectedDeviceId}
+      onSelectedDisplayIdChange={onSelectedDeviceIdChange}
+      theme={theme}
+    />
+  );
+}
+
+function DisplaySettingsDetail({
+  snapshot,
+  selectedDisplayId,
+  onSelectedDisplayIdChange,
+  theme,
+}: {
+  snapshot: LocalControlsSnapshot | null;
+  selectedDisplayId?: string;
+  onSelectedDisplayIdChange?: (displayId: string) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const view = buildDisplaySettingsViewModel(
+    snapshot,
+    selectedDisplayId,
+  ) as DisplaySettingsViewModel;
+  const selected = view.selectedDisplay;
+  const [captures, setCaptures] = useState<Record<string, string>>({});
+  const [resolutionValue, setResolutionValue] = useState("");
+  const [refreshRateValue, setRefreshRateValue] = useState("");
+  const [scaleValue, setScaleValue] = useState("100");
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setResolutionValue(`${selected.width}x${selected.height}`);
+    setRefreshRateValue(
+      selected.refreshRateMillihz ? String(selected.refreshRateMillihz) : "",
+    );
+    setScaleValue(String(selected.scalePercent ?? 100));
+  }, [selected.id, selected.width, selected.height, selected.refreshRateMillihz, selected.scalePercent]);
+
+  const scaleOptions = displayScaleOptions(selected.scalePercent);
+  const scaleChanged = Number(scaleValue) !== Number(selected.scalePercent ?? 100);
+  const canApplyDisplayMode =
+    selected.writeCapabilities.resolution ||
+    selected.writeCapabilities.refreshRate ||
+    selected.writeCapabilities.scale ||
+    scaleChanged;
+
+  const runDisplayAction = async <T,>(
+    action: string,
+    task: () => Promise<T>,
+    successMessage: (result: T) => string,
+  ) => {
+    setBusyAction(action);
+    setStatusMessage(null);
+    try {
+      const result = await task();
+      setStatusMessage(successMessage(result));
+      return result;
+    } catch (error) {
+      setStatusMessage(`操作失败：${String(error)}`);
+      return null;
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const captureDisplayBackgrounds = () =>
+    void runDisplayAction(
+      "capture",
+      async () => {
+        const results: Array<{ displayId: string; result: DisplayCaptureResult }> = [];
+        for (const display of view.displays) {
+          const result = await invokeCommand<DisplayCaptureResult>("capture_display", {
+            display_id: display.id,
+            max_width: 900,
+          });
+          results.push({ displayId: display.id, result });
+        }
+        return results;
+      },
+      (results) => {
+        const nextCaptures: Record<string, string> = {};
+        for (const { displayId, result } of results) {
+          if (result.status !== "Success") {
+            continue;
+          }
+          const dataUrl = displayCaptureDataUrl(result);
+          if (dataUrl) {
+            nextCaptures[displayId] = dataUrl;
+          }
+        }
+        if (Object.keys(nextCaptures).length) {
+          setCaptures((current) => ({ ...current, ...nextCaptures }));
+        }
+        return `桌面贴图已更新：${Object.keys(nextCaptures).length}/${view.displays.length} 台显示器`;
+      },
+    );
+
+  const identifyDisplays = () =>
+    void runDisplayAction(
+      "identify",
+      () => invokeCommand<{ status: DisplayOperationStatus; message?: string | null }>(
+        "identify_displays",
+        { duration_ms: 2500 },
+      ),
+      (result) => displayOperationMessage(result.status, result.message, "正在标识显示器"),
+    );
+
+  const openWindowsDisplaySettings = () =>
+    void runDisplayAction(
+      "open-settings",
+      () => invokeCommand("open_display_settings"),
+      () => "已请求打开 Windows 显示设置",
+    );
+
+  const applyDisplaySettings = () =>
+    void runDisplayAction(
+      "apply",
+      () => {
+        const [width, height] = resolutionValue.split("x").map((value) => Number(value));
+        const refreshRateMillihz = Number(refreshRateValue || selected.refreshRateMillihz);
+        const scalePercent = Number(scaleValue || selected.scalePercent);
+        const request: Record<string, unknown> = {
+          display_id: selected.id,
+        };
+        if (Number.isFinite(width) && Number.isFinite(height)) {
+          request.width = width;
+          request.height = height;
+        }
+        if (Number.isFinite(refreshRateMillihz) && refreshRateMillihz > 0) {
+          request.refresh_rate_millihz = refreshRateMillihz;
+        }
+        if (
+          Number.isFinite(scalePercent) &&
+          scalePercent > 0 &&
+          scalePercent !== selected.scalePercent
+        ) {
+          request.scale_percent = scalePercent;
+        }
+        return invokeCommand<DisplaySettingsUpdateResult>("update_display_settings", {
+          request,
+        });
+      },
+      (result) =>
+        displayOperationMessage(
+          result.status,
+          result.message,
+          "显示设置已应用，正在等待守护进程刷新",
+        ),
+    );
+
+  return (
+    <div className="rshare-scroll h-full min-h-0 overflow-auto pr-1">
+      <section
+        className="min-h-full p-4"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.sidebar,
+        }}
+      >
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold">显示器设置</h2>
+            <p className="text-sm" style={{ color: theme.textMuted }}>
+              按 Windows 显示设置组织本机屏幕、截图和可写显示参数。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "identify"}
+            onClick={identifyDisplays}
+          >
+            标识
+          </button>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "capture"}
+            onClick={captureDisplayBackgrounds}
+          >
+            获取桌面贴图
+          </button>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "open-settings"}
+            onClick={openWindowsDisplaySettings}
+          >
+            Windows 设置
+          </button>
+        </div>
+
+        <div
+          className="relative mb-4 h-[320px] overflow-hidden rounded-md"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background:
+              "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px)",
+            backgroundSize: "24px 24px",
+          }}
+        >
+          <svg
+            className="absolute inset-0 h-full w-full"
+            viewBox={`${view.bounds.minX} ${view.bounds.minY} ${view.bounds.width} ${view.bounds.height}`}
+            preserveAspectRatio="xMidYMid meet"
+            role="img"
+            aria-label="Windows style display arrangement"
+          >
+            {view.displays.map((display) => {
+              const active = display.id === selected.id;
+              const capture = captures[display.id];
+              const strokeWidth = Math.max(view.bounds.width, view.bounds.height) / 420;
+              return (
+                <g
+                  key={display.id}
+                  onClick={() => onSelectedDisplayIdChange?.(display.id)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <rect
+                    x={display.x}
+                    y={display.y}
+                    width={display.width}
+                    height={display.height}
+                    rx={10}
+                    fill={active ? theme.accentSoft : "rgba(255,255,255,0.055)"}
+                    stroke={active ? theme.accent : theme.border}
+                    strokeWidth={strokeWidth * (active ? 2.4 : 1.2)}
+                  />
+                  {capture ? (
+                    <image
+                      href={capture}
+                      x={display.x}
+                      y={display.y}
+                      width={display.width}
+                      height={display.height}
+                      preserveAspectRatio="xMidYMid slice"
+                      opacity={active ? 0.76 : 0.48}
+                    />
+                  ) : null}
+                  <rect
+                    x={display.x}
+                    y={display.y}
+                    width={display.width}
+                    height={display.height}
+                    rx={10}
+                    fill={active ? "rgba(59,130,246,0.14)" : "rgba(0,0,0,0.22)"}
+                    stroke={active ? theme.accent : theme.border}
+                    strokeWidth={strokeWidth * (active ? 2.4 : 1.2)}
+                  />
+                  <text
+                    x={display.x + display.width / 2}
+                    y={display.y + display.height / 2}
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill={theme.text}
+                    fontSize={Math.max(view.bounds.height / 13, 52)}
+                    fontWeight={700}
+                  >
+                    {display.index + 1}
+                  </text>
+                  <text
+                    x={display.x + display.width * 0.04}
+                    y={display.y + display.height * 0.88}
+                    fill={theme.textSub}
+                    fontSize={Math.max(view.bounds.height / 28, 24)}
+                  >
+                    {display.resolutionLabel}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="min-w-0">
+            <div className="mb-3">
+              <div className="text-base font-semibold">
+                {selected.title} · {selected.name}
+              </div>
+              <div className="text-xs" style={{ color: theme.textMuted }}>
+                {selected.deviceName ?? selected.id}
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-3">
+              <DisplaySettingSelect
+                label="缩放"
+                value={scaleValue}
+                onChange={setScaleValue}
+                options={scaleOptions}
+                theme={theme}
+              />
+              <DisplaySettingSelect
+                label="显示器分辨率"
+                value={resolutionValue}
+                onChange={setResolutionValue}
+                options={selected.resolutionOptions}
+                disabled={!selected.writeCapabilities.resolution}
+                theme={theme}
+              />
+              <DisplaySettingSelect
+                label="刷新率"
+                value={refreshRateValue}
+                onChange={setRefreshRateValue}
+                options={selected.refreshRateOptions}
+                disabled={!selected.writeCapabilities.refreshRate}
+                theme={theme}
+              />
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="rounded-md px-4 py-2 text-sm"
+                style={secondaryButtonStyle(theme)}
+                disabled={!canApplyDisplayMode || busyAction === "apply"}
+                onClick={applyDisplaySettings}
+              >
+                应用显示参数
+              </button>
+              <span className="text-xs" style={{ color: theme.textMuted }}>
+                位置与主显示器写入：{selected.writeCapabilities.position || selected.writeCapabilities.primary ? "可用" : "当前后端暂不支持"}
+              </span>
+            </div>
+
+            {statusMessage ? (
+              <div
+                className="mt-3 rounded-md px-3 py-2 text-xs"
+                style={{
+                  border: `1px solid ${theme.border}`,
+                  background: theme.frame,
+                  color: theme.textSub,
+                }}
+              >
+                {statusMessage}
+              </div>
+            ) : null}
+          </div>
+
+          <aside className="grid gap-2 text-sm">
+            <InfoRow label="坐标" value={`${selected.x}, ${selected.y}`} theme={theme} />
+            <InfoRow label="尺寸" value={selected.resolutionLabel} theme={theme} />
+            <InfoRow label="工作区" value={`${selected.workArea.width} × ${selected.workArea.height}`} theme={theme} />
+            <InfoRow label="方向" value={displayOrientationLabel(selected.orientation)} theme={theme} />
+            <InfoRow label="缩放" value={selected.scaleLabel} theme={theme} />
+            <InfoRow label="刷新率" value={selected.refreshRateLabel} theme={theme} />
+            <InfoRow
+              label="DPI"
+              value={
+                selected.dpi.rawX || selected.dpi.x
+                  ? `${selected.dpi.rawX ?? selected.dpi.x} / ${selected.dpi.rawY ?? selected.dpi.y}`
+                  : "未知"
+              }
+              theme={theme}
+            />
+            <InfoRow label="颜色深度" value={selected.bitsPerPixel ? `${selected.bitsPerPixel} bpp` : "未知"} theme={theme} />
+          </aside>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DisplaySettingSelect({
+  label,
+  value,
+  options,
+  disabled = false,
+  onChange,
+  theme,
+}: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <label className="block min-w-0 text-sm">
+      <span className="mb-1 block" style={{ color: theme.textSub }}>
+        {label}
+      </span>
+      <select
+        className="h-9 w-full rounded-md px-2 text-sm outline-none"
+        value={value}
+        disabled={disabled || !options.length}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.frame,
+          color: disabled ? theme.textMuted : theme.text,
+        }}
+      >
+        {options.length ? (
+          options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))
+        ) : (
+          <option value="">不可用</option>
+        )}
+      </select>
+    </label>
+  );
+}
+
+function displayScaleOptions(currentScale: number | null) {
+  const values = new Set([100, 125, 150, 175, 200, 225, 250]);
+  if (currentScale && Number.isFinite(currentScale)) {
+    values.add(currentScale);
+  }
+  return [...values].sort((left, right) => left - right).map((value) => ({
+    value: String(value),
+    label: `${value}%`,
+  }));
+}
+
+function displayCaptureDataUrl(result: DisplayCaptureResult) {
+  const bytes = result.bytes instanceof Uint8Array
+    ? result.bytes
+    : Array.isArray(result.bytes)
+      ? Uint8Array.from(result.bytes)
+      : null;
+  if (!bytes?.length) {
+    return null;
+  }
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(offset, offset + chunkSize));
+  }
+  return `data:${result.mime_type ?? "image/bmp"};base64,${btoa(binary)}`;
+}
+
+function displayOperationMessage(
+  status: DisplayOperationStatus,
+  message: string | null | undefined,
+  success: string,
+) {
+  if (status === "Success") {
+    return message ?? success;
+  }
+  if (status === "RequiresSystemSettings") {
+    return message ?? "该设置需要在 Windows 系统显示设置中完成";
+  }
+  return message ?? `显示操作返回 ${status}`;
+}
+
+function displayOrientationLabel(orientation: DisplayOrientation) {
+  switch (orientation) {
+    case "Portrait":
+      return "纵向";
+    case "LandscapeFlipped":
+      return "横向（翻转）";
+    case "PortraitFlipped":
+      return "纵向（翻转）";
+    default:
+      return "横向";
+  }
 }
 
 function DeviceAttributionNotice({
@@ -7838,6 +8635,14 @@ function HardwareAssetSettingsPanel({
     "gamepad",
     selectedIds.gamepad,
   ) as HardwareRigDefinition | null;
+  const presetOptions = getHardwareAssetPresetOptions() as Array<{
+    key: HardwareRigVariant;
+    label: string;
+  }>;
+  const setHardwareRigVariant = (variant: HardwareRigVariant) => {
+    setSelectedId("keyboard", builtinHardwareAssetId("keyboard", variant));
+    setSelectedId("mouse", builtinHardwareAssetId("mouse", variant));
+  };
 
   const handleImportFile = async (file: File | null | undefined) => {
     if (!file) {
@@ -7928,6 +8733,38 @@ function HardwareAssetSettingsPanel({
           <p className="text-sm" style={{ color: theme.textMuted }}>
             贴图、按键区域和导入包状态。
           </p>
+        </div>
+      </div>
+
+      <div
+        className="mb-4 rounded-md p-3"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.frame,
+        }}
+      >
+        <div className="mb-2 text-sm font-medium">贴图设置</div>
+        <div className="grid w-full max-w-[260px] grid-cols-2 gap-1 rounded-md p-1" style={{ background: "rgba(255,255,255,0.04)" }}>
+          {presetOptions.map((option) => {
+            const active =
+              selectedIds.keyboard === builtinHardwareAssetId("keyboard", option.key) &&
+              selectedIds.mouse === builtinHardwareAssetId("mouse", option.key);
+            return (
+              <button
+                key={option.key}
+                type="button"
+                className="rounded px-2 py-1.5 text-xs transition"
+                style={{
+                  border: `1px solid ${active ? theme.accent : "transparent"}`,
+                  background: active ? theme.accentSoft : "transparent",
+                  color: active ? theme.text : theme.textMuted,
+                }}
+                onClick={() => setHardwareRigVariant(option.key)}
+              >
+                {option.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -8122,35 +8959,228 @@ function SettingsPage({
   busy: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  return (
-    <div className="rshare-scroll grid h-full grid-cols-1 gap-3 overflow-auto xl:grid-cols-[1.1fr_0.9fr]">
-      <section
-        className="p-5"
-        style={{
-          background: theme.sidebar,
-          border: `1px solid ${theme.border}`,
-          boxShadow: theme.panelShadow,
-        }}
+  const [selectedSection, setSelectedSection] = useState<SettingsSectionKey>("local");
+  const selectedSectionMeta =
+    SETTINGS_LAYOUT_SECTIONS.find((section) => section.key === selectedSection) ??
+    SETTINGS_LAYOUT_SECTIONS[0];
+  const panelStyle = {
+    background: theme.sidebar,
+    border: `1px solid ${theme.border}`,
+    boxShadow: theme.panelShadow,
+  };
+  const mutedIconStyle = {
+    background: "rgba(255,255,255,0.04)",
+    color: theme.textSub,
+  };
+  const sectionSummary: Record<SettingsSectionKey, string> = {
+    local: localDevice.name,
+    service: service.online ? "运行中" : "已停止",
+    hardware: "贴图设置",
+    input: inputMode.current,
+    appearance:
+      getThemeModeOptions().find((option) => option.key === themeMode)?.label ??
+      themeMode,
+    acceptance: acceptance.nextStep,
+  };
+  const renderSectionHeader = (
+    icon: ReactNode,
+    title: string,
+    description: string,
+    accent = false,
+  ) => (
+    <div className="mb-5 flex items-center gap-3">
+      <div
+        className="flex h-11 w-11 items-center justify-center rounded-md"
+        style={accent ? { background: theme.accentSoft, color: theme.accent } : mutedIconStyle}
       >
-        <div className="mb-5 flex items-center gap-3">
-          <div
-            className="flex h-11 w-11 items-center justify-center rounded-md"
-            style={{
-              background: theme.accentSoft,
-              color: theme.accent,
-            }}
-          >
-            <Settings size={18} />
-          </div>
-          <div>
-            <h2 className="text-lg font-semibold">本机信息</h2>
-            <p className="text-sm" style={{ color: theme.textMuted }}>
-              当前界面显示的是守护进程快照提供的最小设置集。
-            </p>
-          </div>
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <h2 className="text-lg font-semibold">{title}</h2>
+        <p className="text-sm" style={{ color: theme.textMuted }}>
+          {description}
+        </p>
+      </div>
+    </div>
+  );
+
+  let sectionContent: ReactNode;
+  if (selectedSection === "service") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Wifi size={18} />,
+          "服务状态",
+          "当前守护进程会话的快速运行信息。",
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow label="守护进程" value={service.online ? "运行中" : "已停止"} theme={theme} />
+          <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
+          <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
+          <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
         </div>
 
-        <div className="grid grid-cols-2 gap-3 text-sm">
+        <button
+          type="button"
+          className="mt-5 rounded-md px-4 py-2 text-sm transition"
+          style={{
+            background: service.online
+              ? "rgba(197, 48, 48, 0.08)"
+              : theme.accentSoft,
+            color: service.online ? "#9f1f2d" : theme.accent,
+            border: `1px solid ${
+              service.online ? "rgba(197, 48, 48, 0.55)" : theme.accent
+            }`,
+            opacity: busy ? 0.7 : 1,
+          }}
+          disabled={busy}
+          onClick={onToggleService}
+        >
+          {service.online ? "停止服务" : "启动服务"}
+        </button>
+      </section>
+    );
+  } else if (selectedSection === "hardware") {
+    sectionContent = <HardwareAssetSettingsPanel theme={theme} />;
+  } else if (selectedSection === "input") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <LayoutGrid size={18} />,
+          "输入后端",
+          "当前输入模式以及降级可见性都来自守护进程。",
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow label="当前模式" value={inputMode.current} theme={theme} />
+          <InfoRow label="健康度" value={inputMode.health} theme={theme} />
+          <InfoRow label="原因" value={inputMode.reason ?? "无"} theme={theme} />
+          <InfoRow
+            label="可用后端"
+            value={inputMode.available.length ? inputMode.available.join(", ") : "无"}
+            theme={theme}
+          />
+        </div>
+      </section>
+    );
+  } else if (selectedSection === "appearance") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Settings size={18} />,
+          "界面风格",
+          "选择浅色、深色或跟随系统。",
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          {getThemeModeOptions().map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              className="rounded-md px-4 py-2 text-sm transition"
+              style={{
+                background:
+                  themeMode === option.key ? theme.accentSoft : theme.frame,
+                color: themeMode === option.key ? theme.text : theme.textSub,
+                border: `1px solid ${
+                  themeMode === option.key ? theme.accent : theme.border
+                }`,
+              }}
+              onClick={() => onThemeModeChange(option.key as ThemeMode)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </section>
+    );
+  } else if (selectedSection === "acceptance") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Monitor size={18} />,
+          "实机验收",
+          "打开另一台机器前，先确认后台、布局和输入主链路都已就绪。",
+          true,
+        )}
+
+        <div className="mb-4 flex flex-wrap gap-2 text-xs">
+          <AcceptanceBadge
+            label={acceptance.daemonOnline ? "Daemon 在线" : "Daemon 离线"}
+            state={acceptance.daemonOnline ? "pass" : "block"}
+            theme={theme}
+          />
+          <AcceptanceBadge
+            label={acceptance.autoStarted ? "Desktop 已自动拉起" : "未发生自动拉起"}
+            state={acceptance.autoStarted ? "warn" : "pass"}
+            theme={theme}
+          />
+          <AcceptanceBadge
+            label={`托盘 ${acceptance.trayState}`}
+            state={
+              acceptance.trayOwnedByDaemon
+                ? acceptance.trayState === "Running"
+                  ? "pass"
+                  : "warn"
+                : "block"
+            }
+            theme={theme}
+          />
+        </div>
+
+        <div className="space-y-3">
+          {acceptance.checks.map((check) => (
+            <div
+              key={check.key}
+              className="flex items-start gap-3 rounded-md px-4 py-3"
+              style={{
+                border: `1px solid ${theme.border}`,
+                background: theme.frame,
+              }}
+            >
+              <AcceptanceDot state={check.state} theme={theme} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-medium">{check.label}</div>
+                  <AcceptanceBadge label={acceptanceStateLabel(check.state)} state={check.state} theme={theme} />
+                </div>
+                <div className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
+                  {check.detail}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div
+          className="mt-4 rounded-md px-4 py-3 text-sm"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.frame,
+          }}
+        >
+          <div
+            className="mb-2 text-xs uppercase tracking-[0.16em]"
+            style={{ color: theme.textMuted }}
+          >
+            下一步
+          </div>
+          <div className="font-medium">{acceptance.nextStep}</div>
+        </div>
+      </section>
+    );
+  } else {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Settings size={18} />,
+          "本机信息",
+          "当前界面显示的是守护进程快照提供的最小设置集。",
+          true,
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
           <InfoRow label="设备名" value={localDevice.name} theme={theme} />
           <InfoRow label="主机名" value={localDevice.hostname} theme={theme} />
           <InfoRow label="监听地址" value={localDevice.bindAddress} theme={theme} />
@@ -8159,241 +9189,57 @@ function SettingsPage({
           <InfoRow label="权限状态" value={privilegeState} theme={theme} />
         </div>
       </section>
+    );
+  }
 
-      <div className="flex flex-col gap-4">
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden lg:flex-row">
+      <aside
+        className="rshare-scroll flex shrink-0 flex-col gap-2 overflow-auto p-3 lg:w-[300px]"
+        style={{
+          borderRight: `1px solid ${theme.border}`,
+          background: theme.sidebar,
+        }}
+      >
+        <div className="mb-2 px-2">
+          <div className="text-lg font-semibold">设置</div>
+          <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
+            {selectedSectionMeta.description}
+          </div>
+        </div>
+        {SETTINGS_LAYOUT_SECTIONS.map((section) => {
+          const active = selectedSection === section.key;
+          return (
+            <button
+              key={section.key}
+              type="button"
+              aria-pressed={active}
+              className="w-full rounded-md px-3 py-2.5 text-left transition"
               style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
+                border: `1px solid ${active ? theme.accent : "transparent"}`,
+                background: active ? theme.accentSoft : "transparent",
+                color: active ? theme.text : theme.textSub,
               }}
+              onClick={() => setSelectedSection(section.key)}
             >
-              <Wifi size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">服务状态</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                当前守护进程会话的快速运行信息。
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-3 text-sm">
-            <InfoRow label="守护进程" value={service.online ? "运行中" : "已停止"} theme={theme} />
-            <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
-            <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
-            <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
-          </div>
-
-          <button
-            type="button"
-            className="mt-5 rounded-md px-4 py-2 text-sm transition"
-            style={{
-              background: service.online
-                ? "rgba(197, 48, 48, 0.08)"
-                : theme.accentSoft,
-              color: service.online ? "#9f1f2d" : theme.accent,
-              border: `1px solid ${
-                service.online
-                  ? "rgba(197, 48, 48, 0.55)"
-                  : theme.accent
-              }`,
-              opacity: busy ? 0.7 : 1,
-            }}
-            disabled={busy}
-            onClick={onToggleService}
-          >
-            {service.online ? "停止服务" : "启动服务"}
-          </button>
-        </section>
-
-        <HardwareAssetSettingsPanel theme={theme} />
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
-              }}
-            >
-              <LayoutGrid size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">输入后端</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                当前输入模式以及降级可见性都来自守护进程。
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-3 text-sm">
-            <InfoRow label="当前模式" value={inputMode.current} theme={theme} />
-            <InfoRow label="健康度" value={inputMode.health} theme={theme} />
-            <InfoRow label="原因" value={inputMode.reason ?? "无"} theme={theme} />
-            <InfoRow
-              label="可用后端"
-              value={inputMode.available.length ? inputMode.available.join(", ") : "无"}
-              theme={theme}
-            />
-          </div>
-        </section>
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
-              }}
-            >
-              <Settings size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">界面风格</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                选择浅色、深色或跟随系统。
-              </p>
-            </div>
-          </div>
-
-          <div className="flex gap-2">
-            {getThemeModeOptions().map((option) => (
-              <button
-                key={option.key}
-                type="button"
-                className="rounded-md px-4 py-2 text-sm transition"
-                style={{
-                  background:
-                    themeMode === option.key ? theme.accentSoft : theme.frame,
-                  color: themeMode === option.key ? theme.text : theme.textSub,
-                  border: `1px solid ${
-                    themeMode === option.key ? theme.accent : theme.border
-                  }`,
-                }}
-                onClick={() => onThemeModeChange(option.key as ThemeMode)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: theme.accentSoft,
-                color: theme.accent,
-              }}
-            >
-              <Monitor size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">实机验收</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                打开另一台机器前，先确认后台、布局和输入主链路都已就绪。
-              </p>
-            </div>
-          </div>
-
-          <div className="mb-4 flex flex-wrap gap-2 text-xs">
-            <AcceptanceBadge
-              label={acceptance.daemonOnline ? "Daemon 在线" : "Daemon 离线"}
-              state={acceptance.daemonOnline ? "pass" : "block"}
-              theme={theme}
-            />
-            <AcceptanceBadge
-              label={acceptance.autoStarted ? "Desktop 已自动拉起" : "未发生自动拉起"}
-              state={acceptance.autoStarted ? "warn" : "pass"}
-              theme={theme}
-            />
-            <AcceptanceBadge
-              label={`托盘 ${acceptance.trayState}`}
-              state={
-                acceptance.trayOwnedByDaemon
-                  ? acceptance.trayState === "Running"
-                    ? "pass"
-                    : "warn"
-                  : "block"
-              }
-              theme={theme}
-            />
-          </div>
-
-          <div className="space-y-3">
-            {acceptance.checks.map((check) => (
-              <div
-                key={check.key}
-                className="flex items-start gap-3 rounded-md px-4 py-3"
-                style={{
-                  border: `1px solid ${theme.border}`,
-                  background: theme.frame,
-                }}
-              >
-                <AcceptanceDot state={check.state} theme={theme} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <div className="text-sm font-medium">{check.label}</div>
-                    <AcceptanceBadge label={acceptanceStateLabel(check.state)} state={check.state} theme={theme} />
-                  </div>
-                  <div className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
-                    {check.detail}
-                  </div>
-                </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-medium">{section.label}</span>
+                <span className="truncate text-xs" style={{ color: theme.textMuted }}>
+                  {sectionSummary[section.key]}
+                </span>
               </div>
-            ))}
-          </div>
+              <div className="mt-1 truncate text-xs" style={{ color: theme.textMuted }}>
+                {section.description}
+              </div>
+            </button>
+          );
+        })}
+      </aside>
 
-          <div
-            className="mt-4 rounded-md px-4 py-3 text-sm"
-            style={{
-              border: `1px solid ${theme.border}`,
-              background: theme.frame,
-            }}
-          >
-            <div
-              className="mb-2 text-xs uppercase tracking-[0.16em]"
-              style={{ color: theme.textMuted }}
-            >
-              下一步
-            </div>
-            <div className="font-medium">{acceptance.nextStep}</div>
-          </div>
-        </section>
+      <div className="rshare-scroll min-h-0 flex-1 overflow-auto p-4">
+        <div className="mx-auto max-w-[980px]">
+          {sectionContent}
+        </div>
       </div>
     </div>
   );

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'path'
 import net from 'node:net'
+import { spawn } from 'node:child_process'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 
@@ -15,6 +16,18 @@ type LogEntry = {
   level: string
   target: string
   message: string
+}
+
+type ServiceAction = 'start' | 'stop'
+
+function isDaemonIpcUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return (
+    message.includes('ECONNREFUSED') ||
+    message.includes('ECONNRESET') ||
+    message.includes('daemon IPC closed without a response') ||
+    message.includes('daemon IPC timed out')
+  )
 }
 
 function sendDaemonIpc(request: unknown): Promise<unknown> {
@@ -67,6 +80,86 @@ function sendDaemonIpc(request: unknown): Promise<unknown> {
       }
     })
   })
+}
+
+async function waitForDaemonStatus(timeoutMs = 8000): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown = null
+
+  while (Date.now() < deadline) {
+    try {
+      return await sendDaemonIpc('Status')
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+async function findDaemonBinary(): Promise<string | null> {
+  if (process.env.RSHARE_DAEMON_BIN) {
+    try {
+      await fs.access(process.env.RSHARE_DAEMON_BIN)
+      return process.env.RSHARE_DAEMON_BIN
+    } catch {
+      return null
+    }
+  }
+
+  const repoRoot = path.resolve(__dirname, '../..')
+  const executableName = process.platform === 'win32' ? 'rshare-daemon.exe' : 'rshare-daemon'
+  const candidates = [
+    path.join(repoRoot, 'target', 'debug', executableName),
+    path.join(repoRoot, 'target', 'release', executableName),
+  ]
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate)
+      return candidate
+    } catch {
+      // Keep looking.
+    }
+  }
+
+  return null
+}
+
+async function spawnDaemonProcess() {
+  const daemonBinary = await findDaemonBinary()
+  const repoRoot = path.resolve(__dirname, '../..')
+  const command = daemonBinary ?? 'cargo'
+  const args = daemonBinary ? [] : ['run', '-p', 'rshare-daemon']
+  const child = spawn(command, args, {
+    cwd: repoRoot,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+
+  child.unref()
+}
+
+async function startDaemonService(): Promise<unknown> {
+  try {
+    return await sendDaemonIpc('Status')
+  } catch {
+    await spawnDaemonProcess()
+    return await waitForDaemonStatus()
+  }
+}
+
+async function stopDaemonService(): Promise<unknown> {
+  return await sendDaemonIpc('Shutdown')
+}
+
+async function handleServiceAction(action: ServiceAction): Promise<unknown> {
+  if (action === 'start') {
+    return startDaemonService()
+  }
+  return stopDaemonService()
 }
 
 function readRequestBody(request: import('node:http').IncomingMessage): Promise<string> {
@@ -171,11 +264,44 @@ function rshareDaemonBridge() {
         try {
           const body = await readRequestBody(request)
           const daemonRequest = body ? JSON.parse(body) : 'Status'
-          const daemonResponse = await sendDaemonIpc(daemonRequest)
+          let daemonResponse: unknown
+          try {
+            daemonResponse = await sendDaemonIpc(daemonRequest)
+          } catch (error) {
+            if (!isDaemonIpcUnavailable(error)) {
+              throw error
+            }
+            await handleServiceAction('start')
+            daemonResponse = await sendDaemonIpc(daemonRequest)
+          }
           response.statusCode = 200
           response.end(JSON.stringify(daemonResponse))
         } catch (error) {
           response.statusCode = 502
+          response.end(
+            JSON.stringify({
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          )
+        }
+      })
+
+      server.middlewares.use('/__rshare/service', async (request, response, next) => {
+        if (request.method !== 'POST') {
+          next()
+          return
+        }
+
+        response.setHeader('Content-Type', 'application/json; charset=utf-8')
+        try {
+          const body = await readRequestBody(request)
+          const payload = body ? JSON.parse(body) : {}
+          const action = payload?.action === 'stop' ? 'stop' : 'start'
+          const serviceResponse = await handleServiceAction(action)
+          response.statusCode = 200
+          response.end(JSON.stringify(serviceResponse))
+        } catch (error) {
+          response.statusCode = 500
           response.end(
             JSON.stringify({
               error: error instanceof Error ? error.message : String(error),

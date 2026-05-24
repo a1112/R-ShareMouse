@@ -42,6 +42,14 @@ Expected:
 - Missing ACKs render as a failure state with timeout text.
 - If the daemon status includes `latency_feedback`, the desktop summary follows that daemon feedback instead of only inferring from recent events.
 
+## Local Feedback Strip
+
+Expected:
+
+- Keyboard, mouse, and gamepad rows update visually from `ws://127.0.0.1:27436/local-controls` events.
+- The status labels remain consistent with `status --detailed`.
+- Peer input traffic remains QUIC; WebSocket is localhost-only UI event delivery.
+
 ## Follow-Up Before Optimization
 
 Record the baseline local input status, transport RTT, and remote latency metrics from the same network conditions that will be used for optimization comparisons.

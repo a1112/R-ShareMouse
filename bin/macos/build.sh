@@ -11,7 +11,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-FRONTEND_DIR="$REPO_ROOT/other/figma-ui"
+FRONTEND_DIR="$REPO_ROOT/apps/rshare-desktop-frontend"
 
 cd "$REPO_ROOT"
 
