@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 import {
   BUILTIN_HARDWARE_ASSET_MANIFESTS,
+  buildGamepadAnalogFeedback,
   buildHardwareAssetChoices,
   normalizeHardwareAssetManifest,
   resolveActiveHardwareRegions,
@@ -373,6 +374,66 @@ test("resolveActiveHardwareRegions matches gamepad button aliases", () => {
   });
 
   assert.deepEqual(active.map((region) => region.id), ["gamepad.button.a"]);
+});
+
+test("buildGamepadAnalogFeedback normalizes trigger depth and stick offset", () => {
+  const feedback = buildGamepadAnalogFeedback({
+    pressedButtons: ["South"],
+    leftTrigger: 16384,
+    rightTrigger: 65535,
+    leftStickX: 32767,
+    leftStickY: -16384,
+    rightStickX: -32767,
+    rightStickY: 0,
+  });
+
+  assert.equal(feedback.leftTrigger.active, true);
+  assert.equal(feedback.rightTrigger.value, 1);
+  assert.ok(Math.abs(feedback.leftTrigger.value - 0.25) < 0.01);
+  assert.equal(feedback.leftStick.x, 1);
+  assert.ok(Math.abs(feedback.leftStick.y + 0.5) < 0.01);
+  assert.equal(feedback.rightStick.x, -1);
+  assert.deepEqual(
+    feedback.pressedButtons.filter((button) =>
+      ["South", "LeftTrigger", "RightTrigger", "LeftThumbstick", "RightThumbstick"].includes(button),
+    ),
+    ["South", "LeftTrigger", "RightTrigger", "LeftThumbstick", "RightThumbstick"],
+  );
+});
+
+test("resolveActiveHardwareRegions matches gamepad analog trigger and stick movement", () => {
+  const asset = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.gamepad.xbox",
+    name: "Xbox Style Controller",
+    kind: "gamepad",
+    base_size: { width: 1205, height: 826 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "gamepad.trigger.right",
+        label: "RT",
+        action: { kind: "gamepad_button", buttons: ["RightTrigger", "RT"] },
+        shape: { kind: "rect", x: 0.67, y: 0.02, w: 0.14, h: 0.05 },
+      },
+      {
+        id: "gamepad.stick.left",
+        label: "LS",
+        action: { kind: "gamepad_button", buttons: ["LeftThumbstick", "LS"] },
+        shape: { kind: "rect", x: 0.18, y: 0.23, w: 0.12, h: 0.17 },
+      },
+    ],
+  });
+
+  const active = resolveActiveHardwareRegions(asset, {
+    rightTrigger: 42000,
+    leftStickX: 12000,
+  });
+
+  assert.deepEqual(
+    active.map((region) => region.id),
+    ["gamepad.trigger.right", "gamepad.stick.left"],
+  );
 });
 
 test("resolveSelectedHardwareAsset falls back to first matching kind", () => {

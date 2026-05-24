@@ -39,6 +39,69 @@ export function getDeviceSimulatorChrome() {
   };
 }
 
+export function getMouseDetailLayoutClasses({ compact = false } = {}) {
+  if (compact) {
+    return {
+      root: "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto",
+      previewPane: "relative min-h-[360px]",
+      sidePane: "flex min-h-[220px] flex-col gap-3",
+    };
+  }
+
+  return {
+    root:
+      "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto xl:grid-cols-[minmax(0,1fr)_360px] xl:overflow-hidden",
+    previewPane: "relative min-h-[760px] xl:min-h-0",
+    sidePane: "flex min-h-[220px] flex-col gap-3 xl:min-h-0",
+  };
+}
+
+export function getMouseSimulatorLayoutClasses() {
+  return {
+    root:
+      "grid min-h-full grid-cols-1 gap-4 p-4 xl:h-full xl:min-h-0 xl:grid-cols-[minmax(220px,320px)_minmax(0,1fr)]",
+    previewPane: "flex items-center justify-center",
+    detailsPane: "flex min-w-0 flex-col gap-3",
+    pointerPad: "relative min-h-[170px] flex-1 overflow-hidden rounded xl:min-h-0",
+    signalGrid: "grid shrink-0 grid-cols-2 gap-2 text-xs 2xl:grid-cols-4",
+  };
+}
+
+export function shouldPreventBrowserNavigationEvent(event) {
+  const type = String(event?.type ?? "");
+  const button = Number(event?.button);
+  if (
+    /^(mouse|pointer|auxclick)/i.test(type) &&
+    Number.isFinite(button) &&
+    (button === 3 || button === 4)
+  ) {
+    return true;
+  }
+
+  if (type === "keydown") {
+    const key = String(event?.key ?? "");
+    if (key === "BrowserBack" || key === "BrowserForward") {
+      return true;
+    }
+    if (event?.altKey && (key === "ArrowLeft" || key === "ArrowRight")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function preventBrowserNavigationEvent(event) {
+  if (!shouldPreventBrowserNavigationEvent(event)) {
+    return false;
+  }
+  event?.preventDefault?.();
+  if ("returnValue" in event) {
+    event.returnValue = false;
+  }
+  return true;
+}
+
 export function getSettingsLayoutSections() {
   return [
     { key: "local", label: "本机信息", description: "设备名称、主机与监听端口" },

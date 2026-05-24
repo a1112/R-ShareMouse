@@ -13,9 +13,9 @@ mod windows_impl {
     use rshare_core::{
         DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
         DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
-        DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioInputDevice,
-        LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
-        LocalHardwareDevice,
+        DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioEndpointFormFactor,
+        LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo,
+        LocalDisplayState, LocalHardwareDevice,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +29,7 @@ mod windows_impl {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
     use windows::{
-        core::{BSTR, HSTRING, PWSTR},
+        core::{BSTR, GUID, HSTRING, PWSTR},
         Win32::{
             Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
             Media::Audio::Endpoints::IAudioEndpointVolume,
@@ -41,6 +41,7 @@ mod windows_impl {
                 CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
                 COINIT_MULTITHREADED, STGM_READ,
             },
+            UI::Shell::PropertiesSystem::PROPERTYKEY,
         },
     };
 
@@ -48,6 +49,11 @@ mod windows_impl {
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
     static PROCESS_DPI_AWARENESS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+    const PKEY_AUDIO_ENDPOINT_FORM_FACTOR: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
+        pid: 0,
+    };
 
     thread_local! {
         static WINDOWS_HOOK_CALLBACK: RefCell<Option<WindowsInputCallback>> = RefCell::new(None);
@@ -235,6 +241,8 @@ mod windows_impl {
                 let name = device_friendly_name(&device)
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| format!("Audio Output {}", index + 1));
+                let form_factor = audio_endpoint_form_factor(&device)
+                    .unwrap_or(LocalAudioEndpointFormFactor::Unknown);
                 let volume = endpoint_volume_state(&device);
                 let default = default_endpoint_id
                     .as_deref()
@@ -245,6 +253,7 @@ mod windows_impl {
                     id: format!("core-audio:{}", stable_audio_endpoint_token(&endpoint_id)),
                     name,
                     endpoint_id: Some(endpoint_id),
+                    form_factor,
                     source: "Windows Core Audio".to_string(),
                     connected: true,
                     default,
@@ -294,6 +303,8 @@ mod windows_impl {
                 let name = device_friendly_name(&device)
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| format!("Audio Input {}", index + 1));
+                let form_factor = audio_endpoint_form_factor(&device)
+                    .unwrap_or(LocalAudioEndpointFormFactor::Microphone);
                 let volume = endpoint_volume_state(&device);
                 let default = default_capture_endpoint_id
                     .as_deref()
@@ -308,6 +319,7 @@ mod windows_impl {
                     name,
                     endpoint_id: Some(endpoint_id),
                     kind: LocalAudioInputKind::Microphone,
+                    form_factor,
                     source: "Windows Core Audio".to_string(),
                     connected: true,
                     default,
@@ -332,6 +344,7 @@ mod windows_impl {
                     name: format!("系统声音 ({})", output.name),
                     endpoint_id: Some(endpoint_id),
                     kind: LocalAudioInputKind::Loopback,
+                    form_factor: output.form_factor,
                     source: "Windows WASAPI loopback".to_string(),
                     connected: output.connected,
                     default: output.default,
@@ -444,6 +457,31 @@ mod windows_impl {
         let value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
         let bstr = BSTR::try_from(&value).ok()?;
         String::try_from(bstr).ok()
+    }
+
+    unsafe fn audio_endpoint_form_factor(
+        device: &IMMDevice,
+    ) -> Option<LocalAudioEndpointFormFactor> {
+        let store = device.OpenPropertyStore(STGM_READ).ok()?;
+        let value = store.GetValue(&PKEY_AUDIO_ENDPOINT_FORM_FACTOR).ok()?;
+        let raw = u32::try_from(&value).ok()?;
+        Some(audio_form_factor_from_raw(raw))
+    }
+
+    fn audio_form_factor_from_raw(value: u32) -> LocalAudioEndpointFormFactor {
+        match value {
+            0 => LocalAudioEndpointFormFactor::RemoteNetworkDevice,
+            1 => LocalAudioEndpointFormFactor::Speakers,
+            2 => LocalAudioEndpointFormFactor::LineLevel,
+            3 => LocalAudioEndpointFormFactor::Headphones,
+            4 => LocalAudioEndpointFormFactor::Microphone,
+            5 => LocalAudioEndpointFormFactor::Headset,
+            6 => LocalAudioEndpointFormFactor::Handset,
+            7 => LocalAudioEndpointFormFactor::DigitalPassthrough,
+            8 => LocalAudioEndpointFormFactor::Spdif,
+            9 => LocalAudioEndpointFormFactor::Hdmi,
+            _ => LocalAudioEndpointFormFactor::Unknown,
+        }
     }
 
     unsafe fn endpoint_volume_state(device: &IMMDevice) -> Option<AudioEndpointVolumeState> {

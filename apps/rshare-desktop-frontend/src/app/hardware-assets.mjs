@@ -58,6 +58,34 @@ export function resolveSelectedHardwareAsset(assets = [], kind, selectedId) {
   );
 }
 
+export function buildGamepadAnalogFeedback(activity = {}) {
+  const leftStick = normalizeStickFeedback(
+    activity.leftStickX,
+    activity.leftStickY,
+  );
+  const rightStick = normalizeStickFeedback(
+    activity.rightStickX,
+    activity.rightStickY,
+  );
+  const leftTrigger = normalizeTriggerFeedback(activity.leftTrigger);
+  const rightTrigger = normalizeTriggerFeedback(activity.rightTrigger);
+  const pressedButtons = uniqueTokens([
+    ...(activity.pressedButtons ?? []),
+    ...(leftTrigger.active ? ["LeftTrigger", "LT"] : []),
+    ...(rightTrigger.active ? ["RightTrigger", "RT"] : []),
+    ...(leftStick.active ? ["LeftThumbstick", "LeftStick", "LS"] : []),
+    ...(rightStick.active ? ["RightThumbstick", "RightStick", "RS"] : []),
+  ]);
+
+  return {
+    leftStick,
+    rightStick,
+    leftTrigger,
+    rightTrigger,
+    pressedButtons,
+  };
+}
+
 function resolveAssetUrl(baseUrl, src, resolveUrl) {
   if (/^([a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
     return src;
@@ -161,9 +189,70 @@ function mouseBooleanState(activity) {
 
 function gamepadActionMatches(action, activity) {
   const candidates = new Set((action.buttons ?? []).map(normalizeButtonToken));
-  return (activity.pressedButtons ?? []).some((button) =>
+  const feedback = buildGamepadAnalogFeedback(activity);
+  return feedback.pressedButtons.some((button) =>
     candidates.has(normalizeButtonToken(button)),
   );
+}
+
+function normalizeStickFeedback(rawX, rawY) {
+  const x = normalizeGamepadAxis(rawX);
+  const y = normalizeGamepadAxis(rawY);
+  const magnitude = Math.min(1, Math.sqrt(x * x + y * y));
+  return {
+    x,
+    y,
+    magnitude,
+    active: magnitude > 0.06,
+  };
+}
+
+function normalizeTriggerFeedback(rawValue) {
+  const value = normalizeGamepadTrigger(rawValue);
+  return {
+    value,
+    active: value > 0.02,
+  };
+}
+
+function normalizeGamepadAxis(value) {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  if (Math.abs(numeric) <= 1) {
+    return clamp(numeric, -1, 1);
+  }
+  return clamp(numeric / 32767, -1, 1);
+}
+
+function normalizeGamepadTrigger(value) {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  if (numeric >= 0 && numeric <= 1) {
+    return clamp(numeric, 0, 1);
+  }
+  return clamp(numeric / 65535, 0, 1);
+}
+
+function uniqueTokens(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const token = String(value ?? "");
+    if (!token || seen.has(token)) {
+      continue;
+    }
+    seen.add(token);
+    result.push(token);
+  }
+  return result;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function normalizeKeyToken(value) {

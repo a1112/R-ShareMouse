@@ -1500,6 +1500,413 @@ export function buildDeviceTypeSummaries(counts = {}) {
 ];
 }
 
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function nonEmptyText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function localInputKindLabel(kind) {
+  return kind === "mouse" ? "鼠标" : "键盘";
+}
+
+function isDriverLikeDeviceName(value, kind) {
+  const name = nonEmptyText(value);
+  if (!name) {
+    return true;
+  }
+  const normalized = name.toLowerCase();
+  const label = kind === "mouse" ? "mouse" : "keyboard";
+  return (
+    normalized === `driver ${label}` ||
+    normalized === `raw input ${label}` ||
+    normalized.startsWith(`raw input ${label} `) ||
+    normalized.includes("rshare kmdf") ||
+    normalized.includes("rshare-filter") ||
+    normalized.includes("rshare-driver") ||
+    normalized.includes("\\??\\") ||
+    normalized.includes("hid\\") ||
+    normalized.includes("root#") ||
+    normalized.includes("vid_") ||
+    normalized.includes("pid_")
+  );
+}
+
+function friendlyLocalInputDeviceName(device, kind, index) {
+  const name = nonEmptyText(device?.name);
+  if (name && !isDriverLikeDeviceName(name, kind)) {
+    return name;
+  }
+  return `${localInputKindLabel(kind)} ${index + 1}`;
+}
+
+function localInputDeviceDetail(device, fallback) {
+  return (
+    nonEmptyText(device?.source) ??
+    nonEmptyText(device?.capture_path) ??
+    fallback
+  );
+}
+
+function friendlyGamepadName(gamepad, index) {
+  const raw = nonEmptyText(gamepad?.name);
+  if (!raw) {
+    return `手柄 ${index + 1}`;
+  }
+  const cleaned = raw
+    .replace(/\s*\((?:xinput\s+standard\s+gamepad|standard\s+gamepad)\)\s*/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return cleaned || `手柄 ${index + 1}`;
+}
+
+function finiteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function integerNumber(value, fallback = 0) {
+  return Math.trunc(finiteNumber(value, fallback));
+}
+
+function normalizedGamepadButtonToken(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function uniqueGamepadButtonNames(values) {
+  const byToken = new Map();
+  for (const value of asArray(values)) {
+    const name = nonEmptyText(value);
+    const token = normalizedGamepadButtonToken(name);
+    if (name && token && !byToken.has(token)) {
+      byToken.set(token, name);
+    }
+  }
+  return Array.from(byToken.values());
+}
+
+function pressedGamepadButtonNames(gamepad) {
+  const pressedButtons = uniqueGamepadButtonNames(gamepad?.pressed_buttons);
+  if (pressedButtons.length) {
+    return pressedButtons;
+  }
+  return uniqueGamepadButtonNames(
+    asArray(gamepad?.buttons)
+      .filter((button) => button?.pressed)
+      .map((button) => button?.button),
+  );
+}
+
+function gamepadButtonTokenSet(buttons) {
+  return new Set(buttons.map(normalizedGamepadButtonToken));
+}
+
+function gamepadNumericPayload(gamepad, keys) {
+  return Object.fromEntries(
+    keys.map((key) => [key, String(integerNumber(gamepad?.[key], 0))]),
+  );
+}
+
+function gamepadFieldsChanged(previousGamepad, nextGamepad, keys, threshold) {
+  return keys.some(
+    (key) =>
+      Math.abs(integerNumber(previousGamepad?.[key], 0) - integerNumber(nextGamepad?.[key], 0)) >
+      threshold,
+  );
+}
+
+function gamepadFieldsActive(gamepad, keys, threshold) {
+  return keys.some((key) => Math.abs(integerNumber(gamepad?.[key], 0)) > threshold);
+}
+
+function triggerPercent(value) {
+  const normalized = Math.max(0, Math.min(1, finiteNumber(value, 0) / 65535));
+  return Math.round(normalized * 100);
+}
+
+export function buildBrowserGamepadRecentEvents(
+  previousGamepad = null,
+  nextGamepad = null,
+  options = {},
+) {
+  if (!nextGamepad) {
+    return [];
+  }
+
+  const gamepadId = Math.max(
+    0,
+    integerNumber(nextGamepad?.gamepad_id ?? previousGamepad?.gamepad_id, 0),
+  );
+  const name = nonEmptyText(nextGamepad?.name) ?? nonEmptyText(previousGamepad?.name) ?? `Gamepad ${gamepadId}`;
+  const timestampMs = integerNumber(options.timestampMs, Date.now());
+  const sequenceBase = integerNumber(options.sequenceBase, 0);
+  const connected = nextGamepad?.connected !== false;
+  const wasConnected = Boolean(previousGamepad?.connected);
+  const nextPressedButtons = pressedGamepadButtonNames(nextGamepad);
+  const basePayload = {
+    gamepad_id: String(gamepadId),
+    name,
+    pressed_buttons: nextPressedButtons.join(","),
+    event_count: String(integerNumber(nextGamepad?.event_count, 0)),
+    button_event_count: String(integerNumber(nextGamepad?.button_event_count, 0)),
+    button_press_count: String(integerNumber(nextGamepad?.button_press_count, 0)),
+    button_release_count: String(integerNumber(nextGamepad?.button_release_count, 0)),
+    axis_event_count: String(integerNumber(nextGamepad?.axis_event_count, 0)),
+    trigger_event_count: String(integerNumber(nextGamepad?.trigger_event_count, 0)),
+  };
+  const events = [];
+  const pushEvent = (eventKind, summary, payload = {}) => {
+    events.push({
+      sequence: sequenceBase + events.length + 1,
+      timestamp_ms: timestampMs,
+      device_kind: "Gamepad",
+      event_kind: eventKind,
+      summary,
+      device_id: `gamepad-${gamepadId}`,
+      source: "Hardware",
+      payload: {
+        ...basePayload,
+        ...payload,
+      },
+    });
+  };
+
+  if (connected && !wasConnected) {
+    pushEvent("connected", `connected ${name}`);
+  } else if (!connected && wasConnected) {
+    pushEvent("disconnected", `disconnected ${name}`);
+    return events;
+  }
+
+  if (!connected) {
+    return events;
+  }
+
+  const previousPressedButtons = pressedGamepadButtonNames(previousGamepad);
+  const previousButtonTokens = gamepadButtonTokenSet(previousPressedButtons);
+  const nextButtonTokens = gamepadButtonTokenSet(nextPressedButtons);
+
+  for (const button of nextPressedButtons) {
+    if (!previousButtonTokens.has(normalizedGamepadButtonToken(button))) {
+      pushEvent("button", `${button} Pressed`, {
+        button,
+        state: "Pressed",
+        last_button: `${button} Pressed`,
+      });
+    }
+  }
+
+  for (const button of previousPressedButtons) {
+    if (!nextButtonTokens.has(normalizedGamepadButtonToken(button))) {
+      pushEvent("button", `${button} Released`, {
+        button,
+        state: "Released",
+        last_button: `${button} Released`,
+      });
+    }
+  }
+
+  const stickKeys = ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"];
+  const triggerKeys = ["left_trigger", "right_trigger"];
+  const stickChanged = previousGamepad
+    ? gamepadFieldsChanged(previousGamepad, nextGamepad, stickKeys, 512)
+    : gamepadFieldsActive(nextGamepad, stickKeys, 512);
+  const triggerChanged = previousGamepad
+    ? gamepadFieldsChanged(previousGamepad, nextGamepad, triggerKeys, 512)
+    : gamepadFieldsActive(nextGamepad, triggerKeys, 512);
+
+  if (stickChanged) {
+    pushEvent("axis", "stick", {
+      last_axis: "stick",
+      ...gamepadNumericPayload(nextGamepad, stickKeys),
+    });
+  }
+
+  if (triggerChanged) {
+    pushEvent(
+      "trigger",
+      `trigger LT ${triggerPercent(nextGamepad?.left_trigger)}% / RT ${triggerPercent(nextGamepad?.right_trigger)}%`,
+      gamepadNumericPayload(nextGamepad, triggerKeys),
+    );
+  }
+
+  return events;
+}
+
+const AUDIO_FORM_FACTOR_INFO = Object.freeze({
+  RemoteNetworkDevice: { category: "network", label: "网络音频" },
+  Speakers: { category: "speaker", label: "音箱" },
+  LineLevel: { category: "line", label: "线路输出" },
+  Headphones: { category: "headphones", label: "耳机" },
+  Microphone: { category: "microphone", label: "麦克风" },
+  Headset: { category: "headset", label: "耳麦" },
+  Handset: { category: "handset", label: "听筒" },
+  DigitalPassthrough: { category: "passthrough", label: "数字直通" },
+  Spdif: { category: "spdif", label: "SPDIF" },
+  Hdmi: { category: "display", label: "显示器音频" },
+  Unknown: null,
+});
+
+function normalizeAudioText(value) {
+  return String(value ?? "").toLowerCase();
+}
+
+function inferAudioEndpointInfo(device, direction) {
+  if (device?.kind === "Loopback") {
+    return { category: "loopback", label: "系统回环" };
+  }
+
+  const backendInfo = AUDIO_FORM_FACTOR_INFO[device?.form_factor];
+  if (backendInfo) {
+    return backendInfo;
+  }
+
+  const name = normalizeAudioText(`${device?.name ?? ""} ${device?.source ?? ""}`);
+  if (/(headset|耳麦|hands-free|handsfree)/i.test(name)) {
+    return { category: "headset", label: "耳麦" };
+  }
+  if (/(headphone|耳机|buds|earbuds|wh-|\bairpods?\b)/i.test(name)) {
+    return { category: "headphones", label: "耳机" };
+  }
+  if (/(speaker|speakers|扬声器|音箱)/i.test(name)) {
+    return { category: "speaker", label: "音箱" };
+  }
+  if (/(hdmi|displayport|\bdp\b|monitor|显示器)/i.test(name)) {
+    return { category: "display", label: "显示器音频" };
+  }
+  if (/(spdif|s\/pdif|optical|光纤)/i.test(name)) {
+    return { category: "spdif", label: "SPDIF" };
+  }
+  if (/(mic|microphone|麦克风|阵列麦)/i.test(name) || direction === "input") {
+    return { category: "microphone", label: "麦克风" };
+  }
+  if (/(bluetooth|蓝牙)/i.test(name)) {
+    return { category: "bluetooth", label: "蓝牙音频" };
+  }
+  return { category: "audio", label: direction === "input" ? "音频输入" : "音频输出" };
+}
+
+export function describeAudioEndpoint(device = {}, direction = "output") {
+  const info = inferAudioEndpointInfo(device, direction);
+  const source = nonEmptyText(device?.source) ?? "audio";
+  const parts = [info.label];
+  const formFactorInfo = AUDIO_FORM_FACTOR_INFO[device?.form_factor];
+  if (device?.kind === "Loopback" && formFactorInfo?.label) {
+    parts.push(formFactorInfo.label);
+  }
+  parts.push(source);
+  if (device?.default) {
+    parts.push("default");
+  }
+  return {
+    category: info.category,
+    label: info.label,
+    detail: parts.join(" / "),
+  };
+}
+
+export function buildLocalDeviceSelectItems(snapshot = null, kind, audioOutputs = []) {
+  if (kind === "keyboard" || kind === "mouse") {
+    const devices = asArray(kind === "keyboard" ? snapshot?.keyboard_devices : snapshot?.mouse_devices);
+    const state = kind === "keyboard" ? snapshot?.keyboard : snapshot?.mouse;
+    const label = localInputKindLabel(kind);
+    const aggregateItem = {
+      id: `${kind}-default`,
+      name: `综合${label}`,
+      detail: devices.length
+        ? `${devices.length} 个${label}合并输出`
+        : nonEmptyText(state?.capture_source) ?? "等待输入事件",
+      live: Boolean(state?.detected) || devices.some((device) => device?.connected !== false),
+      active: true,
+    };
+
+    return [
+      aggregateItem,
+      ...devices.map((device, index) => ({
+        id: device?.id || `${kind}-${index}`,
+        name: friendlyLocalInputDeviceName(device, kind, index),
+        detail: localInputDeviceDetail(device, kind),
+        live: device?.connected !== false,
+        active: false,
+      })),
+    ];
+  }
+
+  if (kind === "gamepad") {
+    const gamepads = asArray(snapshot?.gamepads);
+    const aggregateLive = gamepads.some((gamepad) => gamepad?.connected);
+    return [
+      {
+        id: "gamepad-default",
+        name: "综合手柄",
+        detail: gamepads.length ? `${gamepads.length} 个手柄合并输出` : "未连接",
+        live: aggregateLive,
+        active: true,
+      },
+      ...gamepads.map((gamepad, index) => ({
+        id: `gamepad-${gamepad?.gamepad_id ?? index}`,
+        name: friendlyGamepadName(gamepad, index),
+        detail: `事件 ${gamepad?.event_count ?? 0}`,
+        live: Boolean(gamepad?.connected),
+        active: false,
+      })),
+    ];
+  }
+
+  if (kind === "display") {
+    const displays = asArray(snapshot?.display?.displays);
+    if (displays.length) {
+      return displays.map((display, index) => ({
+        id: display?.display_id || `display-${index}`,
+        name: display?.primary ? "主显示器" : `显示器 ${index + 1}`,
+        detail: `${display?.width} x ${display?.height}`,
+        live: true,
+        active: Boolean(display?.primary) || index === 0,
+      }));
+    }
+    return [{
+      id: "display-primary",
+      name: "主显示器",
+      detail: `${snapshot?.display?.primary_width ?? 1920} x ${snapshot?.display?.primary_height ?? 1080}`,
+      live: Boolean(snapshot?.display?.display_count),
+      active: true,
+    }];
+  }
+
+  const audioInputs = asArray(snapshot?.audio_inputs).map((device, index) => {
+    const endpoint = describeAudioEndpoint(device, "input");
+    return {
+      id: device?.id || `audio-input-${index}`,
+      name: nonEmptyText(device?.name) ?? `音频输入 ${index + 1}`,
+      detail: endpoint.detail,
+      live: device?.connected !== false,
+      active: Boolean(device?.default),
+    };
+  });
+  const outputs = asArray(audioOutputs).map((device, index) => {
+    const endpoint = describeAudioEndpoint(device, "output");
+    return {
+      id: device?.id || `audio-output-${index}`,
+      name: nonEmptyText(device?.name) ?? `音频输出 ${index + 1}`,
+      detail: endpoint.detail,
+      live: device?.connected !== false,
+      active: Boolean(device?.default),
+    };
+  });
+  const items = [...audioInputs, ...outputs];
+  return items.length
+    ? items
+    : [{
+        id: "audio-default",
+        name: "默认音频",
+        detail: "等待枚举",
+        live: false,
+        active: true,
+      }];
+}
+
 export const HARDWARE_RIG_ASSETS = Object.freeze({
   keyboard: {
     manifest: "/assets/hardware/live2d/keyboard/manifest.json",
@@ -1516,6 +1923,13 @@ export const HARDWARE_RIG_ASSETS = Object.freeze({
 });
 
 const RECENT_BUTTON_EVENT_WINDOW_MS = 900;
+const MOUSE_BUTTON_ALIASES = Object.freeze({
+  Left: ["Left", "button0", "button1", "primary", "mouseleft"],
+  Right: ["Right", "button2", "button3", "secondary", "mouseright"],
+  Middle: ["Middle", "middlebutton", "button1", "button3", "wheel", "wheelbutton", "auxiliary", "mousemiddle"],
+  Back: ["Back", "x1", "xbutton1", "button4", "button8", "browserback", "side1", "other1", "other4", "other8", "unknown1", "unknown4", "unknown8"],
+  Forward: ["Forward", "x2", "xbutton2", "button5", "button9", "browserforward", "side2", "other2", "other5", "other9", "unknown2", "unknown5", "unknown9"],
+});
 
 function hardwareRigForKind(kind) {
   return HARDWARE_RIG_ASSETS[kind] ? kind : null;
@@ -1546,27 +1960,73 @@ function eventPayloadTokens(event, keys) {
     .filter(Boolean);
 }
 
-function recentMouseButtons(snapshot) {
-  const events = snapshot?.recent_events ?? [];
+function normalizeButtonToken(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function mouseButtonAliases(name) {
+  return MOUSE_BUTTON_ALIASES[name] ?? [name];
+}
+
+function mouseButtonEventTokens(event) {
+  return [
+    ...eventPayloadTokens(event, ["button", "button_name", "name", "pressed_buttons"]),
+    event?.summary,
+  ]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split(/[,\s/]+/).filter(Boolean));
+}
+
+function mouseEventState(event) {
+  return String(event?.payload?.state ?? event?.summary ?? "");
+}
+
+function mouseEventIsPressed(event) {
+  return /\b(pressed|down)\b/i.test(mouseEventState(event));
+}
+
+function mouseEventIsReleased(event) {
+  return /\b(released|up)\b/i.test(mouseEventState(event));
+}
+
+export function mouseButtonRecentlyDown(
+  events = [],
+  buttonName,
+  windowMs = RECENT_BUTTON_EVENT_WINDOW_MS,
+) {
+  const wanted = new Set(mouseButtonAliases(buttonName).map(normalizeButtonToken));
   const latestTimestamp = events.reduce(
     (latest, event) => Math.max(latest, Number(event?.timestamp_ms ?? 0)),
     0,
   );
-  return events
-    .filter((event) => event?.device_kind === "Mouse" && event?.event_kind === "button")
-    .filter((event) => {
-      if (!latestTimestamp) {
-        return true;
-      }
+  let latestMatchingEvent = null;
+
+  for (const event of events) {
+    if (event?.device_kind !== "Mouse" || event?.event_kind !== "button") {
+      continue;
+    }
+    if (latestTimestamp) {
       const timestamp = Number(event?.timestamp_ms ?? 0);
-      return latestTimestamp - timestamp <= RECENT_BUTTON_EVENT_WINDOW_MS;
-    })
-    .slice(-8)
-    .flatMap((event) => [
-      ...eventPayloadTokens(event, ["button", "button_name", "name", "pressed_buttons"]),
-      event?.summary,
-    ])
-    .filter(Boolean);
+      if (latestTimestamp - timestamp > windowMs) {
+        continue;
+      }
+    }
+    const matchesButton = mouseButtonEventTokens(event).some((token) =>
+      wanted.has(normalizeButtonToken(token)),
+    );
+    if (matchesButton && (mouseEventIsPressed(event) || mouseEventIsReleased(event))) {
+      latestMatchingEvent = event;
+    }
+  }
+
+  return latestMatchingEvent ? mouseEventIsPressed(latestMatchingEvent) : false;
+}
+
+function recentMouseButtons(snapshot) {
+  const events = snapshot?.recent_events ?? [];
+  return Object.keys(MOUSE_BUTTON_ALIASES).filter((button) =>
+    mouseButtonRecentlyDown(events, button),
+  );
 }
 
 function galleryNode(index, item) {

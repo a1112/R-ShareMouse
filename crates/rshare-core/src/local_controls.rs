@@ -131,6 +131,27 @@ impl Default for LocalHardwareDevice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalAudioEndpointFormFactor {
+    RemoteNetworkDevice,
+    Speakers,
+    LineLevel,
+    Headphones,
+    Microphone,
+    Headset,
+    Handset,
+    DigitalPassthrough,
+    Spdif,
+    Hdmi,
+    Unknown,
+}
+
+impl Default for LocalAudioEndpointFormFactor {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalAudioInputKind {
     Microphone,
     Loopback,
@@ -146,6 +167,8 @@ pub struct LocalAudioInputDevice {
     pub endpoint_id: Option<String>,
     #[serde(default = "default_audio_input_kind")]
     pub kind: LocalAudioInputKind,
+    #[serde(default)]
+    pub form_factor: LocalAudioEndpointFormFactor,
     #[serde(default)]
     pub source: String,
     #[serde(default)]
@@ -173,6 +196,7 @@ impl Default for LocalAudioInputDevice {
             name: String::new(),
             endpoint_id: None,
             kind: LocalAudioInputKind::Microphone,
+            form_factor: LocalAudioEndpointFormFactor::Unknown,
             source: String::new(),
             connected: false,
             default: false,
@@ -195,6 +219,8 @@ pub struct LocalAudioOutputDevice {
     #[serde(default)]
     pub endpoint_id: Option<String>,
     #[serde(default)]
+    pub form_factor: LocalAudioEndpointFormFactor,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub connected: bool,
@@ -216,6 +242,7 @@ impl Default for LocalAudioOutputDevice {
             id: String::new(),
             name: String::new(),
             endpoint_id: None,
+            form_factor: LocalAudioEndpointFormFactor::Unknown,
             source: String::new(),
             connected: false,
             default: false,

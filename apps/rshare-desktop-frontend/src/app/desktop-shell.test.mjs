@@ -7,9 +7,13 @@ import {
   getDeviceSimulatorChrome,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
+  getMouseDetailLayoutClasses,
+  getMouseSimulatorLayoutClasses,
   getPageLabels,
   getSettingsLayoutSections,
   getThemeModeOptions,
+  preventBrowserNavigationEvent,
+  shouldPreventBrowserNavigationEvent,
 } from "./desktop-shell.mjs";
 
 test("getPageLabels defaults the titlebar tabs to Chinese", () => {
@@ -91,6 +95,46 @@ test("getDeviceSimulatorChrome keeps simulator devices texture first and unframe
     frontFacingDisplays: true,
     displayWindowTexture: true,
   });
+});
+
+test("getMouseDetailLayoutClasses makes narrow mouse detail scroll instead of stacking", () => {
+  const detail = getMouseDetailLayoutClasses();
+  const simulator = getMouseSimulatorLayoutClasses();
+
+  assert.ok(detail.root.split(" ").includes("overflow-auto"));
+  assert.ok(detail.root.split(" ").includes("xl:overflow-hidden"));
+  assert.ok(detail.previewPane.split(" ").includes("min-h-[760px]"));
+  assert.ok(detail.sidePane.split(" ").includes("min-h-[220px]"));
+  assert.ok(!simulator.root.split(" ").includes("h-full"));
+  assert.ok(simulator.root.split(" ").includes("min-h-full"));
+  assert.ok(simulator.pointerPad.split(" ").includes("min-h-[170px]"));
+});
+
+test("shouldPreventBrowserNavigationEvent blocks history mouse and key triggers", () => {
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "mousedown", button: 3 }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "mouseup", button: 4 }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "mousedown", button: 0 }), false);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "keydown", key: "BrowserBack" }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "keydown", key: "BrowserForward" }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "keydown", key: "ArrowLeft", altKey: true }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "keydown", key: "ArrowRight", altKey: true }), true);
+  assert.equal(shouldPreventBrowserNavigationEvent({ type: "keydown", key: "ArrowLeft", altKey: false }), false);
+});
+
+test("preventBrowserNavigationEvent cancels only browser history triggers", () => {
+  let cancelled = 0;
+  const blocked = {
+    type: "auxclick",
+    button: 3,
+    preventDefault() {
+      cancelled += 1;
+    },
+  };
+
+  assert.equal(preventBrowserNavigationEvent(blocked), true);
+  assert.equal(cancelled, 1);
+  assert.equal(preventBrowserNavigationEvent({ type: "mousedown", button: 0 }), false);
+  assert.equal(cancelled, 1);
 });
 
 test("getSettingsLayoutSections exposes a left navigation order for settings", () => {

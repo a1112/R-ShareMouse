@@ -11,11 +11,11 @@ use rshare_core::{
     EndpointCapabilitySnapshot, EndpointDeviceRef, EndpointEvent, EndpointEventDirection,
     EndpointEventFilter, EndpointEventKind, EndpointEventPayload, EndpointEventSource,
     EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioInputDevice, LocalAudioInputKind,
-    LocalAudioOutputDevice, LocalAudioTestRequest, LocalControlDeviceSnapshot,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputTestKind,
-    LocalInputTestRequest, TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceDescriptor, UsbDeviceSpeed,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioEndpointFormFactor,
+    LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
+    LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -446,6 +446,7 @@ async fn local_control_response_round_trips_snapshot_payload() {
         id: "audio-default".to_string(),
         name: "Speakers".to_string(),
         source: "Windows Core Audio".to_string(),
+        form_factor: LocalAudioEndpointFormFactor::Speakers,
         connected: true,
         default: true,
         volume_percent: Some(42),
@@ -457,6 +458,7 @@ async fn local_control_response_round_trips_snapshot_payload() {
         name: "System sound".to_string(),
         source: "Windows WASAPI loopback".to_string(),
         kind: LocalAudioInputKind::Loopback,
+        form_factor: LocalAudioEndpointFormFactor::Speakers,
         connected: true,
         default: true,
         level_peak: 7,

@@ -79,13 +79,14 @@ pub use local_controls::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
     DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioCaptureSource,
-    LocalAudioCaptureState, LocalAudioCaptureStatus, LocalAudioInputDevice, LocalAudioInputKind,
-    LocalAudioOutputDevice, LocalAudioStreamState, LocalAudioTestRequest, LocalAudioTestResult,
-    LocalAudioTestStatus, LocalBackendDiagnosticState, LocalControlDeviceSnapshot,
-    LocalDisplayInfo, LocalDisplayState, LocalDriverDiagnosticState, LocalGamepadState,
-    LocalHardwareDevice, LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus,
-    LocalKeyboardState, LocalMouseState, LocalVirtualGamepadState, RemoteUsbDeviceSnapshot,
+    LocalAudioCaptureState, LocalAudioCaptureStatus, LocalAudioEndpointFormFactor,
+    LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioStreamState,
+    LocalAudioTestRequest, LocalAudioTestResult, LocalAudioTestStatus, LocalBackendDiagnosticState,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalDriverDiagnosticState,
+    LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    LocalInputTestStatus, LocalKeyboardState, LocalMouseState, LocalVirtualGamepadState,
+    RemoteUsbDeviceSnapshot,
 };
 
 // Re-exports from input_mode

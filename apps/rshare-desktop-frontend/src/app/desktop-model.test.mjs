@@ -9,6 +9,9 @@ import {
   buildEndpointAcceptance,
   buildEndpointInjectSummary,
   buildDisplaySettingsViewModel,
+  buildBrowserGamepadRecentEvents,
+  describeAudioEndpoint,
+  buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
   buildRemoteLatencySummary,
@@ -1107,6 +1110,162 @@ test("buildDeviceTypeSummaries keeps device tabs compact and unitless", () => {
   );
 });
 
+test("describeAudioEndpoint prefers backend form factor and falls back from names", () => {
+  assert.deepEqual(
+    describeAudioEndpoint({
+      name: "Realtek Audio",
+      form_factor: "Speakers",
+      source: "Windows Core Audio",
+      default: true,
+    }, "output"),
+    {
+      category: "speaker",
+      label: "音箱",
+      detail: "音箱 / Windows Core Audio / default",
+    },
+  );
+
+  assert.deepEqual(
+    describeAudioEndpoint({
+      name: "WH-1000XM5 Bluetooth Headphones",
+      source: "Windows Core Audio",
+    }, "output"),
+    {
+      category: "headphones",
+      label: "耳机",
+      detail: "耳机 / Windows Core Audio",
+    },
+  );
+
+  assert.deepEqual(
+    describeAudioEndpoint({
+      name: "系统声音 (C32SQ-PLUS)",
+      kind: "Loopback",
+      form_factor: "Hdmi",
+      source: "Windows WASAPI loopback",
+    }, "input"),
+    {
+      category: "loopback",
+      label: "系统回环",
+      detail: "系统回环 / 显示器音频 / Windows WASAPI loopback",
+    },
+  );
+});
+
+test("buildLocalDeviceSelectItems keeps aggregate first and hides driver fallback names", () => {
+  const items = buildLocalDeviceSelectItems(
+    {
+      keyboard: { detected: true, capture_source: "rshare-filter" },
+      keyboard_devices: [
+        {
+          id: "driver-kbd",
+          name: "Driver keyboard",
+          source: "RShare KMDF filter",
+          driver_detail: "HID\\VID_1234&PID_5678\\7&ABC",
+          connected: true,
+        },
+        {
+          id: "real-kbd",
+          name: "Keychron K3",
+          source: "Windows Raw Input",
+          connected: true,
+        },
+      ],
+    },
+    "keyboard",
+  );
+
+  assert.deepEqual(
+    items.map((item) => [item.id, item.name, item.active]),
+    [
+      ["keyboard-default", "综合键盘", true],
+      ["driver-kbd", "键盘 1", false],
+      ["real-kbd", "Keychron K3", false],
+    ],
+  );
+  assert.equal(items[1].detail, "RShare KMDF filter");
+});
+
+test("buildLocalDeviceSelectItems exposes aggregate gamepad before physical controllers", () => {
+  const items = buildLocalDeviceSelectItems(
+    {
+      gamepads: [
+        { gamepad_id: 0, name: "Xbox 360 Controller (XInput STANDARD GAMEPAD)", connected: true, event_count: 3 },
+        { gamepad_id: 1, name: "8BitDo SN30 Pro", connected: true, event_count: 9 },
+      ],
+    },
+    "gamepad",
+  );
+
+  assert.deepEqual(
+    items.map((item) => [item.id, item.name, item.detail, item.active]),
+    [
+      ["gamepad-default", "综合手柄", "2 个手柄合并输出", true],
+      ["gamepad-0", "Xbox 360 Controller", "事件 3", false],
+      ["gamepad-1", "8BitDo SN30 Pro", "事件 9", false],
+    ],
+  );
+});
+
+test("buildBrowserGamepadRecentEvents emits connected button and analog history", () => {
+  const connectedEvents = buildBrowserGamepadRecentEvents(
+    null,
+    { gamepad_id: 1, name: "Xbox Controller", connected: true },
+    { sequenceBase: 10, timestampMs: 1234 },
+  );
+
+  assert.equal(connectedEvents.length, 1);
+  assert.equal(connectedEvents[0].event_kind, "connected");
+  assert.equal(connectedEvents[0].device_id, "gamepad-1");
+  assert.equal(connectedEvents[0].payload.gamepad_id, "1");
+
+  const events = buildBrowserGamepadRecentEvents(
+    {
+      gamepad_id: 1,
+      name: "Xbox Controller",
+      connected: true,
+      pressed_buttons: ["South"],
+      left_stick_x: 0,
+      left_stick_y: 0,
+      right_stick_x: 0,
+      right_stick_y: 0,
+      left_trigger: 0,
+      right_trigger: 0,
+    },
+    {
+      gamepad_id: 1,
+      name: "Xbox Controller",
+      connected: true,
+      pressed_buttons: ["East"],
+      left_stick_x: 4096,
+      left_stick_y: -2048,
+      right_stick_x: 0,
+      right_stick_y: 0,
+      left_trigger: 8192,
+      right_trigger: 0,
+    },
+    { sequenceBase: 20, timestampMs: 5678 },
+  );
+
+  assert.deepEqual(
+    events.map((event) => [
+      event.sequence,
+      event.event_kind,
+      event.payload.button ?? null,
+      event.payload.state ?? null,
+      event.payload.last_button ?? event.summary,
+    ]),
+    [
+      [21, "button", "East", "Pressed", "East Pressed"],
+      [22, "button", "South", "Released", "South Released"],
+      [23, "axis", null, null, "stick"],
+      [24, "trigger", null, null, "trigger LT 13% / RT 0%"],
+    ],
+  );
+  assert.equal(events[2].payload.left_stick_x, "4096");
+  assert.equal(events[3].payload.left_trigger, "8192");
+});
+
 test("buildDeviceGalleryItems lays local and remote devices onto a free canvas", () => {
   const items = buildDeviceGalleryItems(
     {
@@ -1356,6 +1515,38 @@ test("buildDeviceGalleryItems ignores stale mouse button events preserved by dae
         timestamp_ms: 5000,
         summary: "Mouse move 10, 10",
         payload: { x: "10", y: "10" },
+      },
+    ],
+  });
+
+  const mouse = items.find((item) => item.kind === "mouse");
+  assert.deepEqual(mouse.activity.recentButtons, []);
+});
+
+test("buildDeviceGalleryItems clears recent mouse button feedback after release", () => {
+  const items = buildDeviceGalleryItems({
+    mouse: {
+      detected: true,
+      event_count: 2,
+      pressed_buttons: [],
+    },
+    mouse_devices: [{ id: "mouse-1", name: "Mouse A", connected: true }],
+    recent_events: [
+      {
+        sequence: 1,
+        device_kind: "Mouse",
+        event_kind: "button",
+        timestamp_ms: 2000,
+        summary: "Mouse button Left Pressed",
+        payload: { button: "Left", state: "Pressed" },
+      },
+      {
+        sequence: 2,
+        device_kind: "Mouse",
+        event_kind: "button",
+        timestamp_ms: 2050,
+        summary: "Mouse button Left Released",
+        payload: { button: "Left", state: "Released" },
       },
     ],
   });
