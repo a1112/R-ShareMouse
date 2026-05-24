@@ -21,6 +21,7 @@ mod windows_impl {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt;
     use std::mem::size_of;
+    use std::os::windows::process::CommandExt;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, OnceLock,
@@ -1611,6 +1612,7 @@ mod windows_impl {
     const SW_SHOWNOACTIVATE: i32 = 4;
     const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: isize = -3;
     const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
         (device_type << 16) | (access << 14) | (function << 2) | method
@@ -1684,6 +1686,127 @@ mod windows_impl {
         }
 
         format!("windows-display-{hash:016x}")
+    }
+
+    fn gdi_display_number(device_name: &str) -> Option<u32> {
+        let display_pos = device_name.rfind("DISPLAY")?;
+        let number = &device_name[display_pos + "DISPLAY".len()..];
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        number.parse().ok()
+    }
+
+    fn monitor_hardware_id_from_target_id(target_id: &str) -> Option<String> {
+        let mut parts = target_id.split('\\');
+        if !parts
+            .next()
+            .map(|part| part.eq_ignore_ascii_case("MONITOR"))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let hardware_id = parts.next()?.trim();
+        if hardware_id.is_empty() {
+            None
+        } else {
+            Some(hardware_id.to_string())
+        }
+    }
+
+    fn monitor_name_from_edid(edid: &[u8]) -> Option<String> {
+        for descriptor in [54usize, 72, 90, 108] {
+            if edid.len() < descriptor + 18 {
+                continue;
+            }
+            if edid[descriptor..descriptor + 5] != [0x00, 0x00, 0x00, 0xfc, 0x00] {
+                continue;
+            }
+
+            let raw_name = &edid[descriptor + 5..descriptor + 18];
+            let end = raw_name
+                .iter()
+                .position(|byte| *byte == b'\n' || *byte == b'\r' || *byte == 0)
+                .unwrap_or(raw_name.len());
+            let name = String::from_utf8_lossy(&raw_name[..end])
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+
+        None
+    }
+
+    fn normalize_display_name(name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("Generic PnP Monitor") {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    fn display_friendly_name(
+        device_name: &str,
+        windows_friendly_name: Option<&str>,
+        hardware_id: Option<&str>,
+        edid_name: Option<&str>,
+    ) -> Option<String> {
+        let base_name = edid_name
+            .and_then(normalize_display_name)
+            .or_else(|| windows_friendly_name.and_then(normalize_display_name))
+            .or_else(|| hardware_id.and_then(normalize_display_name))?;
+        let display_number = gdi_display_number(device_name);
+
+        match display_number {
+            Some(number) => Some(format!("{base_name} (DISPLAY{number})")),
+            None => Some(base_name),
+        }
+    }
+
+    fn monitor_name_from_registry(target_id: Option<&str>) -> Option<String> {
+        let hardware_id = monitor_hardware_id_from_target_id(target_id?)?;
+        let registry_path = format!(r"HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\{hardware_id}");
+        let output = std::process::Command::new("reg")
+            .args(["query", &registry_path, "/s", "/v", "EDID"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let Some((_, raw_hex)) = line.split_once("REG_BINARY") else {
+                continue;
+            };
+            let hex = raw_hex.trim();
+            let bytes = hex_bytes(hex);
+            if let Some(name) = monitor_name_from_edid(&bytes) {
+                return Some(name);
+            }
+        }
+
+        None
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let digits: Vec<u8> = hex
+            .bytes()
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .collect();
+        digits
+            .chunks_exact(2)
+            .filter_map(|chunk| {
+                let text = std::str::from_utf8(chunk).ok()?;
+                u8::from_str_radix(text, 16).ok()
+            })
+            .collect()
     }
 
     fn devmode_with_size() -> DevModeW {
@@ -2486,6 +2609,18 @@ mod windows_impl {
                 device.and_then(|device| device.friendly_name.as_deref()),
                 device.and_then(|device| device.adapter_id.as_deref()),
             );
+            let target_id = device.and_then(|device| device.target_id.clone());
+            let hardware_id = target_id
+                .as_deref()
+                .and_then(monitor_hardware_id_from_target_id);
+            let edid_name = monitor_name_from_registry(target_id.as_deref());
+            let friendly_name = display_friendly_name(
+                &gdi_device_name,
+                device.and_then(|device| device.friendly_name.as_deref()),
+                hardware_id.as_deref(),
+                edid_name.as_deref(),
+            )
+            .or_else(|| Some(gdi_device_name.clone()));
             let (x, y, width, height) =
                 display_geometry_from_monitor_and_mode(monitor.rect, mode.as_ref());
             let primary = monitor.primary || device.map(|device| device.primary).unwrap_or(false);
@@ -2493,11 +2628,9 @@ mod windows_impl {
             displays.push(LocalDisplayInfo {
                 display_id: display_id.clone(),
                 adapter_id: device.and_then(|device| device.adapter_id.clone()),
-                target_id: device.and_then(|device| device.target_id.clone()),
+                target_id,
                 device_name: Some(gdi_device_name.clone()),
-                friendly_name: device
-                    .and_then(|device| device.friendly_name.clone())
-                    .or_else(|| Some(gdi_device_name.clone())),
+                friendly_name,
                 x,
                 y,
                 width,
@@ -3966,6 +4099,69 @@ mod windows_impl {
 
             assert_eq!(displays[0].display_id, "windows-display-same-2");
             assert_eq!(displays[1].display_id, "windows-display-same");
+        }
+
+        #[test]
+        fn gdi_display_number_is_parsed_from_device_name() {
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY12"), Some(12));
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY3"), Some(3));
+            assert_eq!(gdi_display_number("DISPLAY7"), Some(7));
+            assert_eq!(gdi_display_number(r"\\.\DISPLAY"), None);
+            assert_eq!(gdi_display_number(r"\\.\OTHER1"), None);
+        }
+
+        #[test]
+        fn edid_descriptor_extracts_monitor_name() {
+            let mut edid = [0u8; 128];
+            let descriptor = 54;
+            edid[descriptor] = 0x00;
+            edid[descriptor + 1] = 0x00;
+            edid[descriptor + 2] = 0x00;
+            edid[descriptor + 3] = 0xfc;
+            edid[descriptor + 4] = 0x00;
+            edid[descriptor + 5..descriptor + 18]
+                .copy_from_slice(b"Studio 27Q  \n");
+
+            assert_eq!(monitor_name_from_edid(&edid).as_deref(), Some("Studio 27Q"));
+        }
+
+        #[test]
+        fn target_id_extracts_monitor_hardware_id() {
+            assert_eq!(
+                monitor_hardware_id_from_target_id(
+                    r"MONITOR\DEL4098\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001"
+                )
+                .as_deref(),
+                Some("DEL4098")
+            );
+            assert_eq!(
+                monitor_hardware_id_from_target_id(r"MONITOR\STD2700\foo").as_deref(),
+                Some("STD2700")
+            );
+            assert_eq!(monitor_hardware_id_from_target_id("bad-target"), None);
+        }
+
+        #[test]
+        fn display_friendly_name_prefers_edid_over_generic_pnp_name() {
+            assert_eq!(
+                display_friendly_name(
+                    r"\\.\DISPLAY2",
+                    Some("Generic PnP Monitor"),
+                    Some("STD2700"),
+                    Some("Studio Display 27")
+                )
+                .as_deref(),
+                Some("Studio Display 27 (DISPLAY2)")
+            );
+        }
+
+        #[test]
+        fn display_friendly_name_uses_hardware_id_when_name_is_generic() {
+            assert_eq!(
+                display_friendly_name(r"\\.\DISPLAY3", Some("Generic PnP Monitor"), Some("INN3200"), None)
+                    .as_deref(),
+                Some("INN3200 (DISPLAY3)")
+            );
         }
 
         #[test]

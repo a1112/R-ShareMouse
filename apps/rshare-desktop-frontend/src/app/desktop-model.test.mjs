@@ -1473,6 +1473,55 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
   assert.equal(model.layout.remembered.nodes.length, 3);
 });
 
+test("buildDesktopViewModel labels local visible displays from local controls names", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "left", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "right", x: 2560, y: 0, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 2,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 4720,
+        layout_height: 3840,
+        displays: [
+          { display_id: "left", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+          { display_id: "right", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2385, width: 2160, height: 3840, primary: false },
+        ],
+      },
+    },
+  );
+
+  assert.equal(model.layout.monitors[0].name, "C32SQ-PLUS (DISPLAY3)");
+  assert.equal(model.layout.monitors[1].name, "GX217UR (DISPLAY2)");
+});
+
 test("buildDesktopViewModel snaps visible layout monitor groups before rendering", () => {
   const model = buildDesktopViewModel({
     status: {

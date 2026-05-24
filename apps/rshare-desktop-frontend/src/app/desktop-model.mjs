@@ -78,7 +78,26 @@ function findRememberedDisplay(rememberedLayout, deviceId, displayId) {
     ?.displays?.find((display) => (display.display_id ?? "primary") === displayId);
 }
 
-function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices) {
+function buildLocalDisplayNameLookup(localControls) {
+  return new Map(
+    (localControls?.display?.displays ?? [])
+      .map((display) => [
+        display.display_id ?? "primary",
+        display.friendly_name ?? display.name ?? display.device_name ?? null,
+      ])
+      .filter((entry) => entry[1]),
+  );
+}
+
+function layoutDisplayName(device, displayId, localDisplayNames) {
+  if (device.kind === "local") {
+    return localDisplayNames.get(displayId) ?? `${device.name} 显示器`;
+  }
+
+  return `${device.name} 屏幕`;
+}
+
+function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevice, remoteDevices, localControls) {
   if (!visibleLayout?.nodes?.length) {
     return null;
   }
@@ -95,6 +114,7 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
     return null;
   }
 
+  const localDisplayNames = buildLocalDisplayNameLookup(localControls);
   const visibleNodes = snapVisibleDeviceGroupsEdgeToEdge(
     visibleLayout.nodes.map((node) => ({
       ...node,
@@ -129,10 +149,7 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         visibleX: Number(display.x ?? 0),
         visibleY: Number(display.y ?? 0),
         label: String.fromCharCode(65 + monitorIndex),
-        name:
-          device.kind === "local"
-            ? `${device.name} 显示器`
-            : `${device.name} 屏幕`,
+        name: layoutDisplayName(device, displayId, localDisplayNames),
         resWidth: width,
         resHeight: height,
         color: device.color,
@@ -1631,7 +1648,7 @@ function buildAcceptance(payload, status, remoteDevices, layout, inputMode) {
   };
 }
 
-export function buildDesktopViewModel(payload) {
+export function buildDesktopViewModel(payload, localControls = null) {
   const status = payload?.status ?? null;
   const capabilities = buildCapabilityOverview(payload?.capabilities ?? null);
   const localDevice = buildLocalDevice(status);
@@ -1641,6 +1658,7 @@ export function buildDesktopViewModel(payload) {
     payload?.layout,
     localDevice,
     remoteDevices,
+    localControls,
   );
   const layoutUnavailable = Boolean(payload?.layout_error && status && !payload?.visible_layout);
   const fallbackDevices = layoutUnavailable ? [localDevice] : [localDevice, ...remoteDevices];

@@ -240,6 +240,9 @@ type LocalControlsSnapshot = {
     layout_height: number;
     displays?: Array<{
       display_id: string;
+      friendly_name?: string | null;
+      name?: string | null;
+      device_name?: string | null;
       x: number;
       y: number;
       width: number;
@@ -1610,7 +1613,7 @@ export default function App() {
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
 
-  const model = buildDesktopViewModel(payload);
+  const model = buildDesktopViewModel(payload, localControls);
   const layoutDevices = getLayoutDevices(model.layout.devices);
   const layoutMonitors = getLayoutMonitors(model.layout.monitors, hiddenMonitorIds);
   const isDark = themeMode === "system" ? systemPrefersDark : themeMode === "dark";
