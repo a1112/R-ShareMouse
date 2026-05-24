@@ -416,6 +416,7 @@ const HARDWARE_ASSET_MOUSE_STORAGE_KEY = "rshare.hardwareAsset.mouse";
 const HARDWARE_ASSET_GAMEPAD_STORAGE_KEY = "rshare.hardwareAsset.gamepad";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
+const DAEMON_SERVICE_BRIDGE_ENDPOINT = "/__rshare/service";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
 const NETWORK_COMMANDS = new Set([
   "dashboard_state",
@@ -556,6 +557,37 @@ function daemonResponseValue<T>(response: unknown, variant: string): T {
 
 async function daemonRequestValue<T>(request: unknown, variant: string): Promise<T> {
   return daemonResponseValue<T>(await daemonIpcRequest(request), variant);
+}
+
+function isDaemonIpcUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("ECONNREFUSED") ||
+    message.includes("Connection refused") ||
+    message.includes("Failed to fetch")
+  );
+}
+
+async function daemonServiceRequest<T>(
+  action: "start" | "stop",
+  variant: string,
+): Promise<T> {
+  const response = await fetch(DAEMON_SERVICE_BRIDGE_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : `daemon 服务网关请求失败：HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return daemonResponseValue<T>(payload, variant);
 }
 
 function localInputTestKindForDaemon(
@@ -702,7 +734,17 @@ function endpointEventFilter(endpointId?: string | null) {
 }
 
 async function buildNetworkDashboardState(): Promise<DashboardPayload> {
-  const status = await daemonRequestValue<unknown>("Status", "Status");
+  let autoStarted = false;
+  let status: unknown;
+  try {
+    status = await daemonRequestValue<unknown>("Status", "Status");
+  } catch (error) {
+    if (!isDaemonIpcUnavailable(error)) {
+      throw error;
+    }
+    status = await daemonServiceRequest<unknown>("start", "Status");
+    autoStarted = true;
+  }
 
   let devices: DashboardPayload["devices"] = [];
   try {
@@ -725,7 +767,7 @@ async function buildNetworkDashboardState(): Promise<DashboardPayload> {
     layout,
     visible_layout: layout,
     layout_error: layoutError,
-    auto_started: false,
+    auto_started: autoStarted,
   };
 }
 
@@ -737,9 +779,9 @@ async function invokeNetworkCommand<T = unknown>(
     case "dashboard_state":
       return (await buildNetworkDashboardState()) as T;
     case "start_service":
-      return (await daemonRequestValue<unknown>("Status", "Status")) as T;
+      return (await daemonServiceRequest<unknown>("start", "Status")) as T;
     case "stop_service":
-      return await daemonRequestValue<T>("Shutdown", "Ack");
+      return await daemonServiceRequest<T>("stop", "Ack");
     case "get_logs": {
       const limit = Number(args?.limit ?? 1000);
       const response = await fetch(
