@@ -951,6 +951,7 @@ async function listenLocalControlEvent(
 
   if (typeof WebSocket !== "undefined") {
     const socket = new WebSocket(LOCAL_CONTROLS_WS_URL);
+    let intentionalClose = false;
     socket.addEventListener("message", (event) => {
       try {
         const payload =
@@ -961,15 +962,30 @@ async function listenLocalControlEvent(
       }
     });
     socket.addEventListener("error", () => {
-      handler("本机输入实时 WebSocket 不可用");
+      if (!intentionalClose) {
+        handler("本机输入实时 WebSocket 不可用");
+      }
     });
     socket.addEventListener("close", (event) => {
-      if (event.code !== 1000) {
+      if (!intentionalClose && event.code !== 1000) {
         handler("本机输入实时 WebSocket 已断开");
       }
     });
+    const closeSocket = () => {
+      intentionalClose = true;
+      if (socket.readyState === WebSocket.CONNECTING) {
+        socket.addEventListener("open", () => socket.close(1000), { once: true });
+        return;
+      }
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CLOSING
+      ) {
+        socket.close(1000);
+      }
+    };
     return {
-      stop: () => socket.close(1000),
+      stop: closeSocket,
       usesTauriBridge: false,
     };
   }

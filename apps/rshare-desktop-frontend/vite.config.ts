@@ -20,6 +20,16 @@ type LogEntry = {
 
 type ServiceAction = 'start' | 'stop'
 
+function isDaemonIpcUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return (
+    message.includes('ECONNREFUSED') ||
+    message.includes('ECONNRESET') ||
+    message.includes('daemon IPC closed without a response') ||
+    message.includes('daemon IPC timed out')
+  )
+}
+
 function sendDaemonIpc(request: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(DAEMON_IPC_PORT, DAEMON_IPC_HOST)
@@ -254,7 +264,16 @@ function rshareDaemonBridge() {
         try {
           const body = await readRequestBody(request)
           const daemonRequest = body ? JSON.parse(body) : 'Status'
-          const daemonResponse = await sendDaemonIpc(daemonRequest)
+          let daemonResponse: unknown
+          try {
+            daemonResponse = await sendDaemonIpc(daemonRequest)
+          } catch (error) {
+            if (!isDaemonIpcUnavailable(error)) {
+              throw error
+            }
+            await handleServiceAction('start')
+            daemonResponse = await sendDaemonIpc(daemonRequest)
+          }
           response.statusCode = 200
           response.end(JSON.stringify(daemonResponse))
         } catch (error) {
