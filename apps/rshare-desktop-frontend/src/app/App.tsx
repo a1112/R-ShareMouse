@@ -50,6 +50,7 @@ import {
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
   getPageLabels,
+  getSettingsLayoutSections,
   getThemeModeOptions,
 } from "./desktop-shell.mjs";
 import {
@@ -66,9 +67,21 @@ import {
 } from "./hardware-assets.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
+type SettingsSectionKey =
+  | "local"
+  | "service"
+  | "hardware"
+  | "input"
+  | "appearance"
+  | "acceptance";
 
 const DEVICE_CONSOLE_SECTIONS = getDeviceConsoleSections();
 const DEVICE_SIMULATOR_CHROME = getDeviceSimulatorChrome();
+const SETTINGS_LAYOUT_SECTIONS = getSettingsLayoutSections() as Array<{
+  key: SettingsSectionKey;
+  label: string;
+  description: string;
+}>;
 
 function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
@@ -8846,35 +8859,228 @@ function SettingsPage({
   busy: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
-  return (
-    <div className="rshare-scroll grid h-full grid-cols-1 gap-3 overflow-auto xl:grid-cols-[1.1fr_0.9fr]">
-      <section
-        className="p-5"
-        style={{
-          background: theme.sidebar,
-          border: `1px solid ${theme.border}`,
-          boxShadow: theme.panelShadow,
-        }}
+  const [selectedSection, setSelectedSection] = useState<SettingsSectionKey>("local");
+  const selectedSectionMeta =
+    SETTINGS_LAYOUT_SECTIONS.find((section) => section.key === selectedSection) ??
+    SETTINGS_LAYOUT_SECTIONS[0];
+  const panelStyle = {
+    background: theme.sidebar,
+    border: `1px solid ${theme.border}`,
+    boxShadow: theme.panelShadow,
+  };
+  const mutedIconStyle = {
+    background: "rgba(255,255,255,0.04)",
+    color: theme.textSub,
+  };
+  const sectionSummary: Record<SettingsSectionKey, string> = {
+    local: localDevice.name,
+    service: service.online ? "运行中" : "已停止",
+    hardware: "贴图设置",
+    input: inputMode.current,
+    appearance:
+      getThemeModeOptions().find((option) => option.key === themeMode)?.label ??
+      themeMode,
+    acceptance: acceptance.nextStep,
+  };
+  const renderSectionHeader = (
+    icon: ReactNode,
+    title: string,
+    description: string,
+    accent = false,
+  ) => (
+    <div className="mb-5 flex items-center gap-3">
+      <div
+        className="flex h-11 w-11 items-center justify-center rounded-md"
+        style={accent ? { background: theme.accentSoft, color: theme.accent } : mutedIconStyle}
       >
-        <div className="mb-5 flex items-center gap-3">
-          <div
-            className="flex h-11 w-11 items-center justify-center rounded-md"
-            style={{
-              background: theme.accentSoft,
-              color: theme.accent,
-            }}
-          >
-            <Settings size={18} />
-          </div>
-          <div>
-            <h2 className="text-lg font-semibold">本机信息</h2>
-            <p className="text-sm" style={{ color: theme.textMuted }}>
-              当前界面显示的是守护进程快照提供的最小设置集。
-            </p>
-          </div>
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <h2 className="text-lg font-semibold">{title}</h2>
+        <p className="text-sm" style={{ color: theme.textMuted }}>
+          {description}
+        </p>
+      </div>
+    </div>
+  );
+
+  let sectionContent: ReactNode;
+  if (selectedSection === "service") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Wifi size={18} />,
+          "服务状态",
+          "当前守护进程会话的快速运行信息。",
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow label="守护进程" value={service.online ? "运行中" : "已停止"} theme={theme} />
+          <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
+          <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
+          <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
         </div>
 
-        <div className="grid grid-cols-2 gap-3 text-sm">
+        <button
+          type="button"
+          className="mt-5 rounded-md px-4 py-2 text-sm transition"
+          style={{
+            background: service.online
+              ? "rgba(197, 48, 48, 0.08)"
+              : theme.accentSoft,
+            color: service.online ? "#9f1f2d" : theme.accent,
+            border: `1px solid ${
+              service.online ? "rgba(197, 48, 48, 0.55)" : theme.accent
+            }`,
+            opacity: busy ? 0.7 : 1,
+          }}
+          disabled={busy}
+          onClick={onToggleService}
+        >
+          {service.online ? "停止服务" : "启动服务"}
+        </button>
+      </section>
+    );
+  } else if (selectedSection === "hardware") {
+    sectionContent = <HardwareAssetSettingsPanel theme={theme} />;
+  } else if (selectedSection === "input") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <LayoutGrid size={18} />,
+          "输入后端",
+          "当前输入模式以及降级可见性都来自守护进程。",
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow label="当前模式" value={inputMode.current} theme={theme} />
+          <InfoRow label="健康度" value={inputMode.health} theme={theme} />
+          <InfoRow label="原因" value={inputMode.reason ?? "无"} theme={theme} />
+          <InfoRow
+            label="可用后端"
+            value={inputMode.available.length ? inputMode.available.join(", ") : "无"}
+            theme={theme}
+          />
+        </div>
+      </section>
+    );
+  } else if (selectedSection === "appearance") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Settings size={18} />,
+          "界面风格",
+          "选择浅色、深色或跟随系统。",
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          {getThemeModeOptions().map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              className="rounded-md px-4 py-2 text-sm transition"
+              style={{
+                background:
+                  themeMode === option.key ? theme.accentSoft : theme.frame,
+                color: themeMode === option.key ? theme.text : theme.textSub,
+                border: `1px solid ${
+                  themeMode === option.key ? theme.accent : theme.border
+                }`,
+              }}
+              onClick={() => onThemeModeChange(option.key as ThemeMode)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </section>
+    );
+  } else if (selectedSection === "acceptance") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Monitor size={18} />,
+          "实机验收",
+          "打开另一台机器前，先确认后台、布局和输入主链路都已就绪。",
+          true,
+        )}
+
+        <div className="mb-4 flex flex-wrap gap-2 text-xs">
+          <AcceptanceBadge
+            label={acceptance.daemonOnline ? "Daemon 在线" : "Daemon 离线"}
+            state={acceptance.daemonOnline ? "pass" : "block"}
+            theme={theme}
+          />
+          <AcceptanceBadge
+            label={acceptance.autoStarted ? "Desktop 已自动拉起" : "未发生自动拉起"}
+            state={acceptance.autoStarted ? "warn" : "pass"}
+            theme={theme}
+          />
+          <AcceptanceBadge
+            label={`托盘 ${acceptance.trayState}`}
+            state={
+              acceptance.trayOwnedByDaemon
+                ? acceptance.trayState === "Running"
+                  ? "pass"
+                  : "warn"
+                : "block"
+            }
+            theme={theme}
+          />
+        </div>
+
+        <div className="space-y-3">
+          {acceptance.checks.map((check) => (
+            <div
+              key={check.key}
+              className="flex items-start gap-3 rounded-md px-4 py-3"
+              style={{
+                border: `1px solid ${theme.border}`,
+                background: theme.frame,
+              }}
+            >
+              <AcceptanceDot state={check.state} theme={theme} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-medium">{check.label}</div>
+                  <AcceptanceBadge label={acceptanceStateLabel(check.state)} state={check.state} theme={theme} />
+                </div>
+                <div className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
+                  {check.detail}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div
+          className="mt-4 rounded-md px-4 py-3 text-sm"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background: theme.frame,
+          }}
+        >
+          <div
+            className="mb-2 text-xs uppercase tracking-[0.16em]"
+            style={{ color: theme.textMuted }}
+          >
+            下一步
+          </div>
+          <div className="font-medium">{acceptance.nextStep}</div>
+        </div>
+      </section>
+    );
+  } else {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Settings size={18} />,
+          "本机信息",
+          "当前界面显示的是守护进程快照提供的最小设置集。",
+          true,
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
           <InfoRow label="设备名" value={localDevice.name} theme={theme} />
           <InfoRow label="主机名" value={localDevice.hostname} theme={theme} />
           <InfoRow label="监听地址" value={localDevice.bindAddress} theme={theme} />
@@ -8883,241 +9089,57 @@ function SettingsPage({
           <InfoRow label="权限状态" value={privilegeState} theme={theme} />
         </div>
       </section>
+    );
+  }
 
-      <div className="flex flex-col gap-4">
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden lg:flex-row">
+      <aside
+        className="rshare-scroll flex shrink-0 flex-col gap-2 overflow-auto p-3 lg:w-[300px]"
+        style={{
+          borderRight: `1px solid ${theme.border}`,
+          background: theme.sidebar,
+        }}
+      >
+        <div className="mb-2 px-2">
+          <div className="text-lg font-semibold">设置</div>
+          <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
+            {selectedSectionMeta.description}
+          </div>
+        </div>
+        {SETTINGS_LAYOUT_SECTIONS.map((section) => {
+          const active = selectedSection === section.key;
+          return (
+            <button
+              key={section.key}
+              type="button"
+              aria-pressed={active}
+              className="w-full rounded-md px-3 py-2.5 text-left transition"
               style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
+                border: `1px solid ${active ? theme.accent : "transparent"}`,
+                background: active ? theme.accentSoft : "transparent",
+                color: active ? theme.text : theme.textSub,
               }}
+              onClick={() => setSelectedSection(section.key)}
             >
-              <Wifi size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">服务状态</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                当前守护进程会话的快速运行信息。
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-3 text-sm">
-            <InfoRow label="守护进程" value={service.online ? "运行中" : "已停止"} theme={theme} />
-            <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
-            <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
-            <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
-          </div>
-
-          <button
-            type="button"
-            className="mt-5 rounded-md px-4 py-2 text-sm transition"
-            style={{
-              background: service.online
-                ? "rgba(197, 48, 48, 0.08)"
-                : theme.accentSoft,
-              color: service.online ? "#9f1f2d" : theme.accent,
-              border: `1px solid ${
-                service.online
-                  ? "rgba(197, 48, 48, 0.55)"
-                  : theme.accent
-              }`,
-              opacity: busy ? 0.7 : 1,
-            }}
-            disabled={busy}
-            onClick={onToggleService}
-          >
-            {service.online ? "停止服务" : "启动服务"}
-          </button>
-        </section>
-
-        <HardwareAssetSettingsPanel theme={theme} />
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
-              }}
-            >
-              <LayoutGrid size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">输入后端</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                当前输入模式以及降级可见性都来自守护进程。
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-3 text-sm">
-            <InfoRow label="当前模式" value={inputMode.current} theme={theme} />
-            <InfoRow label="健康度" value={inputMode.health} theme={theme} />
-            <InfoRow label="原因" value={inputMode.reason ?? "无"} theme={theme} />
-            <InfoRow
-              label="可用后端"
-              value={inputMode.available.length ? inputMode.available.join(", ") : "无"}
-              theme={theme}
-            />
-          </div>
-        </section>
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: "rgba(255,255,255,0.04)",
-                color: theme.textSub,
-              }}
-            >
-              <Settings size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">界面风格</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                选择浅色、深色或跟随系统。
-              </p>
-            </div>
-          </div>
-
-          <div className="flex gap-2">
-            {getThemeModeOptions().map((option) => (
-              <button
-                key={option.key}
-                type="button"
-                className="rounded-md px-4 py-2 text-sm transition"
-                style={{
-                  background:
-                    themeMode === option.key ? theme.accentSoft : theme.frame,
-                  color: themeMode === option.key ? theme.text : theme.textSub,
-                  border: `1px solid ${
-                    themeMode === option.key ? theme.accent : theme.border
-                  }`,
-                }}
-                onClick={() => onThemeModeChange(option.key as ThemeMode)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section
-          className="p-5"
-          style={{
-            background: theme.sidebar,
-            border: `1px solid ${theme.border}`,
-            boxShadow: theme.panelShadow,
-          }}
-        >
-          <div className="mb-4 flex items-center gap-3">
-            <div
-              className="flex h-11 w-11 items-center justify-center rounded-md"
-              style={{
-                background: theme.accentSoft,
-                color: theme.accent,
-              }}
-            >
-              <Monitor size={18} />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold">实机验收</h2>
-              <p className="text-sm" style={{ color: theme.textMuted }}>
-                打开另一台机器前，先确认后台、布局和输入主链路都已就绪。
-              </p>
-            </div>
-          </div>
-
-          <div className="mb-4 flex flex-wrap gap-2 text-xs">
-            <AcceptanceBadge
-              label={acceptance.daemonOnline ? "Daemon 在线" : "Daemon 离线"}
-              state={acceptance.daemonOnline ? "pass" : "block"}
-              theme={theme}
-            />
-            <AcceptanceBadge
-              label={acceptance.autoStarted ? "Desktop 已自动拉起" : "未发生自动拉起"}
-              state={acceptance.autoStarted ? "warn" : "pass"}
-              theme={theme}
-            />
-            <AcceptanceBadge
-              label={`托盘 ${acceptance.trayState}`}
-              state={
-                acceptance.trayOwnedByDaemon
-                  ? acceptance.trayState === "Running"
-                    ? "pass"
-                    : "warn"
-                  : "block"
-              }
-              theme={theme}
-            />
-          </div>
-
-          <div className="space-y-3">
-            {acceptance.checks.map((check) => (
-              <div
-                key={check.key}
-                className="flex items-start gap-3 rounded-md px-4 py-3"
-                style={{
-                  border: `1px solid ${theme.border}`,
-                  background: theme.frame,
-                }}
-              >
-                <AcceptanceDot state={check.state} theme={theme} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <div className="text-sm font-medium">{check.label}</div>
-                    <AcceptanceBadge label={acceptanceStateLabel(check.state)} state={check.state} theme={theme} />
-                  </div>
-                  <div className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
-                    {check.detail}
-                  </div>
-                </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-medium">{section.label}</span>
+                <span className="truncate text-xs" style={{ color: theme.textMuted }}>
+                  {sectionSummary[section.key]}
+                </span>
               </div>
-            ))}
-          </div>
+              <div className="mt-1 truncate text-xs" style={{ color: theme.textMuted }}>
+                {section.description}
+              </div>
+            </button>
+          );
+        })}
+      </aside>
 
-          <div
-            className="mt-4 rounded-md px-4 py-3 text-sm"
-            style={{
-              border: `1px solid ${theme.border}`,
-              background: theme.frame,
-            }}
-          >
-            <div
-              className="mb-2 text-xs uppercase tracking-[0.16em]"
-              style={{ color: theme.textMuted }}
-            >
-              下一步
-            </div>
-            <div className="font-medium">{acceptance.nextStep}</div>
-          </div>
-        </section>
+      <div className="rshare-scroll min-h-0 flex-1 overflow-auto p-4">
+        <div className="mx-auto max-w-[980px]">
+          {sectionContent}
+        </div>
       </div>
     </div>
   );

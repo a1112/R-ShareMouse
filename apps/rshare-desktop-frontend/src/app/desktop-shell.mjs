@@ -37,6 +37,17 @@ export function getDeviceSimulatorChrome() {
   };
 }
 
+export function getSettingsLayoutSections() {
+  return [
+    { key: "local", label: "本机信息", description: "设备名称、主机与监听端口" },
+    { key: "service", label: "服务状态", description: "守护进程运行状态" },
+    { key: "hardware", label: "硬件资产", description: "贴图和导入包" },
+    { key: "input", label: "输入后端", description: "捕获模式与健康度" },
+    { key: "appearance", label: "界面风格", description: "主题外观" },
+    { key: "acceptance", label: "实机验收", description: "联机前检查项" },
+  ];
+}
+
 export function getHeaderMetrics() {
   return {
     headerHeight: 40,
