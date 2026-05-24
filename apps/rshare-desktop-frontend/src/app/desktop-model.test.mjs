@@ -1522,6 +1522,61 @@ test("buildDesktopViewModel labels local visible displays from local controls na
   assert.equal(model.layout.monitors[1].name, "GX217UR (DISPLAY2)");
 });
 
+test("buildDesktopViewModel draws local displays from physical DPI while preserving bottom alignment", () => {
+  const model = buildDesktopViewModel(
+    {
+      status: {
+        device_id: "local-1",
+        device_name: "Studio PC",
+        hostname: "studio",
+        bind_address: "127.0.0.1",
+        discovery_port: 4242,
+        pid: 999,
+        discovered_devices: 0,
+        connected_devices: 0,
+        healthy: true,
+      },
+      devices: [],
+      visible_layout: {
+        version: 1,
+        local_device: "local-1",
+        nodes: [
+          {
+            device_id: "local-1",
+            displays: [
+              { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+              { display_id: "portrait", x: 2560, y: -2400, width: 2160, height: 3840, primary: false },
+            ],
+          },
+        ],
+        links: [],
+      },
+    },
+    {
+      display: {
+        display_count: 2,
+        primary_width: 2560,
+        primary_height: 1440,
+        layout_width: 4720,
+        layout_height: 3840,
+        displays: [
+          { display_id: "primary", friendly_name: "C32SQ-PLUS (DISPLAY3)", x: 0, y: 0, width: 2560, height: 1440, raw_dpi_x: 93, raw_dpi_y: 93, primary: true },
+          { display_id: "portrait", friendly_name: "GX217UR (DISPLAY2)", x: 2560, y: -2400, width: 2160, height: 3840, raw_dpi_x: 163, raw_dpi_y: 163, primary: false },
+        ],
+      },
+    },
+  );
+
+  const primary = model.layout.monitors.find((monitor) => monitor.displayId === "primary");
+  const portrait = model.layout.monitors.find((monitor) => monitor.displayId === "portrait");
+
+  assert.equal(primary.w, 307);
+  assert.equal(primary.h, 173);
+  assert.equal(portrait.w, 148);
+  assert.equal(portrait.h, 263);
+  assert.equal(Math.round(portrait.y + portrait.h), Math.round(primary.y + primary.h));
+});
+
 test("buildDesktopViewModel snaps visible layout monitor groups before rendering", () => {
   const model = buildDesktopViewModel({
     status: {

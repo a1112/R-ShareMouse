@@ -89,6 +89,44 @@ function buildLocalDisplayNameLookup(localControls) {
   );
 }
 
+function buildLocalDisplayInfoLookup(localControls) {
+  return new Map(
+    (localControls?.display?.displays ?? []).map((display) => [
+      display.display_id ?? "primary",
+      display,
+    ]),
+  );
+}
+
+function physicalCanvasScale(localDisplayInfo) {
+  const displays = [...localDisplayInfo.values()];
+  const primaryDisplay = displays.find((display) => display.primary) ?? displays[0];
+  const rawDpiX = Number(primaryDisplay?.raw_dpi_x ?? primaryDisplay?.dpi_x ?? 0);
+  return rawDpiX > 0 ? rawDpiX * LAYOUT_SCALE : 96 * LAYOUT_SCALE;
+}
+
+function physicalCanvasSize(display, localDisplayInfo, displayScale) {
+  const physicalDisplay = localDisplayInfo.get(display.display_id ?? "primary");
+  const rawDpiX = Number(physicalDisplay?.raw_dpi_x ?? physicalDisplay?.dpi_x ?? 0);
+  const rawDpiY = Number(physicalDisplay?.raw_dpi_y ?? physicalDisplay?.dpi_y ?? 0);
+  const width = Number(display.width ?? 1920);
+  const height = Number(display.height ?? 1080);
+
+  if (rawDpiX <= 0 || rawDpiY <= 0) {
+    return {
+      w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+      h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+      physical: false,
+    };
+  }
+
+  return {
+    w: Math.max(96, Math.round((width / rawDpiX) * displayScale)),
+    h: Math.max(64, Math.round((height / rawDpiY) * displayScale)),
+    physical: true,
+  };
+}
+
 function layoutDisplayName(device, displayId, localDisplayNames) {
   if (device.kind === "local") {
     return localDisplayNames.get(displayId) ?? `${device.name} 显示器`;
@@ -115,6 +153,8 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
   }
 
   const localDisplayNames = buildLocalDisplayNameLookup(localControls);
+  const localDisplayInfo = buildLocalDisplayInfoLookup(localControls);
+  const localPhysicalScale = physicalCanvasScale(localDisplayInfo);
   const visibleNodes = snapVisibleDeviceGroupsEdgeToEdge(
     visibleLayout.nodes.map((node) => ({
       ...node,
@@ -135,6 +175,17 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
       const width = Number(display.width ?? 1920);
       const height = Number(display.height ?? 1080);
       const displayId = display.display_id ?? "primary";
+      const canvasSize =
+        device.kind === "local"
+          ? physicalCanvasSize(display, localDisplayInfo, localPhysicalScale)
+          : {
+              w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
+              h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+            };
+      const canvasRight = CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE + width * LAYOUT_SCALE;
+      const canvasBottom = CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE + height * LAYOUT_SCALE;
+      const canvasX = CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE;
+      const canvasY = CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE;
       const rememberedDisplay = findRememberedDisplay(
         rememberedLayout,
         node.device_id,
@@ -153,10 +204,10 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         resWidth: width,
         resHeight: height,
         color: device.color,
-        x: CANVAS_ORIGIN_X + Number(display.x ?? 0) * LAYOUT_SCALE,
-        y: CANVAS_ORIGIN_Y + Number(display.y ?? 0) * LAYOUT_SCALE,
-        w: Math.max(96, Math.round(width * LAYOUT_SCALE)),
-        h: Math.max(64, Math.round(height * LAYOUT_SCALE)),
+        x: canvasSize.physical ? canvasRight - canvasSize.w : canvasX,
+        y: canvasSize.physical ? canvasBottom - canvasSize.h : canvasY,
+        w: canvasSize.w,
+        h: canvasSize.h,
         primary: Boolean(display.primary),
         enabled: true,
       });

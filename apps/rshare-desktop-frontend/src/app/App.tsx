@@ -247,6 +247,10 @@ type LocalControlsSnapshot = {
       y: number;
       width: number;
       height: number;
+      dpi_x?: number | null;
+      dpi_y?: number | null;
+      raw_dpi_x?: number | null;
+      raw_dpi_y?: number | null;
       primary: boolean;
     }>;
   };
