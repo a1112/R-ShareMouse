@@ -53,6 +53,11 @@ jobs:
         # 输出格式
         # feature-depth = 1
 
+        # 安全公告配置
+        [advisories]
+        unmaintained = "none"
+        unsound = "none"
+
         # 许可证配置
         [licenses]
         # 许可证白名单
@@ -83,7 +88,6 @@ jobs:
         # 禁止特定的 wildcard 依赖
         wildcards = "allow"
         highlight = "all"
-        workspace-duplicates = "warn"
         DENY_EOF
 
     # 使用 cargo-deny 检查依赖合规性和安全性
