@@ -2939,13 +2939,23 @@ function DevicesPageWithLocalControls({
       : device.id === selectedMonitorDeviceId,
   );
   const capabilityChips = selectedCapabilityDevice?.capabilities?.slice(0, 5) ?? [];
+  const [deviceConsoleRef, deviceConsoleSize] = useElementSize<HTMLDivElement>();
+  const compactDeviceConsole = deviceConsoleSize.width > 0 && deviceConsoleSize.width < 980;
 
   return (
-    <div className="flex h-full min-h-0 overflow-hidden">
+    <div
+      ref={deviceConsoleRef}
+      className={`flex h-full min-h-0 overflow-hidden ${compactDeviceConsole ? "flex-col" : ""}`}
+    >
       <div
-        className="flex w-[250px] shrink-0 flex-col overflow-hidden"
+        className={
+          compactDeviceConsole
+            ? "flex max-h-[240px] min-h-[172px] w-full shrink-0 flex-col overflow-hidden"
+            : "flex w-[250px] shrink-0 flex-col overflow-hidden"
+        }
         style={{
-          borderRight: `1px solid ${theme.border}`,
+          borderRight: compactDeviceConsole ? undefined : `1px solid ${theme.border}`,
+          borderBottom: compactDeviceConsole ? `1px solid ${theme.border}` : undefined,
           background: theme.sidebar,
         }}
       >
@@ -3227,6 +3237,7 @@ function DevicesPageWithLocalControls({
                   : onRunLocalInputTest
               }
               hardwareRigVariant={hardwareRigVariant}
+              compactLayout={compactDeviceConsole}
               theme={theme}
             />
           )}
@@ -3371,7 +3382,12 @@ function LocalLatencyFeedbackStrip({
   };
 
   return (
-    <div className="grid shrink-0 grid-cols-2 gap-2 lg:grid-cols-4">
+    <div
+      className="grid shrink-0 gap-2 px-3 py-2"
+      style={{
+        gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))",
+      }}
+    >
       {rows.map((row) => (
         <div
           key={row.key}
@@ -3705,7 +3721,7 @@ function AllDevicesOverview({
       ) : null}
       <div
         ref={canvasRef}
-        className="relative h-full min-h-[640px] overflow-hidden"
+        className="relative h-full min-h-[420px] overflow-hidden md:min-h-[520px] xl:min-h-[640px]"
         style={{
           cursor: panning ? "grabbing" : "grab",
           backgroundImage: `radial-gradient(circle, ${theme.gridDot} 1px, transparent 1px)`,
@@ -6267,6 +6283,7 @@ function LocalControlDriverHub({
   onSelectedDeviceIdChange,
   onRunInputTest,
   hardwareRigVariant = "office",
+  compactLayout = false,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
@@ -6285,6 +6302,7 @@ function LocalControlDriverHub({
   onSelectedDeviceIdChange?: (deviceId: string) => void;
   onRunInputTest: (kind: string) => void;
   hardwareRigVariant?: HardwareRigVariant;
+  compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const selectedDevices = localDeviceItems(snapshot, selectedKind, audioOutputs);
@@ -6334,6 +6352,7 @@ function LocalControlDriverHub({
           confirmingInputTest={confirmingInputTest}
           onRunInputTest={onRunInputTest}
           hardwareRigVariant={hardwareRigVariant}
+          compactLayout={compactLayout}
           theme={theme}
         />
       </div>
@@ -6409,6 +6428,7 @@ function LocalControlDetail({
   confirmingInputTest,
   onRunInputTest,
   hardwareRigVariant,
+  compactLayout = false,
   theme,
 }: {
   kind: LocalControlKind;
@@ -6424,6 +6444,7 @@ function LocalControlDetail({
   selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
   hardwareRigVariant: HardwareRigVariant;
+  compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const effectiveSelectedDeviceId = selectedLocalDeviceId(snapshot, kind, selectedDeviceId);
@@ -6455,8 +6476,14 @@ function LocalControlDetail({
         ? "再次点击执行 Shift 测试"
         : "真实注入测试";
     return (
-      <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3">
-        <div className="relative min-h-0">
+      <div
+        className={
+          compactLayout
+            ? "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto"
+            : "grid h-full min-h-0 grid-rows-[minmax(0,1fr)_150px] gap-3"
+        }
+      >
+        <div className={compactLayout ? "relative min-h-[320px]" : "relative min-h-0"}>
           <SimulatedKeyboard pressedKeys={keyboardState.pressedKeys} lastKey={keyboardState.lastKey} recentEvents={recentEvents} eventCount={keyboardState.eventCount} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="键盘" theme={theme} />
@@ -6475,8 +6502,14 @@ function LocalControlDetail({
         ? "再次点击执行移动测试"
         : "真实注入测试";
     return (
-      <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="relative min-h-0">
+      <div
+        className={
+          compactLayout
+            ? "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto"
+            : "grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]"
+        }
+      >
+        <div className={compactLayout ? "relative min-h-[360px]" : "relative min-h-0"}>
           <SimulatedMouse x={mouseState.x} y={mouseState.y} pressedButtons={mouseState.pressedButtons} recentEvents={recentEvents} wheelDeltaX={mouseState.wheelDeltaX} wheelDeltaY={mouseState.wheelDeltaY} wheelTotalX={mouseState.wheelTotalX} wheelTotalY={mouseState.wheelTotalY} eventCount={mouseState.eventCount} moveCount={mouseState.moveCount} buttonPressCount={mouseState.buttonPressCount} buttonReleaseCount={mouseState.buttonReleaseCount} wheelEventCount={mouseState.wheelEventCount} displayRelativeX={mouseState.displayRelativeX} displayRelativeY={mouseState.displayRelativeY} currentDisplayIndex={mouseState.currentDisplayIndex} currentDisplayId={mouseState.currentDisplayId} displays={snapshot?.display.displays ?? []} hardwareRigVariant={hardwareRigVariant} theme={theme} />
           {attributionFallback ? (
             <DeviceAttributionNotice kind="鼠标" theme={theme} />
