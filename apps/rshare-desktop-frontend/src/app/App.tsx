@@ -2945,17 +2945,12 @@ function DevicesPageWithLocalControls({
   return (
     <div
       ref={deviceConsoleRef}
-      className={`flex h-full min-h-0 overflow-hidden ${compactDeviceConsole ? "flex-col" : ""}`}
+      className="flex h-full min-h-0 overflow-hidden"
     >
       <div
-        className={
-          compactDeviceConsole
-            ? "flex max-h-[240px] min-h-[172px] w-full shrink-0 flex-col overflow-hidden"
-            : "flex w-[250px] shrink-0 flex-col overflow-hidden"
-        }
+        className="flex w-[250px] shrink-0 flex-col overflow-hidden"
         style={{
-          borderRight: compactDeviceConsole ? undefined : `1px solid ${theme.border}`,
-          borderBottom: compactDeviceConsole ? `1px solid ${theme.border}` : undefined,
+          borderRight: `1px solid ${theme.border}`,
           background: theme.sidebar,
         }}
       >
@@ -3192,7 +3187,7 @@ function DevicesPageWithLocalControls({
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <EndpointAcceptanceStrip acceptance={endpointAcceptance} theme={theme} />
         <LocalLatencyFeedbackStrip rows={localLatencyRows} theme={theme} />
         {selectedRemoteDevice ? (
@@ -3205,7 +3200,7 @@ function DevicesPageWithLocalControls({
             theme={theme}
           />
         ) : null}
-        <div className="min-h-0 flex-1 overflow-hidden">
+        <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
           {selectedPage === "overview" ? (
             <AllDevicesOverview
               snapshot={monitorSnapshot}
