@@ -45,7 +45,6 @@ x11 = { version = "2.21", features = ["xlib", "xtest", "xrandr", "xrecord", "xin
 wayland-client = { version = "0.31", optional = true }
 nix = { version = "0.29", features = ["fs"], optional = true }
 evdev = { version = "0.12", optional = true }
-input-event-codes = "0.1"
 libc = "0.2"
 
 [features]
