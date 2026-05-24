@@ -88,6 +88,8 @@ test("getDeviceSimulatorChrome keeps simulator devices texture first and unframe
     textureFirst: true,
     deviceFrames: false,
     annotationFrames: false,
+    frontFacingDisplays: true,
+    displayWindowTexture: true,
   });
 });
 

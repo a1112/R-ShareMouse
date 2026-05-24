@@ -34,6 +34,8 @@ export function getDeviceSimulatorChrome() {
     textureFirst: true,
     deviceFrames: false,
     annotationFrames: false,
+    frontFacingDisplays: true,
+    displayWindowTexture: true,
   };
 }
 

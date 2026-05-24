@@ -4962,36 +4962,129 @@ function PhysicalDeviceShape({
     const pointerLeft = clamp((Number(activity.pointerX ?? 0) / screenWidth) * 100, 2, 98);
     const pointerTop = clamp((Number(activity.pointerY ?? 0) / screenHeight) * 100, 2, 98);
     return (
-      <div className="relative h-full w-full">
+      <div
+        className="relative h-full w-full overflow-visible"
+        data-front-facing-display={DEVICE_SIMULATOR_CHROME.frontFacingDisplays ? "true" : "false"}
+        data-window-texture={DEVICE_SIMULATOR_CHROME.displayWindowTexture ? "true" : "false"}
+      >
         <div
-          className="absolute inset-x-0 top-0 h-[78%] rounded-xl border-2"
+          className="absolute inset-x-0 top-0 h-[76%] rounded-[18px] border-[3px]"
           style={{
-            borderColor: accent,
-            background: `linear-gradient(160deg, ${theme.sidebar}, ${theme.frame})`,
-            boxShadow: `0 0 0 1px ${accent}22, ${theme.panelShadow}`,
+            borderColor: "#1a2430",
+            background:
+              "linear-gradient(180deg, rgba(10,14,20,0.98), rgba(31,38,47,0.96))",
+            boxShadow: `0 0 0 1px ${accent}55, 0 22px 36px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(255,255,255,0.08)`,
           }}
         >
           {label}
           {liveDot}
           <div
-            className="absolute inset-8 top-14 rounded-md"
+            className="absolute inset-x-5 bottom-5 top-12 overflow-hidden rounded-xl"
             style={{
-              border: `1px solid ${theme.border}`,
+              border: `1px solid ${accent}55`,
               background:
-                "linear-gradient(135deg, rgba(91,139,214,0.18), rgba(255,255,255,0.04))",
+                "radial-gradient(circle at 18% 12%, rgba(99,163,255,0.22), transparent 34%), linear-gradient(135deg, rgba(20,38,56,0.98), rgba(12,18,27,0.96))",
+              boxShadow: "inset 0 0 32px rgba(0,0,0,0.42)",
             }}
           >
             <div
-              className="absolute inset-0 rounded-md opacity-70"
+              className="absolute inset-0 opacity-70"
               style={{
                 backgroundImage:
-                  "linear-gradient(rgba(255,255,255,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.055) 1px, transparent 1px)",
-                backgroundSize: "26px 26px",
+                  "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px)",
+                backgroundSize: "22px 22px",
               }}
             />
+            <div
+              className="absolute inset-x-0 top-0 flex h-6 items-center gap-1.5 px-3"
+              style={{
+                background: "rgba(5,10,16,0.72)",
+                borderBottom: "1px solid rgba(255,255,255,0.08)",
+              }}
+            >
+              {["#ff6b73", "#f6c861", "#4ed37d"].map((color) => (
+                <span
+                  key={color}
+                  className="h-2 w-2 rounded-full"
+                  style={{ background: color }}
+                />
+              ))}
+              <span className="ml-2 text-[9px]" style={{ color: theme.textMuted }}>
+                R-ShareMouse · Desktop
+              </span>
+            </div>
+            <div
+              className="absolute bottom-4 left-4 top-10 w-11 rounded-lg"
+              style={{
+                background: "rgba(255,255,255,0.055)",
+                border: "1px solid rgba(255,255,255,0.07)",
+              }}
+            >
+              {[0, 1, 2].map((index) => (
+                <span
+                  key={index}
+                  className="mx-auto mt-3 block h-2.5 w-6 rounded-full"
+                  style={{
+                    background: index === 0 ? `${accent}88` : "rgba(255,255,255,0.16)",
+                  }}
+                />
+              ))}
+            </div>
+            <div
+              className="absolute bottom-4 left-[72px] right-4 top-10 rounded-xl"
+              style={{
+                background:
+                  "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.035))",
+                border: "1px solid rgba(255,255,255,0.12)",
+                boxShadow: "0 12px 24px rgba(0,0,0,0.22)",
+              }}
+            >
+              <div
+                className="absolute inset-x-0 top-0 flex h-6 items-center justify-between rounded-t-xl px-3"
+                style={{
+                  background: "rgba(255,255,255,0.08)",
+                  borderBottom: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <span className="text-[9px]" style={{ color: theme.textSub }}>
+                  显示窗口
+                </span>
+                <span className="text-[9px]" style={{ color: theme.textMuted }}>
+                  {pointerVisible ? "Pointer live" : "Pointer idle"}
+                </span>
+              </div>
+              <div className="absolute left-4 right-4 top-10 grid grid-cols-[1.2fr_0.8fr] gap-3">
+                <div
+                  className="h-12 rounded-lg"
+                  style={{
+                    background: `linear-gradient(135deg, ${accent}55, rgba(255,255,255,0.05))`,
+                  }}
+                />
+                <div className="grid gap-2">
+                  <span className="h-3 rounded-full" style={{ background: "rgba(255,255,255,0.18)" }} />
+                  <span className="h-3 w-2/3 rounded-full" style={{ background: "rgba(255,255,255,0.12)" }} />
+                  <span className="h-3 w-4/5 rounded-full" style={{ background: `${accent}55` }} />
+                </div>
+              </div>
+              <div className="absolute bottom-4 left-4 right-4 grid grid-cols-3 gap-2">
+                {[0, 1, 2].map((index) => (
+                  <span
+                    key={index}
+                    className="h-9 rounded-lg"
+                    style={{
+                      background:
+                        index === 1
+                          ? `${accent}33`
+                          : "rgba(255,255,255,0.08)",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
             {pointerVisible ? (
               <span
-                className="absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
+                className="absolute z-10 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
                 style={{
                   left: `${pointerLeft}%`,
                   top: `${pointerTop}%`,
@@ -5000,10 +5093,10 @@ function PhysicalDeviceShape({
                 }}
               />
             ) : null}
-            <div className="absolute bottom-4 left-5 text-lg font-semibold" style={{ color: accent }}>
+            <div className="absolute bottom-4 left-5 z-10 text-lg font-semibold" style={{ color: accent }}>
               {item.detail}
             </div>
-            <div className="absolute right-5 top-4 text-[11px]" style={{ color: theme.textMuted }}>
+            <div className="absolute right-5 top-8 z-10 text-[11px]" style={{ color: theme.textMuted }}>
               {pointerVisible
                 ? `Pointer ${Math.round(Number(activity.pointerX ?? 0))}, ${Math.round(Number(activity.pointerY ?? 0))}`
                 : "Pointer idle"}
@@ -5011,12 +5104,19 @@ function PhysicalDeviceShape({
           </div>
         </div>
         <div
-          className="absolute bottom-8 left-1/2 h-10 w-16 -translate-x-1/2 rounded-b-lg"
-          style={{ background: theme.border }}
+          className="absolute bottom-11 left-1/2 h-11 w-20 -translate-x-1/2 rounded-b-lg"
+          style={{
+            background: "linear-gradient(180deg, rgba(78,88,102,0.9), rgba(38,44,53,0.98))",
+            boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.08)",
+          }}
         />
         <div
-          className="absolute bottom-4 left-1/2 h-4 w-44 -translate-x-1/2 rounded-full"
-          style={{ background: theme.sidebar, border: `1px solid ${theme.border}` }}
+          className="absolute bottom-7 left-1/2 h-5 w-52 -translate-x-1/2 rounded-full"
+          style={{
+            background: "linear-gradient(180deg, rgba(58,65,75,0.96), rgba(22,27,34,0.98))",
+            border: "1px solid rgba(255,255,255,0.12)",
+            boxShadow: "0 12px 18px rgba(0,0,0,0.28)",
+          }}
         />
       </div>
     );
