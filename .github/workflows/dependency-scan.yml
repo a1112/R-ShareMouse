@@ -35,25 +35,6 @@ jobs:
         cargo outdated --workspace --exit-code 1 || true
       continue-on-error: true
 
-    # 使用 cargo-deny 检查依赖合规性和安全性
-    - name: Run cargo-deny
-      uses: EmbarkStudios/cargo-deny-action@v1
-      with:
-        command: check
-        arguments: --all-features
-
-    # 使用 CodeQL 进行静态分析
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: rust
-
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v3
-
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
-
     # 创建 cargo-deny 配置（如果不存在）
     - name: Setup cargo-deny config
       run: |
@@ -102,6 +83,26 @@ jobs:
           workspace-duplicates = "warn"
           DENY_EOF
         fi
+
+    # 使用 cargo-deny 检查依赖合规性和安全性
+    - name: Run cargo-deny
+      uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        rust-version: "1.85.0"
+        command: check
+        arguments: --all-features
+
+    # 使用 CodeQL 进行静态分析
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: rust
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
 
   # Clippy 检查代码质量问题
   clippy:
