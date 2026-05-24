@@ -35,6 +35,7 @@ import MonitorManager, {
 } from "./components/MonitorManager";
 import {
   buildDesktopViewModel,
+  buildDisplaySettingsViewModel,
   buildDeviceGalleryItems,
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
@@ -243,6 +244,8 @@ type LocalControlsSnapshot = {
     layout_height: number;
     displays?: Array<{
       display_id: string;
+      adapter_id?: string | null;
+      target_id?: string | null;
       friendly_name?: string | null;
       name?: string | null;
       device_name?: string | null;
@@ -250,11 +253,22 @@ type LocalControlsSnapshot = {
       y: number;
       width: number;
       height: number;
+      work_x?: number;
+      work_y?: number;
+      work_width?: number;
+      work_height?: number;
+      orientation?: DisplayOrientation;
+      scale_percent?: number | null;
       dpi_x?: number | null;
       dpi_y?: number | null;
       raw_dpi_x?: number | null;
       raw_dpi_y?: number | null;
+      refresh_rate_millihz?: number | null;
+      bits_per_pixel?: number | null;
+      active?: boolean;
       primary: boolean;
+      modes?: DisplayModeInfo[];
+      write_capabilities?: DisplayWriteCapabilities;
     }>;
   };
   capture_backend: Record<string, unknown>;
@@ -276,6 +290,93 @@ type LocalControlsSnapshot = {
   recent_events: LocalControlEvent[];
   latency_feedback?: unknown | null;
   last_error?: string | null;
+};
+
+type DisplayOrientation =
+  | "Landscape"
+  | "Portrait"
+  | "LandscapeFlipped"
+  | "PortraitFlipped";
+
+type DisplayWriteCapabilities = {
+  resolution?: boolean;
+  refresh_rate?: boolean;
+  orientation?: boolean;
+  primary?: boolean;
+  position?: boolean;
+  scale?: boolean;
+};
+
+type DisplayModeInfo = {
+  width: number;
+  height: number;
+  refresh_rate_millihz?: number | null;
+  orientation?: DisplayOrientation;
+  bits_per_pixel?: number | null;
+};
+
+type DisplayOperationStatus =
+  | "Success"
+  | "Unsupported"
+  | "PermissionDenied"
+  | "InvalidDisplay"
+  | "InvalidMode"
+  | "RequiresSystemSettings"
+  | "ApplyFailed";
+
+type DisplayCaptureResult = {
+  status: DisplayOperationStatus;
+  display_id?: string;
+  mime_type?: string | null;
+  width?: number | null;
+  height?: number | null;
+  bytes?: number[] | Uint8Array;
+  message?: string | null;
+};
+
+type DisplaySettingsUpdateResult = {
+  status: DisplayOperationStatus;
+  message?: string | null;
+};
+
+type DisplaySettingsDisplayView = {
+  id: string;
+  index: number;
+  title: string;
+  name: string;
+  deviceName: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  workArea: { x: number; y: number; width: number; height: number };
+  primary: boolean;
+  active: boolean;
+  orientation: DisplayOrientation;
+  scalePercent: number | null;
+  refreshRateMillihz: number | null;
+  bitsPerPixel: number | null;
+  dpi: { x: number | null; y: number | null; rawX: number | null; rawY: number | null };
+  resolutionLabel: string;
+  scaleLabel: string;
+  refreshRateLabel: string;
+  resolutionOptions: Array<{ value: string; label: string; width: number; height: number }>;
+  refreshRateOptions: Array<{ value: string; label: string; refreshRateMillihz: number }>;
+  writeCapabilities: {
+    resolution: boolean;
+    refreshRate: boolean;
+    orientation: boolean;
+    primary: boolean;
+    position: boolean;
+    scale: boolean;
+  };
+};
+
+type DisplaySettingsViewModel = {
+  displays: DisplaySettingsDisplayView[];
+  selectedDisplay: DisplaySettingsDisplayView;
+  selectedDisplayId: string | null;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number };
 };
 
 type LocalInputTestResult = {
@@ -456,6 +557,10 @@ const NETWORK_COMMANDS = new Set([
   "start_audio_forwarding",
   "stop_audio_forwarding",
   "run_audio_test",
+  "capture_display",
+  "identify_displays",
+  "update_display_settings",
+  "open_display_settings",
 ]);
 const WEB_NOOP_COMMANDS = new Set([
   "minimize_window",
@@ -936,6 +1041,34 @@ async function invokeNetworkCommand<T = unknown>(
         },
         "LocalAudioTest",
       );
+    case "capture_display":
+      return await daemonRequestValue<T>(
+        {
+          CaptureDisplay: {
+            display_id: args?.display_id ?? args?.displayId ?? "primary",
+            max_width: args?.max_width ?? args?.maxWidth ?? 640,
+          },
+        },
+        "DisplayCapture",
+      );
+    case "identify_displays":
+      return await daemonRequestValue<T>(
+        {
+          IdentifyDisplays: {
+            duration_ms: args?.duration_ms ?? args?.durationMs ?? 2500,
+          },
+        },
+        "DisplayIdentify",
+      );
+    case "update_display_settings":
+      return await daemonRequestValue<T>(
+        {
+          UpdateDisplaySettings: args?.request ?? args,
+        },
+        "DisplaySettingsUpdated",
+      );
+    case "open_display_settings":
+      return await daemonRequestValue<T>("OpenDisplaySettings", "Ack");
     case "start_local_controls_stream":
     case "stop_local_controls_stream":
     case "start_endpoint_events_stream":
@@ -6227,24 +6360,27 @@ function LocalControlDriverHub({
           background: theme.frame,
         }}
       >
-        <div className="mb-2 flex h-9 shrink-0 items-center gap-2">
-          {remoteDevice ? (
-            <div className="min-w-0 text-xs" style={{ color: theme.textMuted }}>
-              正在监听 {remoteDevice.name} · {remoteDevice.hostname}
-            </div>
-          ) : (
-            <DeviceSelector
-              items={selectedDevices}
-              selectedId={selectedDeviceId}
-              onChange={onSelectedDeviceIdChange}
-              theme={theme}
-            />
-          )}
-        </div>
+        {selectedKind === "display" ? null : (
+          <div className="mb-2 flex h-9 shrink-0 items-center gap-2">
+            {remoteDevice ? (
+              <div className="min-w-0 text-xs" style={{ color: theme.textMuted }}>
+                正在监听 {remoteDevice.name} · {remoteDevice.hostname}
+              </div>
+            ) : (
+              <DeviceSelector
+                items={selectedDevices}
+                selectedId={selectedDeviceId}
+                onChange={onSelectedDeviceIdChange}
+                theme={theme}
+              />
+            )}
+          </div>
+        )}
         <LocalControlDetail
           kind={selectedKind}
           snapshot={snapshot}
           selectedDeviceId={selectedDeviceId}
+          onSelectedDeviceIdChange={onSelectedDeviceIdChange}
           remoteDevice={remoteDevice}
           audioOutputs={audioOutputs}
           inputTestResult={inputTestResult}
@@ -6326,6 +6462,7 @@ function LocalControlDetail({
   inputTestResult,
   confirmingInputTest,
   onRunInputTest,
+  onSelectedDeviceIdChange,
   hardwareRigVariant,
   compactLayout = false,
   theme,
@@ -6342,6 +6479,7 @@ function LocalControlDetail({
   confirmingInputTest: string | null;
   selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
+  onSelectedDeviceIdChange?: (deviceId: string) => void;
   hardwareRigVariant: HardwareRigVariant;
   compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
@@ -6426,7 +6564,474 @@ function LocalControlDetail({
   if (kind === "audio") {
     return <AudioDetail snapshot={snapshot} audioOutputs={audioOutputs} theme={theme} />;
   }
-  return <DisplayActivityPreview snapshot={snapshot} theme={theme} />;
+  return (
+    <DisplaySettingsDetail
+      snapshot={snapshot}
+      selectedDisplayId={effectiveSelectedDeviceId}
+      onSelectedDisplayIdChange={onSelectedDeviceIdChange}
+      theme={theme}
+    />
+  );
+}
+
+function DisplaySettingsDetail({
+  snapshot,
+  selectedDisplayId,
+  onSelectedDisplayIdChange,
+  theme,
+}: {
+  snapshot: LocalControlsSnapshot | null;
+  selectedDisplayId?: string;
+  onSelectedDisplayIdChange?: (displayId: string) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const view = buildDisplaySettingsViewModel(
+    snapshot,
+    selectedDisplayId,
+  ) as DisplaySettingsViewModel;
+  const selected = view.selectedDisplay;
+  const [captures, setCaptures] = useState<Record<string, string>>({});
+  const [resolutionValue, setResolutionValue] = useState("");
+  const [refreshRateValue, setRefreshRateValue] = useState("");
+  const [scaleValue, setScaleValue] = useState("100");
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setResolutionValue(`${selected.width}x${selected.height}`);
+    setRefreshRateValue(
+      selected.refreshRateMillihz ? String(selected.refreshRateMillihz) : "",
+    );
+    setScaleValue(String(selected.scalePercent ?? 100));
+  }, [selected.id, selected.width, selected.height, selected.refreshRateMillihz, selected.scalePercent]);
+
+  const scaleOptions = displayScaleOptions(selected.scalePercent);
+  const scaleChanged = Number(scaleValue) !== Number(selected.scalePercent ?? 100);
+  const canApplyDisplayMode =
+    selected.writeCapabilities.resolution ||
+    selected.writeCapabilities.refreshRate ||
+    selected.writeCapabilities.scale ||
+    scaleChanged;
+
+  const runDisplayAction = async <T,>(
+    action: string,
+    task: () => Promise<T>,
+    successMessage: (result: T) => string,
+  ) => {
+    setBusyAction(action);
+    setStatusMessage(null);
+    try {
+      const result = await task();
+      setStatusMessage(successMessage(result));
+      return result;
+    } catch (error) {
+      setStatusMessage(`操作失败：${String(error)}`);
+      return null;
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const captureDisplayBackgrounds = () =>
+    void runDisplayAction(
+      "capture",
+      async () => {
+        const results: Array<{ displayId: string; result: DisplayCaptureResult }> = [];
+        for (const display of view.displays) {
+          const result = await invokeCommand<DisplayCaptureResult>("capture_display", {
+            display_id: display.id,
+            max_width: 900,
+          });
+          results.push({ displayId: display.id, result });
+        }
+        return results;
+      },
+      (results) => {
+        const nextCaptures: Record<string, string> = {};
+        for (const { displayId, result } of results) {
+          if (result.status !== "Success") {
+            continue;
+          }
+          const dataUrl = displayCaptureDataUrl(result);
+          if (dataUrl) {
+            nextCaptures[displayId] = dataUrl;
+          }
+        }
+        if (Object.keys(nextCaptures).length) {
+          setCaptures((current) => ({ ...current, ...nextCaptures }));
+        }
+        return `桌面贴图已更新：${Object.keys(nextCaptures).length}/${view.displays.length} 台显示器`;
+      },
+    );
+
+  const identifyDisplays = () =>
+    void runDisplayAction(
+      "identify",
+      () => invokeCommand<{ status: DisplayOperationStatus; message?: string | null }>(
+        "identify_displays",
+        { duration_ms: 2500 },
+      ),
+      (result) => displayOperationMessage(result.status, result.message, "正在标识显示器"),
+    );
+
+  const openWindowsDisplaySettings = () =>
+    void runDisplayAction(
+      "open-settings",
+      () => invokeCommand("open_display_settings"),
+      () => "已请求打开 Windows 显示设置",
+    );
+
+  const applyDisplaySettings = () =>
+    void runDisplayAction(
+      "apply",
+      () => {
+        const [width, height] = resolutionValue.split("x").map((value) => Number(value));
+        const refreshRateMillihz = Number(refreshRateValue || selected.refreshRateMillihz);
+        const scalePercent = Number(scaleValue || selected.scalePercent);
+        const request: Record<string, unknown> = {
+          display_id: selected.id,
+        };
+        if (Number.isFinite(width) && Number.isFinite(height)) {
+          request.width = width;
+          request.height = height;
+        }
+        if (Number.isFinite(refreshRateMillihz) && refreshRateMillihz > 0) {
+          request.refresh_rate_millihz = refreshRateMillihz;
+        }
+        if (
+          Number.isFinite(scalePercent) &&
+          scalePercent > 0 &&
+          scalePercent !== selected.scalePercent
+        ) {
+          request.scale_percent = scalePercent;
+        }
+        return invokeCommand<DisplaySettingsUpdateResult>("update_display_settings", {
+          request,
+        });
+      },
+      (result) =>
+        displayOperationMessage(
+          result.status,
+          result.message,
+          "显示设置已应用，正在等待守护进程刷新",
+        ),
+    );
+
+  return (
+    <div className="rshare-scroll h-full min-h-0 overflow-auto pr-1">
+      <section
+        className="min-h-full p-4"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.sidebar,
+        }}
+      >
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold">显示器设置</h2>
+            <p className="text-sm" style={{ color: theme.textMuted }}>
+              按 Windows 显示设置组织本机屏幕、截图和可写显示参数。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "identify"}
+            onClick={identifyDisplays}
+          >
+            标识
+          </button>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "capture"}
+            onClick={captureDisplayBackgrounds}
+          >
+            获取桌面贴图
+          </button>
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm"
+            style={secondaryButtonStyle(theme)}
+            disabled={busyAction === "open-settings"}
+            onClick={openWindowsDisplaySettings}
+          >
+            Windows 设置
+          </button>
+        </div>
+
+        <div
+          className="relative mb-4 h-[320px] overflow-hidden rounded-md"
+          style={{
+            border: `1px solid ${theme.border}`,
+            background:
+              "linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px)",
+            backgroundSize: "24px 24px",
+          }}
+        >
+          <svg
+            className="absolute inset-0 h-full w-full"
+            viewBox={`${view.bounds.minX} ${view.bounds.minY} ${view.bounds.width} ${view.bounds.height}`}
+            preserveAspectRatio="xMidYMid meet"
+            role="img"
+            aria-label="Windows style display arrangement"
+          >
+            {view.displays.map((display) => {
+              const active = display.id === selected.id;
+              const capture = captures[display.id];
+              const strokeWidth = Math.max(view.bounds.width, view.bounds.height) / 420;
+              return (
+                <g
+                  key={display.id}
+                  onClick={() => onSelectedDisplayIdChange?.(display.id)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <rect
+                    x={display.x}
+                    y={display.y}
+                    width={display.width}
+                    height={display.height}
+                    rx={10}
+                    fill={active ? theme.accentSoft : "rgba(255,255,255,0.055)"}
+                    stroke={active ? theme.accent : theme.border}
+                    strokeWidth={strokeWidth * (active ? 2.4 : 1.2)}
+                  />
+                  {capture ? (
+                    <image
+                      href={capture}
+                      x={display.x}
+                      y={display.y}
+                      width={display.width}
+                      height={display.height}
+                      preserveAspectRatio="xMidYMid slice"
+                      opacity={active ? 0.76 : 0.48}
+                    />
+                  ) : null}
+                  <rect
+                    x={display.x}
+                    y={display.y}
+                    width={display.width}
+                    height={display.height}
+                    rx={10}
+                    fill={active ? "rgba(59,130,246,0.14)" : "rgba(0,0,0,0.22)"}
+                    stroke={active ? theme.accent : theme.border}
+                    strokeWidth={strokeWidth * (active ? 2.4 : 1.2)}
+                  />
+                  <text
+                    x={display.x + display.width / 2}
+                    y={display.y + display.height / 2}
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill={theme.text}
+                    fontSize={Math.max(view.bounds.height / 13, 52)}
+                    fontWeight={700}
+                  >
+                    {display.index + 1}
+                  </text>
+                  <text
+                    x={display.x + display.width * 0.04}
+                    y={display.y + display.height * 0.88}
+                    fill={theme.textSub}
+                    fontSize={Math.max(view.bounds.height / 28, 24)}
+                  >
+                    {display.resolutionLabel}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="min-w-0">
+            <div className="mb-3">
+              <div className="text-base font-semibold">
+                {selected.title} · {selected.name}
+              </div>
+              <div className="text-xs" style={{ color: theme.textMuted }}>
+                {selected.deviceName ?? selected.id}
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-3">
+              <DisplaySettingSelect
+                label="缩放"
+                value={scaleValue}
+                onChange={setScaleValue}
+                options={scaleOptions}
+                theme={theme}
+              />
+              <DisplaySettingSelect
+                label="显示器分辨率"
+                value={resolutionValue}
+                onChange={setResolutionValue}
+                options={selected.resolutionOptions}
+                disabled={!selected.writeCapabilities.resolution}
+                theme={theme}
+              />
+              <DisplaySettingSelect
+                label="刷新率"
+                value={refreshRateValue}
+                onChange={setRefreshRateValue}
+                options={selected.refreshRateOptions}
+                disabled={!selected.writeCapabilities.refreshRate}
+                theme={theme}
+              />
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="rounded-md px-4 py-2 text-sm"
+                style={secondaryButtonStyle(theme)}
+                disabled={!canApplyDisplayMode || busyAction === "apply"}
+                onClick={applyDisplaySettings}
+              >
+                应用显示参数
+              </button>
+              <span className="text-xs" style={{ color: theme.textMuted }}>
+                位置与主显示器写入：{selected.writeCapabilities.position || selected.writeCapabilities.primary ? "可用" : "当前后端暂不支持"}
+              </span>
+            </div>
+
+            {statusMessage ? (
+              <div
+                className="mt-3 rounded-md px-3 py-2 text-xs"
+                style={{
+                  border: `1px solid ${theme.border}`,
+                  background: theme.frame,
+                  color: theme.textSub,
+                }}
+              >
+                {statusMessage}
+              </div>
+            ) : null}
+          </div>
+
+          <aside className="grid gap-2 text-sm">
+            <InfoRow label="坐标" value={`${selected.x}, ${selected.y}`} theme={theme} />
+            <InfoRow label="尺寸" value={selected.resolutionLabel} theme={theme} />
+            <InfoRow label="工作区" value={`${selected.workArea.width} × ${selected.workArea.height}`} theme={theme} />
+            <InfoRow label="方向" value={displayOrientationLabel(selected.orientation)} theme={theme} />
+            <InfoRow label="缩放" value={selected.scaleLabel} theme={theme} />
+            <InfoRow label="刷新率" value={selected.refreshRateLabel} theme={theme} />
+            <InfoRow
+              label="DPI"
+              value={
+                selected.dpi.rawX || selected.dpi.x
+                  ? `${selected.dpi.rawX ?? selected.dpi.x} / ${selected.dpi.rawY ?? selected.dpi.y}`
+                  : "未知"
+              }
+              theme={theme}
+            />
+            <InfoRow label="颜色深度" value={selected.bitsPerPixel ? `${selected.bitsPerPixel} bpp` : "未知"} theme={theme} />
+          </aside>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DisplaySettingSelect({
+  label,
+  value,
+  options,
+  disabled = false,
+  onChange,
+  theme,
+}: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  return (
+    <label className="block min-w-0 text-sm">
+      <span className="mb-1 block" style={{ color: theme.textSub }}>
+        {label}
+      </span>
+      <select
+        className="h-9 w-full rounded-md px-2 text-sm outline-none"
+        value={value}
+        disabled={disabled || !options.length}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.frame,
+          color: disabled ? theme.textMuted : theme.text,
+        }}
+      >
+        {options.length ? (
+          options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))
+        ) : (
+          <option value="">不可用</option>
+        )}
+      </select>
+    </label>
+  );
+}
+
+function displayScaleOptions(currentScale: number | null) {
+  const values = new Set([100, 125, 150, 175, 200, 225, 250]);
+  if (currentScale && Number.isFinite(currentScale)) {
+    values.add(currentScale);
+  }
+  return [...values].sort((left, right) => left - right).map((value) => ({
+    value: String(value),
+    label: `${value}%`,
+  }));
+}
+
+function displayCaptureDataUrl(result: DisplayCaptureResult) {
+  const bytes = result.bytes instanceof Uint8Array
+    ? result.bytes
+    : Array.isArray(result.bytes)
+      ? Uint8Array.from(result.bytes)
+      : null;
+  if (!bytes?.length) {
+    return null;
+  }
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(offset, offset + chunkSize));
+  }
+  return `data:${result.mime_type ?? "image/bmp"};base64,${btoa(binary)}`;
+}
+
+function displayOperationMessage(
+  status: DisplayOperationStatus,
+  message: string | null | undefined,
+  success: string,
+) {
+  if (status === "Success") {
+    return message ?? success;
+  }
+  if (status === "RequiresSystemSettings") {
+    return message ?? "该设置需要在 Windows 系统显示设置中完成";
+  }
+  return message ?? `显示操作返回 ${status}`;
+}
+
+function displayOrientationLabel(orientation: DisplayOrientation) {
+  switch (orientation) {
+    case "Portrait":
+      return "纵向";
+    case "LandscapeFlipped":
+      return "横向（翻转）";
+    case "PortraitFlipped":
+      return "纵向（翻转）";
+    default:
+      return "横向";
+  }
 }
 
 function DeviceAttributionNotice({

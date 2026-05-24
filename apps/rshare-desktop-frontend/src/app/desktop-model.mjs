@@ -29,6 +29,179 @@ function buildLocalDevice(status) {
   };
 }
 
+function displayTitle(display, index) {
+  if (display.primary) {
+    return "主显示器";
+  }
+  return `显示器 ${index + 1}`;
+}
+
+function displayName(display, index) {
+  return (
+    display.friendly_name ??
+    display.name ??
+    display.device_name ??
+    displayTitle(display, index)
+  );
+}
+
+function formatDisplayRefreshRate(refreshRateMillihz) {
+  const refresh = Number(refreshRateMillihz ?? 0);
+  if (!Number.isFinite(refresh) || refresh <= 0) {
+    return "未知";
+  }
+  const hertz = refresh / 1000;
+  return `${Number.isInteger(hertz) ? hertz : hertz.toFixed(2)} Hz`;
+}
+
+function displayResolutionOptions(display) {
+  const seen = new Set();
+  return [
+    ...(display.modes ?? []),
+    { width: display.width, height: display.height },
+  ]
+    .filter((mode) => Number(mode.width) > 0 && Number(mode.height) > 0)
+    .filter((mode) => {
+      const key = `${mode.width}x${mode.height}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => Number(right.width) * Number(right.height) - Number(left.width) * Number(left.height))
+    .map((mode) => ({
+      value: `${mode.width}x${mode.height}`,
+      label: `${mode.width} × ${mode.height}`,
+      width: Number(mode.width),
+      height: Number(mode.height),
+    }));
+}
+
+function displayRefreshRateOptions(display) {
+  const seen = new Set();
+  return [
+    ...(display.modes ?? []),
+    { refresh_rate_millihz: display.refresh_rate_millihz },
+  ]
+    .map((mode) => Number(mode.refresh_rate_millihz ?? 0))
+    .filter((refresh) => Number.isFinite(refresh) && refresh > 0)
+    .filter((refresh) => {
+      if (seen.has(refresh)) {
+        return false;
+      }
+      seen.add(refresh);
+      return true;
+    })
+    .sort((left, right) => left - right)
+    .map((refresh) => ({
+      value: String(refresh),
+      label: formatDisplayRefreshRate(refresh),
+      refreshRateMillihz: refresh,
+    }));
+}
+
+function displayBounds(displays) {
+  const minX = Math.min(...displays.map((display) => Number(display.x ?? 0)));
+  const minY = Math.min(...displays.map((display) => Number(display.y ?? 0)));
+  const maxX = Math.max(
+    ...displays.map((display) => Number(display.x ?? 0) + Number(display.width ?? 0)),
+  );
+  const maxY = Math.max(
+    ...displays.map((display) => Number(display.y ?? 0) + Number(display.height ?? 0)),
+  );
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY),
+  };
+}
+
+function fallbackDisplay(snapshot) {
+  const display = snapshot?.display ?? {};
+  return {
+    display_id: "primary",
+    x: Number(display.virtual_x ?? 0),
+    y: Number(display.virtual_y ?? 0),
+    width: Number(display.primary_width ?? 1920),
+    height: Number(display.primary_height ?? 1080),
+    primary: true,
+    active: Boolean(display.display_count ?? 1),
+    modes: [],
+    write_capabilities: {},
+  };
+}
+
+export function buildDisplaySettingsViewModel(snapshot, selectedDisplayId) {
+  const rawDisplays = snapshot?.display?.displays?.length
+    ? snapshot.display.displays
+    : [fallbackDisplay(snapshot)];
+  const displays = rawDisplays.map((display, index) => {
+    const id = display.display_id || `display-${index + 1}`;
+    const width = Number(display.width ?? 0);
+    const height = Number(display.height ?? 0);
+    const scalePercent = display.scale_percent == null ? null : Number(display.scale_percent);
+    const refreshRateMillihz =
+      display.refresh_rate_millihz == null ? null : Number(display.refresh_rate_millihz);
+    const writeCapabilities = {
+      resolution: Boolean(display.write_capabilities?.resolution),
+      refreshRate: Boolean(display.write_capabilities?.refresh_rate),
+      orientation: Boolean(display.write_capabilities?.orientation),
+      primary: Boolean(display.write_capabilities?.primary),
+      position: Boolean(display.write_capabilities?.position),
+      scale: Boolean(display.write_capabilities?.scale),
+    };
+    return {
+      id,
+      index,
+      title: displayTitle(display, index),
+      name: displayName(display, index),
+      deviceName: display.device_name ?? null,
+      x: Number(display.x ?? 0),
+      y: Number(display.y ?? 0),
+      width,
+      height,
+      workArea: {
+        x: Number(display.work_x ?? display.x ?? 0),
+        y: Number(display.work_y ?? display.y ?? 0),
+        width: Number(display.work_width ?? width),
+        height: Number(display.work_height ?? height),
+      },
+      primary: Boolean(display.primary),
+      active: display.active !== false,
+      orientation: display.orientation ?? "Landscape",
+      scalePercent,
+      refreshRateMillihz,
+      bitsPerPixel: display.bits_per_pixel ?? null,
+      dpi: {
+        x: display.dpi_x ?? null,
+        y: display.dpi_y ?? null,
+        rawX: display.raw_dpi_x ?? null,
+        rawY: display.raw_dpi_y ?? null,
+      },
+      resolutionLabel: `${width} × ${height}`,
+      scaleLabel: scalePercent ? `${scalePercent}%` : "未知",
+      refreshRateLabel: formatDisplayRefreshRate(refreshRateMillihz),
+      resolutionOptions: displayResolutionOptions({ ...display, width, height }),
+      refreshRateOptions: displayRefreshRateOptions(display),
+      writeCapabilities,
+    };
+  });
+  const selectedDisplay =
+    displays.find((display) => display.id === selectedDisplayId) ??
+    displays.find((display) => display.primary) ??
+    displays[0];
+  return {
+    displays,
+    selectedDisplay,
+    selectedDisplayId: selectedDisplay?.id ?? null,
+    bounds: displayBounds(displays),
+  };
+}
+
 function buildRemoteDevice(device, index) {
   const isLaptop = /book|laptop/i.test(device.name) || /macbook/i.test(device.hostname ?? "");
 

@@ -8,6 +8,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildEndpointInjectSummary,
+  buildDisplaySettingsViewModel,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
   buildRemoteLatencySummary,
@@ -84,6 +85,72 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
 
   assert.equal(overview.available, false);
   assert.deepEqual(overview.devices, []);
+});
+
+test("buildDisplaySettingsViewModel exposes Windows-style display settings", () => {
+  const view = buildDisplaySettingsViewModel(
+    {
+      display: {
+        display_count: 2,
+        virtual_x: -1920,
+        virtual_y: 0,
+        primary_width: 2560,
+        primary_height: 1440,
+        displays: [
+          {
+            display_id: "left",
+            friendly_name: "C32SQ-PLUS (DISPLAY3)",
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: false,
+            scale_percent: 125,
+            refresh_rate_millihz: 60_000,
+            raw_dpi_x: 92,
+            raw_dpi_y: 92,
+            modes: [
+              { width: 1920, height: 1080, refresh_rate_millihz: 60_000 },
+              { width: 1920, height: 1080, refresh_rate_millihz: 144_000 },
+              { width: 1280, height: 720, refresh_rate_millihz: 60_000 },
+            ],
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+          },
+          {
+            display_id: "primary",
+            friendly_name: "GZB0 (DISPLAY1)",
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            primary: true,
+            scale_percent: 150,
+            refresh_rate_millihz: 144_000,
+            modes: [{ width: 2560, height: 1440, refresh_rate_millihz: 144_000 }],
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+          },
+        ],
+      },
+    },
+    "left",
+  );
+
+  assert.equal(view.selectedDisplay.id, "left");
+  assert.equal(view.selectedDisplay.title, "显示器 1");
+  assert.equal(view.selectedDisplay.name, "C32SQ-PLUS (DISPLAY3)");
+  assert.equal(view.selectedDisplay.resolutionLabel, "1920 × 1080");
+  assert.equal(view.selectedDisplay.refreshRateLabel, "60 Hz");
+  assert.equal(view.selectedDisplay.scaleLabel, "125%");
+  assert.deepEqual(view.bounds, { minX: -1920, minY: 0, maxX: 2560, maxY: 1440, width: 4480, height: 1440 });
+  assert.deepEqual(
+    view.selectedDisplay.resolutionOptions.map((option) => option.label),
+    ["1920 × 1080", "1280 × 720"],
+  );
+  assert.deepEqual(
+    view.selectedDisplay.refreshRateOptions.map((option) => option.label),
+    ["60 Hz", "144 Hz"],
+  );
+  assert.equal(view.selectedDisplay.writeCapabilities.scale, false);
 });
 
 test("buildDesktopViewModel exposes daemon latency feedback when present", () => {
