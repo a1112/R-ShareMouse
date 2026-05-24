@@ -413,7 +413,8 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const POLL_INTERVAL_MS = 1500;
-const ENDPOINT_EVENT_POLL_MS = 80;
+const LOCAL_CONTROLS_POLL_INTERVAL_MS = 5000;
+const ENDPOINT_EVENT_POLL_MS = 750;
 const LOCAL_CONTROL_EVENT_FLUSH_MS = 8;
 const RECENT_HARDWARE_EVENT_WINDOW_MS = 900;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
@@ -1693,12 +1694,10 @@ export default function App() {
   }
 
   async function refreshAll() {
-    await Promise.allSettled([
-      refreshDashboard(),
-      refreshLocalControls(),
-      refreshHardwareAssets(),
-    ]);
+    await refreshDashboard();
     setRefreshTick((value) => value + 1);
+    void refreshLocalControls();
+    void refreshHardwareAssets();
   }
 
   function setSelectedHardwareAssetId(kind: HardwareRigKind, assetId: string) {
@@ -1738,16 +1737,27 @@ export default function App() {
   };
 
   useEffect(() => {
-    refreshDashboard();
-    refreshLocalControls();
+    let cancelled = false;
+    refreshDashboard().finally(() => {
+      if (!cancelled) {
+        void refreshLocalControls();
+      }
+    });
     refreshHardwareAssets();
-    const timer = window.setInterval(() => {
+    const dashboardTimer = window.setInterval(() => {
       refreshDashboard();
-      refreshLocalControls();
       setRefreshTick((value) => value + 1);
     }, POLL_INTERVAL_MS);
+    const localControlsTimer = window.setInterval(
+      refreshLocalControls,
+      LOCAL_CONTROLS_POLL_INTERVAL_MS,
+    );
 
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(dashboardTimer);
+      window.clearInterval(localControlsTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -1875,6 +1885,7 @@ export default function App() {
     let cancelled = false;
     let subscription: LocalControlSubscription | null = null;
     let timer: number | null = null;
+    let pollInFlight = false;
 
     const rememberSequences = (events: EndpointEvent[]) => {
       for (const event of events) {
@@ -1924,17 +1935,25 @@ export default function App() {
     }
 
     async function pollAllEndpoints() {
-      for (const endpointId of endpointIds) {
-        if (cancelled) {
-          return;
-        }
-        try {
-          await pollEndpoint(endpointId);
-        } catch (pollError) {
-          if (!cancelled) {
-            setLocalControlsError(String(pollError));
+      if (pollInFlight) {
+        return;
+      }
+      pollInFlight = true;
+      try {
+        for (const endpointId of endpointIds) {
+          if (cancelled) {
+            return;
+          }
+          try {
+            await pollEndpoint(endpointId);
+          } catch (pollError) {
+            if (!cancelled) {
+              setLocalControlsError(String(pollError));
+            }
           }
         }
+      } finally {
+        pollInFlight = false;
       }
     }
 

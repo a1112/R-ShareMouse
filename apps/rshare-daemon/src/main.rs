@@ -6664,7 +6664,6 @@ async fn handle_ipc_client(
         request_remote_endpoint_events(&network_manager, &state, filter).await;
         let events = {
             let mut state = state.write().await;
-            state.refresh_local_controls_platform();
             state.endpoint_events(filter, None, Some(128))
         };
         write_json_line(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
@@ -6823,7 +6822,6 @@ async fn handle_ipc_client(
         } => {
             request_remote_endpoint_events(&network_manager, &state, &filter).await;
             let mut state = state.write().await;
-            state.refresh_local_controls_platform();
             DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))
         }
         DaemonRequest::InjectEndpointEvent { target, request } => {
