@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildFooterStatus,
   getDeviceConsoleSections,
+  getDeviceSimulatorChrome,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
   getPageLabels,
@@ -78,6 +79,14 @@ test("getDeviceConsoleSections hides the local latency feedback strip by default
   assert.deepEqual(getDeviceConsoleSections(), {
     endpointAcceptance: true,
     localLatencyFeedback: false,
+  });
+});
+
+test("getDeviceSimulatorChrome keeps simulator devices texture first and unframed", () => {
+  assert.deepEqual(getDeviceSimulatorChrome(), {
+    textureFirst: true,
+    deviceFrames: false,
+    annotationFrames: false,
   });
 });
 

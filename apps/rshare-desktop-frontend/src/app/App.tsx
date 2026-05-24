@@ -46,6 +46,7 @@ import {
 import {
   buildFooterStatus,
   getDeviceConsoleSections,
+  getDeviceSimulatorChrome,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
   getPageLabels,
@@ -67,6 +68,7 @@ import {
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
 
 const DEVICE_CONSOLE_SECTIONS = getDeviceConsoleSections();
+const DEVICE_SIMULATOR_CHROME = getDeviceSimulatorChrome();
 
 function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
@@ -5016,12 +5018,23 @@ function PhysicalDeviceShape({
       : [];
     return (
       <div
-        className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-2xl border p-4"
-        style={{
-          borderColor: item.live ? accent : theme.border,
-          background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
-          boxShadow: theme.panelShadow,
-        }}
+        className={
+          DEVICE_SIMULATOR_CHROME.deviceFrames
+            ? "relative flex h-full w-full items-center justify-center overflow-hidden rounded-2xl border p-4"
+            : "relative flex h-full w-full items-center justify-center overflow-visible p-3"
+        }
+        style={
+          DEVICE_SIMULATOR_CHROME.deviceFrames
+            ? {
+                borderColor: item.live ? accent : theme.border,
+                background: `linear-gradient(180deg, ${theme.sidebar}, ${theme.frame})`,
+                boxShadow: theme.panelShadow,
+              }
+            : {
+                background: "transparent",
+                boxShadow: "none",
+              }
+        }
       >
         {label}
         {liveDot}
@@ -5034,12 +5047,23 @@ function PhysicalDeviceShape({
           compact
         />
         <div
-          className="absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.05)",
-            color: theme.textSub,
-          }}
+          className={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? "absolute bottom-3 left-5 rounded-md px-2.5 py-1 text-[11px]"
+              : "absolute bottom-3 left-5 text-[11px]"
+          }
+          style={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? {
+                  border: `1px solid ${theme.border}`,
+                  background: "rgba(255,255,255,0.05)",
+                  color: theme.textSub,
+                }
+              : {
+                  color: theme.textSub,
+                  textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+                }
+          }
         >
           最后按键 <span style={{ color: accent }}>{lastKey ?? "等待输入"}</span>
         </div>
@@ -5094,12 +5118,23 @@ function PhysicalDeviceShape({
           {item.metric}
         </div>
         <div
-          className="absolute bottom-8 left-1/2 -translate-x-1/2 rounded-md px-2 py-1 text-center text-[10px]"
-          style={{
-            border: `1px solid ${theme.border}`,
-            background: "rgba(255,255,255,0.05)",
-            color: theme.textSub,
-          }}
+          className={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? "absolute bottom-8 left-1/2 -translate-x-1/2 rounded-md px-2 py-1 text-center text-[10px]"
+              : "absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-[10px]"
+          }
+          style={
+            DEVICE_SIMULATOR_CHROME.annotationFrames
+              ? {
+                  border: `1px solid ${theme.border}`,
+                  background: "rgba(255,255,255,0.05)",
+                  color: theme.textSub,
+                }
+              : {
+                  color: theme.textSub,
+                  textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+                }
+          }
         >
           <div>
             X {pointerX} · Y {pointerY}
@@ -5119,63 +5154,41 @@ function PhysicalDeviceShape({
       : [];
     const leftX = clamp(Number(activity.leftStickX ?? 0) / 32767, -1, 1);
     const leftY = clamp(Number(activity.leftStickY ?? 0) / 32767, -1, 1);
-    const leftTrigger = clamp(Number(activity.leftTrigger ?? 0) / 1023, 0, 1);
-    const rightTrigger = clamp(Number(activity.rightTrigger ?? 0) / 1023, 0, 1);
+    const rightX = clamp(Number(activity.rightStickX ?? 0) / 32767, -1, 1);
+    const rightY = clamp(Number(activity.rightStickY ?? 0) / 32767, -1, 1);
+    const leftTrigger = clamp(Number(activity.leftTrigger ?? 0) / 65535, 0, 1);
+    const rightTrigger = clamp(Number(activity.rightTrigger ?? 0) / 65535, 0, 1);
+    const rigPressedButtons = [
+      ...pressedButtons,
+      ...(leftTrigger > 0.02 ? ["LeftTrigger", "LT"] : []),
+      ...(rightTrigger > 0.02 ? ["RightTrigger", "RT"] : []),
+    ];
     return (
-      <div className="relative h-full w-full">
-        <div
-          className="absolute inset-x-4 bottom-3 top-12 rounded-[48px] border"
-          style={{
-            borderColor: item.live ? accent : theme.border,
-            background: `linear-gradient(145deg, ${theme.sidebar}, ${theme.frame})`,
-            boxShadow: theme.panelShadow,
-          }}
-        />
+      <div className="relative flex h-full w-full items-center justify-center overflow-visible p-3">
         {label}
         {liveDot}
+        <HardwareRigView
+          kind="gamepad"
+          variant={hardwareRigVariant}
+          activity={{ pressedButtons: rigPressedButtons }}
+          accent={accent}
+          theme={theme}
+          compact
+          fitToHeight
+          fitMaxHeight={Math.max(150, item.h - 72)}
+        />
         <div
-          className="absolute left-16 top-28 h-14 w-14 rounded-full border"
-          style={{ borderColor: accent, background: `${accent}10` }}
+          className="absolute bottom-5 left-5 text-[10px]"
+          style={{
+            color: theme.textSub,
+            textShadow: "0 1px 10px rgba(0,0,0,0.38)",
+          }}
         >
-          <span
-            className="absolute left-1/2 top-1/2 h-4 w-4 rounded-full"
-            style={{
-              background: accent,
-              transform: `translate(calc(-50% + ${leftX * 15}px), calc(-50% + ${leftY * 15}px))`,
-              boxShadow: `0 0 10px ${accent}66`,
-            }}
-          />
+          L {Math.round(leftX * 100)}, {Math.round(leftY * 100)} · R {Math.round(rightX * 100)}, {Math.round(rightY * 100)}
+          <br />
+          LT {Math.round(leftTrigger * 100)}% · RT {Math.round(rightTrigger * 100)}%
         </div>
-        <div className="absolute right-16 top-24 grid grid-cols-2 gap-2">
-          {["Y", "B", "X", "A"].map((key) => (
-            <span
-              key={key}
-              className="flex h-8 w-8 items-center justify-center rounded-full text-xs font-semibold"
-              style={{
-                background: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? accent : `${accent}22`,
-                color: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? "#ffffff" : accent,
-                boxShadow: pressedButtons.includes(normalizeGamepadButtonToken(key)) ? `0 0 12px ${accent}66` : "none",
-              }}
-            >
-              {key}
-            </span>
-          ))}
-        </div>
-        <div className="absolute left-14 top-20 flex gap-2 text-[10px]" style={{ color: theme.textSub }}>
-          <span
-            className="rounded px-3 py-1"
-            style={{ border: `1px solid ${theme.border}`, background: `${accent}${leftTrigger ? "33" : "12"}` }}
-          >
-            LT {Math.round(leftTrigger * 100)}%
-          </span>
-          <span
-            className="rounded px-3 py-1"
-            style={{ border: `1px solid ${theme.border}`, background: `${accent}${rightTrigger ? "33" : "12"}` }}
-          >
-            RT {Math.round(rightTrigger * 100)}%
-          </span>
-        </div>
-        <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-sm font-semibold" style={{ color: accent }}>
+        <div className="absolute bottom-5 right-5 text-sm font-semibold" style={{ color: accent }}>
           {item.metric}
         </div>
       </div>
@@ -5306,17 +5319,6 @@ function galleryKeyboardKeyCandidates(key: string) {
     candidates.push(key.toLowerCase(), key.toUpperCase());
   }
   return candidates;
-}
-
-function normalizeGamepadButtonToken(value: string) {
-  const normalized = normalizeKeyToken(value);
-  const aliasMap: Record<string, string> = {
-    south: "a",
-    east: "b",
-    west: "x",
-    north: "y",
-  };
-  return aliasMap[normalized] ?? normalized;
 }
 
 function latestLocalControlEvent(

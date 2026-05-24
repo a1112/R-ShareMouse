@@ -29,6 +29,14 @@ export function getDeviceConsoleSections() {
   };
 }
 
+export function getDeviceSimulatorChrome() {
+  return {
+    textureFirst: true,
+    deviceFrames: false,
+    annotationFrames: false,
+  };
+}
+
 export function getHeaderMetrics() {
   return {
     headerHeight: 40,
