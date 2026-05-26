@@ -190,26 +190,42 @@ pub fn local_capability_snapshots(
                 ),
             );
     if !controls.display.displays.is_empty() {
-        display_topology = display_topology.with_detail(
-            "display_geometries",
-            controls
-                .display
-                .displays
-                .iter()
-                .map(|display| {
-                    format!(
-                        "{}:{}x{}@{},{}{}",
-                        display.display_id,
-                        display.width,
-                        display.height,
-                        display.x,
-                        display.y,
-                        if display.primary { ":primary" } else { "" }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(";"),
-        );
+        let display_settings_writable = controls.display.displays.iter().any(|display| {
+            display.write_capabilities.resolution
+                || display.write_capabilities.refresh_rate
+                || display.write_capabilities.orientation
+                || display.write_capabilities.primary
+                || display.write_capabilities.position
+                || display.write_capabilities.scale
+        });
+        let display_capture_available = controls
+            .display
+            .displays
+            .iter()
+            .any(|display| display.write_capabilities.capture);
+        display_topology = display_topology
+            .with_detail(
+                "display_geometries",
+                controls
+                    .display
+                    .displays
+                    .iter()
+                    .map(|display| {
+                        format!(
+                            "{}:{}x{}@{},{}{}",
+                            display.display_id,
+                            display.width,
+                            display.height,
+                            display.x,
+                            display.y,
+                            if display.primary { ":primary" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            )
+            .with_detail("settings_writable", display_settings_writable.to_string())
+            .with_detail("capture_available", display_capture_available.to_string());
     }
     capabilities.push(display_topology);
 

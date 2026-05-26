@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -125,23 +125,16 @@ pub async fn spawn_daemon(port: Option<u16>, bind: Option<&str>) -> Result<Servi
 pub fn find_daemon_binary() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("RSHARE_DAEMON_BIN") {
         let path = PathBuf::from(path);
-        if path.exists() {
+        if is_daemon_binary_candidate(&path) {
             return Ok(path);
         }
     }
 
     let current_exe = std::env::current_exe().context("Failed to locate current executable")?;
-    let daemon_name = if cfg!(windows) {
-        "rshare-daemon.exe"
-    } else {
-        "rshare-daemon"
-    };
+    let daemon_name = daemon_binary_name();
 
-    for dir in current_exe.ancestors().take(4).filter(|path| path.is_dir()) {
-        let candidate = dir.join(daemon_name);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
+    if let Some(path) = find_daemon_binary_near(&current_exe, daemon_name) {
+        return Ok(path);
     }
 
     anyhow::bail!(
@@ -149,6 +142,36 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         daemon_name,
         current_exe.display()
     )
+}
+
+fn daemon_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "rshare-daemon.exe"
+    } else {
+        "rshare-daemon"
+    }
+}
+
+fn find_daemon_binary_near(current_exe: &Path, daemon_name: &str) -> Option<PathBuf> {
+    for dir in current_exe.ancestors().filter(|path| path.is_dir()).take(8) {
+        let candidate = dir.join(daemon_name);
+        if is_daemon_binary_candidate(&candidate) {
+            return Some(candidate);
+        }
+
+        for profile in ["debug", "release"] {
+            let candidate = dir.join("target").join(profile).join(daemon_name);
+            if is_daemon_binary_candidate(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn is_daemon_binary_candidate(path: &Path) -> bool {
+    path.is_file()
 }
 
 pub async fn request_layout() -> Result<LayoutGraph> {
@@ -344,4 +367,63 @@ pub async fn read_local_control_ws_event(
         }
     }
     anyhow::bail!("Local controls websocket ended")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rshare-core-{name}-{unique}"))
+    }
+
+    #[test]
+    fn find_daemon_binary_near_prefers_adjacent_binary() {
+        let root = temp_root("adjacent");
+        let debug_dir = root.join("apps/rshare-desktop/target/debug");
+        fs::create_dir_all(&debug_dir).expect("create debug dir");
+
+        let current_exe = debug_dir.join("rshare-gui");
+        let adjacent_daemon = debug_dir.join(daemon_binary_name());
+        let workspace_daemon = root.join("target/debug").join(daemon_binary_name());
+        fs::create_dir_all(workspace_daemon.parent().expect("workspace daemon parent"))
+            .expect("create workspace target dir");
+        File::create(&current_exe).expect("create gui binary");
+        File::create(&adjacent_daemon).expect("create adjacent daemon");
+        File::create(&workspace_daemon).expect("create workspace daemon");
+
+        let found = find_daemon_binary_near(&current_exe, daemon_binary_name())
+            .expect("daemon should be found");
+        assert_eq!(found, adjacent_daemon);
+
+        fs::remove_dir_all(root).expect("remove temp tree");
+    }
+
+    #[test]
+    fn find_daemon_binary_near_checks_workspace_target_dir() {
+        let root = temp_root("workspace-target");
+        let debug_dir = root.join("apps/rshare-desktop/target/debug");
+        let workspace_target = root.join("target/debug");
+        let apps_dir = root.join("apps");
+        fs::create_dir_all(&debug_dir).expect("create debug dir");
+        fs::create_dir_all(&workspace_target).expect("create workspace target dir");
+        fs::create_dir_all(apps_dir.join(daemon_binary_name())).expect("create daemon app dir");
+
+        let current_exe = debug_dir.join("rshare-gui");
+        let daemon = workspace_target.join(daemon_binary_name());
+        File::create(&current_exe).expect("create gui binary");
+        File::create(&daemon).expect("create daemon binary");
+
+        let found = find_daemon_binary_near(&current_exe, daemon_binary_name())
+            .expect("daemon should be found");
+        assert_eq!(found, daemon);
+
+        fs::remove_dir_all(root).expect("remove temp tree");
+    }
 }

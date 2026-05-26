@@ -270,11 +270,17 @@ export default function MonitorManager({
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const gestureScaleRef = useRef(1);
+  const panningMovedRef = useRef(false);
   const monitorsRef = useRef(monitors);
   const draggingRef = useRef<string | null>(null);
   const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const dragFrameRef = useRef<number | null>(null);
+  const dragPointRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const panOffsetRef = useRef(panOffset);
   const zoomRef = useRef(zoom);
+  const zoomFrameRef = useRef<number | null>(null);
+  const zoomIntentRef = useRef<{ clientX: number; clientY: number; deltaY: number } | null>(null);
   const pendingLocalSignatureRef = useRef<string | null>(null);
   const pendingLocalSinceRef = useRef(0);
 
@@ -296,6 +302,19 @@ export default function MonitorManager({
   useEffect(() => {
     zoomRef.current = zoom;
   }, [zoom]);
+
+  useEffect(() => {
+    return () => {
+      if (dragFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragFrameRef.current);
+        dragFrameRef.current = null;
+      }
+      if (zoomFrameRef.current !== null) {
+        window.cancelAnimationFrame(zoomFrameRef.current);
+        zoomFrameRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!externalMonitors || externalMonitors.length === 0) {
@@ -626,8 +645,8 @@ export default function MonitorManager({
     []
   );
 
-  const handleMouseMove = useCallback(
-    (e: MouseEvent) => {
+  const applyDragMove = useCallback(
+    (clientX: number, clientY: number) => {
       const dragId = draggingRef.current;
       if (!dragId || !canvasRef.current) return;
       const rect = canvasRef.current.getBoundingClientRect();
@@ -637,8 +656,8 @@ export default function MonitorManager({
       const currentZoom = zoomRef.current;
       const currentPan = panOffsetRef.current;
       const currentOffset = dragOffsetRef.current;
-      const rawX = (e.clientX - rect.left) / currentZoom - currentPan.x - currentOffset.x;
-      const rawY = (e.clientY - rect.top) / currentZoom - currentPan.y - currentOffset.y;
+      const rawX = (clientX - rect.left) / currentZoom - currentPan.x - currentOffset.x;
+      const rawY = (clientY - rect.top) / currentZoom - currentPan.y - currentOffset.y;
       const dragGroup = currentMonitors.filter(
         (monitor) => monitor.enabled && monitor.deviceId === mon.deviceId,
       );
@@ -678,7 +697,34 @@ export default function MonitorManager({
     [computeGroupSnap, computeSnap, resolveCollision, resolveGroupCollision]
   );
 
+  const handleMouseMove = useCallback(
+    (e: MouseEvent) => {
+      dragPointRef.current = { clientX: e.clientX, clientY: e.clientY };
+      if (dragFrameRef.current !== null) {
+        return;
+      }
+      dragFrameRef.current = window.requestAnimationFrame(() => {
+        dragFrameRef.current = null;
+        const point = dragPointRef.current;
+        if (!point) {
+          return;
+        }
+        applyDragMove(point.clientX, point.clientY);
+      });
+    },
+    [applyDragMove],
+  );
+
   const handleMouseUp = useCallback(() => {
+    if (dragFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragFrameRef.current);
+      dragFrameRef.current = null;
+      const point = dragPointRef.current;
+      if (point) {
+        applyDragMove(point.clientX, point.clientY);
+      }
+    }
+    dragPointRef.current = null;
     const dragId = draggingRef.current;
     if (dragId) {
       const committedMonitors = monitorsRef.current;
@@ -689,7 +735,7 @@ export default function MonitorManager({
     draggingRef.current = null;
     setDragging(null);
     setSnapLines([]);
-  }, [onMonitorsCommit]);
+  }, [applyDragMove, onMonitorsCommit]);
 
   useEffect(() => {
     if (dragging) {
@@ -710,18 +756,40 @@ export default function MonitorManager({
     onMonitorsCommit?.(nextMonitors);
   }, [onMonitorsCommit]);
 
-  /* ---- Panning: middle mouse / space+left click ---- */
+  /* ---- Panning: drag the canvas background ---- */
   useEffect(() => {
     if (!isPanning) return;
-    const onMove = (e: MouseEvent) => {
-      const dx = (e.clientX - panStart.x) / zoom;
-      const dy = (e.clientY - panStart.y) / zoom;
+    let frame: number | null = null;
+    let lastPoint = { x: panStart.x, y: panStart.y };
+    const applyPanMove = () => {
+      frame = null;
+      const dx = (lastPoint.x - panStart.x) / zoom;
+      const dy = (lastPoint.y - panStart.y) / zoom;
       setPanOffset({ x: panOffsetStart.x + dx, y: panOffsetStart.y + dy });
     };
-    const onUp = () => setIsPanning(false);
+    const onMove = (e: MouseEvent) => {
+      lastPoint = { x: e.clientX, y: e.clientY };
+      if (Math.abs(e.clientX - panStart.x) > 3 || Math.abs(e.clientY - panStart.y) > 3) {
+        panningMovedRef.current = true;
+      }
+      if (frame !== null) {
+        return;
+      }
+      frame = window.requestAnimationFrame(applyPanMove);
+    };
+    const onUp = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        applyPanMove();
+      }
+      setIsPanning(false);
+    };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -750,33 +818,117 @@ export default function MonitorManager({
     };
   }, []);
 
-  /* ---- Zoom with mouse center ---- */
-  const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
-      e.preventDefault();
+  /* ---- Zoom with pointer center ---- */
+  const applyZoomAtPoint = useCallback(
+    (clientX: number, clientY: number, deltaY: number) => {
       if (!canvasRef.current) return;
       const rect = canvasRef.current.getBoundingClientRect();
       // Mouse position relative to canvas element
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
+      const mouseX = clientX - rect.left;
+      const mouseY = clientY - rect.top;
 
-      const oldZoom = zoom;
-      const delta = -e.deltaY * 0.001;
+      const oldZoom = zoomRef.current;
+      const delta = -deltaY * 0.001;
       const newZoom = Math.min(3, Math.max(0.3, oldZoom + delta));
+      if (newZoom === oldZoom) {
+        return;
+      }
+      const currentPan = panOffsetRef.current;
 
       // World position under cursor before zoom
-      const worldX = mouseX / oldZoom - panOffset.x;
-      const worldY = mouseY / oldZoom - panOffset.y;
+      const worldX = mouseX / oldZoom - currentPan.x;
+      const worldY = mouseY / oldZoom - currentPan.y;
 
       // Adjust pan so world position stays under cursor after zoom
       const newPanX = mouseX / newZoom - worldX;
       const newPanY = mouseY / newZoom - worldY;
 
+      zoomRef.current = newZoom;
+      panOffsetRef.current = { x: newPanX, y: newPanY };
       setZoom(newZoom);
       setPanOffset({ x: newPanX, y: newPanY });
     },
-    [zoom, panOffset]
+    []
   );
+
+  const zoomCanvasAtPoint = useCallback(
+    (clientX: number, clientY: number, deltaY: number) => {
+      const current = zoomIntentRef.current;
+      zoomIntentRef.current = {
+        clientX,
+        clientY,
+        deltaY: (current?.deltaY ?? 0) + deltaY,
+      };
+      if (zoomFrameRef.current !== null) {
+        return;
+      }
+      zoomFrameRef.current = window.requestAnimationFrame(() => {
+        zoomFrameRef.current = null;
+        const intent = zoomIntentRef.current;
+        zoomIntentRef.current = null;
+        if (!intent) {
+          return;
+        }
+        applyZoomAtPoint(intent.clientX, intent.clientY, intent.deltaY);
+      });
+    },
+    [applyZoomAtPoint],
+  );
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+
+    const gesturePoint = (event: Event & { clientX?: number; clientY?: number }) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        clientX: typeof event.clientX === "number" ? event.clientX : rect.left + rect.width / 2,
+        clientY: typeof event.clientY === "number" ? event.clientY : rect.top + rect.height / 2,
+      };
+    };
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      zoomCanvasAtPoint(e.clientX, e.clientY, e.deltaY);
+    };
+    const handleGestureStart = (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const scale = Number((e as Event & { scale?: number }).scale ?? 1);
+      gestureScaleRef.current = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    };
+    const handleGestureChange = (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const scale = Number((e as Event & { scale?: number }).scale ?? 1);
+      if (!Number.isFinite(scale) || scale <= 0) {
+        return;
+      }
+      const previousScale = gestureScaleRef.current || 1;
+      gestureScaleRef.current = scale;
+      if (Math.abs(scale - previousScale) < 0.01) {
+        return;
+      }
+      const point = gesturePoint(e as Event & { clientX?: number; clientY?: number });
+      zoomCanvasAtPoint(point.clientX, point.clientY, scale > previousScale ? -120 : 120);
+    };
+    const handleGestureEnd = (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      gestureScaleRef.current = 1;
+    };
+
+    canvas.addEventListener("wheel", handleWheel, { passive: false, capture: true });
+    canvas.addEventListener("gesturestart", handleGestureStart, { passive: false });
+    canvas.addEventListener("gesturechange", handleGestureChange, { passive: false });
+    canvas.addEventListener("gestureend", handleGestureEnd, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", handleWheel, true);
+      canvas.removeEventListener("gesturestart", handleGestureStart);
+      canvas.removeEventListener("gesturechange", handleGestureChange);
+      canvas.removeEventListener("gestureend", handleGestureEnd);
+    };
+  }, [zoomCanvasAtPoint]);
 
   /* ---- Auto-arrange ---- */
   const autoArrange = useCallback(() => {
@@ -1262,33 +1414,28 @@ export default function MonitorManager({
         <div
           ref={canvasRef}
           className="flex-1 relative overflow-hidden"
-          style={{ background: t.canvasBg, cursor: isPanning ? "grabbing" : spaceHeld ? "grab" : dragging ? "grabbing" : "default" }}
-          onWheel={handleWheel}
-          onClick={() => { if (!isPanning) setSelected(null); }}
+          style={{
+            background: t.canvasBg,
+            cursor: isPanning ? "grabbing" : dragging ? "grabbing" : "grab",
+            overscrollBehavior: "contain",
+            touchAction: "none",
+          }}
+          onClick={() => {
+            if (panningMovedRef.current) {
+              panningMovedRef.current = false;
+              return;
+            }
+            if (!isPanning) setSelected(null);
+          }}
           onContextMenu={(e) => e.preventDefault()}
           onMouseDown={(e) => {
-            // Middle mouse button pan
-            if (e.button === 1) {
+            // Left/middle/right mouse button pan on the empty canvas background.
+            if (e.button === 0 || e.button === 1 || e.button === 2) {
               e.preventDefault();
               setIsPanning(true);
               setPanStart({ x: e.clientX, y: e.clientY });
               setPanOffsetStart(panOffset);
-              return;
-            }
-            // Right mouse button pan
-            if (e.button === 2) {
-              e.preventDefault();
-              setIsPanning(true);
-              setPanStart({ x: e.clientX, y: e.clientY });
-              setPanOffsetStart(panOffset);
-              return;
-            }
-            // Space + left click pan
-            if (e.button === 0 && spaceHeld) {
-              e.preventDefault();
-              setIsPanning(true);
-              setPanStart({ x: e.clientX, y: e.clientY });
-              setPanOffsetStart(panOffset);
+              panningMovedRef.current = false;
             }
           }}
           tabIndex={0}
@@ -1300,6 +1447,7 @@ export default function MonitorManager({
               backgroundImage: `radial-gradient(circle, ${t.dot} 0.8px, transparent 0.8px)`,
               backgroundSize: `${30 * zoom}px ${30 * zoom}px`,
               backgroundPosition: `${panOffset.x * zoom}px ${panOffset.y * zoom}px`,
+              willChange: dragging || isPanning ? "background-position" : undefined,
             }}
           />
 
@@ -1310,6 +1458,7 @@ export default function MonitorManager({
               transform: `scale(${zoom}) translate(${panOffset.x}px, ${panOffset.y}px)`,
               transformOrigin: "0 0",
               pointerEvents: "none",
+              willChange: dragging || isPanning ? "transform" : undefined,
             }}
           >
             {/* Snap lines */}
@@ -1345,7 +1494,7 @@ export default function MonitorManager({
                       : isDraggingThis
                       ? `0 4px 20px ${isDark ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.15)"}`
                       : `0 1px 4px ${isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.08)"}`,
-                    backdropFilter: isDark ? "none" : "blur(2px)",
+                    backdropFilter: isDark || dragging || isPanning ? "none" : "blur(2px)",
                     pointerEvents: "auto",
                   }}
                 >

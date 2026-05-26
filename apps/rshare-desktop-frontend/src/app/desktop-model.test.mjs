@@ -90,7 +90,7 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
   assert.deepEqual(overview.devices, []);
 });
 
-test("buildDisplaySettingsViewModel exposes Windows-style display settings", () => {
+test("buildDisplaySettingsViewModel exposes system display settings", () => {
   const view = buildDisplaySettingsViewModel(
     {
       display: {
@@ -117,7 +117,7 @@ test("buildDisplaySettingsViewModel exposes Windows-style display settings", () 
               { width: 1920, height: 1080, refresh_rate_millihz: 144_000 },
               { width: 1280, height: 720, refresh_rate_millihz: 60_000 },
             ],
-            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false, capture: true },
           },
           {
             display_id: "primary",
@@ -130,7 +130,7 @@ test("buildDisplaySettingsViewModel exposes Windows-style display settings", () 
             scale_percent: 150,
             refresh_rate_millihz: 144_000,
             modes: [{ width: 2560, height: 1440, refresh_rate_millihz: 144_000 }],
-            write_capabilities: { resolution: true, refresh_rate: true, scale: false },
+            write_capabilities: { resolution: true, refresh_rate: true, scale: false, capture: true },
           },
         ],
       },
@@ -154,6 +154,7 @@ test("buildDisplaySettingsViewModel exposes Windows-style display settings", () 
     ["60 Hz", "144 Hz"],
   );
   assert.equal(view.selectedDisplay.writeCapabilities.scale, false);
+  assert.equal(view.selectedDisplay.writeCapabilities.capture, true);
 });
 
 test("buildDesktopViewModel exposes daemon latency feedback when present", () => {

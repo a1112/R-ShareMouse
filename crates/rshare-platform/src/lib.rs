@@ -54,7 +54,9 @@ pub use macos::*;
 pub use linux::*;
 
 #[cfg(target_os = "linux")]
-pub use linux_evdev::{EvdevDriverEvent, EvdevInputListener, UInputInjector};
+pub use linux_evdev::{
+    enumerate_input_devices, EvdevDriverEvent, EvdevInputListener, UInputInjector,
+};
 
 pub use clipboard::*;
 pub use file_drop::*;

@@ -21,6 +21,23 @@ select {
   font: inherit;
 }
 
+select.rshare-select {
+  color-scheme: dark;
+  appearance: auto;
+}
+
+select.rshare-select,
+select.rshare-select option {
+  background-color: var(--rshare-select-bg, #2b2b2b);
+  color: var(--rshare-select-fg, #e0e0e0);
+}
+
+select.rshare-select:disabled {
+  opacity: 1;
+  background-color: var(--rshare-select-disabled-bg, #242424);
+  color: var(--rshare-select-disabled-fg, #8a8a8a);
+}
+
 .rshare-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgba(110, 124, 145, 0.55) transparent;

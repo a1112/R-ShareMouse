@@ -34,12 +34,12 @@ use rshare_input::{
     InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend,
 };
 
-#[cfg(target_os = "linux")]
-use rshare_input::EvdevCaptureBackend;
+#[cfg(any(windows, target_os = "linux"))]
+use rshare_input::InputEventChannel;
 #[cfg(not(windows))]
 use rshare_input::RDevInputListener;
 #[cfg(windows)]
-use rshare_input::{DefaultInputListener, InputEventChannel, InputListener};
+use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
     connection::{ConnectionInfo, ConnectionState},
     DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
@@ -770,7 +770,16 @@ impl DaemonState {
         }
     }
 
+    #[cfg(test)]
     fn record_local_input_event(&mut self, event: &InputEvent) -> LocalInputDiagnosticEvent {
+        self.record_local_input_event_with_metadata(event, None)
+    }
+
+    fn record_local_input_event_with_metadata(
+        &mut self,
+        event: &InputEvent,
+        metadata: Option<&LocalInputDeviceMetadata>,
+    ) -> LocalInputDiagnosticEvent {
         let sequence = self.local_controls.sequence.saturating_add(1);
         self.local_controls.sequence = sequence;
         let timestamp_ms = timestamp_ms_now();
@@ -980,18 +989,19 @@ impl DaemonState {
         };
         let source = self.local_input_source_for_event(device_kind, timestamp_ms, &mut payload);
 
-        let event = LocalInputDiagnosticEvent {
+        let mut event = LocalInputDiagnosticEvent {
             sequence,
             timestamp_ms,
             device_kind,
             event_kind,
             summary,
-            device_id: None,
-            device_instance_id: None,
-            capture_path: None,
+            device_id: metadata.map(|metadata| metadata.device_id.clone()),
+            device_instance_id: metadata.and_then(|metadata| metadata.device_instance_id.clone()),
+            capture_path: metadata.and_then(|metadata| metadata.capture_path.clone()),
             source,
             payload,
         };
+        update_local_input_device_feedback(&mut self.local_controls, &mut event);
         push_recent_local_event(&mut self.local_controls, event.clone());
         event
     }
@@ -1018,6 +1028,28 @@ const LOCAL_CONTROL_RECENT_EVENT_LIMIT: usize = 64;
 const INJECTION_LOOPBACK_WINDOW_MS: u64 = 750;
 
 type UsbHostRuntime = Arc<Mutex<rshare_platform::ExperimentalUsbHostRuntime>>;
+
+#[derive(Debug, Clone)]
+struct CapturedInputEvent {
+    event: InputEvent,
+    metadata: Option<LocalInputDeviceMetadata>,
+}
+
+impl From<InputEvent> for CapturedInputEvent {
+    fn from(event: InputEvent) -> Self {
+        Self {
+            event,
+            metadata: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalInputDeviceMetadata {
+    device_id: String,
+    device_instance_id: Option<String>,
+    capture_path: Option<String>,
+}
 
 fn default_local_control_snapshot(
     width: u32,
@@ -1058,6 +1090,33 @@ fn refresh_platform_local_controls(
         if snapshot.driver.status == "available" {
             snapshot.keyboard.capture_source = "RShare filter driver + fallback hook".to_string();
             snapshot.mouse.capture_source = "RShare filter driver + fallback hook".to_string();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match rshare_platform::display::query_display_state() {
+            Ok(display) if !display.displays.is_empty() => {
+                snapshot.display = display;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                snapshot.last_error = Some(format!("Linux display enumeration failed: {error}"));
+            }
+        }
+        match rshare_platform::enumerate_input_devices() {
+            Ok((keyboards, mice)) => {
+                snapshot.keyboard_devices = keyboards;
+                snapshot.mouse_devices = mice;
+                if !snapshot.keyboard_devices.is_empty() {
+                    snapshot.keyboard.capture_source = "Linux evdev".to_string();
+                }
+                if !snapshot.mouse_devices.is_empty() {
+                    snapshot.mouse.capture_source = "Linux evdev".to_string();
+                }
+            }
+            Err(error) => {
+                snapshot.last_error = Some(format!("Linux input enumeration failed: {error}"));
+            }
         }
     }
     #[cfg(windows)]
@@ -1323,6 +1382,85 @@ fn insert_mouse_position_payload(
     }
 }
 
+fn update_local_input_device_feedback(
+    snapshot: &mut LocalControlDeviceSnapshot,
+    event: &mut LocalInputDiagnosticEvent,
+) {
+    let devices = match event.device_kind {
+        LocalInputDeviceKind::Keyboard => &mut snapshot.keyboard_devices,
+        LocalInputDeviceKind::Mouse => &mut snapshot.mouse_devices,
+        _ => return,
+    };
+
+    if devices.is_empty() {
+        return;
+    }
+
+    let selected_index = event
+        .device_id
+        .as_deref()
+        .or_else(|| event.payload.get("device_id").map(String::as_str))
+        .and_then(|device_id| devices.iter().position(|device| device.id == device_id))
+        .or_else(|| {
+            event
+                .device_instance_id
+                .as_deref()
+                .or_else(|| event.payload.get("device_instance_id").map(String::as_str))
+                .and_then(|instance_id| {
+                    devices.iter().position(|device| {
+                        device.device_instance_id.as_deref() == Some(instance_id)
+                    })
+                })
+        })
+        .or_else(|| {
+            event
+                .capture_path
+                .as_deref()
+                .or_else(|| event.payload.get("capture_path").map(String::as_str))
+                .and_then(|capture_path| {
+                    devices
+                        .iter()
+                        .position(|device| device.capture_path.as_deref() == Some(capture_path))
+                })
+        })
+        .or_else(|| if devices.len() == 1 { Some(0) } else { None });
+
+    let Some(index) = selected_index else {
+        return;
+    };
+
+    let device = &mut devices[index];
+    device.connected = true;
+    device.event_count = device.event_count.saturating_add(1);
+    device.last_event_ms = event.timestamp_ms;
+
+    if event.device_id.is_none() {
+        event.device_id = Some(device.id.clone());
+    }
+    if event.device_instance_id.is_none() {
+        event.device_instance_id = device.device_instance_id.clone();
+    }
+    if event.capture_path.is_none() {
+        event.capture_path = device.capture_path.clone();
+    }
+    event
+        .payload
+        .entry("device_id".to_string())
+        .or_insert_with(|| device.id.clone());
+    if let Some(instance_id) = &device.device_instance_id {
+        event
+            .payload
+            .entry("device_instance_id".to_string())
+            .or_insert_with(|| instance_id.clone());
+    }
+    if let Some(capture_path) = &device.capture_path {
+        event
+            .payload
+            .entry("capture_path".to_string())
+            .or_insert_with(|| capture_path.clone());
+    }
+}
+
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
@@ -1543,6 +1681,7 @@ fn upsert_gamepad_state(snapshot: &mut LocalControlDeviceSnapshot, state: LocalG
     }
 }
 
+#[cfg(windows)]
 fn replace_recent_local_event(
     snapshot: &mut LocalControlDeviceSnapshot,
     event: LocalInputDiagnosticEvent,
@@ -5725,7 +5864,7 @@ async fn send_forwarded_messages(
 }
 
 async fn run_input_forwarding_loop(
-    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<CapturedInputEvent>,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
@@ -5739,14 +5878,17 @@ async fn run_input_forwarding_loop(
 
     loop {
         tokio::select! {
-            event = input_rx.recv() => {
-                let Some(event) = event else {
+            captured = input_rx.recv() => {
+                let Some(captured) = captured else {
                     break;
                 };
+                let event = captured.event;
+                let metadata = captured.metadata;
 
                 let (target, messages, diagnostic, suppress_local_shortcuts) = {
                     let mut state = state.write().await;
-                    let local_event = state.record_local_input_event(&event);
+                    let local_event =
+                        state.record_local_input_event_with_metadata(&event, metadata.as_ref());
                     let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
                     let outcome = captured_input_forwarding_outcome(
@@ -6019,9 +6161,6 @@ fn check_evdev_devices_available() -> BackendHealth {
 
     // Check if there are any event devices
     let mut device_count = 0;
-    let mut has_keyboard = false;
-    let mut has_mouse = false;
-
     if let Ok(entries) = input_dir.read_dir() {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -6070,16 +6209,18 @@ fn check_evdev_devices_available() -> BackendHealth {
 /// Returns Ok(task handle) if Evdev capture is available and started successfully.
 #[cfg(target_os = "linux")]
 fn try_start_evdev_capture(
-    tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    tx: tokio::sync::mpsc::UnboundedSender<CapturedInputEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use rshare_platform::EvdevDriverEvent;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
 
     // Spawn a thread to read events from Evdev and send them to the channel
     let handle = tokio::task::spawn_blocking(move || {
@@ -6095,45 +6236,8 @@ fn try_start_evdev_capture(
             // Log the raw evdev event for debugging
             tracing::debug!("Evdev event: {:?}", evdev_event);
 
-            let input_event = match evdev_event {
-                EvdevDriverEvent::MouseMove { x, y } => InputEvent::MouseMove { x, y },
-                EvdevDriverEvent::MouseButton { button, pressed } => {
-                    use rshare_input::ButtonState;
-                    use rshare_input::MouseButton;
-                    let button_code = match button {
-                        0 => MouseButton::Left,
-                        1 => MouseButton::Right,
-                        2 => MouseButton::Middle,
-                        3 => MouseButton::Back,
-                        4 => MouseButton::Forward,
-                        _ => MouseButton::Other(button as u8),
-                    };
-                    let state = if pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    };
-                    InputEvent::MouseButton {
-                        button: button_code,
-                        state,
-                    }
-                }
-                EvdevDriverEvent::MouseWheel { delta_x, delta_y } => {
-                    InputEvent::MouseWheel { delta_x, delta_y }
-                }
-                EvdevDriverEvent::Key { keycode, pressed } => {
-                    use rshare_input::{ButtonState, KeyCode};
-                    let key = KeyCode::Raw(keycode);
-                    let state = if pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    };
-                    InputEvent::Key {
-                        keycode: key,
-                        state,
-                    }
-                }
+            let Some(input_event) = captured_input_from_evdev_driver_event(evdev_event) else {
+                return;
             };
 
             if tx.send(input_event).is_err() {
@@ -6142,8 +6246,16 @@ fn try_start_evdev_capture(
         };
 
         // Start the listener
-        if let Err(e) = listener.start(callback) {
-            tracing::error!("Evdev listener error: {:?}", e);
+        match listener.start(callback) {
+            Ok(()) => {
+                let _ = started_tx.send(Ok(()));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::error!("Evdev listener error: {message}");
+                let _ = started_tx.send(Err(message));
+                return;
+            }
         }
 
         // Keep the thread alive until shutdown
@@ -6154,7 +6266,113 @@ fn try_start_evdev_capture(
         let _ = listener.stop();
     });
 
-    Ok(handle)
+    match started_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(message)) => anyhow::bail!(message),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(handle),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("Evdev listener exited before startup completed")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn captured_input_from_evdev_driver_event(
+    event: rshare_platform::EvdevDriverEvent,
+) -> Option<CapturedInputEvent> {
+    use rshare_input::{ButtonState, KeyCode, MouseButton};
+    use rshare_platform::EvdevDriverEvent;
+
+    let (event, device_kind, device_path) = match event {
+        EvdevDriverEvent::MouseMove { x, y, device_path } => (
+            InputEvent::MouseMove { x, y },
+            LocalInputDeviceKind::Mouse,
+            device_path,
+        ),
+        EvdevDriverEvent::MouseButton {
+            button,
+            pressed,
+            device_path,
+        } => {
+            let state = if pressed {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            };
+            (
+                InputEvent::MouseButton {
+                    button: MouseButton::from_code(button as u8),
+                    state,
+                },
+                LocalInputDeviceKind::Mouse,
+                device_path,
+            )
+        }
+        EvdevDriverEvent::MouseWheel {
+            delta_x,
+            delta_y,
+            device_path,
+        } => (
+            InputEvent::MouseWheel { delta_x, delta_y },
+            LocalInputDeviceKind::Mouse,
+            device_path,
+        ),
+        EvdevDriverEvent::Key {
+            keycode,
+            pressed,
+            device_path,
+        } => {
+            let state = if pressed {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            };
+            (
+                InputEvent::Key {
+                    keycode: KeyCode::Raw(keycode),
+                    state,
+                },
+                LocalInputDeviceKind::Keyboard,
+                device_path,
+            )
+        }
+    };
+
+    let event_name = Path::new(&device_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    let kind_label = match device_kind {
+        LocalInputDeviceKind::Keyboard => "keyboard",
+        LocalInputDeviceKind::Mouse => "mouse",
+        _ => return None,
+    };
+    let device_id = event_name
+        .as_ref()
+        .map(|event_name| format!("linux-evdev-{kind_label}-{event_name}"))
+        .unwrap_or_else(|| format!("linux-evdev-{kind_label}-unknown"));
+
+    Some(CapturedInputEvent {
+        event,
+        metadata: Some(LocalInputDeviceMetadata {
+            device_id,
+            device_instance_id: event_name,
+            capture_path: Some(device_path),
+        }),
+    })
+}
+
+fn forward_input_events_to_captured_channel(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    tx: tokio::sync::mpsc::UnboundedSender<CapturedInputEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if tx.send(CapturedInputEvent::from(event)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 #[tokio::main]
@@ -6284,17 +6502,19 @@ async fn main() -> Result<()> {
 
     // Input capture: try Evdev on Linux for kernel-level access, fallback to RDev
     #[cfg(target_os = "linux")]
-    let (input_rx, mut input_channel) = {
+    let (input_rx, input_channel, gamepad_input_channel) = {
         use tokio::sync::mpsc;
 
-        let (tx, rx) = mpsc::unbounded_channel::<InputEvent>();
+        let (tx, rx) = mpsc::unbounded_channel::<CapturedInputEvent>();
+        let (gamepad_input_channel, gamepad_rx) = InputEventChannel::new();
+        forward_input_events_to_captured_channel(gamepad_rx, tx.clone());
 
         // Try to use EvdevCaptureBackend for kernel-level input capture
         match try_start_evdev_capture(tx.clone()) {
-            Ok(evdev_task) => {
+            Ok(_evdev_task) => {
                 tracing::info!("Using Evdev backend for input capture (kernel-level)");
                 // Evdev capture is running in the background task
-                (rx, None)
+                (rx, None, gamepad_input_channel)
             }
             Err(e) => {
                 tracing::warn!(
@@ -6303,17 +6523,19 @@ async fn main() -> Result<()> {
                 );
                 // Fallback to RDev (Portable) backend
                 let mut input_listener = RDevInputListener::new();
-                let rx = input_listener.receiver();
+                let rdev_rx = input_listener.receiver();
+                forward_input_events_to_captured_channel(rdev_rx, tx);
                 let channel = Some(input_listener);
-                let _ = tx; // Keep tx in scope
-                (rx, channel)
+                (rx, channel, gamepad_input_channel)
             }
         }
     };
 
     #[cfg(windows)]
     let (input_rx, input_event_channel, _input_listener) = {
-        let (input_event_channel, input_rx) = InputEventChannel::new();
+        let (input_event_channel, raw_input_rx) = InputEventChannel::new();
+        let (captured_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInputEvent>();
+        forward_input_events_to_captured_channel(raw_input_rx, captured_tx);
         let callback_channel = input_event_channel.clone();
         let mut input_listener = DefaultInputListener::new();
         input_listener.start(Box::new(move |event| {
@@ -6327,8 +6549,10 @@ async fn main() -> Result<()> {
     #[cfg(all(not(target_os = "linux"), not(windows)))]
     let (input_rx, mut input_channel) = {
         let mut input_listener = RDevInputListener::new();
-        let rx = input_listener.receiver();
-        (rx, Some(input_listener))
+        let raw_input_rx = input_listener.receiver();
+        let (captured_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInputEvent>();
+        forward_input_events_to_captured_channel(raw_input_rx, captured_tx);
+        (input_rx, Some(input_listener))
     };
 
     let mut gamepad_listener_config = GamepadListenerConfig::from(&config.gamepad);
@@ -6336,10 +6560,7 @@ async fn main() -> Result<()> {
     let mut gamepad_listener = {
         #[cfg(target_os = "linux")]
         {
-            // On Linux with Evdev, we need to create a separate channel for gamepad events
-            use rshare_input::InputEventChannel;
-            let (gamepad_channel, _gamepad_rx) = InputEventChannel::new();
-            GilrsGamepadListener::new(gamepad_channel, gamepad_listener_config)
+            GilrsGamepadListener::new(gamepad_input_channel.clone(), gamepad_listener_config)
         }
         #[cfg(windows)]
         {
@@ -6356,8 +6577,14 @@ async fn main() -> Result<()> {
     gamepad_listener.start()?;
 
     // Start RDev listener if we're using it
+    #[cfg(target_os = "linux")]
+    if let Some(ref listener) = input_channel {
+        listener.start().await?;
+        tracing::info!("Using RDev fallback input capture on Linux");
+    }
+
     #[cfg(all(not(target_os = "linux"), not(windows)))]
-    if let Some(ref mut listener) = input_channel {
+    if let Some(ref listener) = input_channel {
         listener.start().await?;
     }
 
@@ -7983,6 +8210,109 @@ mod tests {
         ));
         assert!(state.local_controls.keyboard.pressed_keys.is_empty());
         assert_eq!(state.local_controls.keyboard.event_count, 2);
+    }
+
+    #[test]
+    fn local_input_event_attributes_single_physical_keyboard() {
+        let mut state = test_daemon_state();
+        state.local_controls.keyboard_devices.clear();
+        state
+            .local_controls
+            .keyboard_devices
+            .push(rshare_core::LocalHardwareDevice {
+                id: "linux-evdev-keyboard-event3".to_string(),
+                name: "Built-in Keyboard".to_string(),
+                source: "Linux evdev".to_string(),
+                connected: true,
+                device_instance_id: Some("event3".to_string()),
+                capture_path: Some("/dev/input/event3".to_string()),
+                ..Default::default()
+            });
+
+        let diagnostic = state.record_local_input_event(&rshare_input::InputEvent::key(
+            rshare_input::KeyCode::ShiftLeft,
+            rshare_input::ButtonState::Pressed,
+        ));
+
+        assert_eq!(
+            diagnostic.device_id.as_deref(),
+            Some("linux-evdev-keyboard-event3")
+        );
+        assert_eq!(diagnostic.device_instance_id.as_deref(), Some("event3"));
+        assert_eq!(
+            diagnostic.capture_path.as_deref(),
+            Some("/dev/input/event3")
+        );
+        assert_eq!(
+            diagnostic.payload.get("device_id").map(String::as_str),
+            Some("linux-evdev-keyboard-event3")
+        );
+        assert_eq!(state.local_controls.keyboard_devices[0].event_count, 1);
+        assert_eq!(
+            state.local_controls.keyboard_devices[0].last_event_ms,
+            diagnostic.timestamp_ms
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evdev_capture_metadata_attributes_matching_physical_mouse() {
+        let captured = captured_input_from_evdev_driver_event(
+            rshare_platform::EvdevDriverEvent::MouseButton {
+                button: 1,
+                pressed: true,
+                device_path: "/dev/input/event9".to_string(),
+            },
+        )
+        .expect("mouse button should convert");
+        assert_eq!(
+            captured
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.device_id.as_str()),
+            Some("linux-evdev-mouse-event9")
+        );
+
+        let mut state = test_daemon_state();
+        state.local_controls.mouse_devices.clear();
+        state
+            .local_controls
+            .mouse_devices
+            .push(rshare_core::LocalHardwareDevice {
+                id: "linux-evdev-mouse-event8".to_string(),
+                name: "External Mouse".to_string(),
+                source: "Linux evdev".to_string(),
+                connected: true,
+                device_instance_id: Some("event8".to_string()),
+                capture_path: Some("/dev/input/event8".to_string()),
+                ..Default::default()
+            });
+        state
+            .local_controls
+            .mouse_devices
+            .push(rshare_core::LocalHardwareDevice {
+                id: "linux-evdev-mouse-event9".to_string(),
+                name: "Touchpad".to_string(),
+                source: "Linux evdev".to_string(),
+                connected: true,
+                device_instance_id: Some("event9".to_string()),
+                capture_path: Some("/dev/input/event9".to_string()),
+                ..Default::default()
+            });
+
+        let diagnostic = state
+            .record_local_input_event_with_metadata(&captured.event, captured.metadata.as_ref());
+
+        assert_eq!(
+            diagnostic.device_id.as_deref(),
+            Some("linux-evdev-mouse-event9")
+        );
+        assert_eq!(state.local_controls.mouse_devices[0].event_count, 0);
+        assert_eq!(state.local_controls.mouse_devices[1].event_count, 1);
+        assert_eq!(
+            state.local_controls.mouse_devices[1].last_event_ms,
+            diagnostic.timestamp_ms
+        );
     }
 
     #[test]

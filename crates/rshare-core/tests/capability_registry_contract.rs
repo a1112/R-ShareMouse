@@ -107,6 +107,12 @@ fn local_display_topology_preserves_multiple_monitor_details() {
             width: 2560,
             height: 1440,
             primary: true,
+            write_capabilities: rshare_core::DisplayWriteCapabilities {
+                resolution: true,
+                refresh_rate: true,
+                capture: true,
+                ..rshare_core::DisplayWriteCapabilities::default()
+            },
             ..LocalDisplayInfo::default()
         },
         LocalDisplayInfo {
@@ -150,6 +156,14 @@ fn local_display_topology_preserves_multiple_monitor_details() {
             .get("display_geometries")
             .map(String::as_str),
         Some("primary:2560x1440@0,0:primary;right:1920x1080@2560,0")
+    );
+    assert_eq!(
+        display.details.get("settings_writable").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        display.details.get("capture_available").map(String::as_str),
+        Some("true")
     );
 }
 

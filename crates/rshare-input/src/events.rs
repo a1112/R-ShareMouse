@@ -427,10 +427,12 @@ impl InputEvent {
     #[cfg(target_os = "linux")]
     pub fn from_evdev_driver_event(event: rshare_platform::EvdevDriverEvent) -> Option<Self> {
         match event {
-            rshare_platform::EvdevDriverEvent::MouseMove { x, y } => {
+            rshare_platform::EvdevDriverEvent::MouseMove { x, y, .. } => {
                 Some(InputEvent::mouse_move(x, y))
             }
-            rshare_platform::EvdevDriverEvent::MouseButton { button, pressed } => {
+            rshare_platform::EvdevDriverEvent::MouseButton {
+                button, pressed, ..
+            } => {
                 let state = if pressed {
                     ButtonState::Pressed
                 } else {
@@ -441,10 +443,12 @@ impl InputEvent {
                     state,
                 ))
             }
-            rshare_platform::EvdevDriverEvent::MouseWheel { delta_x, delta_y } => {
-                Some(InputEvent::mouse_wheel(delta_x, delta_y))
-            }
-            rshare_platform::EvdevDriverEvent::Key { keycode, pressed } => {
+            rshare_platform::EvdevDriverEvent::MouseWheel {
+                delta_x, delta_y, ..
+            } => Some(InputEvent::mouse_wheel(delta_x, delta_y)),
+            rshare_platform::EvdevDriverEvent::Key {
+                keycode, pressed, ..
+            } => {
                 let state = if pressed {
                     ButtonState::Pressed
                 } else {

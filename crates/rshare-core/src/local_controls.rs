@@ -581,6 +581,8 @@ pub struct DisplayWriteCapabilities {
     pub position: bool,
     #[serde(default)]
     pub scale: bool,
+    #[serde(default)]
+    pub capture: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

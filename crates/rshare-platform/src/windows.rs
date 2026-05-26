@@ -2702,6 +2702,7 @@ mod windows_impl {
                     primary: false,
                     position: false,
                     scale: false,
+                    capture: true,
                 },
             });
         }

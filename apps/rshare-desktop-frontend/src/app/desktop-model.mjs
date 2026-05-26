@@ -153,6 +153,7 @@ export function buildDisplaySettingsViewModel(snapshot, selectedDisplayId) {
       primary: Boolean(display.write_capabilities?.primary),
       position: Boolean(display.write_capabilities?.position),
       scale: Boolean(display.write_capabilities?.scale),
+      capture: Boolean(display.write_capabilities?.capture),
     };
     return {
       id,

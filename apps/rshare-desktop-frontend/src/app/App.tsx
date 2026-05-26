@@ -356,6 +356,7 @@ type DisplayWriteCapabilities = {
   primary?: boolean;
   position?: boolean;
   scale?: boolean;
+  capture?: boolean;
 };
 
 type DisplayModeInfo = {
@@ -420,6 +421,7 @@ type DisplaySettingsDisplayView = {
     primary: boolean;
     position: boolean;
     scale: boolean;
+    capture: boolean;
   };
 };
 
@@ -3696,6 +3698,7 @@ function AllDevicesOverview({
 }) {
   const galleryItems = buildDeviceGalleryItems(snapshot, audioOutputs, remoteDevices);
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const gestureScaleRef = useRef(1);
   const [zoom, setZoom] = useState(0.92);
   const [panOffset, setPanOffset] = useState({ x: 24, y: -8 });
   const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
@@ -3798,21 +3801,75 @@ function AllDevicesOverview({
     });
   };
 
-  const handleWheelZoom = (event: React.WheelEvent) => {
+  const zoomCanvasAtPoint = (clientX: number, clientY: number, deltaY: number) => {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) {
       return;
     }
-    event.preventDefault();
-    const nextZoom = clamp(zoom * (event.deltaY > 0 ? 0.9 : 1.1), 0.55, 1.75);
-    const worldX = (event.clientX - rect.left) / zoom - panOffset.x;
-    const worldY = (event.clientY - rect.top) / zoom - panOffset.y;
+    const nextZoom = clamp(zoom * (deltaY > 0 ? 0.9 : 1.1), 0.55, 1.75);
+    const worldX = (clientX - rect.left) / zoom - panOffset.x;
+    const worldY = (clientY - rect.top) / zoom - panOffset.y;
     setZoom(nextZoom);
     setPanOffset({
-      x: (event.clientX - rect.left) / nextZoom - worldX,
-      y: (event.clientY - rect.top) / nextZoom - worldY,
+      x: (clientX - rect.left) / nextZoom - worldX,
+      y: (clientY - rect.top) / nextZoom - worldY,
     });
   };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return undefined;
+    }
+    const gesturePoint = (event: Event & { clientX?: number; clientY?: number }) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        clientX: typeof event.clientX === "number" ? event.clientX : rect.left + rect.width / 2,
+        clientY: typeof event.clientY === "number" ? event.clientY : rect.top + rect.height / 2,
+      };
+    };
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      zoomCanvasAtPoint(event.clientX, event.clientY, event.deltaY);
+    };
+    const handleGestureStart = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const scale = Number((event as Event & { scale?: number }).scale ?? 1);
+      gestureScaleRef.current = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    };
+    const handleGestureChange = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const scale = Number((event as Event & { scale?: number }).scale ?? 1);
+      if (!Number.isFinite(scale) || scale <= 0) {
+        return;
+      }
+      const previousScale = gestureScaleRef.current || 1;
+      gestureScaleRef.current = scale;
+      if (Math.abs(scale - previousScale) < 0.01) {
+        return;
+      }
+      const point = gesturePoint(event as Event & { clientX?: number; clientY?: number });
+      zoomCanvasAtPoint(point.clientX, point.clientY, scale > previousScale ? -120 : 120);
+    };
+    const handleGestureEnd = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      gestureScaleRef.current = 1;
+    };
+    canvas.addEventListener("wheel", handleWheel, { passive: false, capture: true });
+    canvas.addEventListener("gesturestart", handleGestureStart, { passive: false });
+    canvas.addEventListener("gesturechange", handleGestureChange, { passive: false });
+    canvas.addEventListener("gestureend", handleGestureEnd, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", handleWheel, true);
+      canvas.removeEventListener("gesturestart", handleGestureStart);
+      canvas.removeEventListener("gesturechange", handleGestureChange);
+      canvas.removeEventListener("gestureend", handleGestureEnd);
+    };
+  }, [zoom, panOffset]);
 
   return (
     <section
@@ -3839,13 +3896,14 @@ function AllDevicesOverview({
         className="relative h-full min-h-[420px] overflow-hidden md:min-h-[520px] xl:min-h-[640px]"
         style={{
           cursor: panning ? "grabbing" : "grab",
+          overscrollBehavior: "contain",
+          touchAction: "none",
           backgroundImage: `radial-gradient(circle, ${theme.gridDot} 1px, transparent 1px)`,
           backgroundSize: `${28 * zoom}px ${28 * zoom}px`,
           backgroundPosition: `${panOffset.x * zoom}px ${panOffset.y * zoom}px`,
         }}
         onContextMenu={(event) => event.preventDefault()}
         onMouseDown={beginCanvasPan}
-        onWheel={handleWheelZoom}
       >
         <div className="absolute left-6 top-5 z-10">
           <div className="text-xs uppercase tracking-[0.18em]" style={{ color: theme.textMuted }}>
@@ -6201,7 +6259,7 @@ function DeviceSelector({
 
   return (
     <select
-      className={`${compact ? "h-7 max-w-[160px]" : "h-8 max-w-[320px]"} rounded-md px-2 text-xs outline-none`}
+      className={`rshare-select ${compact ? "h-7 max-w-[160px]" : "h-8 max-w-[320px]"} rounded-md px-2 text-xs outline-none`}
       style={{
         border: `1px solid ${theme.border}`,
         background: "rgba(255,255,255,0.035)",
@@ -6215,7 +6273,11 @@ function DeviceSelector({
       )}
     >
       {options.map((item) => (
-        <option key={item.id} value={item.id}>
+        <option
+          key={item.id}
+          value={item.id}
+          style={{ backgroundColor: theme.frame, color: theme.text }}
+        >
           {item.live ? "● " : "○ "}
           {item.name}
         </option>
@@ -6885,12 +6947,14 @@ function DisplaySettingsDetail({
   }, [selected.id, selected.width, selected.height, selected.refreshRateMillihz, selected.scalePercent]);
 
   const scaleOptions = displayScaleOptions(selected.scalePercent);
+  const resolutionChanged = resolutionValue !== `${selected.width}x${selected.height}`;
+  const refreshRateChanged =
+    refreshRateValue !== (selected.refreshRateMillihz ? String(selected.refreshRateMillihz) : "");
   const scaleChanged = Number(scaleValue) !== Number(selected.scalePercent ?? 100);
   const canApplyDisplayMode =
-    selected.writeCapabilities.resolution ||
-    selected.writeCapabilities.refreshRate ||
-    selected.writeCapabilities.scale ||
-    scaleChanged;
+    (resolutionChanged && selected.writeCapabilities.resolution) ||
+    (refreshRateChanged && selected.writeCapabilities.refreshRate) ||
+    (scaleChanged && selected.writeCapabilities.scale);
 
   const runDisplayAction = async <T,>(
     action: string,
@@ -6918,8 +6982,8 @@ function DisplaySettingsDetail({
         const results: Array<{ displayId: string; result: DisplayCaptureResult }> = [];
         for (const display of view.displays) {
           const result = await invokeCommand<DisplayCaptureResult>("capture_display", {
-            display_id: display.id,
-            max_width: 900,
+            displayId: display.id,
+            maxWidth: 900,
           });
           results.push({ displayId: display.id, result });
         }
@@ -6927,8 +6991,10 @@ function DisplaySettingsDetail({
       },
       (results) => {
         const nextCaptures: Record<string, string> = {};
+        const failures: DisplayCaptureResult[] = [];
         for (const { displayId, result } of results) {
           if (result.status !== "Success") {
+            failures.push(result);
             continue;
           }
           const dataUrl = displayCaptureDataUrl(result);
@@ -6936,10 +7002,22 @@ function DisplaySettingsDetail({
             nextCaptures[displayId] = dataUrl;
           }
         }
-        if (Object.keys(nextCaptures).length) {
+        const successCount = Object.keys(nextCaptures).length;
+        if (successCount) {
           setCaptures((current) => ({ ...current, ...nextCaptures }));
         }
-        return `桌面贴图已更新：${Object.keys(nextCaptures).length}/${view.displays.length} 台显示器`;
+        if (successCount === 0 && failures.length) {
+          const firstFailure = failures[0];
+          return `桌面贴图未更新：${displayOperationMessage(
+            firstFailure.status,
+            firstFailure.message,
+            "需要屏幕共享授权",
+          )}`;
+        }
+        if (failures.length) {
+          return `桌面贴图已更新：${successCount}/${view.displays.length} 台显示器，${failures.length} 台失败`;
+        }
+        return `桌面贴图已更新：${successCount}/${view.displays.length} 台显示器`;
       },
     );
 
@@ -6953,11 +7031,11 @@ function DisplaySettingsDetail({
       (result) => displayOperationMessage(result.status, result.message, "正在标识显示器"),
     );
 
-  const openWindowsDisplaySettings = () =>
+  const openSystemDisplaySettings = () =>
     void runDisplayAction(
       "open-settings",
       () => invokeCommand("open_display_settings"),
-      () => "已请求打开 Windows 显示设置",
+      () => "已请求打开系统显示设置",
     );
 
   const applyDisplaySettings = () =>
@@ -7009,7 +7087,7 @@ function DisplaySettingsDetail({
           <div className="min-w-0 flex-1">
             <h2 className="text-lg font-semibold">显示器设置</h2>
             <p className="text-sm" style={{ color: theme.textMuted }}>
-              按 Windows 显示设置组织本机屏幕、截图和可写显示参数。
+              按系统显示设置组织本机屏幕、截图和可写显示参数。
             </p>
           </div>
           <button
@@ -7025,8 +7103,13 @@ function DisplaySettingsDetail({
             type="button"
             className="rounded-md px-3 py-2 text-sm"
             style={secondaryButtonStyle(theme)}
-            disabled={busyAction === "capture"}
+            disabled={busyAction === "capture" || !selected.writeCapabilities.capture}
             onClick={captureDisplayBackgrounds}
+            title={
+              selected.writeCapabilities.capture
+                ? "获取当前显示器桌面贴图"
+                : "当前平台未报告可用截图后端"
+            }
           >
             获取桌面贴图
           </button>
@@ -7035,9 +7118,9 @@ function DisplaySettingsDetail({
             className="rounded-md px-3 py-2 text-sm"
             style={secondaryButtonStyle(theme)}
             disabled={busyAction === "open-settings"}
-            onClick={openWindowsDisplaySettings}
+            onClick={openSystemDisplaySettings}
           >
-            Windows 设置
+            系统设置
           </button>
         </div>
 
@@ -7055,7 +7138,7 @@ function DisplaySettingsDetail({
             viewBox={`${view.bounds.minX} ${view.bounds.minY} ${view.bounds.width} ${view.bounds.height}`}
             preserveAspectRatio="xMidYMid meet"
             role="img"
-            aria-label="Windows style display arrangement"
+            aria-label="System display arrangement"
           >
             {view.displays.map((display) => {
               const active = display.id === selected.id;
@@ -7140,6 +7223,7 @@ function DisplaySettingsDetail({
                 value={scaleValue}
                 onChange={setScaleValue}
                 options={scaleOptions}
+                disabled={!selected.writeCapabilities.scale}
                 theme={theme}
               />
               <DisplaySettingSelect
@@ -7171,7 +7255,7 @@ function DisplaySettingsDetail({
                 应用显示参数
               </button>
               <span className="text-xs" style={{ color: theme.textMuted }}>
-                位置与主显示器写入：{selected.writeCapabilities.position || selected.writeCapabilities.primary ? "可用" : "当前后端暂不支持"}
+                直接写入：{displayCapabilitySummary(selected.writeCapabilities)}
               </span>
             </div>
 
@@ -7234,7 +7318,7 @@ function DisplaySettingSelect({
         {label}
       </span>
       <select
-        className="h-9 w-full rounded-md px-2 text-sm outline-none"
+        className="rshare-select h-9 w-full rounded-md px-2 text-sm outline-none"
         value={value}
         disabled={disabled || !options.length}
         onChange={(event) => onChange(event.currentTarget.value)}
@@ -7246,16 +7330,34 @@ function DisplaySettingSelect({
       >
         {options.length ? (
           options.map((option) => (
-            <option key={option.value} value={option.value}>
+            <option
+              key={option.value}
+              value={option.value}
+              style={{ backgroundColor: theme.frame, color: theme.text }}
+            >
               {option.label}
             </option>
           ))
         ) : (
-          <option value="">不可用</option>
+          <option value="" style={{ backgroundColor: theme.frame, color: theme.textMuted }}>
+            不可用
+          </option>
         )}
       </select>
     </label>
   );
+}
+
+function displayCapabilitySummary(capabilities: DisplaySettingsDisplayView["writeCapabilities"]) {
+  const labels = [
+    capabilities.resolution ? "分辨率" : null,
+    capabilities.refreshRate ? "刷新率" : null,
+    capabilities.scale ? "缩放" : null,
+    capabilities.orientation ? "方向" : null,
+    capabilities.position ? "位置" : null,
+    capabilities.primary ? "主屏" : null,
+  ].filter(Boolean);
+  return labels.length ? labels.join(" / ") : "当前后端暂不支持，请使用系统设置";
 }
 
 function displayScaleOptions(currentScale: number | null) {
@@ -7295,7 +7397,7 @@ function displayOperationMessage(
     return message ?? success;
   }
   if (status === "RequiresSystemSettings") {
-    return message ?? "该设置需要在 Windows 系统显示设置中完成";
+    return message ?? "该设置需要在系统显示设置中完成";
   }
   return message ?? `显示操作返回 ${status}`;
 }
@@ -8840,7 +8942,7 @@ function HardwareAssetSettingsPanel({
           {label}
         </span>
         <select
-          className="h-9 w-full rounded-md px-2 text-sm outline-none"
+          className="rshare-select h-9 w-full rounded-md px-2 text-sm outline-none"
           value={selected?.id ?? selectedIds[kind]}
           onChange={(event) => setSelectedId(kind, event.currentTarget.value)}
           style={{
@@ -8850,7 +8952,11 @@ function HardwareAssetSettingsPanel({
           }}
         >
           {options.map((option) => (
-            <option key={option.id} value={option.id}>
+            <option
+              key={option.id}
+              value={option.id}
+              style={{ backgroundColor: theme.frame, color: theme.text }}
+            >
               {option.name}
             </option>
           ))}
@@ -9762,7 +9868,3 @@ function InfoRow({
     </div>
   );
 }
-
-
-
-
