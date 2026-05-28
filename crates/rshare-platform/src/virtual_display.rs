@@ -222,7 +222,6 @@ fn snapshot_from_driver_state_with_displays(
         status: virtual_display_status_from_driver_activity(state.active),
         display_id: if state.active == RSHARE_VDISPLAY_ACTIVITY_ACTIVE {
             matching_windows_display_id(&state, display_state)
-                .or_else(|| Some(format!("windows-idd-connector-{}", state.connector_index)))
         } else {
             None
         },
@@ -749,7 +748,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn driver_state_maps_to_active_virtual_display_snapshot() {
+    fn active_driver_state_without_topology_match_has_no_display_id() {
         let snapshot = snapshot_from_driver_state(
             "vd-1",
             Some("R-ShareMouse Virtual Display".to_string()),
@@ -774,10 +773,7 @@ mod tests {
             Some("R-ShareMouse Virtual Display")
         );
         assert_eq!(snapshot.status, VirtualDisplayStatus::Active);
-        assert_eq!(
-            snapshot.display_id.as_deref(),
-            Some("windows-idd-connector-2")
-        );
+        assert!(snapshot.display_id.is_none());
     }
 
     #[test]

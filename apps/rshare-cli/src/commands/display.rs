@@ -282,6 +282,32 @@ mod tests {
     }
 
     #[test]
+    fn verify_virtual_display_rejects_active_snapshot_without_system_display_id() {
+        let virtual_display = VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: VirtualDisplayStatus::Active,
+            display_id: None,
+            message: None,
+        };
+        let result = verify_virtual_display_topology(
+            &[virtual_display],
+            &LocalDisplayState::default(),
+            1920,
+            1080,
+            Some(60000),
+        );
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("has no Windows display id yet"));
+    }
+
+    #[test]
     fn format_virtual_display_list_includes_system_identity_and_mode() {
         let output = format_virtual_display_list(&[VirtualDisplaySnapshot {
             id: "rshare-vdisplay-1".to_string(),
