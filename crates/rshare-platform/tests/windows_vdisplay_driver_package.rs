@@ -69,6 +69,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("RShareVirtualDisplayMonitor::CopyDefaultModes"));
     assert!(driver.contains("RShareVirtualDisplayMonitor::CopyTargetModes"));
     assert!(driver.contains("RShareVirtualDisplayMonitor::UpdateMode"));
+    assert!(driver.contains("RShareVirtualDisplayMonitor::UpdateTargetModes"));
+    assert!(driver.contains("IDARG_IN_UPDATEMODES"));
+    assert!(driver.contains("IDDCX_UPDATE_REASON_OTHER"));
+    assert!(driver.contains("IddCxMonitorUpdateModes(m_Monitor"));
+    assert!(driver.contains("monitorContext->Monitor->UpdateTargetModes()"));
     assert!(driver.contains("m_MonitorRequested"));
     assert!(driver.contains("RShareVirtualDisplayDevice::ReportPendingMonitorArrival"));
     assert!(driver.contains("context->Device->ReportPendingMonitorArrival()"));
@@ -121,6 +126,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(header.contains("#include <iddcx.h>"));
     assert!(header.contains("GUID_DEVINTERFACE_RSHARE_VDISPLAY"));
     assert!(header.contains("class RShareVirtualDisplayDevice"));
+    assert!(header.contains("NTSTATUS UpdateTargetModes();"));
     assert!(header.contains("void ReportPendingMonitorArrival();"));
     assert!(header.contains("class RShareSwapChainProcessor"));
     assert!(trace.contains("WPP_CONTROL_GUIDS"));

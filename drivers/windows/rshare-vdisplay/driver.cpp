@@ -411,6 +411,24 @@ void RShareVirtualDisplayMonitor::UpdateMode(const RSHARE_VDISPLAY_STATE& state)
     m_State = state;
 }
 
+NTSTATUS RShareVirtualDisplayMonitor::UpdateTargetModes()
+{
+    auto modes = RShareModesForState(m_State);
+    std::vector<IDDCX_TARGET_MODE> targetModes;
+    targetModes.reserve(modes.size());
+
+    for (const auto& mode : modes) {
+        targetModes.push_back(RShareCreateTargetMode(mode));
+    }
+
+    IDARG_IN_UPDATEMODES updateModes = {};
+    updateModes.Reason = IDDCX_UPDATE_REASON_OTHER;
+    updateModes.TargetModeCount = static_cast<UINT>(targetModes.size());
+    updateModes.pTargetModes = targetModes.data();
+
+    return IddCxMonitorUpdateModes(m_Monitor, &updateModes);
+}
+
 NTSTATUS RShareVirtualDisplayMonitor::CopyDefaultModes(
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* inArgs,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* outArgs) const
@@ -599,9 +617,14 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     m_State.RefreshRateMillihz = request.RefreshRateMillihz;
     m_MonitorRequested = true;
     if (m_Monitor != nullptr) {
+        NTSTATUS status = STATUS_SUCCESS;
         auto monitorContext = RShareGetMonitorContext(m_Monitor);
         if (monitorContext != nullptr && monitorContext->Monitor != nullptr) {
             monitorContext->Monitor->UpdateMode(m_State);
+            status = monitorContext->Monitor->UpdateTargetModes();
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
         }
     }
 

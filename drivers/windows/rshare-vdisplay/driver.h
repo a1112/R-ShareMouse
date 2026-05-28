@@ -76,6 +76,7 @@ namespace RShare::VirtualDisplay
         ~RShareVirtualDisplayMonitor();
 
         void UpdateMode(const RSHARE_VDISPLAY_STATE& state);
+        NTSTATUS UpdateTargetModes();
         NTSTATUS CopyDefaultModes(const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* inArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* outArgs) const;
         NTSTATUS CopyTargetModes(const IDARG_IN_QUERYTARGETMODES* inArgs, IDARG_OUT_QUERYTARGETMODES* outArgs) const;
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
