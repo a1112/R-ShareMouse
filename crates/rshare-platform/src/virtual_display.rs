@@ -28,6 +28,7 @@ const RSHARE_VDISPLAY_ACTIVITY_REMOVED: u16 = 0;
 const RSHARE_VDISPLAY_ACTIVITY_ACTIVE: u16 = 1;
 const RSHARE_VDISPLAY_ACTIVITY_PENDING: u16 = 2;
 const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
+const RSHARE_VDISPLAY_EDID_HARDWARE_ID: &str = "rsm0001";
 const RSHARE_VDISPLAY_SUPPORTED_MODES: &[(u32, u32, u32)] = &[
     (3840, 2160, 60_000),
     (2560, 1440, 144_000),
@@ -312,19 +313,23 @@ fn virtual_display_matches_local_display(
         return false;
     }
 
-    let name_hint = [
+    let identity_hint = [
         display.friendly_name.as_deref(),
         display.device_name.as_deref(),
         display.target_id.as_deref(),
+        display.adapter_id.as_deref(),
     ]
     .into_iter()
     .flatten()
-    .any(|name| {
-        let name = name.to_ascii_lowercase();
-        name.contains("r-sharemouse") || name.contains("rshare") || name.contains("virtual")
+    .any(|identity| {
+        let identity = identity.to_ascii_lowercase();
+        identity.contains("r-sharemouse")
+            || identity.contains("rshare")
+            || identity.contains("virtual")
+            || identity.contains(RSHARE_VDISPLAY_EDID_HARDWARE_ID)
     });
 
-    name_hint
+    identity_hint
 }
 
 fn refresh_rate_matches(actual_millihz: u32, expected_millihz: u32) -> bool {
@@ -974,6 +979,46 @@ mod tests {
         assert_eq!(
             snapshot.display_id.as_deref(),
             Some("windows-display-rounded-refresh")
+        );
+    }
+
+    #[test]
+    fn active_driver_state_matches_windows_display_by_edid_hardware_id() {
+        let display_state = LocalDisplayState {
+            displays: vec![LocalDisplayInfo {
+                display_id: "windows-display-rshare-edid".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                target_id: Some(
+                    r"MONITOR\RSM0001\{4d36e96e-e325-11ce-bfc1-08002be10318}\0001".to_string(),
+                ),
+                friendly_name: Some("Generic PnP Monitor".to_string()),
+                active: true,
+                ..LocalDisplayInfo::default()
+            }],
+            ..LocalDisplayState::default()
+        };
+
+        let snapshot = snapshot_from_driver_state_with_displays(
+            "vd-1",
+            Some("R-ShareMouse Virtual Display".to_string()),
+            RShareVdisplayStateRaw {
+                abi: RSHARE_DRIVER_ABI,
+                active: RSHARE_VDISPLAY_ACTIVITY_ACTIVE,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: 60_000,
+                connector_index: 0,
+            },
+            Some(&display_state),
+            None,
+        )
+        .expect("driver state should map to EDID-matched display snapshot");
+
+        assert_eq!(
+            snapshot.display_id.as_deref(),
+            Some("windows-display-rshare-edid")
         );
     }
 }
