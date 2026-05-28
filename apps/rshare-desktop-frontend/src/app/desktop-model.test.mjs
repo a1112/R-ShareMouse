@@ -193,6 +193,23 @@ test("buildVirtualDisplayViewModel exposes pending driver status without faking 
   assert.equal(virtualView.createDefaults.width, 1920);
   assert.equal(virtualView.createDefaults.height, 1080);
   assert.equal(virtualView.createDefaults.refreshRateMillihz, 60_000);
+  assert.deepEqual(
+    virtualView.createModes.map((mode) => mode.value),
+    [
+      "3840x2160@60000",
+      "2560x1440@144000",
+      "2560x1440@90000",
+      "2560x1440@60000",
+      "1920x1080@144000",
+      "1920x1080@90000",
+      "1920x1080@60000",
+      "1600x900@60000",
+      "1280x720@90000",
+      "1280x720@60000",
+      "1024x768@75000",
+      "1024x768@60000",
+    ],
+  );
   assert.equal(virtualView.displays[0].statusLabel, "驱动不可用");
   assert.match(virtualView.displays[0].message, /not installed/);
   assert.equal(displayView.displays.length, 1);

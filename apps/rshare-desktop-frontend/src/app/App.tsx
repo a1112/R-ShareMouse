@@ -7043,12 +7043,13 @@ function DisplaySettingsDetail({
   const [resolutionValue, setResolutionValue] = useState("");
   const [refreshRateValue, setRefreshRateValue] = useState("");
   const [scaleValue, setScaleValue] = useState("100");
-  const [virtualWidthValue, setVirtualWidthValue] = useState("1920");
-  const [virtualHeightValue, setVirtualHeightValue] = useState("1080");
-  const [virtualRefreshValue, setVirtualRefreshValue] = useState("60000");
+  const [virtualModeValue, setVirtualModeValue] = useState("1920x1080@60000");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const virtualView = buildVirtualDisplayViewModel(virtualDisplays);
+  const virtualCreateMode =
+    virtualView.createModes.find((mode: { value: string }) => mode.value === virtualModeValue) ??
+    virtualView.createModes[0];
 
   async function refreshVirtualDisplays() {
     const displays = await invokeCommand<VirtualDisplaySnapshot[]>("list_virtual_displays");
@@ -7215,9 +7216,9 @@ function DisplaySettingsDetail({
       "create-virtual-display",
       async () => {
         const request = {
-          width: Number(virtualWidthValue),
-          height: Number(virtualHeightValue),
-          refresh_rate_millihz: Number(virtualRefreshValue),
+          width: virtualCreateMode.width,
+          height: virtualCreateMode.height,
+          refresh_rate_millihz: virtualCreateMode.refreshRateMillihz,
           name: virtualView.createDefaults.name,
         };
         const result = await invokeCommand<VirtualDisplayOperationResult>(
@@ -7470,28 +7471,25 @@ function DisplaySettingsDetail({
                 </button>
               </div>
 
-              <div className="grid gap-2 md:grid-cols-[1fr_1fr_1fr_auto]">
-                <input
+              <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                <select
                   className="min-w-0 rounded-md px-3 py-2 text-sm"
                   style={inputStyle(theme)}
-                  value={virtualWidthValue}
-                  onChange={(event) => setVirtualWidthValue(event.target.value)}
-                  aria-label="虚拟显示器宽度"
-                />
-                <input
-                  className="min-w-0 rounded-md px-3 py-2 text-sm"
-                  style={inputStyle(theme)}
-                  value={virtualHeightValue}
-                  onChange={(event) => setVirtualHeightValue(event.target.value)}
-                  aria-label="虚拟显示器高度"
-                />
-                <input
-                  className="min-w-0 rounded-md px-3 py-2 text-sm"
-                  style={inputStyle(theme)}
-                  value={virtualRefreshValue}
-                  onChange={(event) => setVirtualRefreshValue(event.target.value)}
-                  aria-label="虚拟显示器刷新率毫赫兹"
-                />
+                  value={virtualCreateMode.value}
+                  onChange={(event) => setVirtualModeValue(event.target.value)}
+                  aria-label="虚拟显示器模式"
+                >
+                  {virtualView.createModes.map(
+                    (mode: {
+                      value: string;
+                      label: string;
+                    }) => (
+                      <option key={mode.value} value={mode.value}>
+                        {mode.label}
+                      </option>
+                    ),
+                  )}
+                </select>
                 <button
                   type="button"
                   className="rounded-md px-3 py-2 text-sm"

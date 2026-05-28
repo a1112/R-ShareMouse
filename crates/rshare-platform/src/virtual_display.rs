@@ -28,6 +28,20 @@ const RSHARE_VDISPLAY_ACTIVITY_REMOVED: u16 = 0;
 const RSHARE_VDISPLAY_ACTIVITY_ACTIVE: u16 = 1;
 const RSHARE_VDISPLAY_ACTIVITY_PENDING: u16 = 2;
 const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
+const RSHARE_VDISPLAY_SUPPORTED_MODES: &[(u32, u32, u32)] = &[
+    (3840, 2160, 60_000),
+    (2560, 1440, 144_000),
+    (2560, 1440, 90_000),
+    (2560, 1440, 60_000),
+    (1920, 1080, 144_000),
+    (1920, 1080, 90_000),
+    (1920, 1080, 60_000),
+    (1600, 900, 60_000),
+    (1280, 720, 90_000),
+    (1280, 720, 60_000),
+    (1024, 768, 75_000),
+    (1024, 768, 60_000),
+];
 
 pub fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
     #[cfg(windows)]
@@ -47,7 +61,11 @@ pub fn create_virtual_display(
         return Ok(VirtualDisplayOperationResult {
             status: VirtualDisplayOperationStatus::InvalidMode,
             display: None,
-            message: Some("virtual display width, height and refresh rate must be positive".into()),
+            message: Some(invalid_mode_message(
+                request.width,
+                request.height,
+                request.refresh_rate_millihz,
+            )),
         });
     }
 
@@ -96,7 +114,30 @@ pub fn remove_virtual_display(
 }
 
 fn is_valid_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
+    is_positive_mode(width, height, refresh_rate_millihz)
+        && is_supported_mode(width, height, refresh_rate_millihz)
+}
+
+fn is_positive_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
     width > 0 && height > 0 && refresh_rate_millihz.unwrap_or(DEFAULT_REFRESH_RATE_MILLIHZ) > 0
+}
+
+fn is_supported_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
+    let refresh_rate_millihz = refresh_rate_millihz.unwrap_or(DEFAULT_REFRESH_RATE_MILLIHZ);
+    RSHARE_VDISPLAY_SUPPORTED_MODES
+        .iter()
+        .any(|mode| *mode == (width, height, refresh_rate_millihz))
+}
+
+fn invalid_mode_message(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> String {
+    if !is_positive_mode(width, height, refresh_rate_millihz) {
+        return "virtual display width, height and refresh rate must be positive".to_string();
+    }
+
+    let refresh_rate_millihz = refresh_rate_millihz.unwrap_or(DEFAULT_REFRESH_RATE_MILLIHZ);
+    format!(
+        "unsupported virtual display mode {width}x{height}@{refresh_rate_millihz}; use one of the driver-reported modes"
+    )
 }
 
 fn virtual_display_id(id: Option<&str>) -> String {
@@ -178,7 +219,11 @@ fn driver_request_from_create(
     request: &VirtualDisplayCreateRequest,
 ) -> Result<RShareVdisplayRequestRaw> {
     if !is_valid_mode(request.width, request.height, request.refresh_rate_millihz) {
-        anyhow::bail!("virtual display width, height and refresh rate must be positive");
+        anyhow::bail!(invalid_mode_message(
+            request.width,
+            request.height,
+            request.refresh_rate_millihz
+        ));
     }
 
     Ok(RShareVdisplayRequestRaw {
@@ -818,6 +863,22 @@ mod tests {
         assert_eq!(raw.height, 1080);
         assert_eq!(raw.refresh_rate_millihz, DEFAULT_REFRESH_RATE_MILLIHZ);
         assert_eq!(raw.flags, 0);
+    }
+
+    #[test]
+    fn create_request_rejects_mode_not_reported_by_virtual_display_driver() {
+        let error = driver_request_from_create(&VirtualDisplayCreateRequest {
+            id: Some("vd-unsupported-mode".to_string()),
+            width: 1234,
+            height: 567,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+        })
+        .expect_err("unsupported driver mode should be rejected before driver IO");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported virtual display mode"));
     }
 
     #[test]
