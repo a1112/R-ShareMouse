@@ -66,7 +66,37 @@ function Read-VDisplayState {
         Height = [uint32]$Matches[3]
         RefreshRateMillihz = [uint32]$Matches[4]
         ConnectorIndex = [uint32]$Matches[5]
+        Activity = if ($line -match "activity=([A-Za-z]+)") { $Matches[1] } else { "Unknown" }
     }
+}
+
+function WaitForVirtualDisplayActive(
+    [uint32]$ExpectedWidth,
+    [uint32]$ExpectedHeight,
+    [uint32]$ExpectedRefreshRateMillihz
+) {
+    $deadline = (Get-Date).AddSeconds(30)
+    $lastState = $null
+    while ((Get-Date) -lt $deadline) {
+        $state = Read-VDisplayState
+        $lastState = $state
+        $modeMatches = $state.Width -eq $ExpectedWidth -and $state.Height -eq $ExpectedHeight -and $state.RefreshRateMillihz -eq $ExpectedRefreshRateMillihz
+        if ($state.Active -eq 1 -and $modeMatches) {
+            return $state
+        }
+
+        if ($state.Active -eq 2) {
+            Write-Host "Virtual display is pending IddCx arrival: $($state.Raw)"
+        } else {
+            Write-Host "Waiting for virtual display to become active: $($state.Raw)"
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ($lastState) {
+        throw "Timed out waiting for virtual display to become active after create. Last state: $($lastState.Raw)"
+    }
+    throw "Timed out waiting for virtual display to become active after create."
 }
 
 function EnsureDaemonForTopologyVerification {
@@ -203,10 +233,7 @@ Invoke-Step "Create virtual display" {
 }
 
 Invoke-Step "Confirm driver state after create" {
-    $state = Read-VDisplayState
-    if ($state.Active -ne 1 -or $state.Width -ne $Width -or $state.Height -ne $Height -or $state.RefreshRateMillihz -ne $RefreshRateMillihz) {
-        throw "Unexpected virtual display state after create: $($state.Raw)"
-    }
+    WaitForVirtualDisplayActive -ExpectedWidth $Width -ExpectedHeight $Height -ExpectedRefreshRateMillihz $RefreshRateMillihz | Out-Null
 }
 
 if ($VerifyDaemonDisplayTopology) {

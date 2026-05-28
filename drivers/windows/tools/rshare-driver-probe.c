@@ -201,6 +201,20 @@ static int probe_vhid(void)
     return 0;
 }
 
+static const char* vdisplay_activity_name(USHORT activity)
+{
+    switch (activity) {
+    case RSHARE_VDISPLAY_ACTIVITY_REMOVED:
+        return "Removed";
+    case RSHARE_VDISPLAY_ACTIVITY_ACTIVE:
+        return "Active";
+    case RSHARE_VDISPLAY_ACTIVITY_PENDING:
+        return "Pending";
+    default:
+        return "Unknown";
+    }
+}
+
 static int print_vdisplay_state(HANDLE device)
 {
     DWORD returned = 0;
@@ -210,13 +224,14 @@ static int print_vdisplay_state(HANDLE device)
         return 16;
     }
 
-    printf("vdisplay state abi=%u active=%u %lux%lu@%lu connector=%lu\n",
+    printf("vdisplay state abi=%u active=%u %lux%lu@%lu connector=%lu activity=%s\n",
         state.Abi,
         state.Active,
         state.Width,
         state.Height,
         state.RefreshRateMillihz,
-        state.ConnectorIndex);
+        state.ConnectorIndex,
+        vdisplay_activity_name(state.Active));
     return 0;
 }
 

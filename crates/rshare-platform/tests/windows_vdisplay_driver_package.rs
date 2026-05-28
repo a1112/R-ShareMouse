@@ -174,6 +174,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("@(\"vdisplay\", \"create\""));
     assert!(validate_vdisplay_script.contains("ms-settings:display"));
     assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
+    assert!(validate_vdisplay_script.contains("WaitForVirtualDisplayActive"));
+    assert!(validate_vdisplay_script.contains("$state.Active -eq 2"));
     assert!(validate_vdisplay_script.contains("vdisplay state abi="));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual verify"));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual create"));
@@ -202,6 +204,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_QUERY_STATE"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_CREATE"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_REMOVE"));
+    assert!(probe.contains("vdisplay_activity_name"));
+    assert!(probe.contains("RSHARE_VDISPLAY_ACTIVITY_PENDING"));
+    assert!(probe.contains("activity=%s"));
     assert!(probe.contains("vdisplay create"));
     assert!(probe.contains("vdisplay remove"));
     assert!(build_script.contains("Cfgmgr32.lib"));
