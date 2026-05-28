@@ -288,6 +288,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
     let uninstall_script = read_repo_file("scripts/driver/uninstall-test-driver.ps1");
+    let start_validation_script = read_repo_file("scripts/driver/start-vdisplay-validation.ps1");
     let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
     let driver_readme = read_repo_file("drivers/windows/README.md");
 
@@ -464,6 +465,13 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(install_script
         .contains("devcon.exe is required to install root-enumerated driver packages"));
     assert!(uninstall_script.contains("rshare-vdisplay.inf"));
+    assert!(start_validation_script.contains("Start-Process"));
+    assert!(start_validation_script.contains("-Verb RunAs"));
+    assert!(start_validation_script.contains("Start-Transcript"));
+    assert!(start_validation_script.contains("target\\driver-validation"));
+    assert!(start_validation_script.contains("validate-vdisplay.ps1"));
+    assert!(start_validation_script.contains("-VerifyDaemonDisplayTopology"));
+    assert!(start_validation_script.contains("-WaitForManualModeChange"));
 
     assert!(probe.contains("probe_vdisplay"));
     assert!(probe.contains("GUID_DEVINTERFACE_RSHARE_VDISPLAY"));
@@ -483,6 +491,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(build_script.contains("Cfgmgr32.lib"));
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
+    assert!(driver_readme.contains("scripts\\driver\\start-vdisplay-validation.ps1"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
     assert!(driver_readme.contains("EDID-backed monitor"));
     assert!(driver_readme.contains("pending IddCx arrival"));

@@ -17,6 +17,8 @@ Driver installation requires Windows test signing and must be reversible with `u
 
 After WDK and test signing are ready, run `scripts\driver\validate-vdisplay.ps1 -VerifyDaemonDisplayTopology -WaitForManualModeChange` from an elevated PowerShell to build, install, create the virtual display, start the daemon for topology verification, confirm the daemon sees it in the Windows display topology, open Windows display settings, and wait for a manual mode change to be reflected through the driver probe.
 
+From a normal shell, run `scripts\driver\start-vdisplay-validation.ps1` to open the same validation flow in an elevated PowerShell. It writes a transcript under `target\driver-validation` so the Windows Settings and driver-probe evidence can be kept with the build artifacts.
+
 ## Virtual Display Manual Validation Target
 
 The full virtual display feature is complete only when this checklist passes on Windows:
