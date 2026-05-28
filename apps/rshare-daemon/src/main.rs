@@ -29,7 +29,7 @@ use rshare_core::{
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDisplayCreateRequest,
     VirtualDisplayOperationResult, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot,
+    VirtualDisplaySnapshot, VirtualDisplayStatus,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -50,8 +50,8 @@ use tracing_subscriber::prelude::*;
 
 #[cfg(windows)]
 use rshare_platform::firewall;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,10 +124,30 @@ impl VirtualDisplayManager {
         self.displays.values().cloned().collect()
     }
 
-    fn sync_platform_displays(&mut self, displays: Vec<VirtualDisplaySnapshot>) {
+    fn sync_platform_displays(&mut self, displays: Vec<VirtualDisplaySnapshot>) -> bool {
+        let platform_ids = displays
+            .iter()
+            .map(|display| display.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+
         for display in displays {
+            if self.displays.get(&display.id) != Some(&display) {
+                changed = true;
+            }
             self.displays.insert(display.id.clone(), display);
         }
+
+        for display in self.displays.values_mut() {
+            if display.status == VirtualDisplayStatus::Active && !platform_ids.contains(&display.id)
+            {
+                display.status = VirtualDisplayStatus::Removed;
+                display.display_id = None;
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
@@ -140,11 +160,8 @@ impl VirtualDisplayManager {
             };
         }
 
-        if !valid_virtual_display_mode(
-            request.width,
-            request.height,
-            request.refresh_rate_millihz,
-        ) {
+        if !valid_virtual_display_mode(request.width, request.height, request.refresh_rate_millihz)
+        {
             return VirtualDisplayOperationResult {
                 status: VirtualDisplayOperationStatus::InvalidMode,
                 display: None,
@@ -7258,7 +7275,9 @@ async fn handle_ipc_client(
             let platform_displays = rshare_platform::virtual_display::list_virtual_displays();
             let mut state = state.write().await;
             if let Ok(displays) = platform_displays {
-                state.virtual_displays.sync_platform_displays(displays);
+                if state.virtual_displays.sync_platform_displays(displays) {
+                    state.refresh_local_controls_platform();
+                }
             }
             DaemonResponse::VirtualDisplays(state.virtual_displays.list())
         }
@@ -7540,7 +7559,7 @@ mod tests {
     #[test]
     fn virtual_display_manager_syncs_platform_visible_displays_into_list() {
         let mut manager = VirtualDisplayManager::default();
-        manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+        let changed = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
             id: "rshare-vdisplay-1".to_string(),
             width: 2560,
             height: 1440,
@@ -7551,13 +7570,74 @@ mod tests {
             message: None,
         }]);
 
+        assert!(changed);
         let displays = manager.list();
         assert_eq!(displays.len(), 1);
-        assert_eq!(displays[0].status, rshare_core::VirtualDisplayStatus::Active);
+        assert_eq!(
+            displays[0].status,
+            rshare_core::VirtualDisplayStatus::Active
+        );
         assert_eq!(
             displays[0].display_id.as_deref(),
             Some("windows-idd-connector-0")
         );
+    }
+
+    #[test]
+    fn virtual_display_manager_sync_reports_manual_mode_changes() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+
+        let changed = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: Some(144_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+
+        assert!(changed);
+        let displays = manager.list();
+        assert_eq!(displays[0].width, 2560);
+        assert_eq!(displays[0].height, 1440);
+        assert_eq!(displays[0].refresh_rate_millihz, Some(144_000));
+    }
+
+    #[test]
+    fn virtual_display_manager_sync_marks_missing_active_platform_display_removed() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+
+        let changed = manager.sync_platform_displays(Vec::new());
+
+        assert!(changed);
+        let displays = manager.list();
+        assert_eq!(
+            displays[0].status,
+            rshare_core::VirtualDisplayStatus::Removed
+        );
+        assert_eq!(displays[0].display_id, None);
     }
 
     #[test]
