@@ -21,6 +21,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let build_script = read_repo_file("scripts/driver/build.ps1");
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
+    let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
 
     assert!(driver.contains("DriverEntry"));
     assert!(driver.contains("IddCxDeviceInitConfig"));
@@ -69,4 +70,12 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
+
+    assert!(probe.contains("probe_vdisplay"));
+    assert!(probe.contains("RSHARE_VDISPLAY_DOS_DEVICE_NAME"));
+    assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_QUERY_STATE"));
+    assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_CREATE"));
+    assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_REMOVE"));
+    assert!(probe.contains("vdisplay create"));
+    assert!(probe.contains("vdisplay remove"));
 }

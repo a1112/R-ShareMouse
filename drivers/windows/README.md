@@ -19,9 +19,10 @@ The full virtual display feature is complete only when this checklist passes on 
 
 1. Build `drivers/windows/rshare-vdisplay/rshare-vdisplay.vcxproj` with the WDK.
 2. Install the test-signed IDD driver and confirm Device Manager lists `R-ShareMouse Virtual Display`.
-3. Start `rshare-daemon`.
-4. Use the desktop display settings page to create a virtual display.
+3. Run `target\driver-tools\rshare-driver-probe.exe vdisplay status` and confirm the virtual display driver reports version, capabilities, and inactive state.
+4. Run `target\driver-tools\rshare-driver-probe.exe vdisplay create 1920 1080 60000`.
 5. Confirm Windows Settings > System > Display shows the new display.
-6. Change the virtual display resolution or refresh rate in Windows Settings.
-7. Confirm `rshare_platform::display::query_display_state()` and the desktop UI refresh with the changed mode.
-8. Remove the virtual display from the desktop UI and confirm Windows Settings no longer shows it.
+6. Start `rshare-daemon` and use the desktop display settings page to create or refresh the virtual display.
+7. Change the virtual display resolution or refresh rate in Windows Settings.
+8. Confirm `rshare_platform::display::query_display_state()` and the desktop UI refresh with the changed mode.
+9. Run `target\driver-tools\rshare-driver-probe.exe vdisplay remove`, then confirm Windows Settings no longer shows it.
