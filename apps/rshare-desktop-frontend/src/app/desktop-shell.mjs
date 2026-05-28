@@ -39,6 +39,21 @@ export function getDeviceSimulatorChrome() {
   };
 }
 
+export function getLocalControlRefreshTiming() {
+  return {
+    dashboardPollMs: 1500,
+    eventFlushMs: 8,
+  };
+}
+
+export function formatNetworkGatewayError(error, scope = "请求") {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
+    return `${scope}网关不可用，请确认桌面服务正在运行`;
+  }
+  return `${scope}请求失败：${message || "未知错误"}`;
+}
+
 export function getMouseDetailLayoutClasses({ compact = false } = {}) {
   if (compact) {
     return {
@@ -50,9 +65,9 @@ export function getMouseDetailLayoutClasses({ compact = false } = {}) {
 
   return {
     root:
-      "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto xl:grid-cols-[minmax(0,1fr)_360px] xl:overflow-hidden",
+      "rshare-scroll grid h-full min-h-0 grid-cols-1 gap-3 overflow-auto xl:grid-cols-[minmax(0,1fr)_420px] xl:overflow-hidden",
     previewPane: "relative min-h-[760px] xl:min-h-0",
-    sidePane: "flex min-h-[220px] flex-col gap-3 xl:min-h-0",
+    sidePane: "flex min-h-[220px] flex-col gap-3 xl:grid xl:min-h-0 xl:grid-rows-[minmax(220px,1fr)_auto]",
   };
 }
 

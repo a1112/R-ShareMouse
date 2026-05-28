@@ -6076,7 +6076,8 @@ async fn run_windows_driver_capture_loop(
 
                 let (target, messages, diagnostic, suppress_local_shortcuts) = {
                     let mut state = state.write().await;
-                    let mut local_event = state.record_local_input_event(&input_event);
+                    let mut local_event =
+                        state.record_local_input_event_with_metadata(&input_event, None);
                     local_event.device_id = Some(driver_event.device_id.clone());
                     local_event.device_instance_id = Some(driver_event.device_instance_id.clone());
                     local_event.capture_path = Some("rshare-filter".to_string());

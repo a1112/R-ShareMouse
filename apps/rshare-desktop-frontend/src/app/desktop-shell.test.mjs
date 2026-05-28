@@ -7,11 +7,13 @@ import {
   getDeviceSimulatorChrome,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
+  getLocalControlRefreshTiming,
   getMouseDetailLayoutClasses,
   getMouseSimulatorLayoutClasses,
   getPageLabels,
   getSettingsLayoutSections,
   getThemeModeOptions,
+  formatNetworkGatewayError,
   preventBrowserNavigationEvent,
   shouldPreventBrowserNavigationEvent,
 } from "./desktop-shell.mjs";
@@ -97,14 +99,36 @@ test("getDeviceSimulatorChrome keeps simulator devices texture first and unframe
   });
 });
 
+test("getLocalControlRefreshTiming makes local input feedback event driven", () => {
+  const timing = getLocalControlRefreshTiming();
+
+  assert.equal(timing.dashboardPollMs, 1500);
+  assert.equal(Object.hasOwn(timing, "localControlsPollMs"), false);
+  assert.ok(timing.eventFlushMs <= 16);
+});
+
+test("formatNetworkGatewayError hides raw browser fetch failures", () => {
+  assert.equal(
+    formatNetworkGatewayError(new TypeError("Failed to fetch"), "本机输入"),
+    "本机输入网关不可用，请确认桌面服务正在运行",
+  );
+  assert.equal(
+    formatNetworkGatewayError(new Error("HTTP 502"), "日志"),
+    "日志请求失败：HTTP 502",
+  );
+});
+
 test("getMouseDetailLayoutClasses makes narrow mouse detail scroll instead of stacking", () => {
   const detail = getMouseDetailLayoutClasses();
   const simulator = getMouseSimulatorLayoutClasses();
 
   assert.ok(detail.root.split(" ").includes("overflow-auto"));
   assert.ok(detail.root.split(" ").includes("xl:overflow-hidden"));
+  assert.ok(detail.root.split(" ").includes("xl:grid-cols-[minmax(0,1fr)_420px]"));
   assert.ok(detail.previewPane.split(" ").includes("min-h-[760px]"));
   assert.ok(detail.sidePane.split(" ").includes("min-h-[220px]"));
+  assert.ok(detail.sidePane.split(" ").includes("xl:grid"));
+  assert.ok(detail.sidePane.split(" ").includes("xl:grid-rows-[minmax(220px,1fr)_auto]"));
   assert.ok(!simulator.root.split(" ").includes("h-full"));
   assert.ok(simulator.root.split(" ").includes("min-h-full"));
   assert.ok(simulator.pointerPad.split(" ").includes("min-h-[170px]"));
