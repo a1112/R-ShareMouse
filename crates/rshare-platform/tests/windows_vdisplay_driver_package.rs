@@ -20,6 +20,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let inf = read_repo_file("drivers/windows/rshare-vdisplay/rshare-vdisplay.inf");
     let build_script = read_repo_file("scripts/driver/build.ps1");
     let check_wdk_script = read_repo_file("scripts/driver/check-wdk.ps1");
+    let validate_vdisplay_script = read_repo_file("scripts/driver/validate-vdisplay.ps1");
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
     let uninstall_script = read_repo_file("scripts/driver/uninstall-test-driver.ps1");
@@ -96,6 +97,14 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(check_wdk_script.contains("WdfDriverEntry.lib"));
     assert!(check_wdk_script.contains("WindowsUserModeDriver10.0"));
     assert!(check_wdk_script.contains("winget install"));
+    assert!(validate_vdisplay_script.contains("check-wdk.ps1"));
+    assert!(validate_vdisplay_script.contains("build.ps1"));
+    assert!(validate_vdisplay_script.contains("install-test-driver.ps1"));
+    assert!(validate_vdisplay_script.contains("rshare-driver-probe.exe"));
+    assert!(validate_vdisplay_script.contains("@(\"vdisplay\", \"create\""));
+    assert!(validate_vdisplay_script.contains("ms-settings:display"));
+    assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
+    assert!(validate_vdisplay_script.contains("vdisplay state abi="));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
@@ -114,6 +123,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(probe.contains("vdisplay remove"));
     assert!(build_script.contains("Cfgmgr32.lib"));
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
+    assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
     assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
 }

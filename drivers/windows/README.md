@@ -15,6 +15,8 @@ Before building, run `scripts\driver\check-wdk.ps1`. If it reports missing IddCx
 
 Driver installation requires Windows test signing and must be reversible with `uninstall-test-driver.ps1`.
 
+After WDK and test signing are ready, run `scripts\driver\validate-vdisplay.ps1 -WaitForManualModeChange` from an elevated PowerShell to build, install, create the virtual display, open Windows display settings, and wait for a manual mode change to be reflected through the driver probe.
+
 ## Virtual Display Manual Validation Target
 
 The full virtual display feature is complete only when this checklist passes on Windows:
