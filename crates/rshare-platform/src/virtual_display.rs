@@ -1,7 +1,8 @@
 use anyhow::Result;
 use rshare_core::{
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    LocalDisplayInfo, LocalDisplayState, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 
 const DEFAULT_REFRESH_RATE_MILLIHZ: u32 = 60_000;
@@ -196,6 +197,16 @@ fn snapshot_from_driver_state(
     state: RShareVdisplayStateRaw,
     message: Option<String>,
 ) -> Result<VirtualDisplaySnapshot> {
+    snapshot_from_driver_state_with_displays(id, name, state, None, message)
+}
+
+fn snapshot_from_driver_state_with_displays(
+    id: &str,
+    name: Option<String>,
+    state: RShareVdisplayStateRaw,
+    display_state: Option<&LocalDisplayState>,
+    message: Option<String>,
+) -> Result<VirtualDisplaySnapshot> {
     if state.abi != RSHARE_DRIVER_ABI {
         anyhow::bail!(
             "Unsupported RShare virtual display driver ABI {}",
@@ -215,12 +226,56 @@ fn snapshot_from_driver_state(
             VirtualDisplayStatus::Removed
         },
         display_id: if state.active != 0 {
-            Some(format!("windows-idd-connector-{}", state.connector_index))
+            matching_windows_display_id(&state, display_state)
+                .or_else(|| Some(format!("windows-idd-connector-{}", state.connector_index)))
         } else {
             None
         },
         message,
     })
+}
+
+fn matching_windows_display_id(
+    state: &RShareVdisplayStateRaw,
+    display_state: Option<&LocalDisplayState>,
+) -> Option<String> {
+    let display_state = display_state?;
+    display_state
+        .displays
+        .iter()
+        .find(|display| virtual_display_matches_local_display(state, display))
+        .map(|display| display.display_id.clone())
+}
+
+fn virtual_display_matches_local_display(
+    state: &RShareVdisplayStateRaw,
+    display: &LocalDisplayInfo,
+) -> bool {
+    if !display.active || display.width != state.width || display.height != state.height {
+        return false;
+    }
+
+    let refresh_matches = match display.refresh_rate_millihz {
+        Some(refresh) => refresh == state.refresh_rate_millihz,
+        None => true,
+    };
+    if !refresh_matches {
+        return false;
+    }
+
+    let name_hint = [
+        display.friendly_name.as_deref(),
+        display.device_name.as_deref(),
+        display.target_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|name| {
+        let name = name.to_ascii_lowercase();
+        name.contains("r-sharemouse") || name.contains("rshare") || name.contains("virtual")
+    });
+
+    name_hint
 }
 
 fn operation_from_driver_state(
@@ -231,6 +286,29 @@ fn operation_from_driver_state(
     message: Option<String>,
 ) -> VirtualDisplayOperationResult {
     match snapshot_from_driver_state(id, name, state, message.clone()) {
+        Ok(display) => VirtualDisplayOperationResult {
+            status,
+            display: Some(display),
+            message,
+        },
+        Err(error) => VirtualDisplayOperationResult {
+            status: VirtualDisplayOperationStatus::Failed,
+            display: None,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+fn operation_from_driver_state_with_displays(
+    status: VirtualDisplayOperationStatus,
+    id: &str,
+    name: Option<String>,
+    state: RShareVdisplayStateRaw,
+    display_state: Option<&LocalDisplayState>,
+    message: Option<String>,
+) -> VirtualDisplayOperationResult {
+    match snapshot_from_driver_state_with_displays(id, name, state, display_state, message.clone())
+    {
         Ok(display) => VirtualDisplayOperationResult {
             status,
             display: Some(display),
@@ -256,10 +334,12 @@ fn windows_list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
         return Ok(Vec::new());
     }
 
-    Ok(vec![snapshot_from_driver_state(
+    let display_state = crate::display::query_display_state().ok();
+    Ok(vec![snapshot_from_driver_state_with_displays(
         RSHARE_DEFAULT_VDISPLAY_ID,
         Some("R-ShareMouse Virtual Display".to_string()),
         state,
+        display_state.as_ref(),
         None,
     )?])
 }
@@ -288,11 +368,13 @@ fn windows_create_virtual_display(
     }
 
     let state = client.query_state()?;
-    Ok(operation_from_driver_state(
+    let display_state = crate::display::query_display_state().ok();
+    Ok(operation_from_driver_state_with_displays(
         VirtualDisplayOperationStatus::Created,
         &id,
         request.name.clone(),
         state,
+        display_state.as_ref(),
         None,
     ))
 }
@@ -728,5 +810,39 @@ mod tests {
         assert_eq!(result.status, VirtualDisplayOperationStatus::Failed);
         assert!(result.display.is_none());
         assert!(result.message.unwrap().contains("Unsupported RShare virtual display driver ABI"));
+    }
+
+    #[test]
+    fn active_driver_state_prefers_matching_windows_display_id() {
+        let display_state = LocalDisplayState {
+            displays: vec![LocalDisplayInfo {
+                display_id: "windows-display-real".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                friendly_name: Some("R-ShareMouse Virtual Display".to_string()),
+                active: true,
+                ..LocalDisplayInfo::default()
+            }],
+            ..LocalDisplayState::default()
+        };
+
+        let snapshot = snapshot_from_driver_state_with_displays(
+            "vd-1",
+            Some("R-ShareMouse Virtual Display".to_string()),
+            RShareVdisplayStateRaw {
+                abi: RSHARE_DRIVER_ABI,
+                active: 1,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: 60_000,
+                connector_index: 0,
+            },
+            Some(&display_state),
+            None,
+        )
+        .expect("driver state should map to matched display snapshot");
+
+        assert_eq!(snapshot.display_id.as_deref(), Some("windows-display-real"));
     }
 }
