@@ -22,10 +22,26 @@ DEFINE_GUID(
 
 static constexpr DWORD RSHARE_VDISPLAY_MONITOR_COUNT = 1;
 
+// {fb3b7c60-8355-4ea0-94c4-ae166915b937}
+static constexpr GUID RSHARE_VDISPLAY_MONITOR_CONTAINER_ID = {
+    0xfb3b7c60,
+    0x8355,
+    0x4ea0,
+    {0x94, 0xc4, 0xae, 0x16, 0x69, 0x15, 0xb9, 0x37},
+};
+
 static const RShareDisplayMode RShareMonitorModes[] = {
+    {3840, 2160, 60000},
+    {2560, 1440, 144000},
+    {2560, 1440, 90000},
+    {2560, 1440, 60000},
+    {1920, 1080, 144000},
+    {1920, 1080, 90000},
     {1920, 1080, 60000},
     {1600, 900, 60000},
+    {1280, 720, 90000},
     {1280, 720, 60000},
+    {1024, 768, 75000},
     {1024, 768, 60000},
 };
 
@@ -517,7 +533,7 @@ void RShareVirtualDisplayDevice::ReportMonitorArrival(UINT connectorIndex)
     monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     monitorInfo.MonitorDescription.DataSize = 0;
     monitorInfo.MonitorDescription.pData = nullptr;
-    CoCreateGuid(&monitorInfo.MonitorContainerId);
+    monitorInfo.MonitorContainerId = RSHARE_VDISPLAY_MONITOR_CONTAINER_ID;
 
     IDARG_IN_MONITORCREATE monitorCreate = {};
     monitorCreate.ObjectAttributes = &attributes;

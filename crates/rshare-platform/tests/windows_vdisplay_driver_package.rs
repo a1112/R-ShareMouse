@@ -42,6 +42,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("RShareModesForState"));
     assert!(driver.contains("context->Monitor->CopyTargetModes"));
     assert!(driver.contains("context->Monitor->CopyDefaultModes"));
+    assert!(driver.contains("RSHARE_VDISPLAY_MONITOR_CONTAINER_ID"));
+    assert!(driver.contains("monitorInfo.MonitorContainerId = RSHARE_VDISPLAY_MONITOR_CONTAINER_ID"));
+    assert!(!driver.contains("CoCreateGuid(&monitorInfo.MonitorContainerId)"));
     assert!(driver.contains("RShareVirtualDisplayDevice::CommitModes"));
     assert!(driver.contains("RShareModeFromSignalInfo"));
     assert!(driver.contains("IDDCX_PATH_FLAGS_ACTIVE"));
@@ -51,6 +54,12 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("DWORD refreshRateMillihz"));
     assert!(driver.contains("signalInfo.vSyncFreq.Numerator = refreshRateMillihz"));
     assert!(driver.contains("signalInfo.vSyncFreq.Denominator = 1000"));
+    assert!(driver.contains("{3840, 2160, 60000}"));
+    assert!(driver.contains("{2560, 1440, 144000}"));
+    assert!(driver.contains("{2560, 1440, 90000}"));
+    assert!(driver.contains("{1920, 1080, 144000}"));
+    assert!(driver.contains("{1920, 1080, 90000}"));
+    assert!(driver.contains("{1024, 768, 75000}"));
     assert!(driver.contains(
         "const DWORD refreshMillihz = RShareRefreshMillihzFromSignalInfo(path.TargetVideoSignalInfo)"
     ));
