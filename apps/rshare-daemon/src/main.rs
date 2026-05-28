@@ -152,12 +152,14 @@ impl VirtualDisplayManager {
 
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
         let id = virtual_display_request_id(request.id.as_deref(), self.displays.len() + 1);
-        if self.displays.contains_key(&id) {
-            return VirtualDisplayOperationResult {
-                status: VirtualDisplayOperationStatus::AlreadyExists,
-                display: self.displays.get(&id).cloned(),
-                message: Some(format!("virtual display id {id} already exists")),
-            };
+        if let Some(existing) = self.displays.get(&id) {
+            if !virtual_display_status_allows_create_retry(existing.status) {
+                return VirtualDisplayOperationResult {
+                    status: VirtualDisplayOperationStatus::AlreadyExists,
+                    display: Some(existing.clone()),
+                    message: Some(format!("virtual display id {id} already exists")),
+                };
+            }
         }
 
         if !valid_virtual_display_mode(request.width, request.height, request.refresh_rate_millihz)
@@ -217,6 +219,13 @@ fn virtual_display_request_id(id: Option<&str>, ordinal: usize) -> String {
 
 fn valid_virtual_display_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
     width > 0 && height > 0 && refresh_rate_millihz.unwrap_or(60_000) > 0
+}
+
+fn virtual_display_status_allows_create_retry(status: VirtualDisplayStatus) -> bool {
+    !matches!(
+        status,
+        VirtualDisplayStatus::Active | VirtualDisplayStatus::Pending
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -7503,7 +7512,16 @@ mod tests {
             name: None,
         };
 
-        let _ = manager.create(request.clone());
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "vd-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
         let result = manager.create(request);
 
         assert_eq!(
@@ -7511,6 +7529,31 @@ mod tests {
             rshare_core::VirtualDisplayOperationStatus::AlreadyExists
         );
         assert_eq!(manager.list().len(), 1);
+    }
+
+    #[test]
+    fn virtual_display_manager_allows_retry_after_unavailable_create_result() {
+        let mut manager = VirtualDisplayManager::default();
+        let request = rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        };
+
+        let first = manager.create(request.clone());
+        let retry = manager.create(request);
+
+        let expected = if cfg!(windows) {
+            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        } else {
+            rshare_core::VirtualDisplayOperationStatus::Unsupported
+        };
+        assert_eq!(first.status, expected);
+        assert_eq!(retry.status, expected);
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.list()[0].id, "vd-1");
     }
 
     #[test]
