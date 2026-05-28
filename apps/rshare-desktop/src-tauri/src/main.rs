@@ -256,27 +256,35 @@ async fn open_display_settings() -> Result<(), String> {
 
 #[tauri::command]
 async fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>, String> {
-    daemon_client::request_virtual_displays()
-        .await
-        .map_err(|err| err.to_string())
+    list_virtual_displays_with(
+        || Box::pin(async { daemon_client::request_virtual_displays().await }),
+        || rshare_platform::virtual_display::list_virtual_displays(),
+    )
+    .await
 }
 
 #[tauri::command]
 async fn create_virtual_display(
     request: VirtualDisplayCreateRequest,
 ) -> Result<VirtualDisplayOperationResult, String> {
-    daemon_client::request_create_virtual_display(request)
-        .await
-        .map_err(|err| err.to_string())
+    create_virtual_display_with(
+        request,
+        |request| Box::pin(async { daemon_client::request_create_virtual_display(request).await }),
+        |request| rshare_platform::virtual_display::create_virtual_display(&request),
+    )
+    .await
 }
 
 #[tauri::command]
 async fn remove_virtual_display(
     request: VirtualDisplayRemoveRequest,
 ) -> Result<VirtualDisplayOperationResult, String> {
-    daemon_client::request_remove_virtual_display(request)
-        .await
-        .map_err(|err| err.to_string())
+    remove_virtual_display_with(
+        request,
+        |request| Box::pin(async { daemon_client::request_remove_virtual_display(request).await }),
+        |request| rshare_platform::virtual_display::remove_virtual_display(&request),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -523,6 +531,65 @@ fn is_ipc_unavailable(err: &anyhow::Error) -> bool {
             .map(|io_err| io_err.kind() == std::io::ErrorKind::ConnectionRefused)
             .unwrap_or(false)
     })
+}
+
+async fn list_virtual_displays_with<DaemonList, PlatformList>(
+    mut request_daemon: DaemonList,
+    mut list_platform: PlatformList,
+) -> Result<Vec<VirtualDisplaySnapshot>, String>
+where
+    DaemonList: FnMut() -> BoxFutureResult<'static, Vec<VirtualDisplaySnapshot>>,
+    PlatformList: FnMut() -> AnyhowResult<Vec<VirtualDisplaySnapshot>>,
+{
+    match request_daemon().await {
+        Ok(displays) => Ok(displays),
+        Err(err) if is_ipc_unavailable(&err) => {
+            list_platform().map_err(|fallback_err| fallback_err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn create_virtual_display_with<DaemonCreate, PlatformCreate>(
+    request: VirtualDisplayCreateRequest,
+    mut request_daemon: DaemonCreate,
+    mut create_platform: PlatformCreate,
+) -> Result<VirtualDisplayOperationResult, String>
+where
+    DaemonCreate: FnMut(
+        VirtualDisplayCreateRequest,
+    ) -> BoxFutureResult<'static, VirtualDisplayOperationResult>,
+    PlatformCreate:
+        FnMut(VirtualDisplayCreateRequest) -> AnyhowResult<VirtualDisplayOperationResult>,
+{
+    match request_daemon(request.clone()).await {
+        Ok(result) => Ok(result),
+        Err(err) if is_ipc_unavailable(&err) => {
+            create_platform(request).map_err(|fallback_err| fallback_err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn remove_virtual_display_with<DaemonRemove, PlatformRemove>(
+    request: VirtualDisplayRemoveRequest,
+    mut request_daemon: DaemonRemove,
+    mut remove_platform: PlatformRemove,
+) -> Result<VirtualDisplayOperationResult, String>
+where
+    DaemonRemove: FnMut(
+        VirtualDisplayRemoveRequest,
+    ) -> BoxFutureResult<'static, VirtualDisplayOperationResult>,
+    PlatformRemove:
+        FnMut(VirtualDisplayRemoveRequest) -> AnyhowResult<VirtualDisplayOperationResult>,
+{
+    match request_daemon(request.clone()).await {
+        Ok(result) => Ok(result),
+        Err(err) if is_ipc_unavailable(&err) => {
+            remove_platform(request).map_err(|fallback_err| fallback_err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 async fn ensure_daemon_status() -> AnyhowResult<DesktopDaemonStatus> {
@@ -1377,6 +1444,157 @@ mod tests {
                 MouseButtonState::Up,
             )),
             TrayAction::None
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_display_list_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = list_virtual_displays_with(
+            || {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move || {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![VirtualDisplaySnapshot {
+                        id: "rshare-vdisplay-1".to_string(),
+                        width: 1920,
+                        height: 1080,
+                        refresh_rate_millihz: Some(60_000),
+                        name: Some("R-ShareMouse Virtual Display".to_string()),
+                        status: rshare_core::VirtualDisplayStatus::Active,
+                        display_id: Some("windows-display-rshare".to_string()),
+                        message: None,
+                    }])
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return virtual display snapshots");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].display_id.as_deref(),
+            Some("windows-display-rshare")
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_display_create_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+        let request = VirtualDisplayCreateRequest {
+            id: None,
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        };
+
+        let result = create_virtual_display_with(
+            request.clone(),
+            |_| {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move |platform_request| {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(VirtualDisplayOperationResult {
+                        status: rshare_core::VirtualDisplayOperationStatus::Created,
+                        display: Some(VirtualDisplaySnapshot {
+                            id: platform_request
+                                .id
+                                .unwrap_or_else(|| "rshare-vdisplay-1".to_string()),
+                            width: platform_request.width,
+                            height: platform_request.height,
+                            refresh_rate_millihz: platform_request.refresh_rate_millihz,
+                            name: platform_request.name,
+                            status: rshare_core::VirtualDisplayStatus::Pending,
+                            display_id: None,
+                            message: Some("waiting for IddCx arrival".to_string()),
+                        }),
+                        message: None,
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return create operation status");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result.status,
+            rshare_core::VirtualDisplayOperationStatus::Created
+        );
+        assert_eq!(
+            result.display.as_ref().map(|display| display.width),
+            Some(request.width)
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_display_remove_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+        let request = VirtualDisplayRemoveRequest {
+            id: "rshare-vdisplay-1".to_string(),
+        };
+
+        let result = remove_virtual_display_with(
+            request.clone(),
+            |_| {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move |platform_request| {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(VirtualDisplayOperationResult {
+                        status: rshare_core::VirtualDisplayOperationStatus::Removed,
+                        display: Some(VirtualDisplaySnapshot {
+                            id: platform_request.id,
+                            width: 1920,
+                            height: 1080,
+                            refresh_rate_millihz: Some(60_000),
+                            name: None,
+                            status: rshare_core::VirtualDisplayStatus::Removed,
+                            display_id: None,
+                            message: None,
+                        }),
+                        message: None,
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return remove operation status");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result.status,
+            rshare_core::VirtualDisplayOperationStatus::Removed
+        );
+        assert_eq!(
+            result.display.as_ref().map(|display| display.id.as_str()),
+            Some(request.id.as_str())
         );
     }
 
