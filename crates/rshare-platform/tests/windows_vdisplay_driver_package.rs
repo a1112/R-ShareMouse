@@ -1,5 +1,12 @@
 use std::{fs, path::PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VDisplayMode {
+    width: u32,
+    height: u32,
+    refresh_rate_millihz: u32,
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -36,6 +43,233 @@ fn extract_rshare_vdisplay_edid(driver: &str) -> Vec<u8> {
                 return token.as_bytes().get(1).copied();
             }
             panic!("unsupported EDID token {token}");
+        })
+        .collect()
+}
+
+fn expected_vdisplay_modes() -> Vec<VDisplayMode> {
+    vec![
+        VDisplayMode {
+            width: 3840,
+            height: 2160,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 144_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 90_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 144_000,
+        },
+        VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 90_000,
+        },
+        VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 1600,
+            height: 900,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 1280,
+            height: 720,
+            refresh_rate_millihz: 90_000,
+        },
+        VDisplayMode {
+            width: 1280,
+            height: 720,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 1024,
+            height: 768,
+            refresh_rate_millihz: 75_000,
+        },
+        VDisplayMode {
+            width: 1024,
+            height: 768,
+            refresh_rate_millihz: 60_000,
+        },
+    ]
+}
+
+fn extract_vdisplay_modes_from_cpp_table(source: &str, marker: &str) -> Vec<VDisplayMode> {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("source should contain {marker}"));
+    let body = source[start..]
+        .split_once('{')
+        .expect("mode table should start with {")
+        .1
+        .split_once("};")
+        .expect("mode table should end with };")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                return None;
+            }
+            let values = line
+                .trim_matches(|ch| matches!(ch, '{' | '}' | ',' | ' '))
+                .split(',')
+                .map(|value| value.trim().replace('_', ""))
+                .map(|value| value.parse::<u32>().expect("valid mode integer"))
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 3, "mode row should have three values");
+            Some(VDisplayMode {
+                width: values[0],
+                height: values[1],
+                refresh_rate_millihz: values[2],
+            })
+        })
+        .collect()
+}
+
+fn extract_vdisplay_modes_from_rust_table(source: &str, marker: &str) -> Vec<VDisplayMode> {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("source should contain {marker}"));
+    let body = source[start..]
+        .split_once("= &[")
+        .expect("Rust mode table should start with = &[")
+        .1
+        .split_once("];")
+        .expect("Rust mode table should end with ];")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('(') {
+                return None;
+            }
+            let values = line
+                .trim_matches(|ch| matches!(ch, '(' | ')' | ',' | ' '))
+                .split(',')
+                .map(|value| value.trim().replace('_', ""))
+                .map(|value| value.parse::<u32>().expect("valid mode integer"))
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 3, "mode row should have three values");
+            Some(VDisplayMode {
+                width: values[0],
+                height: values[1],
+                refresh_rate_millihz: values[2],
+            })
+        })
+        .collect()
+}
+
+fn extract_vdisplay_modes_from_powershell_table(source: &str, marker: &str) -> Vec<VDisplayMode> {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("source should contain {marker}"));
+    let body = source[start..]
+        .split_once("@(")
+        .expect("PowerShell mode table should start with @(")
+        .1
+        .split_once(')')
+        .expect("PowerShell mode table should end with )")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("@{") {
+                return None;
+            }
+            let mut width = None;
+            let mut height = None;
+            let mut refresh = None;
+            for part in line
+                .trim_matches(|ch| matches!(ch, '@' | '{' | '}' | ',' | ' '))
+                .split(';')
+            {
+                let (key, value) = part
+                    .split_once('=')
+                    .expect("PowerShell mode entry should use key=value");
+                let value = value.trim().replace('_', "");
+                match key.trim() {
+                    "Width" => width = Some(value.parse::<u32>().expect("valid width")),
+                    "Height" => height = Some(value.parse::<u32>().expect("valid height")),
+                    "RefreshRateMillihz" => {
+                        refresh = Some(value.parse::<u32>().expect("valid refresh rate"))
+                    }
+                    other => panic!("unexpected PowerShell mode key {other}"),
+                }
+            }
+            Some(VDisplayMode {
+                width: width.expect("mode should include width"),
+                height: height.expect("mode should include height"),
+                refresh_rate_millihz: refresh.expect("mode should include refresh rate"),
+            })
+        })
+        .collect()
+}
+
+fn extract_vdisplay_modes_from_frontend_table(source: &str, marker: &str) -> Vec<VDisplayMode> {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("source should contain {marker}"));
+    let body = source[start..]
+        .split_once('[')
+        .expect("frontend mode table should start with [")
+        .1
+        .split_once("];")
+        .expect("frontend mode table should end with ];")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                return None;
+            }
+            let mut width = None;
+            let mut height = None;
+            let mut refresh = None;
+            for part in line
+                .trim_matches(|ch| matches!(ch, '{' | '}' | ',' | ' '))
+                .split(',')
+            {
+                let (key, value) = part
+                    .split_once(':')
+                    .expect("frontend mode entry should use key: value");
+                let value = value.trim().replace('_', "");
+                match key.trim() {
+                    "width" => width = Some(value.parse::<u32>().expect("valid width")),
+                    "height" => height = Some(value.parse::<u32>().expect("valid height")),
+                    "refreshRateMillihz" => {
+                        refresh = Some(value.parse::<u32>().expect("valid refresh rate"))
+                    }
+                    other => panic!("unexpected frontend mode key {other}"),
+                }
+            }
+            Some(VDisplayMode {
+                width: width.expect("mode should include width"),
+                height: height.expect("mode should include height"),
+                refresh_rate_millihz: refresh.expect("mode should include refresh rate"),
+            })
         })
         .collect()
 }
@@ -237,6 +471,40 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver_readme.contains("pending IddCx arrival"));
     assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
     assert!(!driver_readme.contains("EDID-less monitor"));
+}
+
+#[test]
+fn virtual_display_supported_mode_tables_stay_synchronized() {
+    let driver = read_repo_file("drivers/windows/rshare-vdisplay/driver.cpp");
+    let platform = read_repo_file("crates/rshare-platform/src/virtual_display.rs");
+    let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
+    let validate_script = read_repo_file("scripts/driver/validate-vdisplay.ps1");
+    let frontend = read_repo_file("apps/rshare-desktop-frontend/src/app/desktop-model.mjs");
+    let expected = expected_vdisplay_modes();
+
+    assert_eq!(
+        extract_vdisplay_modes_from_cpp_table(&driver, "RShareMonitorModes"),
+        expected
+    );
+    assert_eq!(
+        extract_vdisplay_modes_from_rust_table(&platform, "RSHARE_VDISPLAY_SUPPORTED_MODES"),
+        expected
+    );
+    assert_eq!(
+        extract_vdisplay_modes_from_cpp_table(&probe, "RSHARE_PROBE_VDISPLAY_MODES"),
+        expected
+    );
+    assert_eq!(
+        extract_vdisplay_modes_from_powershell_table(
+            &validate_script,
+            "$SupportedVirtualDisplayModes"
+        ),
+        expected
+    );
+    assert_eq!(
+        extract_vdisplay_modes_from_frontend_table(&frontend, "VIRTUAL_DISPLAY_CREATE_MODES"),
+        expected
+    );
 }
 
 #[test]
