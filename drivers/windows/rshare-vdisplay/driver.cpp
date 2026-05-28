@@ -59,6 +59,24 @@ static std::vector<RShareDisplayMode> RShareModesForState(const RSHARE_VDISPLAY_
     return modes;
 }
 
+static DWORD RShareRefreshMillihzFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo)
+{
+    UINT denominator = signalInfo.vSyncFreq.Denominator == 0 ? 1 : signalInfo.vSyncFreq.Denominator;
+    UINT divider = signalInfo.AdditionalSignalInfo.vSyncFreqDivider == 0 ? 1 : signalInfo.AdditionalSignalInfo.vSyncFreqDivider;
+    UINT64 millihz = (static_cast<UINT64>(signalInfo.vSyncFreq.Numerator) * 1000u) / denominator;
+    millihz /= divider;
+    return millihz == 0 ? RShareMonitorModes[0].RefreshRate * 1000 : static_cast<DWORD>(millihz);
+}
+
+static RShareDisplayMode RShareModeFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo)
+{
+    return {
+        signalInfo.activeSize.cx == 0 ? signalInfo.totalSize.cx : signalInfo.activeSize.cx,
+        signalInfo.activeSize.cy == 0 ? signalInfo.totalSize.cy : signalInfo.activeSize.cy,
+        RShareRefreshMillihzFromSignalInfo(signalInfo) / 1000,
+    };
+}
+
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
 EVT_WDF_DRIVER_DEVICE_ADD RShareVDisplayDeviceAdd;
@@ -558,6 +576,49 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     return STATUS_SUCCESS;
 }
 
+NTSTATUS RShareVirtualDisplayDevice::CommitModes(const IDARG_IN_COMMITMODES* inArgs)
+{
+    if (inArgs == nullptr || (inArgs->PathCount > 0 && inArgs->pPaths == nullptr)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (m_Monitor == nullptr) {
+        return STATUS_SUCCESS;
+    }
+
+    for (UINT index = 0; index < inArgs->PathCount; index++) {
+        const auto& path = inArgs->pPaths[index];
+        if (path.MonitorObject != m_Monitor) {
+            continue;
+        }
+
+        if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) == 0) {
+            m_State.Active = 0;
+            return STATUS_SUCCESS;
+        }
+
+        const auto mode = RShareModeFromSignalInfo(path.TargetVideoSignalInfo);
+        const DWORD refreshMillihz = RShareRefreshMillihzFromSignalInfo(path.TargetVideoSignalInfo);
+        if (mode.Width == 0 || mode.Height == 0 || refreshMillihz == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        m_State.Active = 1;
+        m_State.Width = mode.Width;
+        m_State.Height = mode.Height;
+        m_State.RefreshRateMillihz = refreshMillihz;
+
+        auto monitorContext = RShareGetMonitorContext(m_Monitor);
+        if (monitorContext != nullptr && monitorContext->Monitor != nullptr) {
+            monitorContext->Monitor->UpdateMode(m_State);
+        }
+
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS RShareVirtualDisplayDevice::RemoveMonitor()
 {
     if (m_Monitor != nullptr) {
@@ -671,9 +732,12 @@ NTSTATUS RShareVDisplayDeviceIoControl(
 _Use_decl_annotations_
 NTSTATUS RShareVDisplayAdapterCommitModes(IDDCX_ADAPTER adapterObject, const IDARG_IN_COMMITMODES* inArgs)
 {
-    UNREFERENCED_PARAMETER(adapterObject);
-    UNREFERENCED_PARAMETER(inArgs);
-    return STATUS_SUCCESS;
+    auto context = RShareGetDeviceContext(adapterObject);
+    if (context == nullptr || context->Device == nullptr) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    return context->Device->CommitModes(inArgs);
 }
 
 _Use_decl_annotations_

@@ -94,6 +94,7 @@ namespace RShare::VirtualDisplay
         void InitAdapter();
         NTSTATUS QueryState(PRSHARE_VDISPLAY_STATE state, size_t outputSize);
         NTSTATUS CreateOrUpdateMonitor(const RSHARE_VDISPLAY_REQUEST& request);
+        NTSTATUS CommitModes(const IDARG_IN_COMMITMODES* inArgs);
         NTSTATUS RemoveMonitor();
         void ReportMonitorArrival(UINT connectorIndex);
 
