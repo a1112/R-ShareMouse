@@ -424,6 +424,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("Test-SupportedVirtualDisplayMode"));
     assert!(validate_vdisplay_script.contains("Assert-SupportedVirtualDisplayMode"));
     assert!(validate_vdisplay_script.contains("Assert-SupportedVirtualDisplayMode -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz"));
+    assert!(validate_vdisplay_script.contains("Build-VDisplayModeString"));
+    assert!(validate_vdisplay_script.contains("Build-VDisplayModeString -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz"));
+    assert!(validate_vdisplay_script.contains("Build-VDisplayModeString -Width $state.Width -Height $state.Height -RefreshRateMillihz $state.RefreshRateMillihz"));
+    assert!(validate_vdisplay_script.contains("\"--mode\""));
     assert!(validate_vdisplay_script.contains("$RefreshRateToleranceMillihz = 1000"));
     assert!(validate_vdisplay_script.contains("$state.Active -eq 2"));
     assert!(validate_vdisplay_script.contains("$state.Active -eq 0"));
@@ -437,8 +441,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("EnsureDaemonForTopologyVerification"));
     assert!(validate_vdisplay_script.contains("cargo build -p rshare-daemon -p rshare-cli"));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- start --daemon"));
-    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $Width -ExpectedHeight $Height -ExpectedRefreshRateMillihz $RefreshRateMillihz"));
-    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $state.Width -ExpectedHeight $state.Height -ExpectedRefreshRateMillihz $state.RefreshRateMillihz"));
+    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -Mode $requestedMode"));
+    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -Mode $observedMode"));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));

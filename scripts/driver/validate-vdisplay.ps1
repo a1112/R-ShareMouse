@@ -116,6 +116,14 @@ function Assert-SupportedVirtualDisplayMode(
     throw "Unsupported virtual display validation mode ${Width}x${Height}@${RefreshRateMillihz}. Supported modes: $($supported -join ', ')"
 }
 
+function Build-VDisplayModeString(
+    [uint32]$Width,
+    [uint32]$Height,
+    [uint32]$RefreshRateMillihz
+) {
+    return "${Width}x${Height}@${RefreshRateMillihz}"
+}
+
 function WaitForVirtualDisplayActive(
     [uint32]$ExpectedWidth,
     [uint32]$ExpectedHeight,
@@ -186,11 +194,9 @@ function EnsureDaemonForTopologyVerification {
 }
 
 function Invoke-DaemonDisplayTopologyVerification(
-    [uint32]$ExpectedWidth,
-    [uint32]$ExpectedHeight,
-    [uint32]$ExpectedRefreshRateMillihz
+    [string]$Mode
 ) {
-    # cargo run -p rshare-cli -- display virtual verify
+    # cargo run -p rshare-cli -- display virtual verify --mode <WIDTHxHEIGHT@REFRESH_MILLIHZ>
     $args = @(
         "run",
         "-p",
@@ -199,12 +205,8 @@ function Invoke-DaemonDisplayTopologyVerification(
         "display",
         "virtual",
         "verify",
-        "--width",
-        "$ExpectedWidth",
-        "--height",
-        "$ExpectedHeight",
-        "--refresh-rate-millihz",
-        "$ExpectedRefreshRateMillihz"
+        "--mode",
+        "$Mode"
     )
     $output = & cargo @args
     if ($LASTEXITCODE -ne 0) {
@@ -215,7 +217,8 @@ function Invoke-DaemonDisplayTopologyVerification(
 }
 
 function Invoke-DaemonVirtualDisplayCreate {
-    # cargo run -p rshare-cli -- display virtual create
+    $requestedMode = Build-VDisplayModeString -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz
+    # cargo run -p rshare-cli -- display virtual create --mode <WIDTHxHEIGHT@REFRESH_MILLIHZ>
     $args = @(
         "run",
         "-p",
@@ -224,12 +227,8 @@ function Invoke-DaemonVirtualDisplayCreate {
         "display",
         "virtual",
         "create",
-        "--width",
-        "$Width",
-        "--height",
-        "$Height",
-        "--refresh-rate-millihz",
-        "$RefreshRateMillihz",
+        "--mode",
+        "$requestedMode",
         "--name",
         "R-ShareMouse Virtual Display"
     )
@@ -263,6 +262,7 @@ function Invoke-DaemonVirtualDisplayRemove {
 }
 
 Assert-SupportedVirtualDisplayMode -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz
+$requestedMode = Build-VDisplayModeString -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz
 Assert-Admin
 
 Invoke-Step "Check WDK and IddCx environment" {
@@ -305,7 +305,7 @@ Invoke-Step "Confirm driver state after create" {
 
 if ($VerifyDaemonDisplayTopology) {
     Invoke-Step "Verify daemon display topology" {
-        Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $Width -ExpectedHeight $Height -ExpectedRefreshRateMillihz $RefreshRateMillihz
+        Invoke-DaemonDisplayTopologyVerification -Mode $requestedMode
     }
 }
 
@@ -326,7 +326,8 @@ if ($WaitForManualModeChange) {
             if ($state.Active -eq 1 -and -not $sameMode) {
                 Write-Host "Manual mode change observed through CommitModes: $($state.Raw)"
                 if ($VerifyDaemonDisplayTopology) {
-                    Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $state.Width -ExpectedHeight $state.Height -ExpectedRefreshRateMillihz $state.RefreshRateMillihz
+                    $observedMode = Build-VDisplayModeString -Width $state.Width -Height $state.Height -RefreshRateMillihz $state.RefreshRateMillihz
+                    Invoke-DaemonDisplayTopologyVerification -Mode $observedMode
                 }
                 return
             }
