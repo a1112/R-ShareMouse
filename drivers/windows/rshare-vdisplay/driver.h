@@ -99,6 +99,7 @@ namespace RShare::VirtualDisplay
         NTSTATUS RemoveMonitor();
         void ReportMonitorArrival(UINT connectorIndex);
         void ReportPendingMonitorArrival();
+        void ClearMonitorAfterFailedArrival(IDDCX_MONITOR monitor);
 
     private:
         WDFDEVICE m_Device;

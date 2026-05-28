@@ -63,6 +63,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("IddCxAdapterInitAsync"));
     assert!(driver.contains("IddCxMonitorCreate"));
     assert!(driver.contains("IddCxMonitorArrival"));
+    assert!(driver.contains("RShareVirtualDisplayDevice::ClearMonitorAfterFailedArrival"));
+    assert!(driver.contains("ClearMonitorAfterFailedArrival(monitorCreateOut.MonitorObject)"));
     assert!(driver.contains("IddCxSwapChainSetDevice"));
     assert!(driver.contains("IddCxSwapChainFinishedProcessingFrame"));
     assert!(driver.contains("RShareVDisplayMonitorQueryModes"));
@@ -130,6 +132,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(header.contains("#include <iddcx.h>"));
     assert!(header.contains("GUID_DEVINTERFACE_RSHARE_VDISPLAY"));
     assert!(header.contains("class RShareVirtualDisplayDevice"));
+    assert!(header.contains("void ClearMonitorAfterFailedArrival(IDDCX_MONITOR monitor);"));
     assert!(header.contains("NTSTATUS UpdateTargetModes();"));
     assert!(header.contains("void ReportPendingMonitorArrival();"));
     assert!(header.contains("class RShareSwapChainProcessor"));

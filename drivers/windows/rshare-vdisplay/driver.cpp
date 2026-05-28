@@ -586,6 +586,8 @@ void RShareVirtualDisplayDevice::ReportMonitorArrival(UINT connectorIndex)
     if (NT_SUCCESS(status)) {
         m_State.Active = RSHARE_VDISPLAY_ACTIVITY_ACTIVE;
         m_State.ConnectorIndex = connectorIndex;
+    } else {
+        ClearMonitorAfterFailedArrival(monitorCreateOut.MonitorObject);
     }
 }
 
@@ -594,6 +596,24 @@ void RShareVirtualDisplayDevice::ReportPendingMonitorArrival()
     if (m_MonitorRequested) {
         ReportMonitorArrival(0);
     }
+}
+
+void RShareVirtualDisplayDevice::ClearMonitorAfterFailedArrival(IDDCX_MONITOR monitor)
+{
+    if (monitor == nullptr) {
+        return;
+    }
+
+    if (m_Monitor == monitor) {
+        auto monitorContext = RShareGetMonitorContext(monitor);
+        if (monitorContext != nullptr) {
+            delete monitorContext->Monitor;
+            monitorContext->Monitor = nullptr;
+        }
+        m_Monitor = nullptr;
+    }
+
+    WdfObjectDelete(reinterpret_cast<WDFOBJECT>(monitor));
 }
 
 NTSTATUS RShareVirtualDisplayDevice::QueryState(PRSHARE_VDISPLAY_STATE state, size_t outputSize)
