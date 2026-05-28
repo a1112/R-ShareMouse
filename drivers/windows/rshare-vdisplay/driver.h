@@ -75,11 +75,15 @@ namespace RShare::VirtualDisplay
         explicit RShareVirtualDisplayMonitor(IDDCX_MONITOR monitor);
         ~RShareVirtualDisplayMonitor();
 
+        void UpdateMode(const RSHARE_VDISPLAY_STATE& state);
+        NTSTATUS CopyDefaultModes(const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* inArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* outArgs) const;
+        NTSTATUS CopyTargetModes(const IDARG_IN_QUERYTARGETMODES* inArgs, IDARG_OUT_QUERYTARGETMODES* outArgs) const;
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
         void UnassignSwapChain();
 
     private:
         IDDCX_MONITOR m_Monitor;
+        RSHARE_VDISPLAY_STATE m_State;
         std::unique_ptr<RShareSwapChainProcessor> m_Processor;
     };
 

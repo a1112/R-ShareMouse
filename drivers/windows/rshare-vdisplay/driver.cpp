@@ -29,6 +29,36 @@ static const RShareDisplayMode RShareMonitorModes[] = {
     {1024, 768, 60},
 };
 
+static RShareDisplayMode RShareModeFromState(const RSHARE_VDISPLAY_STATE& state)
+{
+    return {
+        state.Width == 0 ? RShareMonitorModes[0].Width : state.Width,
+        state.Height == 0 ? RShareMonitorModes[0].Height : state.Height,
+        state.RefreshRateMillihz == 0 ? RShareMonitorModes[0].RefreshRate : state.RefreshRateMillihz / 1000,
+    };
+}
+
+static std::vector<RShareDisplayMode> RShareModesForState(const RSHARE_VDISPLAY_STATE& state)
+{
+    std::vector<RShareDisplayMode> modes;
+    modes.push_back(RShareModeFromState(state));
+
+    for (const auto& mode : RShareMonitorModes) {
+        bool duplicate = false;
+        for (const auto& existing : modes) {
+            if (existing.Width == mode.Width && existing.Height == mode.Height && existing.RefreshRate == mode.RefreshRate) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            modes.push_back(mode);
+        }
+    }
+
+    return modes;
+}
+
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
 EVT_WDF_DRIVER_DEVICE_ADD RShareVDisplayDeviceAdd;
@@ -316,13 +346,68 @@ void RShareSwapChainProcessor::RunCore()
 }
 
 RShareVirtualDisplayMonitor::RShareVirtualDisplayMonitor(IDDCX_MONITOR monitor)
-    : m_Monitor(monitor)
+    : m_Monitor(monitor),
+      m_State{}
 {
+    m_State.Abi = RSHARE_DRIVER_ABI;
+    m_State.Width = RShareMonitorModes[0].Width;
+    m_State.Height = RShareMonitorModes[0].Height;
+    m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRate * 1000;
 }
 
 RShareVirtualDisplayMonitor::~RShareVirtualDisplayMonitor()
 {
     m_Processor.reset();
+}
+
+void RShareVirtualDisplayMonitor::UpdateMode(const RSHARE_VDISPLAY_STATE& state)
+{
+    m_State = state;
+}
+
+NTSTATUS RShareVirtualDisplayMonitor::CopyDefaultModes(
+    const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* inArgs,
+    IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* outArgs) const
+{
+    auto modes = RShareModesForState(m_State);
+    outArgs->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
+    outArgs->PreferredMonitorModeIdx = 0;
+
+    if (inArgs->DefaultMonitorModeBufferInputCount == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    if (inArgs->DefaultMonitorModeBufferInputCount < modes.size()) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    for (size_t index = 0; index < modes.size(); index++) {
+        inArgs->pDefaultMonitorModes[index] = RShareCreateMonitorMode(modes[index]);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS RShareVirtualDisplayMonitor::CopyTargetModes(
+    const IDARG_IN_QUERYTARGETMODES* inArgs,
+    IDARG_OUT_QUERYTARGETMODES* outArgs) const
+{
+    auto modes = RShareModesForState(m_State);
+    outArgs->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
+
+    if (inArgs->TargetModeBufferInputCount == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    if (inArgs->TargetModeBufferInputCount < modes.size()) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    for (size_t index = 0; index < modes.size(); index++) {
+        inArgs->pTargetModes[index] = RShareCreateTargetMode(modes[index]);
+    }
+
+    return STATUS_SUCCESS;
 }
 
 void RShareVirtualDisplayMonitor::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent)
@@ -429,6 +514,7 @@ void RShareVirtualDisplayDevice::ReportMonitorArrival(UINT connectorIndex)
     m_Monitor = monitorCreateOut.MonitorObject;
     auto monitorContext = RShareGetMonitorContext(monitorCreateOut.MonitorObject);
     monitorContext->Monitor = new RShareVirtualDisplayMonitor(monitorCreateOut.MonitorObject);
+    monitorContext->Monitor->UpdateMode(m_State);
 
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
     status = IddCxMonitorArrival(monitorCreateOut.MonitorObject, &arrivalOut);
@@ -457,6 +543,12 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     m_State.Width = request.Width;
     m_State.Height = request.Height;
     m_State.RefreshRateMillihz = request.RefreshRateMillihz;
+    if (m_Monitor != nullptr) {
+        auto monitorContext = RShareGetMonitorContext(m_Monitor);
+        if (monitorContext != nullptr && monitorContext->Monitor != nullptr) {
+            monitorContext->Monitor->UpdateMode(m_State);
+        }
+    }
 
     if (m_Adapter == nullptr) {
         return STATUS_DEVICE_NOT_READY;
@@ -613,24 +705,12 @@ NTSTATUS RShareVDisplayMonitorGetDefaultModes(
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* inArgs,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* outArgs)
 {
-    UNREFERENCED_PARAMETER(monitorObject);
-
-    outArgs->DefaultMonitorModeBufferOutputCount = ARRAYSIZE(RShareMonitorModes);
-    outArgs->PreferredMonitorModeIdx = 0;
-
-    if (inArgs->DefaultMonitorModeBufferInputCount == 0) {
-        return STATUS_SUCCESS;
+    auto context = RShareGetMonitorContext(monitorObject);
+    if (context == nullptr || context->Monitor == nullptr) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
-    if (inArgs->DefaultMonitorModeBufferInputCount < ARRAYSIZE(RShareMonitorModes)) {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    for (DWORD index = 0; index < ARRAYSIZE(RShareMonitorModes); index++) {
-        inArgs->pDefaultMonitorModes[index] = RShareCreateMonitorMode(RShareMonitorModes[index]);
-    }
-
-    return STATUS_SUCCESS;
+    return context->Monitor->CopyDefaultModes(inArgs, outArgs);
 }
 
 _Use_decl_annotations_
@@ -639,22 +719,12 @@ NTSTATUS RShareVDisplayMonitorQueryModes(
     const IDARG_IN_QUERYTARGETMODES* inArgs,
     IDARG_OUT_QUERYTARGETMODES* outArgs)
 {
-    UNREFERENCED_PARAMETER(monitorObject);
-
-    outArgs->TargetModeBufferOutputCount = ARRAYSIZE(RShareMonitorModes);
-    if (inArgs->TargetModeBufferInputCount == 0) {
-        return STATUS_SUCCESS;
+    auto context = RShareGetMonitorContext(monitorObject);
+    if (context == nullptr || context->Monitor == nullptr) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
-    if (inArgs->TargetModeBufferInputCount < ARRAYSIZE(RShareMonitorModes)) {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    for (DWORD index = 0; index < ARRAYSIZE(RShareMonitorModes); index++) {
-        inArgs->pTargetModes[index] = RShareCreateTargetMode(RShareMonitorModes[index]);
-    }
-
-    return STATUS_SUCCESS;
+    return context->Monitor->CopyTargetModes(inArgs, outArgs);
 }
 
 _Use_decl_annotations_

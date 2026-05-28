@@ -34,6 +34,12 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("IddCxSwapChainSetDevice"));
     assert!(driver.contains("IddCxSwapChainFinishedProcessingFrame"));
     assert!(driver.contains("RShareVDisplayMonitorQueryModes"));
+    assert!(driver.contains("RShareVirtualDisplayMonitor::CopyDefaultModes"));
+    assert!(driver.contains("RShareVirtualDisplayMonitor::CopyTargetModes"));
+    assert!(driver.contains("RShareVirtualDisplayMonitor::UpdateMode"));
+    assert!(driver.contains("RShareModesForState"));
+    assert!(driver.contains("context->Monitor->CopyTargetModes"));
+    assert!(driver.contains("context->Monitor->CopyDefaultModes"));
     assert!(driver.contains("EvtIddCxDeviceIoControl"));
     assert!(driver.contains("WdfDeviceCreateDeviceInterface"));
     assert!(driver.contains("IOCTL_RSHARE_VDISPLAY_QUERY_STATE"));
