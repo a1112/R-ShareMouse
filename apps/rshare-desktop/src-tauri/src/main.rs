@@ -222,28 +222,37 @@ async fn capture_display(
     display_id: String,
     max_width: Option<u32>,
 ) -> Result<DisplayCaptureResult, String> {
-    daemon_client::request_display_capture(DisplayCaptureRequest {
-        display_id,
-        max_width,
-    })
+    capture_display_with(
+        DisplayCaptureRequest {
+            display_id,
+            max_width,
+        },
+        |request| Box::pin(async { daemon_client::request_display_capture(request).await }),
+        |request| rshare_platform::display::capture_display(&request),
+    )
     .await
-    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn identify_displays(duration_ms: Option<u32>) -> Result<DisplayIdentifyResult, String> {
-    daemon_client::request_identify_displays(DisplayIdentifyRequest { duration_ms })
-        .await
-        .map_err(|err| err.to_string())
+    identify_displays_with(
+        DisplayIdentifyRequest { duration_ms },
+        |request| Box::pin(async { daemon_client::request_identify_displays(request).await }),
+        |request| rshare_platform::display::identify_displays(&request),
+    )
+    .await
 }
 
 #[tauri::command]
 async fn update_display_settings(
     request: DisplaySettingsUpdateRequest,
 ) -> Result<DisplaySettingsUpdateResult, String> {
-    daemon_client::request_update_display_settings(request)
-        .await
-        .map_err(|err| err.to_string())
+    update_display_settings_with(
+        request,
+        |request| Box::pin(async { daemon_client::request_update_display_settings(request).await }),
+        |request| rshare_platform::display::update_display_settings(&request),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -550,6 +559,64 @@ where
             snapshot.display =
                 query_platform_display().map_err(|fallback_err| fallback_err.to_string())?;
             Ok(snapshot)
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn capture_display_with<DaemonCapture, PlatformCapture>(
+    request: DisplayCaptureRequest,
+    mut request_daemon: DaemonCapture,
+    mut capture_platform: PlatformCapture,
+) -> Result<DisplayCaptureResult, String>
+where
+    DaemonCapture: FnMut(DisplayCaptureRequest) -> BoxFutureResult<'static, DisplayCaptureResult>,
+    PlatformCapture: FnMut(DisplayCaptureRequest) -> AnyhowResult<DisplayCaptureResult>,
+{
+    match request_daemon(request.clone()).await {
+        Ok(result) => Ok(result),
+        Err(err) if is_ipc_unavailable(&err) => {
+            capture_platform(request).map_err(|fallback_err| fallback_err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn identify_displays_with<DaemonIdentify, PlatformIdentify>(
+    request: DisplayIdentifyRequest,
+    mut request_daemon: DaemonIdentify,
+    mut identify_platform: PlatformIdentify,
+) -> Result<DisplayIdentifyResult, String>
+where
+    DaemonIdentify:
+        FnMut(DisplayIdentifyRequest) -> BoxFutureResult<'static, DisplayIdentifyResult>,
+    PlatformIdentify: FnMut(DisplayIdentifyRequest) -> AnyhowResult<DisplayIdentifyResult>,
+{
+    match request_daemon(request.clone()).await {
+        Ok(result) => Ok(result),
+        Err(err) if is_ipc_unavailable(&err) => {
+            identify_platform(request).map_err(|fallback_err| fallback_err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn update_display_settings_with<DaemonUpdate, PlatformUpdate>(
+    request: DisplaySettingsUpdateRequest,
+    mut request_daemon: DaemonUpdate,
+    mut update_platform: PlatformUpdate,
+) -> Result<DisplaySettingsUpdateResult, String>
+where
+    DaemonUpdate: FnMut(
+        DisplaySettingsUpdateRequest,
+    ) -> BoxFutureResult<'static, DisplaySettingsUpdateResult>,
+    PlatformUpdate:
+        FnMut(DisplaySettingsUpdateRequest) -> AnyhowResult<DisplaySettingsUpdateResult>,
+{
+    match request_daemon(request.clone()).await {
+        Ok(result) => Ok(result),
+        Err(err) if is_ipc_unavailable(&err) => {
+            update_platform(request).map_err(|fallback_err| fallback_err.to_string())
         }
         Err(err) => Err(err.to_string()),
     }
@@ -1552,6 +1619,131 @@ mod tests {
             result.display.displays[0].display_id.as_str(),
             "windows-display-rshare"
         );
+    }
+
+    #[tokio::test]
+    async fn display_capture_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+        let request = DisplayCaptureRequest {
+            display_id: "windows-display-rshare".to_string(),
+            max_width: Some(640),
+        };
+
+        let result = capture_display_with(
+            request.clone(),
+            |_| {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move |platform_request| {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(DisplayCaptureResult {
+                        status: rshare_core::DisplayOperationStatus::Success,
+                        display_id: platform_request.display_id,
+                        mime_type: Some("image/png".to_string()),
+                        width: platform_request.max_width,
+                        height: Some(360),
+                        bytes: vec![1, 2, 3],
+                        message: None,
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return display capture");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status, rshare_core::DisplayOperationStatus::Success);
+        assert_eq!(result.display_id, request.display_id);
+        assert_eq!(result.width, request.max_width);
+    }
+
+    #[tokio::test]
+    async fn display_identify_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+        let request = DisplayIdentifyRequest {
+            duration_ms: Some(750),
+        };
+
+        let result = identify_displays_with(
+            request,
+            |_| {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move |platform_request| {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(DisplayIdentifyResult {
+                        status: rshare_core::DisplayOperationStatus::Success,
+                        message: platform_request
+                            .duration_ms
+                            .map(|duration| format!("identified for {duration}ms")),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return identify result");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status, rshare_core::DisplayOperationStatus::Success);
+        assert_eq!(result.message.as_deref(), Some("identified for 750ms"));
+    }
+
+    #[tokio::test]
+    async fn display_update_falls_back_to_platform_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+        let request = DisplaySettingsUpdateRequest {
+            display_id: "windows-display-rshare".to_string(),
+            width: Some(1920),
+            height: Some(1080),
+            refresh_rate_millihz: Some(60_000),
+            orientation: None,
+            primary: None,
+            x: Some(0),
+            y: Some(0),
+            scale_percent: None,
+        };
+
+        let result = update_display_settings_with(
+            request,
+            |_| {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move |platform_request| {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(platform_request.display_id, "windows-display-rshare");
+                    Ok(DisplaySettingsUpdateResult {
+                        status: rshare_core::DisplayOperationStatus::Success,
+                        message: None,
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform fallback should return display update result");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status, rshare_core::DisplayOperationStatus::Success);
     }
 
     #[tokio::test]
