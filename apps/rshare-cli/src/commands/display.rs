@@ -7,6 +7,20 @@ use rshare_core::{
 };
 
 const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
+const SUPPORTED_VIRTUAL_DISPLAY_MODES: &[(u32, u32, u32)] = &[
+    (3840, 2160, 60_000),
+    (2560, 1440, 144_000),
+    (2560, 1440, 90_000),
+    (2560, 1440, 60_000),
+    (1920, 1080, 144_000),
+    (1920, 1080, 90_000),
+    (1920, 1080, 60_000),
+    (1600, 900, 60_000),
+    (1280, 720, 90_000),
+    (1280, 720, 60_000),
+    (1024, 768, 75_000),
+    (1024, 768, 60_000),
+];
 
 #[derive(Subcommand)]
 pub enum DisplayCommand {
@@ -21,6 +35,8 @@ pub enum DisplayCommand {
 pub enum VirtualDisplayCommand {
     /// List virtual displays known to the daemon
     List,
+    /// List virtual display modes supported by the bundled Windows IDD driver
+    Modes,
     /// Create or retry creating a daemon-managed virtual display
     Create {
         #[arg(long)]
@@ -61,6 +77,10 @@ async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
         VirtualDisplayCommand::List => {
             let displays = rshare_core::daemon_client::request_virtual_displays().await?;
             println!("{}", format_virtual_display_list(&displays));
+            Ok(())
+        }
+        VirtualDisplayCommand::Modes => {
+            println!("{}", format_supported_virtual_display_modes());
             Ok(())
         }
         VirtualDisplayCommand::Create {
@@ -109,6 +129,16 @@ async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn format_supported_virtual_display_modes() -> String {
+    let mut lines = vec!["supported virtual display modes:".to_string()];
+    lines.extend(
+        SUPPORTED_VIRTUAL_DISPLAY_MODES
+            .iter()
+            .map(|(width, height, refresh)| format!("{width}x{height}@{refresh}")),
+    );
+    lines.join("\n")
 }
 
 fn format_virtual_display_list(displays: &[VirtualDisplaySnapshot]) -> String {
@@ -394,5 +424,16 @@ mod tests {
         assert!(output.contains("rshare-vdisplay-1"));
         assert!(output.contains("1920x1080@60000"));
         assert!(output.contains("created"));
+    }
+
+    #[test]
+    fn format_supported_virtual_display_modes_lists_driver_modes() {
+        let output = format_supported_virtual_display_modes();
+
+        assert!(output.contains("supported virtual display modes"));
+        assert!(output.contains("3840x2160@60000"));
+        assert!(output.contains("2560x1440@144000"));
+        assert!(output.contains("1920x1080@60000"));
+        assert!(output.contains("1024x768@60000"));
     }
 }

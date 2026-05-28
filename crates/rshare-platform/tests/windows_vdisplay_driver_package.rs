@@ -480,6 +480,7 @@ fn virtual_display_supported_mode_tables_stay_synchronized() {
     let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
     let validate_script = read_repo_file("scripts/driver/validate-vdisplay.ps1");
     let frontend = read_repo_file("apps/rshare-desktop-frontend/src/app/desktop-model.mjs");
+    let cli = read_repo_file("apps/rshare-cli/src/commands/display.rs");
     let expected = expected_vdisplay_modes();
 
     assert_eq!(
@@ -503,6 +504,10 @@ fn virtual_display_supported_mode_tables_stay_synchronized() {
     );
     assert_eq!(
         extract_vdisplay_modes_from_frontend_table(&frontend, "VIRTUAL_DISPLAY_CREATE_MODES"),
+        expected
+    );
+    assert_eq!(
+        extract_vdisplay_modes_from_rust_table(&cli, "SUPPORTED_VIRTUAL_DISPLAY_MODES"),
         expected
     );
 }
