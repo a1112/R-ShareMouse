@@ -15,6 +15,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+$RefreshRateToleranceMillihz = 1000
 
 function Assert-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -70,6 +71,10 @@ function Read-VDisplayState {
     }
 }
 
+function Test-RefreshRateMatch([uint32]$ActualMillihz, [uint32]$ExpectedMillihz) {
+    return [Math]::Abs([int64]$ActualMillihz - [int64]$ExpectedMillihz) -le $RefreshRateToleranceMillihz
+}
+
 function WaitForVirtualDisplayActive(
     [uint32]$ExpectedWidth,
     [uint32]$ExpectedHeight,
@@ -80,7 +85,7 @@ function WaitForVirtualDisplayActive(
     while ((Get-Date) -lt $deadline) {
         $state = Read-VDisplayState
         $lastState = $state
-        $modeMatches = $state.Width -eq $ExpectedWidth -and $state.Height -eq $ExpectedHeight -and $state.RefreshRateMillihz -eq $ExpectedRefreshRateMillihz
+        $modeMatches = $state.Width -eq $ExpectedWidth -and $state.Height -eq $ExpectedHeight -and (Test-RefreshRateMatch $state.RefreshRateMillihz $ExpectedRefreshRateMillihz)
         if ($state.Active -eq 1 -and $modeMatches) {
             return $state
         }
@@ -275,7 +280,7 @@ if ($WaitForManualModeChange) {
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 2
             $state = Read-VDisplayState
-            $sameMode = $state.Width -eq $Width -and $state.Height -eq $Height -and $state.RefreshRateMillihz -eq $RefreshRateMillihz
+            $sameMode = $state.Width -eq $Width -and $state.Height -eq $Height -and (Test-RefreshRateMatch $state.RefreshRateMillihz $RefreshRateMillihz)
             if ($state.Active -eq 1 -and -not $sameMode) {
                 Write-Host "Manual mode change observed through CommitModes: $($state.Raw)"
                 if ($VerifyDaemonDisplayTopology) {

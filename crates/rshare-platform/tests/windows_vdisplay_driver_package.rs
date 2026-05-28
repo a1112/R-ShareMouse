@@ -176,6 +176,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
     assert!(validate_vdisplay_script.contains("WaitForVirtualDisplayActive"));
     assert!(validate_vdisplay_script.contains("WaitForVirtualDisplayRemoved"));
+    assert!(validate_vdisplay_script.contains("Test-RefreshRateMatch"));
+    assert!(validate_vdisplay_script.contains("$RefreshRateToleranceMillihz = 1000"));
     assert!(validate_vdisplay_script.contains("$state.Active -eq 2"));
     assert!(validate_vdisplay_script.contains("$state.Active -eq 0"));
     assert!(validate_vdisplay_script.contains("vdisplay state abi="));
