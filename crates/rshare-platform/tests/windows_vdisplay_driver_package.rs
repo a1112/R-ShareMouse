@@ -114,6 +114,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("ms-settings:display"));
     assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
     assert!(validate_vdisplay_script.contains("vdisplay state abi="));
+    assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual verify"));
+    assert!(validate_vdisplay_script.contains("VerifyDaemonDisplayTopology"));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));

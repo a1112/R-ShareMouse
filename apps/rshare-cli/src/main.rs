@@ -31,7 +31,7 @@ fn build_metadata() -> String {
     )
 }
 
-use commands::{config_cmd, devices, discover, doctor, start, stop, usb};
+use commands::{config_cmd, devices, discover, display, doctor, start, stop, usb};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -107,6 +107,12 @@ enum Commands {
         /// Show detailed status including network info
         #[arg(short, long)]
         detailed: bool,
+    },
+
+    /// Display and virtual display tools
+    Display {
+        #[command(subcommand)]
+        display_cmd: display::DisplayCommand,
     },
 
     /// Run dual-machine readiness diagnostics
@@ -204,6 +210,9 @@ async fn main() -> Result<()> {
         }
         Commands::Status { detailed } => {
             commands::status::execute(detailed).await?;
+        }
+        Commands::Display { display_cmd } => {
+            display::execute(display_cmd).await?;
         }
         Commands::Doctor {
             connect,

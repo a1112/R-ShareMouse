@@ -2,6 +2,7 @@
 
 pub mod config_cmd;
 pub mod devices;
+pub mod display;
 pub mod discover;
 pub mod doctor;
 pub mod logs;

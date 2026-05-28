@@ -8,6 +8,7 @@ param(
     [uint32]$RefreshRateMillihz = 60000,
     [switch]$SkipBuild,
     [switch]$SkipInstall,
+    [switch]$VerifyDaemonDisplayTopology,
     [switch]$WaitForManualModeChange,
     [switch]$KeepDisplay
 )
@@ -68,6 +69,31 @@ function Read-VDisplayState {
     }
 }
 
+function Invoke-DaemonDisplayTopologyVerification {
+    # cargo run -p rshare-cli -- display virtual verify
+    $args = @(
+        "run",
+        "-p",
+        "rshare-cli",
+        "--",
+        "display",
+        "virtual",
+        "verify",
+        "--width",
+        "$Width",
+        "--height",
+        "$Height",
+        "--refresh-rate-millihz",
+        "$RefreshRateMillihz"
+    )
+    $output = & cargo @args
+    if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
+        throw "Daemon display topology verification failed. Ensure rshare-daemon is running, then re-run this script."
+    }
+    $output | ForEach-Object { Write-Host $_ }
+}
+
 Assert-Admin
 
 Invoke-Step "Check WDK and IddCx environment" {
@@ -98,6 +124,12 @@ Invoke-Step "Confirm driver state after create" {
     $state = Read-VDisplayState
     if ($state.Active -ne 1 -or $state.Width -ne $Width -or $state.Height -ne $Height -or $state.RefreshRateMillihz -ne $RefreshRateMillihz) {
         throw "Unexpected virtual display state after create: $($state.Raw)"
+    }
+}
+
+if ($VerifyDaemonDisplayTopology) {
+    Invoke-Step "Verify daemon display topology" {
+        Invoke-DaemonDisplayTopologyVerification
     }
 }
 
