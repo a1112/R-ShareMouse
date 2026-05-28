@@ -292,6 +292,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let driver_readme = read_repo_file("drivers/windows/README.md");
 
     assert!(driver.contains("DriverEntry"));
+    assert!(driver.contains("#include \"driver.h\"\n#include <initguid.h>"));
+    assert!(header.contains("#ifndef UMDF_USING_NTSTATUS"));
+    assert!(header.contains("#define UMDF_USING_NTSTATUS"));
+    assert!(!header.contains("#include <bugcodes.h>"));
     assert!(driver.contains("IddCxDeviceInitConfig"));
     assert!(driver.contains("IddCxDeviceInitialize"));
     assert!(driver.contains("IddCxAdapterInitAsync"));
@@ -362,6 +366,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     ));
     assert!(driver.contains("m_State.RefreshRateMillihz = refreshMillihz"));
     assert!(driver.contains("EvtIddCxDeviceIoControl"));
+    assert!(driver.contains("VOID RShareVDisplayDeviceIoControl("));
+    assert!(!driver.contains("NTSTATUS RShareVDisplayDeviceIoControl("));
     assert!(driver.contains("WdfDeviceCreateDeviceInterface"));
     assert!(driver.contains("IOCTL_RSHARE_VDISPLAY_QUERY_STATE"));
     assert!(driver.contains("IOCTL_RSHARE_VDISPLAY_CREATE"));
@@ -390,10 +396,15 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(project.contains("<IndirectDisplayDriver>true</IndirectDisplayDriver>"));
     assert!(project.contains("<IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>"));
     assert!(project.contains("<IDDCX_VERSION_MINOR>6</IDDCX_VERSION_MINOR>"));
+    assert!(project.contains("<WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>"));
     assert!(project.contains("<UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>"));
     assert!(project.contains("<ClInclude Include=\"driver.h\" />"));
     assert!(project.contains("<ClInclude Include=\"trace.h\" />"));
     assert!(project.contains("<FilesToPackage Include=\"$(TargetPath)\" />"));
+    assert!(project.contains("Include\\wdf\\umdf\\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR)"));
+    assert!(project.contains("$(WindowsTargetPlatformVersion)\\um\\iddcx\\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR)"));
+    assert!(project.contains("Lib\\wdf\\umdf\\$(Platform)\\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR)"));
+    assert!(project.contains("Lib\\$(WindowsTargetPlatformVersion)\\um\\$(Platform)\\iddcx\\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR)"));
 
     assert!(inf.contains("DeviceGroupId"));
     assert!(inf.contains("RShareMouseVirtualDisplay"));
@@ -408,6 +419,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(check_wdk_script.contains("iddcx.h"));
     assert!(check_wdk_script.contains("IddCxStub.lib"));
     assert!(check_wdk_script.contains("WdfDriverEntry.lib"));
+    assert!(check_wdk_script.contains("Find-PlatformFile"));
+    assert!(check_wdk_script.contains("*\\$TargetPlatform\\*"));
     assert!(check_wdk_script.contains("WindowsUserModeDriver10.0"));
     assert!(check_wdk_script.contains("winget install"));
     assert!(validate_vdisplay_script.contains("check-wdk.ps1"));

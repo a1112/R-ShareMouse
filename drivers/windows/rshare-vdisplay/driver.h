@@ -1,9 +1,11 @@
 #pragma once
 
 #define NOMINMAX
+#ifndef UMDF_USING_NTSTATUS
+#define UMDF_USING_NTSTATUS
+#endif
 
 #include <windows.h>
-#include <bugcodes.h>
 #include <wudfwdm.h>
 #include <wdf.h>
 #include <iddcx.h>

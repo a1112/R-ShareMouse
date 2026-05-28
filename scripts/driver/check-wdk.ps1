@@ -47,6 +47,16 @@ function Find-FirstFile([string]$Root, [string]$Filter) {
         Select-Object -First 1
 }
 
+function Find-PlatformFile([string]$Root, [string]$Filter, [string]$TargetPlatform) {
+    if (-not $Root -or -not (Test-Path $Root)) {
+        return $null
+    }
+    return Get-ChildItem -Path $Root -Recurse -Filter $Filter -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -like "*\$TargetPlatform\*" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+}
+
 function Get-WdkInstallCommand {
     "winget install --id $recommendedWdkPackage --exact --source winget"
 }
@@ -80,8 +90,8 @@ if ($kitRoot) {
 
 $ntddk = Find-FirstFile $includeRoot "ntddk.h"
 $iddcxHeader = Find-FirstFile $includeRoot "iddcx.h"
-$wdfLib = Find-FirstFile $libRoot "WdfDriverEntry.lib"
-$iddcxLib = Find-FirstFile $libRoot "IddCxStub.lib"
+$wdfLib = Find-PlatformFile $libRoot "WdfDriverEntry.lib" $Platform
+$iddcxLib = Find-PlatformFile $libRoot "IddCxStub.lib" $Platform
 
 if (-not $ntddk) { $missing.Add("ntddk.h") }
 if (-not $iddcxHeader) { $missing.Add("iddcx.h") }

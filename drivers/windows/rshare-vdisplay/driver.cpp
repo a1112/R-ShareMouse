@@ -1,6 +1,5 @@
-#include <initguid.h>
-
 #include "driver.h"
+#include <initguid.h>
 
 using namespace Microsoft::WRL;
 using namespace RShare::VirtualDisplay;
@@ -745,7 +744,7 @@ NTSTATUS RShareVDisplayAdapterInitFinished(IDDCX_ADAPTER adapterObject, const ID
 }
 
 _Use_decl_annotations_
-NTSTATUS RShareVDisplayDeviceIoControl(
+VOID RShareVDisplayDeviceIoControl(
     WDFDEVICE device,
     WDFREQUEST request,
     size_t outputBufferLength,
@@ -755,7 +754,7 @@ NTSTATUS RShareVDisplayDeviceIoControl(
     auto context = RShareGetDeviceContext(device);
     if (context == nullptr || context->Device == nullptr) {
         WdfRequestComplete(request, STATUS_DEVICE_NOT_READY);
-        return STATUS_DEVICE_NOT_READY;
+        return;
     }
 
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
@@ -825,7 +824,6 @@ NTSTATUS RShareVDisplayDeviceIoControl(
     } else {
         WdfRequestComplete(request, status);
     }
-    return status;
 }
 
 _Use_decl_annotations_
