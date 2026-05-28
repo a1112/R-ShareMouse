@@ -139,10 +139,13 @@ if (-not $SkipSign) {
 
 $pnpUtil = Find-SystemTool "pnputil.exe"
 $devcon = Find-DevCon (Get-WindowsKitRoot) $Platform
+if (-not $devcon -and ($packages | Where-Object { $_.UseDevCon })) {
+    throw "devcon.exe is required to install root-enumerated driver packages such as rshare-vhid and rshare-vdisplay. Install the WDK tools, then re-run this script from an elevated shell."
+}
 
 foreach ($package in $packages) {
     Write-Host "Installing $($package.Name)"
-    if ($package.UseDevCon -and $devcon) {
+    if ($package.UseDevCon) {
         $verb = if (Test-DevicePresent $pnpUtil $package.HardwareId) { "update" } else { "install" }
         & $devcon $verb $package.Inf $package.HardwareId
         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {

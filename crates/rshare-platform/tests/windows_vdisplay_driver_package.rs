@@ -22,6 +22,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let check_wdk_script = read_repo_file("scripts/driver/check-wdk.ps1");
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
+    let uninstall_script = read_repo_file("scripts/driver/uninstall-test-driver.ps1");
     let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
     let driver_readme = read_repo_file("drivers/windows/README.md");
 
@@ -93,6 +94,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
+    assert!(install_script.contains("if (-not $devcon -and ($packages | Where-Object { $_.UseDevCon }))"));
+    assert!(install_script.contains("devcon.exe is required to install root-enumerated driver packages"));
+    assert!(uninstall_script.contains("rshare-vdisplay.inf"));
 
     assert!(probe.contains("probe_vdisplay"));
     assert!(probe.contains("GUID_DEVINTERFACE_RSHARE_VDISPLAY"));
@@ -106,4 +110,5 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(build_script.contains("Cfgmgr32.lib"));
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
+    assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
 }
