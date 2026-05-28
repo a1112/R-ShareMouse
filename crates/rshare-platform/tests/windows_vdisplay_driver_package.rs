@@ -175,7 +175,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("ms-settings:display"));
     assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
     assert!(validate_vdisplay_script.contains("WaitForVirtualDisplayActive"));
+    assert!(validate_vdisplay_script.contains("WaitForVirtualDisplayRemoved"));
     assert!(validate_vdisplay_script.contains("$state.Active -eq 2"));
+    assert!(validate_vdisplay_script.contains("$state.Active -eq 0"));
     assert!(validate_vdisplay_script.contains("vdisplay state abi="));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual verify"));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual create"));
@@ -213,7 +215,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
+    assert!(driver_readme.contains("EDID-backed monitor"));
+    assert!(driver_readme.contains("pending IddCx arrival"));
     assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
+    assert!(!driver_readme.contains("EDID-less monitor"));
 }
 
 #[test]

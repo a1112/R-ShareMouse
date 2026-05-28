@@ -99,6 +99,26 @@ function WaitForVirtualDisplayActive(
     throw "Timed out waiting for virtual display to become active after create."
 }
 
+function WaitForVirtualDisplayRemoved {
+    $deadline = (Get-Date).AddSeconds(15)
+    $lastState = $null
+    while ((Get-Date) -lt $deadline) {
+        $state = Read-VDisplayState
+        $lastState = $state
+        if ($state.Active -eq 0) {
+            return $state
+        }
+
+        Write-Host "Waiting for virtual display to be removed: $($state.Raw)"
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ($lastState) {
+        throw "Timed out waiting for virtual display removal. Last state: $($lastState.Raw)"
+    }
+    throw "Timed out waiting for virtual display removal."
+}
+
 function EnsureDaemonForTopologyVerification {
     # cargo build -p rshare-daemon -p rshare-cli
     $buildArgs = @("build", "-p", "rshare-daemon", "-p", "rshare-cli")
@@ -275,6 +295,7 @@ if (-not $KeepDisplay) {
         } else {
             Invoke-Probe @("vdisplay", "remove") | Out-Null
         }
+        WaitForVirtualDisplayRemoved | Out-Null
     }
 }
 
