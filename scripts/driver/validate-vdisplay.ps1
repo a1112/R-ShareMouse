@@ -89,7 +89,11 @@ function EnsureDaemonForTopologyVerification {
     $startOutput | ForEach-Object { Write-Host $_ }
 }
 
-function Invoke-DaemonDisplayTopologyVerification {
+function Invoke-DaemonDisplayTopologyVerification(
+    [uint32]$ExpectedWidth,
+    [uint32]$ExpectedHeight,
+    [uint32]$ExpectedRefreshRateMillihz
+) {
     # cargo run -p rshare-cli -- display virtual verify
     $args = @(
         "run",
@@ -100,11 +104,11 @@ function Invoke-DaemonDisplayTopologyVerification {
         "virtual",
         "verify",
         "--width",
-        "$Width",
+        "$ExpectedWidth",
         "--height",
-        "$Height",
+        "$ExpectedHeight",
         "--refresh-rate-millihz",
-        "$RefreshRateMillihz"
+        "$ExpectedRefreshRateMillihz"
     )
     $output = & cargo @args
     if ($LASTEXITCODE -ne 0) {
@@ -153,7 +157,7 @@ if ($VerifyDaemonDisplayTopology) {
     }
 
     Invoke-Step "Verify daemon display topology" {
-        Invoke-DaemonDisplayTopologyVerification
+        Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $Width -ExpectedHeight $Height -ExpectedRefreshRateMillihz $RefreshRateMillihz
     }
 }
 
@@ -173,6 +177,9 @@ if ($WaitForManualModeChange) {
             $sameMode = $state.Width -eq $Width -and $state.Height -eq $Height -and $state.RefreshRateMillihz -eq $RefreshRateMillihz
             if ($state.Active -eq 1 -and -not $sameMode) {
                 Write-Host "Manual mode change observed through CommitModes: $($state.Raw)"
+                if ($VerifyDaemonDisplayTopology) {
+                    Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $state.Width -ExpectedHeight $state.Height -ExpectedRefreshRateMillihz $state.RefreshRateMillihz
+                }
                 return
             }
         }
