@@ -9,7 +9,8 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $projects = @(
     (Join-Path $root "drivers\windows\rshare-filter\rshare-filter.vcxproj"),
-    (Join-Path $root "drivers\windows\rshare-vhid\rshare-vhid.vcxproj")
+    (Join-Path $root "drivers\windows\rshare-vhid\rshare-vhid.vcxproj"),
+    (Join-Path $root "drivers\windows\rshare-vdisplay\rshare-vdisplay.vcxproj")
 )
 
 function Find-VisualStudioInstall {
@@ -89,6 +90,11 @@ if (-not $msbuildPath) {
     throw "msbuild.exe was not found. Install Visual Studio Build Tools/Community with MSBuild and WDK integration."
 }
 
+& (Join-Path $PSScriptRoot "check-wdk.ps1") -Platform $Platform
+if ($LASTEXITCODE -ne 0) {
+    throw "WDK/IddCx environment check failed."
+}
+
 $kitRoot = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10
 if (-not $kitRoot) {
     $kitRoot = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10
@@ -98,9 +104,11 @@ if (-not $kitRoot -or -not (Test-Path $kitRoot)) {
 }
 
 $ntddk = Get-ChildItem -Path (Join-Path $kitRoot "Include") -Recurse -Filter ntddk.h -ErrorAction SilentlyContinue | Select-Object -First 1
+$iddCxHeader = Get-ChildItem -Path (Join-Path $kitRoot "Include") -Recurse -Filter iddcx.h -ErrorAction SilentlyContinue | Select-Object -First 1
 $wdfLib = Get-ChildItem -Path (Join-Path $kitRoot "Lib") -Recurse -Filter WdfDriverEntry.lib -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $ntddk -or -not $wdfLib) {
-    throw "WDK headers/libs are incomplete under $kitRoot. Missing ntddk.h or WdfDriverEntry.lib. Install the Windows Driver Kit driver headers/libraries for x64."
+$iddCxLib = Get-ChildItem -Path (Join-Path $kitRoot "Lib") -Recurse -Filter IddCxStub.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $ntddk -or -not $iddCxHeader -or -not $wdfLib -or -not $iddCxLib) {
+    throw "WDK headers/libs are incomplete under $kitRoot. Missing ntddk.h, iddcx.h, WdfDriverEntry.lib, or IddCxStub.lib. Install the Windows Driver Kit with Indirect Display Driver Class Extension support for x64."
 }
 
 foreach ($project in $projects) {
@@ -157,9 +165,9 @@ if ($cl -or $vsInstall) {
     if ($vcInclude -and (Test-Path $vcInclude)) {
         $includeArgs = @("/I$vcInclude") + $includeArgs
     }
-    $linkArgs = @("/link", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib")
+    $linkArgs = @("/link", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib", "Cfgmgr32.lib")
     if ($vcLib -and (Test-Path $vcLib)) {
-        $linkArgs = @("/link", "/LIBPATH:$vcLib", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib")
+        $linkArgs = @("/link", "/LIBPATH:$vcLib", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib", "Cfgmgr32.lib")
     }
 
     & $clPath /nologo /W4 /WX $includeArgs $probe "/Fo$probeObj" "/Fe$probeOut" $linkArgs

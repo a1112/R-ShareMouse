@@ -1,13 +1,41 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cfgmgr32.h>
+#include <initguid.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <wchar.h>
 
 #include "..\rshare-common\rshare_ioctls.h"
 
-static int probe_filter(void)
+// {8c1fd719-6fb8-4f82-a4d2-07c6fd490875}
+DEFINE_GUID(
+    GUID_DEVINTERFACE_RSHARE_VDISPLAY,
+    0x8c1fd719,
+    0x6fb8,
+    0x4f82,
+    0xa4,
+    0xd2,
+    0x07,
+    0xc6,
+    0xfd,
+    0x49,
+    0x08,
+    0x75);
+
+static void print_usage(void)
+{
+    wprintf(L"usage:\n");
+    wprintf(L"  rshare-driver-probe\n");
+    wprintf(L"  rshare-driver-probe vdisplay status\n");
+    wprintf(L"  rshare-driver-probe vdisplay create [width height refresh_millihz]\n");
+    wprintf(L"  rshare-driver-probe vdisplay remove\n");
+}
+
+static HANDLE open_device(const wchar_t* path, const wchar_t* label)
 {
     HANDLE device = CreateFileW(
-        L"\\\\.\\RShareInputControl",
+        path,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
@@ -16,7 +44,58 @@ static int probe_filter(void)
         NULL);
 
     if (device == INVALID_HANDLE_VALUE) {
-        wprintf(L"open failed: %lu\n", GetLastError());
+        wprintf(L"%ls open failed: %lu\n", label, GetLastError());
+    }
+    return device;
+}
+
+static wchar_t* first_device_interface_path(GUID* interface_guid)
+{
+    ULONG length = 0;
+    CONFIGRET status = CM_Get_Device_Interface_List_SizeW(
+        &length,
+        interface_guid,
+        NULL,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (status != CR_SUCCESS || length <= 1) {
+        wprintf(L"vdisplay interface list size failed: 0x%08lx length=%lu\n", status, length);
+        return NULL;
+    }
+
+    wchar_t* buffer = (wchar_t*)calloc(length, sizeof(wchar_t));
+    if (buffer == NULL) {
+        wprintf(L"vdisplay interface allocation failed\n");
+        return NULL;
+    }
+
+    status = CM_Get_Device_Interface_ListW(
+        interface_guid,
+        NULL,
+        buffer,
+        length,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (status != CR_SUCCESS || buffer[0] == L'\0') {
+        wprintf(L"vdisplay interface list failed: 0x%08lx\n", status);
+        free(buffer);
+        return NULL;
+    }
+
+    size_t first_len = wcslen(buffer);
+    wchar_t* path = (wchar_t*)calloc(first_len + 1, sizeof(wchar_t));
+    if (path == NULL) {
+        free(buffer);
+        return NULL;
+    }
+    wcscpy_s(path, first_len + 1, buffer);
+    free(buffer);
+    return path;
+}
+
+static int probe_filter(void)
+{
+    HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
+
+    if (device == INVALID_HANDLE_VALUE) {
         return 2;
     }
 
@@ -59,17 +138,9 @@ static int probe_filter(void)
 
 static int probe_vhid(void)
 {
-    HANDLE device = CreateFileW(
-        L"\\\\.\\RShareVirtualHidControl",
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
+    HANDLE device = open_device(L"\\\\.\\RShareVirtualHidControl", L"vhid");
 
     if (device == INVALID_HANDLE_VALUE) {
-        wprintf(L"vhid open failed: %lu\n", GetLastError());
         return 6;
     }
 
@@ -130,8 +201,110 @@ static int probe_vhid(void)
     return 0;
 }
 
-int main(void)
+static int print_vdisplay_state(HANDLE device)
 {
+    DWORD returned = 0;
+    RSHARE_VDISPLAY_STATE state = {0};
+    if (!DeviceIoControl(device, IOCTL_RSHARE_VDISPLAY_QUERY_STATE, NULL, 0, &state, sizeof(state), &returned, NULL)) {
+        wprintf(L"vdisplay query state failed: %lu\n", GetLastError());
+        return 16;
+    }
+
+    printf("vdisplay state abi=%u active=%u %lux%lu@%lu connector=%lu\n",
+        state.Abi,
+        state.Active,
+        state.Width,
+        state.Height,
+        state.RefreshRateMillihz,
+        state.ConnectorIndex);
+    return 0;
+}
+
+static int probe_vdisplay(int argc, wchar_t** argv)
+{
+    if (argc < 3) {
+        print_usage();
+        return 13;
+    }
+
+    GUID interface_guid = GUID_DEVINTERFACE_RSHARE_VDISPLAY;
+    wchar_t* path = first_device_interface_path(&interface_guid);
+    if (path == NULL) {
+        return 14;
+    }
+
+    HANDLE device = open_device(path, L"vdisplay");
+    free(path);
+    if (device == INVALID_HANDLE_VALUE) {
+        return 14;
+    }
+
+    DWORD returned = 0;
+    RSHARE_DRIVER_VERSION version = {0};
+    if (!DeviceIoControl(device, IOCTL_RSHARE_QUERY_VERSION, NULL, 0, &version, sizeof(version), &returned, NULL)) {
+        wprintf(L"vdisplay query version failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 15;
+    }
+    printf("vdisplay version %u.%u.%u abi %u\n", version.Major, version.Minor, version.Patch, version.Abi);
+
+    RSHARE_DRIVER_CAPABILITIES capabilities = {0};
+    if (DeviceIoControl(device, IOCTL_RSHARE_QUERY_CAPABILITIES, NULL, 0, &capabilities, sizeof(capabilities), &returned, NULL)) {
+        printf("vdisplay capabilities flags=0x%08lx max_event=%lu\n", capabilities.Flags, capabilities.MaxEventSize);
+    }
+
+    if (wcscmp(argv[2], L"status") == 0) {
+        int result = print_vdisplay_state(device);
+        CloseHandle(device);
+        return result;
+    }
+
+    if (wcscmp(argv[2], L"create") == 0) {
+        RSHARE_VDISPLAY_REQUEST request = {0};
+        request.Width = argc > 3 ? wcstoul(argv[3], NULL, 10) : 1920;
+        request.Height = argc > 4 ? wcstoul(argv[4], NULL, 10) : 1080;
+        request.RefreshRateMillihz = argc > 5 ? wcstoul(argv[5], NULL, 10) : 60000;
+
+        if (!DeviceIoControl(device, IOCTL_RSHARE_VDISPLAY_CREATE, &request, sizeof(request), NULL, 0, &returned, NULL)) {
+            wprintf(L"vdisplay create failed: %lu\n", GetLastError());
+            CloseHandle(device);
+            return 17;
+        }
+
+        printf("vdisplay create requested %lux%lu@%lu\n", request.Width, request.Height, request.RefreshRateMillihz);
+        int result = print_vdisplay_state(device);
+        CloseHandle(device);
+        return result;
+    }
+
+    if (wcscmp(argv[2], L"remove") == 0) {
+        if (!DeviceIoControl(device, IOCTL_RSHARE_VDISPLAY_REMOVE, NULL, 0, NULL, 0, &returned, NULL)) {
+            wprintf(L"vdisplay remove failed: %lu\n", GetLastError());
+            CloseHandle(device);
+            return 18;
+        }
+
+        printf("vdisplay remove requested\n");
+        int result = print_vdisplay_state(device);
+        CloseHandle(device);
+        return result;
+    }
+
+    print_usage();
+    CloseHandle(device);
+    return 19;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc > 1) {
+        if (wcscmp(argv[1], L"vdisplay") == 0) {
+            return probe_vdisplay(argc, argv);
+        }
+        print_usage();
+        return 1;
+    }
+
     int filter_result = probe_filter();
     int vhid_result = probe_vhid();
 

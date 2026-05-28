@@ -23,6 +23,7 @@ arboard = "3.4"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
