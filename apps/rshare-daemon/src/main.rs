@@ -153,7 +153,9 @@ impl VirtualDisplayManager {
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
         let id = virtual_display_request_id(request.id.as_deref(), self.displays.len() + 1);
         if let Some(existing) = self.displays.get(&id) {
-            if !virtual_display_status_allows_create_retry(existing.status) {
+            if !virtual_display_status_allows_create_retry(existing.status)
+                && virtual_display_matches_create_request(existing, &request)
+            {
                 return VirtualDisplayOperationResult {
                     status: VirtualDisplayOperationStatus::AlreadyExists,
                     display: Some(existing.clone()),
@@ -226,6 +228,15 @@ fn virtual_display_status_allows_create_retry(status: VirtualDisplayStatus) -> b
         status,
         VirtualDisplayStatus::Active | VirtualDisplayStatus::Pending
     )
+}
+
+fn virtual_display_matches_create_request(
+    display: &VirtualDisplaySnapshot,
+    request: &VirtualDisplayCreateRequest,
+) -> bool {
+    display.width == request.width
+        && display.height == request.height
+        && display.refresh_rate_millihz == request.refresh_rate_millihz.or(Some(60_000))
 }
 
 #[derive(Debug, Clone)]
@@ -7529,6 +7540,40 @@ mod tests {
             rshare_core::VirtualDisplayOperationStatus::AlreadyExists
         );
         assert_eq!(manager.list().len(), 1);
+    }
+
+    #[test]
+    fn virtual_display_manager_allows_active_display_mode_update() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "vd-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+
+        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: Some(144_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        });
+
+        let expected = if cfg!(windows) {
+            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        } else {
+            rshare_core::VirtualDisplayOperationStatus::Unsupported
+        };
+        assert_eq!(result.status, expected);
+        assert_ne!(
+            result.status,
+            rshare_core::VirtualDisplayOperationStatus::AlreadyExists
+        );
     }
 
     #[test]
