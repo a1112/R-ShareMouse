@@ -41,6 +41,8 @@ pub enum VirtualDisplayCommand {
     Create {
         #[arg(long)]
         id: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
         #[arg(long, default_value_t = 1920)]
         width: u32,
         #[arg(long, default_value_t = 1080)]
@@ -58,9 +60,11 @@ pub enum VirtualDisplayCommand {
     /// Verify the active virtual display appears in the Windows display topology
     Verify {
         #[arg(long)]
-        width: u32,
+        mode: Option<String>,
         #[arg(long)]
-        height: u32,
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
         #[arg(long)]
         refresh_rate_millihz: Option<u32>,
     },
@@ -85,11 +89,18 @@ async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
         }
         VirtualDisplayCommand::Create {
             id,
+            mode,
             width,
             height,
             refresh_rate_millihz,
             name,
         } => {
+            let (width, height, refresh_rate_millihz) = resolve_create_virtual_display_mode(
+                mode.as_deref(),
+                width,
+                height,
+                refresh_rate_millihz,
+            )?;
             let result = rshare_core::daemon_client::request_create_virtual_display(
                 VirtualDisplayCreateRequest {
                     id,
@@ -112,10 +123,17 @@ async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
             Ok(())
         }
         VirtualDisplayCommand::Verify {
+            mode,
             width,
             height,
             refresh_rate_millihz,
         } => {
+            let (width, height, refresh_rate_millihz) = resolve_verify_virtual_display_mode(
+                mode.as_deref(),
+                width,
+                height,
+                refresh_rate_millihz,
+            )?;
             let virtual_displays = rshare_core::daemon_client::request_virtual_displays().await?;
             let local_controls = rshare_core::daemon_client::request_local_controls().await?;
             let summary = verify_virtual_display_topology(
@@ -139,6 +157,79 @@ fn format_supported_virtual_display_modes() -> String {
             .map(|(width, height, refresh)| format!("{width}x{height}@{refresh}")),
     );
     lines.join("\n")
+}
+
+fn parse_virtual_display_mode(mode: &str) -> Result<(u32, u32, u32)> {
+    let Some((resolution, refresh)) = mode.trim().split_once('@') else {
+        bail!("virtual display mode must use WIDTHxHEIGHT@REFRESH_MILLIHZ");
+    };
+    let Some((width, height)) = resolution
+        .split_once('x')
+        .or_else(|| resolution.split_once('X'))
+    else {
+        bail!("virtual display mode must use WIDTHxHEIGHT@REFRESH_MILLIHZ");
+    };
+
+    let width = width.trim().parse::<u32>()?;
+    let height = height.trim().parse::<u32>()?;
+    let refresh = refresh.trim().parse::<u32>()?;
+    ensure_supported_virtual_display_mode(width, height, refresh)?;
+    Ok((width, height, refresh))
+}
+
+fn resolve_create_virtual_display_mode(
+    mode: Option<&str>,
+    width: u32,
+    height: u32,
+    refresh_rate_millihz: u32,
+) -> Result<(u32, u32, u32)> {
+    if let Some(mode) = mode {
+        return parse_virtual_display_mode(mode);
+    }
+
+    ensure_supported_virtual_display_mode(width, height, refresh_rate_millihz)?;
+    Ok((width, height, refresh_rate_millihz))
+}
+
+fn resolve_verify_virtual_display_mode(
+    mode: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    refresh_rate_millihz: Option<u32>,
+) -> Result<(u32, u32, Option<u32>)> {
+    if let Some(mode) = mode {
+        let (width, height, refresh_rate_millihz) = parse_virtual_display_mode(mode)?;
+        return Ok((width, height, Some(refresh_rate_millihz)));
+    }
+
+    let Some(width) = width else {
+        bail!("virtual display verify requires --width and --height, or --mode WIDTHxHEIGHT@REFRESH_MILLIHZ");
+    };
+    let Some(height) = height else {
+        bail!("virtual display verify requires --width and --height, or --mode WIDTHxHEIGHT@REFRESH_MILLIHZ");
+    };
+    if let Some(refresh_rate_millihz) = refresh_rate_millihz {
+        ensure_supported_virtual_display_mode(width, height, refresh_rate_millihz)?;
+    }
+    Ok((width, height, refresh_rate_millihz))
+}
+
+fn ensure_supported_virtual_display_mode(
+    width: u32,
+    height: u32,
+    refresh_rate_millihz: u32,
+) -> Result<()> {
+    if SUPPORTED_VIRTUAL_DISPLAY_MODES
+        .iter()
+        .any(|mode| *mode == (width, height, refresh_rate_millihz))
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "unsupported virtual display mode {width}x{height}@{refresh_rate_millihz}\n{}",
+        format_supported_virtual_display_modes()
+    )
 }
 
 fn format_virtual_display_list(displays: &[VirtualDisplaySnapshot]) -> String {
@@ -435,5 +526,19 @@ mod tests {
         assert!(output.contains("2560x1440@144000"));
         assert!(output.contains("1920x1080@60000"));
         assert!(output.contains("1024x768@60000"));
+    }
+
+    #[test]
+    fn parse_virtual_display_mode_accepts_supported_mode_string() {
+        let mode = parse_virtual_display_mode("1920x1080@60000")
+            .expect("supported mode string should parse");
+
+        assert_eq!(mode, (1920, 1080, 60_000));
+    }
+
+    #[test]
+    fn parse_virtual_display_mode_rejects_invalid_or_unsupported_modes() {
+        assert!(parse_virtual_display_mode("1920x1080").is_err());
+        assert!(parse_virtual_display_mode("1234x567@60000").is_err());
     }
 }
