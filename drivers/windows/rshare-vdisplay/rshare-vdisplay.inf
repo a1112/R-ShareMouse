@@ -48,7 +48,7 @@ UmdfKernelModeClientPolicy=AllowKernelModeClients
 [RShareVDisplay_UmdfService]
 UmdfLibraryVersion=2.33
 ServiceBinary=%12%\UMDF\rshare-vdisplay.dll
-UmdfExtensions=IddCx0102
+UmdfExtensions=IddCx0106
 
 [DestinationDirs]
 RShareVDisplay_CopyFiles=12,UMDF

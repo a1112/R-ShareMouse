@@ -159,6 +159,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(inf.contains("DeviceGroupId"));
     assert!(inf.contains("RShareMouseVirtualDisplay"));
     assert!(inf.contains("UmdfService=RShareVDisplay,RShareVDisplay_UmdfService"));
+    assert!(inf.contains("UmdfExtensions=IddCx0106"));
     assert!(inf.contains("rshare-vdisplay.dll"));
 
     assert!(build_script.contains("drivers\\windows\\rshare-vdisplay\\rshare-vdisplay.vcxproj"));
