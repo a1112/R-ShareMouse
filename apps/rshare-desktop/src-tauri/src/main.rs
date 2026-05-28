@@ -7,9 +7,9 @@ use rshare_core::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    ServiceStatusSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    LocalControlDeviceSnapshot, LocalDisplayState, LocalInputTestKind, LocalInputTestRequest,
+    LocalInputTestResult, ServiceStatusSnapshot, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -210,9 +210,11 @@ async fn disconnect_device(device_id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
-    daemon_client::request_local_controls()
-        .await
-        .map_err(|err| err.to_string())
+    local_controls_state_with(
+        || Box::pin(async { daemon_client::request_local_controls().await }),
+        || rshare_platform::display::query_display_state(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -531,6 +533,26 @@ fn is_ipc_unavailable(err: &anyhow::Error) -> bool {
             .map(|io_err| io_err.kind() == std::io::ErrorKind::ConnectionRefused)
             .unwrap_or(false)
     })
+}
+
+async fn local_controls_state_with<DaemonLocalControls, PlatformDisplay>(
+    mut request_daemon: DaemonLocalControls,
+    mut query_platform_display: PlatformDisplay,
+) -> Result<LocalControlDeviceSnapshot, String>
+where
+    DaemonLocalControls: FnMut() -> BoxFutureResult<'static, LocalControlDeviceSnapshot>,
+    PlatformDisplay: FnMut() -> AnyhowResult<LocalDisplayState>,
+{
+    match request_daemon().await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(err) if is_ipc_unavailable(&err) => {
+            let mut snapshot = LocalControlDeviceSnapshot::default();
+            snapshot.display =
+                query_platform_display().map_err(|fallback_err| fallback_err.to_string())?;
+            Ok(snapshot)
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 async fn list_virtual_displays_with<DaemonList, PlatformList>(
@@ -1485,6 +1507,50 @@ mod tests {
         assert_eq!(
             result[0].display_id.as_deref(),
             Some("windows-display-rshare")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_controls_state_falls_back_to_platform_display_when_daemon_ipc_is_unavailable() {
+        let platform_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = local_controls_state_with(
+            || {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "daemon offline",
+                    )))
+                })
+            },
+            {
+                let platform_calls = Arc::clone(&platform_calls);
+                move || {
+                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(rshare_core::LocalDisplayState {
+                        display_count: 1,
+                        primary_width: 1920,
+                        primary_height: 1080,
+                        displays: vec![rshare_core::LocalDisplayInfo {
+                            display_id: "windows-display-rshare".to_string(),
+                            width: 1920,
+                            height: 1080,
+                            active: true,
+                            ..rshare_core::LocalDisplayInfo::default()
+                        }],
+                        ..rshare_core::LocalDisplayState::default()
+                    })
+                }
+            },
+        )
+        .await
+        .expect("platform display fallback should return a local controls snapshot");
+
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.display.display_count, 1);
+        assert_eq!(
+            result.display.displays[0].display_id.as_str(),
+            "windows-display-rshare"
         );
     }
 
