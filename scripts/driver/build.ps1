@@ -90,6 +90,11 @@ if (-not $msbuildPath) {
     throw "msbuild.exe was not found. Install Visual Studio Build Tools/Community with MSBuild and WDK integration."
 }
 
+& (Join-Path $PSScriptRoot "check-wdk.ps1") -Platform $Platform
+if ($LASTEXITCODE -ne 0) {
+    throw "WDK/IddCx environment check failed."
+}
+
 $kitRoot = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10
 if (-not $kitRoot) {
     $kitRoot = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10

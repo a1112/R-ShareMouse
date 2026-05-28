@@ -19,9 +19,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let project = read_repo_file("drivers/windows/rshare-vdisplay/rshare-vdisplay.vcxproj");
     let inf = read_repo_file("drivers/windows/rshare-vdisplay/rshare-vdisplay.inf");
     let build_script = read_repo_file("scripts/driver/build.ps1");
+    let check_wdk_script = read_repo_file("scripts/driver/check-wdk.ps1");
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
     let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
+    let driver_readme = read_repo_file("drivers/windows/README.md");
 
     assert!(driver.contains("DriverEntry"));
     assert!(driver.contains("IddCxDeviceInitConfig"));
@@ -67,6 +69,13 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
 
     assert!(build_script.contains("drivers\\windows\\rshare-vdisplay\\rshare-vdisplay.vcxproj"));
     assert!(build_script.contains("IddCxStub.lib"));
+    assert!(build_script.contains("check-wdk.ps1"));
+    assert!(check_wdk_script.contains("Microsoft.WindowsWDK.10.0.26100"));
+    assert!(check_wdk_script.contains("iddcx.h"));
+    assert!(check_wdk_script.contains("IddCxStub.lib"));
+    assert!(check_wdk_script.contains("WdfDriverEntry.lib"));
+    assert!(check_wdk_script.contains("WindowsUserModeDriver10.0"));
+    assert!(check_wdk_script.contains("winget install"));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
@@ -81,4 +90,6 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(probe.contains("vdisplay create"));
     assert!(probe.contains("vdisplay remove"));
     assert!(build_script.contains("Cfgmgr32.lib"));
+    assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
+    assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
 }

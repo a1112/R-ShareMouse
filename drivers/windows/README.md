@@ -11,6 +11,8 @@ Generic USB device forwarding is intentionally not in these drivers yet. It is t
 
 The drivers are not part of the Cargo workspace. Build them with the scripts under `scripts/driver/` from a Windows Developer Command Prompt with WDK installed. `rshare-vdisplay` additionally requires WDK IddCx headers and libraries (`iddcx.h` and `IddCxStub.lib`); a Windows SDK-only install is not enough.
 
+Before building, run `scripts\driver\check-wdk.ps1`. If it reports missing IddCx components, install the matching WDK package, for example `winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --source winget`, then reopen the shell and run the check again.
+
 Driver installation requires Windows test signing and must be reversible with `uninstall-test-driver.ps1`.
 
 ## Virtual Display Manual Validation Target
