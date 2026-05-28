@@ -124,6 +124,12 @@ impl VirtualDisplayManager {
         self.displays.values().cloned().collect()
     }
 
+    fn sync_platform_displays(&mut self, displays: Vec<VirtualDisplaySnapshot>) {
+        for display in displays {
+            self.displays.insert(display.id.clone(), display);
+        }
+    }
+
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
         let id = virtual_display_request_id(request.id.as_deref(), self.displays.len() + 1);
         if self.displays.contains_key(&id) {
@@ -7249,7 +7255,11 @@ async fn handle_ipc_client(
             }
         }
         DaemonRequest::ListVirtualDisplays => {
-            let state = state.read().await;
+            let platform_displays = rshare_platform::virtual_display::list_virtual_displays();
+            let mut state = state.write().await;
+            if let Ok(displays) = platform_displays {
+                state.virtual_displays.sync_platform_displays(displays);
+            }
             DaemonResponse::VirtualDisplays(state.virtual_displays.list())
         }
         DaemonRequest::CreateVirtualDisplay(request) => {
@@ -7525,6 +7535,29 @@ mod tests {
         };
         assert_eq!(result.status, expected);
         assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn virtual_display_manager_syncs_platform_visible_displays_into_list() {
+        let mut manager = VirtualDisplayManager::default();
+        manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: Some(144_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Active,
+            display_id: Some("windows-idd-connector-0".to_string()),
+            message: None,
+        }]);
+
+        let displays = manager.list();
+        assert_eq!(displays.len(), 1);
+        assert_eq!(displays[0].status, rshare_core::VirtualDisplayStatus::Active);
+        assert_eq!(
+            displays[0].display_id.as_deref(),
+            Some("windows-idd-connector-0")
+        );
     }
 
     #[test]
