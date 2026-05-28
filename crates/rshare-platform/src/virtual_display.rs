@@ -1,8 +1,8 @@
 use anyhow::Result;
 use rshare_core::{
-    LocalDisplayInfo, LocalDisplayState, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
-    VirtualDisplayStatus,
+    LocalDisplayInfo, LocalDisplayState, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
+    VirtualDisplaySnapshot, VirtualDisplayStatus,
 };
 
 const DEFAULT_REFRESH_RATE_MILLIHZ: u32 = 60_000;
@@ -24,6 +24,9 @@ const IOCTL_RSHARE_VDISPLAY_REMOVE: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_WRITE_DATA);
 const RSHARE_CAP_VIRTUAL_DISPLAY: u32 = 0x0000_0010;
 const RSHARE_DEFAULT_VDISPLAY_ID: &str = "rshare-vdisplay-1";
+const RSHARE_VDISPLAY_ACTIVITY_REMOVED: u16 = 0;
+const RSHARE_VDISPLAY_ACTIVITY_ACTIVE: u16 = 1;
+const RSHARE_VDISPLAY_ACTIVITY_PENDING: u16 = 2;
 
 pub fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
     #[cfg(windows)]
@@ -86,11 +89,7 @@ pub fn remove_virtual_display(
         Ok(VirtualDisplayOperationResult {
             status,
             display: None,
-            message: Some(format!(
-                "{}: {}",
-                unavailable_message(),
-                request.id.trim()
-            )),
+            message: Some(format!("{}: {}", unavailable_message(), request.id.trim())),
         })
     }
 }
@@ -220,12 +219,8 @@ fn snapshot_from_driver_state_with_displays(
         height: state.height,
         refresh_rate_millihz: Some(state.refresh_rate_millihz),
         name,
-        status: if state.active != 0 {
-            VirtualDisplayStatus::Active
-        } else {
-            VirtualDisplayStatus::Removed
-        },
-        display_id: if state.active != 0 {
+        status: virtual_display_status_from_driver_activity(state.active),
+        display_id: if state.active == RSHARE_VDISPLAY_ACTIVITY_ACTIVE {
             matching_windows_display_id(&state, display_state)
                 .or_else(|| Some(format!("windows-idd-connector-{}", state.connector_index)))
         } else {
@@ -233,6 +228,15 @@ fn snapshot_from_driver_state_with_displays(
         },
         message,
     })
+}
+
+fn virtual_display_status_from_driver_activity(activity: u16) -> VirtualDisplayStatus {
+    match activity {
+        RSHARE_VDISPLAY_ACTIVITY_REMOVED => VirtualDisplayStatus::Removed,
+        RSHARE_VDISPLAY_ACTIVITY_ACTIVE => VirtualDisplayStatus::Active,
+        RSHARE_VDISPLAY_ACTIVITY_PENDING => VirtualDisplayStatus::Pending,
+        _ => VirtualDisplayStatus::Failed,
+    }
 }
 
 fn matching_windows_display_id(
@@ -330,7 +334,7 @@ fn windows_list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
     };
 
     let state = client.query_state()?;
-    if state.active == 0 {
+    if state.active == RSHARE_VDISPLAY_ACTIVITY_REMOVED {
         return Ok(Vec::new());
     }
 
@@ -765,12 +769,37 @@ mod tests {
         assert_eq!(snapshot.width, 2560);
         assert_eq!(snapshot.height, 1440);
         assert_eq!(snapshot.refresh_rate_millihz, Some(144_000));
-        assert_eq!(snapshot.name.as_deref(), Some("R-ShareMouse Virtual Display"));
+        assert_eq!(
+            snapshot.name.as_deref(),
+            Some("R-ShareMouse Virtual Display")
+        );
         assert_eq!(snapshot.status, VirtualDisplayStatus::Active);
         assert_eq!(
             snapshot.display_id.as_deref(),
             Some("windows-idd-connector-2")
         );
+    }
+
+    #[test]
+    fn driver_state_maps_requested_but_inactive_display_to_pending_snapshot() {
+        let snapshot = snapshot_from_driver_state(
+            "vd-pending",
+            Some("R-ShareMouse Virtual Display".to_string()),
+            RShareVdisplayStateRaw {
+                abi: RSHARE_DRIVER_ABI,
+                active: 2,
+                width: 2560,
+                height: 1440,
+                refresh_rate_millihz: 144_000,
+                connector_index: 0,
+            },
+            Some("monitor requested; waiting for IddCx arrival".to_string()),
+        )
+        .expect("requested driver state should map to a pending snapshot");
+
+        assert_eq!(snapshot.id, "vd-pending");
+        assert_eq!(snapshot.status, VirtualDisplayStatus::Pending);
+        assert!(snapshot.display_id.is_none());
     }
 
     #[test]
@@ -809,7 +838,10 @@ mod tests {
 
         assert_eq!(result.status, VirtualDisplayOperationStatus::Failed);
         assert!(result.display.is_none());
-        assert!(result.message.unwrap().contains("Unsupported RShare virtual display driver ABI"));
+        assert!(result
+            .message
+            .unwrap()
+            .contains("Unsupported RShare virtual display driver ABI"));
     }
 
     #[test]

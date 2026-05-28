@@ -500,7 +500,7 @@ RShareVirtualDisplayDevice::RShareVirtualDisplayDevice(WDFDEVICE device)
       m_MonitorRequested(false)
 {
     m_State.Abi = RSHARE_DRIVER_ABI;
-    m_State.Active = 0;
+    m_State.Active = RSHARE_VDISPLAY_ACTIVITY_REMOVED;
     m_State.Width = RShareMonitorModes[0].Width;
     m_State.Height = RShareMonitorModes[0].Height;
     m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRateMillihz;
@@ -584,7 +584,7 @@ void RShareVirtualDisplayDevice::ReportMonitorArrival(UINT connectorIndex)
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
     status = IddCxMonitorArrival(monitorCreateOut.MonitorObject, &arrivalOut);
     if (NT_SUCCESS(status)) {
-        m_State.Active = 1;
+        m_State.Active = RSHARE_VDISPLAY_ACTIVITY_ACTIVE;
         m_State.ConnectorIndex = connectorIndex;
     }
 }
@@ -615,6 +615,9 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     m_State.Width = request.Width;
     m_State.Height = request.Height;
     m_State.RefreshRateMillihz = request.RefreshRateMillihz;
+    if (m_State.Active != RSHARE_VDISPLAY_ACTIVITY_ACTIVE) {
+        m_State.Active = RSHARE_VDISPLAY_ACTIVITY_PENDING;
+    }
     m_MonitorRequested = true;
     if (m_Monitor != nullptr) {
         NTSTATUS status = STATUS_SUCCESS;
@@ -653,7 +656,7 @@ NTSTATUS RShareVirtualDisplayDevice::CommitModes(const IDARG_IN_COMMITMODES* inA
         }
 
         if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) == 0) {
-            m_State.Active = 0;
+            m_State.Active = RSHARE_VDISPLAY_ACTIVITY_REMOVED;
             return STATUS_SUCCESS;
         }
 
@@ -663,7 +666,7 @@ NTSTATUS RShareVirtualDisplayDevice::CommitModes(const IDARG_IN_COMMITMODES* inA
             return STATUS_INVALID_PARAMETER;
         }
 
-        m_State.Active = 1;
+        m_State.Active = RSHARE_VDISPLAY_ACTIVITY_ACTIVE;
         m_State.Width = mode.Width;
         m_State.Height = mode.Height;
         m_State.RefreshRateMillihz = refreshMillihz;
@@ -687,7 +690,7 @@ NTSTATUS RShareVirtualDisplayDevice::RemoveMonitor()
     }
 
     m_MonitorRequested = false;
-    m_State.Active = 0;
+    m_State.Active = RSHARE_VDISPLAY_ACTIVITY_REMOVED;
     return STATUS_SUCCESS;
 }
 

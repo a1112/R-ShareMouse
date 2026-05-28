@@ -78,6 +78,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("RShareVirtualDisplayDevice::ReportPendingMonitorArrival"));
     assert!(driver.contains("context->Device->ReportPendingMonitorArrival()"));
     assert!(driver.contains("m_MonitorRequested = true"));
+    assert!(driver.contains("RSHARE_VDISPLAY_ACTIVITY_PENDING"));
+    assert!(driver.contains("m_State.Active = RSHARE_VDISPLAY_ACTIVITY_PENDING"));
+    assert!(driver.contains("m_State.Active = RSHARE_VDISPLAY_ACTIVITY_ACTIVE"));
+    assert!(driver.contains("m_State.Active = RSHARE_VDISPLAY_ACTIVITY_REMOVED"));
     assert!(driver.contains("if (m_Adapter == nullptr)"));
     assert!(driver.contains("return STATUS_SUCCESS;"));
     assert!(driver.contains("s_RShareVirtualDisplayEdid"));
@@ -137,6 +141,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(ioctls.contains("IOCTL_RSHARE_VDISPLAY_REMOVE"));
     assert!(ioctls.contains("RSHARE_VDISPLAY_REQUEST"));
     assert!(ioctls.contains("RSHARE_VDISPLAY_STATE"));
+    assert!(ioctls.contains("RSHARE_VDISPLAY_ACTIVITY_REMOVED"));
+    assert!(ioctls.contains("RSHARE_VDISPLAY_ACTIVITY_ACTIVE"));
+    assert!(ioctls.contains("RSHARE_VDISPLAY_ACTIVITY_PENDING"));
 
     assert!(project.contains("<IndirectDisplayDriver>true</IndirectDisplayDriver>"));
     assert!(project.contains("<IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>"));
