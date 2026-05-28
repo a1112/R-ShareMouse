@@ -45,6 +45,13 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("m_MonitorRequested = true"));
     assert!(driver.contains("if (m_Adapter == nullptr)"));
     assert!(driver.contains("return STATUS_SUCCESS;"));
+    assert!(driver.contains("s_RShareVirtualDisplayEdid"));
+    assert!(driver.contains("RSHARE VDISP"));
+    assert!(driver.contains("RSM00000001"));
+    assert!(driver.contains("MonitorDescription.DataSize = sizeof(s_RShareVirtualDisplayEdid)"));
+    assert!(driver.contains("MonitorDescription.pData = const_cast<BYTE*>(s_RShareVirtualDisplayEdid)"));
+    assert!(!driver.contains("monitorInfo.MonitorDescription.DataSize = 0"));
+    assert!(!driver.contains("monitorInfo.MonitorDescription.pData = nullptr"));
     assert!(driver.contains("RShareModesForState"));
     assert!(driver.contains("context->Monitor->CopyTargetModes"));
     assert!(driver.contains("context->Monitor->CopyDefaultModes"));
