@@ -69,6 +69,26 @@ function Read-VDisplayState {
     }
 }
 
+function EnsureDaemonForTopologyVerification {
+    # cargo build -p rshare-daemon -p rshare-cli
+    $buildArgs = @("build", "-p", "rshare-daemon", "-p", "rshare-cli")
+    $buildOutput = & cargo @buildArgs
+    if ($LASTEXITCODE -ne 0) {
+        $buildOutput | ForEach-Object { Write-Host $_ }
+        throw "Failed to build rshare-daemon and rshare-cli for topology verification."
+    }
+    $buildOutput | ForEach-Object { Write-Host $_ }
+
+    # cargo run -p rshare-cli -- start --daemon
+    $startArgs = @("run", "-p", "rshare-cli", "--", "start", "--daemon")
+    $startOutput = & cargo @startArgs
+    if ($LASTEXITCODE -ne 0) {
+        $startOutput | ForEach-Object { Write-Host $_ }
+        throw "Failed to start rshare-daemon for topology verification."
+    }
+    $startOutput | ForEach-Object { Write-Host $_ }
+}
+
 function Invoke-DaemonDisplayTopologyVerification {
     # cargo run -p rshare-cli -- display virtual verify
     $args = @(
@@ -128,6 +148,10 @@ Invoke-Step "Confirm driver state after create" {
 }
 
 if ($VerifyDaemonDisplayTopology) {
+    Invoke-Step "Ensure daemon for topology verification" {
+        EnsureDaemonForTopologyVerification
+    }
+
     Invoke-Step "Verify daemon display topology" {
         Invoke-DaemonDisplayTopologyVerification
     }
