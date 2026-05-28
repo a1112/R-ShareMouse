@@ -10,6 +10,36 @@ fn read_repo_file(path: &str) -> String {
     fs::read_to_string(repo_root().join(path)).expect(path)
 }
 
+fn extract_rshare_vdisplay_edid(driver: &str) -> Vec<u8> {
+    let start = driver
+        .find("s_RShareVirtualDisplayEdid[] = {")
+        .expect("driver should contain virtual display EDID");
+    let body = &driver[start..];
+    let body = body
+        .split_once('{')
+        .expect("EDID initializer should start with {")
+        .1
+        .split_once("};")
+        .expect("EDID initializer should end with };")
+        .0;
+
+    body.split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            if let Some(hex) = token.strip_prefix("0x") {
+                return Some(u8::from_str_radix(hex, 16).expect("valid EDID hex byte"));
+            }
+            if token.starts_with('\'') && token.ends_with('\'') {
+                return token.as_bytes().get(1).copied();
+            }
+            panic!("unsupported EDID token {token}");
+        })
+        .collect()
+}
+
 #[test]
 fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let driver = read_repo_file("drivers/windows/rshare-vdisplay/driver.cpp");
@@ -46,17 +76,21 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("if (m_Adapter == nullptr)"));
     assert!(driver.contains("return STATUS_SUCCESS;"));
     assert!(driver.contains("s_RShareVirtualDisplayEdid"));
-    assert!(driver.contains("RSHARE VDISP"));
+    assert!(driver.contains("R-SHAREMOUSE"));
     assert!(driver.contains("RSM00000001"));
     assert!(driver.contains("MonitorDescription.DataSize = sizeof(s_RShareVirtualDisplayEdid)"));
-    assert!(driver.contains("MonitorDescription.pData = const_cast<BYTE*>(s_RShareVirtualDisplayEdid)"));
+    assert!(
+        driver.contains("MonitorDescription.pData = const_cast<BYTE*>(s_RShareVirtualDisplayEdid)")
+    );
     assert!(!driver.contains("monitorInfo.MonitorDescription.DataSize = 0"));
     assert!(!driver.contains("monitorInfo.MonitorDescription.pData = nullptr"));
     assert!(driver.contains("RShareModesForState"));
     assert!(driver.contains("context->Monitor->CopyTargetModes"));
     assert!(driver.contains("context->Monitor->CopyDefaultModes"));
     assert!(driver.contains("RSHARE_VDISPLAY_MONITOR_CONTAINER_ID"));
-    assert!(driver.contains("monitorInfo.MonitorContainerId = RSHARE_VDISPLAY_MONITOR_CONTAINER_ID"));
+    assert!(
+        driver.contains("monitorInfo.MonitorContainerId = RSHARE_VDISPLAY_MONITOR_CONTAINER_ID")
+    );
     assert!(!driver.contains("CoCreateGuid(&monitorInfo.MonitorContainerId)"));
     assert!(driver.contains("RShareVirtualDisplayDevice::CommitModes"));
     assert!(driver.contains("RShareModeFromSignalInfo"));
@@ -138,8 +172,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
-    assert!(install_script.contains("if (-not $devcon -and ($packages | Where-Object { $_.UseDevCon }))"));
-    assert!(install_script.contains("devcon.exe is required to install root-enumerated driver packages"));
+    assert!(install_script
+        .contains("if (-not $devcon -and ($packages | Where-Object { $_.UseDevCon }))"));
+    assert!(install_script
+        .contains("devcon.exe is required to install root-enumerated driver packages"));
     assert!(uninstall_script.contains("rshare-vdisplay.inf"));
 
     assert!(probe.contains("probe_vdisplay"));
@@ -156,4 +192,24 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
     assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
+}
+
+#[test]
+fn windows_virtual_display_edid_has_stable_identity_and_checksum() {
+    let driver = read_repo_file("drivers/windows/rshare-vdisplay/driver.cpp");
+    let edid = extract_rshare_vdisplay_edid(&driver);
+
+    assert_eq!(edid.len(), 128);
+    assert_eq!(
+        &edid[0..8],
+        &[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]
+    );
+    assert_eq!(
+        edid.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        0
+    );
+
+    let edid_text = String::from_utf8_lossy(&edid);
+    assert!(edid_text.contains("R-SHAREMOUSE"));
+    assert!(edid_text.contains("RSM00000001"));
 }
