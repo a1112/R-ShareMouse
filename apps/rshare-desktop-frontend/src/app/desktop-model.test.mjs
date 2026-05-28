@@ -14,6 +14,7 @@ import {
   buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
+  buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
@@ -1579,7 +1580,7 @@ test("buildDesktopViewModel maps daemon devices into layout and device cards", (
         id: "remote-1",
         name: "MacBook Pro",
         hostname: "mbp",
-        addresses: ["192.168.1.20"],
+        addresses: ["192.168.1.20:27432"],
         connected: true,
         last_seen_secs: 12,
       },
@@ -1604,16 +1605,165 @@ test("buildDesktopViewModel maps daemon devices into layout and device cards", (
       id: device.id,
       connected: device.connected,
       online: device.online,
+      address: device.address,
+      ipAddress: device.ipAddress,
     })),
     [
-      { id: "remote-1", connected: true, online: true },
-      { id: "remote-2", connected: false, online: true },
+      {
+        id: "remote-1",
+        connected: true,
+        online: true,
+        address: "192.168.1.20:27432",
+        ipAddress: "192.168.1.20",
+      },
+      {
+        id: "remote-2",
+        connected: false,
+        online: true,
+        address: "192.168.1.21",
+        ipAddress: "192.168.1.21",
+      },
     ],
   );
   assert.equal(model.layout.devices[1].connected, true);
-  assert.equal(model.layout.devices[2].connected, false);
+  assert.equal(model.layout.devices.some((device) => device.id === "remote-2"), true);
   assert.equal(model.settings.localDevice.name, "Studio PC");
   assert.equal(model.settings.inputMode.current, "WindowsNative");
+  assert.equal(model.service.discoveredDevices, 2);
+  assert.equal(model.service.connectedDevices, 1);
+
+  const galleryItems = buildDeviceGalleryItems({}, [], model.devices);
+  const remoteItem = galleryItems.find((item) => item.id === "gallery-remote-remote-2");
+  assert.equal(remoteItem?.detail, "已发现");
+});
+
+test("buildDesktopViewModel keeps discovered visible-layout devices before connection", () => {
+  const payload = {
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      bind_address: "127.0.0.1",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 1,
+      connected_devices: 0,
+      healthy: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote Workstation",
+        hostname: "remote",
+        addresses: ["192.168.1.30:27432"],
+        connected: false,
+        last_seen_secs: 2,
+      },
+    ],
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1280, height: 720, primary: true }],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 1280, y: 0, width: 1024, height: 768, primary: true }],
+        },
+      ],
+      links: [],
+    },
+  };
+
+  const model = buildDesktopViewModel(payload);
+
+  assert.deepEqual(model.devices.map((device) => device.id), ["remote-1"]);
+  assert.equal(model.devices[0].online, true);
+  assert.equal(model.devices[0].connected, false);
+  assert.deepEqual(model.layout.devices.map((device) => device.id), ["local-1", "remote-1"]);
+  assert.equal(model.layout.monitors.some((monitor) => monitor.deviceId === "remote-1"), true);
+  assert.equal(model.service.discoveredDevices, 1);
+  assert.equal(model.service.connectedDevices, 0);
+});
+
+test("buildRemoteControlSnapshot synthesizes remote hardware from capabilities layout and events", () => {
+  const snapshot = buildRemoteControlSnapshot({
+    baseSnapshot: {
+      keyboard: { detected: true, event_count: 99 },
+      mouse: { detected: true, event_count: 88 },
+      recent_events: [
+        {
+          sequence: 1,
+          device_kind: "Keyboard",
+          event_kind: "key",
+          device_id: "remote-1",
+          summary: "Remote key A Pressed",
+          payload: { remote_device_id: "remote-1", key: "A", state: "Pressed" },
+        },
+        {
+          sequence: 2,
+          device_kind: "Mouse",
+          event_kind: "move",
+          device_id: "other-remote",
+          summary: "Other mouse move",
+          payload: { remote_device_id: "other-remote" },
+        },
+      ],
+    },
+    device: {
+      id: "remote-1",
+      name: "Remote Workstation",
+      hostname: "remote",
+      connected: true,
+    },
+    capabilities: {
+      devices: [
+        {
+          id: "remote-1",
+          connected: true,
+          capabilities: [
+            { kind: "Input", state: "Available", details: { hotkeys: "true" } },
+            { kind: "Gamepad", state: "Available", details: { max_gamepads: "1" } },
+            { kind: "Audio", state: "Available", details: { formats: "2" } },
+            {
+              kind: "DisplayTopology",
+              state: "Available",
+              details: {
+                display_count: "2",
+                primary_display_id: "primary",
+                display_geometries: "primary:2560x1440@0,0:primary;left:1920x1080@-1920,0",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    visibleLayout: {
+      nodes: [
+        {
+          device_id: "remote-1",
+          displays: [
+            { display_id: "primary", x: 0, y: 0, width: 2560, height: 1440, primary: true },
+            { display_id: "left", x: -1920, y: 0, width: 1920, height: 1080, primary: false },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.equal(snapshot.keyboard.detected, true);
+  assert.equal(snapshot.keyboard.event_count, 1);
+  assert.equal(snapshot.mouse.detected, true);
+  assert.equal(snapshot.mouse.event_count, 0);
+  assert.equal(snapshot.keyboard_devices[0].name, "Remote Workstation 键盘");
+  assert.equal(snapshot.mouse_devices[0].source, "remote capability");
+  assert.equal(snapshot.gamepads[0].connected, true);
+  assert.equal(snapshot.audio_outputs[0].name, "Remote Workstation 音频");
+  assert.equal(snapshot.display.display_count, 2);
+  assert.equal(snapshot.display.displays[1].display_id, "left");
+  assert.deepEqual(snapshot.recent_events.map((event) => event.sequence), [1]);
 });
 
 test("buildDesktopViewModel preserves connection status consistently across pages", () => {
@@ -1672,7 +1822,7 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
       discovery_port: 4242,
       pid: 999,
       discovered_devices: 1,
-      connected_devices: 0,
+      connected_devices: 1,
       healthy: true,
     },
     devices: [
@@ -1681,7 +1831,7 @@ test("buildDesktopViewModel renders daemon visible_layout instead of synthesizin
         name: "Remote Workstation",
         hostname: "remote",
         addresses: ["192.168.1.30"],
-        connected: false,
+        connected: true,
         last_seen_secs: 2,
       },
     ],
@@ -1903,7 +2053,7 @@ test("buildDesktopViewModel snaps visible layout monitor groups before rendering
       discovery_port: 4242,
       pid: 999,
       discovered_devices: 1,
-      connected_devices: 0,
+      connected_devices: 1,
       healthy: true,
     },
     devices: [
@@ -1912,7 +2062,7 @@ test("buildDesktopViewModel snaps visible layout monitor groups before rendering
         name: "Remote Workstation",
         hostname: "remote",
         addresses: ["192.168.1.30"],
-        connected: false,
+        connected: true,
         last_seen_secs: 2,
       },
     ],

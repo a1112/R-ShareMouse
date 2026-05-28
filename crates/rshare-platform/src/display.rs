@@ -1,11 +1,14 @@
 use anyhow::Result;
 use rshare_core::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-    DisplayModeInfo, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
-    DisplayWriteCapabilities, LocalDisplayInfo, LocalDisplayState,
+    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, LocalDisplayState,
 };
 #[cfg(any(not(windows), test))]
-use rshare_core::{DisplayOperationStatus, DisplayOrientation};
+use rshare_core::DisplayOperationStatus;
+#[cfg(target_os = "linux")]
+use rshare_core::{
+    DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities, LocalDisplayInfo,
+};
 
 #[cfg(windows)]
 pub fn query_display_state() -> Result<LocalDisplayState> {
@@ -1679,6 +1682,20 @@ fn unsupported_capture(display_id: &str, message: impl Into<String>) -> DisplayC
     }
 }
 
+pub(crate) fn fit_thumbnail_size(width: u32, height: u32, max_width: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_width == 0 {
+        return (0, 0);
+    }
+
+    if width <= max_width {
+        return (width, height);
+    }
+
+    let scaled_width = max_width;
+    let scaled_height = scale_dimension(height, max_width, width);
+    (scaled_width.max(1), scaled_height.max(1))
+}
+
 pub(crate) fn clamp_identify_duration_ms(duration_ms: Option<u32>) -> u32 {
     duration_ms.unwrap_or(2500).clamp(500, 10_000)
 }
@@ -1718,6 +1735,16 @@ mod tests {
             result.status,
             DisplayOperationStatus::RequiresSystemSettings
         );
+    }
+
+    #[test]
+    fn thumbnail_size_fits_landscape_display_to_max_width() {
+        assert_eq!(fit_thumbnail_size(3840, 2160, 640), (640, 360));
+    }
+
+    #[test]
+    fn thumbnail_size_fits_portrait_display_to_max_width() {
+        assert_eq!(fit_thumbnail_size(1080, 1920, 480), (480, 853));
     }
 
     #[cfg(target_os = "linux")]

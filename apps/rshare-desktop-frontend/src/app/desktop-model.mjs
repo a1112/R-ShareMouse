@@ -205,6 +205,7 @@ export function buildDisplaySettingsViewModel(snapshot, selectedDisplayId) {
 
 function buildRemoteDevice(device, index) {
   const isLaptop = /book|laptop/i.test(device.name) || /macbook/i.test(device.hostname ?? "");
+  const address = device.addresses?.[0] ?? "未知";
 
   return {
     id: device.id,
@@ -216,13 +217,38 @@ function buildRemoteDevice(device, index) {
     connected: Boolean(device.connected),
     type: isLaptop ? "laptop" : "desktop",
     expanded: true,
-    address: device.addresses?.[0] ?? "未知",
-    port: null,
+    address,
+    ipAddress: displayAddressHost(address),
+    port: displayAddressPort(address),
     lastSeenLabel:
       device.last_seen_secs == null
         ? "刚刚"
         : `${device.last_seen_secs} 秒前`,
   };
+}
+
+function displayAddressHost(address) {
+  if (!address || address === "未知") {
+    return "未知";
+  }
+  if (address.startsWith("[")) {
+    const closingBracket = address.indexOf("]");
+    return closingBracket > 1 ? address.slice(1, closingBracket) : address;
+  }
+  const lastColon = address.lastIndexOf(":");
+  if (lastColon <= 0 || address.indexOf(":") !== lastColon) {
+    return address;
+  }
+  const maybePort = address.slice(lastColon + 1);
+  return /^\d+$/.test(maybePort) ? address.slice(0, lastColon) : address;
+}
+
+function displayAddressPort(address) {
+  if (!address || address === "未知") {
+    return null;
+  }
+  const match = address.match(/:(\d+)$/);
+  return match ? Number(match[1]) : null;
 }
 
 function buildLayoutMonitor(device, index, kind) {
@@ -237,6 +263,7 @@ function buildLayoutMonitor(device, index, kind) {
     resWidth: kind === "local" ? 2560 : 1920,
     resHeight: kind === "local" ? 1440 : 1080,
     color: device.color,
+    deviceKind: kind,
     x: 80 + offsetX,
     y: 170 + offsetY,
     w: kind === "local" ? 307 : 230,
@@ -566,6 +593,7 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         resWidth: width,
         resHeight: height,
         color: device.color,
+        deviceKind: device.kind,
         x: localPhysicalDisplay
           ? localPhysicalDisplay.x
           : canvasSize.physical ? canvasRight - canvasSize.w : canvasX,
@@ -576,6 +604,21 @@ function buildLayoutFromVisibleGraph(visibleLayout, rememberedLayout, localDevic
         h: canvasSize.h,
         primary: Boolean(display.primary),
         enabled: true,
+        orientation: display.orientation ?? null,
+        scalePercent: display.scale_percent == null ? null : Number(display.scale_percent),
+        refreshRateMillihz:
+          display.refresh_rate_millihz == null
+            ? null
+            : Number(display.refresh_rate_millihz),
+        writeCapabilities: {
+          resolution: Boolean(display.write_capabilities?.resolution),
+          refreshRate: Boolean(display.write_capabilities?.refresh_rate),
+          orientation: Boolean(display.write_capabilities?.orientation),
+          primary: Boolean(display.write_capabilities?.primary),
+          position: Boolean(display.write_capabilities?.position),
+          scale: Boolean(display.write_capabilities?.scale),
+          capture: Boolean(display.write_capabilities?.capture),
+        },
       });
     }
   }
@@ -851,6 +894,203 @@ export function buildCapabilityOverview(registry) {
         details: capability.details ?? {},
       })),
     })),
+  };
+}
+
+function capabilityDeviceFor(capabilities, deviceId) {
+  return (capabilities?.devices ?? []).find(
+    (device) => (device.id ?? device.device_id) === deviceId,
+  );
+}
+
+function capabilityFor(deviceCapabilities, kind) {
+  return (deviceCapabilities?.capabilities ?? []).find(
+    (capability) => capability.kind === kind,
+  );
+}
+
+function capabilityUsable(capability) {
+  return Boolean(
+    capability &&
+      capability.state !== "Unavailable" &&
+      capability.state !== "unavailable",
+  );
+}
+
+function eventRemoteDeviceId(event) {
+  return event?.device_id ?? event?.payload?.remote_device_id ?? null;
+}
+
+function eventsForRemote(snapshot, deviceId) {
+  return asArray(snapshot?.recent_events)
+    .filter((event) => eventRemoteDeviceId(event) === deviceId)
+    .sort((left, right) => Number(left.sequence ?? 0) - Number(right.sequence ?? 0));
+}
+
+function visibleLayoutNodeFor(visibleLayout, deviceId) {
+  return (visibleLayout?.nodes ?? []).find((node) => node.device_id === deviceId) ?? null;
+}
+
+function displayStateFromNode(node) {
+  const displays = asArray(node?.displays).map((display, index) => ({
+    display_id: display.display_id ?? (index === 0 ? "primary" : `display-${index + 1}`),
+    x: Number(display.x ?? 0),
+    y: Number(display.y ?? 0),
+    width: Number(display.width ?? 1920),
+    height: Number(display.height ?? 1080),
+    primary: Boolean(display.primary ?? index === 0),
+    active: display.active !== false,
+    orientation: display.orientation ?? null,
+    scale_percent: display.scale_percent ?? null,
+    refresh_rate_millihz: display.refresh_rate_millihz ?? null,
+    write_capabilities: display.write_capabilities ?? {},
+  }));
+
+  if (!displays.length) {
+    return {
+      display_count: 0,
+      virtual_x: 0,
+      virtual_y: 0,
+      primary_width: 0,
+      primary_height: 0,
+      layout_width: 0,
+      layout_height: 0,
+      displays: [],
+    };
+  }
+
+  const primary = displays.find((display) => display.primary) ?? displays[0];
+  const bounds = displayBounds(displays);
+  return {
+    display_count: displays.length,
+    virtual_x: bounds.minX,
+    virtual_y: bounds.minY,
+    primary_width: primary.width,
+    primary_height: primary.height,
+    layout_width: bounds.width,
+    layout_height: bounds.height,
+    displays,
+  };
+}
+
+function latestEventPayload(events, kind) {
+  const event = [...events].reverse().find((item) => item.device_kind === kind);
+  return event?.payload ?? {};
+}
+
+function remoteInputDevice(device, kind, connected, eventCount) {
+  return {
+    id: `${device.id}-${kind}`,
+    name: `${device.name ?? "远端设备"} ${kind === "keyboard" ? "键盘" : "鼠标"}`,
+    source: "remote capability",
+    connected,
+    capture_path: "remote endpoint",
+    event_count: eventCount,
+    capabilities: ["remote", "endpoint"],
+  };
+}
+
+export function buildRemoteControlSnapshot({
+  baseSnapshot = null,
+  device,
+  capabilities = null,
+  visibleLayout = null,
+} = {}) {
+  const deviceId = device?.id ?? device?.device_id ?? "";
+  const remoteEvents = eventsForRemote(baseSnapshot, deviceId);
+  const capabilityDevice = capabilityDeviceFor(capabilities, deviceId);
+  const inputCapability = capabilityFor(capabilityDevice, "Input");
+  const gamepadCapability = capabilityFor(capabilityDevice, "Gamepad");
+  const audioCapability = capabilityFor(capabilityDevice, "Audio");
+  const displayCapability = capabilityFor(capabilityDevice, "DisplayTopology");
+  const inputDetected = capabilityUsable(inputCapability) || remoteEvents.length > 0;
+  const keyboardEvents = remoteEvents.filter((event) => event.device_kind === "Keyboard");
+  const mouseEvents = remoteEvents.filter((event) => event.device_kind === "Mouse");
+  const latestKeyboard = latestEventPayload(remoteEvents, "Keyboard");
+  const latestMouse = latestEventPayload(remoteEvents, "Mouse");
+  const display = displayStateFromNode(visibleLayoutNodeFor(visibleLayout, deviceId));
+  const gamepadAvailable = capabilityUsable(gamepadCapability);
+  const audioAvailable = capabilityUsable(audioCapability);
+
+  return {
+    sequence: Number(baseSnapshot?.sequence ?? 0),
+    keyboard: {
+      detected: inputDetected,
+      pressed_keys: latestKeyboard.state === "Pressed" && latestKeyboard.key ? [latestKeyboard.key] : [],
+      last_key: latestKeyboard.key ?? null,
+      event_count: keyboardEvents.length,
+      capture_source: "remote endpoint",
+    },
+    mouse: {
+      detected: inputDetected,
+      x: Number(latestMouse.x ?? 0),
+      y: Number(latestMouse.y ?? 0),
+      pressed_buttons:
+        latestMouse.state === "Pressed" && latestMouse.button ? [latestMouse.button] : [],
+      wheel_delta_x: Number(latestMouse.delta_x ?? 0),
+      wheel_delta_y: Number(latestMouse.delta_y ?? 0),
+      event_count: mouseEvents.length,
+      move_count: mouseEvents.filter((event) => event.event_kind === "move").length,
+      button_event_count: mouseEvents.filter((event) => event.event_kind === "button").length,
+      button_press_count: mouseEvents.filter((event) => event.payload?.state === "Pressed").length,
+      button_release_count: mouseEvents.filter((event) => event.payload?.state === "Released").length,
+      wheel_event_count: mouseEvents.filter((event) => event.event_kind === "wheel").length,
+      display_relative_x: Number(latestMouse.display_relative_x ?? latestMouse.x ?? 0),
+      display_relative_y: Number(latestMouse.display_relative_y ?? latestMouse.y ?? 0),
+      current_display_id: latestMouse.display_id ?? null,
+      current_display_index: latestMouse.display_index == null ? null : Number(latestMouse.display_index),
+    },
+    keyboard_devices: inputDetected
+      ? [remoteInputDevice(device, "keyboard", Boolean(device?.connected), keyboardEvents.length)]
+      : [],
+    mouse_devices: inputDetected
+      ? [remoteInputDevice(device, "mouse", Boolean(device?.connected), mouseEvents.length)]
+      : [],
+    gamepads: gamepadAvailable
+      ? [
+          {
+            gamepad_id: 0,
+            name: `${device?.name ?? "远端设备"} 手柄`,
+            connected: true,
+            event_count: remoteEvents.filter((event) => event.device_kind === "Gamepad").length,
+            pressed_buttons: [],
+          },
+        ]
+      : [],
+    audio_inputs: [],
+    audio_outputs: audioAvailable
+      ? [
+          {
+            id: `${deviceId}-audio`,
+            name: `${device?.name ?? "远端设备"} 音频`,
+            source: "remote capability",
+            connected: Boolean(device?.connected),
+            default: true,
+          },
+        ]
+      : [],
+    display,
+    capture_backend: {
+      mode: "RemoteEndpoint",
+      health: inputDetected ? "Healthy" : "Unavailable",
+      active: inputDetected,
+    },
+    inject_backend: {
+      mode: "RemoteEndpoint",
+      health: Boolean(device?.connected) ? "Healthy" : "Unavailable",
+      active: Boolean(device?.connected),
+    },
+    privilege_state: null,
+    virtual_gamepad: {
+      status: gamepadAvailable ? "remote_capability" : "not_available",
+      detail: gamepadAvailable ? "Remote gamepad capability advertised." : "Remote gamepad capability unavailable.",
+    },
+    driver: baseSnapshot?.driver,
+    recent_events: remoteEvents,
+    last_error:
+      capabilityUsable(displayCapability) || display.display_count > 0
+        ? null
+        : "Remote display topology has not been advertised yet.",
   };
 }
 
@@ -2201,7 +2441,7 @@ export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevic
       kind: "remote",
       title: device.name,
       detail: device.connected ? "已连接" : "已发现",
-      metric: device.hostname ?? device.address ?? "",
+      metric: device.ipAddress ?? device.address ?? device.hostname ?? "",
       live: Boolean(device.connected),
     });
   }
@@ -2443,6 +2683,7 @@ function buildAcceptanceChecks(acceptance, status, inputMode) {
 
 function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
   const daemonOnline = Boolean(status);
+  const connectedRemoteDevices = remoteDevices.filter((device) => device.connected);
   const backgroundReady =
     daemonOnline &&
     (status?.background_owner ?? "Daemon") === "Daemon" &&
@@ -2463,7 +2704,7 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
   const dualMachineReady =
     backgroundReady &&
     inputReady &&
-    remoteDevices.length > 0 &&
+    connectedRemoteDevices.length > 0 &&
     visibleLayoutDevices > 1 &&
     !payload?.layout_error;
 
@@ -2474,6 +2715,8 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
     nextStep = "本机能力已就绪，可以进行本机设备监控；双机验收等待局域网发现";
   } else if (daemonOnline && remoteDevices.length === 0) {
     nextStep = "打开另一台机器并保持同一局域网，等待自动发现";
+  } else if (daemonOnline && connectedRemoteDevices.length === 0) {
+    nextStep = "已发现远端设备；连接一台在线设备后开始边缘切换验收";
   } else if (daemonOnline && !dualMachineReady) {
     nextStep = "确认设备进入 Layout 并保存布局后开始连接";
   } else if (dualMachineReady) {
@@ -2487,7 +2730,7 @@ function fallbackAcceptance(payload, status, remoteDevices, layout, inputMode) {
     trayState,
     localEndpoint: status?.bind_address ?? "不可用",
     discoveredDevices: remoteDevices.length,
-    connectedDevices: remoteDevices.filter((device) => device.connected).length,
+    connectedDevices: connectedRemoteDevices.length,
     visibleLayoutDevices,
     localDisplayCount,
     localReady,
@@ -2529,7 +2772,8 @@ export function buildDesktopViewModel(payload, localControls = null) {
   const status = payload?.status ?? null;
   const capabilities = buildCapabilityOverview(payload?.capabilities ?? null);
   const localDevice = buildLocalDevice(status);
-  const remoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
+  const discoveredRemoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
+  const remoteDevices = discoveredRemoteDevices;
   const daemonLayout = buildLayoutFromVisibleGraph(
     payload?.visible_layout,
     payload?.layout,
@@ -2564,8 +2808,9 @@ export function buildDesktopViewModel(payload, localControls = null) {
     healthy: Boolean(status?.healthy),
     label: status ? "运行中" : "已停止",
     error: status?.last_backend_error ?? payload?.layout_error ?? null,
-    discoveredDevices: status?.discovered_devices ?? remoteDevices.length,
-    connectedDevices: status?.connected_devices ?? 0,
+    discoveredDevices: status?.discovered_devices ?? discoveredRemoteDevices.length,
+    connectedDevices:
+      status?.connected_devices ?? remoteDevices.filter((device) => device.connected).length,
     autoStarted: Boolean(payload?.auto_started ?? status?.started_by_desktop),
   };
 
@@ -2587,6 +2832,6 @@ export function buildDesktopViewModel(payload, localControls = null) {
       inputMode,
       privilegeState: status?.privilege_state ?? "不可用",
     },
-    acceptance: buildAcceptance(payload, status, remoteDevices, layout, inputMode),
+    acceptance: buildAcceptance(payload, status, discoveredRemoteDevices, layout, inputMode),
   };
 }

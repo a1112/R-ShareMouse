@@ -153,13 +153,11 @@ function keyboardActionMatches(action, activity) {
   if (pressedKeys.some((key) => candidates.has(normalizeKeyToken(key)))) {
     return true;
   }
-  if (activity.lastKey && candidates.has(normalizeKeyToken(activity.lastKey))) {
-    return true;
-  }
-  return (activity.keyboardEvents ?? []).some((event) => {
+  const latestEvent = [...(activity.keyboardEvents ?? [])].reverse().find((event) => {
     const key = keyboardEventKey(event);
     return key ? candidates.has(normalizeKeyToken(key)) : false;
   });
+  return latestEvent ? keyboardEventIsPressed(latestEvent) : false;
 }
 
 function mouseActionMatches(action, activity) {
@@ -274,6 +272,11 @@ function keyboardEventKey(event) {
     /Key\s+(.+?)\s+(Pressed|Released|Down|Up)$/i,
   );
   return normalizeIncomingKeyName(match?.[1] ?? null);
+}
+
+function keyboardEventIsPressed(event) {
+  const state = event?.payload?.state ?? event?.summary ?? "";
+  return /\b(pressed|down)\b/i.test(state);
 }
 
 function normalizeIncomingKeyName(value) {

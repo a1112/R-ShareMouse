@@ -41,18 +41,20 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildLocalDeviceSelectItems,
+  buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   describeAudioEndpoint,
   endpointEventToLocalControlEvent,
-  mouseButtonRecentlyDown,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 import {
   buildFooterStatus,
   getDeviceConsoleSections,
   getDeviceSimulatorChrome,
+  formatNetworkGatewayError,
   getHeaderMetrics,
   getHardwareAssetPresetOptions,
+  getLocalControlRefreshTiming,
   getMouseDetailLayoutClasses,
   getMouseSimulatorLayoutClasses,
   getPageLabels,
@@ -571,11 +573,10 @@ type LocalControlSubscription = {
 
 type ThemeMode = "light" | "dark" | "system";
 
-const POLL_INTERVAL_MS = 1500;
-const LOCAL_CONTROLS_POLL_INTERVAL_MS = 5000;
+const LOCAL_CONTROL_REFRESH_TIMING = getLocalControlRefreshTiming();
+const POLL_INTERVAL_MS = LOCAL_CONTROL_REFRESH_TIMING.dashboardPollMs;
 const ENDPOINT_EVENT_POLL_MS = 750;
-const LOCAL_CONTROL_EVENT_FLUSH_MS = 8;
-const RECENT_HARDWARE_EVENT_WINDOW_MS = 900;
+const LOCAL_CONTROL_EVENT_FLUSH_MS = LOCAL_CONTROL_REFRESH_TIMING.eventFlushMs;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 const HARDWARE_RIG_VARIANT_STORAGE_KEY = "rshare.hardwareRigVariant";
 const HARDWARE_ASSET_KEYBOARD_STORAGE_KEY = "rshare.hardwareAsset.keyboard";
@@ -682,14 +683,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function daemonIpcRequest(request: unknown): Promise<unknown> {
-  const response = await fetch(DAEMON_IPC_BRIDGE_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(request),
-  });
+  let response: Response;
+  try {
+    response = await fetch(DAEMON_IPC_BRIDGE_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    });
+  } catch (error) {
+    throw new Error(formatNetworkGatewayError(error, "daemon IPC"));
+  }
 
   let payload: unknown = null;
   try {
@@ -731,11 +741,12 @@ async function daemonRequestValue<T>(request: unknown, variant: string): Promise
 }
 
 function isDaemonIpcUnavailable(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   return (
     message.includes("ECONNREFUSED") ||
     message.includes("Connection refused") ||
-    message.includes("Failed to fetch")
+    message.includes("Failed to fetch") ||
+    message.includes("网关不可用")
   );
 }
 
@@ -743,13 +754,18 @@ async function daemonServiceRequest<T>(
   action: "start" | "stop",
   variant: string,
 ): Promise<T> {
-  const response = await fetch(DAEMON_SERVICE_BRIDGE_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ action }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(DAEMON_SERVICE_BRIDGE_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ action }),
+    });
+  } catch (error) {
+    throw new Error(formatNetworkGatewayError(error, "daemon 服务"));
+  }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const message =
@@ -955,9 +971,14 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonServiceRequest<T>("stop", "Ack");
     case "get_logs": {
       const limit = Number(args?.limit ?? 1000);
-      const response = await fetch(
-        `${DAEMON_LOGS_BRIDGE_ENDPOINT}?limit=${encodeURIComponent(String(limit))}`,
-      );
+      let response: Response;
+      try {
+        response = await fetch(
+          `${DAEMON_LOGS_BRIDGE_ENDPOINT}?limit=${encodeURIComponent(String(limit))}`,
+        );
+      } catch (error) {
+        throw new Error(formatNetworkGatewayError(error, "日志"));
+      }
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
         const message =
@@ -969,7 +990,12 @@ async function invokeNetworkCommand<T = unknown>(
       return safeArray(payload as LogEntry[] | null | undefined) as T;
     }
     case "clear_logs": {
-      const response = await fetch(DAEMON_LOGS_BRIDGE_ENDPOINT, { method: "DELETE" });
+      let response: Response;
+      try {
+        response = await fetch(DAEMON_LOGS_BRIDGE_ENDPOINT, { method: "DELETE" });
+      } catch (error) {
+        throw new Error(formatNetworkGatewayError(error, "日志"));
+      }
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
         const message =
@@ -1807,6 +1833,7 @@ function getLayoutMonitors(
     label: String(monitor.label),
     name: String(monitor.name),
     deviceId: String(monitor.deviceId),
+    deviceKind: monitor.deviceKind === "remote" ? "remote" : "local",
     resWidth: Number(monitor.resWidth),
     resHeight: Number(monitor.resHeight),
     color: String(monitor.color),
@@ -1816,6 +1843,23 @@ function getLayoutMonitors(
     h: Number(monitor.h),
     primary: Boolean(monitor.primary),
     enabled: Boolean(monitor.enabled) && !hiddenMonitorIds.has(String(monitor.id)),
+    orientation:
+      monitor.orientation == null ? null : String(monitor.orientation),
+    scalePercent:
+      monitor.scalePercent == null ? null : Number(monitor.scalePercent),
+    refreshRateMillihz:
+      monitor.refreshRateMillihz == null ? null : Number(monitor.refreshRateMillihz),
+    writeCapabilities: isRecord(monitor.writeCapabilities)
+      ? {
+          resolution: Boolean(monitor.writeCapabilities.resolution),
+          refreshRate: Boolean(monitor.writeCapabilities.refreshRate),
+          orientation: Boolean(monitor.writeCapabilities.orientation),
+          primary: Boolean(monitor.writeCapabilities.primary),
+          position: Boolean(monitor.writeCapabilities.position),
+          scale: Boolean(monitor.writeCapabilities.scale),
+          capture: Boolean(monitor.writeCapabilities.capture),
+        }
+      : undefined,
   }));
 }
 
@@ -1875,7 +1919,7 @@ export default function App() {
       setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
     } catch (refreshError) {
       setPayload(EMPTY_PAYLOAD);
-      setError(String(refreshError));
+      setError(errorMessage(refreshError));
     }
   }
 
@@ -1885,7 +1929,7 @@ export default function App() {
       setLocalControls((current) => mergeLocalControlSnapshot(current, snapshot));
       setLocalControlsError(null);
     } catch (localError) {
-      setLocalControlsError(String(localError));
+      setLocalControlsError(errorMessage(localError));
     }
   }
 
@@ -1964,15 +2008,10 @@ export default function App() {
       refreshDashboard();
       setRefreshTick((value) => value + 1);
     }, POLL_INTERVAL_MS);
-    const localControlsTimer = window.setInterval(
-      refreshLocalControls,
-      LOCAL_CONTROLS_POLL_INTERVAL_MS,
-    );
 
     return () => {
       cancelled = true;
       window.clearInterval(dashboardTimer);
-      window.clearInterval(localControlsTimer);
     };
   }, []);
 
@@ -2077,7 +2116,7 @@ export default function App() {
           await invokeCommand("start_local_controls_stream");
         }
       } catch (streamError) {
-        setLocalControlsError(String(streamError));
+        setLocalControlsError(errorMessage(streamError));
       }
     }
 
@@ -2164,7 +2203,7 @@ export default function App() {
             await pollEndpoint(endpointId);
           } catch (pollError) {
             if (!cancelled) {
-              setLocalControlsError(String(pollError));
+              setLocalControlsError(errorMessage(pollError));
             }
           }
         }
@@ -2188,7 +2227,7 @@ export default function App() {
 
     startEndpointStream().catch((streamError) => {
       if (!cancelled) {
-        setLocalControlsError(String(streamError));
+        setLocalControlsError(errorMessage(streamError));
       }
     });
     pollAllEndpoints();
@@ -2243,7 +2282,7 @@ export default function App() {
       }
       await refreshDashboard();
     } catch (actionError) {
-      setError(String(actionError));
+      setError(errorMessage(actionError));
     } finally {
       setBusy(false);
     }
@@ -2255,7 +2294,7 @@ export default function App() {
       await invokeCommand("connect_device", { device_id: deviceId });
       await refreshDashboard();
     } catch (actionError) {
-      setError(String(actionError));
+      setError(errorMessage(actionError));
     } finally {
       setBusy(false);
     }
@@ -2267,7 +2306,7 @@ export default function App() {
       await invokeCommand("disconnect_device", { device_id: deviceId });
       await refreshDashboard();
     } catch (actionError) {
-      setError(String(actionError));
+      setError(errorMessage(actionError));
     } finally {
       setBusy(false);
     }
@@ -2303,7 +2342,7 @@ export default function App() {
     } catch (testError) {
       setLocalInputTestResult({
         status: "Failed",
-        message: String(testError),
+        message: errorMessage(testError),
         kind,
         targetId: remoteDeviceId ?? null,
       });
@@ -2330,7 +2369,7 @@ export default function App() {
     } catch (latencyError) {
       setRemoteLatencyTestResult({
         status: "Failed",
-        message: String(latencyError),
+        message: errorMessage(latencyError),
         targetId: deviceId,
       });
     } finally {
@@ -2359,7 +2398,7 @@ export default function App() {
       setError(null);
       await refreshDashboard();
     } catch (layoutSaveError) {
-      const message = `布局未保存：${String(layoutSaveError)}`;
+      const message = `布局未保存：${errorMessage(layoutSaveError)}`;
       setPayload((current) => ({
         ...current,
         layout_error: message,
@@ -2382,11 +2421,29 @@ export default function App() {
     });
   }
 
+  async function handleMonitorContextAction(actionId: string, monitor: MonitorData) {
+    if (
+      actionId !== "open-display-settings" &&
+      !actionId.startsWith("change-")
+    ) {
+      return;
+    }
+
+    try {
+      await invokeCommand("open_display_settings", {
+        display_id: monitor.displayId ?? monitor.id,
+      });
+      setError(null);
+    } catch (displaySettingsError) {
+      setError(errorMessage(displaySettingsError));
+    }
+  }
+
   async function handleWindow(command: "minimize_window" | "toggle_maximize_window" | "close_window") {
     try {
       await invokeCommand(command);
     } catch (windowError) {
-      setError(String(windowError));
+      setError(errorMessage(windowError));
     }
   }
 
@@ -2577,6 +2634,7 @@ export default function App() {
                   ? `布局未保存：${model.layout.error}`
                   : "布局来自守护进程记忆；离线设备已隐藏。"
               }
+              onMonitorContextAction={handleMonitorContextAction}
             />
           ) : null}
 
@@ -2585,6 +2643,7 @@ export default function App() {
               busy={busy}
               devices={model.devices}
               capabilities={model.capabilities}
+              visibleLayout={model.layout.visible}
               localDevice={model.settings.localDevice}
               latencyFeedback={model.latencyFeedback}
               localControls={localControls}
@@ -2656,6 +2715,7 @@ export default function App() {
 function DevicesPage({
   devices,
   capabilities,
+  visibleLayout,
   localDevice,
   latencyFeedback,
   localControls,
@@ -2676,11 +2736,13 @@ function DevicesPage({
     name: string;
     hostname: string;
     address: string;
+    ipAddress?: string;
     connected: boolean;
     online: boolean;
     lastSeenLabel: string;
   }>;
   capabilities: CapabilityOverview;
+  visibleLayout: unknown | null;
   localDevice: {
     id: string;
     name: string;
@@ -2704,6 +2766,7 @@ function DevicesPage({
     <DevicesPageWithLocalControls
       devices={devices}
       capabilities={capabilities}
+      visibleLayout={visibleLayout}
       localDevice={localDevice}
       latencyFeedback={latencyFeedback}
       localControls={localControls}
@@ -2800,7 +2863,7 @@ function DevicesPage({
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-            <InfoRow label="地址" value={device.address} theme={theme} />
+            <InfoRow label="IP" value={device.ipAddress ?? device.address} theme={theme} />
             <InfoRow label="最近出现" value={device.lastSeenLabel} theme={theme} />
             <InfoRow label="状态" value={device.online ? "可达" : "离线"} theme={theme} />
             <InfoRow label="布局映射" value={device.connected ? "已联动" : "空闲"} theme={theme} />
@@ -2927,6 +2990,7 @@ function DeviceTreeNodeButton({
 function DevicesPageWithLocalControls({
   devices,
   capabilities,
+  visibleLayout,
   localDevice,
   latencyFeedback,
   localControls,
@@ -2947,11 +3011,13 @@ function DevicesPageWithLocalControls({
     name: string;
     hostname: string;
     address: string;
+    ipAddress?: string;
     connected: boolean;
     online: boolean;
     lastSeenLabel: string;
   }>;
   capabilities: CapabilityOverview;
+  visibleLayout: unknown | null;
   localDevice: {
     id: string;
     name: string;
@@ -3028,6 +3094,13 @@ function DevicesPageWithLocalControls({
     selectedMonitorDeviceId === "local"
       ? null
       : safeDevices.find((device) => device.id === selectedMonitorDeviceId) ?? null;
+  const remoteMonitorSnapshotFor = (device: (typeof safeDevices)[number]) =>
+    buildRemoteControlSnapshot({
+      baseSnapshot: localControls,
+      device,
+      capabilities,
+      visibleLayout,
+    }) as LocalControlsSnapshot;
   const latencyFeedbackSnapshot =
     latencyFeedback == null
       ? localControls
@@ -3047,7 +3120,7 @@ function DevicesPageWithLocalControls({
       : null;
   const remoteDeviceIds = new Set(safeDevices.map((device) => device.id));
   const monitorSnapshot = selectedRemoteDevice
-    ? buildRemoteMonitorSnapshot(localControls, selectedRemoteDevice.id)
+    ? remoteMonitorSnapshotFor(selectedRemoteDevice)
     : buildLocalMonitorSnapshot(localControls, remoteDeviceIds);
   const monitorError = selectedRemoteDevice ? null : localControlsError;
   const handleMonitorDeviceChange = (deviceId: string) => {
@@ -3137,7 +3210,11 @@ function DevicesPageWithLocalControls({
     handleMonitorDeviceChange(deviceId);
     setSelectedPage(kind);
     if (kind !== "remote") {
-      const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, deviceId);
+      const selected = safeDevices.find((device) => device.id === deviceId);
+      if (!selected) {
+        return;
+      }
+      const remoteSnapshot = remoteMonitorSnapshotFor(selected);
       const aggregate = localDeviceItems(remoteSnapshot, kind as LocalControlKind, [])[0];
       if (aggregate) {
         setSelectedDeviceId(kind as LocalControlKind, aggregate.id);
@@ -3310,7 +3387,7 @@ function DevicesPageWithLocalControls({
 
           {safeDevices.map((device) => {
             const expanded = Boolean(expandedRemoteDevices[device.id]);
-            const remoteSnapshot = buildRemoteMonitorSnapshot(localControls, device.id);
+            const remoteSnapshot = remoteMonitorSnapshotFor(device);
             const remoteCounts = deviceTreeCounts(remoteSnapshot, []);
             const remoteTabs = buildDeviceTypeSummaries(remoteCounts).filter(
               (tab) => tab.kind !== "remote",
@@ -3334,7 +3411,7 @@ function DevicesPageWithLocalControls({
                     active={selectedMonitorDeviceId === device.id && selectedPage === "overview"}
                     icon={<Monitor size={16} />}
                     title={device.name}
-                    detail={device.hostname || (device.connected ? "已连接" : "已发现")}
+                    detail={device.ipAddress || device.address || device.hostname || (device.connected ? "已连接" : "已发现")}
                     live={device.connected}
                     onClick={() => {
                       handleMonitorDeviceChange(device.id);
@@ -3490,7 +3567,7 @@ function DevicesPageWithLocalControls({
                       />
                     </div>
                     <div className="mt-1 text-sm" style={{ color: theme.textMuted }}>
-                      {device.hostname}
+                      {device.hostname} · {device.ipAddress ?? device.address}
                     </div>
                   </div>
                   <button
@@ -3517,7 +3594,8 @@ function DevicesPageWithLocalControls({
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-                  <InfoRow label="地址" value={device.address} theme={theme} />
+                  <InfoRow label="IP" value={device.ipAddress ?? device.address} theme={theme} />
+                  <InfoRow label="端点" value={device.address} theme={theme} />
                   <InfoRow label="最近出现" value={device.lastSeenLabel} theme={theme} />
                   <InfoRow label="状态" value={device.online ? "可达" : "离线"} theme={theme} />
                   <InfoRow
@@ -3688,6 +3766,7 @@ function AllDevicesOverview({
     name: string;
     hostname: string;
     address: string;
+    ipAddress?: string;
     connected: boolean;
     online: boolean;
     lastSeenLabel: string;
@@ -4441,7 +4520,17 @@ function loadSelectedHardwareAssetIds(): Record<HardwareRigKind, string> {
 async function loadBuiltinHardwareRigAssets(): Promise<HardwareRigDefinition[]> {
   const assets = await Promise.all(
     BUILTIN_HARDWARE_ASSET_MANIFESTS.map(async (manifestUrl) => {
-      const response = await fetch(manifestUrl);
+      let response: Response;
+      try {
+        response = await fetch(manifestUrl);
+      } catch (error) {
+        const detail = /failed to fetch/i.test(errorMessage(error))
+          ? "网络请求失败"
+          : errorMessage(error);
+        throw new Error(
+          `内置硬件资产读取失败：${detail || manifestUrl}`,
+        );
+      }
       if (!response.ok) {
         throw new Error(`内置硬件资产读取失败：${manifestUrl}`);
       }
@@ -4485,7 +4574,7 @@ async function loadInstalledHardwareRigAssets(): Promise<{
       .filter(isHardwareRigDefinition);
     return { installed, assets, error: null };
   } catch (error) {
-    const message = String(error);
+    const message = errorMessage(error);
     if (message.includes("需要 Tauri bridge")) {
       return { installed: [], assets: [], error: null };
     }
@@ -6178,23 +6267,6 @@ function buildEmptyControlSnapshot(base: LocalControlsSnapshot | null): LocalCon
   };
 }
 
-function buildRemoteMonitorSnapshot(
-  snapshot: LocalControlsSnapshot | null,
-  remoteDeviceId: string,
-) {
-  const remoteEvents = safeArray(snapshot?.recent_events)
-    .filter((event) => {
-      const sourceDeviceId = event.device_id ?? event.payload?.remote_device_id;
-      return sourceDeviceId === remoteDeviceId;
-    })
-    .sort((left, right) => left.sequence - right.sequence);
-  let remoteSnapshot = buildEmptyControlSnapshot(snapshot);
-  for (const event of remoteEvents) {
-    remoteSnapshot = applyLocalControlEvent(remoteSnapshot, event);
-  }
-  return remoteSnapshot;
-}
-
 function deviceTreeCounts(
   snapshot: LocalControlsSnapshot | null,
   audioOutputs: AudioOutputDevice[] = [],
@@ -6530,6 +6602,7 @@ function RemoteDevicesPanel({
     name: string;
     hostname: string;
     address: string;
+    ipAddress?: string;
     connected: boolean;
     online: boolean;
     lastSeenLabel: string;
@@ -6581,7 +6654,7 @@ function RemoteDevicesPanel({
                 />
               </div>
               <div className="mt-1 text-sm" style={{ color: theme.textMuted }}>
-                {device.hostname}
+                {device.hostname} · {device.ipAddress ?? device.address}
               </div>
             </div>
             <button
@@ -6606,7 +6679,8 @@ function RemoteDevicesPanel({
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-            <InfoRow label="地址" value={device.address} theme={theme} />
+            <InfoRow label="IP" value={device.ipAddress ?? device.address} theme={theme} />
+            <InfoRow label="端点" value={device.address} theme={theme} />
             <InfoRow label="最近出现" value={device.lastSeenLabel} theme={theme} />
             <InfoRow label="状态" value={device.online ? "可达" : "离线"} theme={theme} />
             <InfoRow label="布局映射" value={device.connected ? "已联动" : "空闲"} theme={theme} />
@@ -7943,19 +8017,20 @@ function MouseEventLog({
       <div className="mb-2 flex shrink-0 items-center justify-between gap-3">
         <div className="text-sm font-medium">鼠标记录</div>
         <div className="text-xs" style={{ color: theme.textMuted }}>
-          最近 {events.length} 条        </div>
+          最近 {events.length} 条
+        </div>
       </div>
       <div className="rshare-scroll min-h-0 flex-1 space-y-1.5 overflow-auto pr-1">
         {events.length ? (
           events.map((event) => (
             <div
               key={`${event.sequence}-${event.summary}`}
-              className="grid grid-cols-[74px_minmax(0,1fr)] items-center gap-2 text-xs"
+              className="grid grid-cols-[86px_minmax(0,1fr)] items-start gap-2 text-xs"
               style={{ color: theme.text }}
             >
               <span style={{ color: theme.textMuted }}>{keyboardEventTime(event)}</span>
               <span
-                className="truncate rounded px-2 py-1"
+                className="min-w-0 break-words rounded px-2 py-1"
                 style={{ background: "rgba(255,255,255,0.055)" }}
               >
                 {mouseEventLabel(event)}
@@ -8172,10 +8247,6 @@ function mouseButtonPressed(buttons: string[], name: string) {
   );
 }
 
-function mouseButtonRecentlyActive(events: LocalControlEvent[], name: string) {
-  return Boolean(mouseButtonRecentlyDown(events, name, RECENT_HARDWARE_EVENT_WINDOW_MS));
-}
-
 function SimulatedMouse({
   x,
   y,
@@ -8219,11 +8290,11 @@ function SimulatedMouse({
   theme: typeof FIGMA_DESKTOP_THEME;
   compact?: boolean;
 }) {
-  const leftDown = mouseButtonPressed(pressedButtons, "Left") || mouseButtonRecentlyActive(recentEvents, "Left");
-  const rightDown = mouseButtonPressed(pressedButtons, "Right") || mouseButtonRecentlyActive(recentEvents, "Right");
-  const middleDown = mouseButtonPressed(pressedButtons, "Middle") || mouseButtonRecentlyActive(recentEvents, "Middle");
-  const backDown = mouseButtonPressed(pressedButtons, "Back") || mouseButtonRecentlyActive(recentEvents, "Back");
-  const forwardDown = mouseButtonPressed(pressedButtons, "Forward") || mouseButtonRecentlyActive(recentEvents, "Forward");
+  const leftDown = mouseButtonPressed(pressedButtons, "Left");
+  const rightDown = mouseButtonPressed(pressedButtons, "Right");
+  const middleDown = mouseButtonPressed(pressedButtons, "Middle");
+  const backDown = mouseButtonPressed(pressedButtons, "Back");
+  const forwardDown = mouseButtonPressed(pressedButtons, "Forward");
   const activeDisplay =
     currentDisplayIndex !== null && currentDisplayIndex >= 0
       ? displays[currentDisplayIndex] ?? null

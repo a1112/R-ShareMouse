@@ -72,6 +72,44 @@ test("resolveActiveHardwareRegions matches pressed keyboard codes", () => {
   );
 });
 
+test("resolveActiveHardwareRegions does not keep released keyboard keys active", () => {
+  const asset = normalizeHardwareAssetManifest(
+    keyboardManifest,
+    "/assets/hardware/keyboard/",
+  );
+
+  assert.deepEqual(
+    resolveActiveHardwareRegions(asset, {
+      pressedKeys: [],
+      lastKey: "Char(65)",
+      keyboardEvents: [
+        {
+          device_kind: "Keyboard",
+          event_kind: "key",
+          summary: "Key A Released",
+          payload: { key: "KeyA", state: "Released" },
+        },
+      ],
+    }).map((region) => region.id),
+    [],
+  );
+
+  assert.deepEqual(
+    resolveActiveHardwareRegions(asset, {
+      pressedKeys: [],
+      keyboardEvents: [
+        {
+          device_kind: "Keyboard",
+          event_kind: "key",
+          summary: "Key A Pressed",
+          payload: { key: "KeyA", state: "Pressed" },
+        },
+      ],
+    }).map((region) => region.id),
+    ["key.a"],
+  );
+});
+
 test("buildHardwareAssetChoices groups assets by kind", () => {
   const asset = normalizeHardwareAssetManifest(
     keyboardManifest,
@@ -124,6 +162,121 @@ test("checked-in office mouse manifest has mapped button regions", () => {
     asset.regions.find((region) => region.id === "mouse.left").action.kind,
     "mouse_button",
   );
+});
+
+test("checked-in keyboard manifests align bottom-row key regions to artwork", () => {
+  const cases = [
+    {
+      relative: "../../public/assets/hardware/live2d/keyboard/manifest.json",
+      baseUrl: "/assets/hardware/live2d/keyboard/",
+      expected: {
+        "key.controlleft": { x: 39, y: 430, w: 87, h: 67 },
+        "key.superleft": { x: 132, y: 430, w: 83, h: 67 },
+        "key.altleft": { x: 223, y: 430, w: 83, h: 67 },
+        "key.space": { x: 313, y: 430, w: 467, h: 67 },
+        "key.altright": { x: 787, y: 430, w: 83, h: 67 },
+        "key.superright": { x: 877, y: 430, w: 84, h: 67 },
+        "key.raw.93": { x: 969, y: 430, w: 84, h: 67 },
+        "key.controlright": { x: 1059, y: 430, w: 84, h: 67 },
+      },
+    },
+    {
+      relative: "../../public/assets/hardware/live2d/keyboard/gaming/manifest.json",
+      baseUrl: "/assets/hardware/live2d/keyboard/gaming/",
+      expected: {
+        "key.controlleft": { x: 37, y: 424, w: 89, h: 68 },
+        "key.superleft": { x: 130, y: 424, w: 87, h: 68 },
+        "key.altleft": { x: 221, y: 424, w: 87, h: 68 },
+        "key.space": { x: 312, y: 424, w: 444, h: 68 },
+        "key.altright": { x: 760, y: 424, w: 86, h: 68 },
+        "key.superright": { x: 850, y: 424, w: 87, h: 68 },
+        "key.raw.93": { x: 941, y: 424, w: 83, h: 68 },
+        "key.controlright": { x: 1028, y: 424, w: 91, h: 68 },
+      },
+    },
+  ];
+
+  for (const { relative, baseUrl, expected } of cases) {
+    const raw = JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
+    const asset = normalizeHardwareAssetManifest(raw, baseUrl);
+    const regionsById = new Map(
+      asset.regions.map((region) => [region.id, region]),
+    );
+
+    for (const [id, expectedRect] of Object.entries(expected)) {
+      const region = regionsById.get(id);
+      assert.ok(region, `missing ${id} in ${relative}`);
+      assert.equal(region.shape.kind, "rect", `${id} should use a rect shape`);
+      const actual = {
+        x: region.shape.x * asset.baseSize.width,
+        y: region.shape.y * asset.baseSize.height,
+        w: region.shape.w * asset.baseSize.width,
+        h: region.shape.h * asset.baseSize.height,
+      };
+      for (const key of ["x", "y", "w", "h"]) {
+        assert.ok(
+          Math.abs(actual[key] - expectedRect[key]) <= 8,
+          `${id} ${key} ${actual[key].toFixed(1)} differs from ${expectedRect[key]} in ${relative}`,
+        );
+      }
+    }
+  }
+});
+
+test("checked-in keyboard manifests align commonly tested key rows", () => {
+  const cases = [
+    {
+      relative: "../../public/assets/hardware/live2d/keyboard/manifest.json",
+      baseUrl: "/assets/hardware/live2d/keyboard/",
+      expected: {
+        "key.escape": { x: 38, y: 43, w: 72, h: 71 },
+        "key.capslock": { x: 38, y: 277, w: 134, h: 72 },
+        "key.shiftleft": { x: 38, y: 351, w: 175, h: 72 },
+        "key.char.67": { x: 362, y: 351, w: 72, h: 72 },
+        "key.char.86": { x: 436, y: 351, w: 72, h: 72 },
+        "key.char.66": { x: 509, y: 351, w: 73, h: 72 },
+        "key.char.78": { x: 584, y: 351, w: 72, h: 72 },
+      },
+    },
+    {
+      relative: "../../public/assets/hardware/live2d/keyboard/gaming/manifest.json",
+      baseUrl: "/assets/hardware/live2d/keyboard/gaming/",
+      expected: {
+        "key.escape": { x: 38, y: 45, w: 72, h: 69 },
+        "key.capslock": { x: 38, y: 277, w: 116, h: 58 },
+        "key.shiftleft": { x: 38, y: 348, w: 152, h: 73 },
+        "key.char.67": { x: 350, y: 348, w: 64, h: 73 },
+        "key.char.86": { x: 422, y: 348, w: 64, h: 73 },
+        "key.char.66": { x: 494, y: 348, w: 64, h: 73 },
+        "key.char.78": { x: 566, y: 348, w: 64, h: 73 },
+      },
+    },
+  ];
+
+  for (const { relative, baseUrl, expected } of cases) {
+    const raw = JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
+    const asset = normalizeHardwareAssetManifest(raw, baseUrl);
+    const regionsById = new Map(
+      asset.regions.map((region) => [region.id, region]),
+    );
+    for (const [id, expectedRect] of Object.entries(expected)) {
+      const region = regionsById.get(id);
+      assert.ok(region, `missing ${id} in ${relative}`);
+      assert.equal(region.shape.kind, "rect", `${id} should use a rect shape`);
+      const actual = {
+        x: region.shape.x * asset.baseSize.width,
+        y: region.shape.y * asset.baseSize.height,
+        w: region.shape.w * asset.baseSize.width,
+        h: region.shape.h * asset.baseSize.height,
+      };
+      for (const key of ["x", "y", "w", "h"]) {
+        assert.ok(
+          Math.abs(actual[key] - expectedRect[key]) <= 8,
+          `${id} ${key} ${actual[key].toFixed(1)} differs from ${expectedRect[key]} in ${relative}`,
+        );
+      }
+    }
+  }
 });
 
 test("checked-in mouse manifests use precision polygon regions", () => {
@@ -287,6 +440,40 @@ test("resolveActiveHardwareRegions matches mouse boolean button state", () => {
 
   assert.equal(active[0].id, "mouse.left");
   assert.equal(active[0].shape.radius, 38);
+});
+
+test("resolveActiveHardwareRegions does not use released mouse buttons as active feedback", () => {
+  const mouse = normalizeHardwareAssetManifest({
+    schema_version: 1,
+    id: "builtin.mouse.office",
+    name: "Office Mouse",
+    kind: "mouse",
+    base_size: { width: 575, height: 1109 },
+    layers: [{ id: "base", role: "base", src: "base.png" }],
+    regions: [
+      {
+        id: "mouse.left",
+        label: "Left",
+        action: { kind: "mouse_button", buttons: ["Left"] },
+        shape: { kind: "rect", x: 0.2, y: 0.07, w: 0.3, h: 0.4 },
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    resolveActiveHardwareRegions(mouse, {
+      pressedButtons: [],
+      recentButtons: ["Left Released"],
+    }).map((region) => region.id),
+    [],
+  );
+  assert.deepEqual(
+    resolveActiveHardwareRegions(mouse, {
+      pressedButtons: ["Left"],
+      recentButtons: ["Left Released"],
+    }).map((region) => region.id),
+    ["mouse.left"],
+  );
 });
 
 test("normalizeHardwareAssetManifest preserves polygon region points", () => {

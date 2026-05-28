@@ -27,7 +27,18 @@ import {
   ArrowLeft,
   ArrowRight,
   Lock,
+  Copy,
+  ExternalLink,
 } from "lucide-react";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "./ui/context-menu";
+import { buildMonitorContextMenuModel } from "../monitor-context-menu.mjs";
 
 /* ---------- Types ---------- */
 export interface MonitorData {
@@ -40,6 +51,7 @@ export interface MonitorData {
   label: string;
   name: string;
   deviceId: string;
+  deviceKind?: "local" | "remote";
   resWidth: number;
   resHeight: number;
   color: string;
@@ -49,6 +61,18 @@ export interface MonitorData {
   h: number;
   primary: boolean;
   enabled: boolean;
+  orientation?: string | null;
+  scalePercent?: number | null;
+  refreshRateMillihz?: number | null;
+  writeCapabilities?: {
+    resolution?: boolean;
+    refreshRate?: boolean;
+    orientation?: boolean;
+    primary?: boolean;
+    position?: boolean;
+    scale?: boolean;
+    capture?: boolean;
+  };
 }
 
 export interface DeviceData {
@@ -169,6 +193,7 @@ interface MonitorManagerProps {
   showFooter?: boolean;
   onMonitorsCommit?: (monitors: MonitorData[]) => void;
   onMonitorVisibilityChange?: (monitorId: string, enabled: boolean) => void;
+  onMonitorContextAction?: (actionId: string, monitor: MonitorData) => void;
 }
 
 function normalizeDevice(device: DeviceData): DeviceData {
@@ -236,6 +261,62 @@ function rectsOverlap(a: RectBounds, b: RectBounds) {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
+function monitorActionIcon(actionId: string) {
+  if (actionId.startsWith("copy-")) {
+    return <Copy size={14} />;
+  }
+  if (actionId === "edit-position") {
+    return <Move size={14} />;
+  }
+  if (actionId === "open-display-settings") {
+    return <ExternalLink size={14} />;
+  }
+  return <Settings size={14} />;
+}
+
+function MonitorContextMenuContent({
+  monitor,
+  onAction,
+}: {
+  monitor: MonitorData;
+  onAction: (actionId: string, monitor: MonitorData) => void;
+}) {
+  const items = buildMonitorContextMenuModel(monitor);
+  const copyItems = items.filter((item) => item.group === "copy");
+  const settingsItems = items.filter((item) => item.group === "settings");
+  const layoutItems = items.filter((item) => item.group === "layout");
+
+  const renderItem = (item: {
+    id: string;
+    label: string;
+    enabled: boolean;
+    reason?: string | null;
+  }) => (
+    <ContextMenuItem
+      key={item.id}
+      disabled={!item.enabled}
+      title={item.enabled ? item.label : item.reason ?? item.label}
+      onSelect={() => onAction(item.id, monitor)}
+    >
+      {monitorActionIcon(item.id)}
+      <span>{item.label}</span>
+    </ContextMenuItem>
+  );
+
+  return (
+    <ContextMenuContent className="min-w-[190px]">
+      <ContextMenuLabel className="max-w-[240px] truncate">
+        {monitor.name}
+      </ContextMenuLabel>
+      {copyItems.map(renderItem)}
+      <ContextMenuSeparator />
+      {settingsItems.map(renderItem)}
+      <ContextMenuSeparator />
+      {layoutItems.map(renderItem)}
+    </ContextMenuContent>
+  );
+}
+
 /* ---------- Component ---------- */
 export default function MonitorManager({
   devices: externalDevices,
@@ -247,6 +328,7 @@ export default function MonitorManager({
   showFooter = true,
   onMonitorsCommit,
   onMonitorVisibilityChange,
+  onMonitorContextAction,
 }: MonitorManagerProps) {
   const [monitors, setMonitors] = useState<MonitorData[]>(
     externalMonitors && externalMonitors.length ? externalMonitors : initialMonitors
@@ -624,12 +706,36 @@ export default function MonitorManager({
     [],
   );
 
+  const handleMonitorContextAction = useCallback(
+    (actionId: string, monitor: MonitorData) => {
+      setSelected(monitor.id);
+      const item = buildMonitorContextMenuModel(monitor).find(
+        (entry: { id: string }) => entry.id === actionId,
+      );
+      if (!item?.enabled) {
+        return;
+      }
+      if (item.copyText) {
+        void navigator.clipboard?.writeText(String(item.copyText));
+        return;
+      }
+      if (actionId === "edit-position") {
+        return;
+      }
+      onMonitorContextAction?.(actionId, monitor);
+    },
+    [onMonitorContextAction],
+  );
+
   /* ---- Drag handlers ---- */
   const handleMouseDown = useCallback(
     (e: React.MouseEvent, id: string) => {
-      e.preventDefault();
       e.stopPropagation();
       setSelected(id);
+      if (e.button !== 0) {
+        return;
+      }
+      e.preventDefault();
       const mon = monitorsRef.current.find((m) => m.id === id);
       if (!mon || !canvasRef.current) return;
       const rect = canvasRef.current.getBoundingClientRect();
@@ -1478,26 +1584,28 @@ export default function MonitorManager({
               const isDraggingThis = dragging === mon.id;
               const isAdj = getAdjacentPairs.some(([a, b]) => a === mon.id || b === mon.id);
               return (
-                <div
-                  key={mon.id}
-                  onMouseDown={(e) => handleMouseDown(e, mon.id)}
-                  onClick={(e) => { e.stopPropagation(); setSelected(mon.id); }}
-                  className="absolute rounded-[5px] border-2 transition-shadow duration-150 flex flex-col items-center justify-center"
-                  style={{
-                    left: mon.x, top: mon.y, width: mon.w, height: mon.h,
-                    backgroundColor: monFill(mon.color),
-                    borderColor: isSelected ? t.selectBorder : isDraggingThis ? t.snapColor : isAdj ? monBorderAdj(mon.color) : monBorderIdle(mon.color),
-                    cursor: isDraggingThis ? "grabbing" : "grab",
-                    zIndex: isDraggingThis ? 15 : isSelected ? 12 : 5,
-                    boxShadow: isSelected
-                      ? `0 0 0 1px ${t.selectBorder}, 0 0 24px ${mon.color}22`
-                      : isDraggingThis
-                      ? `0 4px 20px ${isDark ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.15)"}`
-                      : `0 1px 4px ${isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.08)"}`,
-                    backdropFilter: isDark || dragging || isPanning ? "none" : "blur(2px)",
-                    pointerEvents: "auto",
-                  }}
-                >
+                <ContextMenu key={mon.id}>
+                  <ContextMenuTrigger asChild>
+                    <div
+                      onMouseDown={(e) => handleMouseDown(e, mon.id)}
+                      onContextMenu={(e) => { e.stopPropagation(); setSelected(mon.id); }}
+                      onClick={(e) => { e.stopPropagation(); setSelected(mon.id); }}
+                      className="absolute rounded-[5px] border-2 transition-shadow duration-150 flex flex-col items-center justify-center"
+                      style={{
+                        left: mon.x, top: mon.y, width: mon.w, height: mon.h,
+                        backgroundColor: monFill(mon.color),
+                        borderColor: isSelected ? t.selectBorder : isDraggingThis ? t.snapColor : isAdj ? monBorderAdj(mon.color) : monBorderIdle(mon.color),
+                        cursor: isDraggingThis ? "grabbing" : "grab",
+                        zIndex: isDraggingThis ? 15 : isSelected ? 12 : 5,
+                        boxShadow: isSelected
+                          ? `0 0 0 1px ${t.selectBorder}, 0 0 24px ${mon.color}22`
+                          : isDraggingThis
+                          ? `0 4px 20px ${isDark ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.15)"}`
+                          : `0 1px 4px ${isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.08)"}`,
+                        backdropFilter: isDark || dragging || isPanning ? "none" : "blur(2px)",
+                        pointerEvents: "auto",
+                      }}
+                    >
                   <div
                     className="w-[32px] h-[32px] rounded-full flex items-center justify-center mb-1"
                     style={{ backgroundColor: mon.color + "33", border: `2px solid ${mon.color}` }}
@@ -1583,7 +1691,13 @@ export default function MonitorManager({
                   <div className="absolute top-1 left-1 opacity-30">
                     <Move size={10} />
                   </div>
-                </div>
+                    </div>
+                  </ContextMenuTrigger>
+                  <MonitorContextMenuContent
+                    monitor={mon}
+                    onAction={handleMonitorContextAction}
+                  />
+                </ContextMenu>
               );
             })}
 
