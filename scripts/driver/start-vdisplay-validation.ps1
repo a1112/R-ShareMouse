@@ -6,6 +6,7 @@ param(
     [uint32]$Width = 1920,
     [uint32]$Height = 1080,
     [uint32]$RefreshRateMillihz = 60000,
+    [switch]$EnableTestSigning,
     [switch]$KeepDisplay
 )
 
@@ -27,7 +28,7 @@ $validationArgs = @(
 Set-Location '$root'
 Start-Transcript -Path '$logPath' -Force
 try {
-    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz -VerifyDaemonDisplayTopology -WaitForManualModeChange $(if ($KeepDisplay) { '-KeepDisplay' } else { '' })
+    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz -VerifyDaemonDisplayTopology -WaitForManualModeChange $(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' }) $(if ($KeepDisplay) { '-KeepDisplay' } else { '' })
 } finally {
     Stop-Transcript
     Write-Host ''

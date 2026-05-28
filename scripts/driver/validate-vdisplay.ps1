@@ -8,6 +8,7 @@ param(
     [uint32]$RefreshRateMillihz = 60000,
     [switch]$SkipBuild,
     [switch]$SkipInstall,
+    [switch]$EnableTestSigning,
     [switch]$VerifyDaemonDisplayTopology,
     [switch]$WaitForManualModeChange,
     [switch]$KeepDisplay
@@ -277,7 +278,14 @@ if (-not $SkipBuild) {
 
 if (-not $SkipInstall) {
     Invoke-Step "Install test driver packages" {
-        & (Join-Path $PSScriptRoot "install-test-driver.ps1") -Configuration $Configuration -Platform $Platform
+        $installArgs = @{
+            Configuration = $Configuration
+            Platform = $Platform
+        }
+        if ($EnableTestSigning) {
+            $installArgs.EnableTestSigning = $true
+        }
+        & (Join-Path $PSScriptRoot "install-test-driver.ps1") @installArgs
     }
 }
 

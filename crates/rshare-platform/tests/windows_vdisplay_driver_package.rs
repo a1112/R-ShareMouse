@@ -427,6 +427,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("check-wdk.ps1"));
     assert!(validate_vdisplay_script.contains("build.ps1"));
     assert!(validate_vdisplay_script.contains("install-test-driver.ps1"));
+    assert!(validate_vdisplay_script.contains("[switch]$EnableTestSigning"));
+    assert!(validate_vdisplay_script.contains("$installArgs.EnableTestSigning = $true"));
     assert!(validate_vdisplay_script.contains("rshare-driver-probe.exe"));
     assert!(validate_vdisplay_script.contains("@(\"vdisplay\", \"create\""));
     assert!(validate_vdisplay_script.contains("ms-settings:display"));
@@ -459,6 +461,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -Mode $observedMode"));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
+    assert!(install_script.contains("[switch]$EnableTestSigning"));
+    assert!(install_script.contains("Confirm-SecureBootUEFI"));
+    assert!(install_script.contains("Secure Boot is enabled"));
+    assert!(install_script.contains("& $bcdEdit /set testsigning on"));
+    assert!(install_script.contains("Reboot Windows, then re-run this script."));
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
     assert!(install_script
         .contains("if (-not $devcon -and ($packages | Where-Object { $_.UseDevCon }))"));
@@ -470,6 +477,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(start_validation_script.contains("Start-Transcript"));
     assert!(start_validation_script.contains("target\\driver-validation"));
     assert!(start_validation_script.contains("validate-vdisplay.ps1"));
+    assert!(start_validation_script.contains("[switch]$EnableTestSigning"));
+    assert!(start_validation_script.contains("$(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' })"));
     assert!(start_validation_script.contains("-VerifyDaemonDisplayTopology"));
     assert!(start_validation_script.contains("-WaitForManualModeChange"));
 
@@ -492,6 +501,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-vdisplay-validation.ps1"));
+    assert!(driver_readme.contains("-EnableTestSigning"));
+    assert!(driver_readme.contains("Disable Secure Boot"));
     assert!(driver_readme.contains("Microsoft.WindowsWDK.10.0.26100"));
     assert!(driver_readme.contains("EDID-backed monitor"));
     assert!(driver_readme.contains("pending IddCx arrival"));

@@ -5,7 +5,8 @@ param(
     [string]$Platform = "x64",
     [switch]$IncludeFilter,
     [switch]$FilterOnly,
-    [switch]$SkipSign
+    [switch]$SkipSign,
+    [switch]$EnableTestSigning
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,6 +66,15 @@ function Get-TestSigningEnabled([string]$BcdEdit) {
     return [bool]($output | Select-String -Pattern "testsigning\s+Yes")
 }
 
+function Get-SecureBootEnabled {
+    try {
+        return [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+    } catch {
+        Write-Verbose "Secure Boot state could not be queried: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Test-DevicePresent([string]$PnpUtil, [string]$HardwareId) {
     if (-not $HardwareId) {
         return $false
@@ -110,7 +120,20 @@ Assert-Admin
 
 $bcdEdit = Find-SystemTool "bcdedit.exe"
 if (-not (Get-TestSigningEnabled $bcdEdit)) {
-    throw "Windows test signing is not enabled. Run elevated: bcdedit /set testsigning on, reboot, then re-run this script."
+    if (Get-SecureBootEnabled) {
+        throw "Windows test signing is not enabled and Secure Boot is enabled. Disable Secure Boot in firmware settings, boot Windows again, then re-run this script with -EnableTestSigning."
+    }
+
+    if ($EnableTestSigning) {
+        Write-Host "Enabling Windows test signing with bcdedit."
+        & $bcdEdit /set testsigning on
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to enable Windows test signing with bcdedit."
+        }
+        throw "Windows test signing has been enabled. Reboot Windows, then re-run this script."
+    }
+
+    throw "Windows test signing is not enabled. Re-run with -EnableTestSigning from an elevated PowerShell, reboot Windows, then re-run this script."
 }
 
 $packages = Get-DriverPackages

@@ -13,7 +13,7 @@ The drivers are not part of the Cargo workspace. Build them with the scripts und
 
 Before building, run `scripts\driver\check-wdk.ps1`. If it reports missing IddCx components, install the matching WDK package, for example `winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --source winget`, then reopen the shell and run the check again.
 
-Driver installation requires Windows test signing and must be reversible with `uninstall-test-driver.ps1`.
+Driver installation requires Windows test signing and must be reversible with `uninstall-test-driver.ps1`. On a new test machine, run `scripts\driver\start-vdisplay-validation.ps1 -EnableTestSigning` or `scripts\driver\validate-vdisplay.ps1 -EnableTestSigning` from an elevated PowerShell once; after it enables test signing, reboot Windows and re-run the validation command without that first-run setup step. If the script reports that Secure Boot is enabled, Disable Secure Boot in firmware settings first because Windows blocks `bcdedit /set testsigning on` while Secure Boot policy is active.
 
 After WDK and test signing are ready, run `scripts\driver\validate-vdisplay.ps1 -VerifyDaemonDisplayTopology -WaitForManualModeChange` from an elevated PowerShell to build, install, create the virtual display, start the daemon for topology verification, confirm the daemon sees it in the Windows display topology, open Windows display settings, and wait for a manual mode change to be reflected through the driver probe.
 
