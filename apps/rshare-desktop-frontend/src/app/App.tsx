@@ -3526,6 +3526,7 @@ function DevicesPageWithLocalControls({
                   ? (kind) => onRunRemoteEndpointInputTest(selectedRemoteDevice.id, kind)
                   : onRunLocalInputTest
               }
+              onRefreshLocalControls={refreshLocalControls}
               hardwareRigVariant={hardwareRigVariant}
               compactLayout={compactDeviceConsole}
               theme={theme}
@@ -3544,6 +3545,7 @@ function DevicesPageWithLocalControls({
         inputTestResult={localInputTestResult}
         confirmingInputTest={confirmingInputTest}
         onRunInputTest={onRunLocalInputTest}
+        onRefreshLocalControls={refreshLocalControls}
         theme={theme}
       />
 
@@ -6730,6 +6732,7 @@ function LocalControlCenter({
   inputTestResult,
   confirmingInputTest,
   onRunInputTest,
+  onRefreshLocalControls,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
@@ -6737,6 +6740,7 @@ function LocalControlCenter({
   inputTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
   onRunInputTest: (kind: string) => void;
+  onRefreshLocalControls?: () => Promise<void>;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const [selectedKind, setSelectedKind] = useState<LocalControlKind>("keyboard");
@@ -6750,6 +6754,7 @@ function LocalControlCenter({
       selectedKind={selectedKind}
       onSelectedKindChange={setSelectedKind}
       onRunInputTest={onRunInputTest}
+      onRefreshLocalControls={onRefreshLocalControls}
       theme={theme}
     />
   );
@@ -6767,6 +6772,7 @@ function LocalControlDriverHub({
   onSelectedKindChange,
   onSelectedDeviceIdChange,
   onRunInputTest,
+  onRefreshLocalControls,
   hardwareRigVariant = "office",
   compactLayout = false,
   theme,
@@ -6786,6 +6792,7 @@ function LocalControlDriverHub({
   onSelectedKindChange: (kind: LocalControlKind) => void;
   onSelectedDeviceIdChange?: (deviceId: string) => void;
   onRunInputTest: (kind: string) => void;
+  onRefreshLocalControls?: () => Promise<void>;
   hardwareRigVariant?: HardwareRigVariant;
   compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
@@ -6839,6 +6846,7 @@ function LocalControlDriverHub({
           inputTestResult={inputTestResult}
           confirmingInputTest={confirmingInputTest}
           onRunInputTest={onRunInputTest}
+          onRefreshLocalControls={onRefreshLocalControls}
           hardwareRigVariant={hardwareRigVariant}
           compactLayout={compactLayout}
           theme={theme}
@@ -6916,6 +6924,7 @@ function LocalControlDetail({
   confirmingInputTest,
   onRunInputTest,
   onSelectedDeviceIdChange,
+  onRefreshLocalControls,
   hardwareRigVariant,
   compactLayout = false,
   theme,
@@ -6933,6 +6942,7 @@ function LocalControlDetail({
   selectedDeviceId?: string;
   onRunInputTest: (kind: string) => void;
   onSelectedDeviceIdChange?: (deviceId: string) => void;
+  onRefreshLocalControls?: () => Promise<void>;
   hardwareRigVariant: HardwareRigVariant;
   compactLayout?: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
@@ -7017,6 +7027,7 @@ function LocalControlDetail({
       snapshot={snapshot}
       selectedDisplayId={effectiveSelectedDeviceId}
       onSelectedDisplayIdChange={onSelectedDeviceIdChange}
+      onRefreshLocalControls={onRefreshLocalControls}
       theme={theme}
     />
   );
@@ -7026,11 +7037,13 @@ function DisplaySettingsDetail({
   snapshot,
   selectedDisplayId,
   onSelectedDisplayIdChange,
+  onRefreshLocalControls,
   theme,
 }: {
   snapshot: LocalControlsSnapshot | null;
   selectedDisplayId?: string;
   onSelectedDisplayIdChange?: (displayId: string) => void;
+  onRefreshLocalControls?: () => Promise<void>;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const view = buildDisplaySettingsViewModel(
@@ -7226,6 +7239,7 @@ function DisplaySettingsDetail({
           { request },
         );
         await refreshVirtualDisplays();
+        await onRefreshLocalControls?.();
         return result;
       },
       (result) => virtualDisplayOperationMessage(result),
@@ -7240,6 +7254,7 @@ function DisplaySettingsDetail({
           { request: { id } },
         );
         await refreshVirtualDisplays();
+        await onRefreshLocalControls?.();
         return result;
       },
       (result) => virtualDisplayOperationMessage(result),

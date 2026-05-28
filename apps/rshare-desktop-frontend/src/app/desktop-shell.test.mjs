@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 import {
   buildFooterStatus,
@@ -186,4 +187,15 @@ test("getHeaderMetrics tightens titlebar padding and button density", () => {
     windowButtonSize: 16,
     windowButtonHitSize: 46,
   });
+});
+
+test("display settings refreshes system topology after virtual display operations", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /onRefreshLocalControls=\{refreshLocalControls\}/);
+  assert.match(source, /onRefreshLocalControls\?: \(\) => Promise<void>/);
+  const topologyRefreshes = source.match(
+    /await refreshVirtualDisplays\(\);\s*await onRefreshLocalControls\?\.\(\);/g,
+  );
+  assert.equal(topologyRefreshes?.length, 2);
 });
