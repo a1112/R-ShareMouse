@@ -23,6 +23,39 @@ DEFINE_GUID(
     0x08,
     0x75);
 
+typedef struct RSHARE_PROBE_VDISPLAY_MODE {
+    DWORD Width;
+    DWORD Height;
+    DWORD RefreshRateMillihz;
+} RSHARE_PROBE_VDISPLAY_MODE;
+
+static const RSHARE_PROBE_VDISPLAY_MODE RSHARE_PROBE_VDISPLAY_MODES[] = {
+    {3840, 2160, 60000},
+    {2560, 1440, 144000},
+    {2560, 1440, 90000},
+    {2560, 1440, 60000},
+    {1920, 1080, 144000},
+    {1920, 1080, 90000},
+    {1920, 1080, 60000},
+    {1600, 900, 60000},
+    {1280, 720, 90000},
+    {1280, 720, 60000},
+    {1024, 768, 75000},
+    {1024, 768, 60000},
+};
+
+static BOOL vdisplay_is_supported_mode(DWORD width, DWORD height, DWORD refreshRateMillihz)
+{
+    for (size_t index = 0; index < ARRAYSIZE(RSHARE_PROBE_VDISPLAY_MODES); index++) {
+        RSHARE_PROBE_VDISPLAY_MODE mode = RSHARE_PROBE_VDISPLAY_MODES[index];
+        if (mode.Width == width && mode.Height == height && mode.RefreshRateMillihz == refreshRateMillihz) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static void print_usage(void)
 {
     wprintf(L"usage:\n");
@@ -279,6 +312,15 @@ static int probe_vdisplay(int argc, wchar_t** argv)
         request.Width = argc > 3 ? wcstoul(argv[3], NULL, 10) : 1920;
         request.Height = argc > 4 ? wcstoul(argv[4], NULL, 10) : 1080;
         request.RefreshRateMillihz = argc > 5 ? wcstoul(argv[5], NULL, 10) : 60000;
+        if (!vdisplay_is_supported_mode(request.Width, request.Height, request.RefreshRateMillihz)) {
+            wprintf(
+                L"unsupported vdisplay mode %lux%lu@%lu; use a driver-reported mode\n",
+                request.Width,
+                request.Height,
+                request.RefreshRateMillihz);
+            CloseHandle(device);
+            return 19;
+        }
 
         if (!DeviceIoControl(device, IOCTL_RSHARE_VDISPLAY_CREATE, &request, sizeof(request), NULL, 0, &returned, NULL)) {
             wprintf(L"vdisplay create failed: %lu\n", GetLastError());

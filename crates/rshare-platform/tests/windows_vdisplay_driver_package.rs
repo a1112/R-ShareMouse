@@ -118,6 +118,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("{1920, 1080, 144000}"));
     assert!(driver.contains("{1920, 1080, 90000}"));
     assert!(driver.contains("{1024, 768, 75000}"));
+    assert!(driver.contains("RShareIsSupportedMode"));
+    assert!(driver.contains(
+        "!RShareIsSupportedMode(request.Width, request.Height, request.RefreshRateMillihz)"
+    ));
+    assert!(driver.contains("return STATUS_NOT_SUPPORTED"));
     assert!(driver.contains(
         "const DWORD refreshMillihz = RShareRefreshMillihzFromSignalInfo(path.TargetVideoSignalInfo)"
     ));
@@ -213,6 +218,9 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_CREATE"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_REMOVE"));
     assert!(probe.contains("vdisplay_activity_name"));
+    assert!(probe.contains("vdisplay_is_supported_mode"));
+    assert!(probe.contains("unsupported vdisplay mode"));
+    assert!(probe.contains("return 19"));
     assert!(probe.contains("RSHARE_VDISPLAY_ACTIVITY_PENDING"));
     assert!(probe.contains("activity=%s"));
     assert!(probe.contains("vdisplay create"));

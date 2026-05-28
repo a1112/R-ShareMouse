@@ -87,6 +87,17 @@ static std::vector<RShareDisplayMode> RShareModesForState(const RSHARE_VDISPLAY_
     return modes;
 }
 
+static bool RShareIsSupportedMode(DWORD width, DWORD height, DWORD refreshRateMillihz)
+{
+    for (const auto& mode : RShareMonitorModes) {
+        if (mode.Width == width && mode.Height == height && mode.RefreshRateMillihz == refreshRateMillihz) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static DWORD RShareRefreshMillihzFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo)
 {
     UINT denominator = signalInfo.vSyncFreq.Denominator == 0 ? 1 : signalInfo.vSyncFreq.Denominator;
@@ -630,6 +641,9 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
 {
     if (request.Width == 0 || request.Height == 0 || request.RefreshRateMillihz == 0) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (!RShareIsSupportedMode(request.Width, request.Height, request.RefreshRateMillihz)) {
+        return STATUS_NOT_SUPPORTED;
     }
 
     m_State.Width = request.Width;
