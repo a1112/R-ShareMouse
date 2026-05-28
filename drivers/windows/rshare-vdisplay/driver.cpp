@@ -466,7 +466,8 @@ RShareVirtualDisplayDevice::RShareVirtualDisplayDevice(WDFDEVICE device)
     : m_Device(device),
       m_Adapter(nullptr),
       m_Monitor(nullptr),
-      m_State{}
+      m_State{},
+      m_MonitorRequested(false)
 {
     m_State.Abi = RSHARE_DRIVER_ABI;
     m_State.Active = 0;
@@ -558,6 +559,13 @@ void RShareVirtualDisplayDevice::ReportMonitorArrival(UINT connectorIndex)
     }
 }
 
+void RShareVirtualDisplayDevice::ReportPendingMonitorArrival()
+{
+    if (m_MonitorRequested) {
+        ReportMonitorArrival(0);
+    }
+}
+
 NTSTATUS RShareVirtualDisplayDevice::QueryState(PRSHARE_VDISPLAY_STATE state, size_t outputSize)
 {
     if (state == nullptr || outputSize < sizeof(RSHARE_VDISPLAY_STATE)) {
@@ -577,6 +585,7 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     m_State.Width = request.Width;
     m_State.Height = request.Height;
     m_State.RefreshRateMillihz = request.RefreshRateMillihz;
+    m_MonitorRequested = true;
     if (m_Monitor != nullptr) {
         auto monitorContext = RShareGetMonitorContext(m_Monitor);
         if (monitorContext != nullptr && monitorContext->Monitor != nullptr) {
@@ -585,7 +594,7 @@ NTSTATUS RShareVirtualDisplayDevice::CreateOrUpdateMonitor(const RSHARE_VDISPLAY
     }
 
     if (m_Adapter == nullptr) {
-        return STATUS_DEVICE_NOT_READY;
+        return STATUS_SUCCESS;
     }
 
     ReportMonitorArrival(0);
@@ -642,6 +651,7 @@ NTSTATUS RShareVirtualDisplayDevice::RemoveMonitor()
         m_Monitor = nullptr;
     }
 
+    m_MonitorRequested = false;
     m_State.Active = 0;
     return STATUS_SUCCESS;
 }
@@ -658,6 +668,7 @@ NTSTATUS RShareVDisplayAdapterInitFinished(IDDCX_ADAPTER adapterObject, const ID
         return STATUS_DEVICE_NOT_READY;
     }
 
+    context->Device->ReportPendingMonitorArrival();
     return STATUS_SUCCESS;
 }
 

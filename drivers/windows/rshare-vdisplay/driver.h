@@ -97,11 +97,13 @@ namespace RShare::VirtualDisplay
         NTSTATUS CommitModes(const IDARG_IN_COMMITMODES* inArgs);
         NTSTATUS RemoveMonitor();
         void ReportMonitorArrival(UINT connectorIndex);
+        void ReportPendingMonitorArrival();
 
     private:
         WDFDEVICE m_Device;
         IDDCX_ADAPTER m_Adapter;
         IDDCX_MONITOR m_Monitor;
         RSHARE_VDISPLAY_STATE m_State;
+        bool m_MonitorRequested;
     };
 }
