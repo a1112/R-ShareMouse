@@ -141,7 +141,10 @@ impl VirtualDisplayManager {
         }
 
         for display in self.displays.values_mut() {
-            if display.status == VirtualDisplayStatus::Active && !platform_ids.contains(&display.id)
+            if matches!(
+                display.status,
+                VirtualDisplayStatus::Active | VirtualDisplayStatus::Pending
+            ) && !platform_ids.contains(&display.id)
             {
                 display.status = VirtualDisplayStatus::Removed;
                 display.display_id = None;
@@ -7747,6 +7750,31 @@ mod tests {
             status: rshare_core::VirtualDisplayStatus::Active,
             display_id: Some("windows-display-rshare".to_string()),
             message: None,
+        }]);
+
+        let changed = manager.sync_platform_displays(Vec::new());
+
+        assert!(changed);
+        let displays = manager.list();
+        assert_eq!(
+            displays[0].status,
+            rshare_core::VirtualDisplayStatus::Removed
+        );
+        assert_eq!(displays[0].display_id, None);
+    }
+
+    #[test]
+    fn virtual_display_manager_sync_marks_missing_pending_platform_display_removed() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: rshare_core::VirtualDisplayStatus::Pending,
+            display_id: None,
+            message: Some("waiting for IddCx arrival".to_string()),
         }]);
 
         let changed = manager.sync_platform_displays(Vec::new());
