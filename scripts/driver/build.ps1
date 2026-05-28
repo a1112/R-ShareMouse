@@ -160,9 +160,9 @@ if ($cl -or $vsInstall) {
     if ($vcInclude -and (Test-Path $vcInclude)) {
         $includeArgs = @("/I$vcInclude") + $includeArgs
     }
-    $linkArgs = @("/link", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib")
+    $linkArgs = @("/link", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib", "Cfgmgr32.lib")
     if ($vcLib -and (Test-Path $vcLib)) {
-        $linkArgs = @("/link", "/LIBPATH:$vcLib", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib")
+        $linkArgs = @("/link", "/LIBPATH:$vcLib", "/LIBPATH:$sdkUmLib", "/LIBPATH:$sdkUcrtLib", "Cfgmgr32.lib")
     }
 
     & $clPath /nologo /W4 /WX $includeArgs $probe "/Fo$probeObj" "/Fe$probeOut" $linkArgs

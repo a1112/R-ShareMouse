@@ -72,10 +72,13 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(install_script.contains("ROOT\\RShareVDisplay"));
 
     assert!(probe.contains("probe_vdisplay"));
-    assert!(probe.contains("RSHARE_VDISPLAY_DOS_DEVICE_NAME"));
+    assert!(probe.contains("GUID_DEVINTERFACE_RSHARE_VDISPLAY"));
+    assert!(probe.contains("CM_Get_Device_Interface_List_SizeW"));
+    assert!(probe.contains("CM_Get_Device_Interface_ListW"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_QUERY_STATE"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_CREATE"));
     assert!(probe.contains("IOCTL_RSHARE_VDISPLAY_REMOVE"));
     assert!(probe.contains("vdisplay create"));
     assert!(probe.contains("vdisplay remove"));
+    assert!(build_script.contains("Cfgmgr32.lib"));
 }

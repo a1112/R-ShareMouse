@@ -1,10 +1,27 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cfgmgr32.h>
+#include <initguid.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 
 #include "..\rshare-common\rshare_ioctls.h"
+
+// {8c1fd719-6fb8-4f82-a4d2-07c6fd490875}
+DEFINE_GUID(
+    GUID_DEVINTERFACE_RSHARE_VDISPLAY,
+    0x8c1fd719,
+    0x6fb8,
+    0x4f82,
+    0xa4,
+    0xd2,
+    0x07,
+    0xc6,
+    0xfd,
+    0x49,
+    0x08,
+    0x75);
 
 static void print_usage(void)
 {
@@ -30,6 +47,48 @@ static HANDLE open_device(const wchar_t* path, const wchar_t* label)
         wprintf(L"%ls open failed: %lu\n", label, GetLastError());
     }
     return device;
+}
+
+static wchar_t* first_device_interface_path(GUID* interface_guid)
+{
+    ULONG length = 0;
+    CONFIGRET status = CM_Get_Device_Interface_List_SizeW(
+        &length,
+        interface_guid,
+        NULL,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (status != CR_SUCCESS || length <= 1) {
+        wprintf(L"vdisplay interface list size failed: 0x%08lx length=%lu\n", status, length);
+        return NULL;
+    }
+
+    wchar_t* buffer = (wchar_t*)calloc(length, sizeof(wchar_t));
+    if (buffer == NULL) {
+        wprintf(L"vdisplay interface allocation failed\n");
+        return NULL;
+    }
+
+    status = CM_Get_Device_Interface_ListW(
+        interface_guid,
+        NULL,
+        buffer,
+        length,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    if (status != CR_SUCCESS || buffer[0] == L'\0') {
+        wprintf(L"vdisplay interface list failed: 0x%08lx\n", status);
+        free(buffer);
+        return NULL;
+    }
+
+    size_t first_len = wcslen(buffer);
+    wchar_t* path = (wchar_t*)calloc(first_len + 1, sizeof(wchar_t));
+    if (path == NULL) {
+        free(buffer);
+        return NULL;
+    }
+    wcscpy_s(path, first_len + 1, buffer);
+    free(buffer);
+    return path;
 }
 
 static int probe_filter(void)
@@ -168,7 +227,14 @@ static int probe_vdisplay(int argc, wchar_t** argv)
         return 13;
     }
 
-    HANDLE device = open_device(RSHARE_VDISPLAY_DOS_DEVICE_NAME, L"vdisplay");
+    GUID interface_guid = GUID_DEVINTERFACE_RSHARE_VDISPLAY;
+    wchar_t* path = first_device_interface_path(&interface_guid);
+    if (path == NULL) {
+        return 14;
+    }
+
+    HANDLE device = open_device(path, L"vdisplay");
+    free(path);
     if (device == INVALID_HANDLE_VALUE) {
         return 14;
     }
