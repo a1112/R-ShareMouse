@@ -6,6 +6,8 @@ use rshare_core::{
     VirtualDisplayStatus,
 };
 
+const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
+
 #[derive(Subcommand)]
 pub enum DisplayCommand {
     /// Validate virtual display visibility through daemon display state
@@ -227,8 +229,17 @@ fn display_matches_mode(
     display.width == width
         && display.height == height
         && refresh_rate_millihz
-            .map(|expected| display.refresh_rate_millihz == Some(expected))
+            .map(|expected| {
+                display
+                    .refresh_rate_millihz
+                    .map(|actual| refresh_rate_matches(actual, expected))
+                    .unwrap_or(false)
+            })
             .unwrap_or(true)
+}
+
+fn refresh_rate_matches(actual_millihz: u32, expected_millihz: u32) -> bool {
+    actual_millihz.abs_diff(expected_millihz) <= REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ
 }
 
 #[cfg(test)]
@@ -305,6 +316,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("has no Windows display id yet"));
+    }
+
+    #[test]
+    fn verify_virtual_display_accepts_small_refresh_rounding_delta() {
+        let virtual_display = VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        };
+        let local_display = LocalDisplayState {
+            displays: vec![LocalDisplayInfo {
+                display_id: "windows-display-rshare".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(59940),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = verify_virtual_display_topology(
+            &[virtual_display],
+            &local_display,
+            1920,
+            1080,
+            Some(60000),
+        );
+
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

@@ -27,6 +27,7 @@ const RSHARE_DEFAULT_VDISPLAY_ID: &str = "rshare-vdisplay-1";
 const RSHARE_VDISPLAY_ACTIVITY_REMOVED: u16 = 0;
 const RSHARE_VDISPLAY_ACTIVITY_ACTIVE: u16 = 1;
 const RSHARE_VDISPLAY_ACTIVITY_PENDING: u16 = 2;
+const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
 
 pub fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
     #[cfg(windows)]
@@ -258,10 +259,10 @@ fn virtual_display_matches_local_display(
         return false;
     }
 
-    let refresh_matches = match display.refresh_rate_millihz {
-        Some(refresh) => refresh == state.refresh_rate_millihz,
-        None => true,
-    };
+    let refresh_matches = display
+        .refresh_rate_millihz
+        .map(|refresh| refresh_rate_matches(refresh, state.refresh_rate_millihz))
+        .unwrap_or(true);
     if !refresh_matches {
         return false;
     }
@@ -279,6 +280,10 @@ fn virtual_display_matches_local_display(
     });
 
     name_hint
+}
+
+fn refresh_rate_matches(actual_millihz: u32, expected_millihz: u32) -> bool {
+    actual_millihz.abs_diff(expected_millihz) <= REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ
 }
 
 fn operation_from_driver_state(
@@ -872,5 +877,42 @@ mod tests {
         .expect("driver state should map to matched display snapshot");
 
         assert_eq!(snapshot.display_id.as_deref(), Some("windows-display-real"));
+    }
+
+    #[test]
+    fn active_driver_state_matches_windows_display_with_refresh_rounding_delta() {
+        let display_state = LocalDisplayState {
+            displays: vec![LocalDisplayInfo {
+                display_id: "windows-display-rounded-refresh".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(59_940),
+                friendly_name: Some("R-SHAREMOUSE".to_string()),
+                active: true,
+                ..LocalDisplayInfo::default()
+            }],
+            ..LocalDisplayState::default()
+        };
+
+        let snapshot = snapshot_from_driver_state_with_displays(
+            "vd-1",
+            Some("R-ShareMouse Virtual Display".to_string()),
+            RShareVdisplayStateRaw {
+                abi: RSHARE_DRIVER_ABI,
+                active: RSHARE_VDISPLAY_ACTIVITY_ACTIVE,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: 60_000,
+                connector_index: 0,
+            },
+            Some(&display_state),
+            None,
+        )
+        .expect("driver state should map to rounded display snapshot");
+
+        assert_eq!(
+            snapshot.display_id.as_deref(),
+            Some("windows-display-rounded-refresh")
+        );
     }
 }
