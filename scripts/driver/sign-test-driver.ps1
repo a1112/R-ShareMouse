@@ -50,6 +50,11 @@ function Get-DriverPackages {
             Directory = Join-Path $root "drivers\windows\rshare-vhid\$Platform\$Configuration\rshare-vhid"
             Catalog = "rshare-vhid.cat"
         }
+        $packages += [pscustomobject]@{
+            Name = "rshare-vdisplay"
+            Directory = Join-Path $root "drivers\windows\rshare-vdisplay\$Platform\$Configuration\rshare-vdisplay"
+            Catalog = "rshare-vdisplay.cat"
+        }
     }
 
     if ($IncludeFilter -or $FilterOnly) {

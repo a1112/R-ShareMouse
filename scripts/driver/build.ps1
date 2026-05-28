@@ -9,7 +9,8 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $projects = @(
     (Join-Path $root "drivers\windows\rshare-filter\rshare-filter.vcxproj"),
-    (Join-Path $root "drivers\windows\rshare-vhid\rshare-vhid.vcxproj")
+    (Join-Path $root "drivers\windows\rshare-vhid\rshare-vhid.vcxproj"),
+    (Join-Path $root "drivers\windows\rshare-vdisplay\rshare-vdisplay.vcxproj")
 )
 
 function Find-VisualStudioInstall {
@@ -98,9 +99,11 @@ if (-not $kitRoot -or -not (Test-Path $kitRoot)) {
 }
 
 $ntddk = Get-ChildItem -Path (Join-Path $kitRoot "Include") -Recurse -Filter ntddk.h -ErrorAction SilentlyContinue | Select-Object -First 1
+$iddCxHeader = Get-ChildItem -Path (Join-Path $kitRoot "Include") -Recurse -Filter iddcx.h -ErrorAction SilentlyContinue | Select-Object -First 1
 $wdfLib = Get-ChildItem -Path (Join-Path $kitRoot "Lib") -Recurse -Filter WdfDriverEntry.lib -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $ntddk -or -not $wdfLib) {
-    throw "WDK headers/libs are incomplete under $kitRoot. Missing ntddk.h or WdfDriverEntry.lib. Install the Windows Driver Kit driver headers/libraries for x64."
+$iddCxLib = Get-ChildItem -Path (Join-Path $kitRoot "Lib") -Recurse -Filter IddCxStub.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $ntddk -or -not $iddCxHeader -or -not $wdfLib -or -not $iddCxLib) {
+    throw "WDK headers/libs are incomplete under $kitRoot. Missing ntddk.h, iddcx.h, WdfDriverEntry.lib, or IddCxStub.lib. Install the Windows Driver Kit with Indirect Display Driver Class Extension support for x64."
 }
 
 foreach ($project in $projects) {

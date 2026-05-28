@@ -84,6 +84,12 @@ function Get-DriverPackages {
             HardwareId = "ROOT\RSHAREVHID"
             UseDevCon = $true
         }
+        $packages += [pscustomobject]@{
+            Name = "rshare-vdisplay"
+            Inf = Join-Path $root "drivers\windows\rshare-vdisplay\$Platform\$Configuration\rshare-vdisplay\rshare-vdisplay.inf"
+            HardwareId = "ROOT\RShareVDisplay"
+            UseDevCon = $true
+        }
     }
 
     if ($IncludeFilter -or $FilterOnly) {
