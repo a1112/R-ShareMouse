@@ -163,6 +163,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("WaitForManualModeChange"));
     assert!(validate_vdisplay_script.contains("vdisplay state abi="));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual verify"));
+    assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual create"));
+    assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- display virtual remove"));
+    assert!(validate_vdisplay_script.contains("Invoke-DaemonVirtualDisplayCreate"));
+    assert!(validate_vdisplay_script.contains("Invoke-DaemonVirtualDisplayRemove"));
     assert!(validate_vdisplay_script.contains("VerifyDaemonDisplayTopology"));
     assert!(validate_vdisplay_script.contains("EnsureDaemonForTopologyVerification"));
     assert!(validate_vdisplay_script.contains("cargo build -p rshare-daemon -p rshare-cli"));

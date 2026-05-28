@@ -1,7 +1,9 @@
 use anyhow::{bail, Result};
 use clap::Subcommand;
 use rshare_core::{
-    LocalDisplayInfo, LocalDisplayState, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    LocalDisplayInfo, LocalDisplayState, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 
 #[derive(Subcommand)]
@@ -15,6 +17,26 @@ pub enum DisplayCommand {
 
 #[derive(Subcommand)]
 pub enum VirtualDisplayCommand {
+    /// List virtual displays known to the daemon
+    List,
+    /// Create or retry creating a daemon-managed virtual display
+    Create {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        #[arg(long, default_value_t = 60000)]
+        refresh_rate_millihz: u32,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a daemon-managed virtual display
+    Remove {
+        #[arg(long, default_value = "rshare-vdisplay-1")]
+        id: String,
+    },
     /// Verify the active virtual display appears in the Windows display topology
     Verify {
         #[arg(long)]
@@ -34,6 +56,39 @@ pub async fn execute(command: DisplayCommand) -> Result<()> {
 
 async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
     match command {
+        VirtualDisplayCommand::List => {
+            let displays = rshare_core::daemon_client::request_virtual_displays().await?;
+            println!("{}", format_virtual_display_list(&displays));
+            Ok(())
+        }
+        VirtualDisplayCommand::Create {
+            id,
+            width,
+            height,
+            refresh_rate_millihz,
+            name,
+        } => {
+            let result = rshare_core::daemon_client::request_create_virtual_display(
+                VirtualDisplayCreateRequest {
+                    id,
+                    width,
+                    height,
+                    refresh_rate_millihz: Some(refresh_rate_millihz),
+                    name,
+                },
+            )
+            .await?;
+            println!("{}", format_virtual_display_operation(&result));
+            Ok(())
+        }
+        VirtualDisplayCommand::Remove { id } => {
+            let result = rshare_core::daemon_client::request_remove_virtual_display(
+                VirtualDisplayRemoveRequest { id },
+            )
+            .await?;
+            println!("{}", format_virtual_display_operation(&result));
+            Ok(())
+        }
         VirtualDisplayCommand::Verify {
             width,
             height,
@@ -52,6 +107,60 @@ async fn execute_virtual(command: VirtualDisplayCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn format_virtual_display_list(displays: &[VirtualDisplaySnapshot]) -> String {
+    if displays.is_empty() {
+        return "no virtual displays reported by daemon".to_string();
+    }
+
+    displays
+        .iter()
+        .map(format_virtual_display_snapshot)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_virtual_display_operation(result: &VirtualDisplayOperationResult) -> String {
+    let mut lines = vec![format!("virtual display operation: {:?}", result.status)];
+    if let Some(display) = result.display.as_ref() {
+        lines.push(format_virtual_display_snapshot(display));
+    }
+    if let Some(message) = result
+        .message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+    {
+        lines.push(format!("message: {message}"));
+    }
+    lines.join("\n")
+}
+
+fn format_virtual_display_snapshot(display: &VirtualDisplaySnapshot) -> String {
+    let refresh = display
+        .refresh_rate_millihz
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let display_id = display.display_id.as_deref().unwrap_or("unmatched");
+    let name = display.name.as_deref().unwrap_or("unnamed");
+    let message = display
+        .message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+        .map(|message| format!(" message=\"{message}\""))
+        .unwrap_or_default();
+
+    format!(
+        "{} {:?} {}x{}@{} display_id={} name=\"{}\"{}",
+        display.id,
+        display.status,
+        display.width,
+        display.height,
+        refresh,
+        display_id,
+        name,
+        message
+    )
 }
 
 fn verify_virtual_display_topology(
@@ -170,5 +279,48 @@ mod tests {
         );
 
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn format_virtual_display_list_includes_system_identity_and_mode() {
+        let output = format_virtual_display_list(&[VirtualDisplaySnapshot {
+            id: "rshare-vdisplay-1".to_string(),
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: Some(144000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+            status: VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+
+        assert!(output.contains("rshare-vdisplay-1"));
+        assert!(output.contains("Active"));
+        assert!(output.contains("2560x1440@144000"));
+        assert!(output.contains("windows-display-rshare"));
+    }
+
+    #[test]
+    fn format_virtual_display_operation_includes_result_snapshot() {
+        let output =
+            format_virtual_display_operation(&rshare_core::VirtualDisplayOperationResult {
+                status: rshare_core::VirtualDisplayOperationStatus::Created,
+                display: Some(VirtualDisplaySnapshot {
+                    id: "rshare-vdisplay-1".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate_millihz: Some(60000),
+                    name: Some("R-ShareMouse Virtual Display".to_string()),
+                    status: VirtualDisplayStatus::Active,
+                    display_id: Some("windows-display-rshare".to_string()),
+                    message: None,
+                }),
+                message: Some("created".to_string()),
+            });
+
+        assert!(output.contains("Created"));
+        assert!(output.contains("rshare-vdisplay-1"));
+        assert!(output.contains("1920x1080@60000"));
+        assert!(output.contains("created"));
     }
 }

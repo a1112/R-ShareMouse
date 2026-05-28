@@ -118,6 +118,54 @@ function Invoke-DaemonDisplayTopologyVerification(
     $output | ForEach-Object { Write-Host $_ }
 }
 
+function Invoke-DaemonVirtualDisplayCreate {
+    # cargo run -p rshare-cli -- display virtual create
+    $args = @(
+        "run",
+        "-p",
+        "rshare-cli",
+        "--",
+        "display",
+        "virtual",
+        "create",
+        "--width",
+        "$Width",
+        "--height",
+        "$Height",
+        "--refresh-rate-millihz",
+        "$RefreshRateMillihz",
+        "--name",
+        "R-ShareMouse Virtual Display"
+    )
+    $output = & cargo @args
+    if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
+        throw "Daemon virtual display create failed. Ensure rshare-daemon is running, then re-run this script."
+    }
+    $output | ForEach-Object { Write-Host $_ }
+}
+
+function Invoke-DaemonVirtualDisplayRemove {
+    # cargo run -p rshare-cli -- display virtual remove
+    $args = @(
+        "run",
+        "-p",
+        "rshare-cli",
+        "--",
+        "display",
+        "virtual",
+        "remove",
+        "--id",
+        "rshare-vdisplay-1"
+    )
+    $output = & cargo @args
+    if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
+        throw "Daemon virtual display remove failed. Ensure rshare-daemon is running, then remove the display manually if needed."
+    }
+    $output | ForEach-Object { Write-Host $_ }
+}
+
 Assert-Admin
 
 Invoke-Step "Check WDK and IddCx environment" {
@@ -140,8 +188,18 @@ Invoke-Step "Probe installed virtual display driver" {
     Invoke-Probe @("vdisplay", "status") | Out-Null
 }
 
+if ($VerifyDaemonDisplayTopology) {
+    Invoke-Step "Ensure daemon for virtual display control" {
+        EnsureDaemonForTopologyVerification
+    }
+}
+
 Invoke-Step "Create virtual display" {
-    Invoke-Probe @("vdisplay", "create", "$Width", "$Height", "$RefreshRateMillihz") | Out-Null
+    if ($VerifyDaemonDisplayTopology) {
+        Invoke-DaemonVirtualDisplayCreate
+    } else {
+        Invoke-Probe @("vdisplay", "create", "$Width", "$Height", "$RefreshRateMillihz") | Out-Null
+    }
 }
 
 Invoke-Step "Confirm driver state after create" {
@@ -152,10 +210,6 @@ Invoke-Step "Confirm driver state after create" {
 }
 
 if ($VerifyDaemonDisplayTopology) {
-    Invoke-Step "Ensure daemon for topology verification" {
-        EnsureDaemonForTopologyVerification
-    }
-
     Invoke-Step "Verify daemon display topology" {
         Invoke-DaemonDisplayTopologyVerification -ExpectedWidth $Width -ExpectedHeight $Height -ExpectedRefreshRateMillihz $RefreshRateMillihz
     }
@@ -189,7 +243,11 @@ if ($WaitForManualModeChange) {
 
 if (-not $KeepDisplay) {
     Invoke-Step "Remove virtual display" {
-        Invoke-Probe @("vdisplay", "remove") | Out-Null
+        if ($VerifyDaemonDisplayTopology) {
+            Invoke-DaemonVirtualDisplayRemove
+        } else {
+            Invoke-Probe @("vdisplay", "remove") | Out-Null
+        }
     }
 }
 
