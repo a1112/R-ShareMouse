@@ -119,6 +119,8 @@ struct VirtualDisplayManager {
     displays: BTreeMap<String, VirtualDisplaySnapshot>,
 }
 
+const DEFAULT_VIRTUAL_DISPLAY_ID: &str = "rshare-vdisplay-1";
+
 impl VirtualDisplayManager {
     fn list(&self) -> Vec<VirtualDisplaySnapshot> {
         self.displays.values().cloned().collect()
@@ -151,7 +153,7 @@ impl VirtualDisplayManager {
     }
 
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
-        let id = virtual_display_request_id(request.id.as_deref(), self.displays.len() + 1);
+        let id = virtual_display_request_id(request.id.as_deref());
         if let Some(existing) = self.displays.get(&id) {
             if !virtual_display_status_allows_create_retry(existing.status)
                 && virtual_display_matches_create_request(existing, &request)
@@ -212,11 +214,11 @@ impl VirtualDisplayManager {
     }
 }
 
-fn virtual_display_request_id(id: Option<&str>, ordinal: usize) -> String {
+fn virtual_display_request_id(id: Option<&str>) -> String {
     id.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("rshare-vdisplay-{ordinal}"))
+        .unwrap_or_else(|| DEFAULT_VIRTUAL_DISPLAY_ID.to_string())
 }
 
 fn valid_virtual_display_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
@@ -7599,6 +7601,36 @@ mod tests {
         assert_eq!(retry.status, expected);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
+    }
+
+    #[test]
+    fn virtual_display_manager_reuses_default_id_after_existing_default_record() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let first = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: None,
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        });
+        let retry = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: None,
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: Some(144_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        });
+
+        assert_eq!(
+            first.display.as_ref().map(|display| display.id.as_str()),
+            Some("rshare-vdisplay-1")
+        );
+        assert_eq!(
+            retry.display.as_ref().map(|display| display.id.as_str()),
+            Some("rshare-vdisplay-1")
+        );
+        assert_eq!(manager.list().len(), 1);
     }
 
     #[test]
