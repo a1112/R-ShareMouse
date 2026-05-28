@@ -16,6 +16,20 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $RefreshRateToleranceMillihz = 1000
+$SupportedVirtualDisplayModes = @(
+    @{ Width = 3840; Height = 2160; RefreshRateMillihz = 60000 },
+    @{ Width = 2560; Height = 1440; RefreshRateMillihz = 144000 },
+    @{ Width = 2560; Height = 1440; RefreshRateMillihz = 90000 },
+    @{ Width = 2560; Height = 1440; RefreshRateMillihz = 60000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 144000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 90000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 60000 },
+    @{ Width = 1600; Height = 900; RefreshRateMillihz = 60000 },
+    @{ Width = 1280; Height = 720; RefreshRateMillihz = 90000 },
+    @{ Width = 1280; Height = 720; RefreshRateMillihz = 60000 },
+    @{ Width = 1024; Height = 768; RefreshRateMillihz = 75000 },
+    @{ Width = 1024; Height = 768; RefreshRateMillihz = 60000 }
+)
 
 function Assert-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -73,6 +87,33 @@ function Read-VDisplayState {
 
 function Test-RefreshRateMatch([uint32]$ActualMillihz, [uint32]$ExpectedMillihz) {
     return [Math]::Abs([int64]$ActualMillihz - [int64]$ExpectedMillihz) -le $RefreshRateToleranceMillihz
+}
+
+function Test-SupportedVirtualDisplayMode(
+    [uint32]$Width,
+    [uint32]$Height,
+    [uint32]$RefreshRateMillihz
+) {
+    foreach ($mode in $SupportedVirtualDisplayModes) {
+        if ($mode.Width -eq $Width -and $mode.Height -eq $Height -and $mode.RefreshRateMillihz -eq $RefreshRateMillihz) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-SupportedVirtualDisplayMode(
+    [uint32]$Width,
+    [uint32]$Height,
+    [uint32]$RefreshRateMillihz
+) {
+    if (Test-SupportedVirtualDisplayMode -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz) {
+        return
+    }
+
+    $supported = $SupportedVirtualDisplayModes |
+        ForEach-Object { "$($_.Width)x$($_.Height)@$($_.RefreshRateMillihz)" }
+    throw "Unsupported virtual display validation mode ${Width}x${Height}@${RefreshRateMillihz}. Supported modes: $($supported -join ', ')"
 }
 
 function WaitForVirtualDisplayActive(
@@ -221,6 +262,7 @@ function Invoke-DaemonVirtualDisplayRemove {
     $output | ForEach-Object { Write-Host $_ }
 }
 
+Assert-SupportedVirtualDisplayMode -Width $Width -Height $Height -RefreshRateMillihz $RefreshRateMillihz
 Assert-Admin
 
 Invoke-Step "Check WDK and IddCx environment" {
