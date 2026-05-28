@@ -33,7 +33,7 @@ namespace RShare::VirtualDisplay
     {
         DWORD Width;
         DWORD Height;
-        DWORD RefreshRate;
+        DWORD RefreshRateMillihz;
     };
 
     class RShareDirect3DDevice

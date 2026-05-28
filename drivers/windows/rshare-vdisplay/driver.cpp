@@ -23,10 +23,10 @@ DEFINE_GUID(
 static constexpr DWORD RSHARE_VDISPLAY_MONITOR_COUNT = 1;
 
 static const RShareDisplayMode RShareMonitorModes[] = {
-    {1920, 1080, 60},
-    {1600, 900, 60},
-    {1280, 720, 60},
-    {1024, 768, 60},
+    {1920, 1080, 60000},
+    {1600, 900, 60000},
+    {1280, 720, 60000},
+    {1024, 768, 60000},
 };
 
 static RShareDisplayMode RShareModeFromState(const RSHARE_VDISPLAY_STATE& state)
@@ -34,7 +34,7 @@ static RShareDisplayMode RShareModeFromState(const RSHARE_VDISPLAY_STATE& state)
     return {
         state.Width == 0 ? RShareMonitorModes[0].Width : state.Width,
         state.Height == 0 ? RShareMonitorModes[0].Height : state.Height,
-        state.RefreshRateMillihz == 0 ? RShareMonitorModes[0].RefreshRate : state.RefreshRateMillihz / 1000,
+        state.RefreshRateMillihz == 0 ? RShareMonitorModes[0].RefreshRateMillihz : state.RefreshRateMillihz,
     };
 }
 
@@ -46,7 +46,7 @@ static std::vector<RShareDisplayMode> RShareModesForState(const RSHARE_VDISPLAY_
     for (const auto& mode : RShareMonitorModes) {
         bool duplicate = false;
         for (const auto& existing : modes) {
-            if (existing.Width == mode.Width && existing.Height == mode.Height && existing.RefreshRate == mode.RefreshRate) {
+            if (existing.Width == mode.Width && existing.Height == mode.Height && existing.RefreshRateMillihz == mode.RefreshRateMillihz) {
                 duplicate = true;
                 break;
             }
@@ -65,7 +65,7 @@ static DWORD RShareRefreshMillihzFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGNAL
     UINT divider = signalInfo.AdditionalSignalInfo.vSyncFreqDivider == 0 ? 1 : signalInfo.AdditionalSignalInfo.vSyncFreqDivider;
     UINT64 millihz = (static_cast<UINT64>(signalInfo.vSyncFreq.Numerator) * 1000u) / denominator;
     millihz /= divider;
-    return millihz == 0 ? RShareMonitorModes[0].RefreshRate * 1000 : static_cast<DWORD>(millihz);
+    return millihz == 0 ? RShareMonitorModes[0].RefreshRateMillihz : static_cast<DWORD>(millihz);
 }
 
 static RShareDisplayMode RShareModeFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo)
@@ -73,7 +73,7 @@ static RShareDisplayMode RShareModeFromSignalInfo(const DISPLAYCONFIG_VIDEO_SIGN
     return {
         signalInfo.activeSize.cx == 0 ? signalInfo.totalSize.cx : signalInfo.activeSize.cx,
         signalInfo.activeSize.cy == 0 ? signalInfo.totalSize.cy : signalInfo.activeSize.cy,
-        RShareRefreshMillihzFromSignalInfo(signalInfo) / 1000,
+        RShareRefreshMillihzFromSignalInfo(signalInfo),
     };
 }
 
@@ -134,18 +134,18 @@ static void RShareFillSignalInfo(
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
     DWORD width,
     DWORD height,
-    DWORD refreshRate,
+    DWORD refreshRateMillihz,
     bool monitorMode)
 {
     signalInfo.totalSize.cx = width;
     signalInfo.totalSize.cy = height;
     signalInfo.activeSize.cx = width;
     signalInfo.activeSize.cy = height;
-    signalInfo.vSyncFreq.Numerator = refreshRate;
-    signalInfo.vSyncFreq.Denominator = 1;
-    signalInfo.hSyncFreq.Numerator = refreshRate * height;
-    signalInfo.hSyncFreq.Denominator = 1;
-    signalInfo.pixelRate = static_cast<UINT64>(refreshRate) * static_cast<UINT64>(width) * static_cast<UINT64>(height);
+    signalInfo.vSyncFreq.Numerator = refreshRateMillihz;
+    signalInfo.vSyncFreq.Denominator = 1000;
+    signalInfo.hSyncFreq.Numerator = refreshRateMillihz * height;
+    signalInfo.hSyncFreq.Denominator = 1000;
+    signalInfo.pixelRate = (static_cast<UINT64>(refreshRateMillihz) * static_cast<UINT64>(width) * static_cast<UINT64>(height)) / 1000u;
     signalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
     signalInfo.AdditionalSignalInfo.videoStandard = 255;
     signalInfo.AdditionalSignalInfo.vSyncFreqDivider = monitorMode ? 0 : 1;
@@ -156,7 +156,7 @@ static IDDCX_MONITOR_MODE RShareCreateMonitorMode(const RShareDisplayMode& mode)
     IDDCX_MONITOR_MODE monitorMode = {};
     monitorMode.Size = sizeof(monitorMode);
     monitorMode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    RShareFillSignalInfo(monitorMode.MonitorVideoSignalInfo, mode.Width, mode.Height, mode.RefreshRate, true);
+    RShareFillSignalInfo(monitorMode.MonitorVideoSignalInfo, mode.Width, mode.Height, mode.RefreshRateMillihz, true);
     return monitorMode;
 }
 
@@ -164,7 +164,7 @@ static IDDCX_TARGET_MODE RShareCreateTargetMode(const RShareDisplayMode& mode)
 {
     IDDCX_TARGET_MODE targetMode = {};
     targetMode.Size = sizeof(targetMode);
-    RShareFillSignalInfo(targetMode.TargetVideoSignalInfo.targetVideoSignalInfo, mode.Width, mode.Height, mode.RefreshRate, false);
+    RShareFillSignalInfo(targetMode.TargetVideoSignalInfo.targetVideoSignalInfo, mode.Width, mode.Height, mode.RefreshRateMillihz, false);
     return targetMode;
 }
 
@@ -370,7 +370,7 @@ RShareVirtualDisplayMonitor::RShareVirtualDisplayMonitor(IDDCX_MONITOR monitor)
     m_State.Abi = RSHARE_DRIVER_ABI;
     m_State.Width = RShareMonitorModes[0].Width;
     m_State.Height = RShareMonitorModes[0].Height;
-    m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRate * 1000;
+    m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRateMillihz;
 }
 
 RShareVirtualDisplayMonitor::~RShareVirtualDisplayMonitor()
@@ -456,7 +456,7 @@ RShareVirtualDisplayDevice::RShareVirtualDisplayDevice(WDFDEVICE device)
     m_State.Active = 0;
     m_State.Width = RShareMonitorModes[0].Width;
     m_State.Height = RShareMonitorModes[0].Height;
-    m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRate * 1000;
+    m_State.RefreshRateMillihz = RShareMonitorModes[0].RefreshRateMillihz;
     m_State.ConnectorIndex = 0;
 }
 

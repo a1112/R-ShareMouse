@@ -45,6 +45,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("RShareModeFromSignalInfo"));
     assert!(driver.contains("IDDCX_PATH_FLAGS_ACTIVE"));
     assert!(driver.contains("context->Device->CommitModes(inArgs)"));
+    assert!(driver.contains("RefreshRateMillihz"));
+    assert!(driver.contains("RShareFillSignalInfo("));
+    assert!(driver.contains("DWORD refreshRateMillihz"));
+    assert!(driver.contains("signalInfo.vSyncFreq.Numerator = refreshRateMillihz"));
+    assert!(driver.contains("signalInfo.vSyncFreq.Denominator = 1000"));
     assert!(driver.contains(
         "const DWORD refreshMillihz = RShareRefreshMillihzFromSignalInfo(path.TargetVideoSignalInfo)"
     ));
