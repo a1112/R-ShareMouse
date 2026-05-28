@@ -16,6 +16,8 @@ use rshare_core::{
     LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
     UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -191,6 +193,89 @@ fn ipc_contract_daemon_client_display_helpers_have_expected_signatures() {
     assert_identify_helper(rshare_core::daemon_client::request_identify_displays);
     assert_update_helper(rshare_core::daemon_client::request_update_display_settings);
     assert_open_helper(rshare_core::daemon_client::request_open_display_settings);
+}
+
+#[tokio::test]
+async fn virtual_display_requests_round_trip_over_json_lines() {
+    let requests = [
+        DaemonRequest::ListVirtualDisplays,
+        DaemonRequest::CreateVirtualDisplay(VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        }),
+        DaemonRequest::RemoveVirtualDisplay(VirtualDisplayRemoveRequest {
+            id: "vd-1".to_string(),
+        }),
+    ];
+
+    for request in requests {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, request);
+    }
+}
+
+#[tokio::test]
+async fn virtual_display_responses_round_trip_over_json_lines() {
+    let display = VirtualDisplaySnapshot {
+        id: "vd-1".to_string(),
+        width: 1920,
+        height: 1080,
+        refresh_rate_millihz: Some(60_000),
+        name: Some("R-ShareMouse Virtual Display".to_string()),
+        status: VirtualDisplayStatus::DriverUnavailable,
+        display_id: None,
+        message: Some("Windows virtual display driver is not installed".to_string()),
+    };
+    let responses = [
+        DaemonResponse::VirtualDisplays(vec![display.clone()]),
+        DaemonResponse::VirtualDisplayOperation(VirtualDisplayOperationResult {
+            status: VirtualDisplayOperationStatus::DriverUnavailable,
+            display: Some(display),
+            message: Some("Windows virtual display driver is not installed".to_string()),
+        }),
+    ];
+
+    for response in responses {
+        let (mut writer, mut reader) = duplex(4096);
+        write_json_line(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+        assert_eq!(decoded, response);
+    }
+}
+
+#[test]
+fn ipc_contract_daemon_client_virtual_display_helpers_have_expected_signatures() {
+    fn assert_list_helper<F, Fut>(_helper: F)
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<VirtualDisplaySnapshot>>>,
+    {
+    }
+
+    fn assert_create_helper<F, Fut>(_helper: F)
+    where
+        F: Fn(VirtualDisplayCreateRequest) -> Fut,
+        Fut: Future<Output = anyhow::Result<VirtualDisplayOperationResult>>,
+    {
+    }
+
+    fn assert_remove_helper<F, Fut>(_helper: F)
+    where
+        F: Fn(VirtualDisplayRemoveRequest) -> Fut,
+        Fut: Future<Output = anyhow::Result<VirtualDisplayOperationResult>>,
+    {
+    }
+
+    assert_list_helper(rshare_core::daemon_client::request_virtual_displays);
+    assert_create_helper(rshare_core::daemon_client::request_create_virtual_display);
+    assert_remove_helper(rshare_core::daemon_client::request_remove_virtual_display);
 }
 
 #[tokio::test]

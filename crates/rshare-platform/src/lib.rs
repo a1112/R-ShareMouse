@@ -40,6 +40,9 @@ pub mod system;
 // Cross-platform display settings helpers
 pub mod display;
 
+// Cross-platform virtual display control helpers
+pub mod virtual_display;
+
 // Experimental USB forwarding host runtime
 pub mod usb_forwarding;
 

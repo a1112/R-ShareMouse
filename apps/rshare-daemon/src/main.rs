@@ -27,7 +27,9 @@ use rshare_core::{
     RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
     TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
+    VirtualDisplaySnapshot,
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
@@ -112,6 +114,88 @@ struct PendingEndpointInject {
     result_tx: oneshot::Sender<EndpointInjectResult>,
 }
 
+#[derive(Debug, Default)]
+struct VirtualDisplayManager {
+    displays: BTreeMap<String, VirtualDisplaySnapshot>,
+}
+
+impl VirtualDisplayManager {
+    fn list(&self) -> Vec<VirtualDisplaySnapshot> {
+        self.displays.values().cloned().collect()
+    }
+
+    fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
+        let id = virtual_display_request_id(request.id.as_deref(), self.displays.len() + 1);
+        if self.displays.contains_key(&id) {
+            return VirtualDisplayOperationResult {
+                status: VirtualDisplayOperationStatus::AlreadyExists,
+                display: self.displays.get(&id).cloned(),
+                message: Some(format!("virtual display id {id} already exists")),
+            };
+        }
+
+        if !valid_virtual_display_mode(
+            request.width,
+            request.height,
+            request.refresh_rate_millihz,
+        ) {
+            return VirtualDisplayOperationResult {
+                status: VirtualDisplayOperationStatus::InvalidMode,
+                display: None,
+                message: Some(
+                    "virtual display width, height and refresh rate must be positive".to_string(),
+                ),
+            };
+        }
+
+        let mut platform_request = request;
+        platform_request.id = Some(id.clone());
+        match rshare_platform::virtual_display::create_virtual_display(&platform_request) {
+            Ok(result) => {
+                if let Some(display) = result.display.clone() {
+                    self.displays.insert(display.id.clone(), display);
+                }
+                result
+            }
+            Err(error) => VirtualDisplayOperationResult {
+                status: VirtualDisplayOperationStatus::Failed,
+                display: None,
+                message: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn remove(&mut self, request: VirtualDisplayRemoveRequest) -> VirtualDisplayOperationResult {
+        let id = request.id.trim().to_string();
+        if id.is_empty() {
+            return VirtualDisplayOperationResult {
+                status: VirtualDisplayOperationStatus::Failed,
+                display: None,
+                message: Some("virtual display id is required".to_string()),
+            };
+        }
+
+        let platform_result = rshare_platform::virtual_display::remove_virtual_display(&request);
+        self.displays.remove(&id);
+        platform_result.unwrap_or_else(|error| VirtualDisplayOperationResult {
+            status: VirtualDisplayOperationStatus::Failed,
+            display: None,
+            message: Some(error.to_string()),
+        })
+    }
+}
+
+fn virtual_display_request_id(id: Option<&str>, ordinal: usize) -> String {
+    id.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("rshare-vdisplay-{ordinal}"))
+}
+
+fn valid_virtual_display_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
+    width > 0 && height > 0 && refresh_rate_millihz.unwrap_or(60_000) > 0
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeFeatureConfig {
     suppress_local_shortcuts_when_remote: bool,
@@ -183,6 +267,7 @@ struct DaemonState {
     pending_usb_claims: HashMap<u64, PendingUsbClaim>,
     pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
     pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
+    virtual_displays: VirtualDisplayManager,
 }
 
 impl DaemonState {
@@ -221,6 +306,7 @@ impl DaemonState {
             pending_usb_claims: HashMap::new(),
             pending_usb_transfers: HashMap::new(),
             pending_endpoint_injects: HashMap::new(),
+            virtual_displays: VirtualDisplayManager::default(),
         }
     }
 
@@ -7162,6 +7248,22 @@ async fn handle_ipc_client(
                 Err(error) => DaemonResponse::Error(error.to_string()),
             }
         }
+        DaemonRequest::ListVirtualDisplays => {
+            let state = state.read().await;
+            DaemonResponse::VirtualDisplays(state.virtual_displays.list())
+        }
+        DaemonRequest::CreateVirtualDisplay(request) => {
+            let mut state = state.write().await;
+            let result = state.virtual_displays.create(request);
+            state.refresh_local_controls_platform();
+            DaemonResponse::VirtualDisplayOperation(result)
+        }
+        DaemonRequest::RemoveVirtualDisplay(request) => {
+            let mut state = state.write().await;
+            let result = state.virtual_displays.remove(request);
+            state.refresh_local_controls_platform();
+            DaemonResponse::VirtualDisplayOperation(result)
+        }
         DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
         DaemonRequest::SubscribeEndpointEvents { .. } => {
             unreachable!("handled before response match")
@@ -7337,6 +7439,92 @@ mod tests {
         info.datagram_available = true;
         info.rtt_ms = rtt_ms;
         info
+    }
+
+    #[test]
+    fn virtual_display_manager_records_driver_unavailable_create_result() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        });
+
+        let expected = if cfg!(windows) {
+            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        } else {
+            rshare_core::VirtualDisplayOperationStatus::Unsupported
+        };
+        assert_eq!(result.status, expected);
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.list()[0].id, "vd-1");
+    }
+
+    #[test]
+    fn virtual_display_manager_rejects_duplicate_ids() {
+        let mut manager = VirtualDisplayManager::default();
+        let request = rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+        };
+
+        let _ = manager.create(request.clone());
+        let result = manager.create(request);
+
+        assert_eq!(
+            result.status,
+            rshare_core::VirtualDisplayOperationStatus::AlreadyExists
+        );
+        assert_eq!(manager.list().len(), 1);
+    }
+
+    #[test]
+    fn virtual_display_manager_rejects_invalid_modes() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-invalid".to_string()),
+            width: 0,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+        });
+
+        assert_eq!(
+            result.status,
+            rshare_core::VirtualDisplayOperationStatus::InvalidMode
+        );
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn virtual_display_manager_removes_requested_snapshot() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.create(rshare_core::VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+        });
+
+        let result = manager.remove(rshare_core::VirtualDisplayRemoveRequest {
+            id: "vd-1".to_string(),
+        });
+
+        let expected = if cfg!(windows) {
+            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        } else {
+            rshare_core::VirtualDisplayOperationStatus::Unsupported
+        };
+        assert_eq!(result.status, expected);
+        assert!(manager.list().is_empty());
     }
 
     #[test]

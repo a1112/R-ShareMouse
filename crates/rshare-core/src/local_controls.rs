@@ -662,6 +662,69 @@ pub struct DisplaySettingsUpdateResult {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VirtualDisplayStatus {
+    Pending,
+    Active,
+    Removed,
+    DriverUnavailable,
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VirtualDisplayOperationStatus {
+    Created,
+    Removed,
+    AlreadyExists,
+    InvalidMode,
+    DriverUnavailable,
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualDisplayCreateRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub refresh_rate_millihz: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualDisplayRemoveRequest {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualDisplaySnapshot {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub refresh_rate_millihz: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub status: VirtualDisplayStatus,
+    #[serde(default)]
+    pub display_id: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualDisplayOperationResult {
+    pub status: VirtualDisplayOperationStatus,
+    #[serde(default)]
+    pub display: Option<VirtualDisplaySnapshot>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalDisplayState {
     #[serde(default)]

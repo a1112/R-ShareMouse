@@ -1,0 +1,49 @@
+; R-ShareMouse virtual display driver scaffold.
+; This INF is a placeholder for the future Windows IDD/IddCx backend and is
+; not installable until the UMDF service binary and catalog are produced.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=05/28/2026,0.1.0.0
+CatalogFile=rshare-vdisplay.cat
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=RShareVDisplay_Install, ROOT\RShareVDisplay
+
+[RShareVDisplay_Install]
+CopyFiles=RShareVDisplay_CopyFiles
+
+[RShareVDisplay_CopyFiles]
+rshare-vdisplay.dll
+
+[RShareVDisplay_Install.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[RShareVDisplay_Install.Wdf]
+UmdfService=RShareVDisplay,RShareVDisplay_UmdfService
+UmdfServiceOrder=RShareVDisplay
+
+[RShareVDisplay_UmdfService]
+UmdfLibraryVersion=2.33
+ServiceBinary=%13%\rshare-vdisplay.dll
+
+[DestinationDirs]
+RShareVDisplay_CopyFiles=13
+
+[Strings]
+ManufacturerName="R-ShareMouse"
+DeviceName="R-ShareMouse Virtual Display"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"

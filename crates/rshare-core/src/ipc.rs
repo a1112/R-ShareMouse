@@ -14,6 +14,8 @@ use crate::{
     LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
     LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
     LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
+    VirtualDisplaySnapshot,
 };
 
 /// Default TCP port for localhost daemon IPC.
@@ -466,6 +468,9 @@ pub enum DaemonRequest {
     IdentifyDisplays(DisplayIdentifyRequest),
     UpdateDisplaySettings(DisplaySettingsUpdateRequest),
     OpenDisplaySettings,
+    ListVirtualDisplays,
+    CreateVirtualDisplay(VirtualDisplayCreateRequest),
+    RemoveVirtualDisplay(VirtualDisplayRemoveRequest),
     Shutdown,
 }
 
@@ -487,6 +492,8 @@ pub enum DaemonResponse {
     DisplayCapture(DisplayCaptureResult),
     DisplayIdentify(DisplayIdentifyResult),
     DisplaySettingsUpdated(DisplaySettingsUpdateResult),
+    VirtualDisplays(Vec<VirtualDisplaySnapshot>),
+    VirtualDisplayOperation(VirtualDisplayOperationResult),
     UsbDescriptorProbe(UsbDescriptorProbeResult),
     Ack,
     Error(String),

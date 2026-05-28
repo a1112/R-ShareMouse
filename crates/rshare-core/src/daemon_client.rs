@@ -17,7 +17,8 @@ use crate::{
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
-    UsbDescriptorProbeResult, UsbDeviceDescriptor,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -231,6 +232,34 @@ pub async fn request_update_display_settings(
 pub async fn request_open_display_settings() -> Result<()> {
     match send_request(DaemonRequest::OpenDisplaySettings).await? {
         DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
+    match send_request(DaemonRequest::ListVirtualDisplays).await? {
+        DaemonResponse::VirtualDisplays(displays) => Ok(displays),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_create_virtual_display(
+    request: VirtualDisplayCreateRequest,
+) -> Result<VirtualDisplayOperationResult> {
+    match send_request(DaemonRequest::CreateVirtualDisplay(request)).await? {
+        DaemonResponse::VirtualDisplayOperation(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_remove_virtual_display(
+    request: VirtualDisplayRemoveRequest,
+) -> Result<VirtualDisplayOperationResult> {
+    match send_request(DaemonRequest::RemoveVirtualDisplay(request)).await? {
+        DaemonResponse::VirtualDisplayOperation(result) => Ok(result),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

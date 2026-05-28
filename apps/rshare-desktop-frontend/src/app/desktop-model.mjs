@@ -203,6 +203,61 @@ export function buildDisplaySettingsViewModel(snapshot, selectedDisplayId) {
   };
 }
 
+export function buildVirtualDisplayViewModel(displays = []) {
+  const normalizedDisplays = (Array.isArray(displays) ? displays : []).map((display, index) => {
+    const width = Number(display?.width ?? 0);
+    const height = Number(display?.height ?? 0);
+    const refreshRateMillihz =
+      display?.refresh_rate_millihz == null
+        ? null
+        : Number(display.refresh_rate_millihz);
+    return {
+      id: String(display?.id ?? `vd-${index + 1}`),
+      name: display?.name ? String(display.name) : `虚拟显示器 ${index + 1}`,
+      width,
+      height,
+      refreshRateMillihz,
+      resolutionLabel: `${width} × ${height}`,
+      refreshRateLabel: formatDisplayRefreshRate(refreshRateMillihz),
+      status: String(display?.status ?? "Pending"),
+      statusLabel: virtualDisplayStatusLabel(display?.status),
+      displayId: display?.display_id ?? null,
+      message: display?.message == null ? null : String(display.message),
+      osVisible: Boolean(display?.display_id),
+    };
+  });
+
+  return {
+    createDefaults: {
+      width: 1920,
+      height: 1080,
+      refreshRateMillihz: 60_000,
+      name: "R-ShareMouse Virtual Display",
+    },
+    displays: normalizedDisplays,
+    count: normalizedDisplays.length,
+    hasActiveDisplay: normalizedDisplays.some((display) => display.status === "Active"),
+  };
+}
+
+function virtualDisplayStatusLabel(status) {
+  switch (status) {
+    case "Active":
+      return "系统可见";
+    case "Removed":
+      return "已移除";
+    case "DriverUnavailable":
+      return "驱动不可用";
+    case "Unsupported":
+      return "平台不支持";
+    case "Failed":
+      return "失败";
+    case "Pending":
+    default:
+      return "等待创建";
+  }
+}
+
 function buildRemoteDevice(device, index) {
   const isLaptop = /book|laptop/i.test(device.name) || /macbook/i.test(device.hostname ?? "");
   const address = device.addresses?.[0] ?? "未知";

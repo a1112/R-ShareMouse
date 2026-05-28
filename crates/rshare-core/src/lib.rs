@@ -86,7 +86,9 @@ pub use local_controls::{
     LocalGamepadState, LocalHardwareDevice, LocalInputDeviceKind, LocalInputDiagnosticEvent,
     LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
     LocalInputTestStatus, LocalKeyboardState, LocalMouseState, LocalVirtualGamepadState,
-    RemoteUsbDeviceSnapshot,
+    RemoteUsbDeviceSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 
 // Re-exports from input_mode

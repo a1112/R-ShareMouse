@@ -43,6 +43,7 @@ import {
   buildLocalDeviceSelectItems,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
+  buildVirtualDisplayViewModel,
   describeAudioEndpoint,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
@@ -434,6 +435,23 @@ type DisplaySettingsViewModel = {
   bounds: { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number };
 };
 
+type VirtualDisplaySnapshot = {
+  id: string;
+  width: number;
+  height: number;
+  refresh_rate_millihz?: number | null;
+  name?: string | null;
+  status: string;
+  display_id?: string | null;
+  message?: string | null;
+};
+
+type VirtualDisplayOperationResult = {
+  status: string;
+  display?: VirtualDisplaySnapshot | null;
+  message?: string | null;
+};
+
 type LocalInputTestResult = {
   status: "Success" | "PermissionDenied" | "BackendUnavailable" | "Failed" | "Unsupported";
   message: string;
@@ -617,6 +635,9 @@ const NETWORK_COMMANDS = new Set([
   "identify_displays",
   "update_display_settings",
   "open_display_settings",
+  "list_virtual_displays",
+  "create_virtual_display",
+  "remove_virtual_display",
 ]);
 const WEB_NOOP_COMMANDS = new Set([
   "minimize_window",
@@ -1150,6 +1171,18 @@ async function invokeNetworkCommand<T = unknown>(
       );
     case "open_display_settings":
       return await daemonRequestValue<T>("OpenDisplaySettings", "Ack");
+    case "list_virtual_displays":
+      return await daemonRequestValue<T>("ListVirtualDisplays", "VirtualDisplays");
+    case "create_virtual_display":
+      return await daemonRequestValue<T>(
+        { CreateVirtualDisplay: args?.request ?? args },
+        "VirtualDisplayOperation",
+      );
+    case "remove_virtual_display":
+      return await daemonRequestValue<T>(
+        { RemoveVirtualDisplay: args?.request ?? args },
+        "VirtualDisplayOperation",
+      );
     case "start_local_controls_stream":
     case "stop_local_controls_stream":
     case "start_endpoint_events_stream":
@@ -7005,12 +7038,23 @@ function DisplaySettingsDetail({
     selectedDisplayId,
   ) as DisplaySettingsViewModel;
   const selected = view.selectedDisplay;
+  const [virtualDisplays, setVirtualDisplays] = useState<VirtualDisplaySnapshot[]>([]);
   const [captures, setCaptures] = useState<Record<string, string>>({});
   const [resolutionValue, setResolutionValue] = useState("");
   const [refreshRateValue, setRefreshRateValue] = useState("");
   const [scaleValue, setScaleValue] = useState("100");
+  const [virtualWidthValue, setVirtualWidthValue] = useState("1920");
+  const [virtualHeightValue, setVirtualHeightValue] = useState("1080");
+  const [virtualRefreshValue, setVirtualRefreshValue] = useState("60000");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const virtualView = buildVirtualDisplayViewModel(virtualDisplays);
+
+  async function refreshVirtualDisplays() {
+    const displays = await invokeCommand<VirtualDisplaySnapshot[]>("list_virtual_displays");
+    setVirtualDisplays(displays);
+    return displays;
+  }
 
   useEffect(() => {
     setResolutionValue(`${selected.width}x${selected.height}`);
@@ -7019,6 +7063,24 @@ function DisplaySettingsDetail({
     );
     setScaleValue(String(selected.scalePercent ?? 100));
   }, [selected.id, selected.width, selected.height, selected.refreshRateMillihz, selected.scalePercent]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invokeCommand<VirtualDisplaySnapshot[]>("list_virtual_displays")
+      .then((displays) => {
+        if (!cancelled) {
+          setVirtualDisplays(displays);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setStatusMessage(`虚拟显示器状态不可用：${errorMessage(error)}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const scaleOptions = displayScaleOptions(selected.scalePercent);
   const resolutionChanged = resolutionValue !== `${selected.width}x${selected.height}`;
@@ -7146,6 +7208,40 @@ function DisplaySettingsDetail({
           result.message,
           "显示设置已应用，正在等待守护进程刷新",
         ),
+    );
+
+  const createVirtualDisplay = () =>
+    void runDisplayAction(
+      "create-virtual-display",
+      async () => {
+        const request = {
+          width: Number(virtualWidthValue),
+          height: Number(virtualHeightValue),
+          refresh_rate_millihz: Number(virtualRefreshValue),
+          name: virtualView.createDefaults.name,
+        };
+        const result = await invokeCommand<VirtualDisplayOperationResult>(
+          "create_virtual_display",
+          { request },
+        );
+        await refreshVirtualDisplays();
+        return result;
+      },
+      (result) => virtualDisplayOperationMessage(result),
+    );
+
+  const removeVirtualDisplay = (id: string) =>
+    void runDisplayAction(
+      `remove-virtual-display-${id}`,
+      async () => {
+        const result = await invokeCommand<VirtualDisplayOperationResult>(
+          "remove_virtual_display",
+          { request: { id } },
+        );
+        await refreshVirtualDisplays();
+        return result;
+      },
+      (result) => virtualDisplayOperationMessage(result),
     );
 
   return (
@@ -7345,6 +7441,104 @@ function DisplaySettingsDetail({
                 {statusMessage}
               </div>
             ) : null}
+
+            <div
+              className="mt-4 rounded-md p-3"
+              style={{ border: `1px solid ${theme.border}`, background: theme.frame }}
+            >
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold">虚拟显示器</div>
+                  <div className="text-xs" style={{ color: theme.textMuted }}>
+                    创建后需由 Windows 虚拟显示驱动上报，系统显示设置才会出现新屏幕。
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="rounded-md px-3 py-1.5 text-xs"
+                  style={secondaryButtonStyle(theme)}
+                  disabled={busyAction === "refresh-virtual-display"}
+                  onClick={() =>
+                    void runDisplayAction(
+                      "refresh-virtual-display",
+                      refreshVirtualDisplays,
+                      () => "虚拟显示器状态已刷新",
+                    )
+                  }
+                >
+                  刷新
+                </button>
+              </div>
+
+              <div className="grid gap-2 md:grid-cols-[1fr_1fr_1fr_auto]">
+                <input
+                  className="min-w-0 rounded-md px-3 py-2 text-sm"
+                  style={inputStyle(theme)}
+                  value={virtualWidthValue}
+                  onChange={(event) => setVirtualWidthValue(event.target.value)}
+                  aria-label="虚拟显示器宽度"
+                />
+                <input
+                  className="min-w-0 rounded-md px-3 py-2 text-sm"
+                  style={inputStyle(theme)}
+                  value={virtualHeightValue}
+                  onChange={(event) => setVirtualHeightValue(event.target.value)}
+                  aria-label="虚拟显示器高度"
+                />
+                <input
+                  className="min-w-0 rounded-md px-3 py-2 text-sm"
+                  style={inputStyle(theme)}
+                  value={virtualRefreshValue}
+                  onChange={(event) => setVirtualRefreshValue(event.target.value)}
+                  aria-label="虚拟显示器刷新率毫赫兹"
+                />
+                <button
+                  type="button"
+                  className="rounded-md px-3 py-2 text-sm"
+                  style={secondaryButtonStyle(theme)}
+                  disabled={busyAction === "create-virtual-display"}
+                  onClick={createVirtualDisplay}
+                >
+                  创建
+                </button>
+              </div>
+
+              <div className="mt-3 grid gap-2">
+                {virtualView.displays.length ? (
+                  virtualView.displays.map((display) => (
+                    <div
+                      key={display.id}
+                      className="grid gap-2 rounded-md p-2 text-xs md:grid-cols-[minmax(0,1fr)_auto]"
+                      style={{ border: `1px solid ${theme.border}`, color: theme.textSub }}
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium" style={{ color: theme.text }}>
+                          {display.name} · {display.resolutionLabel} · {display.refreshRateLabel}
+                        </div>
+                        <div className="mt-1 break-words">
+                          {display.statusLabel}
+                          {display.displayId ? ` · 系统显示器 ${display.displayId}` : ""}
+                          {display.message ? ` · ${display.message}` : ""}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="rounded-md px-3 py-1.5"
+                        style={secondaryButtonStyle(theme)}
+                        disabled={busyAction === `remove-virtual-display-${display.id}`}
+                        onClick={() => removeVirtualDisplay(display.id)}
+                      >
+                        移除
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-xs" style={{ color: theme.textMuted }}>
+                    尚未创建虚拟显示器。
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
           <aside className="grid gap-2 text-sm">
@@ -7474,6 +7668,25 @@ function displayOperationMessage(
     return message ?? "该设置需要在系统显示设置中完成";
   }
   return message ?? `显示操作返回 ${status}`;
+}
+
+function virtualDisplayOperationMessage(result: VirtualDisplayOperationResult) {
+  if (result.status === "Created") {
+    return result.message ?? "虚拟显示器创建请求已发送";
+  }
+  if (result.status === "Removed") {
+    return result.message ?? "虚拟显示器已移除";
+  }
+  if (result.status === "DriverUnavailable") {
+    return result.message ?? "虚拟显示驱动不可用，尚不能创建系统显示器";
+  }
+  if (result.status === "Unsupported") {
+    return result.message ?? "当前平台不支持虚拟显示器";
+  }
+  if (result.status === "InvalidMode") {
+    return result.message ?? "虚拟显示器参数无效";
+  }
+  return result.message ?? `虚拟显示操作返回 ${result.status}`;
 }
 
 function displayOrientationLabel(orientation: DisplayOrientation) {
@@ -7641,6 +7854,7 @@ function AudioDeviceCard({ title, categoryLabel, subtitle, live, defaultDevice, 
   );
 }
 function secondaryButtonStyle(theme: typeof FIGMA_DESKTOP_THEME) { return { border: `1px solid ${theme.accent}`, background: theme.accentSoft, color: theme.text }; }
+function inputStyle(theme: typeof FIGMA_DESKTOP_THEME) { return { border: `1px solid ${theme.border}`, background: theme.frame, color: theme.text }; }
 function dangerButtonStyle(_theme: typeof FIGMA_DESKTOP_THEME) { return { border: "1px solid rgba(197, 48, 48, 0.55)", background: "rgba(197, 48, 48, 0.12)", color: "#8a1f2d" }; }
 const KEYBOARD_ROWS: Array<Array<{ label: string; codes: string[]; width?: number }>> = [
   [

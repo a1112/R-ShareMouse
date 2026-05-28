@@ -8,7 +8,8 @@ use rshare_core::{
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    ServiceStatusSnapshot,
+    ServiceStatusSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -251,6 +252,31 @@ async fn open_display_settings() -> Result<(), String> {
             .map_err(|fallback_err| fallback_err.to_string()),
         Err(err) => Err(err.to_string()),
     }
+}
+
+#[tauri::command]
+async fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>, String> {
+    daemon_client::request_virtual_displays()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn create_virtual_display(
+    request: VirtualDisplayCreateRequest,
+) -> Result<VirtualDisplayOperationResult, String> {
+    daemon_client::request_create_virtual_display(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn remove_virtual_display(
+    request: VirtualDisplayRemoveRequest,
+) -> Result<VirtualDisplayOperationResult, String> {
+    daemon_client::request_remove_virtual_display(request)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -700,6 +726,9 @@ fn main() {
             identify_displays,
             update_display_settings,
             open_display_settings,
+            list_virtual_displays,
+            create_virtual_display,
+            remove_virtual_display,
             endpoint_events_state,
             inject_endpoint_event,
             start_local_controls_stream,

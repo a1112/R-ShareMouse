@@ -16,6 +16,7 @@ import {
   buildLocalControlsViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
+  buildVirtualDisplayViewModel,
   endpointEventToLocalControlEvent,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
@@ -156,6 +157,46 @@ test("buildDisplaySettingsViewModel exposes system display settings", () => {
   );
   assert.equal(view.selectedDisplay.writeCapabilities.scale, false);
   assert.equal(view.selectedDisplay.writeCapabilities.capture, true);
+});
+
+test("buildVirtualDisplayViewModel exposes pending driver status without faking system displays", () => {
+  const virtualDisplays = [
+    {
+      id: "vd-1",
+      width: 1920,
+      height: 1080,
+      refresh_rate_millihz: 60_000,
+      name: "R-ShareMouse Virtual Display",
+      status: "DriverUnavailable",
+      display_id: null,
+      message: "Windows virtual display driver is not installed",
+    },
+  ];
+
+  const virtualView = buildVirtualDisplayViewModel(virtualDisplays);
+  const displayView = buildDisplaySettingsViewModel({
+    display: {
+      display_count: 1,
+      displays: [
+        {
+          display_id: "physical",
+          friendly_name: "Physical monitor",
+          width: 2560,
+          height: 1440,
+          active: true,
+        },
+      ],
+    },
+    virtual_displays: virtualDisplays,
+  });
+
+  assert.equal(virtualView.createDefaults.width, 1920);
+  assert.equal(virtualView.createDefaults.height, 1080);
+  assert.equal(virtualView.createDefaults.refreshRateMillihz, 60_000);
+  assert.equal(virtualView.displays[0].statusLabel, "驱动不可用");
+  assert.match(virtualView.displays[0].message, /not installed/);
+  assert.equal(displayView.displays.length, 1);
+  assert.equal(displayView.displays[0].id, "physical");
 });
 
 test("buildDesktopViewModel exposes daemon latency feedback when present", () => {
