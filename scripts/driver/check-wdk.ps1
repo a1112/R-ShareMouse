@@ -1,7 +1,8 @@
 param(
     [ValidateSet("x64")]
     [string]$Platform = "x64",
-    [switch]$Install
+    [switch]$Install,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
@@ -120,10 +121,12 @@ if ($missing.Count -gt 0) {
     throw ($details -join [Environment]::NewLine)
 }
 
-Write-Host "WDK/IddCx environment OK"
-Write-Host "Windows Kits root: $kitRoot"
-Write-Host "ntddk.h: $($ntddk.FullName)"
-Write-Host "iddcx.h: $($iddcxHeader.FullName)"
-Write-Host "WdfDriverEntry.lib: $($wdfLib.FullName)"
-Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
-Write-Host "WindowsUserModeDriver10.0: $driverToolset"
+if (-not $Quiet) {
+    Write-Host "WDK/IddCx environment OK"
+    Write-Host "Windows Kits root: $kitRoot"
+    Write-Host "ntddk.h: $($ntddk.FullName)"
+    Write-Host "iddcx.h: $($iddcxHeader.FullName)"
+    Write-Host "WdfDriverEntry.lib: $($wdfLib.FullName)"
+    Write-Host "IddCxStub.lib: $($iddcxLib.FullName)"
+    Write-Host "WindowsUserModeDriver10.0: $driverToolset"
+}
