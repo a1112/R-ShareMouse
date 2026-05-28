@@ -285,6 +285,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     let build_script = read_repo_file("scripts/driver/build.ps1");
     let check_wdk_script = read_repo_file("scripts/driver/check-wdk.ps1");
     let preflight_vdisplay_script = read_repo_file("scripts/driver/preflight-vdisplay.ps1");
+    let start_preflight_script = read_repo_file("scripts/driver/start-vdisplay-preflight.ps1");
     let validate_vdisplay_script = read_repo_file("scripts/driver/validate-vdisplay.ps1");
     let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
     let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
@@ -435,6 +436,12 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(preflight_vdisplay_script.contains("rshare-driver-probe.exe"));
     assert!(preflight_vdisplay_script.contains("vdisplay status"));
     assert!(preflight_vdisplay_script.contains("[switch]$Strict"));
+    assert!(start_preflight_script.contains("Start-Process"));
+    assert!(start_preflight_script.contains("-Verb RunAs"));
+    assert!(start_preflight_script.contains("Start-Transcript"));
+    assert!(start_preflight_script.contains("target\\driver-validation"));
+    assert!(start_preflight_script.contains("preflight-vdisplay.ps1"));
+    assert!(start_preflight_script.contains("-Strict"));
     assert!(validate_vdisplay_script.contains("check-wdk.ps1"));
     assert!(validate_vdisplay_script.contains("build.ps1"));
     assert!(validate_vdisplay_script.contains("install-test-driver.ps1"));
@@ -511,6 +518,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(build_script.contains("Cfgmgr32.lib"));
     assert!(driver_readme.contains("scripts\\driver\\check-wdk.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\preflight-vdisplay.ps1"));
+    assert!(driver_readme.contains("scripts\\driver\\start-vdisplay-preflight.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\validate-vdisplay.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-vdisplay-validation.ps1"));
     assert!(driver_readme.contains("-EnableTestSigning"));
