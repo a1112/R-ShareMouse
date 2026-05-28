@@ -325,7 +325,6 @@ fn virtual_display_matches_local_display(
         let identity = identity.to_ascii_lowercase();
         identity.contains("r-sharemouse")
             || identity.contains("rshare")
-            || identity.contains("virtual")
             || identity.contains(RSHARE_VDISPLAY_EDID_HARDWARE_ID)
     });
 
@@ -1020,5 +1019,39 @@ mod tests {
             snapshot.display_id.as_deref(),
             Some("windows-display-rshare-edid")
         );
+    }
+
+    #[test]
+    fn active_driver_state_does_not_match_unrelated_virtual_display_name() {
+        let display_state = LocalDisplayState {
+            displays: vec![LocalDisplayInfo {
+                display_id: "windows-display-unrelated-vdd".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                friendly_name: Some("Generic Virtual Display".to_string()),
+                active: true,
+                ..LocalDisplayInfo::default()
+            }],
+            ..LocalDisplayState::default()
+        };
+
+        let snapshot = snapshot_from_driver_state_with_displays(
+            "vd-1",
+            Some("R-ShareMouse Virtual Display".to_string()),
+            RShareVdisplayStateRaw {
+                abi: RSHARE_DRIVER_ABI,
+                active: RSHARE_VDISPLAY_ACTIVITY_ACTIVE,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: 60_000,
+                connector_index: 0,
+            },
+            Some(&display_state),
+            None,
+        )
+        .expect("driver state should still map without a Windows topology match");
+
+        assert_eq!(snapshot.display_id, None);
     }
 }
