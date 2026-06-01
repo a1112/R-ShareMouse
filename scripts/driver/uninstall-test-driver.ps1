@@ -33,8 +33,30 @@ function Remove-RShareClassUpperFilter([string]$ClassGuid) {
     }
 }
 
+function Remove-RShareClassFilterService {
+    $sc = Join-Path $env:SystemRoot "System32\sc.exe"
+    if (-not (Test-Path $sc)) {
+        $command = Get-Command sc.exe -ErrorAction SilentlyContinue
+        if (-not $command) {
+            return
+        }
+        $sc = $command.Source
+    }
+
+    & $sc query rshare-filter *> $null
+    if ($LASTEXITCODE -ne 0) {
+        return
+    }
+
+    & $sc delete rshare-filter
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to delete rshare-filter service."
+    }
+}
+
 Remove-RShareClassUpperFilter "{4D36E96B-E325-11CE-BFC1-08002BE10318}"
 Remove-RShareClassUpperFilter "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
+Remove-RShareClassFilterService
 
 $drivers = pnputil /enum-drivers
 $targets = $drivers | Select-String -Pattern "Published Name|Original Name|Provider Name|Class Name" -Context 0,3 |

@@ -105,6 +105,26 @@ function Add-RShareClassUpperFilter([string]$ClassGuid) {
     New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value $updated -Force | Out-Null
 }
 
+function Ensure-RShareClassFilterService([string]$DriverPath) {
+    if (-not (Test-Path $DriverPath)) {
+        throw "Missing class filter driver binary: $DriverPath. Run scripts\driver\build.ps1 first."
+    }
+
+    $targetPath = Join-Path $env:SystemRoot "System32\drivers\rshare-filter.sys"
+    Copy-Item -LiteralPath $DriverPath -Destination $targetPath -Force
+
+    $sc = Find-SystemTool "sc.exe"
+    & $sc query rshare-filter *> $null
+    if ($LASTEXITCODE -eq 0) {
+        & $sc config rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys"
+    } else {
+        & $sc create rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys" DisplayName= "R-ShareMouse input filter driver"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create or update the rshare-filter kernel service."
+    }
+}
+
 function Get-DriverPackages {
     $packages = @()
 
@@ -219,6 +239,7 @@ foreach ($package in $packages) {
 }
 
 if ($EnableInputClassFilters) {
+    Ensure-RShareClassFilterService (Join-Path $root "drivers\windows\rshare-filter\$Platform\$Configuration\rshare-filter.sys")
     Add-RShareClassUpperFilter $KeyboardClassGuid
     Add-RShareClassUpperFilter $MouseClassGuid
     Write-Warning "RShare keyboard/mouse class filters were enabled. Restart or reboot Windows before validating real filter capture."
