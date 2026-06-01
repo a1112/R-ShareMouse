@@ -504,7 +504,6 @@ impl CaptureDriver for WindowsNativeCaptureDriver {
 #[cfg(target_os = "windows")]
 pub struct VirtualHidInjectBackend {
     client: rshare_platform::windows::WindowsDriverClient,
-    absolute_mouse: crate::emulator::WindowsNativeInputEmulator,
     health: BackendHealth,
 }
 
@@ -519,7 +518,6 @@ impl VirtualHidInjectBackend {
 
         Ok(Self {
             client,
-            absolute_mouse: crate::emulator::WindowsNativeInputEmulator::new()?,
             health: BackendHealth::Healthy,
         })
     }
@@ -573,7 +571,13 @@ impl InjectBackend for VirtualHidInjectBackend {
                 self.client
                     .inject_keyboard(keycode.to_raw() as u16, state.is_pressed())
             }
-            InputEvent::MouseMove { x, y } => self.absolute_mouse.move_mouse(x, y),
+            InputEvent::MouseMove { x, y } => {
+                let (current_x, current_y) = rshare_platform::windows::current_cursor_position()?;
+                for (dx, dy) in windows_driver_relative_mouse_steps(current_x, current_y, x, y) {
+                    self.client.inject_mouse_move(dx, dy)?;
+                }
+                Ok(())
+            }
             InputEvent::MouseButton { button, state } => self
                 .client
                 .inject_mouse_button(button.to_code(), state.is_pressed()),
@@ -590,6 +594,30 @@ impl InjectBackend for VirtualHidInjectBackend {
     fn is_active(&self) -> bool {
         matches!(self.health, BackendHealth::Healthy)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_driver_relative_mouse_steps(
+    current_x: i32,
+    current_y: i32,
+    target_x: i32,
+    target_y: i32,
+) -> Vec<(i32, i32)> {
+    const MAX_DRIVER_MOUSE_DELTA: i32 = 127;
+
+    let mut remaining_x = target_x.saturating_sub(current_x);
+    let mut remaining_y = target_y.saturating_sub(current_y);
+    let mut steps = Vec::new();
+
+    while remaining_x != 0 || remaining_y != 0 {
+        let step_x = remaining_x.clamp(-MAX_DRIVER_MOUSE_DELTA, MAX_DRIVER_MOUSE_DELTA);
+        let step_y = remaining_y.clamp(-MAX_DRIVER_MOUSE_DELTA, MAX_DRIVER_MOUSE_DELTA);
+        steps.push((step_x, step_y));
+        remaining_x = remaining_x.saturating_sub(step_x);
+        remaining_y = remaining_y.saturating_sub(step_y);
+    }
+
+    steps
 }
 
 /// Virtual HID capture backend (Windows only).
@@ -1326,5 +1354,18 @@ mod tests {
             assert!(backend.is_active());
             assert!(matches!(backend.health(), BackendHealth::Healthy));
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn virtual_hid_absolute_mouse_move_is_split_into_driver_relative_reports() {
+        assert_eq!(
+            windows_driver_relative_mouse_steps(10, 20, 300, -200),
+            vec![(127, -127), (127, -93), (36, 0)]
+        );
+        assert_eq!(
+            windows_driver_relative_mouse_steps(50, 50, 50, 50),
+            Vec::<(i32, i32)>::new()
+        );
     }
 }

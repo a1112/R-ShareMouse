@@ -1500,6 +1500,16 @@ mod windows_impl {
         }
     }
 
+    pub fn current_cursor_position() -> Result<(i32, i32)> {
+        unsafe {
+            let mut point = Point::default();
+            if GetCursorPos(&mut point) == 0 {
+                anyhow::bail!("GetCursorPos failed: {}", std::io::Error::last_os_error());
+            }
+            Ok((point.x, point.y))
+        }
+    }
+
     /// Screen information on Windows
     #[derive(Debug, Clone)]
     pub struct ScreenInfo {
@@ -2328,6 +2338,7 @@ mod windows_impl {
         fn CallNextHookEx(hook: isize, code: i32, w_param: usize, l_param: isize) -> isize;
         fn GetMessageW(message: *mut Message, hwnd: isize, min_filter: u32, max_filter: u32)
             -> i32;
+        fn GetCursorPos(lp_point: *mut Point) -> i32;
         fn PeekMessageW(
             message: *mut Message,
             hwnd: isize,

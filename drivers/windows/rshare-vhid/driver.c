@@ -12,6 +12,8 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RShareVhidEvtControlIoDeviceControl;
 
 static FAST_MUTEX g_RShareVhidLock;
 static VHFHANDLE g_RShareVhidHandle;
+static UCHAR g_RShareKeyboardModifiers;
+static UCHAR g_RShareKeyboardKeys[6];
 static UCHAR g_RShareMouseButtons;
 
 static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
@@ -116,9 +118,154 @@ static UCHAR RShareVkToHidUsage(LONG vk)
         return 0x2B;
     case 0x20:
         return 0x2C;
+    case 0xBD:
+        return 0x2D;
+    case 0xBB:
+        return 0x2E;
+    case 0xDB:
+        return 0x2F;
+    case 0xDD:
+        return 0x30;
+    case 0xDC:
+        return 0x31;
+    case 0xBA:
+        return 0x33;
+    case 0xDE:
+        return 0x34;
+    case 0xC0:
+        return 0x35;
+    case 0xBC:
+        return 0x36;
+    case 0xBE:
+        return 0x37;
+    case 0xBF:
+        return 0x38;
+    case 0x14:
+        return 0x39;
+    case 0x70:
+        return 0x3A;
+    case 0x71:
+        return 0x3B;
+    case 0x72:
+        return 0x3C;
+    case 0x73:
+        return 0x3D;
+    case 0x74:
+        return 0x3E;
+    case 0x75:
+        return 0x3F;
+    case 0x76:
+        return 0x40;
+    case 0x77:
+        return 0x41;
+    case 0x78:
+        return 0x42;
+    case 0x79:
+        return 0x43;
+    case 0x7A:
+        return 0x44;
+    case 0x7B:
+        return 0x45;
+    case 0x2C:
+        return 0x46;
+    case 0x91:
+        return 0x47;
+    case 0x13:
+        return 0x48;
+    case 0x2D:
+        return 0x49;
+    case 0x24:
+        return 0x4A;
+    case 0x21:
+        return 0x4B;
+    case 0x2E:
+        return 0x4C;
+    case 0x23:
+        return 0x4D;
+    case 0x22:
+        return 0x4E;
+    case 0x27:
+        return 0x4F;
+    case 0x25:
+        return 0x50;
+    case 0x28:
+        return 0x51;
+    case 0x26:
+        return 0x52;
+    case 0x90:
+        return 0x53;
+    case 0x6F:
+        return 0x54;
+    case 0x6A:
+        return 0x55;
+    case 0x6D:
+        return 0x56;
+    case 0x6B:
+        return 0x57;
+    case 0x61:
+        return 0x59;
+    case 0x62:
+        return 0x5A;
+    case 0x63:
+        return 0x5B;
+    case 0x64:
+        return 0x5C;
+    case 0x65:
+        return 0x5D;
+    case 0x66:
+        return 0x5E;
+    case 0x67:
+        return 0x5F;
+    case 0x68:
+        return 0x60;
+    case 0x69:
+        return 0x61;
+    case 0x60:
+        return 0x62;
+    case 0x6E:
+        return 0x63;
     default:
         return 0;
     }
+}
+
+static VOID RShareAddKeyboardUsage(UCHAR usage)
+{
+    ULONG index;
+
+    for (index = 0; index < ARRAYSIZE(g_RShareKeyboardKeys); index++) {
+        if (g_RShareKeyboardKeys[index] == usage) {
+            return;
+        }
+    }
+
+    for (index = 0; index < ARRAYSIZE(g_RShareKeyboardKeys); index++) {
+        if (g_RShareKeyboardKeys[index] == 0) {
+            g_RShareKeyboardKeys[index] = usage;
+            return;
+        }
+    }
+
+    RtlMoveMemory(
+        &g_RShareKeyboardKeys[0],
+        &g_RShareKeyboardKeys[1],
+        ARRAYSIZE(g_RShareKeyboardKeys) - 1);
+    g_RShareKeyboardKeys[ARRAYSIZE(g_RShareKeyboardKeys) - 1] = usage;
+}
+
+static VOID RShareRemoveKeyboardUsage(UCHAR usage)
+{
+    ULONG readIndex;
+    ULONG writeIndex = 0;
+    UCHAR compacted[ARRAYSIZE(g_RShareKeyboardKeys)] = {0};
+
+    for (readIndex = 0; readIndex < ARRAYSIZE(g_RShareKeyboardKeys); readIndex++) {
+        if (g_RShareKeyboardKeys[readIndex] != 0 && g_RShareKeyboardKeys[readIndex] != usage) {
+            compacted[writeIndex++] = g_RShareKeyboardKeys[readIndex];
+        }
+    }
+
+    RtlCopyMemory(g_RShareKeyboardKeys, compacted, sizeof(g_RShareKeyboardKeys));
 }
 
 static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pressed)
@@ -130,12 +277,23 @@ static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pr
 
     report[0] = 0x01;
     if (modifier != 0) {
-        report[1] = pressed ? modifier : 0;
-    } else if (usage != 0 && pressed) {
-        report[3] = usage;
+        if (pressed) {
+            g_RShareKeyboardModifiers |= modifier;
+        } else {
+            g_RShareKeyboardModifiers &= (UCHAR)~modifier;
+        }
+    } else if (usage != 0) {
+        if (pressed) {
+            RShareAddKeyboardUsage(usage);
+        } else {
+            RShareRemoveKeyboardUsage(usage);
+        }
     } else if (usage == 0) {
         return STATUS_NOT_SUPPORTED;
     }
+
+    report[1] = g_RShareKeyboardModifiers;
+    RtlCopyMemory(&report[3], g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
 
     RtlZeroMemory(&packet, sizeof(packet));
     packet.reportBuffer = report;
@@ -253,6 +411,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS status;
 
     ExInitializeFastMutex(&g_RShareVhidLock);
+    g_RShareKeyboardModifiers = 0;
+    RtlZeroMemory(g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
     g_RShareMouseButtons = 0;
     WDF_DRIVER_CONFIG_INIT(&config, RShareVhidEvtDeviceAdd);
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
@@ -310,6 +470,8 @@ VOID RShareVhidEvtCleanup(WDFOBJECT DeviceObject)
         ExAcquireFastMutex(&g_RShareVhidLock);
         if (g_RShareVhidHandle == context->VhfHandle) {
             g_RShareVhidHandle = NULL;
+            g_RShareKeyboardModifiers = 0;
+            RtlZeroMemory(g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
             g_RShareMouseButtons = 0;
         }
         ExReleaseFastMutex(&g_RShareVhidLock);

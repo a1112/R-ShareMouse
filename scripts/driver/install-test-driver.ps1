@@ -5,6 +5,8 @@ param(
     [string]$Platform = "x64",
     [switch]$IncludeFilter,
     [switch]$FilterOnly,
+    [switch]$HidOnly,
+    [switch]$EnableInputClassFilters,
     [switch]$SkipSign,
     [switch]$EnableTestSigning
 )
@@ -84,6 +86,25 @@ function Test-DevicePresent([string]$PnpUtil, [string]$HardwareId) {
     return [bool]($output | Select-String -Pattern "Instance ID:")
 }
 
+$KeyboardClassGuid = "{4D36E96B-E325-11CE-BFC1-08002BE10318}"
+$MouseClassGuid = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
+
+function Add-RShareClassUpperFilter([string]$ClassGuid) {
+    $classPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$ClassGuid"
+    if (-not (Test-Path $classPath)) {
+        throw "Device class registry key not found: $classPath"
+    }
+
+    $existingValue = (Get-ItemProperty -Path $classPath -Name UpperFilters -ErrorAction SilentlyContinue).UpperFilters
+    $existing = @()
+    if ($existingValue) {
+        $existing = @($existingValue) | Where-Object { $_ -and $_ -ne "rshare-filter" }
+    }
+
+    $updated = @($existing + "rshare-filter")
+    New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value $updated -Force | Out-Null
+}
+
 function Get-DriverPackages {
     $packages = @()
 
@@ -94,6 +115,9 @@ function Get-DriverPackages {
             HardwareId = "ROOT\RSHAREVHID"
             UseDevCon = $true
         }
+    }
+
+    if (-not $FilterOnly -and -not $HidOnly) {
         $packages += [pscustomobject]@{
             Name = "rshare-vdisplay"
             Inf = Join-Path $root "drivers\windows\rshare-vdisplay\$Platform\$Configuration\rshare-vdisplay\rshare-vdisplay.inf"
@@ -102,7 +126,7 @@ function Get-DriverPackages {
         }
     }
 
-    if ($IncludeFilter -or $FilterOnly) {
+    if ($IncludeFilter -or $FilterOnly -or $EnableInputClassFilters) {
         $packages += [pscustomobject]@{
             Name = "rshare-filter"
             Inf = Join-Path $root "drivers\windows\rshare-filter\$Platform\$Configuration\rshare-filter\rshare-filter.inf"
@@ -151,8 +175,14 @@ if (-not $SkipSign) {
     if ($IncludeFilter) {
         $signArgs.IncludeFilter = $true
     }
+    if ($EnableInputClassFilters) {
+        $signArgs.IncludeFilter = $true
+    }
     if ($FilterOnly) {
         $signArgs.FilterOnly = $true
+    }
+    if ($HidOnly) {
+        $signArgs.HidOnly = $true
     }
     & (Join-Path $PSScriptRoot "sign-test-driver.ps1") @signArgs
     if ($LASTEXITCODE -ne 0) {
@@ -186,6 +216,12 @@ foreach ($package in $packages) {
             Write-Warning "$($package.Name) installed; reboot is required to complete device setup."
         }
     }
+}
+
+if ($EnableInputClassFilters) {
+    Add-RShareClassUpperFilter $KeyboardClassGuid
+    Add-RShareClassUpperFilter $MouseClassGuid
+    Write-Warning "RShare keyboard/mouse class filters were enabled. Restart or reboot Windows before validating real filter capture."
 }
 
 Write-Host "RShare test drivers installed. Reboot if Windows asks for it."

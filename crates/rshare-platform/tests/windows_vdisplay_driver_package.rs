@@ -400,15 +400,19 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(project.contains("<IndirectDisplayDriver>true</IndirectDisplayDriver>"));
     assert!(project.contains("<IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>"));
     assert!(project.contains("<IDDCX_VERSION_MINOR>2</IDDCX_VERSION_MINOR>"));
-    assert!(project.contains("<WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>"));
+    assert!(project
+        .contains("<WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>"));
     assert!(project.contains("<UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>"));
     assert!(project.contains("<UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>"));
     assert!(project.contains("<ClInclude Include=\"driver.h\" />"));
     assert!(project.contains("<ClInclude Include=\"trace.h\" />"));
     assert!(project.contains("<FilesToPackage Include=\"$(TargetPath)\" />"));
     assert!(project.contains("Include\\wdf\\umdf\\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR)"));
-    assert!(project.contains("$(WindowsTargetPlatformVersion)\\um\\iddcx\\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR)"));
-    assert!(project.contains("Lib\\wdf\\umdf\\$(Platform)\\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR)"));
+    assert!(project.contains(
+        "$(WindowsTargetPlatformVersion)\\um\\iddcx\\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR)"
+    ));
+    assert!(project
+        .contains("Lib\\wdf\\umdf\\$(Platform)\\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR)"));
     assert!(project.contains("Lib\\$(WindowsTargetPlatformVersion)\\um\\$(Platform)\\iddcx\\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR)"));
 
     assert!(inf.contains("DeviceGroupId"));
@@ -480,8 +484,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(validate_vdisplay_script.contains("EnsureDaemonForTopologyVerification"));
     assert!(validate_vdisplay_script.contains("cargo build -p rshare-daemon -p rshare-cli"));
     assert!(validate_vdisplay_script.contains("cargo run -p rshare-cli -- start --daemon"));
-    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -Mode $requestedMode"));
-    assert!(validate_vdisplay_script.contains("Invoke-DaemonDisplayTopologyVerification -Mode $observedMode"));
+    assert!(validate_vdisplay_script
+        .contains("Invoke-DaemonDisplayTopologyVerification -Mode $requestedMode"));
+    assert!(validate_vdisplay_script
+        .contains("Invoke-DaemonDisplayTopologyVerification -Mode $observedMode"));
     assert!(sign_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("drivers\\windows\\rshare-vdisplay"));
     assert!(install_script.contains("[switch]$EnableTestSigning"));
@@ -501,7 +507,8 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(start_validation_script.contains("target\\driver-validation"));
     assert!(start_validation_script.contains("validate-vdisplay.ps1"));
     assert!(start_validation_script.contains("[switch]$EnableTestSigning"));
-    assert!(start_validation_script.contains("$(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' })"));
+    assert!(start_validation_script
+        .contains("$(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' })"));
     assert!(start_validation_script.contains("-VerifyDaemonDisplayTopology"));
     assert!(start_validation_script.contains("-WaitForManualModeChange"));
 
@@ -533,6 +540,90 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver_readme.contains("pending IddCx arrival"));
     assert!(!driver_readme.contains("daemon still needs a Windows user-mode client"));
     assert!(!driver_readme.contains("EDID-less monitor"));
+}
+
+#[test]
+fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
+    let vhid = read_repo_file("drivers/windows/rshare-vhid/driver.c");
+    let filter = read_repo_file("drivers/windows/rshare-filter/driver.c");
+    let ioctls = read_repo_file("drivers/windows/rshare-common/rshare_ioctls.h");
+    let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
+    let install_script = read_repo_file("scripts/driver/install-test-driver.ps1");
+    let sign_script = read_repo_file("scripts/driver/sign-test-driver.ps1");
+    let uninstall_script = read_repo_file("scripts/driver/uninstall-test-driver.ps1");
+    let validate_hid_script = read_repo_file("scripts/driver/validate-hid.ps1");
+    let start_hid_validation_script = read_repo_file("scripts/driver/start-hid-validation.ps1");
+    let driver_readme = read_repo_file("drivers/windows/README.md");
+
+    assert!(ioctls.contains("RSHARE_CAP_FILTER_EVENTS"));
+    assert!(ioctls.contains("RSHARE_CAP_VIRTUAL_KEYBOARD"));
+    assert!(ioctls.contains("RSHARE_CAP_VIRTUAL_MOUSE"));
+    assert!(ioctls.contains("IOCTL_RSHARE_READ_EVENT"));
+    assert!(ioctls.contains("IOCTL_RSHARE_INJECT_REPORT"));
+
+    assert!(filter.contains("IOCTL_INTERNAL_KEYBOARD_CONNECT"));
+    assert!(filter.contains("IOCTL_INTERNAL_MOUSE_CONNECT"));
+    assert!(filter.contains("RShareFilterKeyboardServiceCallback"));
+    assert!(filter.contains("RShareFilterMouseServiceCallback"));
+    assert!(filter.contains("RSHARE_EVENT_QUEUE_CAPACITY"));
+    assert!(filter.contains("context->Tail = (context->Tail + 1u) % RSHARE_EVENT_QUEUE_CAPACITY"));
+    assert!(filter.contains("RSHARE_EVENT_MOUSE_WHEEL"));
+
+    assert!(vhid.contains("g_RShareKeyboardModifiers"));
+    assert!(vhid.contains("g_RShareKeyboardKeys[6]"));
+    assert!(vhid.contains("RShareAddKeyboardUsage"));
+    assert!(vhid.contains("RShareRemoveKeyboardUsage"));
+    assert!(vhid.contains("report[1] = g_RShareKeyboardModifiers"));
+    assert!(vhid.contains("RtlCopyMemory(&report[3], g_RShareKeyboardKeys"));
+    assert!(vhid.contains("case 0x70:"));
+    assert!(vhid.contains("return 0x3A"));
+    assert!(vhid.contains("case 0x25:"));
+    assert!(vhid.contains("return 0x50"));
+    assert!(vhid.contains("case 0x2E:"));
+    assert!(vhid.contains("return 0x4C"));
+    assert!(vhid.contains("case 0x60:"));
+    assert!(vhid.contains("return 0x62"));
+    assert!(vhid.contains("g_RShareMouseButtons"));
+    assert!(vhid.contains("RSHARE_REPORT_MOUSE_WHEEL"));
+
+    assert!(probe.contains("rshare-driver-probe filter status"));
+    assert!(probe.contains("rshare-driver-probe filter test"));
+    assert!(probe.contains("rshare-driver-probe filter watch [timeout_seconds]"));
+    assert!(probe.contains("probe_filter_watch"));
+    assert!(probe.contains("RSHARE_SOURCE_HARDWARE"));
+    assert!(probe.contains("rshare-driver-probe vhid status"));
+    assert!(probe.contains("rshare-driver-probe vhid inject-smoke"));
+
+    assert!(install_script.contains("[switch]$EnableInputClassFilters"));
+    assert!(install_script.contains("[switch]$HidOnly"));
+    assert!(install_script.contains("$signArgs.HidOnly = $true"));
+    assert!(install_script.contains("$signArgs.IncludeFilter = $true"));
+    assert!(install_script.contains("Add-RShareClassUpperFilter"));
+    assert!(install_script.contains("{4D36E96B-E325-11CE-BFC1-08002BE10318}"));
+    assert!(install_script.contains("{4D36E96F-E325-11CE-BFC1-08002BE10318}"));
+    assert!(install_script.contains("UpperFilters"));
+    assert!(
+        install_script.contains("Restart or reboot Windows before validating real filter capture")
+    );
+    assert!(uninstall_script.contains("Remove-RShareClassUpperFilter"));
+    assert!(uninstall_script.contains("rshare-filter"));
+    assert!(sign_script.contains("[switch]$HidOnly"));
+    assert!(sign_script.contains("-not $HidOnly"));
+    assert!(validate_hid_script.contains("install-test-driver.ps1"));
+    assert!(validate_hid_script.contains("HidOnly = $true"));
+    assert!(validate_hid_script.contains("-EnableInputClassFilters"));
+    assert!(validate_hid_script.contains("@(\"filter\", \"status\")"));
+    assert!(validate_hid_script.contains("@(\"vhid\", \"status\")"));
+    assert!(validate_hid_script.contains("@(\"vhid\", \"inject-smoke\")"));
+    assert!(validate_hid_script.contains("Press and release a keyboard key"));
+    assert!(validate_hid_script.contains("Move the mouse or click a mouse button"));
+    assert!(start_hid_validation_script.contains("Start-Transcript"));
+    assert!(start_hid_validation_script.contains("target\\driver-validation"));
+    assert!(start_hid_validation_script.contains("validate-hid.ps1"));
+    assert!(driver_readme.contains("-EnableInputClassFilters"));
+    assert!(driver_readme.contains("scripts\\driver\\validate-hid.ps1"));
+    assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1"));
+    assert!(driver_readme.contains("target\\driver-validation"));
 }
 
 #[test]

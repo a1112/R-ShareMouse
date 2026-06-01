@@ -4,7 +4,8 @@ param(
     [ValidateSet("x64")]
     [string]$Platform = "x64",
     [switch]$IncludeFilter,
-    [switch]$FilterOnly
+    [switch]$FilterOnly,
+    [switch]$HidOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +51,9 @@ function Get-DriverPackages {
             Directory = Join-Path $root "drivers\windows\rshare-vhid\$Platform\$Configuration\rshare-vhid"
             Catalog = "rshare-vhid.cat"
         }
+    }
+
+    if (-not $FilterOnly -and -not $HidOnly) {
         $packages += [pscustomobject]@{
             Name = "rshare-vdisplay"
             Directory = Join-Path $root "drivers\windows\rshare-vdisplay\$Platform\$Configuration\rshare-vdisplay"

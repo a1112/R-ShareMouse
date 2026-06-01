@@ -1891,6 +1891,16 @@ fn backend_kind_from_resolved_mode(mode: ResolvedInputMode) -> BackendKind {
     }
 }
 
+#[cfg(windows)]
+fn windows_should_use_filter_capture(
+    mode: Option<ResolvedInputMode>,
+    driver: &rshare_core::LocalDriverDiagnosticState,
+) -> bool {
+    matches!(mode, Some(ResolvedInputMode::VirtualHid))
+        && driver.status == "available"
+        && driver.filter_active
+}
+
 fn timestamp_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6101,9 +6111,12 @@ fn input_event_from_windows_driver_event(
 ) -> Option<InputEvent> {
     use rshare_platform::windows::{WindowsDriverDeviceKind, WindowsDriverEventKind};
 
+    if let Some(input_event) = rshare_input::InputEvent::from_windows_driver_event(event.clone()) {
+        return Some(input_event);
+    }
+
     match (event.device_kind, event.event_kind) {
-        (WindowsDriverDeviceKind::Keyboard, WindowsDriverEventKind::Key)
-        | (WindowsDriverDeviceKind::Keyboard, WindowsDriverEventKind::Synthetic) => {
+        (WindowsDriverDeviceKind::Keyboard, WindowsDriverEventKind::Synthetic) => {
             Some(InputEvent::key(
                 rshare_input::KeyCode::Raw(event.value0 as u32),
                 if event.value1 != 0 {
@@ -6113,8 +6126,7 @@ fn input_event_from_windows_driver_event(
                 },
             ))
         }
-        (WindowsDriverDeviceKind::Mouse, WindowsDriverEventKind::MouseMove)
-        | (WindowsDriverDeviceKind::Mouse, WindowsDriverEventKind::Synthetic) => {
+        (WindowsDriverDeviceKind::Mouse, WindowsDriverEventKind::Synthetic) => {
             Some(InputEvent::mouse_move(event.value0, event.value1))
         }
         (WindowsDriverDeviceKind::Mouse, WindowsDriverEventKind::MouseButton) => {
@@ -6132,6 +6144,55 @@ fn input_event_from_windows_driver_event(
         }
         _ => None,
     }
+}
+
+#[cfg(windows)]
+fn input_event_from_windows_driver_event_with_pointer(
+    event: &rshare_platform::windows::WindowsDriverInputEvent,
+    current_x: i32,
+    current_y: i32,
+    display: &LocalDisplayState,
+) -> Option<InputEvent> {
+    use rshare_platform::windows::{WindowsDriverDeviceKind, WindowsDriverEventKind};
+
+    const MOUSE_MOVE_ABSOLUTE: u32 = 0x0001;
+
+    if event.device_kind == WindowsDriverDeviceKind::Mouse
+        && event.event_kind == WindowsDriverEventKind::MouseMove
+        && event.flags & MOUSE_MOVE_ABSOLUTE == 0
+    {
+        let (x, y) = clamp_windows_driver_mouse_delta(
+            current_x,
+            current_y,
+            event.value0,
+            event.value1,
+            display,
+        );
+        return Some(InputEvent::mouse_move(x, y));
+    }
+
+    input_event_from_windows_driver_event(event)
+}
+
+#[cfg(windows)]
+fn clamp_windows_driver_mouse_delta(
+    current_x: i32,
+    current_y: i32,
+    delta_x: i32,
+    delta_y: i32,
+    display: &LocalDisplayState,
+) -> (i32, i32) {
+    let min_x = display.virtual_x;
+    let min_y = display.virtual_y;
+    let width = i32::try_from(display.layout_width.max(1)).unwrap_or(i32::MAX);
+    let height = i32::try_from(display.layout_height.max(1)).unwrap_or(i32::MAX);
+    let max_x = min_x.saturating_add(width.saturating_sub(1));
+    let max_y = min_y.saturating_add(height.saturating_sub(1));
+
+    (
+        current_x.saturating_add(delta_x).clamp(min_x, max_x),
+        current_y.saturating_add(delta_y).clamp(min_y, max_y),
+    )
 }
 
 #[cfg(windows)]
@@ -6204,12 +6265,17 @@ async fn run_windows_driver_capture_loop(
                 let Some(driver_event) = event else {
                     break;
                 };
-                let Some(input_event) = input_event_from_windows_driver_event(&driver_event) else {
-                    continue;
-                };
 
                 let (target, messages, diagnostic, suppress_local_shortcuts) = {
                     let mut state = state.write().await;
+                    let Some(input_event) = input_event_from_windows_driver_event_with_pointer(
+                        &driver_event,
+                        state.local_controls.mouse.x,
+                        state.local_controls.mouse.y,
+                        &state.local_controls.display,
+                    ) else {
+                        continue;
+                    };
                     let mut local_event =
                         state.record_local_input_event_with_metadata(&input_event, None);
                     local_event.device_id = Some(driver_event.device_id.clone());
@@ -6667,18 +6733,28 @@ async fn main() -> Result<()> {
     };
 
     #[cfg(windows)]
-    let (input_rx, input_event_channel, _input_listener) = {
+    let (input_rx, input_event_channel, _input_listener, use_windows_filter_capture) = {
         let (input_event_channel, raw_input_rx) = InputEventChannel::new();
         let (captured_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInputEvent>();
         forward_input_events_to_captured_channel(raw_input_rx, captured_tx);
-        let callback_channel = input_event_channel.clone();
-        let mut input_listener = DefaultInputListener::new();
-        input_listener.start(Box::new(move |event| {
-            let _ = callback_channel.send(event);
-        }))?;
         set_local_shortcut_suppression(false);
-        tracing::info!("Using native Windows low-level hook input capture");
-        (input_rx, input_event_channel, input_listener)
+        let use_windows_filter_capture = {
+            let state = state.read().await;
+            windows_should_use_filter_capture(input_mode, &state.local_controls.driver)
+        };
+
+        if use_windows_filter_capture {
+            tracing::info!("Using RShare Windows filter driver input capture");
+            (input_rx, input_event_channel, None, true)
+        } else {
+            let callback_channel = input_event_channel.clone();
+            let mut input_listener = DefaultInputListener::new();
+            input_listener.start(Box::new(move |event| {
+                let _ = callback_channel.send(event);
+            }))?;
+            tracing::info!("Using native Windows low-level hook input capture");
+            (input_rx, input_event_channel, Some(input_listener), false)
+        }
     };
 
     #[cfg(all(not(target_os = "linux"), not(windows)))]
@@ -6759,13 +6835,17 @@ async fn main() -> Result<()> {
     ));
 
     #[cfg(windows)]
-    let _windows_driver_capture_task = tokio::spawn(run_windows_driver_capture_loop(
-        state.clone(),
-        network_manager.clone(),
-        local_events_tx.clone(),
-        shutdown_tx.subscribe(),
-        config.edge_threshold(),
-    ));
+    let _windows_driver_capture_task = if use_windows_filter_capture {
+        Some(tokio::spawn(run_windows_driver_capture_loop(
+            state.clone(),
+            network_manager.clone(),
+            local_events_tx.clone(),
+            shutdown_tx.subscribe(),
+            config.edge_threshold(),
+        )))
+    } else {
+        None
+    };
 
     let event_task = {
         let state = state.clone();
@@ -9657,6 +9737,44 @@ mod tests {
         assert!(error.unwrap().contains("using Portable"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_uses_filter_capture_only_for_selected_virtual_hid_backend() {
+        let driver = rshare_core::LocalDriverDiagnosticState {
+            status: "available".to_string(),
+            filter_active: true,
+            ..rshare_core::LocalDriverDiagnosticState::default()
+        };
+
+        assert!(windows_should_use_filter_capture(
+            Some(ResolvedInputMode::VirtualHid),
+            &driver
+        ));
+        assert!(!windows_should_use_filter_capture(
+            Some(ResolvedInputMode::WindowsNative),
+            &driver
+        ));
+        assert!(!windows_should_use_filter_capture(
+            Some(ResolvedInputMode::Portable),
+            &driver
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_falls_back_to_hook_when_filter_driver_is_not_active() {
+        let driver = rshare_core::LocalDriverDiagnosticState {
+            status: "available".to_string(),
+            filter_active: false,
+            ..rshare_core::LocalDriverDiagnosticState::default()
+        };
+
+        assert!(!windows_should_use_filter_capture(
+            Some(ResolvedInputMode::VirtualHid),
+            &driver
+        ));
+    }
+
     #[test]
     fn input_event_maps_to_forwarding_raw_event() {
         let raw = input_event_to_raw_event(rshare_input::InputEvent::mouse_button(
@@ -9696,7 +9814,7 @@ mod tests {
             event_kind: rshare_platform::windows::WindowsDriverEventKind::Key,
             device_id: "driver-keyboard".to_string(),
             device_instance_id: "instance".to_string(),
-            value0: 0x10,
+            value0: 0x1E,
             value1: 1,
             value2: 0,
             flags: 0,
@@ -9708,7 +9826,7 @@ mod tests {
         assert!(matches!(
             input,
             rshare_input::InputEvent::Key {
-                keycode: rshare_input::KeyCode::Raw(0x10),
+                keycode: rshare_input::KeyCode::Char(b'A'),
                 state: rshare_input::ButtonState::Pressed
             }
         ));
@@ -9716,6 +9834,32 @@ mod tests {
             local_source_from_windows_driver_event(event.source),
             LocalInputEventSource::DriverTest
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_driver_relative_mouse_move_updates_absolute_position() {
+        let display = fallback_display_state(1920, 1080);
+        let event = rshare_platform::windows::WindowsDriverInputEvent {
+            source: rshare_platform::windows::WindowsDriverEventSource::Hardware,
+            device_kind: rshare_platform::windows::WindowsDriverDeviceKind::Mouse,
+            event_kind: rshare_platform::windows::WindowsDriverEventKind::MouseMove,
+            device_id: "driver-mouse".to_string(),
+            device_instance_id: "instance".to_string(),
+            value0: 5,
+            value1: -10,
+            value2: 0,
+            flags: 0,
+            timestamp_us: 1,
+        };
+
+        let input = input_event_from_windows_driver_event_with_pointer(&event, 100, 200, &display)
+            .expect("driver mouse delta should map to absolute mouse move");
+
+        assert!(matches!(
+            input,
+            rshare_input::InputEvent::MouseMove { x: 105, y: 190 }
+        ));
     }
 
     #[test]
