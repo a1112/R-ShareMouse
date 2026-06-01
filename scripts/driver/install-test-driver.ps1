@@ -89,6 +89,25 @@ function Test-DevicePresent([string]$PnpUtil, [string]$HardwareId) {
 $KeyboardClassGuid = "{4D36E96B-E325-11CE-BFC1-08002BE10318}"
 $MouseClassGuid = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
 
+function Normalize-RShareUpperFilters($Value) {
+    $items = @()
+    foreach ($item in @($Value)) {
+        if (-not $item) {
+            continue
+        }
+        if ($item -ne "rshare-filter" -and $item.EndsWith("rshare-filter", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $prefix = $item.Substring(0, $item.Length - "rshare-filter".Length)
+            if ($prefix) {
+                $items += $prefix
+            }
+            $items += "rshare-filter"
+            continue
+        }
+        $items += $item
+    }
+    return $items
+}
+
 function Add-RShareClassUpperFilter([string]$ClassGuid) {
     $classPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$ClassGuid"
     if (-not (Test-Path $classPath)) {
@@ -98,30 +117,36 @@ function Add-RShareClassUpperFilter([string]$ClassGuid) {
     $existingValue = (Get-ItemProperty -Path $classPath -Name UpperFilters -ErrorAction SilentlyContinue).UpperFilters
     $existing = @()
     if ($existingValue) {
-        $existing = @($existingValue) | Where-Object { $_ -and $_ -ne "rshare-filter" }
+        $existing = Normalize-RShareUpperFilters $existingValue | Where-Object { $_ -and $_ -ne "rshare-filter" }
     }
 
-    $updated = @($existing + "rshare-filter")
-    New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value $updated -Force | Out-Null
+    $updated = @()
+    $updated += $existing
+    $updated += "rshare-filter"
+    New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value ([string[]]$updated) -Force | Out-Null
 }
 
 function Ensure-RShareClassFilterService([string]$DriverPath) {
-    if (-not (Test-Path $DriverPath)) {
-        throw "Missing class filter driver binary: $DriverPath. Run scripts\driver\build.ps1 first."
-    }
-
-    $targetPath = Join-Path $env:SystemRoot "System32\drivers\rshare-filter.sys"
-    Copy-Item -LiteralPath $DriverPath -Destination $targetPath -Force
-
     $sc = Find-SystemTool "sc.exe"
     & $sc query rshare-filter *> $null
     if ($LASTEXITCODE -eq 0) {
         & $sc config rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys"
-    } else {
-        & $sc create rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys" DisplayName= "R-ShareMouse input filter driver"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to update the rshare-filter kernel service."
+        }
+        return
     }
+
+    if (-not (Test-Path $DriverPath)) {
+        throw "Missing class filter driver binary: $DriverPath. Run scripts\driver\build.ps1 first."
+    } else {
+        $targetPath = Join-Path $env:SystemRoot "System32\drivers\rshare-filter.sys"
+        Copy-Item -LiteralPath $DriverPath -Destination $targetPath -Force
+    }
+
+    & $sc create rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys" DisplayName= "R-ShareMouse input filter driver"
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create or update the rshare-filter kernel service."
+        throw "Failed to create the rshare-filter kernel service."
     }
 }
 

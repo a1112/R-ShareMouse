@@ -596,6 +596,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
 
     assert!(install_script.contains("[switch]$EnableInputClassFilters"));
     assert!(install_script.contains("[switch]$HidOnly"));
+    assert!(install_script.contains("Normalize-RShareUpperFilters"));
+    assert!(install_script.contains("[string[]]$updated"));
     assert!(install_script.contains("Ensure-RShareClassFilterService"));
     assert!(install_script.contains("Copy-Item -LiteralPath $DriverPath"));
     assert!(install_script.contains("sc.exe"));
@@ -610,6 +612,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
         install_script.contains("Restart or reboot Windows before validating real filter capture")
     );
     assert!(uninstall_script.contains("Remove-RShareClassUpperFilter"));
+    assert!(uninstall_script.contains("Normalize-RShareUpperFilters"));
+    assert!(uninstall_script.contains("[string[]]$updated"));
     assert!(uninstall_script.contains("Remove-RShareClassFilterService"));
     assert!(uninstall_script.contains("delete rshare-filter"));
     assert!(uninstall_script.contains("rshare-filter"));
@@ -618,6 +622,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(validate_hid_script.contains("install-test-driver.ps1"));
     assert!(validate_hid_script.contains("HidOnly = $true"));
     assert!(validate_hid_script.contains("-EnableInputClassFilters"));
+    assert!(validate_hid_script.contains("return"));
+    assert!(validate_hid_script.contains("Re-run with -SkipBuild -SkipInstall after reboot"));
     assert!(validate_hid_script.contains("@(\"filter\", \"status\")"));
     assert!(validate_hid_script.contains("@(\"vhid\", \"status\")"));
     assert!(validate_hid_script.contains("@(\"vhid\", \"inject-smoke\")"));

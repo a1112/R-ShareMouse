@@ -80,6 +80,9 @@ if (-not $SkipInstall) {
 
 if ($requiresRestartBeforeHardwareCapture) {
     Write-Warning "Keyboard/mouse class filters were enabled or refreshed. Restart or reboot Windows, then re-run this script with -SkipBuild -SkipInstall to validate real hardware capture."
+    Write-Host "HID validation paused before probe checks because the class filter is not attached until Windows rebuilds the keyboard/mouse device stacks."
+    Write-Host "Re-run with -SkipBuild -SkipInstall after reboot to validate filter/vhid status and real hardware capture."
+    return
 } elseif (-not $EnableInputClassFilters -and -not $SkipInstall) {
     Write-Warning "Real keyboard/mouse class capture requires -EnableInputClassFilters once, followed by a Windows restart or reboot."
 }

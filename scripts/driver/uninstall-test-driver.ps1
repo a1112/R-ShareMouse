@@ -14,6 +14,25 @@ function Assert-Admin {
 
 Assert-Admin
 
+function Normalize-RShareUpperFilters($Value) {
+    $items = @()
+    foreach ($item in @($Value)) {
+        if (-not $item) {
+            continue
+        }
+        if ($item -ne "rshare-filter" -and $item.EndsWith("rshare-filter", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $prefix = $item.Substring(0, $item.Length - "rshare-filter".Length)
+            if ($prefix) {
+                $items += $prefix
+            }
+            $items += "rshare-filter"
+            continue
+        }
+        $items += $item
+    }
+    return $items
+}
+
 function Remove-RShareClassUpperFilter([string]$ClassGuid) {
     $classPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$ClassGuid"
     if (-not (Test-Path $classPath)) {
@@ -25,11 +44,11 @@ function Remove-RShareClassUpperFilter([string]$ClassGuid) {
         return
     }
 
-    $updated = @($existingValue) | Where-Object { $_ -and $_ -ne "rshare-filter" }
+    $updated = Normalize-RShareUpperFilters $existingValue | Where-Object { $_ -and $_ -ne "rshare-filter" }
     if ($updated.Count -eq 0) {
         Remove-ItemProperty -Path $classPath -Name UpperFilters -ErrorAction SilentlyContinue
     } else {
-        New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value $updated -Force | Out-Null
+        New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value ([string[]]$updated) -Force | Out-Null
     }
 }
 
