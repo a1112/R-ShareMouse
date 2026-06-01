@@ -42,13 +42,13 @@ static const BYTE s_RShareVirtualDisplayEdid[] = {
 };
 
 static const RShareDisplayMode RShareMonitorModes[] = {
-    {3840, 2160, 60000},
+    {1920, 1080, 60000},
+    {1920, 1080, 144000},
+    {1920, 1080, 90000},
     {2560, 1440, 144000},
     {2560, 1440, 90000},
     {2560, 1440, 60000},
-    {1920, 1080, 144000},
-    {1920, 1080, 90000},
-    {1920, 1080, 60000},
+    {3840, 2160, 60000},
     {1600, 900, 60000},
     {1280, 720, 90000},
     {1280, 720, 60000},
@@ -856,7 +856,7 @@ NTSTATUS RShareVDisplayParseMonitorDescription(
         inArgs->pMonitorModes[index] = RShareCreateMonitorMode(RShareMonitorModes[index]);
     }
 
-    outArgs->PreferredMonitorModeIdx = 0;
+    outArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
     return STATUS_SUCCESS;
 }
 

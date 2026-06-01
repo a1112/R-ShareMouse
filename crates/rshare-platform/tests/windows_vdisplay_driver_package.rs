@@ -50,38 +50,38 @@ fn extract_rshare_vdisplay_edid(driver: &str) -> Vec<u8> {
 fn expected_vdisplay_modes() -> Vec<VDisplayMode> {
     vec![
         VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 144_000,
+        },
+        VDisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: 90_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 144_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 90_000,
+        },
+        VDisplayMode {
+            width: 2560,
+            height: 1440,
+            refresh_rate_millihz: 60_000,
+        },
+        VDisplayMode {
             width: 3840,
             height: 2160,
-            refresh_rate_millihz: 60_000,
-        },
-        VDisplayMode {
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: 144_000,
-        },
-        VDisplayMode {
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: 90_000,
-        },
-        VDisplayMode {
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: 60_000,
-        },
-        VDisplayMode {
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: 144_000,
-        },
-        VDisplayMode {
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: 90_000,
-        },
-        VDisplayMode {
-            width: 1920,
-            height: 1080,
             refresh_rate_millihz: 60_000,
         },
         VDisplayMode {
@@ -316,6 +316,7 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
     assert!(driver.contains("IDARG_IN_UPDATEMODES"));
     assert!(driver.contains("IDDCX_UPDATE_REASON_OTHER"));
     assert!(driver.contains("IddCxMonitorUpdateModes(m_Monitor"));
+    assert!(driver.contains("outArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;"));
     assert!(driver.contains("monitorContext->Monitor->UpdateTargetModes()"));
     assert!(driver.contains("m_MonitorRequested"));
     assert!(driver.contains("RShareVirtualDisplayDevice::ReportPendingMonitorArrival"));
@@ -398,9 +399,10 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
 
     assert!(project.contains("<IndirectDisplayDriver>true</IndirectDisplayDriver>"));
     assert!(project.contains("<IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>"));
-    assert!(project.contains("<IDDCX_VERSION_MINOR>6</IDDCX_VERSION_MINOR>"));
+    assert!(project.contains("<IDDCX_VERSION_MINOR>2</IDDCX_VERSION_MINOR>"));
     assert!(project.contains("<WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>"));
     assert!(project.contains("<UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>"));
+    assert!(project.contains("<UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>"));
     assert!(project.contains("<ClInclude Include=\"driver.h\" />"));
     assert!(project.contains("<ClInclude Include=\"trace.h\" />"));
     assert!(project.contains("<FilesToPackage Include=\"$(TargetPath)\" />"));
@@ -411,8 +413,11 @@ fn windows_virtual_display_driver_is_a_real_iddcx_package() {
 
     assert!(inf.contains("DeviceGroupId"));
     assert!(inf.contains("RShareMouseVirtualDisplay"));
+    assert!(inf.contains("HKR,,Security,,\"D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;UD)(A;;GA;;;BU)\""));
     assert!(inf.contains("UmdfService=RShareVDisplay,RShareVDisplay_UmdfService"));
-    assert!(inf.contains("UmdfExtensions=IddCx0106"));
+    assert!(inf.contains("UmdfLibraryVersion=2.25"));
+    assert!(project.contains("/DIDDCX_MINIMUM_VERSION_REQUIRED=2"));
+    assert!(inf.contains("UmdfExtensions=IddCx0102"));
     assert!(inf.contains("rshare-vdisplay.dll"));
 
     assert!(build_script.contains("drivers\\windows\\rshare-vdisplay\\rshare-vdisplay.vcxproj"));

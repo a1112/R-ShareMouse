@@ -6,13 +6,13 @@ const CANVAS_ORIGIN_Y = 170;
 const LAYOUT_COMMIT_SNAP_DISTANCE = Math.ceil(12 / LAYOUT_SCALE);
 const LATENCY_HEALTHY_RTT_MS = 50;
 const VIRTUAL_DISPLAY_CREATE_MODES = [
-  { width: 3840, height: 2160, refreshRateMillihz: 60_000 },
+  { width: 1920, height: 1080, refreshRateMillihz: 60_000 },
+  { width: 1920, height: 1080, refreshRateMillihz: 144_000 },
+  { width: 1920, height: 1080, refreshRateMillihz: 90_000 },
   { width: 2560, height: 1440, refreshRateMillihz: 144_000 },
   { width: 2560, height: 1440, refreshRateMillihz: 90_000 },
   { width: 2560, height: 1440, refreshRateMillihz: 60_000 },
-  { width: 1920, height: 1080, refreshRateMillihz: 144_000 },
-  { width: 1920, height: 1080, refreshRateMillihz: 90_000 },
-  { width: 1920, height: 1080, refreshRateMillihz: 60_000 },
+  { width: 3840, height: 2160, refreshRateMillihz: 60_000 },
   { width: 1600, height: 900, refreshRateMillihz: 60_000 },
   { width: 1280, height: 720, refreshRateMillihz: 90_000 },
   { width: 1280, height: 720, refreshRateMillihz: 60_000 },

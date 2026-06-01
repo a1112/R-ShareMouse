@@ -18,13 +18,13 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $RefreshRateToleranceMillihz = 1000
 $SupportedVirtualDisplayModes = @(
-    @{ Width = 3840; Height = 2160; RefreshRateMillihz = 60000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 60000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 144000 },
+    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 90000 },
     @{ Width = 2560; Height = 1440; RefreshRateMillihz = 144000 },
     @{ Width = 2560; Height = 1440; RefreshRateMillihz = 90000 },
     @{ Width = 2560; Height = 1440; RefreshRateMillihz = 60000 },
-    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 144000 },
-    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 90000 },
-    @{ Width = 1920; Height = 1080; RefreshRateMillihz = 60000 },
+    @{ Width = 3840; Height = 2160; RefreshRateMillihz = 60000 },
     @{ Width = 1600; Height = 900; RefreshRateMillihz = 60000 },
     @{ Width = 1280; Height = 720; RefreshRateMillihz = 90000 },
     @{ Width = 1280; Height = 720; RefreshRateMillihz = 60000 },

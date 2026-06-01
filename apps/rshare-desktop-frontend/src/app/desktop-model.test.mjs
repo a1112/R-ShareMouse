@@ -196,13 +196,13 @@ test("buildVirtualDisplayViewModel exposes pending driver status without faking 
   assert.deepEqual(
     virtualView.createModes.map((mode) => mode.value),
     [
-      "3840x2160@60000",
+      "1920x1080@60000",
+      "1920x1080@144000",
+      "1920x1080@90000",
       "2560x1440@144000",
       "2560x1440@90000",
       "2560x1440@60000",
-      "1920x1080@144000",
-      "1920x1080@90000",
-      "1920x1080@60000",
+      "3840x2160@60000",
       "1600x900@60000",
       "1280x720@90000",
       "1280x720@60000",

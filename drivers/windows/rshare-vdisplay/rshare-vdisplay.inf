@@ -35,6 +35,7 @@ AddReg=RShareVDisplay_HardwareSettings
 [RShareVDisplay_HardwareSettings]
 HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "RShareMouseVirtualDisplay"
+HKR,,Security,,"D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;UD)(A;;GA;;;BU)"
 
 [RShareVDisplay_Install.NT.Services]
 Include=WUDFRD.inf
@@ -46,9 +47,9 @@ UmdfServiceOrder=RShareVDisplay
 UmdfKernelModeClientPolicy=AllowKernelModeClients
 
 [RShareVDisplay_UmdfService]
-UmdfLibraryVersion=2.33
+UmdfLibraryVersion=2.25
 ServiceBinary=%12%\UMDF\rshare-vdisplay.dll
-UmdfExtensions=IddCx0106
+UmdfExtensions=IddCx0102
 
 [DestinationDirs]
 RShareVDisplay_CopyFiles=12,UMDF
