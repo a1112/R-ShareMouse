@@ -202,6 +202,8 @@ static UCHAR RShareVkToHidUsage(LONG vk)
         return 0x56;
     case 0x6B:
         return 0x57;
+    case 0xE01C:
+        return 0x58;
     case 0x61:
         return 0x59;
     case 0x62:

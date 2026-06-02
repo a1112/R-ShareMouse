@@ -1635,7 +1635,10 @@ mod windows_impl {
 
     const WHEEL_DELTA: i32 = 120;
 
+    const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_SCANCODE: u32 = 0x0008;
+    const RSHARE_KEYPAD_ENTER_RAW: u16 = 0xE01C;
     const INPUT_MOUSE: u32 = 0;
     const INPUT_KEYBOARD: u32 = 1;
     const HC_ACTION: i32 = 0;
@@ -2685,20 +2688,29 @@ mod windows_impl {
 
     /// Send key via SendInput using the native INPUT ABI.
     unsafe fn send_key_input(vk: u16, down: bool) -> Result<()> {
+        let keyboard = keyboard_input_for_key(vk, down);
         let input = Input {
             kind: INPUT_KEYBOARD,
-            payload: InputPayload {
-                keyboard: KeyboardInput {
-                    vk,
-                    scan: 0,
-                    flags: if down { 0 } else { KEYEVENTF_KEYUP },
-                    time: 0,
-                    extra_info: 0,
-                },
-            },
+            payload: InputPayload { keyboard },
         };
 
         send_input(&input, "keyboard")
+    }
+
+    fn keyboard_input_for_key(vk: u16, down: bool) -> KeyboardInput {
+        let (vk, scan, flags) = if vk == RSHARE_KEYPAD_ENTER_RAW {
+            (0, 0x1C, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
+        } else {
+            (vk, 0, 0)
+        };
+
+        KeyboardInput {
+            vk,
+            scan,
+            flags: flags | if down { 0 } else { KEYEVENTF_KEYUP },
+            time: 0,
+            extra_info: 0,
+        }
     }
 
     fn claim_process_dpi_awareness_attempt(attempted: &AtomicBool) -> bool {
@@ -4523,6 +4535,20 @@ mod windows_impl {
             assert_eq!(align_of::<InputPayload>(), align_of::<usize>());
             assert_eq!(offset_of!(Input, kind), 0);
             assert_eq!(offset_of!(Input, payload), 8);
+        }
+
+        #[test]
+        fn keypad_enter_sendinput_uses_extended_scan_code() {
+            let down = keyboard_input_for_key(RSHARE_KEYPAD_ENTER_RAW, true);
+            assert_eq!(down.vk, 0);
+            assert_eq!(down.scan, 0x1C);
+            assert_eq!(down.flags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+
+            let up = keyboard_input_for_key(RSHARE_KEYPAD_ENTER_RAW, false);
+            assert_eq!(
+                up.flags,
+                KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+            );
         }
 
         #[test]

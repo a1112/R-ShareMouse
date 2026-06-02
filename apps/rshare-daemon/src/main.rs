@@ -3462,7 +3462,7 @@ fn message_to_input_event(message: Message) -> Option<InputEvent> {
         )),
         Message::MouseWheel { delta_x, delta_y } => Some(InputEvent::mouse_wheel(delta_x, delta_y)),
         Message::Key { keycode, state } => Some(InputEvent::key(
-            rshare_input::KeyCode::Raw(keycode),
+            input_keycode_from_message(keycode),
             input_key_state(state),
         )),
         Message::KeyExtended {
@@ -3473,7 +3473,7 @@ fn message_to_input_event(message: Message) -> Option<InputEvent> {
             alt,
             meta,
         } => Some(InputEvent::key_extended(
-            rshare_input::KeyCode::Raw(keycode),
+            input_keycode_from_message(keycode),
             input_key_state(state),
             shift,
             ctrl,
@@ -3486,6 +3486,14 @@ fn message_to_input_event(message: Message) -> Option<InputEvent> {
         }
         Message::GamepadState { state } => Some(InputEvent::gamepad_state(state)),
         _ => None,
+    }
+}
+
+fn input_keycode_from_message(keycode: u32) -> rshare_input::KeyCode {
+    if keycode == rshare_input::RSHARE_KEYPAD_ENTER_RAW {
+        rshare_input::KeyCode::KeypadEnter
+    } else {
+        rshare_input::KeyCode::Raw(keycode)
     }
 }
 
@@ -10087,6 +10095,40 @@ mod tests {
         assert!(matches!(
             raw,
             rshare_core::engine::RawInputEvent::GamepadState { .. }
+        ));
+    }
+
+    #[test]
+    fn keypad_enter_uses_distinct_forwarding_keycode() {
+        let raw = input_event_to_raw_event(rshare_input::InputEvent::key(
+            rshare_input::KeyCode::KeypadEnter,
+            rshare_input::ButtonState::Pressed,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            raw,
+            rshare_core::engine::RawInputEvent::Key {
+                keycode: rshare_input::RSHARE_KEYPAD_ENTER_RAW,
+                pressed: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn forwarded_keypad_enter_restores_key_identity() {
+        let input = message_to_input_event(rshare_core::Message::Key {
+            keycode: rshare_input::RSHARE_KEYPAD_ENTER_RAW,
+            state: rshare_core::KeyState::Pressed,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            input,
+            rshare_input::InputEvent::Key {
+                keycode: rshare_input::KeyCode::KeypadEnter,
+                state: rshare_input::ButtonState::Pressed,
+            }
         ));
     }
 

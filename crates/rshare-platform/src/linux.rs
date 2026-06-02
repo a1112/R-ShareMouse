@@ -424,6 +424,10 @@ mod linux_impl {
 
         #[cfg(feature = "x11")]
         fn keycode_to_x11(&self, keycode: u32) -> u32 {
+            if keycode == 0xE01C {
+                return 104;
+            }
+
             // Common X11 keycodes
             match keycode {
                 0x01 => 9,   // Escape

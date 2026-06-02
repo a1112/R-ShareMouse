@@ -428,6 +428,7 @@ mod macos_impl {
             0x79 => MacKeyCode::F10,
             0x7A => MacKeyCode::F11,
             0x7B => MacKeyCode::F12,
+            0xE01C => 0x4C,
             raw if raw <= u16::MAX as u32 => raw as u16,
             _ => bail!("Unsupported macOS keycode: {}", keycode),
         };

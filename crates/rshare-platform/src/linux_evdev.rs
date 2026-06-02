@@ -730,6 +730,7 @@ impl UInputInjector {
         }
 
         if let Some(keyboard) = &mut self.keyboard_device {
+            let keycode = if keycode == 0xE01C { 96 } else { keycode };
             let key = Key(keycode as u16);
             keyboard.emit_key(key, press)?;
         }

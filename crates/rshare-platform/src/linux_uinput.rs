@@ -293,6 +293,7 @@ impl UInputDevice {
         if !self.active.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let keycode = if keycode == 0xE01C { 96 } else { keycode };
 
         #[cfg(feature = "x11")]
         if let Some(file) = &self.file {
@@ -702,6 +703,7 @@ impl VirtualInputDevice {
     /// Send key event
     pub fn send_key(&self, keycode: u16, press: bool) -> Result<()> {
         if let Some(keyboard) = &self.keyboard {
+            let keycode = if keycode == 0xE01C { 96 } else { keycode };
             keyboard.send_key(keycode, press)?;
         }
         Ok(())

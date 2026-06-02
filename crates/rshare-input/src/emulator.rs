@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton};
+use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton, RSHARE_KEYPAD_ENTER_RAW};
 
 /// Input emulator trait
 pub trait InputEmulator {
@@ -719,6 +719,7 @@ impl WindowsNativeInputEmulator {
         let vk = match keycode {
             KeyCode::Escape => vk::VK_ESCAPE,
             KeyCode::Enter => vk::VK_RETURN,
+            KeyCode::KeypadEnter => RSHARE_KEYPAD_ENTER_RAW as u16,
             KeyCode::Tab => vk::VK_TAB,
             KeyCode::Backspace => vk::VK_BACK,
             KeyCode::Delete => vk::VK_DELETE,

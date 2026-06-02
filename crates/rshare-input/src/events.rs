@@ -178,6 +178,8 @@ pub enum KeyCode {
     Raw(u32),
 }
 
+pub const RSHARE_KEYPAD_ENTER_RAW: u32 = 0xE01C;
+
 impl KeyCode {
     /// Convert to platform-specific key code
     pub fn to_raw(&self) -> u32 {
@@ -240,7 +242,7 @@ impl KeyCode {
             KeyCode::Keypad9 => 0x69,
             KeyCode::KeypadMultiply => 0x6A,
             KeyCode::KeypadAdd => 0x6B,
-            KeyCode::KeypadEnter => 0x0D,
+            KeyCode::KeypadEnter => RSHARE_KEYPAD_ENTER_RAW,
             KeyCode::KeypadSubtract => 0x6D,
             KeyCode::KeypadDecimal => 0x6E,
             KeyCode::KeypadDivide => 0x6F,
@@ -747,6 +749,8 @@ mod tests {
         assert_eq!(KeyCode::SuperLeft.to_raw(), 0x5B);
         assert_eq!(KeyCode::Keypad5.to_raw(), 0x65);
         assert_eq!(KeyCode::KeypadDivide.to_raw(), 0x6F);
+        assert_ne!(KeyCode::KeypadEnter.to_raw(), KeyCode::Enter.to_raw());
+        assert_eq!(KeyCode::KeypadEnter.to_raw(), RSHARE_KEYPAD_ENTER_RAW);
         assert_eq!(KeyCode::Raw(123).to_raw(), 123);
     }
 
