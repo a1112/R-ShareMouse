@@ -63,6 +63,9 @@ static void print_usage(void)
     wprintf(L"  rshare-driver-probe filter status\n");
     wprintf(L"  rshare-driver-probe filter test\n");
     wprintf(L"  rshare-driver-probe filter watch [timeout_seconds]\n");
+    wprintf(L"  rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]\n");
+    wprintf(L"  rshare-driver-probe filter watch-keyboard [timeout_seconds]\n");
+    wprintf(L"  rshare-driver-probe filter watch-mouse [timeout_seconds]\n");
     wprintf(L"  rshare-driver-probe vhid status\n");
     wprintf(L"  rshare-driver-probe vhid inject-smoke\n");
     wprintf(L"  rshare-driver-probe vdisplay status\n");
@@ -199,7 +202,16 @@ static int probe_filter(BOOL emit_test)
     return 0;
 }
 
-static int probe_filter_watch(DWORD timeout_seconds)
+static BOOL filter_event_matches_target(const RSHARE_DRIVER_EVENT* event, ULONG target_device_kind)
+{
+    if (event->Source != RSHARE_SOURCE_HARDWARE) {
+        return FALSE;
+    }
+
+    return target_device_kind == 0 || event->DeviceKind == target_device_kind;
+}
+
+static int probe_filter_watch(DWORD timeout_seconds, ULONG target_device_kind)
 {
     HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
 
@@ -216,8 +228,11 @@ static int probe_filter_watch(DWORD timeout_seconds)
         DWORD returned = 0;
         RSHARE_DRIVER_EVENT event = {0};
         if (DeviceIoControl(device, IOCTL_RSHARE_READ_EVENT, NULL, 0, &event, sizeof(event), &returned, NULL)) {
-            print_driver_event("event", &event);
-            if (event.Source == RSHARE_SOURCE_HARDWARE) {
+            BOOL matches_target = filter_event_matches_target(&event, target_device_kind);
+            if (target_device_kind == 0 || matches_target) {
+                print_driver_event("event", &event);
+            }
+            if (matches_target) {
                 CloseHandle(device);
                 return 0;
             }
@@ -235,9 +250,68 @@ static int probe_filter_watch(DWORD timeout_seconds)
         return 15;
     }
 
-    wprintf(L"filter watch timed out without a hardware event\n");
+    if (target_device_kind == RSHARE_DEVICE_KEYBOARD) {
+        wprintf(L"filter watch timed out without a keyboard hardware event\n");
+    } else if (target_device_kind == RSHARE_DEVICE_MOUSE) {
+        wprintf(L"filter watch timed out without a mouse hardware event\n");
+    } else {
+        wprintf(L"filter watch timed out without a hardware event\n");
+    }
     CloseHandle(device);
     return 16;
+}
+
+static int probe_filter_drain(DWORD quiet_ms, DWORD timeout_seconds)
+{
+    HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
+
+    if (device == INVALID_HANDLE_VALUE) {
+        return 14;
+    }
+
+    if (quiet_ms == 0) {
+        quiet_ms = 500;
+    }
+    if (timeout_seconds == 0) {
+        timeout_seconds = 10;
+    }
+
+    DWORD drained = 0;
+    ULONGLONG deadline = GetTickCount64() + ((ULONGLONG)timeout_seconds * 1000ULL);
+    ULONGLONG idle_since = 0;
+    while (GetTickCount64() < deadline) {
+        DWORD returned = 0;
+        RSHARE_DRIVER_EVENT event = {0};
+        if (DeviceIoControl(device, IOCTL_RSHARE_READ_EVENT, NULL, 0, &event, sizeof(event), &returned, NULL)) {
+            print_driver_event("drained", &event);
+            drained++;
+            idle_since = 0;
+            continue;
+        }
+
+        DWORD error = GetLastError();
+        if (error == ERROR_NO_MORE_ITEMS) {
+            ULONGLONG now = GetTickCount64();
+            if (idle_since == 0) {
+                idle_since = now;
+            }
+            if (now - idle_since >= quiet_ms) {
+                printf("filter drain idle drained=%lu quiet_ms=%lu\n", drained, quiet_ms);
+                CloseHandle(device);
+                return 0;
+            }
+            Sleep(10);
+            continue;
+        }
+
+        wprintf(L"filter drain read failed: %lu\n", error);
+        CloseHandle(device);
+        return 20;
+    }
+
+    wprintf(L"filter drain timed out before idle\n");
+    CloseHandle(device);
+    return 21;
 }
 
 static int probe_vhid(BOOL inject_smoke)
@@ -447,7 +521,32 @@ int wmain(int argc, wchar_t** argv)
                 if (argc >= 4) {
                     timeout_seconds = (DWORD)_wtoi(argv[3]);
                 }
-                return probe_filter_watch(timeout_seconds);
+                return probe_filter_watch(timeout_seconds, 0);
+            }
+            if (wcscmp(argv[2], L"watch-keyboard") == 0) {
+                DWORD timeout_seconds = 15;
+                if (argc >= 4) {
+                    timeout_seconds = (DWORD)_wtoi(argv[3]);
+                }
+                return probe_filter_watch(timeout_seconds, RSHARE_DEVICE_KEYBOARD);
+            }
+            if (wcscmp(argv[2], L"watch-mouse") == 0) {
+                DWORD timeout_seconds = 15;
+                if (argc >= 4) {
+                    timeout_seconds = (DWORD)_wtoi(argv[3]);
+                }
+                return probe_filter_watch(timeout_seconds, RSHARE_DEVICE_MOUSE);
+            }
+            if (wcscmp(argv[2], L"drain") == 0) {
+                DWORD quiet_ms = 500;
+                DWORD timeout_seconds = 10;
+                if (argc >= 4) {
+                    quiet_ms = (DWORD)_wtoi(argv[3]);
+                }
+                if (argc >= 5) {
+                    timeout_seconds = (DWORD)_wtoi(argv[4]);
+                }
+                return probe_filter_drain(quiet_ms, timeout_seconds);
             }
             print_usage();
             return 1;

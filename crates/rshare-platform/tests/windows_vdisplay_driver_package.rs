@@ -589,7 +589,13 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(probe.contains("rshare-driver-probe filter status"));
     assert!(probe.contains("rshare-driver-probe filter test"));
     assert!(probe.contains("rshare-driver-probe filter watch [timeout_seconds]"));
+    assert!(probe.contains("rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]"));
+    assert!(probe.contains("rshare-driver-probe filter watch-keyboard [timeout_seconds]"));
+    assert!(probe.contains("rshare-driver-probe filter watch-mouse [timeout_seconds]"));
     assert!(probe.contains("probe_filter_watch"));
+    assert!(probe.contains("probe_filter_drain"));
+    assert!(probe.contains("RSHARE_DEVICE_KEYBOARD"));
+    assert!(probe.contains("RSHARE_DEVICE_MOUSE"));
     assert!(probe.contains("RSHARE_SOURCE_HARDWARE"));
     assert!(probe.contains("rshare-driver-probe vhid status"));
     assert!(probe.contains("rshare-driver-probe vhid inject-smoke"));
@@ -599,7 +605,10 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(install_script.contains("Normalize-RShareUpperFilters"));
     assert!(install_script.contains("Get-RShareClassDriverName"));
     assert!(install_script.contains("Insert-RShareFilterBeforeClassDriver"));
-    assert!(install_script.contains("rshare-filter must be below the keyboard/mouse class driver"));
+    assert!(install_script.contains(
+        "rshare-filter must be inserted before the keyboard/mouse class driver"
+    ));
+    assert!(!install_script.contains("rshare-filter must be below the keyboard/mouse class driver"));
     assert!(install_script.contains("Test-PnPUtilDriverInstallSucceeded"));
     assert!(install_script.contains("Driver package is up-to-date"));
     assert!(install_script.contains("[string[]]$updated"));
@@ -616,6 +625,10 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(
         install_script.contains("Restart or reboot Windows before validating real filter capture")
     );
+    assert!(validate_hid_script.contains("filter\", \"drain\""));
+    assert!(validate_hid_script.contains("filter\", \"watch-keyboard\""));
+    assert!(validate_hid_script.contains("filter\", \"watch-mouse\""));
+    assert!(validate_hid_script.contains("Drain filter queue after virtual HID injection"));
     assert!(uninstall_script.contains("Remove-RShareClassUpperFilter"));
     assert!(uninstall_script.contains("Normalize-RShareUpperFilters"));
     assert!(uninstall_script.contains("[string[]]$updated"));

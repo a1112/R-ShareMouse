@@ -99,6 +99,10 @@ Invoke-Step "Run virtual HID injection smoke test" {
     Invoke-Probe @("vhid", "inject-smoke") | Out-Null
 }
 
+Invoke-Step "Drain filter queue after virtual HID injection" {
+    Invoke-Probe @("filter", "drain", "500", "10") | Out-Null
+}
+
 Invoke-Step "Run filter synthetic event test" {
     Invoke-Probe @("filter", "test") | Out-Null
 }
@@ -106,10 +110,20 @@ Invoke-Step "Run filter synthetic event test" {
 if (-not $SkipManualHardwareCapture -and $requiresRestartBeforeHardwareCapture) {
     Write-Warning "Skipping live hardware capture watch until after the required Windows restart or reboot."
 } elseif (-not $SkipManualHardwareCapture) {
-    Invoke-Step "Watch real keyboard/mouse capture" {
-        Write-Host "Press and release a keyboard key. Move the mouse or click a mouse button."
-        Write-Host "Waiting up to $HardwareCaptureTimeoutSeconds seconds for a hardware event from the filter driver..."
-        Invoke-Probe @("filter", "watch", "$HardwareCaptureTimeoutSeconds") | Out-Null
+    Invoke-Step "Watch real keyboard capture" {
+        Write-Host "Press and release a keyboard key."
+        Write-Host "Waiting up to $HardwareCaptureTimeoutSeconds seconds for a keyboard hardware event from the filter driver..."
+        Invoke-Probe @("filter", "watch-keyboard", "$HardwareCaptureTimeoutSeconds") | Out-Null
+    }
+
+    Invoke-Step "Drain filter queue before mouse capture" {
+        Invoke-Probe @("filter", "drain", "500", "10") | Out-Null
+    }
+
+    Invoke-Step "Watch real mouse capture" {
+        Write-Host "Move the mouse or click a mouse button."
+        Write-Host "Waiting up to $HardwareCaptureTimeoutSeconds seconds for a mouse hardware event from the filter driver..."
+        Invoke-Probe @("filter", "watch-mouse", "$HardwareCaptureTimeoutSeconds") | Out-Null
     }
 }
 

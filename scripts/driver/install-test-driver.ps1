@@ -133,7 +133,7 @@ function Insert-RShareFilterBeforeClassDriver([string[]]$Existing, [string]$Clas
     $inserted = $false
     foreach ($item in @($Existing)) {
         if (-not $inserted -and $item -ieq $ClassDriverName) {
-            # rshare-filter must be below the keyboard/mouse class driver to see CONNECT ioctls.
+            # rshare-filter must be inserted before the keyboard/mouse class driver to see CONNECT ioctls.
             $updated += "rshare-filter"
             $inserted = $true
         }
