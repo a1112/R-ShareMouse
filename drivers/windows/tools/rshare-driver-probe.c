@@ -61,6 +61,7 @@ static void print_usage(void)
     wprintf(L"usage:\n");
     wprintf(L"  rshare-driver-probe\n");
     wprintf(L"  rshare-driver-probe filter status\n");
+    wprintf(L"  rshare-driver-probe filter stats\n");
     wprintf(L"  rshare-driver-probe filter test\n");
     wprintf(L"  rshare-driver-probe filter watch [timeout_seconds]\n");
     wprintf(L"  rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]\n");
@@ -104,6 +105,21 @@ static void print_driver_event(const char* prefix, const RSHARE_DRIVER_EVENT* ev
         event->Value2,
         (unsigned long long)event->DeviceId,
         (unsigned long long)event->DeviceInstanceHash);
+}
+
+static void print_driver_stats(const RSHARE_DRIVER_STATS* stats)
+{
+    printf(
+        "stats abi=%hu queue=%lu/%lu queued=%llu dropped=%llu keyboard_connect=%llu mouse_connect=%llu keyboard_events=%llu mouse_events=%llu\n",
+        stats->Abi,
+        stats->QueueDepth,
+        stats->QueueCapacity,
+        (unsigned long long)stats->QueuedEventCount,
+        (unsigned long long)stats->DroppedEventCount,
+        (unsigned long long)stats->KeyboardConnectCount,
+        (unsigned long long)stats->MouseConnectCount,
+        (unsigned long long)stats->KeyboardEventCount,
+        (unsigned long long)stats->MouseEventCount);
 }
 
 static wchar_t* first_device_interface_path(GUID* interface_guid)
@@ -198,6 +214,27 @@ static int probe_filter(BOOL emit_test)
 
     print_driver_event("event", &event);
 
+    CloseHandle(device);
+    return 0;
+}
+
+static int probe_filter_stats(void)
+{
+    HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
+
+    if (device == INVALID_HANDLE_VALUE) {
+        return 2;
+    }
+
+    DWORD returned = 0;
+    RSHARE_DRIVER_STATS stats = {0};
+    if (!DeviceIoControl(device, IOCTL_RSHARE_QUERY_STATS, NULL, 0, &stats, sizeof(stats), &returned, NULL)) {
+        wprintf(L"filter query stats failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 22;
+    }
+
+    print_driver_stats(&stats);
     CloseHandle(device);
     return 0;
 }
@@ -512,6 +549,9 @@ int wmain(int argc, wchar_t** argv)
             }
             if (wcscmp(argv[2], L"status") == 0) {
                 return probe_filter(FALSE);
+            }
+            if (wcscmp(argv[2], L"stats") == 0) {
+                return probe_filter_stats();
             }
             if (wcscmp(argv[2], L"test") == 0) {
                 return probe_filter(TRUE);

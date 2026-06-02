@@ -560,13 +560,23 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(ioctls.contains("RSHARE_CAP_VIRTUAL_MOUSE"));
     assert!(ioctls.contains("IOCTL_RSHARE_READ_EVENT"));
     assert!(ioctls.contains("IOCTL_RSHARE_INJECT_REPORT"));
+    assert!(ioctls.contains("IOCTL_RSHARE_QUERY_STATS"));
+    assert!(ioctls.contains("RSHARE_DRIVER_STATS"));
+    assert!(ioctls.contains("KeyboardConnectCount"));
+    assert!(ioctls.contains("MouseConnectCount"));
+    assert!(ioctls.contains("DroppedEventCount"));
 
     assert!(filter.contains("IOCTL_INTERNAL_KEYBOARD_CONNECT"));
+    assert!(filter.contains("version->Minor = 3"));
     assert!(filter.contains("IOCTL_INTERNAL_MOUSE_CONNECT"));
     assert!(filter.contains("RShareFilterKeyboardServiceCallback"));
     assert!(filter.contains("RShareFilterMouseServiceCallback"));
+    assert!(filter.contains("RShareIncrementStatsCounter(&context->KeyboardConnectCount)"));
+    assert!(filter.contains("RShareIncrementStatsCounter(&context->MouseConnectCount)"));
+    assert!(filter.contains("RShareSnapshotStats"));
     assert!(filter.contains("RSHARE_EVENT_QUEUE_CAPACITY"));
     assert!(filter.contains("context->Tail = (context->Tail + 1u) % RSHARE_EVENT_QUEUE_CAPACITY"));
+    assert!(filter.contains("RShareIncrementStatsCounter(&context->DroppedEventCount)"));
     assert!(filter.contains("RSHARE_EVENT_MOUSE_WHEEL"));
 
     assert!(vhid.contains("g_RShareKeyboardModifiers"));
@@ -587,6 +597,7 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(vhid.contains("RSHARE_REPORT_MOUSE_WHEEL"));
 
     assert!(probe.contains("rshare-driver-probe filter status"));
+    assert!(probe.contains("rshare-driver-probe filter stats"));
     assert!(probe.contains("rshare-driver-probe filter test"));
     assert!(probe.contains("rshare-driver-probe filter watch [timeout_seconds]"));
     assert!(probe.contains("rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]"));
@@ -594,6 +605,7 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(probe.contains("rshare-driver-probe filter watch-mouse [timeout_seconds]"));
     assert!(probe.contains("probe_filter_watch"));
     assert!(probe.contains("probe_filter_drain"));
+    assert!(probe.contains("probe_filter_stats"));
     assert!(probe.contains("RSHARE_DEVICE_KEYBOARD"));
     assert!(probe.contains("RSHARE_DEVICE_MOUSE"));
     assert!(probe.contains("RSHARE_SOURCE_HARDWARE"));
@@ -611,6 +623,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(!install_script.contains("rshare-filter must be below the keyboard/mouse class driver"));
     assert!(install_script.contains("Test-PnPUtilDriverInstallSucceeded"));
     assert!(install_script.contains("Driver package is up-to-date"));
+    assert!(install_script.contains("Test-DevConDriverInstallSucceeded"));
+    assert!(install_script.contains("Drivers installed successfully"));
     assert!(install_script.contains("[string[]]$updated"));
     assert!(install_script.contains("Ensure-RShareClassFilterService"));
     assert!(install_script.contains("Copy-Item -LiteralPath $DriverPath"));

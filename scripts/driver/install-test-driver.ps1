@@ -96,6 +96,17 @@ function Test-PnPUtilDriverInstallSucceeded([int]$ExitCode, $Output) {
         $text -match "Driver package is up-to-date"
 }
 
+function Test-DevConDriverInstallSucceeded([int]$ExitCode, $Output) {
+    if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
+        return $true
+    }
+
+    $text = ($Output | Out-String)
+    return $text -match "Drivers installed successfully" -or
+        $text -match "Driver is already installed" -or
+        $text -match "No devices were updated"
+}
+
 $KeyboardClassGuid = "{4D36E96B-E325-11CE-BFC1-08002BE10318}"
 $MouseClassGuid = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
 
@@ -281,11 +292,13 @@ foreach ($package in $packages) {
     Write-Host "Installing $($package.Name)"
     if ($package.UseDevCon) {
         $verb = if (Test-DevicePresent $pnpUtil $package.HardwareId) { "update" } else { "install" }
-        & $devcon $verb $package.Inf $package.HardwareId
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+        $devconOutput = & $devcon $verb $package.Inf $package.HardwareId 2>&1
+        $devconExitCode = $LASTEXITCODE
+        $devconOutput | ForEach-Object { Write-Host $_ }
+        if (-not (Test-DevConDriverInstallSucceeded $devconExitCode $devconOutput)) {
             throw "devcon failed for $($package.Inf)"
         }
-        if ($LASTEXITCODE -eq 3010) {
+        if ($devconExitCode -eq 3010) {
             Write-Warning "$($package.Name) installed; reboot is required to complete device setup."
         }
     } else {
