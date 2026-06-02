@@ -554,6 +554,10 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     let validate_hid_script = read_repo_file("scripts/driver/validate-hid.ps1");
     let start_hid_validation_script = read_repo_file("scripts/driver/start-hid-validation.ps1");
     let restart_input_script = read_repo_file("scripts/driver/restart-input-class-devices.ps1");
+    let register_post_reboot_script =
+        read_repo_file("scripts/driver/register-hid-post-reboot-validation.ps1");
+    let run_post_reboot_script =
+        read_repo_file("scripts/driver/run-hid-post-reboot-validation.ps1");
     let driver_readme = read_repo_file("drivers/windows/README.md");
 
     assert!(ioctls.contains("RSHARE_CAP_FILTER_EVENTS"));
@@ -730,6 +734,17 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(restart_input_script.contains("/restart-device"));
     assert!(restart_input_script.contains("ConfirmRestart"));
     assert!(restart_input_script.contains("keyboard and mouse device stacks"));
+    assert!(register_post_reboot_script.contains("Register-ScheduledTask"));
+    assert!(register_post_reboot_script.contains("New-ScheduledTaskTrigger -AtLogOn"));
+    assert!(register_post_reboot_script.contains("New-ScheduledTaskPrincipal"));
+    assert!(register_post_reboot_script.contains("RunLevel Highest"));
+    assert!(register_post_reboot_script.contains("run-hid-post-reboot-validation.ps1"));
+    assert!(register_post_reboot_script.contains("RShareMouse-HidPostRebootValidation"));
+    assert!(run_post_reboot_script.contains("validate-hid.ps1"));
+    assert!(run_post_reboot_script.contains("-SkipBuild"));
+    assert!(run_post_reboot_script.contains("-SkipInstall"));
+    assert!(run_post_reboot_script.contains("Unregister-ScheduledTask"));
+    assert!(run_post_reboot_script.contains("hid-validation-post-reboot"));
     assert!(driver_readme.contains("-EnableInputClassFilters"));
     assert!(driver_readme.contains("scripts\\driver\\validate-hid.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1"));
@@ -746,6 +761,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(driver_readme.contains("-RestartInputDeviceStacks"));
     assert!(driver_readme.contains("restart-input-class-devices.ps1"));
     assert!(driver_readme.contains("does not unload an older loaded filter driver"));
+    assert!(driver_readme.contains("register-hid-post-reboot-validation.ps1"));
+    assert!(driver_readme.contains("RShareMouse-HidPostRebootValidation"));
 }
 
 #[test]
