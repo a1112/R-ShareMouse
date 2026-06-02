@@ -98,11 +98,32 @@ function Assert-FilterDriverStats($Output) {
     return [pscustomobject]@{
         KeyboardConnect = $keyboardConnect
         MouseConnect = $mouseConnect
+        KeyboardEvents = Get-FilterStatsValue $text "keyboard_events"
+        MouseEvents = Get-FilterStatsValue $text "mouse_events"
     }
+}
+
+function Assert-FilterStatsIncrease($Before, $After) {
+    if ($null -eq $Before) {
+        throw "Missing baseline rshare-filter stats before virtual HID injection."
+    }
+    if ($null -eq $After) {
+        throw "Missing rshare-filter stats after virtual HID injection."
+    }
+
+    if ($After.KeyboardEvents -le $Before.KeyboardEvents) {
+        throw "Virtual HID injection did not produce keyboard events in rshare-filter stats. Restart Windows after installing the filter/vhid drivers, then re-run with -SkipBuild -SkipInstall."
+    }
+    if ($After.MouseEvents -le $Before.MouseEvents) {
+        throw "Virtual HID injection did not produce mouse events in rshare-filter stats. Restart Windows after installing the filter/vhid drivers, then re-run with -SkipBuild -SkipInstall."
+    }
+
+    Write-Host "Virtual HID injection observed by rshare-filter stats: keyboard_events $($Before.KeyboardEvents) -> $($After.KeyboardEvents), mouse_events $($Before.MouseEvents) -> $($After.MouseEvents)"
 }
 
 Assert-Admin
 $requiresRestartBeforeHardwareCapture = $EnableInputClassFilters -and -not $SkipInstall
+$script:filterStatsBeforeInjection = $null
 
 Invoke-Step "Check WDK environment" {
     & (Join-Path $PSScriptRoot "check-wdk.ps1")
@@ -148,15 +169,25 @@ Invoke-Step "Probe filter driver status" {
 
 Invoke-Step "Probe filter driver attachment stats" {
     $filterStats = Invoke-Probe @("filter", "stats")
-    Assert-FilterDriverStats $filterStats | Out-Null
+    $script:filterStatsBeforeInjection = Assert-FilterDriverStats $filterStats
 }
 
 Invoke-Step "Probe virtual HID driver status" {
     Invoke-Probe @("vhid", "status") | Out-Null
 }
 
+Invoke-Step "Drain filter queue before virtual HID injection" {
+    Invoke-Probe @("filter", "drain", "500", "10") | Out-Null
+}
+
 Invoke-Step "Run virtual HID injection smoke test" {
     Invoke-Probe @("vhid", "inject-smoke") | Out-Null
+}
+
+Invoke-Step "Verify virtual HID injection is visible to the filter driver" {
+    $filterStats = Invoke-Probe @("filter", "stats")
+    $filterStatsAfterInjection = Assert-FilterDriverStats $filterStats
+    Assert-FilterStatsIncrease $script:filterStatsBeforeInjection $filterStatsAfterInjection
 }
 
 Invoke-Step "Drain filter queue after virtual HID injection" {
