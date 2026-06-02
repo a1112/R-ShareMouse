@@ -537,6 +537,8 @@ fn key_code_from_windows_scan_code(scan_code: u32, flags: u32) -> KeyCode {
         (0x09, _) => KeyCode::Char(b'8'),
         (0x0A, _) => KeyCode::Char(b'9'),
         (0x0B, _) => KeyCode::Char(b'0'),
+        (0x0C, _) => KeyCode::Raw(0xBD),
+        (0x0D, _) => KeyCode::Raw(0xBB),
         (0x0E, _) => KeyCode::Backspace,
         (0x0F, _) => KeyCode::Tab,
         (0x10, _) => KeyCode::Char(b'Q'),
@@ -549,6 +551,8 @@ fn key_code_from_windows_scan_code(scan_code: u32, flags: u32) -> KeyCode {
         (0x17, _) => KeyCode::Char(b'I'),
         (0x18, _) => KeyCode::Char(b'O'),
         (0x19, _) => KeyCode::Char(b'P'),
+        (0x1A, _) => KeyCode::Raw(0xDB),
+        (0x1B, _) => KeyCode::Raw(0xDD),
         (0x1C, false) => KeyCode::Enter,
         (0x1C, true) => KeyCode::KeypadEnter,
         (0x1D, false) => KeyCode::ControlLeft,
@@ -562,7 +566,11 @@ fn key_code_from_windows_scan_code(scan_code: u32, flags: u32) -> KeyCode {
         (0x24, _) => KeyCode::Char(b'J'),
         (0x25, _) => KeyCode::Char(b'K'),
         (0x26, _) => KeyCode::Char(b'L'),
+        (0x27, _) => KeyCode::Raw(0xBA),
+        (0x28, _) => KeyCode::Raw(0xDE),
+        (0x29, _) => KeyCode::Raw(0xC0),
         (0x2A, _) => KeyCode::ShiftLeft,
+        (0x2B, _) => KeyCode::Raw(0xDC),
         (0x2C, _) => KeyCode::Char(b'Z'),
         (0x2D, _) => KeyCode::Char(b'X'),
         (0x2E, _) => KeyCode::Char(b'C'),
@@ -570,6 +578,9 @@ fn key_code_from_windows_scan_code(scan_code: u32, flags: u32) -> KeyCode {
         (0x30, _) => KeyCode::Char(b'B'),
         (0x31, _) => KeyCode::Char(b'N'),
         (0x32, _) => KeyCode::Char(b'M'),
+        (0x33, _) => KeyCode::Raw(0xBC),
+        (0x34, _) => KeyCode::Raw(0xBE),
+        (0x35, false) => KeyCode::Raw(0xBF),
         (0x35, true) => KeyCode::KeypadDivide,
         (0x36, _) => KeyCode::ShiftRight,
         (0x37, false) => KeyCode::KeypadMultiply,
@@ -778,6 +789,22 @@ mod tests {
             key_code_from_windows_scan_code(0x5B, 0x02),
             KeyCode::SuperLeft
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_punctuation_scan_codes_normalize_to_virtual_keys_for_driver_capture() {
+        assert_eq!(key_code_from_windows_scan_code(0x0C, 0), KeyCode::Raw(0xBD));
+        assert_eq!(key_code_from_windows_scan_code(0x0D, 0), KeyCode::Raw(0xBB));
+        assert_eq!(key_code_from_windows_scan_code(0x1A, 0), KeyCode::Raw(0xDB));
+        assert_eq!(key_code_from_windows_scan_code(0x1B, 0), KeyCode::Raw(0xDD));
+        assert_eq!(key_code_from_windows_scan_code(0x27, 0), KeyCode::Raw(0xBA));
+        assert_eq!(key_code_from_windows_scan_code(0x28, 0), KeyCode::Raw(0xDE));
+        assert_eq!(key_code_from_windows_scan_code(0x29, 0), KeyCode::Raw(0xC0));
+        assert_eq!(key_code_from_windows_scan_code(0x2B, 0), KeyCode::Raw(0xDC));
+        assert_eq!(key_code_from_windows_scan_code(0x33, 0), KeyCode::Raw(0xBC));
+        assert_eq!(key_code_from_windows_scan_code(0x34, 0), KeyCode::Raw(0xBE));
+        assert_eq!(key_code_from_windows_scan_code(0x35, 0), KeyCode::Raw(0xBF));
     }
 
     #[test]
