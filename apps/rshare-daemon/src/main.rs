@@ -3837,6 +3837,7 @@ async fn run_local_input_test(
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     test: LocalInputTestRequest,
 ) -> LocalInputTestResult {
+    let mut diagnostic_payload = BTreeMap::new();
     let result = match test.kind {
         LocalInputTestKind::KeyboardShift => {
             let mut backend = inject_backend.lock().await;
@@ -3872,6 +3873,10 @@ async fn run_local_input_test(
             }
             let ((first_x, first_y), (second_x, second_y)) =
                 ((x.saturating_add(8), y.saturating_add(8)), (x, y));
+            diagnostic_payload.insert("x".to_string(), first_x.to_string());
+            diagnostic_payload.insert("y".to_string(), first_y.to_string());
+            diagnostic_payload.insert("return_x".to_string(), second_x.to_string());
+            diagnostic_payload.insert("return_y".to_string(), second_y.to_string());
             backend
                 .inject(InputEvent::mouse_move(first_x, first_y))
                 .and_then(|_| backend.inject(InputEvent::mouse_move(second_x, second_y)))
@@ -3886,7 +3891,7 @@ async fn run_local_input_test(
 
     match result {
         Ok(()) => {
-            let event = record_injected_test_event(state, test.kind).await;
+            let event = record_injected_test_event(state, test.kind, diagnostic_payload).await;
             let _ = local_events_tx.send(event);
             LocalInputTestResult::success("Local input injection test completed.")
         }
@@ -5415,6 +5420,7 @@ async fn complete_pending_usb_error(
 async fn record_injected_test_event(
     state: &Arc<RwLock<DaemonState>>,
     kind: LocalInputTestKind,
+    payload: BTreeMap<String, String>,
 ) -> LocalInputDiagnosticEvent {
     let mut state = state.write().await;
     let sequence = state.local_controls.sequence.saturating_add(1);
@@ -5448,7 +5454,7 @@ async fn record_injected_test_event(
         device_instance_id: None,
         capture_path: Some("daemon-injection-test".to_string()),
         source: LocalInputEventSource::InjectedLoopback,
-        payload: BTreeMap::new(),
+        payload,
     };
     push_recent_local_event(&mut state.local_controls, event.clone());
     event
@@ -9560,7 +9566,7 @@ mod tests {
         daemon.local_controls.mouse.x = 500;
         daemon.local_controls.mouse.y = 300;
         let state = Arc::new(RwLock::new(daemon));
-        let (events, _rx) = broadcast::channel(4);
+        let (events, mut rx) = broadcast::channel(4);
 
         let result = run_local_input_test(
             &backend,
@@ -9583,13 +9589,25 @@ mod tests {
             injected[1],
             rshare_input::InputEvent::MouseMove { x: 500, y: 300 }
         ));
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.payload.get("x").map(String::as_str), Some("508"));
+        assert_eq!(event.payload.get("y").map(String::as_str), Some("308"));
+        assert_eq!(
+            event.payload.get("return_x").map(String::as_str),
+            Some("500")
+        );
+        assert_eq!(
+            event.payload.get("return_y").map(String::as_str),
+            Some("300")
+        );
     }
 
     #[tokio::test]
     async fn injected_test_marks_immediate_capture_feedback_as_loopback() {
         let state = Arc::new(RwLock::new(test_daemon_state()));
 
-        record_injected_test_event(&state, LocalInputTestKind::KeyboardShift).await;
+        record_injected_test_event(&state, LocalInputTestKind::KeyboardShift, BTreeMap::new())
+            .await;
         let mut state = state.write().await;
         let feedback = state.record_local_input_event(&rshare_input::InputEvent::key(
             rshare_input::KeyCode::ShiftLeft,
