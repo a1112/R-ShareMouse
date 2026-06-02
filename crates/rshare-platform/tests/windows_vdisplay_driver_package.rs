@@ -615,6 +615,12 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(probe.contains("RSHARE_SOURCE_HARDWARE"));
     assert!(probe.contains("rshare-driver-probe vhid status"));
     assert!(probe.contains("rshare-driver-probe vhid inject-smoke"));
+    assert!(probe.contains("RSHARE_REPORT_MOUSE_BUTTON"));
+    assert!(probe.contains("vhid inject mouse button down failed"));
+    assert!(probe.contains("vhid inject mouse button up failed"));
+    assert!(probe.contains("RSHARE_REPORT_MOUSE_WHEEL"));
+    assert!(probe.contains("vhid inject mouse wheel failed"));
+    assert!(probe.contains("vhid inject horizontal mouse wheel failed"));
 
     assert!(install_script.contains("[switch]$EnableInputClassFilters"));
     assert!(install_script.contains("[switch]$HidOnly"));
@@ -703,6 +709,7 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1 -SkipBuild -SkipInstall"));
     assert!(driver_readme.contains("rshare-driver-probe filter stats"));
     assert!(driver_readme.contains("virtual HID injection increments the filter keyboard and mouse event counters"));
+    assert!(driver_readme.contains("mouse button and wheel reports"));
     assert!(driver_readme.contains("watch-keyboard"));
     assert!(driver_readme.contains("watch-mouse"));
     assert!(driver_readme.contains("target\\driver-validation"));

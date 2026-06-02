@@ -417,6 +417,39 @@ static int probe_vhid(BOOL inject_smoke)
         return 13;
     }
 
+    report.ReportKind = RSHARE_REPORT_MOUSE_BUTTON;
+    report.Value0 = 1;
+    report.Value1 = 1;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_REPORT, &report, sizeof(report), NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid inject mouse button down failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 14;
+    }
+
+    report.Value1 = 0;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_REPORT, &report, sizeof(report), NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid inject mouse button up failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 15;
+    }
+
+    report.ReportKind = RSHARE_REPORT_MOUSE_WHEEL;
+    report.Value0 = 0;
+    report.Value1 = 1;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_REPORT, &report, sizeof(report), NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid inject mouse wheel failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 16;
+    }
+
+    report.Value0 = 1;
+    report.Value1 = 0;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_REPORT, &report, sizeof(report), NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid inject horizontal mouse wheel failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 17;
+    }
+
     printf("vhid inject smoke ok\n");
     CloseHandle(device);
     return 0;
