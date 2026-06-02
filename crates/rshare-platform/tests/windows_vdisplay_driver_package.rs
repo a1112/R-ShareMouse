@@ -643,6 +643,15 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(validate_hid_script.contains("filter\", \"watch-keyboard\""));
     assert!(validate_hid_script.contains("filter\", \"watch-mouse\""));
     assert!(validate_hid_script.contains("Drain filter queue after virtual HID injection"));
+    assert!(validate_hid_script.contains("Assert-FilterDriverVersion"));
+    assert!(validate_hid_script.contains("Assert-FilterDriverStats"));
+    assert!(validate_hid_script.contains("MinFilterMinorVersion"));
+    assert!(validate_hid_script.contains("@(\"filter\", \"stats\")"));
+    assert!(validate_hid_script.contains("keyboard_connect"));
+    assert!(validate_hid_script.contains("mouse_connect"));
+    assert!(validate_hid_script.contains("The loaded rshare-filter driver is older than expected"));
+    assert!(validate_hid_script.contains("The filter driver has not attached to a keyboard class stack"));
+    assert!(validate_hid_script.contains("The filter driver has not attached to a mouse class stack"));
     assert!(uninstall_script.contains("Remove-RShareClassUpperFilter"));
     assert!(uninstall_script.contains("Normalize-RShareUpperFilters"));
     assert!(uninstall_script.contains("[string[]]$updated"));
@@ -667,6 +676,9 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(driver_readme.contains("-EnableInputClassFilters"));
     assert!(driver_readme.contains("scripts\\driver\\validate-hid.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1"));
+    assert!(driver_readme.contains("rshare-driver-probe filter stats"));
+    assert!(driver_readme.contains("watch-keyboard"));
+    assert!(driver_readme.contains("watch-mouse"));
     assert!(driver_readme.contains("target\\driver-validation"));
 }
 

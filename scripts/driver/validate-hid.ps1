@@ -8,6 +8,7 @@ param(
     [switch]$EnableTestSigning,
     [switch]$EnableInputClassFilters,
     [switch]$SkipManualHardwareCapture,
+    [uint32]$MinFilterMinorVersion = 3,
     [uint32]$HardwareCaptureTimeoutSeconds = 20
 )
 
@@ -45,6 +46,53 @@ function Invoke-Probe([string[]]$Arguments) {
     }
     $output | ForEach-Object { Write-Host $_ }
     return $output
+}
+
+function Assert-FilterDriverVersion($Output, [uint32]$MinimumMinorVersion) {
+    $text = ($Output | Out-String)
+    $match = [regex]::Match(
+        $text,
+        "version\s+(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)\s+abi\s+(?<abi>\d+)"
+    )
+    if (-not $match.Success) {
+        throw "Could not parse rshare-filter version output."
+    }
+
+    $major = [uint32]$match.Groups["major"].Value
+    $minor = [uint32]$match.Groups["minor"].Value
+    $patch = [uint32]$match.Groups["patch"].Value
+    if ($major -eq 0 -and $minor -lt $MinimumMinorVersion) {
+        throw "The loaded rshare-filter driver is older than expected ($major.$minor.$patch). Reboot Windows after installing the updated package, then re-run with -SkipBuild -SkipInstall."
+    }
+}
+
+function Get-FilterStatsValue([string]$Text, [string]$Name) {
+    $match = [regex]::Match($Text, "(^|\s)$Name=(?<value>\d+)")
+    if (-not $match.Success) {
+        throw "Could not parse $Name from rshare-filter stats output."
+    }
+    return [uint64]$match.Groups["value"].Value
+}
+
+function Assert-FilterDriverStats($Output) {
+    $text = ($Output | Out-String)
+    if (-not ($text -match "stats\s+abi=")) {
+        throw "Could not parse rshare-filter stats output."
+    }
+
+    $keyboardConnect = Get-FilterStatsValue $text "keyboard_connect"
+    $mouseConnect = Get-FilterStatsValue $text "mouse_connect"
+    if ($keyboardConnect -eq 0) {
+        throw "The filter driver has not attached to a keyboard class stack. Reboot Windows after enabling input class filters, then re-run with -SkipBuild -SkipInstall."
+    }
+    if ($mouseConnect -eq 0) {
+        throw "The filter driver has not attached to a mouse class stack. Reboot Windows after enabling input class filters, then re-run with -SkipBuild -SkipInstall."
+    }
+
+    return [pscustomobject]@{
+        KeyboardConnect = $keyboardConnect
+        MouseConnect = $mouseConnect
+    }
 }
 
 Assert-Admin
@@ -88,7 +136,13 @@ if ($requiresRestartBeforeHardwareCapture) {
 }
 
 Invoke-Step "Probe filter driver status" {
-    Invoke-Probe @("filter", "status") | Out-Null
+    $filterStatus = Invoke-Probe @("filter", "status")
+    Assert-FilterDriverVersion $filterStatus $MinFilterMinorVersion
+}
+
+Invoke-Step "Probe filter driver attachment stats" {
+    $filterStats = Invoke-Probe @("filter", "stats")
+    Assert-FilterDriverStats $filterStats | Out-Null
 }
 
 Invoke-Step "Probe virtual HID driver status" {
