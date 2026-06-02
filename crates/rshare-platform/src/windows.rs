@@ -562,6 +562,24 @@ mod windows_impl {
         pub max_event_size: u32,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WindowsDriverStats {
+        pub queue_capacity: u32,
+        pub queue_depth: u32,
+        pub queued_events: u64,
+        pub dropped_events: u64,
+        pub keyboard_connects: u64,
+        pub mouse_connects: u64,
+        pub keyboard_events: u64,
+        pub mouse_events: u64,
+    }
+
+    impl WindowsDriverStats {
+        pub fn filter_capture_ready(&self) -> bool {
+            self.keyboard_connects > 0 && self.mouse_connects > 0
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum WindowsDriverDeviceKind {
         Keyboard,
@@ -718,6 +736,21 @@ mod windows_impl {
             raw.try_into()
         }
 
+        pub fn query_stats(&self) -> Result<WindowsDriverStats> {
+            let mut raw = RShareDriverStatsRaw::default();
+            unsafe {
+                device_io_control(
+                    self.handle,
+                    IOCTL_RSHARE_QUERY_STATS,
+                    std::ptr::null_mut(),
+                    0,
+                    (&mut raw as *mut RShareDriverStatsRaw).cast(),
+                    size_of::<RShareDriverStatsRaw>() as u32,
+                )?;
+            }
+            raw.try_into()
+        }
+
         pub fn inject_keyboard(&self, vk: u16, pressed: bool) -> Result<()> {
             let mut raw = RShareInjectReportRaw {
                 report_kind: RSHARE_REPORT_KEYBOARD,
@@ -861,6 +894,19 @@ mod windows_impl {
                 match client.query_capabilities() {
                     Ok(capabilities) => {
                         state.filter_active = capabilities.filter_events;
+                    }
+                    Err(error) => errors.push(error.to_string()),
+                }
+                match client.query_stats() {
+                    Ok(stats) => {
+                        state.filter_queue_capacity = stats.queue_capacity;
+                        state.filter_queue_depth = stats.queue_depth;
+                        state.filter_queued_events = stats.queued_events;
+                        state.filter_dropped_events = stats.dropped_events;
+                        state.filter_keyboard_connects = stats.keyboard_connects;
+                        state.filter_mouse_connects = stats.mouse_connects;
+                        state.filter_keyboard_events = stats.keyboard_events;
+                        state.filter_mouse_events = stats.mouse_events;
                     }
                     Err(error) => errors.push(error.to_string()),
                 }
@@ -1563,6 +1609,8 @@ mod windows_impl {
         ctl_code(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_DATA);
     const IOCTL_RSHARE_EMIT_TEST_PACKET: u32 =
         ctl_code(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA);
+    const IOCTL_RSHARE_QUERY_STATS: u32 =
+        ctl_code(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA);
     const ERROR_NO_MORE_ITEMS: i32 = 259;
 
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -2017,6 +2065,42 @@ mod windows_impl {
         value1: i32,
         value2: i32,
         timestamp_us: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RShareDriverStatsRaw {
+        abi: u16,
+        reserved0: u16,
+        queue_capacity: u32,
+        queue_depth: u32,
+        queued_events: u64,
+        dropped_events: u64,
+        keyboard_connects: u64,
+        mouse_connects: u64,
+        keyboard_events: u64,
+        mouse_events: u64,
+    }
+
+    impl TryFrom<RShareDriverStatsRaw> for WindowsDriverStats {
+        type Error = anyhow::Error;
+
+        fn try_from(raw: RShareDriverStatsRaw) -> Result<Self> {
+            if raw.abi != RSHARE_DRIVER_ABI {
+                anyhow::bail!("Unsupported RShare driver stats ABI {}", raw.abi);
+            }
+
+            Ok(Self {
+                queue_capacity: raw.queue_capacity,
+                queue_depth: raw.queue_depth,
+                queued_events: raw.queued_events,
+                dropped_events: raw.dropped_events,
+                keyboard_connects: raw.keyboard_connects,
+                mouse_connects: raw.mouse_connects,
+                keyboard_events: raw.keyboard_events,
+                mouse_events: raw.mouse_events,
+            })
+        }
     }
 
     impl TryFrom<RShareDriverEventRaw> for WindowsDriverInputEvent {
@@ -4431,8 +4515,10 @@ mod windows_impl {
             assert_eq!(size_of::<RShareInjectReportRaw>(), 20);
             assert_eq!(size_of::<RShareTestPacketRaw>(), 20);
             assert_eq!(size_of::<RShareDriverEventRaw>(), 56);
+            assert_eq!(size_of::<RShareDriverStatsRaw>(), 64);
             assert_eq!(IOCTL_RSHARE_QUERY_VERSION, 0x0022_2004);
             assert_eq!(IOCTL_RSHARE_READ_EVENT, 0x0022_600c);
+            assert_eq!(IOCTL_RSHARE_QUERY_STATS, 0x0022_6018);
         }
 
         #[test]
@@ -4474,6 +4560,56 @@ mod windows_impl {
             assert_eq!(event.source, WindowsDriverEventSource::DriverTest);
             assert_eq!(event.device_id, "rshare-driver:0000000000001234");
             assert_eq!(event.device_instance_id, "hash:0000000000005678");
+        }
+
+        #[test]
+        fn rshare_driver_raw_stats_convert_to_public_stats() {
+            let raw = RShareDriverStatsRaw {
+                abi: RSHARE_DRIVER_ABI,
+                queue_capacity: 256,
+                queue_depth: 3,
+                queued_events: 40,
+                dropped_events: 2,
+                keyboard_connects: 1,
+                mouse_connects: 1,
+                keyboard_events: 12,
+                mouse_events: 28,
+                ..RShareDriverStatsRaw::default()
+            };
+
+            let stats = WindowsDriverStats::try_from(raw).unwrap();
+
+            assert_eq!(stats.queue_capacity, 256);
+            assert_eq!(stats.queue_depth, 3);
+            assert_eq!(stats.queued_events, 40);
+            assert_eq!(stats.dropped_events, 2);
+            assert_eq!(stats.keyboard_connects, 1);
+            assert_eq!(stats.mouse_connects, 1);
+            assert_eq!(stats.keyboard_events, 12);
+            assert_eq!(stats.mouse_events, 28);
+            assert!(stats.filter_capture_ready());
+
+            let invalid = RShareDriverStatsRaw {
+                abi: RSHARE_DRIVER_ABI + 1,
+                ..raw
+            };
+            assert!(WindowsDriverStats::try_from(invalid).is_err());
+        }
+
+        #[test]
+        fn rshare_driver_stats_require_keyboard_and_mouse_attachment() {
+            let stats = WindowsDriverStats {
+                queue_capacity: 256,
+                queue_depth: 0,
+                queued_events: 0,
+                dropped_events: 0,
+                keyboard_connects: 1,
+                mouse_connects: 0,
+                keyboard_events: 0,
+                mouse_events: 0,
+            };
+
+            assert!(!stats.filter_capture_ready());
         }
 
         #[test]

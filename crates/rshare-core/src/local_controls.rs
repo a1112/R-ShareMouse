@@ -357,6 +357,22 @@ pub struct LocalDriverDiagnosticState {
     #[serde(default)]
     pub vhid_active: bool,
     #[serde(default)]
+    pub filter_queue_capacity: u32,
+    #[serde(default)]
+    pub filter_queue_depth: u32,
+    #[serde(default)]
+    pub filter_queued_events: u64,
+    #[serde(default)]
+    pub filter_dropped_events: u64,
+    #[serde(default)]
+    pub filter_keyboard_connects: u64,
+    #[serde(default)]
+    pub filter_mouse_connects: u64,
+    #[serde(default)]
+    pub filter_keyboard_events: u64,
+    #[serde(default)]
+    pub filter_mouse_events: u64,
+    #[serde(default)]
     pub test_signing_required: bool,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -370,6 +386,14 @@ impl Default for LocalDriverDiagnosticState {
             version: None,
             filter_active: false,
             vhid_active: false,
+            filter_queue_capacity: 0,
+            filter_queue_depth: 0,
+            filter_queued_events: 0,
+            filter_dropped_events: 0,
+            filter_keyboard_connects: 0,
+            filter_mouse_connects: 0,
+            filter_keyboard_events: 0,
+            filter_mouse_events: 0,
             test_signing_required: false,
             last_error: None,
         }
@@ -1012,4 +1036,23 @@ fn default_virtual_gamepad_status() -> String {
 
 fn default_virtual_gamepad_detail() -> String {
     "Virtual HID gamepad injection is not implemented in this build.".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn driver_diagnostic_defaults_include_filter_attachment_stats() {
+        let driver = LocalDriverDiagnosticState::default();
+
+        assert_eq!(driver.filter_queue_capacity, 0);
+        assert_eq!(driver.filter_queue_depth, 0);
+        assert_eq!(driver.filter_queued_events, 0);
+        assert_eq!(driver.filter_dropped_events, 0);
+        assert_eq!(driver.filter_keyboard_connects, 0);
+        assert_eq!(driver.filter_mouse_connects, 0);
+        assert_eq!(driver.filter_keyboard_events, 0);
+        assert_eq!(driver.filter_mouse_events, 0);
+    }
 }

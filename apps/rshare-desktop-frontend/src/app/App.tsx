@@ -338,6 +338,14 @@ type LocalControlsSnapshot = {
     version?: string | null;
     filter_active: boolean;
     vhid_active: boolean;
+    filter_queue_capacity?: number;
+    filter_queue_depth?: number;
+    filter_queued_events?: number;
+    filter_dropped_events?: number;
+    filter_keyboard_connects?: number;
+    filter_mouse_connects?: number;
+    filter_keyboard_events?: number;
+    filter_mouse_events?: number;
     test_signing_required: boolean;
     last_error?: string | null;
   };
@@ -9091,7 +9099,14 @@ function driverStatusLabel(snapshot: LocalControlsSnapshot | null) {
   const version = snapshot.driver.version ? ` ${snapshot.driver.version}` : "";
   const filter = snapshot.driver.filter_active ? " filter" : "";
   const vhid = snapshot.driver.vhid_active ? " vhid" : "";
-  return `${snapshot.driver.status}${version}${filter}${vhid}`;
+  const keyboardConnects = snapshot.driver.filter_keyboard_connects ?? 0;
+  const mouseConnects = snapshot.driver.filter_mouse_connects ?? 0;
+  const keyboardEvents = snapshot.driver.filter_keyboard_events ?? 0;
+  const mouseEvents = snapshot.driver.filter_mouse_events ?? 0;
+  const filterStats = snapshot.driver.filter_active
+    ? ` attach ${keyboardConnects}/${mouseConnects} events ${keyboardEvents}/${mouseEvents}`
+    : "";
+  return `${snapshot.driver.status}${version}${filter}${vhid}${filterStats}`;
 }
 
 function localInputDeviceCount(

@@ -1221,7 +1221,7 @@ fn refresh_platform_local_controls(
             }
         }
         snapshot.driver = rshare_platform::windows::probe_rshare_driver();
-        if snapshot.driver.status == "available" {
+        if windows_driver_filter_capture_ready(&snapshot.driver) {
             snapshot.keyboard.capture_source = "RShare filter driver + fallback hook".to_string();
             snapshot.mouse.capture_source = "RShare filter driver + fallback hook".to_string();
         }
@@ -1258,10 +1258,14 @@ fn refresh_platform_local_controls(
         Ok((keyboards, mice)) => {
             snapshot.keyboard_devices = keyboards;
             snapshot.mouse_devices = mice;
-            if !snapshot.keyboard_devices.is_empty() && snapshot.driver.status != "available" {
+            if !snapshot.keyboard_devices.is_empty()
+                && !windows_driver_filter_capture_ready(&snapshot.driver)
+            {
                 snapshot.keyboard.capture_source = "Windows Raw Input + low-level hook".to_string();
             }
-            if !snapshot.mouse_devices.is_empty() && snapshot.driver.status != "available" {
+            if !snapshot.mouse_devices.is_empty()
+                && !windows_driver_filter_capture_ready(&snapshot.driver)
+            {
                 snapshot.mouse.capture_source = "Windows Raw Input + low-level hook".to_string();
             }
         }
@@ -1892,13 +1896,20 @@ fn backend_kind_from_resolved_mode(mode: ResolvedInputMode) -> BackendKind {
 }
 
 #[cfg(windows)]
+fn windows_driver_filter_capture_ready(driver: &rshare_core::LocalDriverDiagnosticState) -> bool {
+    driver.status == "available"
+        && driver.filter_active
+        && driver.filter_keyboard_connects > 0
+        && driver.filter_mouse_connects > 0
+}
+
+#[cfg(windows)]
 fn windows_should_use_filter_capture(
     mode: Option<ResolvedInputMode>,
     driver: &rshare_core::LocalDriverDiagnosticState,
 ) -> bool {
     matches!(mode, Some(ResolvedInputMode::VirtualHid))
-        && driver.status == "available"
-        && driver.filter_active
+        && windows_driver_filter_capture_ready(driver)
 }
 
 fn timestamp_ms_now() -> u64 {
@@ -9743,6 +9754,8 @@ mod tests {
         let driver = rshare_core::LocalDriverDiagnosticState {
             status: "available".to_string(),
             filter_active: true,
+            filter_keyboard_connects: 1,
+            filter_mouse_connects: 1,
             ..rshare_core::LocalDriverDiagnosticState::default()
         };
 
@@ -9750,6 +9763,7 @@ mod tests {
             Some(ResolvedInputMode::VirtualHid),
             &driver
         ));
+        assert!(windows_driver_filter_capture_ready(&driver));
         assert!(!windows_should_use_filter_capture(
             Some(ResolvedInputMode::WindowsNative),
             &driver
@@ -9766,6 +9780,24 @@ mod tests {
         let driver = rshare_core::LocalDriverDiagnosticState {
             status: "available".to_string(),
             filter_active: false,
+            ..rshare_core::LocalDriverDiagnosticState::default()
+        };
+
+        assert!(!windows_should_use_filter_capture(
+            Some(ResolvedInputMode::VirtualHid),
+            &driver
+        ));
+        assert!(!windows_driver_filter_capture_ready(&driver));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_falls_back_to_hook_until_filter_attaches_to_keyboard_and_mouse_stacks() {
+        let driver = rshare_core::LocalDriverDiagnosticState {
+            status: "available".to_string(),
+            filter_active: true,
+            filter_keyboard_connects: 1,
+            filter_mouse_connects: 0,
             ..rshare_core::LocalDriverDiagnosticState::default()
         };
 

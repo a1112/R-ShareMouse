@@ -667,7 +667,13 @@ impl VirtualHidCaptureBackend {
         };
 
         match client.query_capabilities() {
-            Ok(capabilities) if capabilities.filter_events => BackendHealth::Healthy,
+            Ok(capabilities) if capabilities.filter_events => match client.query_stats() {
+                Ok(stats) if stats.filter_capture_ready() => BackendHealth::Healthy,
+                Ok(_) => BackendHealth::Degraded {
+                    reason: BackendFailureReason::Unavailable,
+                },
+                Err(error) => driver_error_health(&error.to_string()),
+            },
             Ok(_) => BackendHealth::Degraded {
                 reason: BackendFailureReason::Unavailable,
             },
