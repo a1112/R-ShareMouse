@@ -597,6 +597,11 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(install_script.contains("[switch]$EnableInputClassFilters"));
     assert!(install_script.contains("[switch]$HidOnly"));
     assert!(install_script.contains("Normalize-RShareUpperFilters"));
+    assert!(install_script.contains("Get-RShareClassDriverName"));
+    assert!(install_script.contains("Insert-RShareFilterBeforeClassDriver"));
+    assert!(install_script.contains("rshare-filter must be below the keyboard/mouse class driver"));
+    assert!(install_script.contains("Test-PnPUtilDriverInstallSucceeded"));
+    assert!(install_script.contains("Driver package is up-to-date"));
     assert!(install_script.contains("[string[]]$updated"));
     assert!(install_script.contains("Ensure-RShareClassFilterService"));
     assert!(install_script.contains("Copy-Item -LiteralPath $DriverPath"));

@@ -86,8 +86,28 @@ function Test-DevicePresent([string]$PnpUtil, [string]$HardwareId) {
     return [bool]($output | Select-String -Pattern "Instance ID:")
 }
 
+function Test-PnPUtilDriverInstallSucceeded([int]$ExitCode, $Output) {
+    if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
+        return $true
+    }
+
+    $text = ($Output | Out-String)
+    return $text -match "Driver package added successfully" -or
+        $text -match "Driver package is up-to-date"
+}
+
 $KeyboardClassGuid = "{4D36E96B-E325-11CE-BFC1-08002BE10318}"
 $MouseClassGuid = "{4D36E96F-E325-11CE-BFC1-08002BE10318}"
+
+function Get-RShareClassDriverName([string]$ClassGuid) {
+    if ($ClassGuid -ieq $KeyboardClassGuid) {
+        return "kbdclass"
+    }
+    if ($ClassGuid -ieq $MouseClassGuid) {
+        return "mouclass"
+    }
+    throw "Unsupported RShare input class filter GUID: $ClassGuid"
+}
 
 function Normalize-RShareUpperFilters($Value) {
     $items = @()
@@ -108,21 +128,37 @@ function Normalize-RShareUpperFilters($Value) {
     return $items
 }
 
+function Insert-RShareFilterBeforeClassDriver([string[]]$Existing, [string]$ClassDriverName) {
+    $updated = @()
+    $inserted = $false
+    foreach ($item in @($Existing)) {
+        if (-not $inserted -and $item -ieq $ClassDriverName) {
+            # rshare-filter must be below the keyboard/mouse class driver to see CONNECT ioctls.
+            $updated += "rshare-filter"
+            $inserted = $true
+        }
+        $updated += $item
+    }
+    if (-not $inserted) {
+        $updated = @("rshare-filter") + $updated
+    }
+    return $updated
+}
+
 function Add-RShareClassUpperFilter([string]$ClassGuid) {
     $classPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$ClassGuid"
     if (-not (Test-Path $classPath)) {
         throw "Device class registry key not found: $classPath"
     }
 
+    $classDriverName = Get-RShareClassDriverName $ClassGuid
     $existingValue = (Get-ItemProperty -Path $classPath -Name UpperFilters -ErrorAction SilentlyContinue).UpperFilters
     $existing = @()
     if ($existingValue) {
         $existing = Normalize-RShareUpperFilters $existingValue | Where-Object { $_ -and $_ -ne "rshare-filter" }
     }
 
-    $updated = @()
-    $updated += $existing
-    $updated += "rshare-filter"
+    $updated = Insert-RShareFilterBeforeClassDriver ([string[]]$existing) $classDriverName
     New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value ([string[]]$updated) -Force | Out-Null
 }
 
@@ -253,11 +289,13 @@ foreach ($package in $packages) {
             Write-Warning "$($package.Name) installed; reboot is required to complete device setup."
         }
     } else {
-        & $pnpUtil /add-driver $package.Inf /install
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+        $pnpOutput = & $pnpUtil /add-driver $package.Inf /install 2>&1
+        $pnpExitCode = $LASTEXITCODE
+        $pnpOutput | ForEach-Object { Write-Host $_ }
+        if (-not (Test-PnPUtilDriverInstallSucceeded $pnpExitCode $pnpOutput)) {
             throw "pnputil failed for $($package.Inf)"
         }
-        if ($LASTEXITCODE -eq 3010) {
+        if ($pnpExitCode -eq 3010) {
             Write-Warning "$($package.Name) installed; reboot is required to complete device setup."
         }
     }
