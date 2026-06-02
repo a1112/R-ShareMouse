@@ -553,6 +553,7 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     let uninstall_script = read_repo_file("scripts/driver/uninstall-test-driver.ps1");
     let validate_hid_script = read_repo_file("scripts/driver/validate-hid.ps1");
     let start_hid_validation_script = read_repo_file("scripts/driver/start-hid-validation.ps1");
+    let restart_input_script = read_repo_file("scripts/driver/restart-input-class-devices.ps1");
     let driver_readme = read_repo_file("drivers/windows/README.md");
 
     assert!(ioctls.contains("RSHARE_CAP_FILTER_EVENTS"));
@@ -679,6 +680,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(validate_hid_script.contains("ExpectedFilterStatsBytes"));
     assert!(validate_hid_script.contains("The loaded rshare-filter driver is older than expected"));
     assert!(validate_hid_script
+        .contains("RestartInputDeviceStacks does not unload an older driver instance"));
+    assert!(validate_hid_script
         .contains("The filter driver has not attached to a keyboard class stack"));
     assert!(
         validate_hid_script.contains("The filter driver has not attached to a mouse class stack")
@@ -705,6 +708,9 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(validate_hid_script.contains("@(\"vhid\", \"inject-smoke\")"));
     assert!(validate_hid_script.contains("Press and release a keyboard key"));
     assert!(validate_hid_script.contains("Move the mouse or click a mouse button"));
+    assert!(validate_hid_script.contains("[switch]$RestartInputDeviceStacks"));
+    assert!(validate_hid_script.contains("restart-input-class-devices.ps1"));
+    assert!(validate_hid_script.contains("-RestartInputDeviceStacks"));
     assert!(start_hid_validation_script.contains("Start-Transcript"));
     assert!(start_hid_validation_script.contains("target\\driver-validation"));
     assert!(start_hid_validation_script.contains("validate-hid.ps1"));
@@ -714,6 +720,16 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(
         start_hid_validation_script.contains("$(if ($SkipInstall) { '-SkipInstall' } else { '' })")
     );
+    assert!(start_hid_validation_script.contains("[switch]$RestartInputDeviceStacks"));
+    assert!(start_hid_validation_script
+        .contains("$(if ($RestartInputDeviceStacks) { '-RestartInputDeviceStacks' } else { '' })"));
+    assert!(restart_input_script.contains("Assert-Admin"));
+    assert!(restart_input_script.contains("{4D36E96B-E325-11CE-BFC1-08002BE10318}"));
+    assert!(restart_input_script.contains("{4D36E96F-E325-11CE-BFC1-08002BE10318}"));
+    assert!(restart_input_script.contains("pnputil.exe"));
+    assert!(restart_input_script.contains("/restart-device"));
+    assert!(restart_input_script.contains("ConfirmRestart"));
+    assert!(restart_input_script.contains("keyboard and mouse device stacks"));
     assert!(driver_readme.contains("-EnableInputClassFilters"));
     assert!(driver_readme.contains("scripts\\driver\\validate-hid.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1"));
@@ -727,6 +743,9 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(driver_readme.contains("watch-keyboard"));
     assert!(driver_readme.contains("watch-mouse"));
     assert!(driver_readme.contains("target\\driver-validation"));
+    assert!(driver_readme.contains("-RestartInputDeviceStacks"));
+    assert!(driver_readme.contains("restart-input-class-devices.ps1"));
+    assert!(driver_readme.contains("does not unload an older loaded filter driver"));
 }
 
 #[test]

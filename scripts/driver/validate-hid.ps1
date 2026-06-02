@@ -7,6 +7,7 @@ param(
     [switch]$SkipInstall,
     [switch]$EnableTestSigning,
     [switch]$EnableInputClassFilters,
+    [switch]$RestartInputDeviceStacks,
     [switch]$SkipManualHardwareCapture,
     [uint32]$MinFilterMinorVersion = 3,
     [uint32]$ExpectedFilterStatsBytes = 64,
@@ -63,7 +64,7 @@ function Assert-FilterDriverVersion($Output, [uint32]$MinimumMinorVersion) {
     $minor = [uint32]$match.Groups["minor"].Value
     $patch = [uint32]$match.Groups["patch"].Value
     if ($major -eq 0 -and $minor -lt $MinimumMinorVersion) {
-        throw "The loaded rshare-filter driver is older than expected ($major.$minor.$patch). Reboot Windows after installing the updated package, then re-run with -SkipBuild -SkipInstall."
+        throw "The loaded rshare-filter driver is older than expected ($major.$minor.$patch). RestartInputDeviceStacks does not unload an older driver instance; reboot Windows after installing the updated package, then re-run with -SkipBuild -SkipInstall."
     }
 }
 
@@ -153,10 +154,18 @@ if (-not $SkipInstall) {
     }
 }
 
+if ($RestartInputDeviceStacks) {
+    Invoke-Step "Restart keyboard and mouse device stacks" {
+        & (Join-Path $PSScriptRoot "restart-input-class-devices.ps1") -ConfirmRestart
+    }
+    $requiresRestartBeforeHardwareCapture = $false
+}
+
 if ($requiresRestartBeforeHardwareCapture) {
     Write-Warning "Keyboard/mouse class filters were enabled or refreshed. Restart or reboot Windows, then re-run this script with -SkipBuild -SkipInstall to validate real hardware capture."
     Write-Host "HID validation paused before probe checks because the class filter is not attached until Windows rebuilds the keyboard/mouse device stacks."
     Write-Host "Re-run with -SkipBuild -SkipInstall after reboot to validate filter/vhid status and real hardware capture."
+    Write-Host "Alternatively, re-run with -SkipBuild -SkipInstall -RestartInputDeviceStacks to restart keyboard/mouse device stacks before validation."
     return
 } elseif (-not $EnableInputClassFilters -and -not $SkipInstall) {
     Write-Warning "Real keyboard/mouse class capture requires -EnableInputClassFilters once, followed by a Windows restart or reboot."

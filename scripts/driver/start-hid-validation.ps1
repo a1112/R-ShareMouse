@@ -7,6 +7,7 @@ param(
     [switch]$SkipInstall,
     [switch]$EnableTestSigning,
     [switch]$EnableInputClassFilters,
+    [switch]$RestartInputDeviceStacks,
     [switch]$SkipManualHardwareCapture,
     [uint32]$HardwareCaptureTimeoutSeconds = 20
 )
@@ -29,7 +30,7 @@ $validationArgs = @(
 Set-Location '$root'
 Start-Transcript -Path '$logPath' -Force
 try {
-    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -HardwareCaptureTimeoutSeconds $HardwareCaptureTimeoutSeconds $(if ($SkipBuild) { '-SkipBuild' } else { '' }) $(if ($SkipInstall) { '-SkipInstall' } else { '' }) $(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' }) $(if ($EnableInputClassFilters) { '-EnableInputClassFilters' } else { '' }) $(if ($SkipManualHardwareCapture) { '-SkipManualHardwareCapture' } else { '' })
+    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -HardwareCaptureTimeoutSeconds $HardwareCaptureTimeoutSeconds $(if ($SkipBuild) { '-SkipBuild' } else { '' }) $(if ($SkipInstall) { '-SkipInstall' } else { '' }) $(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' }) $(if ($EnableInputClassFilters) { '-EnableInputClassFilters' } else { '' }) $(if ($RestartInputDeviceStacks) { '-RestartInputDeviceStacks' } else { '' }) $(if ($SkipManualHardwareCapture) { '-SkipManualHardwareCapture' } else { '' })
 } finally {
     Stop-Transcript
     Write-Host ''
