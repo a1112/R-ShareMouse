@@ -631,6 +631,14 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(install_script.contains("Drivers installed successfully"));
     assert!(install_script.contains("[string[]]$updated"));
     assert!(install_script.contains("Ensure-RShareClassFilterService"));
+    assert!(install_script.contains("Install-RShareClassFilterServiceBinary"));
+    assert!(install_script.contains("Install-RShareClassFilterServiceBinary $DriverPath"));
+    assert!(install_script.contains("Schedule-RShareFileReplacementOnReboot"));
+    assert!(install_script.contains("MoveFileEx"));
+    assert!(install_script.contains("MOVEFILE_DELAY_UNTIL_REBOOT"));
+    assert!(install_script.contains("MOVEFILE_REPLACE_EXISTING"));
+    assert!(install_script.contains("ProgramData"));
+    assert!(install_script.contains("Copy-Item -LiteralPath $DriverPath -Destination $stagedPath -Force -ErrorAction Stop"));
     assert!(install_script.contains("Copy-Item -LiteralPath $DriverPath"));
     assert!(install_script.contains("sc.exe"));
     assert!(install_script.contains("type= kernel"));

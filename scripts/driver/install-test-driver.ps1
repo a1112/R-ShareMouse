@@ -173,7 +173,50 @@ function Add-RShareClassUpperFilter([string]$ClassGuid) {
     New-ItemProperty -Path $classPath -Name UpperFilters -PropertyType MultiString -Value ([string[]]$updated) -Force | Out-Null
 }
 
+function Schedule-RShareFileReplacementOnReboot([string]$SourcePath, [string]$DestinationPath) {
+    if (-not ("RShareMoveFileEx" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class RShareMoveFileEx {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool MoveFileEx(string existingFileName, string newFileName, int flags);
+}
+"@
+    }
+
+    $MOVEFILE_REPLACE_EXISTING = 0x1
+    $MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+    $flags = $MOVEFILE_REPLACE_EXISTING -bor $MOVEFILE_DELAY_UNTIL_REBOOT
+    if (-not [RShareMoveFileEx]::MoveFileEx($SourcePath, $DestinationPath, $flags)) {
+        $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Failed to schedule $DestinationPath replacement on reboot. Win32 error: $lastError"
+    }
+}
+
+function Install-RShareClassFilterServiceBinary([string]$DriverPath) {
+    if (-not (Test-Path $DriverPath)) {
+        throw "Missing class filter driver binary: $DriverPath. Run scripts\driver\build.ps1 first."
+    }
+
+    $targetPath = Join-Path $env:SystemRoot "System32\drivers\rshare-filter.sys"
+    try {
+        Copy-Item -LiteralPath $DriverPath -Destination $targetPath -Force -ErrorAction Stop
+        return
+    } catch {
+        $stagingRoot = Join-Path $env:ProgramData "RShareMouse\drivers"
+        New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+        $stagedPath = Join-Path $stagingRoot "rshare-filter.sys.next"
+        Copy-Item -LiteralPath $DriverPath -Destination $stagedPath -Force -ErrorAction Stop
+        Schedule-RShareFileReplacementOnReboot $stagedPath $targetPath
+        Write-Warning "rshare-filter.sys is currently locked; scheduled service binary replacement on next Windows reboot."
+    }
+}
+
 function Ensure-RShareClassFilterService([string]$DriverPath) {
+    Install-RShareClassFilterServiceBinary $DriverPath
+
     $sc = Find-SystemTool "sc.exe"
     & $sc query rshare-filter *> $null
     if ($LASTEXITCODE -eq 0) {
@@ -182,13 +225,6 @@ function Ensure-RShareClassFilterService([string]$DriverPath) {
             throw "Failed to update the rshare-filter kernel service."
         }
         return
-    }
-
-    if (-not (Test-Path $DriverPath)) {
-        throw "Missing class filter driver binary: $DriverPath. Run scripts\driver\build.ps1 first."
-    } else {
-        $targetPath = Join-Path $env:SystemRoot "System32\drivers\rshare-filter.sys"
-        Copy-Item -LiteralPath $DriverPath -Destination $targetPath -Force
     }
 
     & $sc create rshare-filter type= kernel start= demand error= normal binPath= "\SystemRoot\System32\drivers\rshare-filter.sys" DisplayName= "R-ShareMouse input filter driver"
