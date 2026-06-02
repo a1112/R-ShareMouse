@@ -3870,21 +3870,8 @@ async fn run_local_input_test(
                     "Input injection backend is not active.",
                 );
             }
-            let is_virtual_hid = {
-                #[cfg(target_os = "windows")]
-                {
-                    backend.kind() == BackendKind::VirtualHid
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    false
-                }
-            };
-            let ((first_x, first_y), (second_x, second_y)) = if is_virtual_hid {
-                ((8, 8), (-8, -8))
-            } else {
-                ((x.saturating_add(8), y.saturating_add(8)), (x, y))
-            };
+            let ((first_x, first_y), (second_x, second_y)) =
+                ((x.saturating_add(8), y.saturating_add(8)), (x, y));
             backend
                 .inject(InputEvent::mouse_move(first_x, first_y))
                 .and_then(|_| backend.inject(InputEvent::mouse_move(second_x, second_y)))
@@ -9508,6 +9495,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RecordingKindInjectBackend {
+        kind: BackendKind,
+        injected: Arc<std::sync::Mutex<Vec<rshare_input::InputEvent>>>,
+    }
+
+    impl InjectBackend for RecordingKindInjectBackend {
+        fn kind(&self) -> BackendKind {
+            self.kind
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: rshare_input::InputEvent) -> Result<()> {
+            self.injected.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn run_local_input_test_reports_success_and_broadcasts_feedback() {
         let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
@@ -9534,6 +9546,43 @@ mod tests {
         assert_eq!(event.source, LocalInputEventSource::InjectedLoopback);
         assert_eq!(event.device_kind, LocalInputDeviceKind::Keyboard);
         assert_eq!(state.read().await.local_controls.recent_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn virtual_hid_mouse_test_uses_absolute_round_trip_coordinates() {
+        let injected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(RecordingKindInjectBackend {
+                kind: BackendKind::VirtualHid,
+                injected: injected.clone(),
+            })));
+        let mut daemon = test_daemon_state();
+        daemon.local_controls.mouse.x = 500;
+        daemon.local_controls.mouse.y = 300;
+        let state = Arc::new(RwLock::new(daemon));
+        let (events, _rx) = broadcast::channel(4);
+
+        let result = run_local_input_test(
+            &backend,
+            &state,
+            &events,
+            LocalInputTestRequest {
+                kind: LocalInputTestKind::MouseMove,
+            },
+        )
+        .await;
+
+        assert_eq!(result.status, LocalInputTestStatus::Success);
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 2);
+        assert!(matches!(
+            injected[0],
+            rshare_input::InputEvent::MouseMove { x: 508, y: 308 }
+        ));
+        assert!(matches!(
+            injected[1],
+            rshare_input::InputEvent::MouseMove { x: 500, y: 300 }
+        ));
     }
 
     #[tokio::test]
