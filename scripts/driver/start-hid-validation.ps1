@@ -3,6 +3,8 @@ param(
     [string]$Configuration = "Debug",
     [ValidateSet("x64")]
     [string]$Platform = "x64",
+    [switch]$SkipBuild,
+    [switch]$SkipInstall,
     [switch]$EnableTestSigning,
     [switch]$EnableInputClassFilters,
     [switch]$SkipManualHardwareCapture,
@@ -27,7 +29,7 @@ $validationArgs = @(
 Set-Location '$root'
 Start-Transcript -Path '$logPath' -Force
 try {
-    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -HardwareCaptureTimeoutSeconds $HardwareCaptureTimeoutSeconds $(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' }) $(if ($EnableInputClassFilters) { '-EnableInputClassFilters' } else { '' }) $(if ($SkipManualHardwareCapture) { '-SkipManualHardwareCapture' } else { '' })
+    & '$validateScript' -Configuration '$Configuration' -Platform '$Platform' -HardwareCaptureTimeoutSeconds $HardwareCaptureTimeoutSeconds $(if ($SkipBuild) { '-SkipBuild' } else { '' }) $(if ($SkipInstall) { '-SkipInstall' } else { '' }) $(if ($EnableTestSigning) { '-EnableTestSigning' } else { '' }) $(if ($EnableInputClassFilters) { '-EnableInputClassFilters' } else { '' }) $(if ($SkipManualHardwareCapture) { '-SkipManualHardwareCapture' } else { '' })
 } finally {
     Stop-Transcript
     Write-Host ''

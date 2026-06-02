@@ -693,9 +693,14 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(start_hid_validation_script.contains("Start-Transcript"));
     assert!(start_hid_validation_script.contains("target\\driver-validation"));
     assert!(start_hid_validation_script.contains("validate-hid.ps1"));
+    assert!(start_hid_validation_script.contains("[switch]$SkipBuild"));
+    assert!(start_hid_validation_script.contains("[switch]$SkipInstall"));
+    assert!(start_hid_validation_script.contains("$(if ($SkipBuild) { '-SkipBuild' } else { '' })"));
+    assert!(start_hid_validation_script.contains("$(if ($SkipInstall) { '-SkipInstall' } else { '' })"));
     assert!(driver_readme.contains("-EnableInputClassFilters"));
     assert!(driver_readme.contains("scripts\\driver\\validate-hid.ps1"));
     assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1"));
+    assert!(driver_readme.contains("scripts\\driver\\start-hid-validation.ps1 -SkipBuild -SkipInstall"));
     assert!(driver_readme.contains("rshare-driver-probe filter stats"));
     assert!(driver_readme.contains("virtual HID injection increments the filter keyboard and mouse event counters"));
     assert!(driver_readme.contains("watch-keyboard"));
