@@ -9,6 +9,7 @@ param(
     [switch]$EnableInputClassFilters,
     [switch]$SkipManualHardwareCapture,
     [uint32]$MinFilterMinorVersion = 3,
+    [uint32]$ExpectedFilterStatsBytes = 64,
     [uint32]$HardwareCaptureTimeoutSeconds = 20
 )
 
@@ -78,6 +79,11 @@ function Assert-FilterDriverStats($Output) {
     $text = ($Output | Out-String)
     if (-not ($text -match "stats\s+abi=")) {
         throw "Could not parse rshare-filter stats output."
+    }
+
+    $statsBytes = Get-FilterStatsValue $text "stats_bytes"
+    if ($statsBytes -ne $ExpectedFilterStatsBytes) {
+        throw "Unexpected rshare-filter stats ABI size $statsBytes bytes; expected $ExpectedFilterStatsBytes bytes."
     }
 
     $keyboardConnect = Get-FilterStatsValue $text "keyboard_connect"

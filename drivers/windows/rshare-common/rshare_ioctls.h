@@ -7,6 +7,11 @@
 #include <winioctl.h>
 #endif
 
+#define RSHARE_STATIC_ASSERT_JOIN2(a, b) a##b
+#define RSHARE_STATIC_ASSERT_JOIN(a, b) RSHARE_STATIC_ASSERT_JOIN2(a, b)
+#define RSHARE_STATIC_ASSERT(e) \
+    typedef char RSHARE_STATIC_ASSERT_JOIN(rshare_static_assert_, __LINE__)[(e) ? 1 : -1]
+
 #define RSHARE_DRIVER_ABI 1
 #define RSHARE_NT_DEVICE_NAME L"\\Device\\RShareInputControl"
 #define RSHARE_DOS_DEVICE_NAME L"\\DosDevices\\RShareInputControl"
@@ -103,6 +108,9 @@ typedef struct _RSHARE_DRIVER_STATS {
     ULONGLONG KeyboardEventCount;
     ULONGLONG MouseEventCount;
 } RSHARE_DRIVER_STATS, *PRSHARE_DRIVER_STATS;
+
+#define RSHARE_DRIVER_STATS_SIZE 64u
+RSHARE_STATIC_ASSERT(sizeof(RSHARE_DRIVER_STATS) == RSHARE_DRIVER_STATS_SIZE);
 
 typedef struct _RSHARE_INJECT_REPORT {
     ULONG ReportKind;

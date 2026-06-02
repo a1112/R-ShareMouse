@@ -110,8 +110,9 @@ static void print_driver_event(const char* prefix, const RSHARE_DRIVER_EVENT* ev
 static void print_driver_stats(const RSHARE_DRIVER_STATS* stats)
 {
     printf(
-        "stats abi=%hu queue=%lu/%lu queued=%llu dropped=%llu keyboard_connect=%llu mouse_connect=%llu keyboard_events=%llu mouse_events=%llu\n",
+        "stats abi=%hu stats_bytes=%zu queue=%lu/%lu queued=%llu dropped=%llu keyboard_connect=%llu mouse_connect=%llu keyboard_events=%llu mouse_events=%llu\n",
         stats->Abi,
+        sizeof(*stats),
         stats->QueueDepth,
         stats->QueueCapacity,
         (unsigned long long)stats->QueuedEventCount,

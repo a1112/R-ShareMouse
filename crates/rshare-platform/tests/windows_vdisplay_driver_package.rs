@@ -562,6 +562,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(ioctls.contains("IOCTL_RSHARE_INJECT_REPORT"));
     assert!(ioctls.contains("IOCTL_RSHARE_QUERY_STATS"));
     assert!(ioctls.contains("RSHARE_DRIVER_STATS"));
+    assert!(ioctls.contains("RSHARE_DRIVER_STATS_SIZE"));
+    assert!(ioctls.contains("sizeof(RSHARE_DRIVER_STATS) == RSHARE_DRIVER_STATS_SIZE"));
     assert!(ioctls.contains("KeyboardConnectCount"));
     assert!(ioctls.contains("MouseConnectCount"));
     assert!(ioctls.contains("DroppedEventCount"));
@@ -598,6 +600,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
 
     assert!(probe.contains("rshare-driver-probe filter status"));
     assert!(probe.contains("rshare-driver-probe filter stats"));
+    assert!(probe.contains("stats_bytes=%zu"));
+    assert!(probe.contains("sizeof(*stats)"));
     assert!(probe.contains("rshare-driver-probe filter test"));
     assert!(probe.contains("rshare-driver-probe filter watch [timeout_seconds]"));
     assert!(probe.contains("rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]"));
@@ -649,6 +653,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(validate_hid_script.contains("@(\"filter\", \"stats\")"));
     assert!(validate_hid_script.contains("keyboard_connect"));
     assert!(validate_hid_script.contains("mouse_connect"));
+    assert!(validate_hid_script.contains("stats_bytes"));
+    assert!(validate_hid_script.contains("ExpectedFilterStatsBytes"));
     assert!(validate_hid_script.contains("The loaded rshare-filter driver is older than expected"));
     assert!(validate_hid_script.contains("The filter driver has not attached to a keyboard class stack"));
     assert!(validate_hid_script.contains("The filter driver has not attached to a mouse class stack"));
