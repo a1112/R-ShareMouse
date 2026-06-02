@@ -712,13 +712,7 @@ mod windows_impl {
                     size_of::<RShareDriverCapabilitiesRaw>() as u32,
                 )?;
             }
-            Ok(WindowsDriverCapabilities {
-                filter_events: raw.flags & RSHARE_CAP_FILTER_EVENTS != 0,
-                virtual_keyboard: raw.flags & RSHARE_CAP_VIRTUAL_KEYBOARD != 0,
-                virtual_mouse: raw.flags & RSHARE_CAP_VIRTUAL_MOUSE != 0,
-                virtual_gamepad_scaffold: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD != 0,
-                max_event_size: raw.max_event_size,
-            })
+            raw.try_into()
         }
 
         pub fn read_event(&self) -> Result<WindowsDriverInputEvent> {
@@ -1567,7 +1561,7 @@ mod windows_impl {
 
     // Windows API constants
 
-    const RSHARE_DRIVER_ABI: u16 = 1;
+    pub const RSHARE_DRIVER_ABI: u16 = 1;
     const RSHARE_CAP_FILTER_EVENTS: u32 = 0x0000_0001;
     const RSHARE_CAP_VIRTUAL_KEYBOARD: u32 = 0x0000_0002;
     const RSHARE_CAP_VIRTUAL_MOUSE: u32 = 0x0000_0004;
@@ -2080,6 +2074,24 @@ mod windows_impl {
         mouse_connects: u64,
         keyboard_events: u64,
         mouse_events: u64,
+    }
+
+    impl TryFrom<RShareDriverCapabilitiesRaw> for WindowsDriverCapabilities {
+        type Error = anyhow::Error;
+
+        fn try_from(raw: RShareDriverCapabilitiesRaw) -> Result<Self> {
+            if raw.abi != RSHARE_DRIVER_ABI {
+                anyhow::bail!("Unsupported RShare driver capabilities ABI {}", raw.abi);
+            }
+
+            Ok(Self {
+                filter_events: raw.flags & RSHARE_CAP_FILTER_EVENTS != 0,
+                virtual_keyboard: raw.flags & RSHARE_CAP_VIRTUAL_KEYBOARD != 0,
+                virtual_mouse: raw.flags & RSHARE_CAP_VIRTUAL_MOUSE != 0,
+                virtual_gamepad_scaffold: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD != 0,
+                max_event_size: raw.max_event_size,
+            })
+        }
     }
 
     impl TryFrom<RShareDriverStatsRaw> for WindowsDriverStats {
@@ -4594,6 +4606,31 @@ mod windows_impl {
                 ..raw
             };
             assert!(WindowsDriverStats::try_from(invalid).is_err());
+        }
+
+        #[test]
+        fn rshare_driver_raw_capabilities_reject_unsupported_abi() {
+            let valid = RShareDriverCapabilitiesRaw {
+                abi: RSHARE_DRIVER_ABI,
+                flags: RSHARE_CAP_FILTER_EVENTS
+                    | RSHARE_CAP_VIRTUAL_KEYBOARD
+                    | RSHARE_CAP_VIRTUAL_MOUSE,
+                max_event_size: size_of::<RShareDriverEventRaw>() as u32,
+                reserved: 0,
+            };
+            let capabilities = WindowsDriverCapabilities::try_from(valid).unwrap();
+            assert!(capabilities.filter_events);
+            assert!(capabilities.virtual_keyboard);
+            assert!(capabilities.virtual_mouse);
+
+            let raw = RShareDriverCapabilitiesRaw {
+                abi: RSHARE_DRIVER_ABI + 1,
+                flags: RSHARE_CAP_FILTER_EVENTS,
+                max_event_size: size_of::<RShareDriverEventRaw>() as u32,
+                reserved: 0,
+            };
+
+            assert!(WindowsDriverCapabilities::try_from(raw).is_err());
         }
 
         #[test]

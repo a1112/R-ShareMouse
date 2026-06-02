@@ -556,6 +556,23 @@ fn driver_error_health(error: &str) -> BackendHealth {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_filter_driver_version_health(
+    version: &rshare_platform::windows::WindowsDriverVersion,
+) -> BackendHealth {
+    const MIN_FILTER_MINOR_VERSION: u16 = 3;
+
+    if version.abi != rshare_platform::windows::RSHARE_DRIVER_ABI
+        || (version.major == 0 && version.minor < MIN_FILTER_MINOR_VERSION)
+    {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::VersionMismatch,
+        }
+    } else {
+        BackendHealth::Healthy
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl InjectBackend for VirtualHidInjectBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::VirtualHid
@@ -666,6 +683,15 @@ impl VirtualHidCaptureBackend {
             }
         };
 
+        let version = match client.query_version() {
+            Ok(version) => version,
+            Err(error) => return driver_error_health(&error.to_string()),
+        };
+        let version_health = windows_filter_driver_version_health(&version);
+        if !matches!(version_health, BackendHealth::Healthy) {
+            return version_health;
+        }
+
         match client.query_capabilities() {
             Ok(capabilities) if capabilities.filter_events => match client.query_stats() {
                 Ok(stats) if stats.filter_capture_ready() => BackendHealth::Healthy,
@@ -764,6 +790,19 @@ impl VirtualHidCaptureDriver {
 
         let client = rshare_platform::windows::WindowsDriverClient::open_filter()
             .map_err(|_| anyhow::anyhow!("Failed to open RShare filter driver"))?;
+
+        let version = client
+            .query_version()
+            .map_err(|_| anyhow::anyhow!("Failed to query driver version"))?;
+        if !matches!(
+            windows_filter_driver_version_health(&version),
+            BackendHealth::Healthy
+        ) {
+            anyhow::bail!(
+                "RShare filter driver version {} is older than required",
+                version.display()
+            );
+        }
 
         let capabilities = client
             .query_capabilities()
@@ -1337,6 +1376,46 @@ mod tests {
 
         assert!(!backend.is_running());
         assert!(matches!(backend.health(), BackendHealth::Degraded { .. }));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn virtual_hid_capture_rejects_old_filter_driver_versions() {
+        let old_filter = rshare_platform::windows::WindowsDriverVersion {
+            major: 0,
+            minor: 2,
+            patch: 0,
+            abi: 1,
+        };
+        let current_filter = rshare_platform::windows::WindowsDriverVersion {
+            major: 0,
+            minor: 3,
+            patch: 0,
+            abi: 1,
+        };
+        let abi_mismatch = rshare_platform::windows::WindowsDriverVersion {
+            major: 0,
+            minor: 3,
+            patch: 0,
+            abi: rshare_platform::windows::RSHARE_DRIVER_ABI + 1,
+        };
+
+        assert_eq!(
+            windows_filter_driver_version_health(&old_filter),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::VersionMismatch
+            }
+        );
+        assert_eq!(
+            windows_filter_driver_version_health(&current_filter),
+            BackendHealth::Healthy
+        );
+        assert_eq!(
+            windows_filter_driver_version_health(&abi_mismatch),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::VersionMismatch
+            }
+        );
     }
 
     #[cfg(target_os = "windows")]
