@@ -3332,6 +3332,32 @@ fn captured_input_forwarding_outcome(
     event: InputEvent,
     gamepad_forwarding_enabled: bool,
 ) -> CapturedInputForwardingOutcome {
+    captured_input_forwarding_outcome_with_source(
+        state,
+        routing,
+        forwarder,
+        event,
+        LocalInputEventSource::Hardware,
+        gamepad_forwarding_enabled,
+    )
+}
+
+fn captured_input_forwarding_outcome_with_source(
+    state: &mut DaemonState,
+    routing: &mut InputRoutingState,
+    forwarder: &mut rshare_core::engine::ForwardingEngine,
+    event: InputEvent,
+    source: LocalInputEventSource,
+    gamepad_forwarding_enabled: bool,
+) -> CapturedInputForwardingOutcome {
+    if !captured_input_source_should_forward(source) {
+        return CapturedInputForwardingOutcome {
+            target: None,
+            messages: Vec::new(),
+            suppress_local_shortcuts: false,
+        };
+    }
+
     if !state.features.automatic_input_forwarding {
         if state.session.is_remote_active() {
             state.session.reset();
@@ -3359,6 +3385,10 @@ fn captured_input_forwarding_outcome(
         messages,
         suppress_local_shortcuts,
     }
+}
+
+fn captured_input_source_should_forward(source: LocalInputEventSource) -> bool {
+    matches!(source, LocalInputEventSource::Hardware)
 }
 
 fn is_quick_return_hotkey(event: &InputEvent, modifiers: ActiveModifiers) -> bool {
@@ -3578,20 +3608,44 @@ fn build_inject_backend(
 
 async fn inject_remote_message(
     inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    state: &Arc<RwLock<DaemonState>>,
     from: DeviceId,
     message: Message,
 ) {
     let Some(event) = message_to_input_event(message) else {
         return;
     };
+    let loopback_device_kind = injected_input_loopback_device_kind(&event);
 
     let result = {
         let mut backend = inject_backend.lock().await;
         backend.inject(event)
     };
 
-    if let Err(error) = result {
-        tracing::warn!("Failed to inject input from {}: {}", from, error);
+    match result {
+        Ok(()) => {
+            if let Some(device_kind) = loopback_device_kind {
+                state
+                    .write()
+                    .await
+                    .arm_injected_loopback(device_kind, timestamp_ms_now());
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Failed to inject input from {}: {}", from, error);
+        }
+    }
+}
+
+fn injected_input_loopback_device_kind(event: &InputEvent) -> Option<LocalInputDeviceKind> {
+    match event {
+        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } => {
+            Some(LocalInputDeviceKind::Keyboard)
+        }
+        InputEvent::MouseMove { .. }
+        | InputEvent::MouseButton { .. }
+        | InputEvent::MouseWheel { .. } => Some(LocalInputDeviceKind::Mouse),
+        _ => None,
     }
 }
 
@@ -5230,7 +5284,7 @@ async fn handle_network_message(
             );
         }
         other => {
-            inject_remote_message(inject_backend, from, other).await;
+            inject_remote_message(inject_backend, state, from, other).await;
         }
     }
 }
@@ -6044,13 +6098,15 @@ async fn run_input_forwarding_loop(
                     let mut state = state.write().await;
                     let local_event =
                         state.record_local_input_event_with_metadata(&event, metadata.as_ref());
+                    let source = local_event.source;
                     let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
-                    let outcome = captured_input_forwarding_outcome(
+                    let outcome = captured_input_forwarding_outcome_with_source(
                         &mut state,
                         &mut routing,
                         &mut forwarder,
                         event,
+                        source,
                         gamepad_forwarding_enabled,
                     );
                     (
@@ -6227,6 +6283,18 @@ fn local_source_from_windows_driver_event(
 }
 
 #[cfg(windows)]
+fn resolve_windows_driver_local_source(
+    recorded_source: LocalInputEventSource,
+    driver_source: LocalInputEventSource,
+) -> LocalInputEventSource {
+    if matches!(recorded_source, LocalInputEventSource::InjectedLoopback) {
+        recorded_source
+    } else {
+        driver_source
+    }
+}
+
+#[cfg(windows)]
 async fn run_windows_driver_capture_loop(
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
@@ -6292,17 +6360,22 @@ async fn run_windows_driver_capture_loop(
                     local_event.device_id = Some(driver_event.device_id.clone());
                     local_event.device_instance_id = Some(driver_event.device_instance_id.clone());
                     local_event.capture_path = Some("rshare-filter".to_string());
-                    local_event.source = local_source_from_windows_driver_event(driver_event.source);
+                    local_event.source = resolve_windows_driver_local_source(
+                        local_event.source,
+                        local_source_from_windows_driver_event(driver_event.source),
+                    );
+                    let source = local_event.source;
                     local_event.payload.insert("driver_flags".to_string(), driver_event.flags.to_string());
                     update_driver_device_from_event(&mut state.local_controls, &driver_event, local_event.timestamp_ms);
                     replace_recent_local_event(&mut state.local_controls, local_event.clone());
                     let diagnostic = (state.status.device_id, local_event.clone());
                     let _ = local_events_tx.send(local_event);
-                    let outcome = captured_input_forwarding_outcome(
+                    let outcome = captured_input_forwarding_outcome_with_source(
                         &mut state,
                         &mut routing,
                         &mut forwarder,
                         input_event,
+                        source,
                         true,
                     );
                     (
@@ -9478,6 +9551,119 @@ mod tests {
         assert_eq!(
             feedback.payload.get("source_note").map(String::as_str),
             Some("possible daemon injection loopback")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_message_injection_marks_immediate_capture_feedback_as_loopback() {
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(TestInjectBackend {
+                active: true,
+                fail: false,
+                injected: Vec::new(),
+            })));
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let remote_id = DeviceId::new_v4();
+
+        inject_remote_message(
+            &backend,
+            &state,
+            remote_id,
+            Message::Key {
+                keycode: 0x20,
+                state: rshare_core::KeyState::Pressed,
+            },
+        )
+        .await;
+
+        let feedback =
+            state
+                .write()
+                .await
+                .record_local_input_event(&rshare_input::InputEvent::key(
+                    rshare_input::KeyCode::Space,
+                    rshare_input::ButtonState::Pressed,
+                ));
+
+        assert_eq!(feedback.source, LocalInputEventSource::InjectedLoopback);
+    }
+
+    #[test]
+    fn injected_loopback_capture_is_not_forwarded_back_to_remote_peer() {
+        use rshare_core::{Direction, LayoutLink};
+
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+            "127.0.0.1:27431".to_string(),
+            27432,
+            1,
+        ));
+        state.features.automatic_input_forwarding = true;
+        state.layout.upsert_link_for_edge(LayoutLink::new(
+            local_id,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+        state.devices.insert(
+            remote_id,
+            TrackedDevice {
+                id: remote_id,
+                name: "remote".to_string(),
+                hostname: "remote-host".to_string(),
+                addresses: vec!["127.0.0.1:27431".to_string()],
+                connected: true,
+                capabilities: DeviceCapabilities::default(),
+                last_seen_at: Instant::now(),
+            },
+        );
+        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
+        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
+
+        let _ = captured_input_forwarding_outcome(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::mouse_move(1919, 500),
+            true,
+        );
+        let outcome = captured_input_forwarding_outcome_with_source(
+            &mut state,
+            &mut routing,
+            &mut forwarder,
+            rshare_input::InputEvent::key(
+                rshare_input::KeyCode::Space,
+                rshare_input::ButtonState::Pressed,
+            ),
+            LocalInputEventSource::InjectedLoopback,
+            true,
+        );
+
+        assert!(outcome.messages.is_empty());
+        assert_eq!(outcome.target, None);
+        assert_eq!(forwarder.target(), Some(remote_id));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_driver_source_keeps_pending_loopback_classification() {
+        assert_eq!(
+            resolve_windows_driver_local_source(
+                LocalInputEventSource::InjectedLoopback,
+                LocalInputEventSource::Hardware,
+            ),
+            LocalInputEventSource::InjectedLoopback
+        );
+        assert_eq!(
+            resolve_windows_driver_local_source(
+                LocalInputEventSource::Hardware,
+                LocalInputEventSource::DriverTest,
+            ),
+            LocalInputEventSource::DriverTest
         );
     }
 
