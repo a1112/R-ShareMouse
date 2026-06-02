@@ -562,6 +562,12 @@ mod windows_impl {
         pub max_event_size: u32,
     }
 
+    impl WindowsDriverCapabilities {
+        pub fn virtual_hid_ready(&self) -> bool {
+            self.virtual_keyboard && self.virtual_mouse
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct WindowsDriverStats {
         pub queue_capacity: u32,
@@ -921,8 +927,7 @@ mod windows_impl {
                 }
                 match client.query_capabilities() {
                     Ok(capabilities) => {
-                        state.vhid_active =
-                            capabilities.virtual_keyboard || capabilities.virtual_mouse;
+                        state.vhid_active = capabilities.virtual_hid_ready();
                     }
                     Err(error) => errors.push(error.to_string()),
                 }
@@ -4622,6 +4627,24 @@ mod windows_impl {
             assert!(capabilities.filter_events);
             assert!(capabilities.virtual_keyboard);
             assert!(capabilities.virtual_mouse);
+            assert!(capabilities.virtual_hid_ready());
+
+            let keyboard_only = WindowsDriverCapabilities::try_from(RShareDriverCapabilitiesRaw {
+                abi: RSHARE_DRIVER_ABI,
+                flags: RSHARE_CAP_VIRTUAL_KEYBOARD,
+                max_event_size: size_of::<RShareDriverEventRaw>() as u32,
+                reserved: 0,
+            })
+            .unwrap();
+            let mouse_only = WindowsDriverCapabilities::try_from(RShareDriverCapabilitiesRaw {
+                abi: RSHARE_DRIVER_ABI,
+                flags: RSHARE_CAP_VIRTUAL_MOUSE,
+                max_event_size: size_of::<RShareDriverEventRaw>() as u32,
+                reserved: 0,
+            })
+            .unwrap();
+            assert!(!keyboard_only.virtual_hid_ready());
+            assert!(!mouse_only.virtual_hid_ready());
 
             let raw = RShareDriverCapabilitiesRaw {
                 abi: RSHARE_DRIVER_ABI + 1,

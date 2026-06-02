@@ -512,8 +512,11 @@ impl VirtualHidInjectBackend {
     pub fn new() -> Result<Self> {
         let client = rshare_platform::windows::WindowsDriverClient::open_vhid()?;
         let capabilities = client.query_capabilities()?;
-        if !capabilities.virtual_keyboard && !capabilities.virtual_mouse {
-            anyhow::bail!("RShare Virtual HID driver interface is not active");
+        if !matches!(
+            virtual_hid_inject_capabilities_health(&capabilities),
+            BackendHealth::Healthy
+        ) {
+            anyhow::bail!("RShare Virtual HID keyboard and mouse interfaces are not both active");
         }
 
         Ok(Self {
@@ -553,6 +556,19 @@ fn driver_error_health(error: &str) -> BackendHealth {
             BackendFailureReason::InitializationFailed
         };
     BackendHealth::Degraded { reason }
+}
+
+#[cfg(target_os = "windows")]
+fn virtual_hid_inject_capabilities_health(
+    capabilities: &rshare_platform::windows::WindowsDriverCapabilities,
+) -> BackendHealth {
+    if capabilities.virtual_hid_ready() {
+        BackendHealth::Healthy
+    } else {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::Unavailable,
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1415,6 +1431,49 @@ mod tests {
             BackendHealth::Degraded {
                 reason: BackendFailureReason::VersionMismatch
             }
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn virtual_hid_inject_requires_keyboard_and_mouse_capabilities() {
+        let keyboard_only = rshare_platform::windows::WindowsDriverCapabilities {
+            filter_events: false,
+            virtual_keyboard: true,
+            virtual_mouse: false,
+            virtual_gamepad_scaffold: false,
+            max_event_size: 56,
+        };
+        let mouse_only = rshare_platform::windows::WindowsDriverCapabilities {
+            filter_events: false,
+            virtual_keyboard: false,
+            virtual_mouse: true,
+            virtual_gamepad_scaffold: false,
+            max_event_size: 56,
+        };
+        let keyboard_and_mouse = rshare_platform::windows::WindowsDriverCapabilities {
+            filter_events: false,
+            virtual_keyboard: true,
+            virtual_mouse: true,
+            virtual_gamepad_scaffold: false,
+            max_event_size: 56,
+        };
+
+        assert!(matches!(
+            virtual_hid_inject_capabilities_health(&keyboard_only),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::Unavailable
+            }
+        ));
+        assert!(matches!(
+            virtual_hid_inject_capabilities_health(&mouse_only),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::Unavailable
+            }
+        ));
+        assert_eq!(
+            virtual_hid_inject_capabilities_health(&keyboard_and_mouse),
+            BackendHealth::Healthy
         );
     }
 
