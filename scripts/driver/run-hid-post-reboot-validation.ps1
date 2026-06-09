@@ -17,13 +17,13 @@ Start-Transcript -Path $logPath -Force
 try {
     Set-Location $root
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    $validateArgs = @(
-        "-SkipBuild",
-        "-SkipInstall",
-        "-HardwareCaptureTimeoutSeconds", "$HardwareCaptureTimeoutSeconds"
-    )
+    $validateArgs = @{
+        SkipBuild = $true
+        SkipInstall = $true
+        HardwareCaptureTimeoutSeconds = $HardwareCaptureTimeoutSeconds
+    }
     if ($SkipManualHardwareCapture) {
-        $validateArgs += "-SkipManualHardwareCapture"
+        $validateArgs.SkipManualHardwareCapture = $true
     }
     & $validateScript @validateArgs
 } finally {

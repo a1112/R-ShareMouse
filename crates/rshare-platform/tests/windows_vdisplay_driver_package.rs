@@ -741,8 +741,11 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(register_post_reboot_script.contains("run-hid-post-reboot-validation.ps1"));
     assert!(register_post_reboot_script.contains("RShareMouse-HidPostRebootValidation"));
     assert!(run_post_reboot_script.contains("validate-hid.ps1"));
-    assert!(run_post_reboot_script.contains("-SkipBuild"));
-    assert!(run_post_reboot_script.contains("-SkipInstall"));
+    assert!(run_post_reboot_script.contains("$validateArgs = @{"));
+    assert!(run_post_reboot_script.contains("SkipBuild = $true"));
+    assert!(run_post_reboot_script.contains("SkipInstall = $true"));
+    assert!(run_post_reboot_script
+        .contains("HardwareCaptureTimeoutSeconds = $HardwareCaptureTimeoutSeconds"));
     assert!(run_post_reboot_script.contains("Unregister-ScheduledTask"));
     assert!(run_post_reboot_script.contains("hid-validation-post-reboot"));
     assert!(driver_readme.contains("-EnableInputClassFilters"));
