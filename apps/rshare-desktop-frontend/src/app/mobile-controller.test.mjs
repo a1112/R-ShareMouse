@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  MOBILE_TEXT_INPUT_HINTS,
   buildKeyTapRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
@@ -11,6 +12,7 @@ import {
   createPointerMoveCoalescer,
   isTouchpadTap,
   nextPointerPosition,
+  shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
@@ -33,6 +35,41 @@ test("buildTextCommitRequest creates daemon IPC inject request for unicode input
       },
     },
   });
+});
+
+test("mobile text input uses phone keyboard send hints", () => {
+  assert.deepEqual(MOBILE_TEXT_INPUT_HINTS, {
+    enterKeyHint: "send",
+    autoCapitalize: "none",
+    autoCorrect: "off",
+    spellCheck: false,
+  });
+});
+
+test("shouldCommitMobileTextOnKeyDown ignores IME composition enter", () => {
+  assert.equal(shouldCommitMobileTextOnKeyDown({ key: "Enter" }), true);
+  assert.equal(
+    shouldCommitMobileTextOnKeyDown({
+      key: "Enter",
+      isComposing: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCommitMobileTextOnKeyDown({
+      key: "Enter",
+      keyCode: 229,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCommitMobileTextOnKeyDown({
+      key: "Enter",
+      nativeEvent: { isComposing: true },
+    }),
+    false,
+  );
+  assert.equal(shouldCommitMobileTextOnKeyDown({ key: "a" }), false);
 });
 
 test("mobile mouse requests use local endpoint injection payloads", () => {

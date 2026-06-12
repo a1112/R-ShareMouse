@@ -1,6 +1,20 @@
 const DEFAULT_MOUSE_TIMEOUT_MS = 250;
 const DEFAULT_KEYBOARD_TIMEOUT_MS = 750;
 
+export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
+  enterKeyHint: "send",
+  autoCapitalize: "none",
+  autoCorrect: "off",
+  spellCheck: false,
+});
+
+export function shouldCommitMobileTextOnKeyDown(event) {
+  const keyCode = Number(event?.keyCode ?? event?.which ?? event?.nativeEvent?.keyCode ?? 0);
+  const isComposing =
+    event?.isComposing === true || event?.nativeEvent?.isComposing === true || keyCode === 229;
+  return event?.key === "Enter" && !isComposing;
+}
+
 function daemonInjectRequest(deviceKind, payload, correlationId, options = {}) {
   return {
     InjectEndpointEvent: {

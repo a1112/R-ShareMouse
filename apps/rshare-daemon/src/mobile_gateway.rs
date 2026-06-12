@@ -483,7 +483,7 @@ fn render_mobile_page() -> String {
     <button data-key="Right">右</button>
   </section>
   <section class="textRow">
-    <div class="inputWrap"><input id="text" placeholder="文本" autocomplete="off"></div>
+    <div class="inputWrap"><input id="text" placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send"></div>
     <button class="send" id="send">发送</button>
   </section>
 </main>
@@ -682,8 +682,11 @@ async function sendText() {
   await inject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750));
   textInput.value = "";
 }
+function shouldSendTextOnKeydown(event) {
+  return event.key === "Enter" && !event.isComposing && event.keyCode !== 229;
+}
 document.getElementById("send").addEventListener("click", sendText);
-textInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); sendText(); } });
+textInput.addEventListener("keydown", (event) => { if (shouldSendTextOnKeydown(event)) { event.preventDefault(); sendText(); } });
 refresh();
 setInterval(refresh, 1500);
 </script>
@@ -810,6 +813,17 @@ mod tests {
         assert!(page.contains("kind: \"MouseWheel\""));
         assert!(page.contains("lastWheelTouches ="));
         assert!(page.contains("touchPointsSnapshot()"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_respects_ime_composition_before_text_commit() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("enterkeyhint=\"send\""));
+        assert!(page.contains("function shouldSendTextOnKeydown"));
+        assert!(page.contains("event.isComposing"));
+        assert!(page.contains("event.keyCode !== 229"));
+        assert!(page.contains("if (shouldSendTextOnKeydown(event))"));
     }
 
     #[test]

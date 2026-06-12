@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import {
+  MOBILE_TEXT_INPUT_HINTS,
   buildKeyTapRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
@@ -22,6 +23,7 @@ import {
   createPointerMoveCoalescer,
   isTouchpadTap,
   nextPointerPosition,
+  shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
@@ -478,13 +480,14 @@ export default function MobileController() {
           <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-3" style={{ background: "#171b1d", border: "1px solid #29302d" }}>
             <Keyboard size={18} color="#8f9b96" />
             <input
+              {...MOBILE_TEXT_INPUT_HINTS}
               className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none"
               value={text}
               placeholder="文本"
               style={{ color: "#edf2ef" }}
               onChange={(event) => setText(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") {
+                if (shouldCommitMobileTextOnKeyDown(event)) {
                   event.preventDefault();
                   void commitText();
                 }
