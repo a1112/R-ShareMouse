@@ -124,6 +124,58 @@ export function nextPointerPosition(current, delta, bounds) {
   };
 }
 
+export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
+  const requestFrame =
+    scheduler.requestFrame ??
+    ((callback) => {
+      if (typeof requestAnimationFrame === "function") {
+        return requestAnimationFrame(callback);
+      }
+      return setTimeout(callback, 16);
+    });
+  const cancelFrame =
+    scheduler.cancelFrame ??
+    ((frameId) => {
+      if (typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(frameId);
+      } else {
+        clearTimeout(frameId);
+      }
+    });
+  let pendingMove = null;
+  let frameId = null;
+
+  function drain() {
+    frameId = null;
+    const next = pendingMove;
+    pendingMove = null;
+    if (next) {
+      sendMove(next);
+    }
+  }
+
+  return {
+    schedule(next) {
+      pendingMove = next;
+      if (frameId != null) {
+        return;
+      }
+      frameId = requestFrame(drain);
+    },
+    flush() {
+      const next = pendingMove;
+      pendingMove = null;
+      if (frameId != null) {
+        cancelFrame(frameId);
+        frameId = null;
+      }
+      if (next) {
+        sendMove(next);
+      }
+    },
+  };
+}
+
 export function tauriInvocationForMobileRequest(request) {
   if (request === "LocalControls") {
     return {

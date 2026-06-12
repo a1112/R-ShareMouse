@@ -7,6 +7,7 @@ import {
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   buildTextCommitRequest,
+  createPointerMoveCoalescer,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
 } from "./mobile-controller.mjs";
@@ -90,6 +91,54 @@ test("nextPointerPosition applies sensitivity and clamps to desktop bounds", () 
     ),
     { x: 1919, y: 1079 },
   );
+});
+
+test("createPointerMoveCoalescer sends only the latest move per animation frame", () => {
+  const sent = [];
+  const frameCallbacks = [];
+  const coalescer = createPointerMoveCoalescer((move) => sent.push(move), {
+    requestFrame(callback) {
+      frameCallbacks.push(callback);
+      return frameCallbacks.length;
+    },
+    cancelFrame() {},
+  });
+
+  coalescer.schedule({ x: 10, y: 10 });
+  coalescer.schedule({ x: 20, y: 30 });
+
+  assert.deepEqual(sent, []);
+  assert.equal(frameCallbacks.length, 1);
+
+  frameCallbacks.shift()();
+
+  assert.deepEqual(sent, [{ x: 20, y: 30 }]);
+});
+
+test("createPointerMoveCoalescer flushes the final pending move without duplicate send", () => {
+  const sent = [];
+  const frameCallbacks = [];
+  const cancelled = [];
+  const coalescer = createPointerMoveCoalescer((move) => sent.push(move), {
+    requestFrame(callback) {
+      frameCallbacks.push(callback);
+      return frameCallbacks.length;
+    },
+    cancelFrame(frameId) {
+      cancelled.push(frameId);
+    },
+  });
+
+  coalescer.schedule({ x: 40, y: 50 });
+  coalescer.schedule({ x: 70, y: 80 });
+  coalescer.flush();
+
+  assert.deepEqual(sent, [{ x: 70, y: 80 }]);
+  assert.deepEqual(cancelled, [1]);
+
+  frameCallbacks.shift()();
+
+  assert.deepEqual(sent, [{ x: 70, y: 80 }]);
 });
 
 test("tauriInvocationForMobileRequest maps mobile requests to desktop commands", () => {

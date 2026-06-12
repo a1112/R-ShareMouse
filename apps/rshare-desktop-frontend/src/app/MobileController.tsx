@@ -18,6 +18,7 @@ import {
   buildMouseWheelRequest,
   buildTextCommitRequest,
   createMobileCorrelationId,
+  createPointerMoveCoalescer,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
 } from "./mobile-controller.mjs";
@@ -139,7 +140,8 @@ export default function MobileController() {
   const activePointerRef = useRef<number | null>(null);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const pointerRef = useRef(pointer);
-  const lastMoveSentRef = useRef(0);
+  const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
+  const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
 
   useEffect(() => {
     pointerRef.current = pointer;
@@ -185,12 +187,7 @@ export default function MobileController() {
     }
   }
 
-  function sendMove(next: PointerState) {
-    const now = performance.now();
-    if (now - lastMoveSentRef.current < 16) {
-      return;
-    }
-    lastMoveSentRef.current = now;
+  function sendMoveNow(next: PointerState) {
     void sendRequest(
       buildMouseMoveRequest(
         next.x,
@@ -200,6 +197,17 @@ export default function MobileController() {
       ),
       true,
     );
+  }
+
+  sendMoveNowRef.current = sendMoveNow;
+  if (!moveCoalescerRef.current) {
+    moveCoalescerRef.current = createPointerMoveCoalescer((next: PointerState) =>
+      sendMoveNowRef.current(next),
+    );
+  }
+
+  function sendMove(next: PointerState) {
+    moveCoalescerRef.current?.schedule(next);
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
@@ -230,6 +238,7 @@ export default function MobileController() {
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
     if (activePointerRef.current === event.pointerId) {
+      moveCoalescerRef.current?.flush();
       activePointerRef.current = null;
       lastPointRef.current = null;
     }

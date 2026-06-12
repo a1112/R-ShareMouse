@@ -496,7 +496,8 @@ const textInput = document.getElementById("text");
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
-let lastMoveSent = 0;
+let pendingMove = null;
+let pendingMoveFrame = 0;
 function cid(prefix) {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
@@ -543,11 +544,27 @@ async function refresh() {
     statusEl.textContent = error.message || String(error);
   }
 }
-function sendMove(next) {
-  const now = performance.now();
-  if (now - lastMoveSent < 16) return;
-  lastMoveSent = now;
+function sendMoveNow(next) {
   inject(daemonRequest("Mouse", { kind: "MouseMove", data: { x: next.x, y: next.y, display_id: next.displayId } }, cid("mobile-move")));
+}
+function scheduleMove(next) {
+  pendingMove = { ...next };
+  if (pendingMoveFrame) return;
+  pendingMoveFrame = requestAnimationFrame(() => {
+    pendingMoveFrame = 0;
+    const next = pendingMove;
+    pendingMove = null;
+    if (next) sendMoveNow(next);
+  });
+}
+function flushMove() {
+  const next = pendingMove;
+  pendingMove = null;
+  if (pendingMoveFrame) {
+    cancelAnimationFrame(pendingMoveFrame);
+    pendingMoveFrame = 0;
+  }
+  if (next) sendMoveNow(next);
 }
 pad.addEventListener("pointerdown", (event) => {
   activePointer = event.pointerId;
@@ -561,10 +578,10 @@ pad.addEventListener("pointermove", (event) => {
   lastPoint = { x: event.clientX, y: event.clientY };
   pointer = { ...pointer, x: Math.max(0, Math.min(pointer.width - 1, pointer.x + dx)), y: Math.max(0, Math.min(pointer.height - 1, pointer.y + dy)) };
   posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
-  sendMove(pointer);
+  scheduleMove(pointer);
 });
 function clearPointer(event) {
-  if (activePointer === event.pointerId) { activePointer = null; lastPoint = null; }
+  if (activePointer === event.pointerId) { flushMove(); activePointer = null; lastPoint = null; }
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", clearPointer);
@@ -681,6 +698,18 @@ mod tests {
         let error = mobile_inject_request_from_body(&body).unwrap_err();
 
         assert!(error.to_string().contains("local endpoint"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_coalesces_pointer_moves_and_flushes_on_release() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function scheduleMove(next)"));
+        assert!(page.contains("requestAnimationFrame"));
+        assert!(page.contains("function flushMove()"));
+        assert!(page.contains("cancelAnimationFrame"));
+        assert!(page.contains("scheduleMove(pointer);"));
+        assert!(page.contains("flushMove();"));
     }
 
     #[test]
