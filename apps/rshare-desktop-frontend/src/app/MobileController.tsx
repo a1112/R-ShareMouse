@@ -14,11 +14,13 @@ import {
 import {
   buildKeyTapRequests,
   buildMouseButtonRequest,
+  buildMouseClickRequests,
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   buildTextCommitRequest,
   createMobileCorrelationId,
   createPointerMoveCoalescer,
+  isTouchpadTap,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
 } from "./mobile-controller.mjs";
@@ -139,6 +141,7 @@ export default function MobileController() {
   const [status, setStatus] = useState("连接中");
   const activePointerRef = useRef<number | null>(null);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
+  const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
   const pointerRef = useRef(pointer);
   const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
@@ -213,6 +216,7 @@ export default function MobileController() {
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     activePointerRef.current = event.pointerId;
     lastPointRef.current = { x: event.clientX, y: event.clientY };
+    tapStartRef.current = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
@@ -239,8 +243,41 @@ export default function MobileController() {
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
     if (activePointerRef.current === event.pointerId) {
       moveCoalescerRef.current?.flush();
+      const tapStart = tapStartRef.current;
+      tapStartRef.current = null;
+      if (
+        isTouchpadTap(tapStart, {
+          x: event.clientX,
+          y: event.clientY,
+          timeMs: event.timeStamp,
+        })
+      ) {
+        void mouseClick("Left");
+      }
       activePointerRef.current = null;
       lastPointRef.current = null;
+    }
+  }
+
+  function handlePointerCancel(event: React.PointerEvent<HTMLDivElement>) {
+    if (activePointerRef.current === event.pointerId) {
+      moveCoalescerRef.current?.flush();
+      tapStartRef.current = null;
+      activePointerRef.current = null;
+      lastPointRef.current = null;
+    }
+  }
+
+  async function mouseClick(button: "Left" | "Right" | "Middle") {
+    const current = pointerRef.current;
+    const requests = buildMouseClickRequests(
+      button,
+      current.x,
+      current.y,
+      createMobileCorrelationId(`mobile-${button.toLowerCase()}-click`),
+    );
+    for (const request of requests) {
+      await sendRequest(request);
     }
   }
 
@@ -328,7 +365,7 @@ export default function MobileController() {
             }}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
-            onPointerCancel={handlePointerUp}
+            onPointerCancel={handlePointerCancel}
             onPointerUp={handlePointerUp}
           >
             <div className="flex h-full items-center justify-center">

@@ -496,6 +496,7 @@ const textInput = document.getElementById("text");
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
+let tapStart = null;
 let pendingMove = null;
 let pendingMoveFrame = 0;
 function cid(prefix) {
@@ -566,9 +567,20 @@ function flushMove() {
   }
   if (next) sendMoveNow(next);
 }
+function isTouchpadTap(start, end) {
+  if (!start || !end) return false;
+  const duration = end.timeMs - start.timeMs;
+  if (duration < 0 || duration > 260) return false;
+  return Math.hypot(end.x - start.x, end.y - start.y) <= 12;
+}
+async function sendTapClick() {
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")));
+}
 pad.addEventListener("pointerdown", (event) => {
   activePointer = event.pointerId;
   lastPoint = { x: event.clientX, y: event.clientY };
+  tapStart = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
   pad.setPointerCapture(event.pointerId);
 });
 pad.addEventListener("pointermove", (event) => {
@@ -581,10 +593,26 @@ pad.addEventListener("pointermove", (event) => {
   scheduleMove(pointer);
 });
 function clearPointer(event) {
-  if (activePointer === event.pointerId) { flushMove(); activePointer = null; lastPoint = null; }
+  if (activePointer === event.pointerId) {
+    flushMove();
+    if (isTouchpadTap(tapStart, { x: event.clientX, y: event.clientY, timeMs: event.timeStamp })) {
+      sendTapClick();
+    }
+    activePointer = null;
+    lastPoint = null;
+    tapStart = null;
+  }
+}
+function cancelPointer(event) {
+  if (activePointer === event.pointerId) {
+    flushMove();
+    activePointer = null;
+    lastPoint = null;
+    tapStart = null;
+  }
 }
 pad.addEventListener("pointerup", clearPointer);
-pad.addEventListener("pointercancel", clearPointer);
+pad.addEventListener("pointercancel", cancelPointer);
 document.querySelectorAll("[data-button]").forEach((button) => {
   const name = button.dataset.button;
   const sendButton = (state) => inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: name, state, x: pointer.x, y: pointer.y } }, cid(`mobile-${name}-${state}`)));
@@ -710,6 +738,18 @@ mod tests {
         assert!(page.contains("cancelAnimationFrame"));
         assert!(page.contains("scheduleMove(pointer);"));
         assert!(page.contains("flushMove();"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_turns_short_touchpad_taps_into_left_clicks() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function isTouchpadTap"));
+        assert!(page.contains("function sendTapClick()"));
+        assert!(page.contains("sendTapClick();"));
+        assert!(page.contains("pad.addEventListener(\"pointercancel\", cancelPointer);"));
+        assert!(page.contains("button: \"Left\", state: \"Pressed\""));
+        assert!(page.contains("button: \"Left\", state: \"Released\""));
     }
 
     #[test]

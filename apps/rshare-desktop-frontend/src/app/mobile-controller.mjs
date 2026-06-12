@@ -89,6 +89,13 @@ export function buildMouseButtonRequest(button, state, x, y, correlationId) {
   );
 }
 
+export function buildMouseClickRequests(button, x, y, correlationPrefix) {
+  return [
+    buildMouseButtonRequest(button, "Pressed", x, y, `${correlationPrefix}-down`),
+    buildMouseButtonRequest(button, "Released", x, y, `${correlationPrefix}-up`),
+  ];
+}
+
 export function buildMouseWheelRequest(deltaX, deltaY, x, y, correlationId) {
   return daemonInjectRequest(
     "Mouse",
@@ -122,6 +129,24 @@ export function nextPointerPosition(current, delta, bounds) {
     x: Math.max(0, Math.min(width - 1, x)),
     y: Math.max(0, Math.min(height - 1, y)),
   };
+}
+
+export function isTouchpadTap(start, end, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  if (!start || !end) {
+    return false;
+  }
+  const maxDurationMs = Number(options.maxDurationMs ?? 260);
+  const maxDistancePx = Number(options.maxDistancePx ?? 12);
+  const duration = Number(end.timeMs ?? 0) - Number(start.timeMs ?? 0);
+  if (!Number.isFinite(duration) || duration < 0 || duration > maxDurationMs) {
+    return false;
+  }
+  const dx = Number(end.x ?? 0) - Number(start.x ?? 0);
+  const dy = Number(end.y ?? 0) - Number(start.y ?? 0);
+  return Math.hypot(dx, dy) <= maxDistancePx;
 }
 
 export function createPointerMoveCoalescer(sendMove, scheduler = {}) {

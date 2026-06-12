@@ -4,10 +4,12 @@ import assert from "node:assert/strict";
 import {
   buildKeyTapRequests,
   buildMouseButtonRequest,
+  buildMouseClickRequests,
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   buildTextCommitRequest,
   createPointerMoveCoalescer,
+  isTouchpadTap,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
 } from "./mobile-controller.mjs";
@@ -65,6 +67,18 @@ test("mobile mouse requests use local endpoint injection payloads", () => {
   );
 });
 
+test("buildMouseClickRequests emits press and release at the current pointer", () => {
+  const [down, up] = buildMouseClickRequests("Left", 320, 240, "mobile-tap");
+
+  assert.equal(down.InjectEndpointEvent.request.payload.data.button, "Left");
+  assert.equal(down.InjectEndpointEvent.request.payload.data.state, "Pressed");
+  assert.equal(up.InjectEndpointEvent.request.payload.data.state, "Released");
+  assert.equal(down.InjectEndpointEvent.request.payload.data.x, 320);
+  assert.equal(up.InjectEndpointEvent.request.payload.data.y, 240);
+  assert.equal(down.InjectEndpointEvent.request.correlation_id, "mobile-tap-down");
+  assert.equal(up.InjectEndpointEvent.request.correlation_id, "mobile-tap-up");
+});
+
 test("buildKeyTapRequests emits press and release requests with stable ordering", () => {
   const [down, up] = buildKeyTapRequests("Backspace", "mobile-backspace");
 
@@ -72,6 +86,38 @@ test("buildKeyTapRequests emits press and release requests with stable ordering"
   assert.equal(up.InjectEndpointEvent.request.payload.data.state, "Released");
   assert.equal(down.InjectEndpointEvent.request.correlation_id, "mobile-backspace-down");
   assert.equal(up.InjectEndpointEvent.request.correlation_id, "mobile-backspace-up");
+});
+
+test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {
+  assert.equal(
+    isTouchpadTap(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 106, y: 104, timeMs: 1140 },
+    ),
+    true,
+  );
+  assert.equal(
+    isTouchpadTap(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 135, y: 105, timeMs: 1100 },
+    ),
+    false,
+  );
+  assert.equal(
+    isTouchpadTap(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 104, y: 103, timeMs: 1500 },
+    ),
+    false,
+  );
+  assert.equal(
+    isTouchpadTap(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 104, y: 103, timeMs: 1100 },
+      { cancelled: true },
+    ),
+    false,
+  );
 });
 
 test("nextPointerPosition applies sensitivity and clamps to desktop bounds", () => {
