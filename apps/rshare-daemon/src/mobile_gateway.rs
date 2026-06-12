@@ -20,6 +20,7 @@ const MAX_BODY_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MobileGatewayAccess {
+    enabled: bool,
     bind_addr: SocketAddr,
     token: String,
     advertise_host: String,
@@ -28,9 +29,19 @@ pub(crate) struct MobileGatewayAccess {
 impl MobileGatewayAccess {
     pub(crate) fn new(bind_addr: SocketAddr, token: String, advertise_host: String) -> Self {
         Self {
+            enabled: true,
             bind_addr,
             token,
             advertise_host,
+        }
+    }
+
+    pub(crate) fn disabled(_reason: String) -> Self {
+        Self {
+            enabled: false,
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            token: String::new(),
+            advertise_host: String::new(),
         }
     }
 
@@ -43,6 +54,15 @@ impl MobileGatewayAccess {
     }
 
     pub(crate) fn snapshot(&self) -> MobileAccessSnapshot {
+        if !self.enabled {
+            return MobileAccessSnapshot {
+                enabled: false,
+                bind_address: "不可用".to_string(),
+                page_url: "不可用".to_string(),
+                token: String::new(),
+            };
+        }
+
         MobileAccessSnapshot {
             enabled: true,
             bind_address: self.bind_addr.to_string(),
@@ -141,7 +161,23 @@ pub(crate) async fn run_mobile_gateway_server(
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(access.bind_addr()).await?;
+    let listener = match TcpListener::bind(access.bind_addr()).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let reason = format!(
+                "Mobile gateway unavailable on {}: {}",
+                access.bind_addr(),
+                error
+            );
+            tracing::warn!("{}", reason);
+            {
+                let mut state = state.write().await;
+                state.mobile_access = MobileGatewayAccess::disabled(reason);
+            }
+            let _ = shutdown_rx.recv().await;
+            return Ok(());
+        }
+    };
     tracing::info!("Mobile gateway listening on {}", access.bind_addr());
 
     loop {
@@ -568,9 +604,38 @@ setInterval(refresh, 1500);
 mod tests {
     use super::*;
     use rshare_core::{
-        DeviceId, EndpointEventKind, EndpointEventPayload, EndpointInjectMode,
-        EndpointInjectRequest,
+        BackendHealth, BackendKind, DeviceId, EndpointEventKind, EndpointEventPayload,
+        EndpointInjectMode, EndpointInjectRequest, ServiceStatusSnapshot,
     };
+    use rshare_input::InputEvent;
+    use std::fmt;
+    use tokio::time::{sleep, timeout, Duration};
+
+    struct NoopInjectBackend;
+
+    impl fmt::Debug for NoopInjectBackend {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("NoopInjectBackend").finish()
+        }
+    }
+
+    impl InjectBackend for NoopInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, _event: InputEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn decodes_mobile_daemon_inject_request_as_local_only() {
@@ -616,5 +681,77 @@ mod tests {
         let error = mobile_inject_request_from_body(&body).unwrap_err();
 
         assert!(error.to_string().contains("local endpoint"));
+    }
+
+    #[test]
+    fn disabled_mobile_access_snapshot_does_not_expose_a_token_link() {
+        let access = MobileGatewayAccess::disabled("mobile port is already in use".to_string());
+
+        let snapshot = access.snapshot();
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.bind_address, "不可用");
+        assert_eq!(snapshot.page_url, "不可用");
+        assert_eq!(snapshot.token, "");
+    }
+
+    #[tokio::test]
+    async fn bind_failure_marks_mobile_access_disabled_without_failing_daemon() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+            "0.0.0.0:27431".to_string(),
+            27432,
+            42,
+        ))));
+        let access =
+            MobileGatewayAccess::new(addr, "mobile-secret".to_string(), "127.0.0.1".to_string());
+        {
+            let mut state = state.write().await;
+            state.mobile_access = access.clone();
+        }
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+        )));
+        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let (local_events_tx, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let task = tokio::spawn(run_mobile_gateway_server(
+            access,
+            state.clone(),
+            network_manager,
+            inject_backend,
+            local_events_tx,
+            shutdown_rx,
+        ));
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !state.read().await.mobile_access.snapshot().enabled {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let snapshot = state.read().await.mobile_access.snapshot();
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.page_url, "不可用");
+
+        let _ = shutdown_tx.send(());
+        let result = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
     }
 }
