@@ -14,7 +14,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn read_repo_file(path: &str) -> String {
-    fs::read_to_string(repo_root().join(path)).expect(path)
+    fs::read_to_string(repo_root().join(path))
+        .expect(path)
+        .replace("\r\n", "\n")
 }
 
 fn extract_rshare_vdisplay_edid(driver: &str) -> Vec<u8> {

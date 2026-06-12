@@ -149,6 +149,57 @@ export function isTouchpadTap(start, end, options = {}) {
   return Math.hypot(dx, dy) <= maxDistancePx;
 }
 
+function normalizedTwoFingerTouches(touches) {
+  if (!Array.isArray(touches) || touches.length !== 2) {
+    return null;
+  }
+  return touches
+    .map((touch) => ({
+      id: String(touch?.id ?? ""),
+      x: Number(touch?.x ?? 0),
+      y: Number(touch?.y ?? 0),
+    }))
+    .filter((touch) => touch.id && Number.isFinite(touch.x) && Number.isFinite(touch.y))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function centroid(touches) {
+  return {
+    x: (touches[0].x + touches[1].x) / 2,
+    y: (touches[0].y + touches[1].y) / 2,
+  };
+}
+
+export function twoFingerWheelDelta(previousTouches, currentTouches, options = {}) {
+  const previous = normalizedTwoFingerTouches(previousTouches);
+  const current = normalizedTwoFingerTouches(currentTouches);
+  if (!previous || !current) {
+    return null;
+  }
+  if (previous[0].id !== current[0].id || previous[1].id !== current[1].id) {
+    return null;
+  }
+
+  const sensitivity = Number(options.sensitivity ?? 0.12);
+  const minDeltaPx = Number(options.minDeltaPx ?? 6);
+  const previousCenter = centroid(previous);
+  const currentCenter = centroid(current);
+  const dx = currentCenter.x - previousCenter.x;
+  const dy = currentCenter.y - previousCenter.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < minDeltaPx) {
+    return null;
+  }
+
+  const rawDeltaX = Math.round(dx * sensitivity);
+  const rawDeltaY = Math.round(dy * sensitivity);
+  const deltaX = Object.is(rawDeltaX, -0) ? 0 : rawDeltaX;
+  const deltaY = Object.is(rawDeltaY, -0) ? 0 : rawDeltaY;
+  if (deltaX === 0 && deltaY === 0) {
+    return null;
+  }
+  return { deltaX, deltaY };
+}
+
 export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
   const requestFrame =
     scheduler.requestFrame ??

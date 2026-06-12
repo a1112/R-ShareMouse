@@ -7715,8 +7715,55 @@ mod tests {
         info
     }
 
+    fn assert_virtual_display_create_status(status: rshare_core::VirtualDisplayOperationStatus) {
+        if cfg!(windows) {
+            assert!(
+                matches!(
+                    status,
+                    rshare_core::VirtualDisplayOperationStatus::Created
+                        | rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+                ),
+                "unexpected virtual display create status: {status:?}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                rshare_core::VirtualDisplayOperationStatus::Unsupported
+            );
+        }
+    }
+
+    fn assert_virtual_display_remove_status(status: rshare_core::VirtualDisplayOperationStatus) {
+        if cfg!(windows) {
+            assert!(
+                matches!(
+                    status,
+                    rshare_core::VirtualDisplayOperationStatus::Removed
+                        | rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+                ),
+                "unexpected virtual display remove status: {status:?}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                rshare_core::VirtualDisplayOperationStatus::Unsupported
+            );
+        }
+    }
+
+    fn cleanup_created_virtual_display(
+        id: &str,
+        status: rshare_core::VirtualDisplayOperationStatus,
+    ) {
+        if status == rshare_core::VirtualDisplayOperationStatus::Created {
+            let _ = rshare_platform::virtual_display::remove_virtual_display(
+                &rshare_core::VirtualDisplayRemoveRequest { id: id.to_string() },
+            );
+        }
+    }
+
     #[test]
-    fn virtual_display_manager_records_driver_unavailable_create_result() {
+    fn virtual_display_manager_records_platform_create_result() {
         let mut manager = VirtualDisplayManager::default();
 
         let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
@@ -7727,14 +7774,10 @@ mod tests {
             name: Some("R-ShareMouse Virtual Display".to_string()),
         });
 
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
+        assert_virtual_display_create_status(result.status);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
+        cleanup_created_virtual_display("vd-1", result.status);
     }
 
     #[test]
@@ -7789,20 +7832,16 @@ mod tests {
             name: Some("R-ShareMouse Virtual Display".to_string()),
         });
 
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
+        assert_virtual_display_create_status(result.status);
         assert_ne!(
             result.status,
             rshare_core::VirtualDisplayOperationStatus::AlreadyExists
         );
+        cleanup_created_virtual_display("vd-1", result.status);
     }
 
     #[test]
-    fn virtual_display_manager_allows_retry_after_unavailable_create_result() {
+    fn virtual_display_manager_handles_retry_after_platform_create_result() {
         let mut manager = VirtualDisplayManager::default();
         let request = rshare_core::VirtualDisplayCreateRequest {
             id: Some("vd-1".to_string()),
@@ -7815,15 +7854,18 @@ mod tests {
         let first = manager.create(request.clone());
         let retry = manager.create(request);
 
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        assert_virtual_display_create_status(first.status);
+        if first.status == rshare_core::VirtualDisplayOperationStatus::Created {
+            assert_eq!(
+                retry.status,
+                rshare_core::VirtualDisplayOperationStatus::AlreadyExists
+            );
         } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(first.status, expected);
-        assert_eq!(retry.status, expected);
+            assert_eq!(retry.status, first.status);
+        }
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
+        cleanup_created_virtual_display("vd-1", first.status);
     }
 
     #[test]
@@ -7854,6 +7896,8 @@ mod tests {
             Some("rshare-vdisplay-1")
         );
         assert_eq!(manager.list().len(), 1);
+        cleanup_created_virtual_display(DEFAULT_VIRTUAL_DISPLAY_ID, first.status);
+        cleanup_created_virtual_display(DEFAULT_VIRTUAL_DISPLAY_ID, retry.status);
     }
 
     #[test]
@@ -7890,12 +7934,7 @@ mod tests {
             id: "vd-1".to_string(),
         });
 
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
+        assert_virtual_display_remove_status(result.status);
         assert!(manager.list().is_empty());
     }
 

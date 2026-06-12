@@ -497,6 +497,8 @@ let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
 let tapStart = null;
+let touchPoints = new Map();
+let lastWheelTouches = null;
 let pendingMove = null;
 let pendingMoveFrame = 0;
 function cid(prefix) {
@@ -577,13 +579,55 @@ async function sendTapClick() {
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")));
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")));
 }
+function touchPointsSnapshot() {
+  return Array.from(touchPoints.values()).sort((left, right) => left.id - right.id);
+}
+function centerOfTouches(touches) {
+  return { x: (touches[0].x + touches[1].x) / 2, y: (touches[0].y + touches[1].y) / 2 };
+}
+function twoFingerWheelDelta(previousTouches, currentTouches) {
+  if (!previousTouches || !currentTouches || previousTouches.length !== 2 || currentTouches.length !== 2) return null;
+  if (previousTouches[0].id !== currentTouches[0].id || previousTouches[1].id !== currentTouches[1].id) return null;
+  const previousCenter = centerOfTouches(previousTouches);
+  const currentCenter = centerOfTouches(currentTouches);
+  const dx = currentCenter.x - previousCenter.x;
+  const dy = currentCenter.y - previousCenter.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < 6) return null;
+  const wheel = { deltaX: Math.round(dx * 0.12), deltaY: Math.round(dy * 0.12) };
+  return wheel.deltaX || wheel.deltaY ? wheel : null;
+}
+function sendWheelDelta(wheel) {
+  inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: wheel.deltaX, delta_y: wheel.deltaY, x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
+}
 pad.addEventListener("pointerdown", (event) => {
+  touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
   activePointer = event.pointerId;
   lastPoint = { x: event.clientX, y: event.clientY };
   tapStart = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
   pad.setPointerCapture(event.pointerId);
+  if (touchPoints.size >= 2) {
+    flushMove();
+    lastWheelTouches = touchPoints.size === 2 ? touchPointsSnapshot() : null;
+    activePointer = null;
+    lastPoint = null;
+    tapStart = null;
+  }
 });
 pad.addEventListener("pointermove", (event) => {
+  if (touchPoints.has(event.pointerId)) {
+    touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
+  }
+  if (touchPoints.size >= 2) {
+    if (touchPoints.size > 2) {
+      lastWheelTouches = null;
+      return;
+    }
+    const currentTouches = touchPointsSnapshot();
+    const wheel = twoFingerWheelDelta(lastWheelTouches, currentTouches);
+    lastWheelTouches = currentTouches;
+    if (wheel) sendWheelDelta(wheel);
+    return;
+  }
   if (activePointer !== event.pointerId || !lastPoint) return;
   const dx = Math.round((event.clientX - lastPoint.x) * 1.35);
   const dy = Math.round((event.clientY - lastPoint.y) * 1.35);
@@ -602,6 +646,8 @@ function clearPointer(event) {
     lastPoint = null;
     tapStart = null;
   }
+  touchPoints.delete(event.pointerId);
+  if (touchPoints.size !== 2) lastWheelTouches = null;
 }
 function cancelPointer(event) {
   if (activePointer === event.pointerId) {
@@ -610,6 +656,8 @@ function cancelPointer(event) {
     lastPoint = null;
     tapStart = null;
   }
+  touchPoints.delete(event.pointerId);
+  if (touchPoints.size !== 2) lastWheelTouches = null;
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
@@ -750,6 +798,18 @@ mod tests {
         assert!(page.contains("pad.addEventListener(\"pointercancel\", cancelPointer);"));
         assert!(page.contains("button: \"Left\", state: \"Pressed\""));
         assert!(page.contains("button: \"Left\", state: \"Released\""));
+    }
+
+    #[test]
+    fn rendered_mobile_page_supports_two_finger_wheel_gestures() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function twoFingerWheelDelta"));
+        assert!(page.contains("function touchPointsSnapshot"));
+        assert!(page.contains("sendWheelDelta(wheel);"));
+        assert!(page.contains("kind: \"MouseWheel\""));
+        assert!(page.contains("lastWheelTouches ="));
+        assert!(page.contains("touchPointsSnapshot()"));
     }
 
     #[test]

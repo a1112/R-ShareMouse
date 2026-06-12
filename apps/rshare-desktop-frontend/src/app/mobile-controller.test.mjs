@@ -12,6 +12,7 @@ import {
   isTouchpadTap,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
+  twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
 
 test("buildTextCommitRequest creates daemon IPC inject request for unicode input", () => {
@@ -136,6 +137,72 @@ test("nextPointerPosition applies sensitivity and clamps to desktop bounds", () 
       { width: 1920, height: 1080, sensitivity: 1 },
     ),
     { x: 1919, y: 1079 },
+  );
+});
+
+test("twoFingerWheelDelta maps two finger movement into wheel delta", () => {
+  assert.deepEqual(
+    twoFingerWheelDelta(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 140, y: 100 },
+      ],
+      [
+        { id: 1, x: 98, y: 60 },
+        { id: 2, x: 138, y: 60 },
+      ],
+      { sensitivity: 0.12, minDeltaPx: 6 },
+    ),
+    { deltaX: 0, deltaY: -5 },
+  );
+
+  assert.deepEqual(
+    twoFingerWheelDelta(
+      [
+        { id: "a", x: 100, y: 100 },
+        { id: "b", x: 140, y: 100 },
+      ],
+      [
+        { id: "a", x: 140, y: 103 },
+        { id: "b", x: 180, y: 103 },
+      ],
+      { sensitivity: 0.1, minDeltaPx: 6 },
+    ),
+    { deltaX: 4, deltaY: 0 },
+  );
+});
+
+test("twoFingerWheelDelta ignores single finger tiny or mismatched gestures", () => {
+  assert.equal(
+    twoFingerWheelDelta([{ id: 1, x: 100, y: 100 }], [{ id: 1, x: 100, y: 40 }]),
+    null,
+  );
+  assert.equal(
+    twoFingerWheelDelta(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 140, y: 100 },
+      ],
+      [
+        { id: 1, x: 102, y: 103 },
+        { id: 2, x: 142, y: 103 },
+      ],
+      { minDeltaPx: 8 },
+    ),
+    null,
+  );
+  assert.equal(
+    twoFingerWheelDelta(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 140, y: 100 },
+      ],
+      [
+        { id: 1, x: 110, y: 70 },
+        { id: 3, x: 150, y: 70 },
+      ],
+    ),
+    null,
   );
 });
 

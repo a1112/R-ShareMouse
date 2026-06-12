@@ -23,6 +23,7 @@ import {
   isTouchpadTap,
   nextPointerPosition,
   tauriInvocationForMobileRequest,
+  twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
 
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
@@ -38,6 +39,7 @@ type PointerState = {
 };
 
 type SendState = "idle" | "sending" | "ok" | "error";
+type TouchPoint = { id: number; x: number; y: number };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -142,6 +144,8 @@ export default function MobileController() {
   const activePointerRef = useRef<number | null>(null);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
+  const touchPointsRef = useRef<Map<number, TouchPoint>>(new Map());
+  const lastWheelTouchesRef = useRef<TouchPoint[] | null>(null);
   const pointerRef = useRef(pointer);
   const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
@@ -214,13 +218,46 @@ export default function MobileController() {
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    touchPointsRef.current.set(event.pointerId, {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+    });
     activePointerRef.current = event.pointerId;
     lastPointRef.current = { x: event.clientX, y: event.clientY };
     tapStartRef.current = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
     event.currentTarget.setPointerCapture(event.pointerId);
+    if (touchPointsRef.current.size >= 2) {
+      moveCoalescerRef.current?.flush();
+      lastWheelTouchesRef.current =
+        touchPointsRef.current.size === 2 ? touchPointsSnapshot() : null;
+      activePointerRef.current = null;
+      lastPointRef.current = null;
+      tapStartRef.current = null;
+    }
   }
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (touchPointsRef.current.has(event.pointerId)) {
+      touchPointsRef.current.set(event.pointerId, {
+        id: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+      });
+    }
+    if (touchPointsRef.current.size >= 2) {
+      if (touchPointsRef.current.size > 2) {
+        lastWheelTouchesRef.current = null;
+        return;
+      }
+      const currentTouches = touchPointsSnapshot();
+      const wheelDelta = twoFingerWheelDelta(lastWheelTouchesRef.current, currentTouches);
+      lastWheelTouchesRef.current = currentTouches;
+      if (wheelDelta) {
+        wheel(wheelDelta.deltaY, wheelDelta.deltaX);
+      }
+      return;
+    }
     if (activePointerRef.current !== event.pointerId || !lastPointRef.current) {
       return;
     }
@@ -257,6 +294,10 @@ export default function MobileController() {
       activePointerRef.current = null;
       lastPointRef.current = null;
     }
+    touchPointsRef.current.delete(event.pointerId);
+    if (touchPointsRef.current.size !== 2) {
+      lastWheelTouchesRef.current = null;
+    }
   }
 
   function handlePointerCancel(event: React.PointerEvent<HTMLDivElement>) {
@@ -265,6 +306,10 @@ export default function MobileController() {
       tapStartRef.current = null;
       activePointerRef.current = null;
       lastPointRef.current = null;
+    }
+    touchPointsRef.current.delete(event.pointerId);
+    if (touchPointsRef.current.size !== 2) {
+      lastWheelTouchesRef.current = null;
     }
   }
 
@@ -293,10 +338,14 @@ export default function MobileController() {
     );
   }
 
-  function wheel(deltaY: number) {
+  function touchPointsSnapshot() {
+    return [...touchPointsRef.current.values()].sort((left, right) => left.id - right.id);
+  }
+
+  function wheel(deltaY: number, deltaX = 0) {
     void sendRequest(
       buildMouseWheelRequest(
-        0,
+        deltaX,
         deltaY,
         pointer.x,
         pointer.y,
