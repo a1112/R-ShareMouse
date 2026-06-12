@@ -1,3 +1,5 @@
+import qrcode from "qrcode-generator";
+
 const DEVICE_COLORS = ["#5b8bd6", "#49b35c", "#d6a64b", "#9b6ef3", "#e56b6f"];
 const LOCAL_DEVICE_COLOR = "#60a5fa";
 const LAYOUT_SCALE = 0.12;
@@ -19,6 +21,19 @@ const VIRTUAL_DISPLAY_CREATE_MODES = [
   { width: 1024, height: 768, refreshRateMillihz: 75_000 },
   { width: 1024, height: 768, refreshRateMillihz: 60_000 },
 ];
+
+function buildQrCodeSvgDataUri(value) {
+  if (!value || value === "不可用") {
+    return null;
+  }
+
+  const qr = qrcode(0, "M");
+  qr.addData(value);
+  qr.make();
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+    qr.createSvgTag({ cellSize: 4, margin: 3, scalable: true }),
+  )}`;
+}
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -58,6 +73,8 @@ export function buildMobileAccessViewModel(snapshot) {
     token: typeof snapshot?.token === "string" ? snapshot.token : "",
     bindAddress,
     port: Number.isFinite(port) && port > 0 ? port : null,
+    qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(url) : null,
+    qrCodeAlt: "移动端控制二维码",
     summary: enabled
       ? "用手机浏览器打开链接，即可把手机作为触控板和输入法。"
       : "移动端控制网关不可用，请先启动守护进程。",

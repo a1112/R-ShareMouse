@@ -22,6 +22,7 @@ import {
   Monitor,
   MousePointer2,
   Play,
+  QrCode,
   RotateCcw,
   Settings,
   Smartphone,
@@ -9690,15 +9691,34 @@ function SettingsPage({
         </div>
 
         <div
-          className="mt-4 rounded-md px-4 py-3 text-sm"
+          className="mt-4 grid gap-4 rounded-md px-4 py-3 text-sm lg:grid-cols-[148px_minmax(0,1fr)]"
           style={{ border: `1px solid ${theme.border}`, background: theme.frame }}
         >
-          <div className="mb-2 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
-            手机访问链接
+          <div
+            className="flex h-[148px] w-[148px] items-center justify-center rounded-md"
+            style={{
+              background: mobileAccessView.qrCodeSvgDataUri ? "#ffffff" : theme.surface,
+              border: `1px solid ${theme.border}`,
+            }}
+          >
+            {mobileAccessView.qrCodeSvgDataUri ? (
+              <img
+                className="h-[132px] w-[132px]"
+                src={mobileAccessView.qrCodeSvgDataUri}
+                alt={mobileAccessView.qrCodeAlt}
+              />
+            ) : (
+              <QrCode size={42} style={{ color: theme.textMuted }} />
+            )}
           </div>
-          <div className="break-all font-medium">{mobileAccessView.url}</div>
-          <div className="mt-2 text-sm leading-6" style={{ color: theme.textMuted }}>
-            {mobileAccessError ?? mobileAccessView.summary}
+          <div className="min-w-0 self-center">
+            <div className="mb-2 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
+              手机访问链接
+            </div>
+            <div className="break-all font-medium">{mobileAccessView.url}</div>
+            <div className="mt-2 text-sm leading-6" style={{ color: theme.textMuted }}>
+              {mobileAccessError ?? mobileAccessView.summary}
+            </div>
           </div>
         </div>
 

@@ -113,6 +113,24 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
   assert.equal(offline.port, null);
 });
 
+test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile link", () => {
+  const view = buildMobileAccessViewModel({
+    enabled: true,
+    bind_address: "0.0.0.0:27437",
+    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    token: "abc123",
+  });
+
+  assert.match(view.qrCodeSvgDataUri, /^data:image\/svg\+xml;charset=utf-8,/);
+  const svg = decodeURIComponent(view.qrCodeSvgDataUri.split(",", 2)[1]);
+  assert.match(svg, /<svg/);
+  assert.match(svg, /<path/);
+  assert.equal(view.qrCodeAlt, "移动端控制二维码");
+
+  const offline = buildMobileAccessViewModel(null);
+  assert.equal(offline.qrCodeSvgDataUri, null);
+});
+
 test("buildDisplaySettingsViewModel exposes system display settings", () => {
   const view = buildDisplaySettingsViewModel(
     {
