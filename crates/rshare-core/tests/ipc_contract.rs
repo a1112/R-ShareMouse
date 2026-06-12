@@ -352,6 +352,28 @@ async fn endpoint_inject_request_round_trips_over_json_lines() {
 }
 
 #[tokio::test]
+async fn endpoint_text_commit_request_round_trips_over_json_lines() {
+    let request = DaemonRequest::InjectEndpointEvent {
+        target: EndpointInjectTarget::Local,
+        request: EndpointInjectRequest {
+            correlation_id: "mobile-text-1".to_string(),
+            device_kind: EndpointEventKind::Keyboard,
+            payload: EndpointEventPayload::TextCommit {
+                text: "你好🙂".to_string(),
+            },
+            mode: EndpointInjectMode::RequireHealthyBackend,
+            timeout_ms: 750,
+        },
+    };
+
+    let (mut writer, mut reader) = duplex(4096);
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+}
+
+#[tokio::test]
 async fn capability_requests_round_trip_over_json_lines() {
     let requests = [
         DaemonRequest::Capabilities { device_id: None },

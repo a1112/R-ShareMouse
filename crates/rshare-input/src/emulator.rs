@@ -40,6 +40,9 @@ pub trait InputEmulator {
     /// Type a key (press and release)
     fn type_key(&mut self, keycode: KeyCode) -> Result<()>;
 
+    /// Commit text at the active text insertion point.
+    fn commit_text(&mut self, text: &str) -> Result<()>;
+
     /// Check if emulator is active
     fn is_active(&self) -> bool;
 }
@@ -210,6 +213,7 @@ impl InputEmulator for EnigoInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -368,6 +372,19 @@ impl InputEmulator for EnigoInputEmulator {
         self.release_key(keycode)
     }
 
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        let mut enigo = self
+            .enigo
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock enigo: {}", e))?;
+
+        enigo
+            .text(text)
+            .map_err(|e| anyhow::anyhow!("Failed to commit text: {:?}", e))?;
+
+        Ok(())
+    }
+
     fn is_active(&self) -> bool {
         self.active
     }
@@ -499,6 +516,11 @@ impl InputEmulator for MacosNativeInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { .. } => {
+                anyhow::bail!(
+                    "Text commit injection is not supported by the macOS native emulator"
+                );
+            }
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -553,6 +575,10 @@ impl InputEmulator for MacosNativeInputEmulator {
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
         self.press_key(keycode)?;
         self.release_key(keycode)
+    }
+
+    fn commit_text(&mut self, _text: &str) -> Result<()> {
+        anyhow::bail!("Text commit injection is not supported by the macOS native emulator")
     }
 
     fn is_active(&self) -> bool {
@@ -800,6 +826,7 @@ impl InputEmulator for WindowsNativeInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -854,6 +881,10 @@ impl InputEmulator for WindowsNativeInputEmulator {
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
         self.press_key(keycode)?;
         self.release_key(keycode)
+    }
+
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.send_text(text)
     }
 
     fn is_active(&self) -> bool {
@@ -989,6 +1020,10 @@ impl<E: InputEmulator> InputEmulator for BatchEmulator<E> {
 
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
         self.inner.type_key(keycode)
+    }
+
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.commit_text(text)
     }
 
     fn is_active(&self) -> bool {

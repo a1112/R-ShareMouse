@@ -174,6 +174,9 @@ pub enum EndpointEventPayload {
         key: String,
         state: String,
     },
+    TextCommit {
+        text: String,
+    },
     MouseMove {
         x: i32,
         y: i32,
@@ -264,6 +267,9 @@ pub enum EndpointInjectError {
 impl EndpointEventPayload {
     fn from_diagnostic(event: &LocalInputDiagnosticEvent) -> Self {
         match event.device_kind {
+            LocalInputDeviceKind::Keyboard if event.event_kind == "text" => Self::TextCommit {
+                text: payload_string(&event.payload, "text", ""),
+            },
             LocalInputDeviceKind::Keyboard => Self::Keyboard {
                 key: payload_string(&event.payload, "key", &event.summary),
                 state: payload_string(&event.payload, "state", &event.event_kind),

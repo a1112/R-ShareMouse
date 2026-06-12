@@ -1,0 +1,462 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  CornerDownLeft,
+  Delete,
+  Keyboard,
+  MousePointer2,
+  Send,
+} from "lucide-react";
+
+import {
+  buildKeyTapRequests,
+  buildMouseButtonRequest,
+  buildMouseMoveRequest,
+  buildMouseWheelRequest,
+  buildTextCommitRequest,
+  createMobileCorrelationId,
+  nextPointerPosition,
+  tauriInvocationForMobileRequest,
+} from "./mobile-controller.mjs";
+
+const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
+
+type TauriInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+type PointerState = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  displayId: string | null;
+};
+
+type SendState = "idle" | "sending" | "ok" | "error";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function responseVariant<T>(response: unknown, variant: string): T {
+  if (isRecord(response)) {
+    if (Object.prototype.hasOwnProperty.call(response, "Error")) {
+      throw new Error(String(response.Error));
+    }
+    if (Object.prototype.hasOwnProperty.call(response, variant)) {
+      return response[variant] as T;
+    }
+  }
+  throw new Error(`Unexpected daemon response: ${JSON.stringify(response)}`);
+}
+
+function getTauriInvoke(): TauriInvoke | null {
+  const tauriWindow = window as Window & {
+    __TAURI__?: {
+      core?: {
+        invoke?: TauriInvoke;
+      };
+    };
+  };
+
+  return tauriWindow.__TAURI__?.core?.invoke ?? null;
+}
+
+async function daemonRequest(request: unknown): Promise<unknown> {
+  const invoke = getTauriInvoke();
+  const tauriInvocation = tauriInvocationForMobileRequest(request);
+  if (invoke && tauriInvocation) {
+    const payload = await invoke(tauriInvocation.command, tauriInvocation.args);
+    return {
+      [tauriInvocation.responseVariant]: payload,
+    };
+  }
+
+  const response = await fetch(DAEMON_IPC_BRIDGE_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message =
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+async function sendInjectRequest(request: unknown) {
+  return responseVariant(await daemonRequest(request), "EndpointInjectResult");
+}
+
+function pointerFromLocalControls(snapshot: unknown): PointerState {
+  const record = isRecord(snapshot) ? snapshot : {};
+  const mouse = isRecord(record.mouse) ? record.mouse : {};
+  const display = isRecord(record.display) ? record.display : {};
+  const displays = Array.isArray(display.displays) ? display.displays : [];
+  const primary = displays.find((item) => isRecord(item) && item.primary) ?? displays[0];
+  const primaryDisplay = isRecord(primary) ? primary : {};
+  const width = Number(display.primary_width ?? primaryDisplay.w ?? 1920);
+  const height = Number(display.primary_height ?? primaryDisplay.h ?? 1080);
+
+  return {
+    x: Number(mouse.x ?? 0),
+    y: Number(mouse.y ?? 0),
+    width: Number.isFinite(width) && width > 0 ? Math.floor(width) : 1920,
+    height: Number.isFinite(height) && height > 0 ? Math.floor(height) : 1080,
+    displayId:
+      typeof mouse.current_display_id === "string"
+        ? mouse.current_display_id
+        : typeof primaryDisplay.id === "string"
+          ? primaryDisplay.id
+          : null,
+  };
+}
+
+async function fetchPointerState() {
+  const response = await daemonRequest("LocalControls");
+  return pointerFromLocalControls(responseVariant(response, "LocalControls"));
+}
+
+export default function MobileController() {
+  const [pointer, setPointer] = useState<PointerState>({
+    x: 0,
+    y: 0,
+    width: 1920,
+    height: 1080,
+    displayId: null,
+  });
+  const [text, setText] = useState("");
+  const [sendState, setSendState] = useState<SendState>("idle");
+  const [status, setStatus] = useState("连接中");
+  const activePointerRef = useRef<number | null>(null);
+  const lastPointRef = useRef<{ x: number; y: number } | null>(null);
+  const pointerRef = useRef(pointer);
+  const lastMoveSentRef = useRef(0);
+
+  useEffect(() => {
+    pointerRef.current = pointer;
+  }, [pointer]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function refresh() {
+      try {
+        const next = await fetchPointerState();
+        if (!cancelled) {
+          setPointer(next);
+          setStatus("已连接");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setStatus(error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+
+    void refresh();
+    const timer = window.setInterval(refresh, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  async function sendRequest(request: unknown, quiet = false) {
+    if (!quiet) {
+      setSendState("sending");
+    }
+    try {
+      await sendInjectRequest(request);
+      if (!quiet) {
+        setSendState("ok");
+      }
+      setStatus("已连接");
+    } catch (error) {
+      setSendState("error");
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function sendMove(next: PointerState) {
+    const now = performance.now();
+    if (now - lastMoveSentRef.current < 16) {
+      return;
+    }
+    lastMoveSentRef.current = now;
+    void sendRequest(
+      buildMouseMoveRequest(
+        next.x,
+        next.y,
+        next.displayId,
+        createMobileCorrelationId("mobile-move"),
+      ),
+      true,
+    );
+  }
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    activePointerRef.current = event.pointerId;
+    lastPointRef.current = { x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (activePointerRef.current !== event.pointerId || !lastPointRef.current) {
+      return;
+    }
+    const last = lastPointRef.current;
+    lastPointRef.current = { x: event.clientX, y: event.clientY };
+    const current = pointerRef.current;
+    const next = {
+      ...current,
+      ...nextPointerPosition(
+        current,
+        { dx: event.clientX - last.x, dy: event.clientY - last.y },
+        { width: current.width, height: current.height, sensitivity: 1.35 },
+      ),
+    };
+    pointerRef.current = next;
+    setPointer(next);
+    sendMove(next);
+  }
+
+  function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (activePointerRef.current === event.pointerId) {
+      activePointerRef.current = null;
+      lastPointRef.current = null;
+    }
+  }
+
+  function mouseButton(button: "Left" | "Right" | "Middle", state: "Pressed" | "Released") {
+    void sendRequest(
+      buildMouseButtonRequest(
+        button,
+        state,
+        pointer.x,
+        pointer.y,
+        createMobileCorrelationId(`mobile-${button.toLowerCase()}-${state.toLowerCase()}`),
+      ),
+    );
+  }
+
+  function wheel(deltaY: number) {
+    void sendRequest(
+      buildMouseWheelRequest(
+        0,
+        deltaY,
+        pointer.x,
+        pointer.y,
+        createMobileCorrelationId("mobile-wheel"),
+      ),
+    );
+  }
+
+  async function keyTap(key: string) {
+    const requests = buildKeyTapRequests(key, createMobileCorrelationId(`mobile-key-${key}`));
+    for (const request of requests) {
+      await sendRequest(request);
+    }
+  }
+
+  async function commitText() {
+    const value = text;
+    if (!value) {
+      return;
+    }
+    await sendRequest(buildTextCommitRequest(value, createMobileCorrelationId("mobile-text")));
+    setText("");
+  }
+
+  const statusColor =
+    sendState === "error" ? "#f87171" : sendState === "sending" ? "#fbbf24" : "#47c27a";
+
+  return (
+    <main
+      className="min-h-screen overflow-hidden"
+      style={{
+        background: "#101214",
+        color: "#edf2ef",
+        fontFamily:
+          'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      }}
+    >
+      <div className="mx-auto flex min-h-screen w-full max-w-[720px] flex-col gap-3 px-3 py-3">
+        <header className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <MousePointer2 size={20} color="#47c27a" />
+            <div>
+              <div className="text-sm font-semibold">R-ShareMouse Mobile</div>
+              <div className="text-xs" style={{ color: "#8f9b96" }}>
+                {pointer.x}, {pointer.y} / {pointer.width}x{pointer.height}
+              </div>
+            </div>
+          </div>
+          <div
+            className="rounded-md px-2 py-1 text-xs"
+            style={{ border: "1px solid #2a302d", color: statusColor }}
+          >
+            {status}
+          </div>
+        </header>
+
+        <section
+          className="min-h-0 flex-1 rounded-md"
+          style={{ background: "#161a1c", border: "1px solid #29302d" }}
+        >
+          <div
+            className="h-full min-h-[360px] touch-none select-none rounded-md"
+            style={{
+              background:
+                "linear-gradient(135deg, rgba(71,194,122,0.08), rgba(255,255,255,0.02))",
+            }}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerCancel={handlePointerUp}
+            onPointerUp={handlePointerUp}
+          >
+            <div className="flex h-full items-center justify-center">
+              <div
+                className="h-3 w-3 rounded-full"
+                style={{ background: "#47c27a", boxShadow: "0 0 24px rgba(71,194,122,0.5)" }}
+              />
+            </div>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-3 gap-2">
+          <PressButton
+            label="左键"
+            onDown={() => mouseButton("Left", "Pressed")}
+            onUp={() => mouseButton("Left", "Released")}
+          />
+          <PressButton
+            label="中键"
+            onDown={() => mouseButton("Middle", "Pressed")}
+            onUp={() => mouseButton("Middle", "Released")}
+          />
+          <PressButton
+            label="右键"
+            onDown={() => mouseButton("Right", "Pressed")}
+            onUp={() => mouseButton("Right", "Released")}
+          />
+        </section>
+
+        <section className="grid grid-cols-4 gap-2">
+          <IconButton label="上滚" onClick={() => wheel(3)}>
+            <ArrowUp size={20} />
+          </IconButton>
+          <IconButton label="下滚" onClick={() => wheel(-3)}>
+            <ArrowDown size={20} />
+          </IconButton>
+          <IconButton label="退格" onClick={() => void keyTap("Backspace")}>
+            <Delete size={20} />
+          </IconButton>
+          <IconButton label="回车" onClick={() => void keyTap("Enter")}>
+            <CornerDownLeft size={20} />
+          </IconButton>
+        </section>
+
+        <section className="grid grid-cols-4 gap-2">
+          <IconButton label="左" onClick={() => void keyTap("Left")}>
+            <ArrowLeft size={20} />
+          </IconButton>
+          <IconButton label="上" onClick={() => void keyTap("Up")}>
+            <ArrowUp size={20} />
+          </IconButton>
+          <IconButton label="下" onClick={() => void keyTap("Down")}>
+            <ArrowDown size={20} />
+          </IconButton>
+          <IconButton label="右" onClick={() => void keyTap("Right")}>
+            <ArrowRight size={20} />
+          </IconButton>
+        </section>
+
+        <section className="flex gap-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-3" style={{ background: "#171b1d", border: "1px solid #29302d" }}>
+            <Keyboard size={18} color="#8f9b96" />
+            <input
+              className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none"
+              value={text}
+              placeholder="文本"
+              style={{ color: "#edf2ef" }}
+              onChange={(event) => setText(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void commitText();
+                }
+              }}
+            />
+          </div>
+          <button
+            className="flex h-12 w-14 items-center justify-center rounded-md"
+            style={{ background: "#47c27a", color: "#07110b" }}
+            title="发送"
+            onClick={() => void commitText()}
+          >
+            <Send size={20} />
+          </button>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function IconButton({
+  children,
+  label,
+  onClick,
+}: {
+  children: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className="flex h-12 items-center justify-center rounded-md"
+      style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
+      title={label}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function PressButton({
+  label,
+  onDown,
+  onUp,
+}: {
+  label: string;
+  onDown: () => void;
+  onUp: () => void;
+}) {
+  return (
+    <button
+      className="h-12 rounded-md text-sm font-medium"
+      style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId);
+        onDown();
+      }}
+      onPointerCancel={onUp}
+      onPointerLeave={(event) => {
+        if (event.buttons) {
+          onUp();
+        }
+      }}
+      onPointerUp={onUp}
+    >
+      {label}
+    </button>
+  );
+}

@@ -33,6 +33,7 @@ import MonitorManager, {
   DeviceData as LayoutDevice,
   MonitorData,
 } from "./components/MonitorManager";
+import MobileController from "./MobileController";
 import {
   buildDesktopViewModel,
   buildDisplaySettingsViewModel,
@@ -1904,7 +1905,21 @@ function getLayoutMonitors(
   }));
 }
 
+function isMobileControllerPath() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.location.pathname.replace(/\/+$/, "") === "/mobile";
+}
+
 export default function App() {
+  if (isMobileControllerPath()) {
+    return <MobileController />;
+  }
+  return <DesktopApp />;
+}
+
+function DesktopApp() {
   usePreventBrowserNavigationEvents();
 
   const [page, setPage] = useState<DesktopPage>("layout");

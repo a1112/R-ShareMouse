@@ -1038,6 +1038,19 @@ impl DaemonState {
                     format!("Key {} {:?}", key, state),
                 )
             }
+            InputEvent::TextCommit { text } => {
+                self.local_controls.keyboard.detected = true;
+                self.local_controls.keyboard.event_count =
+                    self.local_controls.keyboard.event_count.saturating_add(1);
+                self.local_controls.keyboard.last_key = Some("TextCommit".to_string());
+                payload.insert("text".to_string(), text.clone());
+                payload.insert("char_count".to_string(), text.chars().count().to_string());
+                (
+                    LocalInputDeviceKind::Keyboard,
+                    "text".to_string(),
+                    format!("Text commit {} chars", text.chars().count()),
+                )
+            }
             InputEvent::GamepadConnected { info } => {
                 upsert_gamepad_metadata(
                     &mut self.local_controls,
@@ -3172,6 +3185,7 @@ fn input_event_to_raw_event(
             alt,
             meta,
         }),
+        rshare_input::InputEvent::TextCommit { .. } => None,
         rshare_input::InputEvent::GamepadConnected { info } => {
             Some(rshare_core::engine::RawInputEvent::GamepadConnected { info })
         }
@@ -3647,7 +3661,7 @@ async fn inject_remote_message(
 
 fn injected_input_loopback_device_kind(event: &InputEvent) -> Option<LocalInputDeviceKind> {
     match event {
-        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } => {
+        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } | InputEvent::TextCommit { .. } => {
             Some(LocalInputDeviceKind::Keyboard)
         }
         InputEvent::MouseMove { .. }
@@ -3716,6 +3730,10 @@ fn endpoint_payload_to_input_event(request: &EndpointInjectRequest) -> Result<In
             parse_key_code(key)?,
             parse_button_state(state)?,
         )),
+        (
+            rshare_core::EndpointEventKind::Keyboard,
+            rshare_core::EndpointEventPayload::TextCommit { text },
+        ) => Ok(InputEvent::text_commit(text.clone())),
         (
             rshare_core::EndpointEventKind::Mouse,
             rshare_core::EndpointEventPayload::MouseMove { x, y, .. },
@@ -3959,6 +3977,15 @@ fn endpoint_inject_diagnostic_payload(
             (
                 "key".to_string(),
                 format!("Injected {key} {state}"),
+                payload,
+            )
+        }
+        rshare_core::EndpointEventPayload::TextCommit { text } => {
+            payload.insert("text".to_string(), text.clone());
+            payload.insert("char_count".to_string(), text.chars().count().to_string());
+            (
+                "text".to_string(),
+                format!("Injected text commit ({} chars)", text.chars().count()),
                 payload,
             )
         }
@@ -9824,6 +9851,49 @@ mod tests {
             events[0].direction,
             rshare_core::EndpointEventDirection::InjectedLoopback
         );
+    }
+
+    #[tokio::test]
+    async fn inject_endpoint_event_accepts_unicode_text_commit() {
+        let injected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(RecordingKindInjectBackend {
+                kind: BackendKind::Portable,
+                injected: injected.clone(),
+            })));
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local".to_string(),
+        )));
+        let (events, _rx) = broadcast::channel(4);
+
+        let result = inject_endpoint_event(
+            &network_manager,
+            &backend,
+            &state,
+            &events,
+            rshare_core::EndpointInjectTarget::Local,
+            rshare_core::EndpointInjectRequest {
+                correlation_id: "mobile-text-1".to_string(),
+                device_kind: rshare_core::EndpointEventKind::Keyboard,
+                payload: rshare_core::EndpointEventPayload::TextCommit {
+                    text: "你好🙂".to_string(),
+                },
+                mode: rshare_core::EndpointInjectMode::RequireHealthyBackend,
+                timeout_ms: 750,
+            },
+        )
+        .await;
+
+        assert!(result.accepted);
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 1);
+        assert!(matches!(
+            &injected[0],
+            rshare_input::InputEvent::TextCommit { text } if text == "你好🙂"
+        ));
     }
 
     #[tokio::test]

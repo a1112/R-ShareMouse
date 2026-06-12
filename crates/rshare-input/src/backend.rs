@@ -617,6 +617,7 @@ impl InjectBackend for VirtualHidInjectBackend {
             InputEvent::MouseWheel { delta_x, delta_y } => {
                 self.client.inject_mouse_wheel(delta_x, delta_y)
             }
+            InputEvent::TextCommit { text } => rshare_platform::windows::send_unicode_text(&text),
             _ => anyhow::bail!(
                 "Virtual HID driver injection does not support {}",
                 event.event_type()

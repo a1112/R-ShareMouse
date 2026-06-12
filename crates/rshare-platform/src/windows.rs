@@ -1537,6 +1537,16 @@ mod windows_impl {
 
             Ok(())
         }
+
+        /// Commit Unicode text at the current text insertion point.
+        pub fn send_text(&mut self, text: &str) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+
+            tracing::trace!("Windows: text commit ({} chars)", text.chars().count());
+            send_unicode_text(text)
+        }
     }
 
     impl Default for WindowsInputEmulator {
@@ -1637,6 +1647,7 @@ mod windows_impl {
 
     const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_UNICODE: u32 = 0x0004;
     const KEYEVENTF_SCANCODE: u32 = 0x0008;
     const RSHARE_KEYPAD_ENTER_RAW: u16 = 0xE01C;
     const INPUT_MOUSE: u32 = 0;
@@ -2697,6 +2708,26 @@ mod windows_impl {
         send_input(&input, "keyboard")
     }
 
+    pub fn send_unicode_text(text: &str) -> Result<()> {
+        unsafe {
+            for unit in text.encode_utf16() {
+                send_unicode_unit_input(unit, true)?;
+                send_unicode_unit_input(unit, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn send_unicode_unit_input(unit: u16, down: bool) -> Result<()> {
+        let keyboard = keyboard_input_for_unicode_unit(unit, down);
+        let input = Input {
+            kind: INPUT_KEYBOARD,
+            payload: InputPayload { keyboard },
+        };
+
+        send_input(&input, "unicode text")
+    }
+
     fn keyboard_input_for_key(vk: u16, down: bool) -> KeyboardInput {
         let (vk, scan, flags) = if vk == RSHARE_KEYPAD_ENTER_RAW {
             (0, 0x1C, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
@@ -2708,6 +2739,16 @@ mod windows_impl {
             vk,
             scan,
             flags: flags | if down { 0 } else { KEYEVENTF_KEYUP },
+            time: 0,
+            extra_info: 0,
+        }
+    }
+
+    fn keyboard_input_for_unicode_unit(unit: u16, down: bool) -> KeyboardInput {
+        KeyboardInput {
+            vk: 0,
+            scan: unit,
+            flags: KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP },
             time: 0,
             extra_info: 0,
         }
@@ -4549,6 +4590,19 @@ mod windows_impl {
                 up.flags,
                 KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
             );
+        }
+
+        #[test]
+        fn unicode_text_sendinput_uses_unicode_scan_units() {
+            let down = keyboard_input_for_unicode_unit('你' as u16, true);
+            assert_eq!(down.vk, 0);
+            assert_eq!(down.scan, '你' as u16);
+            assert_eq!(down.flags, KEYEVENTF_UNICODE);
+
+            let up = keyboard_input_for_unicode_unit('你' as u16, false);
+            assert_eq!(up.vk, 0);
+            assert_eq!(up.scan, '你' as u16);
+            assert_eq!(up.flags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
         }
 
         #[test]
