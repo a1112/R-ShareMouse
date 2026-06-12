@@ -121,6 +121,7 @@ export function getSettingsLayoutSections() {
   return [
     { key: "local", label: "本机信息", description: "设备名称、主机与监听端口" },
     { key: "service", label: "服务状态", description: "守护进程运行状态" },
+    { key: "mobile", label: "移动端控制", description: "手机触控板和输入法入口" },
     { key: "hardware", label: "硬件资产", description: "贴图和导入包" },
     { key: "input", label: "输入后端", description: "捕获模式与健康度" },
     { key: "appearance", label: "界面风格", description: "主题外观" },

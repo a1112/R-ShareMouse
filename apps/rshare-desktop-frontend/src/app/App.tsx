@@ -9,7 +9,9 @@ import {
 import {
   ChevronDown,
   ChevronRight,
+  Copy,
   Download,
+  ExternalLink,
   FileText,
   Gamepad2,
   HardDrive,
@@ -22,6 +24,7 @@ import {
   Play,
   RotateCcw,
   Settings,
+  Smartphone,
   Square,
   Upload,
   Volume2,
@@ -42,6 +45,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildLocalDeviceSelectItems,
+  buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   buildVirtualDisplayViewModel,
@@ -82,6 +86,7 @@ type DesktopPage = "layout" | "devices" | "logs" | "settings";
 type SettingsSectionKey =
   | "local"
   | "service"
+  | "mobile"
   | "hardware"
   | "input"
   | "appearance"
@@ -472,6 +477,13 @@ type LocalInputTestResult = {
   maxElapsedMs?: number | null;
 };
 
+type MobileAccessSnapshot = {
+  enabled: boolean;
+  bind_address: string;
+  page_url: string;
+  token: string;
+};
+
 type RemoteLatencySummary = {
   state: "idle" | "pending" | "pass" | "warn" | "fail";
   message: string;
@@ -624,6 +636,7 @@ const NETWORK_COMMANDS = new Set([
   "get_layout",
   "set_layout",
   "local_controls_state",
+  "mobile_access",
   "endpoint_events_state",
   "inject_endpoint_event",
   "start_local_controls_stream",
@@ -1052,6 +1065,8 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonRequestValue<T>({ SetLayout: { layout: args?.layout } }, "Ack");
     case "local_controls_state":
       return await daemonRequestValue<T>("LocalControls", "LocalControls");
+    case "mobile_access":
+      return await daemonRequestValue<T>("MobileAccess", "MobileAccess");
     case "endpoint_events_state":
       return await daemonRequestValue<T>(
         {
@@ -1930,6 +1945,8 @@ function DesktopApp() {
   const [error, setError] = useState<string | null>(null);
   const [localControls, setLocalControls] = useState<LocalControlsSnapshot | null>(null);
   const [localControlsError, setLocalControlsError] = useState<string | null>(null);
+  const [mobileAccess, setMobileAccess] = useState<MobileAccessSnapshot | null>(null);
+  const [mobileAccessError, setMobileAccessError] = useState<string | null>(null);
   const [localInputTestResult, setLocalInputTestResult] =
     useState<LocalInputTestResult | null>(null);
   const [remoteLatencyTestResult, setRemoteLatencyTestResult] =
@@ -1989,6 +2006,17 @@ function DesktopApp() {
     }
   }
 
+  async function refreshMobileAccess() {
+    try {
+      const snapshot = await invokeCommand<MobileAccessSnapshot>("mobile_access");
+      setMobileAccess(snapshot);
+      setMobileAccessError(null);
+    } catch (mobileError) {
+      setMobileAccess(null);
+      setMobileAccessError(errorMessage(mobileError));
+    }
+  }
+
   async function refreshHardwareAssets() {
     setHardwareAssetCatalog((current) => ({ ...current, loading: true, error: null }));
     try {
@@ -2013,6 +2041,7 @@ function DesktopApp() {
     await refreshDashboard();
     setRefreshTick((value) => value + 1);
     void refreshLocalControls();
+    void refreshMobileAccess();
     void refreshHardwareAssets();
   }
 
@@ -2057,11 +2086,13 @@ function DesktopApp() {
     refreshDashboard().finally(() => {
       if (!cancelled) {
         void refreshLocalControls();
+        void refreshMobileAccess();
       }
     });
     refreshHardwareAssets();
     const dashboardTimer = window.setInterval(() => {
       refreshDashboard();
+      refreshMobileAccess();
       setRefreshTick((value) => value + 1);
     }, POLL_INTERVAL_MS);
 
@@ -2726,6 +2757,8 @@ function DesktopApp() {
               localDevice={model.settings.localDevice}
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
+              mobileAccess={mobileAccess}
+              mobileAccessError={mobileAccessError}
               service={model.service}
               themeMode={themeMode}
               onThemeModeChange={setThemeMode}
@@ -9488,6 +9521,8 @@ function SettingsPage({
   localDevice,
   inputMode,
   privilegeState,
+  mobileAccess,
+  mobileAccessError,
   service,
   themeMode,
   onThemeModeChange,
@@ -9531,6 +9566,8 @@ function SettingsPage({
     reason: string | null;
   };
   privilegeState: string;
+  mobileAccess: MobileAccessSnapshot | null;
+  mobileAccessError: string | null;
   service: {
     online: boolean;
     healthy: boolean;
@@ -9556,9 +9593,11 @@ function SettingsPage({
     background: "rgba(255,255,255,0.04)",
     color: theme.textSub,
   };
+  const mobileAccessView = buildMobileAccessViewModel(mobileAccess);
   const sectionSummary: Record<SettingsSectionKey, string> = {
     local: localDevice.name,
     service: service.online ? "运行中" : "已停止",
+    mobile: mobileAccessView.available ? `端口 ${mobileAccessView.port ?? "未知"}` : "不可用",
     hardware: "贴图设置",
     input: inputMode.current,
     appearance:
@@ -9623,6 +9662,81 @@ function SettingsPage({
         >
           {service.online ? "停止服务" : "启动服务"}
         </button>
+      </section>
+    );
+  } else if (selectedSection === "mobile") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Smartphone size={18} />,
+          "移动端控制",
+          "用手机浏览器连接本机移动网关，模拟鼠标、按键和手机输入法文本。",
+          true,
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow
+            label="网关"
+            value={mobileAccessView.available ? "可用" : "不可用"}
+            theme={theme}
+          />
+          <InfoRow label="监听地址" value={mobileAccessView.bindAddress} theme={theme} />
+          <InfoRow label="端口" value={mobileAccessView.port == null ? "不可用" : String(mobileAccessView.port)} theme={theme} />
+          <InfoRow
+            label="访问令牌"
+            value={mobileAccessView.token ? `${mobileAccessView.token.slice(0, 8)}...` : "不可用"}
+            theme={theme}
+          />
+        </div>
+
+        <div
+          className="mt-4 rounded-md px-4 py-3 text-sm"
+          style={{ border: `1px solid ${theme.border}`, background: theme.frame }}
+        >
+          <div className="mb-2 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
+            手机访问链接
+          </div>
+          <div className="break-all font-medium">{mobileAccessView.url}</div>
+          <div className="mt-2 text-sm leading-6" style={{ color: theme.textMuted }}>
+            {mobileAccessError ?? mobileAccessView.summary}
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="flex items-center gap-2 rounded-md px-4 py-2 text-sm transition"
+            style={{
+              background: theme.accentSoft,
+              color: theme.accent,
+              border: `1px solid ${theme.accent}`,
+              opacity: mobileAccessView.available ? 1 : 0.6,
+            }}
+            disabled={!mobileAccessView.available}
+            onClick={() => {
+              void navigator.clipboard?.writeText(mobileAccessView.url);
+            }}
+          >
+            <Copy size={14} />
+            复制链接
+          </button>
+          <a
+            className="flex items-center gap-2 rounded-md px-4 py-2 text-sm transition"
+            style={{
+              background: theme.frame,
+              color: mobileAccessView.available ? theme.text : theme.textMuted,
+              border: `1px solid ${theme.border}`,
+              pointerEvents: mobileAccessView.available ? "auto" : "none",
+              opacity: mobileAccessView.available ? 1 : 0.6,
+            }}
+            href={mobileAccessView.available ? mobileAccessView.url : undefined}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <ExternalLink size={14} />
+            打开
+          </a>
+        </div>
       </section>
     );
   } else if (selectedSection === "hardware") {

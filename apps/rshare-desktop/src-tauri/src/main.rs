@@ -8,7 +8,7 @@ use rshare_core::{
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalDisplayState, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, ServiceStatusSnapshot, VirtualDisplayCreateRequest,
+    LocalInputTestResult, MobileAccessSnapshot, ServiceStatusSnapshot, VirtualDisplayCreateRequest,
     VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
@@ -215,6 +215,13 @@ async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
         || rshare_platform::display::query_display_state(),
     )
     .await
+}
+
+#[tauri::command]
+async fn mobile_access() -> Result<MobileAccessSnapshot, String> {
+    daemon_client::request_mobile_access()
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -878,6 +885,7 @@ fn main() {
             connect_device,
             disconnect_device,
             local_controls_state,
+            mobile_access,
             capture_display,
             identify_displays,
             update_display_settings,

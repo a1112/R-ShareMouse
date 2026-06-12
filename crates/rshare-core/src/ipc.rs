@@ -21,6 +21,7 @@ use crate::{
 /// Default TCP port for localhost daemon IPC.
 pub const DEFAULT_IPC_PORT: u16 = 27435;
 pub const DEFAULT_LOCAL_CONTROLS_WS_PORT: u16 = 27436;
+pub const DEFAULT_MOBILE_GATEWAY_PORT: u16 = 27437;
 
 /// Current daemon status snapshot returned to local clients.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +352,14 @@ impl ServiceStatusSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileAccessSnapshot {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub page_url: String,
+    pub token: String,
+}
+
 /// Lightweight device snapshot returned by daemon queries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonDeviceSnapshot {
@@ -422,6 +431,7 @@ pub enum DaemonRequest {
         #[serde(default)]
         limit: Option<u16>,
     },
+    MobileAccess,
     SubscribeEndpointEvents {
         #[serde(default)]
         filter: EndpointEventFilter,
@@ -487,6 +497,7 @@ pub enum DaemonResponse {
     EndpointEvents(Vec<EndpointEvent>),
     EndpointEvent(EndpointEvent),
     EndpointInjectResult(EndpointInjectResult),
+    MobileAccess(MobileAccessSnapshot),
     LocalInputTest(LocalInputTestResult),
     LocalAudioTest(LocalAudioTestResult),
     DisplayCapture(DisplayCaptureResult),
@@ -513,6 +524,13 @@ pub fn default_local_controls_ws_addr() -> SocketAddr {
 
 pub fn default_local_controls_ws_url() -> String {
     format!("ws://{}/local-controls", default_local_controls_ws_addr())
+}
+
+pub fn default_mobile_gateway_addr() -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        DEFAULT_MOBILE_GATEWAY_PORT,
+    )
 }
 
 /// Read a single newline-delimited JSON value from a stream.

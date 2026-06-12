@@ -43,6 +43,27 @@ function buildLocalDevice(status) {
   };
 }
 
+export function buildMobileAccessViewModel(snapshot) {
+  const enabled = Boolean(snapshot?.enabled);
+  const url = typeof snapshot?.page_url === "string" && snapshot.page_url.length
+    ? snapshot.page_url
+    : "不可用";
+  const bindAddress = typeof snapshot?.bind_address === "string" ? snapshot.bind_address : "不可用";
+  const portText = bindAddress.includes(":") ? bindAddress.split(":").pop() : "";
+  const port = portText ? Number(portText) : null;
+
+  return {
+    available: enabled && url !== "不可用",
+    url,
+    token: typeof snapshot?.token === "string" ? snapshot.token : "",
+    bindAddress,
+    port: Number.isFinite(port) && port > 0 ? port : null,
+    summary: enabled
+      ? "用手机浏览器打开链接，即可把手机作为触控板和输入法。"
+      : "移动端控制网关不可用，请先启动守护进程。",
+  };
+}
+
 function displayTitle(display, index) {
   if (display.primary) {
     return "主显示器";

@@ -1,7 +1,7 @@
 use rshare_core::{
     ipc::{
-        default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
-        DaemonResponse, ServiceStatusSnapshot,
+        default_ipc_addr, default_mobile_gateway_addr, read_json_line, write_json_line,
+        DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
     BackgroundProcessOwner, BackgroundRunMode, CapabilityRegistrySnapshot, DeviceAttribution,
@@ -14,10 +14,11 @@ use rshare_core::{
     LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioEndpointFormFactor,
     LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
     LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, MobileAccessSnapshot,
+    TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor,
+    UsbDeviceSpeed, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -809,4 +810,39 @@ fn default_ipc_addr_binds_to_loopback() {
 
     assert!(addr.ip().is_loopback());
     assert_eq!(addr.port(), 27435);
+}
+
+#[tokio::test]
+async fn mobile_access_request_round_trips_over_json_lines() {
+    let (mut writer, mut reader) = duplex(2048);
+    let request = DaemonRequest::MobileAccess;
+
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+
+    let snapshot = MobileAccessSnapshot {
+        enabled: true,
+        bind_address: "0.0.0.0:27437".to_string(),
+        page_url: "http://192.168.1.50:27437/mobile?t=abc123".to_string(),
+        token: "abc123".to_string(),
+    };
+    let response = DaemonResponse::MobileAccess(snapshot.clone());
+    let (mut writer, mut reader) = duplex(2048);
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+    assert!(snapshot.page_url.contains(&snapshot.token));
+}
+
+#[test]
+fn default_mobile_gateway_addr_uses_separate_port() {
+    let ipc_addr = default_ipc_addr();
+    let mobile_addr = default_mobile_gateway_addr();
+
+    assert_ne!(mobile_addr.port(), ipc_addr.port());
+    assert_eq!(mobile_addr.port(), 27437);
 }

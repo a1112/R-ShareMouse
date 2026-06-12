@@ -14,6 +14,7 @@ import {
   buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
+  buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   buildVirtualDisplayViewModel,
@@ -90,6 +91,26 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
 
   assert.equal(overview.available, false);
   assert.deepEqual(overview.devices, []);
+});
+
+test("buildMobileAccessViewModel exposes mobile controller link and token state", () => {
+  const view = buildMobileAccessViewModel({
+    enabled: true,
+    bind_address: "0.0.0.0:27437",
+    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    token: "abc123",
+  });
+
+  assert.equal(view.available, true);
+  assert.equal(view.url, "http://192.168.1.50:27437/mobile?t=abc123");
+  assert.equal(view.token, "abc123");
+  assert.equal(view.port, 27437);
+  assert.match(view.summary, /手机浏览器/);
+
+  const offline = buildMobileAccessViewModel(null);
+  assert.equal(offline.available, false);
+  assert.equal(offline.url, "不可用");
+  assert.equal(offline.port, null);
 });
 
 test("buildDisplaySettingsViewModel exposes system display settings", () => {

@@ -4,22 +4,23 @@
 
 mod audio_runtime;
 mod endpoint_runtime;
+mod mobile_gateway;
 
 use anyhow::Result;
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::SinkExt;
 use rshare_core::{
-    default_ipc_addr, default_local_controls_ws_addr, local_capability_snapshots, read_json_line,
-    remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
-    BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
-    CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
-    DisplayCaptureResult, DisplayIdentifyResult, DisplayNode, DisplayOperationStatus,
-    DisplaySettingsUpdateResult, EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent,
-    EndpointEventFilter, EndpointEventStore, EndpointInjectError, EndpointInjectRequest,
-    EndpointInjectResult, EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot,
-    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
+    local_capability_snapshots, read_json_line, remote_capability_snapshots, write_json_line,
+    AudioFormat, BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
+    CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine, Config,
+    ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
+    DeviceCapabilitySnapshot, DeviceId, Direction, DisplayCaptureResult, DisplayIdentifyResult,
+    DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
+    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
+    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
+    FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph, LayoutNode,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
@@ -316,6 +317,7 @@ struct DaemonState {
     pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
     pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
     virtual_displays: VirtualDisplayManager,
+    mobile_access: mobile_gateway::MobileGatewayAccess,
 }
 
 impl DaemonState {
@@ -336,6 +338,11 @@ impl DaemonState {
         let features = RuntimeFeatureConfig::default();
         let local_controls =
             default_local_control_snapshot(local_screen.width, local_screen.height, &features);
+        let mobile_access = mobile_gateway::MobileGatewayAccess::new(
+            default_mobile_gateway_addr(),
+            DeviceId::new_v4().simple().to_string(),
+            mobile_gateway::preferred_mobile_advertise_host(&status.hostname),
+        );
 
         Self {
             status,
@@ -355,6 +362,7 @@ impl DaemonState {
             pending_usb_transfers: HashMap::new(),
             pending_endpoint_injects: HashMap::new(),
             virtual_displays: VirtualDisplayManager::default(),
+            mobile_access,
         }
     }
 
@@ -6935,6 +6943,18 @@ async fn main() -> Result<()> {
         local_events_tx.clone(),
         shutdown_tx.subscribe(),
     ));
+    let mobile_access = {
+        let state = state.read().await;
+        state.mobile_access.clone()
+    };
+    let mobile_gateway_task = tokio::spawn(mobile_gateway::run_mobile_gateway_server(
+        mobile_access,
+        state.clone(),
+        network_manager.clone(),
+        inject_backend.clone(),
+        local_events_tx.clone(),
+        shutdown_tx.subscribe(),
+    ));
 
     let input_forwarding_task = tokio::spawn(run_input_forwarding_loop(
         input_rx,
@@ -7054,6 +7074,10 @@ async fn main() -> Result<()> {
         }
         result = local_controls_ws_task => {
             tracing::info!("Local controls websocket task completed");
+            result??;
+        }
+        result = mobile_gateway_task => {
+            tracing::info!("Mobile gateway task completed");
             result??;
         }
         result = event_task => {
@@ -7377,6 +7401,10 @@ async fn handle_ipc_client(
             request_remote_endpoint_events(&network_manager, &state, &filter).await;
             let mut state = state.write().await;
             DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))
+        }
+        DaemonRequest::MobileAccess => {
+            let state = state.read().await;
+            DaemonResponse::MobileAccess(state.mobile_access.snapshot())
         }
         DaemonRequest::InjectEndpointEvent { target, request } => {
             DaemonResponse::EndpointInjectResult(
@@ -9894,6 +9922,61 @@ mod tests {
             &injected[0],
             rshare_input::InputEvent::TextCommit { text } if text == "你好🙂"
         ));
+    }
+
+    #[test]
+    fn mobile_gateway_authorizes_query_or_bearer_token() {
+        let query_request =
+            mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=mobile-secret", Vec::new());
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &query_request,
+            "mobile-secret"
+        ));
+
+        let header_request = mobile_gateway::MobileHttpRequest::new(
+            "POST",
+            "/api/inject",
+            vec![("authorization", "Bearer mobile-secret")],
+        );
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &header_request,
+            "mobile-secret"
+        ));
+    }
+
+    #[test]
+    fn mobile_gateway_rejects_missing_or_wrong_token() {
+        let missing = mobile_gateway::MobileHttpRequest::new("GET", "/mobile", Vec::new());
+        assert!(!mobile_gateway::is_authorized_mobile_request(
+            &missing,
+            "mobile-secret"
+        ));
+
+        let wrong = mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=wrong", Vec::new());
+        assert!(!mobile_gateway::is_authorized_mobile_request(
+            &wrong,
+            "mobile-secret"
+        ));
+    }
+
+    #[test]
+    fn mobile_gateway_routes_only_mobile_page_status_and_inject() {
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile?t=token"),
+            mobile_gateway::MobileGatewayRoute::Page
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/api/local-controls?t=token"),
+            mobile_gateway::MobileGatewayRoute::LocalControls
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("POST", "/api/inject?t=token"),
+            mobile_gateway::MobileGatewayRoute::Inject
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("POST", "/api/shutdown?t=token"),
+            mobile_gateway::MobileGatewayRoute::NotFound
+        );
     }
 
     #[tokio::test]
