@@ -9,6 +9,7 @@ import {
   buildMouseClickRequests,
   buildMouseMoveRequest,
   buildMouseWheelRequest,
+  createHeldInputController,
   buildTextCommitRequest,
   createPointerMoveCoalescer,
   isTouchpadTap,
@@ -141,6 +142,25 @@ test("buildKeyRequest emits a single keyboard hold transition", () => {
     key: "Left",
     state: "Released",
   });
+});
+
+test("createHeldInputController releases a held input once from pointer or global cancellation", () => {
+  const states = [];
+  const held = createHeldInputController((state) => states.push(state));
+
+  assert.equal(held.press(7), true);
+  assert.deepEqual(states, ["Pressed"]);
+  assert.equal(held.releaseIfPointerStillDown(7, 1), true);
+  assert.deepEqual(states, ["Pressed", "Released"]);
+  assert.equal(held.release(7), false);
+  assert.deepEqual(states, ["Pressed", "Released"]);
+
+  assert.equal(held.press(8), true);
+  assert.equal(held.release(9), false);
+  assert.equal(held.isPressed(), true);
+  assert.equal(held.releaseAll(), true);
+  assert.equal(held.isPressed(), false);
+  assert.deepEqual(states, ["Pressed", "Released", "Pressed", "Released"]);
 });
 
 test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {

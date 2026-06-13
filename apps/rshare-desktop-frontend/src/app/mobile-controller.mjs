@@ -64,6 +64,46 @@ export function buildKeyTapRequests(key, correlationPrefix) {
   ];
 }
 
+export function createHeldInputController(sendState) {
+  let active = false;
+  let activePointerId = null;
+
+  function releasePointer(pointerId, force = false) {
+    if (!active) {
+      return false;
+    }
+    if (!force && pointerId != null && activePointerId !== pointerId) {
+      return false;
+    }
+    active = false;
+    activePointerId = null;
+    sendState("Released");
+    return true;
+  }
+
+  return {
+    press(pointerId) {
+      releasePointer(null, true);
+      active = true;
+      activePointerId = pointerId;
+      sendState("Pressed");
+      return true;
+    },
+    release(pointerId) {
+      return releasePointer(pointerId);
+    },
+    releaseAll() {
+      return releasePointer(null, true);
+    },
+    releaseIfPointerStillDown(pointerId, buttons) {
+      return buttons ? releasePointer(pointerId) : false;
+    },
+    isPressed() {
+      return active;
+    },
+  };
+}
+
 export function buildMouseMoveRequest(x, y, displayId, correlationId) {
   return daemonInjectRequest(
     "Mouse",

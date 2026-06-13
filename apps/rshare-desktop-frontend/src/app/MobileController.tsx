@@ -19,6 +19,7 @@ import {
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   buildTextCommitRequest,
+  createHeldInputController,
   createMobileCorrelationId,
   createPointerMoveCoalescer,
   isTouchpadTap,
@@ -42,6 +43,7 @@ type PointerState = {
 
 type SendState = "idle" | "sending" | "ok" | "error";
 type TouchPoint = { id: number; x: number; y: number };
+type HeldInputState = "Pressed" | "Released";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -125,6 +127,42 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
           ? primaryDisplay.id
           : null,
   };
+}
+
+function useHeldInputController(onState: (state: HeldInputState) => void) {
+  const onStateRef = useRef(onState);
+  onStateRef.current = onState;
+  const controllerRef = useRef<ReturnType<typeof createHeldInputController> | null>(null);
+
+  if (!controllerRef.current) {
+    controllerRef.current = createHeldInputController((state: HeldInputState) =>
+      onStateRef.current(state),
+    );
+  }
+
+  useEffect(() => {
+    const release = () => {
+      controllerRef.current?.releaseAll();
+    };
+    const releaseWhenHidden = () => {
+      if (document.visibilityState === "hidden") {
+        release();
+      }
+    };
+
+    window.addEventListener("blur", release);
+    window.addEventListener("pagehide", release);
+    document.addEventListener("visibilitychange", releaseWhenHidden);
+
+    return () => {
+      release();
+      window.removeEventListener("blur", release);
+      window.removeEventListener("pagehide", release);
+      document.removeEventListener("visibilitychange", releaseWhenHidden);
+    };
+  }, []);
+
+  return controllerRef.current;
 }
 
 async function fetchPointerState() {
@@ -543,9 +581,7 @@ function HoldKeyButton({
   keyboardKey: string;
   onKeyState: (key: string, state: "Pressed" | "Released") => void;
 }) {
-  function release() {
-    onKeyState(keyboardKey, "Released");
-  }
+  const held = useHeldInputController((state) => onKeyState(keyboardKey, state));
 
   return (
     <button
@@ -554,10 +590,11 @@ function HoldKeyButton({
       title={label}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId);
-        onKeyState(keyboardKey, "Pressed");
+        held.press(event.pointerId);
       }}
-      onPointerUp={release}
-      onPointerCancel={release}
+      onPointerUp={(event) => held.release(event.pointerId)}
+      onPointerCancel={(event) => held.release(event.pointerId)}
+      onPointerLeave={(event) => held.releaseIfPointerStillDown(event.pointerId, event.buttons)}
     >
       {children}
     </button>
@@ -573,21 +610,25 @@ function PressButton({
   onDown: () => void;
   onUp: () => void;
 }) {
+  const held = useHeldInputController((state) => {
+    if (state === "Pressed") {
+      onDown();
+    } else {
+      onUp();
+    }
+  });
+
   return (
     <button
       className="h-12 rounded-md text-sm font-medium"
       style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId);
-        onDown();
+        held.press(event.pointerId);
       }}
-      onPointerCancel={onUp}
-      onPointerLeave={(event) => {
-        if (event.buttons) {
-          onUp();
-        }
-      }}
-      onPointerUp={onUp}
+      onPointerCancel={(event) => held.release(event.pointerId)}
+      onPointerLeave={(event) => held.releaseIfPointerStillDown(event.pointerId, event.buttons)}
+      onPointerUp={(event) => held.release(event.pointerId)}
     >
       {label}
     </button>

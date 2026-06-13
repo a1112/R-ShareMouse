@@ -661,12 +661,38 @@ function cancelPointer(event) {
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
+function attachHeldButton(button, sendState) {
+  let activePointer = null;
+  function release(force, pointerId = null) {
+    if (activePointer === null) return;
+    if (!force && pointerId !== null && activePointer !== pointerId) return;
+    activePointer = null;
+    sendState("Released");
+  }
+  button.addEventListener("pointerdown", (event) => {
+    release(true);
+    activePointer = event.pointerId;
+    button.setPointerCapture(event.pointerId);
+    sendState("Pressed");
+  });
+  button.addEventListener("pointerup", (event) => release(false, event.pointerId));
+  button.addEventListener("pointercancel", (event) => release(false, event.pointerId));
+  button.addEventListener("pointerleave", (event) => {
+    if (event.buttons) release(false, event.pointerId);
+  });
+  window.addEventListener("blur", () => release(true));
+  window.addEventListener("pagehide", () => release(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") release(true);
+  });
+}
 document.querySelectorAll("[data-button]").forEach((button) => {
   const name = button.dataset.button;
   const sendButton = (state) => inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: name, state, x: pointer.x, y: pointer.y } }, cid(`mobile-${name}-${state}`)));
-  button.addEventListener("pointerdown", (event) => { button.setPointerCapture(event.pointerId); sendButton("Pressed"); });
-  button.addEventListener("pointerup", () => sendButton("Released"));
-  button.addEventListener("pointercancel", () => sendButton("Released"));
+  attachHeldButton(button, (state) => {
+    if (state === "Pressed") return sendButton("Pressed");
+    return sendButton("Released");
+  });
 });
 document.querySelectorAll("[data-wheel]").forEach((button) => button.addEventListener("click", () => {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: 0, delta_y: Number(button.dataset.wheel), x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
@@ -676,12 +702,10 @@ function sendKeyState(button, state) {
   return inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
 }
 document.querySelectorAll("[data-key]").forEach((button) => {
-  button.addEventListener("pointerdown", (event) => {
-    button.setPointerCapture(event.pointerId);
-    sendKeyState(button, "Pressed");
+  attachHeldButton(button, (state) => {
+    if (state === "Pressed") return sendKeyState(button, "Pressed");
+    return sendKeyState(button, "Released");
   });
-  button.addEventListener("pointerup", () => sendKeyState(button, "Released"));
-  button.addEventListener("pointercancel", () => sendKeyState(button, "Released"));
 });
 async function sendText() {
   const text = textInput.value;
@@ -844,6 +868,19 @@ mod tests {
         assert!(page.contains("button.addEventListener(\"pointercancel\""));
         assert!(page.contains("sendKeyState(button, \"Pressed\")"));
         assert!(page.contains("sendKeyState(button, \"Released\")"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_releases_held_buttons_when_pointer_or_page_cancels() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function attachHeldButton"));
+        assert!(page.contains("button.addEventListener(\"pointerleave\""));
+        assert!(page.contains("window.addEventListener(\"blur\""));
+        assert!(page.contains("window.addEventListener(\"pagehide\""));
+        assert!(page.contains("document.addEventListener(\"visibilitychange\""));
+        assert!(page.contains("document.visibilityState === \"hidden\""));
+        assert!(page.contains("release(true);"));
     }
 
     #[test]
