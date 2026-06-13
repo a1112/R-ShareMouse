@@ -671,11 +671,18 @@ document.querySelectorAll("[data-button]").forEach((button) => {
 document.querySelectorAll("[data-wheel]").forEach((button) => button.addEventListener("click", () => {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: 0, delta_y: Number(button.dataset.wheel), x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
 }));
-document.querySelectorAll("[data-key]").forEach((button) => button.addEventListener("click", async () => {
+function sendKeyState(button, state) {
   const key = button.dataset.key;
-  await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-${key}-down`), "RequireHealthyBackend", 750));
-  await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-${key}-up`), "RequireHealthyBackend", 750));
-}));
+  return inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
+}
+document.querySelectorAll("[data-key]").forEach((button) => {
+  button.addEventListener("pointerdown", (event) => {
+    button.setPointerCapture(event.pointerId);
+    sendKeyState(button, "Pressed");
+  });
+  button.addEventListener("pointerup", () => sendKeyState(button, "Released"));
+  button.addEventListener("pointercancel", () => sendKeyState(button, "Released"));
+});
 async function sendText() {
   const text = textInput.value;
   if (!text) return;
@@ -824,6 +831,19 @@ mod tests {
         assert!(page.contains("event.isComposing"));
         assert!(page.contains("event.keyCode !== 229"));
         assert!(page.contains("if (shouldSendTextOnKeydown(event))"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_holds_keyboard_buttons_until_pointer_release() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function sendKeyState"));
+        assert!(page.contains("data-key"));
+        assert!(page.contains("button.addEventListener(\"pointerdown\""));
+        assert!(page.contains("button.addEventListener(\"pointerup\""));
+        assert!(page.contains("button.addEventListener(\"pointercancel\""));
+        assert!(page.contains("sendKeyState(button, \"Pressed\")"));
+        assert!(page.contains("sendKeyState(button, \"Released\")"));
     }
 
     #[test]

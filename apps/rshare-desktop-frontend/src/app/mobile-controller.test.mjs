@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   MOBILE_TEXT_INPUT_HINTS,
+  buildKeyRequest,
   buildKeyTapRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
@@ -124,6 +125,22 @@ test("buildKeyTapRequests emits press and release requests with stable ordering"
   assert.equal(up.InjectEndpointEvent.request.payload.data.state, "Released");
   assert.equal(down.InjectEndpointEvent.request.correlation_id, "mobile-backspace-down");
   assert.equal(up.InjectEndpointEvent.request.correlation_id, "mobile-backspace-up");
+});
+
+test("buildKeyRequest emits a single keyboard hold transition", () => {
+  const down = buildKeyRequest("Left", "Pressed", "mobile-left-down");
+  const up = buildKeyRequest("Left", "Released", "mobile-left-up");
+
+  assert.equal(down.InjectEndpointEvent.request.device_kind, "Keyboard");
+  assert.equal(down.InjectEndpointEvent.request.payload.kind, "Keyboard");
+  assert.deepEqual(down.InjectEndpointEvent.request.payload.data, {
+    key: "Left",
+    state: "Pressed",
+  });
+  assert.deepEqual(up.InjectEndpointEvent.request.payload.data, {
+    key: "Left",
+    state: "Released",
+  });
 });
 
 test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {

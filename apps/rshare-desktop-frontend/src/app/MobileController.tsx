@@ -13,7 +13,7 @@ import {
 
 import {
   MOBILE_TEXT_INPUT_HINTS,
-  buildKeyTapRequests,
+  buildKeyRequest,
   buildMouseButtonRequest,
   buildMouseClickRequests,
   buildMouseMoveRequest,
@@ -356,11 +356,14 @@ export default function MobileController() {
     );
   }
 
-  async function keyTap(key: string) {
-    const requests = buildKeyTapRequests(key, createMobileCorrelationId(`mobile-key-${key}`));
-    for (const request of requests) {
-      await sendRequest(request);
-    }
+  function keyState(key: string, state: "Pressed" | "Released") {
+    void sendRequest(
+      buildKeyRequest(
+        key,
+        state,
+        createMobileCorrelationId(`mobile-key-${key}-${state.toLowerCase()}`),
+      ),
+    );
   }
 
   async function commitText() {
@@ -453,27 +456,27 @@ export default function MobileController() {
           <IconButton label="下滚" onClick={() => wheel(-3)}>
             <ArrowDown size={20} />
           </IconButton>
-          <IconButton label="退格" onClick={() => void keyTap("Backspace")}>
+          <HoldKeyButton label="退格" keyboardKey="Backspace" onKeyState={keyState}>
             <Delete size={20} />
-          </IconButton>
-          <IconButton label="回车" onClick={() => void keyTap("Enter")}>
+          </HoldKeyButton>
+          <HoldKeyButton label="回车" keyboardKey="Enter" onKeyState={keyState}>
             <CornerDownLeft size={20} />
-          </IconButton>
+          </HoldKeyButton>
         </section>
 
         <section className="grid grid-cols-4 gap-2">
-          <IconButton label="左" onClick={() => void keyTap("Left")}>
+          <HoldKeyButton label="左" keyboardKey="Left" onKeyState={keyState}>
             <ArrowLeft size={20} />
-          </IconButton>
-          <IconButton label="上" onClick={() => void keyTap("Up")}>
+          </HoldKeyButton>
+          <HoldKeyButton label="上" keyboardKey="Up" onKeyState={keyState}>
             <ArrowUp size={20} />
-          </IconButton>
-          <IconButton label="下" onClick={() => void keyTap("Down")}>
+          </HoldKeyButton>
+          <HoldKeyButton label="下" keyboardKey="Down" onKeyState={keyState}>
             <ArrowDown size={20} />
-          </IconButton>
-          <IconButton label="右" onClick={() => void keyTap("Right")}>
+          </HoldKeyButton>
+          <HoldKeyButton label="右" keyboardKey="Right" onKeyState={keyState}>
             <ArrowRight size={20} />
-          </IconButton>
+          </HoldKeyButton>
         </section>
 
         <section className="flex gap-2">
@@ -523,6 +526,38 @@ function IconButton({
       style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
       title={label}
       onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+function HoldKeyButton({
+  children,
+  label,
+  keyboardKey,
+  onKeyState,
+}: {
+  children: React.ReactNode;
+  label: string;
+  keyboardKey: string;
+  onKeyState: (key: string, state: "Pressed" | "Released") => void;
+}) {
+  function release() {
+    onKeyState(keyboardKey, "Released");
+  }
+
+  return (
+    <button
+      className="flex h-12 touch-none items-center justify-center rounded-md"
+      style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
+      title={label}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId);
+        onKeyState(keyboardKey, "Pressed");
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
     >
       {children}
     </button>
