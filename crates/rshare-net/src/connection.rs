@@ -279,7 +279,23 @@ impl ConnectionManager {
 
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         let mut infos_by_id = self.connections.clone();
-        for (device_id, diagnostics) in self.pool.diagnostics_all().await {
+        let active_diagnostics = self.pool.diagnostics_all().await;
+        let active_device_ids: std::collections::HashSet<_> = active_diagnostics
+            .iter()
+            .map(|(device_id, _)| *device_id)
+            .collect();
+
+        for (device_id, info) in &mut infos_by_id {
+            if info.state == ConnectionState::Connected && !active_device_ids.contains(device_id) {
+                info.state = ConnectionState::Disconnected;
+                info.datagram_available = false;
+                info.rtt_ms = None;
+                info.last_datagram_rx_ms = None;
+                info.cert_trust_state = None;
+            }
+        }
+
+        for (device_id, diagnostics) in active_diagnostics {
             let info = infos_by_id
                 .entry(device_id)
                 .or_insert_with(|| ConnectionInfo::new(device_id, diagnostics.address.clone()));
@@ -297,15 +313,6 @@ impl ConnectionManager {
     }
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
-        if self
-            .connections
-            .get(device_id)
-            .map(|info| info.state == ConnectionState::Connected)
-            .unwrap_or(false)
-        {
-            return true;
-        }
-
         self.pool.diagnostics_for(device_id).await.is_some()
     }
 
@@ -518,6 +525,42 @@ mod tests {
             .unwrap();
 
         assert!(matches!(event, ManagerEvent::Disconnected(id) if id == remote_id));
+    }
+
+    #[tokio::test]
+    async fn connected_entry_without_active_transport_is_reported_disconnected() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut manager = ConnectionManager::new(local_id);
+        manager.connections.insert(
+            remote_id,
+            ConnectionInfo {
+                device_id: remote_id,
+                address: "127.0.0.1:27431".to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: None,
+            },
+        );
+
+        let infos = manager.connection_infos().await;
+        let info = infos
+            .iter()
+            .find(|info| info.device_id == remote_id)
+            .expect("connection info should remain visible");
+
+        assert_eq!(info.state, ConnectionState::Disconnected);
+        assert!(!info.datagram_available);
+        assert_eq!(info.rtt_ms, None);
+        assert!(!manager.is_connected(&remote_id).await);
     }
 
     #[tokio::test]

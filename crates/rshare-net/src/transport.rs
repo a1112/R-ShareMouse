@@ -483,13 +483,17 @@ impl ConnectionPool {
         device_id: &DeviceId,
     ) -> Option<TransportConnectionDiagnostics> {
         let conns = self.connections.lock().await;
-        conns.get(device_id).map(QuicConnection::diagnostics)
+        conns
+            .get(device_id)
+            .filter(|conn| conn.is_connected())
+            .map(QuicConnection::diagnostics)
     }
 
     pub async fn diagnostics_all(&self) -> Vec<(DeviceId, TransportConnectionDiagnostics)> {
         let conns = self.connections.lock().await;
         conns
             .iter()
+            .filter(|(_, conn)| conn.is_connected())
             .map(|(device_id, conn)| (*device_id, conn.diagnostics()))
             .collect()
     }
