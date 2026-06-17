@@ -94,6 +94,43 @@ export function formatMobileControllerError(error, scope = "移动端") {
   return `${scope}请求失败：${message || "未知错误"}`;
 }
 
+function formatEndpointInjectError(error) {
+  switch (String(error ?? "")) {
+    case "BackendUnavailable":
+      return "输入后端不可用";
+    case "BackendDegraded":
+      return "输入后端异常";
+    case "PermissionDenied":
+      return "权限不足";
+    case "UnsupportedEvent":
+      return "当前输入事件不支持";
+    case "TargetDisconnected":
+      return "目标设备已断开";
+    case "Timeout":
+      return "注入超时";
+    case "RejectedByPolicy":
+      return "请求被策略拒绝";
+    case "TransportFailed":
+      return "传输失败";
+    case "Failed":
+      return "注入失败";
+    default:
+      return "未知错误";
+  }
+}
+
+export function formatMobileInjectResultStatus(result) {
+  const injectResult = result?.EndpointInjectResult ?? result ?? {};
+  if (injectResult.accepted !== false) {
+    return { accepted: true, status: "已连接" };
+  }
+  const backendKind = injectResult.backend_kind ? ` · ${injectResult.backend_kind}` : "";
+  return {
+    accepted: false,
+    status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}`,
+  };
+}
+
 export function normalizeMobilePointerSensitivity(value, config = MOBILE_POINTER_SENSITIVITY) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {

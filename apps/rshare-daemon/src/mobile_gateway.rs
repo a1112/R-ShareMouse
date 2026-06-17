@@ -799,6 +799,28 @@ function formatBackendStatus(snapshot) {
   }
   return { state: "blocked", label: "输入注入不可用", detail: `${kind}: ${backendHealthReason(backend.health)}` };
 }
+function formatEndpointInjectError(error) {
+  switch (String(error || "")) {
+    case "BackendUnavailable": return "输入后端不可用";
+    case "BackendDegraded": return "输入后端异常";
+    case "PermissionDenied": return "权限不足";
+    case "UnsupportedEvent": return "当前输入事件不支持";
+    case "TargetDisconnected": return "目标设备已断开";
+    case "Timeout": return "注入超时";
+    case "RejectedByPolicy": return "请求被策略拒绝";
+    case "TransportFailed": return "传输失败";
+    case "Failed": return "注入失败";
+    default: return "未知错误";
+  }
+}
+function formatInjectResultStatus(result) {
+  const injectResult = result?.EndpointInjectResult || result || {};
+  if (injectResult.accepted !== false) {
+    return { accepted: true, status: "已连接" };
+  }
+  const backendKind = injectResult.backend_kind ? ` · ${injectResult.backend_kind}` : "";
+  return { accepted: false, status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}` };
+}
 async function inject(request) {
   try {
     const result = await api("/api/inject", {
@@ -806,9 +828,9 @@ async function inject(request) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request)
     });
-    const accepted = result.EndpointInjectResult?.accepted !== false;
-    statusEl.textContent = accepted ? "已连接" : "注入失败";
-    return accepted;
+    const feedback = formatInjectResultStatus(result);
+    statusEl.textContent = feedback.status;
+    return feedback.accepted;
   } catch (error) {
     statusEl.textContent = formatMobileError(error, "移动端注入");
     return false;
@@ -1453,6 +1475,19 @@ mod tests {
         assert!(page.contains("输入注入就绪"));
         assert!(page.contains("输入注入不可用"));
         assert!(page.contains("等待输入后端"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_reports_rejected_endpoint_inject_results() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function formatInjectResultStatus(result)"));
+        assert!(page.contains("EndpointInjectResult"));
+        assert!(page.contains("injectResult.error"));
+        assert!(page.contains("PermissionDenied"));
+        assert!(page.contains("输入后端不可用"));
+        assert!(page.contains("statusEl.textContent = feedback.status"));
+        assert!(page.contains("return feedback.accepted"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ import {
   createPointerMoveCoalescer,
   formatMobileBackendStatus,
   formatMobileControllerError,
+  formatMobileInjectResultStatus,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   isTwoFingerTap,
@@ -194,6 +195,35 @@ test("formatMobileControllerError hides raw browser fetch failures", () => {
   assert.equal(
     formatMobileControllerError(new Error("HTTP 401"), "移动端状态"),
     "移动端状态请求失败：HTTP 401",
+  );
+});
+
+test("formatMobileInjectResultStatus reports rejected endpoint injections", () => {
+  assert.deepEqual(
+    formatMobileInjectResultStatus({
+      accepted: true,
+      backend_kind: "Portable",
+      error: null,
+    }),
+    { accepted: true, status: "已连接" },
+  );
+  assert.deepEqual(
+    formatMobileInjectResultStatus({
+      accepted: false,
+      backend_kind: "Portable",
+      error: "PermissionDenied",
+    }),
+    { accepted: false, status: "注入失败：权限不足 · Portable" },
+  );
+  assert.deepEqual(
+    formatMobileInjectResultStatus({
+      EndpointInjectResult: {
+        accepted: false,
+        backend_kind: "VirtualHid",
+        error: "BackendUnavailable",
+      },
+    }),
+    { accepted: false, status: "注入失败：输入后端不可用 · VirtualHid" },
   );
 });
 

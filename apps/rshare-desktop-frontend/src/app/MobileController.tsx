@@ -32,6 +32,7 @@ import {
   createPointerMoveCoalescer,
   formatMobileBackendStatus,
   formatMobileControllerError,
+  formatMobileInjectResultStatus,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   isTwoFingerTap,
@@ -395,11 +396,17 @@ export default function MobileController() {
       setSendState("sending");
     }
     try {
-      await sendInjectRequest(request);
+      const result = await sendInjectRequest(request);
+      const feedback = formatMobileInjectResultStatus(result);
+      if (!feedback.accepted) {
+        setSendState("error");
+        setStatus(feedback.status);
+        return false;
+      }
       if (!quiet) {
         setSendState("ok");
       }
-      setStatus("已连接");
+      setStatus(feedback.status);
       return true;
     } catch (error) {
       setSendState("error");
