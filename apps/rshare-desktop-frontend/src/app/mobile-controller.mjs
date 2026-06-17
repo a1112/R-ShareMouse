@@ -303,6 +303,42 @@ export function nextPointerPosition(current, delta, bounds) {
   };
 }
 
+export function resolveMobileDisplayIdAt(displays, x, y, fallbackId = null) {
+  const pointerX = Number(x);
+  const pointerY = Number(y);
+  if (!Number.isFinite(pointerX) || !Number.isFinite(pointerY) || !Array.isArray(displays)) {
+    return fallbackId ?? null;
+  }
+
+  for (const display of displays) {
+    if (!display || typeof display !== "object") {
+      continue;
+    }
+    const displayId = display.display_id ?? display.id;
+    const left = Number(display.x ?? 0);
+    const top = Number(display.y ?? 0);
+    const width = Number(display.width ?? display.w ?? 0);
+    const height = Number(display.height ?? display.h ?? 0);
+    if (
+      displayId != null &&
+      Number.isFinite(left) &&
+      Number.isFinite(top) &&
+      Number.isFinite(width) &&
+      Number.isFinite(height) &&
+      width > 0 &&
+      height > 0 &&
+      pointerX >= left &&
+      pointerX < left + width &&
+      pointerY >= top &&
+      pointerY < top + height
+    ) {
+      return String(displayId);
+    }
+  }
+
+  return fallbackId ?? null;
+}
+
 export function isTouchpadTap(start, end, options = {}) {
   if (options.cancelled) {
     return false;

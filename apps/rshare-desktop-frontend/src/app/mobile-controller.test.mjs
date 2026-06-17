@@ -27,6 +27,7 @@ import {
   nextPointerPosition,
   normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
+  resolveMobileDisplayIdAt,
   shouldCommitMobileTextOnKeyDown,
   shouldPreventMobileGestureDefault,
   tauriInvocationForMobileRequest,
@@ -359,6 +360,14 @@ test("mobile controller uses the full virtual desktop bounds for pointer movemen
   assert.match(source, /layout_height/);
 });
 
+test("mobile controller updates display id from pointer coordinates after cross-screen moves", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /resolveMobileDisplayIdAt/);
+  assert.match(source, /displayEntries/);
+  assert.match(source, /displayId: resolveMobileDisplayIdAt/);
+});
+
 test("preventMobileGestureDefault blocks control-surface browser gestures but preserves text editing", () => {
   const controlTarget = { closest: () => null, tagName: "DIV" };
   const inputTarget = { closest: () => ({}), tagName: "INPUT" };
@@ -464,6 +473,18 @@ test("nextPointerPosition preserves negative coordinates inside a virtual deskto
     ),
     { x: 1919, y: 1439 },
   );
+});
+
+test("resolveMobileDisplayIdAt finds the monitor containing a pointer coordinate", () => {
+  const displays = [
+    { display_id: "left", x: -2560, y: -240, width: 2560, height: 1440 },
+    { display_id: "primary", x: 0, y: 0, width: 1920, height: 1080 },
+  ];
+
+  assert.equal(resolveMobileDisplayIdAt(displays, -1200, 34, "primary"), "left");
+  assert.equal(resolveMobileDisplayIdAt(displays, 12, 34, "left"), "primary");
+  assert.equal(resolveMobileDisplayIdAt(displays, 5000, 5000, "primary"), "primary");
+  assert.equal(resolveMobileDisplayIdAt([{ id: "legacy", x: 0, y: 0, w: 800, h: 600 }], 42, 42), "legacy");
 });
 
 test("twoFingerWheelDelta maps two finger movement into wheel delta", () => {

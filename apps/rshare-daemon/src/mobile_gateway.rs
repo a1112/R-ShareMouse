@@ -606,6 +606,7 @@ const sensitivityInput = document.getElementById("sensitivity");
 const sensitivityValue = document.getElementById("sensitivityValue");
 const mobileEventOptions = { capture: true, passive: false };
 let pointer = { x: 0, y: 0, minX: 0, minY: 0, width: 1920, height: 1080, displayId: null };
+let displayEntries = [];
 let activePointer = null;
 let lastPoint = null;
 let tapStart = null;
@@ -663,6 +664,21 @@ function editableMobileTarget(target) {
   if (tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT") return true;
   if (target.isContentEditable === true) return true;
   return Boolean(target.closest && target.closest("input, textarea, select, [contenteditable='true']"));
+}
+function displayIdForPointer(displays, x, y, fallbackId = null) {
+  if (!Array.isArray(displays)) return fallbackId || null;
+  for (const display of displays) {
+    if (!display || typeof display !== "object") continue;
+    const displayId = display.display_id || display.id;
+    const left = Number(display.x || 0);
+    const top = Number(display.y || 0);
+    const width = Number(display.width || display.w || 0);
+    const height = Number(display.height || display.h || 0);
+    if (displayId && Number.isFinite(left) && Number.isFinite(top) && Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 && x >= left && x < left + width && y >= top && y < top + height) {
+      return String(displayId);
+    }
+  }
+  return fallbackId || null;
 }
 function shouldPreventBrowserNavigationEvent(event) {
   const type = String(event?.type || "");
@@ -730,7 +746,8 @@ async function refresh() {
     const snapshot = payload.LocalControls || {};
     const mouse = snapshot.mouse || {};
     const display = snapshot.display || {};
-    const primary = (display.displays || []).find((item) => item.primary) || (display.displays || [])[0] || {};
+    displayEntries = Array.isArray(display.displays) ? display.displays : [];
+    const primary = displayEntries.find((item) => item.primary) || displayEntries[0] || {};
     const minX = Number(display.virtual_x ?? primary.x ?? 0);
     const minY = Number(display.virtual_y ?? primary.y ?? 0);
     const layoutWidth = Number(display.layout_width ?? display.primary_width ?? primary.width ?? primary.w ?? 1920);
@@ -742,7 +759,7 @@ async function refresh() {
       minY: Number.isFinite(minY) ? Math.floor(minY) : 0,
       width: Math.max(1, Math.floor(Number.isFinite(layoutWidth) ? layoutWidth : 1920)),
       height: Math.max(1, Math.floor(Number.isFinite(layoutHeight) ? layoutHeight : 1080)),
-      displayId: mouse.current_display_id || primary.id || null
+      displayId: displayIdForPointer(displayEntries, Number(mouse.x || 0), Number(mouse.y || 0), mouse.current_display_id || primary.display_id || primary.id || null)
     };
     posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
     statusEl.textContent = "已连接";
@@ -916,6 +933,7 @@ pad.addEventListener("pointermove", (event) => {
   const maxX = pointer.minX + pointer.width - 1;
   const maxY = pointer.minY + pointer.height - 1;
   pointer = { ...pointer, x: Math.max(pointer.minX, Math.min(maxX, pointer.x + dx)), y: Math.max(pointer.minY, Math.min(maxY, pointer.y + dy)) };
+  pointer.displayId = displayIdForPointer(displayEntries, pointer.x, pointer.y, pointer.displayId);
   posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
   scheduleMove(pointer);
 });
@@ -1359,6 +1377,15 @@ mod tests {
         assert!(page.contains("display.layout_height"));
         assert!(page.contains("minX"));
         assert!(page.contains("minY"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_updates_display_id_from_pointer_coordinates() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function displayIdForPointer"));
+        assert!(page.contains("display.display_id || display.id"));
+        assert!(page.contains("pointer.displayId = displayIdForPointer"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ import {
   nextPointerPosition,
   normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
+  resolveMobileDisplayIdAt,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
@@ -53,6 +54,7 @@ type PointerState = {
   width: number;
   height: number;
   displayId: string | null;
+  displayEntries: Record<string, unknown>[];
 };
 
 type SendState = "idle" | "sending" | "ok" | "error";
@@ -125,7 +127,8 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
   const mouse = isRecord(record.mouse) ? record.mouse : {};
   const display = isRecord(record.display) ? record.display : {};
   const displays = Array.isArray(display.displays) ? display.displays : [];
-  const primary = displays.find((item) => isRecord(item) && item.primary) ?? displays[0];
+  const displayEntries = displays.filter(isRecord);
+  const primary = displayEntries.find((item) => item.primary) ?? displayEntries[0];
   const primaryDisplay = isRecord(primary) ? primary : {};
   const minX = Number(display.virtual_x ?? primaryDisplay.x ?? 0);
   const minY = Number(display.virtual_y ?? primaryDisplay.y ?? 0);
@@ -150,9 +153,12 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
     displayId:
       typeof mouse.current_display_id === "string"
         ? mouse.current_display_id
+        : typeof primaryDisplay.display_id === "string"
+          ? primaryDisplay.display_id
         : typeof primaryDisplay.id === "string"
           ? primaryDisplay.id
           : null,
+    displayEntries,
   };
 }
 
@@ -249,6 +255,7 @@ export default function MobileController() {
     width: 1920,
     height: 1080,
     displayId: null,
+    displayEntries: [],
   });
   const [pointerSensitivity, setPointerSensitivity] = useState(() => {
     if (typeof window === "undefined") {
@@ -490,18 +497,25 @@ export default function MobileController() {
     const last = lastPointRef.current;
     lastPointRef.current = { x: event.clientX, y: event.clientY };
     const current = pointerRef.current;
+    const nextPosition = nextPointerPosition(
+      current,
+      { dx: event.clientX - last.x, dy: event.clientY - last.y },
+      {
+        x: current.minX,
+        y: current.minY,
+        width: current.width,
+        height: current.height,
+        sensitivity: sensitivityRef.current,
+      },
+    );
     const next = {
       ...current,
-      ...nextPointerPosition(
-        current,
-        { dx: event.clientX - last.x, dy: event.clientY - last.y },
-        {
-          x: current.minX,
-          y: current.minY,
-          width: current.width,
-          height: current.height,
-          sensitivity: sensitivityRef.current,
-        },
+      ...nextPosition,
+      displayId: resolveMobileDisplayIdAt(
+        current.displayEntries,
+        nextPosition.x,
+        nextPosition.y,
+        current.displayId,
       ),
     };
     pointerRef.current = next;
