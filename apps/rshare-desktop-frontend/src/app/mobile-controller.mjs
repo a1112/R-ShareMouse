@@ -264,6 +264,13 @@ export function buildMouseClickRequests(button, x, y, correlationPrefix) {
   ];
 }
 
+export function buildMouseDoubleClickRequests(button, x, y, correlationPrefix) {
+  return [
+    ...buildMouseClickRequests(button, x, y, `${correlationPrefix}-1`),
+    ...buildMouseClickRequests(button, x, y, `${correlationPrefix}-2`),
+  ];
+}
+
 export function buildMouseWheelRequest(deltaX, deltaY, x, y, correlationId) {
   return daemonInjectRequest(
     "Mouse",

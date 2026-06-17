@@ -15,6 +15,7 @@ import {
   buildKeyTapRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
+  buildMouseDoubleClickRequests,
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   createHeldInputController,
@@ -116,6 +117,15 @@ test("mobile controller exposes holdable modifier keys for keyboard input", () =
   assert.match(source, /MOBILE_MODIFIER_KEY_BUTTONS/);
   assert.match(source, /MOBILE_MODIFIER_KEY_BUTTONS\.map/);
   assert.match(source, /keyboardKey=\{button\.key\}/);
+});
+
+test("mobile controller exposes an explicit left double click control", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /buildMouseDoubleClickRequests/);
+  assert.match(source, /function mouseDoubleClick/);
+  assert.match(source, /label="双击"/);
+  assert.match(source, /mobile-left-double-click/);
 });
 
 test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {
@@ -243,6 +253,28 @@ test("buildMouseClickRequests emits press and release at the current pointer", (
   assert.equal(up.InjectEndpointEvent.request.payload.data.y, 240);
   assert.equal(down.InjectEndpointEvent.request.correlation_id, "mobile-tap-down");
   assert.equal(up.InjectEndpointEvent.request.correlation_id, "mobile-tap-up");
+});
+
+test("buildMouseDoubleClickRequests emits two ordered click pairs at the current pointer", () => {
+  const requests = buildMouseDoubleClickRequests("Left", 320, 240, "mobile-double-click");
+
+  assert.deepEqual(
+    requests.map((request) => request.InjectEndpointEvent.request.payload.data.state),
+    ["Pressed", "Released", "Pressed", "Released"],
+  );
+  assert.deepEqual(
+    requests.map((request) => request.InjectEndpointEvent.request.payload.data.button),
+    ["Left", "Left", "Left", "Left"],
+  );
+  assert.deepEqual(
+    requests.map((request) => request.InjectEndpointEvent.request.correlation_id),
+    [
+      "mobile-double-click-1-down",
+      "mobile-double-click-1-up",
+      "mobile-double-click-2-down",
+      "mobile-double-click-2-up",
+    ],
+  );
 });
 
 test("buildKeyTapRequests emits press and release requests with stable ordering", () => {

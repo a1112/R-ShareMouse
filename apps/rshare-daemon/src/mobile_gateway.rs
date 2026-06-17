@@ -550,10 +550,11 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <input id="sensitivity" type="range" aria-label="触控板灵敏度" min="0.5" max="3" step="0.05" value="1.35">
     <span class="rangeValue" id="sensitivityValue">1.35</span>
   </section>
-  <section class="grid3">
+  <section class="grid4">
     <button data-button="Left">左键</button>
     <button data-button="Middle">中键</button>
     <button data-button="Right">右键</button>
+    <button data-double-click="Left">双击</button>
   </section>
   <section class="grid4">
     <button data-wheel="3">上滚</button>
@@ -805,6 +806,19 @@ async function sendTapClick() {
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")));
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")));
 }
+async function sendDoubleClick(buttonName) {
+  if (buttonName === "Left") {
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-down")));
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-up")));
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-down")));
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-up")));
+    return;
+  }
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-down`)));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-up`)));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)));
+}
 function clearDragTimer() {
   if (dragTimer) {
     clearTimeout(dragTimer);
@@ -1020,6 +1034,9 @@ document.querySelectorAll("[data-button]").forEach((button) => {
     return sendButton("Released");
   });
 });
+document.querySelectorAll("[data-double-click]").forEach((button) => button.addEventListener("click", () => {
+  sendDoubleClick(button.dataset.doubleClick || "Left");
+}));
 document.querySelectorAll("[data-wheel]").forEach((button) => button.addEventListener("click", () => {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: 0, delta_y: Number(button.dataset.wheel), x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
 }));
@@ -1181,6 +1198,16 @@ mod tests {
         assert!(page.contains("pad.addEventListener(\"pointercancel\", cancelPointer);"));
         assert!(page.contains("button: \"Left\", state: \"Pressed\""));
         assert!(page.contains("button: \"Left\", state: \"Released\""));
+    }
+
+    #[test]
+    fn rendered_mobile_page_exposes_explicit_left_double_click() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("data-double-click=\"Left\""));
+        assert!(page.contains("function sendDoubleClick"));
+        assert!(page.contains("mobile-double-Left-1-down"));
+        assert!(page.contains("mobile-double-Left-2-up"));
     }
 
     #[test]

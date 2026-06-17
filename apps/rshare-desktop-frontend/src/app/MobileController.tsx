@@ -22,6 +22,7 @@ import {
   buildKeyRequest,
   buildMouseButtonRequest,
   buildMouseClickRequests,
+  buildMouseDoubleClickRequests,
   buildMouseMoveRequest,
   buildMouseWheelRequest,
   buildTextCommitRequest,
@@ -618,6 +619,25 @@ export default function MobileController() {
     }
   }
 
+  async function mouseDoubleClick(
+    button: "Left" | "Right" | "Middle",
+    correlationPrefix = `mobile-${button.toLowerCase()}-double-click`,
+  ) {
+    const current = pointerRef.current;
+    const requests = buildMouseDoubleClickRequests(
+      button,
+      current.x,
+      current.y,
+      createMobileCorrelationId(correlationPrefix),
+    );
+    for (const request of requests) {
+      const ok = await sendRequest(request);
+      if (!ok) {
+        break;
+      }
+    }
+  }
+
   function mouseButton(button: "Left" | "Right" | "Middle", state: "Pressed" | "Released") {
     void sendRequest(
       buildMouseButtonRequest(
@@ -770,7 +790,7 @@ export default function MobileController() {
           </span>
         </section>
 
-        <section className="grid grid-cols-3 gap-2">
+        <section className="grid grid-cols-4 gap-2">
           <PressButton
             label="左键"
             onDown={() => mouseButton("Left", "Pressed")}
@@ -786,6 +806,9 @@ export default function MobileController() {
             onDown={() => mouseButton("Right", "Pressed")}
             onUp={() => mouseButton("Right", "Released")}
           />
+          <IconButton label="双击" onClick={() => void mouseDoubleClick("Left", "mobile-left-double-click")}>
+            <span className="text-sm font-medium">双击</span>
+          </IconButton>
         </section>
 
         <section className="grid grid-cols-4 gap-2">
