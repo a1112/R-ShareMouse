@@ -66,6 +66,11 @@ export function buildMobileAccessViewModel(snapshot) {
   const bindAddress = typeof snapshot?.bind_address === "string" ? snapshot.bind_address : "不可用";
   const portText = bindAddress.includes(":") ? bindAddress.split(":").pop() : "";
   const port = portText ? Number(portText) : null;
+  const lastClientAddr =
+    typeof snapshot?.last_client_addr === "string" && snapshot.last_client_addr.length
+      ? snapshot.last_client_addr
+      : null;
+  const clientCount = Math.max(0, Math.floor(Number(snapshot?.client_count ?? 0)));
 
   return {
     available: enabled && url !== "不可用",
@@ -73,6 +78,12 @@ export function buildMobileAccessViewModel(snapshot) {
     token: typeof snapshot?.token === "string" ? snapshot.token : "",
     bindAddress,
     port: Number.isFinite(port) && port > 0 ? port : null,
+    clientStatus: lastClientAddr ? "已连接手机" : "未连接",
+    clientDetail: lastClientAddr
+      ? `最近 ${lastClientAddr} · ${clientCount} 次请求`
+      : enabled
+        ? "等待手机扫码或打开链接"
+        : "网关不可用",
     qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(url) : null,
     qrCodeAlt: "移动端控制二维码",
     summary: enabled

@@ -99,18 +99,23 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
     bind_address: "0.0.0.0:27437",
     page_url: "http://192.168.1.50:27437/mobile?t=abc123",
     token: "abc123",
+    last_client_addr: "192.168.1.80:53120",
+    client_count: 2,
   });
 
   assert.equal(view.available, true);
   assert.equal(view.url, "http://192.168.1.50:27437/mobile?t=abc123");
   assert.equal(view.token, "abc123");
   assert.equal(view.port, 27437);
+  assert.equal(view.clientStatus, "已连接手机");
+  assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 2 次请求");
   assert.match(view.summary, /手机浏览器/);
 
   const offline = buildMobileAccessViewModel(null);
   assert.equal(offline.available, false);
   assert.equal(offline.url, "不可用");
   assert.equal(offline.port, null);
+  assert.equal(offline.clientStatus, "未连接");
 });
 
 test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile link", () => {

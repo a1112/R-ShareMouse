@@ -358,6 +358,10 @@ pub struct MobileAccessSnapshot {
     pub bind_address: String,
     pub page_url: String,
     pub token: String,
+    #[serde(default)]
+    pub last_client_addr: Option<String>,
+    #[serde(default)]
+    pub client_count: u64,
 }
 
 /// Lightweight device snapshot returned by daemon queries.

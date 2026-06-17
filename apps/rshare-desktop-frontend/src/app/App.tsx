@@ -483,6 +483,8 @@ type MobileAccessSnapshot = {
   bind_address: string;
   page_url: string;
   token: string;
+  last_client_addr?: string | null;
+  client_count?: number;
 };
 
 type RemoteLatencySummary = {
@@ -9686,6 +9688,11 @@ function SettingsPage({
           <InfoRow
             label="访问令牌"
             value={mobileAccessView.token ? `${mobileAccessView.token.slice(0, 8)}...` : "不可用"}
+            theme={theme}
+          />
+          <InfoRow
+            label="手机连接"
+            value={`${mobileAccessView.clientStatus} · ${mobileAccessView.clientDetail}`}
             theme={theme}
           />
         </div>

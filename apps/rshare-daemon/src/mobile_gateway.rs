@@ -8,7 +8,7 @@ use rshare_net::NetworkManager;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -24,6 +24,13 @@ pub(crate) struct MobileGatewayAccess {
     bind_addr: SocketAddr,
     token: String,
     advertise_host: String,
+    activity: Arc<StdMutex<MobileGatewayActivity>>,
+}
+
+#[derive(Debug, Default)]
+struct MobileGatewayActivity {
+    last_client_addr: Option<String>,
+    client_count: u64,
 }
 
 impl MobileGatewayAccess {
@@ -33,6 +40,7 @@ impl MobileGatewayAccess {
             bind_addr,
             token,
             advertise_host,
+            activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
         }
     }
 
@@ -42,6 +50,7 @@ impl MobileGatewayAccess {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             token: String::new(),
             advertise_host: String::new(),
+            activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
         }
     }
 
@@ -53,6 +62,20 @@ impl MobileGatewayAccess {
         &self.token
     }
 
+    pub(crate) fn record_client(&self, addr: SocketAddr) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.client_count = activity.client_count.saturating_add(1);
+            activity.last_client_addr = Some(addr.to_string());
+        }
+    }
+
+    fn activity_snapshot(&self) -> (Option<String>, u64) {
+        self.activity
+            .lock()
+            .map(|activity| (activity.last_client_addr.clone(), activity.client_count))
+            .unwrap_or((None, 0))
+    }
+
     pub(crate) fn snapshot(&self) -> MobileAccessSnapshot {
         if !self.enabled {
             return MobileAccessSnapshot {
@@ -60,9 +83,12 @@ impl MobileGatewayAccess {
                 bind_address: "不可用".to_string(),
                 page_url: "不可用".to_string(),
                 token: String::new(),
+                last_client_addr: None,
+                client_count: 0,
             };
         }
 
+        let (last_client_addr, client_count) = self.activity_snapshot();
         MobileAccessSnapshot {
             enabled: true,
             bind_address: self.bind_addr.to_string(),
@@ -73,6 +99,8 @@ impl MobileGatewayAccess {
                 self.token
             ),
             token: self.token.clone(),
+            last_client_addr,
+            client_count,
         }
     }
 }
@@ -187,7 +215,7 @@ pub(crate) async fn run_mobile_gateway_server(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let (stream, peer_addr) = result?;
                 let access = access.clone();
                 let state = state.clone();
                 let network_manager = network_manager.clone();
@@ -196,6 +224,7 @@ pub(crate) async fn run_mobile_gateway_server(
                 tokio::spawn(async move {
                     if let Err(error) = handle_mobile_gateway_client(
                         stream,
+                        peer_addr,
                         access,
                         state,
                         network_manager,
@@ -217,6 +246,7 @@ pub(crate) async fn run_mobile_gateway_server(
 
 async fn handle_mobile_gateway_client(
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
@@ -245,6 +275,7 @@ async fn handle_mobile_gateway_client(
         )
         .await;
     }
+    access.record_client(peer_addr);
 
     match route {
         MobileGatewayRoute::Page => {
@@ -1539,6 +1570,72 @@ mod tests {
         assert_eq!(snapshot.bind_address, "不可用");
         assert_eq!(snapshot.page_url, "不可用");
         assert_eq!(snapshot.token, "");
+        assert_eq!(snapshot.last_client_addr, None);
+        assert_eq!(snapshot.client_count, 0);
+    }
+
+    #[tokio::test]
+    async fn authorized_mobile_request_updates_last_client_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            client
+                .write_all(b"GET /mobile?t=mobile-secret HTTP/1.1\r\nHost: mobile\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (server_stream, peer_addr) = listener.accept().await.unwrap();
+        let access = MobileGatewayAccess::new(
+            SocketAddr::from(([127, 0, 0, 1], 27437)),
+            "mobile-secret".to_string(),
+            "127.0.0.1".to_string(),
+        );
+        let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+            "0.0.0.0:27431".to_string(),
+            27432,
+            42,
+        ))));
+        {
+            let mut state = state.write().await;
+            state.mobile_access = access.clone();
+        }
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+        )));
+        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let (local_events_tx, _) = broadcast::channel(1);
+
+        handle_mobile_gateway_client(
+            server_stream,
+            peer_addr,
+            access,
+            state.clone(),
+            network_manager,
+            inject_backend,
+            local_events_tx,
+        )
+        .await
+        .unwrap();
+        let response = client_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+
+        let snapshot = state.read().await.mobile_access.snapshot();
+        let expected_peer_addr = peer_addr.to_string();
+        assert_eq!(
+            snapshot.last_client_addr.as_deref(),
+            Some(expected_peer_addr.as_str())
+        );
+        assert_eq!(snapshot.client_count, 1);
     }
 
     #[tokio::test]
