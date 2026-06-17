@@ -361,6 +361,8 @@ pub struct MobileAccessSnapshot {
     #[serde(default)]
     pub last_client_addr: Option<String>,
     #[serde(default)]
+    pub last_client_seen_at_ms: Option<u64>,
+    #[serde(default)]
     pub client_count: u64,
 }
 

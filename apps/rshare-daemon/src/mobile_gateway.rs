@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -30,6 +31,7 @@ pub(crate) struct MobileGatewayAccess {
 #[derive(Debug, Default)]
 struct MobileGatewayActivity {
     last_client_addr: Option<String>,
+    last_client_seen_at_ms: Option<u64>,
     client_count: u64,
 }
 
@@ -66,14 +68,21 @@ impl MobileGatewayAccess {
         if let Ok(mut activity) = self.activity.lock() {
             activity.client_count = activity.client_count.saturating_add(1);
             activity.last_client_addr = Some(addr.to_string());
+            activity.last_client_seen_at_ms = Some(mobile_timestamp_ms_now());
         }
     }
 
-    fn activity_snapshot(&self) -> (Option<String>, u64) {
+    fn activity_snapshot(&self) -> (Option<String>, Option<u64>, u64) {
         self.activity
             .lock()
-            .map(|activity| (activity.last_client_addr.clone(), activity.client_count))
-            .unwrap_or((None, 0))
+            .map(|activity| {
+                (
+                    activity.last_client_addr.clone(),
+                    activity.last_client_seen_at_ms,
+                    activity.client_count,
+                )
+            })
+            .unwrap_or((None, None, 0))
     }
 
     pub(crate) fn snapshot(&self) -> MobileAccessSnapshot {
@@ -84,11 +93,12 @@ impl MobileGatewayAccess {
                 page_url: "不可用".to_string(),
                 token: String::new(),
                 last_client_addr: None,
+                last_client_seen_at_ms: None,
                 client_count: 0,
             };
         }
 
-        let (last_client_addr, client_count) = self.activity_snapshot();
+        let (last_client_addr, last_client_seen_at_ms, client_count) = self.activity_snapshot();
         MobileAccessSnapshot {
             enabled: true,
             bind_address: self.bind_addr.to_string(),
@@ -100,9 +110,17 @@ impl MobileGatewayAccess {
             ),
             token: self.token.clone(),
             last_client_addr,
+            last_client_seen_at_ms,
             client_count,
         }
     }
+}
+
+fn mobile_timestamp_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone)]
@@ -1689,6 +1707,7 @@ mod tests {
         assert_eq!(snapshot.page_url, "不可用");
         assert_eq!(snapshot.token, "");
         assert_eq!(snapshot.last_client_addr, None);
+        assert_eq!(snapshot.last_client_seen_at_ms, None);
         assert_eq!(snapshot.client_count, 0);
     }
 
@@ -1753,6 +1772,7 @@ mod tests {
             snapshot.last_client_addr.as_deref(),
             Some(expected_peer_addr.as_str())
         );
+        assert!(snapshot.last_client_seen_at_ms.unwrap_or_default() > 0);
         assert_eq!(snapshot.client_count, 1);
     }
 

@@ -7,6 +7,7 @@ const CANVAS_ORIGIN_X = 80;
 const CANVAS_ORIGIN_Y = 170;
 const LAYOUT_COMMIT_SNAP_DISTANCE = Math.ceil(12 / LAYOUT_SCALE);
 const LATENCY_HEALTHY_RTT_MS = 50;
+const MOBILE_CLIENT_STALE_MS = 15_000;
 const VIRTUAL_DISPLAY_CREATE_MODES = [
   { width: 1920, height: 1080, refreshRateMillihz: 60_000 },
   { width: 1920, height: 1080, refreshRateMillihz: 144_000 },
@@ -58,7 +59,26 @@ function buildLocalDevice(status) {
   };
 }
 
-export function buildMobileAccessViewModel(snapshot) {
+function formatMobileClientAge(seenAtMs, nowMs) {
+  if (!Number.isFinite(seenAtMs) || !Number.isFinite(nowMs) || nowMs < seenAtMs) {
+    return null;
+  }
+  const ageSeconds = Math.floor((nowMs - seenAtMs) / 1000);
+  if (ageSeconds < 1) {
+    return "刚刚";
+  }
+  if (ageSeconds < 60) {
+    return `${ageSeconds} 秒前`;
+  }
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) {
+    return `${ageMinutes} 分钟前`;
+  }
+  const ageHours = Math.floor(ageMinutes / 60);
+  return `${ageHours} 小时前`;
+}
+
+export function buildMobileAccessViewModel(snapshot, options = {}) {
   const enabled = Boolean(snapshot?.enabled);
   const url = typeof snapshot?.page_url === "string" && snapshot.page_url.length
     ? snapshot.page_url
@@ -71,6 +91,19 @@ export function buildMobileAccessViewModel(snapshot) {
       ? snapshot.last_client_addr
       : null;
   const clientCount = Math.max(0, Math.floor(Number(snapshot?.client_count ?? 0)));
+  const lastClientSeenAtMs = Number(snapshot?.last_client_seen_at_ms);
+  const hasSeenAt = Number.isFinite(lastClientSeenAtMs) && lastClientSeenAtMs > 0;
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const clientAgeLabel = hasSeenAt ? formatMobileClientAge(lastClientSeenAtMs, nowMs) : null;
+  const clientStale =
+    hasSeenAt && Number.isFinite(nowMs) && nowMs - lastClientSeenAtMs > MOBILE_CLIENT_STALE_MS;
+  const clientDetailParts = lastClientAddr
+    ? [
+        `最近 ${lastClientAddr}`,
+        clientAgeLabel,
+        `${clientCount} 次请求`,
+      ].filter(Boolean)
+    : [];
 
   return {
     available: enabled && url !== "不可用",
@@ -78,9 +111,9 @@ export function buildMobileAccessViewModel(snapshot) {
     token: typeof snapshot?.token === "string" ? snapshot.token : "",
     bindAddress,
     port: Number.isFinite(port) && port > 0 ? port : null,
-    clientStatus: lastClientAddr ? "已连接手机" : "未连接",
+    clientStatus: lastClientAddr ? (clientStale ? "最近离线" : "已连接手机") : "未连接",
     clientDetail: lastClientAddr
-      ? `最近 ${lastClientAddr} · ${clientCount} 次请求`
+      ? clientDetailParts.join(" · ")
       : enabled
         ? "等待手机扫码或打开链接"
         : "网关不可用",

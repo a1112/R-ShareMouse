@@ -484,6 +484,7 @@ type MobileAccessSnapshot = {
   page_url: string;
   token: string;
   last_client_addr?: string | null;
+  last_client_seen_at_ms?: number | null;
   client_count?: number;
 };
 

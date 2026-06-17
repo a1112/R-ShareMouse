@@ -828,6 +828,7 @@ async fn mobile_access_request_round_trips_over_json_lines() {
         page_url: "http://192.168.1.50:27437/mobile?t=abc123".to_string(),
         token: "abc123".to_string(),
         last_client_addr: Some("192.168.1.80:53120".to_string()),
+        last_client_seen_at_ms: Some(1_800_000),
         client_count: 2,
     };
     let response = DaemonResponse::MobileAccess(snapshot.clone());
@@ -842,6 +843,7 @@ async fn mobile_access_request_round_trips_over_json_lines() {
         snapshot.last_client_addr.as_deref(),
         Some("192.168.1.80:53120")
     );
+    assert_eq!(snapshot.last_client_seen_at_ms, Some(1_800_000));
     assert_eq!(snapshot.client_count, 2);
 }
 

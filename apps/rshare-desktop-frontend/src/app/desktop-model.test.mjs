@@ -100,15 +100,16 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
     page_url: "http://192.168.1.50:27437/mobile?t=abc123",
     token: "abc123",
     last_client_addr: "192.168.1.80:53120",
+    last_client_seen_at_ms: 1_000,
     client_count: 2,
-  });
+  }, { nowMs: 6_000 });
 
   assert.equal(view.available, true);
   assert.equal(view.url, "http://192.168.1.50:27437/mobile?t=abc123");
   assert.equal(view.token, "abc123");
   assert.equal(view.port, 27437);
   assert.equal(view.clientStatus, "已连接手机");
-  assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 2 次请求");
+  assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 5 秒前 · 2 次请求");
   assert.match(view.summary, /手机浏览器/);
 
   const offline = buildMobileAccessViewModel(null);
@@ -116,6 +117,21 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
   assert.equal(offline.url, "不可用");
   assert.equal(offline.port, null);
   assert.equal(offline.clientStatus, "未连接");
+
+  const stale = buildMobileAccessViewModel(
+    {
+      enabled: true,
+      bind_address: "0.0.0.0:27437",
+      page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+      token: "abc123",
+      last_client_addr: "192.168.1.80:53120",
+      last_client_seen_at_ms: 1_000,
+      client_count: 9,
+    },
+    { nowMs: 22_000 },
+  );
+  assert.equal(stale.clientStatus, "最近离线");
+  assert.equal(stale.clientDetail, "最近 192.168.1.80:53120 · 21 秒前 · 9 次请求");
 });
 
 test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile link", () => {
