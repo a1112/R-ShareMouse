@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   MOBILE_TEXT_INPUT_HINTS,
@@ -23,6 +26,12 @@ import {
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
+
+const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+function readAppFile(path) {
+  return readFileSync(resolve(APP_ROOT, path), "utf8");
+}
 
 test("buildTextCommitRequest creates daemon IPC inject request for unicode input", () => {
   assert.deepEqual(buildTextCommitRequest("你好🙂", "mobile-text-1"), {
@@ -51,6 +60,22 @@ test("mobile text input uses phone keyboard send hints", () => {
     autoCorrect: "off",
     spellCheck: false,
   });
+});
+
+test("desktop frontend exposes mobile PWA metadata", () => {
+  const index = readAppFile("index.html");
+  const manifest = JSON.parse(readAppFile("public/mobile.webmanifest"));
+
+  assert.match(index, /<link rel="manifest" href="\/mobile\.webmanifest"/);
+  assert.match(index, /<meta name="theme-color" content="#101214"/);
+  assert.match(index, /<meta name="mobile-web-app-capable" content="yes"/);
+  assert.match(index, /<meta name="apple-mobile-web-app-capable" content="yes"/);
+  assert.equal(manifest.name, "R-ShareMouse Mobile");
+  assert.equal(manifest.start_url, "/mobile");
+  assert.equal(manifest.display, "standalone");
+  assert.equal(manifest.orientation, "portrait");
+  assert.equal(manifest.theme_color, "#101214");
+  assert.ok(manifest.icons.some((icon) => icon.src === "/mobile-icon.svg"));
 });
 
 test("mobile keyboard controls expose common non-text keys and shortcuts", () => {

@@ -109,6 +109,8 @@ impl MobileHttpRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobileGatewayRoute {
     Page,
+    Manifest,
+    Icon,
     LocalControls,
     Inject,
     NotFound,
@@ -122,6 +124,8 @@ pub(crate) fn route_mobile_http_request(method: &str, target: &str) -> MobileGat
         .trim_end_matches('/');
     match (method.to_ascii_uppercase().as_str(), path) {
         ("GET", "" | "/mobile") => MobileGatewayRoute::Page,
+        ("GET", "/mobile.webmanifest") => MobileGatewayRoute::Manifest,
+        ("GET", "/mobile-icon.svg") => MobileGatewayRoute::Icon,
         ("GET", "/api/local-controls") => MobileGatewayRoute::LocalControls,
         ("POST", "/api/inject") => MobileGatewayRoute::Inject,
         _ => MobileGatewayRoute::NotFound,
@@ -249,6 +253,25 @@ async fn handle_mobile_gateway_client(
                 200,
                 "text/html; charset=utf-8",
                 render_mobile_page().into_bytes(),
+            )
+            .await
+        }
+        MobileGatewayRoute::Manifest => {
+            let manifest = render_mobile_manifest(&request.target)?;
+            write_mobile_response(
+                &mut stream,
+                200,
+                "application/manifest+json; charset=utf-8",
+                serde_json::to_vec(&manifest)?,
+            )
+            .await
+        }
+        MobileGatewayRoute::Icon => {
+            write_mobile_response(
+                &mut stream,
+                200,
+                "image/svg+xml; charset=utf-8",
+                render_mobile_icon_svg().into_bytes(),
             )
             .await
         }
@@ -425,12 +448,57 @@ fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+fn render_mobile_manifest(target: &str) -> Result<serde_json::Value> {
+    let token = mobile_token_from_target(target).unwrap_or_default();
+    let token_query = if token.is_empty() {
+        String::new()
+    } else {
+        format!("?t={token}")
+    };
+
+    Ok(json!({
+        "name": "R-ShareMouse Mobile",
+        "short_name": "R-ShareMouse",
+        "description": "Phone touchpad, keyboard shortcuts, and IME text input for R-ShareMouse.",
+        "start_url": format!("/mobile{token_query}"),
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "theme_color": "#101214",
+        "background_color": "#101214",
+        "icons": [
+            {
+                "src": format!("/mobile-icon.svg{token_query}"),
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any maskable"
+            }
+        ]
+    }))
+}
+
+fn render_mobile_icon_svg() -> String {
+    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">R-ShareMouse Mobile</title>
+  <rect width="512" height="512" rx="112" fill="#101214"/>
+  <path d="M152 104l224 152-118 28-42 124-64-304z" fill="#47c27a"/>
+  <path d="M196 177l33 157 22-65 62-15-117-77z" fill="#101214"/>
+</svg>"##
+        .to_string()
+}
+
 fn render_mobile_page() -> String {
     r#"<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name='theme-color' content='#101214'>
+  <meta name='mobile-web-app-capable' content='yes'>
+  <meta name='apple-mobile-web-app-capable' content='yes'>
+  <meta name='apple-mobile-web-app-title' content='R-ShareMouse'>
+  <link rel='icon' href='/mobile-icon.svg' type='image/svg+xml'>
+  <link rel='apple-touch-icon' href='/mobile-icon.svg'>
   <title>R-ShareMouse Mobile</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -505,6 +573,10 @@ const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
+const manifestLink = document.createElement("link");
+manifestLink.rel = "manifest";
+manifestLink.href = token ? `/mobile.webmanifest?t=${encodeURIComponent(token)}` : "/mobile.webmanifest";
+document.head.appendChild(manifestLink);
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
@@ -937,6 +1009,11 @@ mod tests {
     fn rendered_mobile_page_respects_ime_composition_before_text_commit() {
         let page = render_mobile_page();
 
+        assert!(page.contains("manifestLink.rel = \"manifest\""));
+        assert!(page.contains("/mobile.webmanifest?t=${encodeURIComponent(token)}"));
+        assert!(page.contains("mobile-web-app-capable"));
+        assert!(page.contains("apple-mobile-web-app-capable"));
+        assert!(page.contains("theme-color"));
         assert!(page.contains("enterkeyhint=\"send\""));
         assert!(page.contains("function shouldSendTextOnKeydown"));
         assert!(page.contains("event.isComposing"));
@@ -989,6 +1066,34 @@ mod tests {
         assert!(page.contains("for (const key of [...keys].reverse())"));
         assert!(page.contains("overflow: auto"));
         assert!(page.contains("min-height: 100dvh"));
+    }
+
+    #[test]
+    fn renders_mobile_manifest_with_token_scoped_start_url_and_icon() {
+        let manifest = render_mobile_manifest("/mobile.webmanifest?t=mobile-secret").unwrap();
+
+        assert_eq!(manifest["name"], "R-ShareMouse Mobile");
+        assert_eq!(manifest["short_name"], "R-ShareMouse");
+        assert_eq!(manifest["start_url"], "/mobile?t=mobile-secret");
+        assert_eq!(manifest["scope"], "/");
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["orientation"], "portrait");
+        assert_eq!(manifest["theme_color"], "#101214");
+        assert_eq!(manifest["background_color"], "#101214");
+        assert_eq!(
+            manifest["icons"][0]["src"],
+            "/mobile-icon.svg?t=mobile-secret"
+        );
+        assert_eq!(manifest["icons"][0]["type"], "image/svg+xml");
+    }
+
+    #[test]
+    fn renders_mobile_icon_svg_for_pwa_installation() {
+        let icon = render_mobile_icon_svg();
+
+        assert!(icon.contains("<svg"));
+        assert!(icon.contains("R-ShareMouse"));
+        assert!(icon.contains("#47c27a"));
     }
 
     #[test]

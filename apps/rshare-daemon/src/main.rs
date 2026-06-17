@@ -10038,6 +10038,14 @@ mod tests {
             mobile_gateway::MobileGatewayRoute::Page
         );
         assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile.webmanifest?t=token"),
+            mobile_gateway::MobileGatewayRoute::Manifest
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile-icon.svg?t=token"),
+            mobile_gateway::MobileGatewayRoute::Icon
+        );
+        assert_eq!(
             mobile_gateway::route_mobile_http_request("GET", "/api/local-controls?t=token"),
             mobile_gateway::MobileGatewayRoute::LocalControls
         );

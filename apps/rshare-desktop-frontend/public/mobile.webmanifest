@@ -1,0 +1,19 @@
+{
+  "name": "R-ShareMouse Mobile",
+  "short_name": "R-ShareMouse",
+  "description": "Phone touchpad, keyboard shortcuts, and IME text input for R-ShareMouse.",
+  "start_url": "/mobile",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#101214",
+  "background_color": "#101214",
+  "icons": [
+    {
+      "src": "/mobile-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
