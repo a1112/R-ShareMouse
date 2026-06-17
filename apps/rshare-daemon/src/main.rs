@@ -406,7 +406,7 @@ impl DaemonState {
             .retain(|_, probe| probe.target != id);
     }
 
-    fn mark_connected(&mut self, id: &DeviceId, connected: bool) {
+    fn mark_connected(&mut self, id: &DeviceId, connected: bool) -> bool {
         if let Some(device) = self.devices.get_mut(id) {
             device.connected = connected;
             device.last_seen_at = Instant::now();
@@ -424,6 +424,10 @@ impl DaemonState {
                 },
             );
         }
+        let mut layout_changed = false;
+        if connected {
+            layout_changed = self.layout.merge_discovered_peers_to_right([*id]);
+        }
         if !connected {
             self.clear_pending_latency_probes_for(*id);
         }
@@ -432,6 +436,7 @@ impl DaemonState {
                 device.connected = connected;
             }
         }
+        layout_changed
     }
 
     fn status_snapshot(&self) -> ServiceStatusSnapshot {
@@ -7004,11 +7009,24 @@ async fn main() -> Result<()> {
                         }
                     }
                     NetworkEvent::DeviceConnected(id) => {
-                        let should_advertise_usb = {
+                        let (should_advertise_usb, layout_to_save) = {
                             let mut state = state.write().await;
-                            state.mark_connected(&id, true);
-                            state.features.usb_advertising_enabled()
+                            let layout_changed = state.mark_connected(&id, true);
+                            (
+                                state.features.usb_advertising_enabled(),
+                                layout_changed.then(|| state.layout.clone()),
+                            )
                         };
+                        if let Some(layout_to_save) = layout_to_save {
+                            if let Err(err) =
+                                save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                            {
+                                tracing::warn!(
+                                    "Failed to persist connected-device layout: {}",
+                                    err
+                                );
+                            }
+                        }
                         if should_advertise_usb {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
@@ -7329,7 +7347,22 @@ async fn handle_ipc_client(
 
                     match result {
                         Ok(_) => {
-                            state.write().await.mark_connected(&device_id, true);
+                            let layout_to_save = {
+                                let mut state = state.write().await;
+                                state
+                                    .mark_connected(&device_id, true)
+                                    .then(|| state.layout.clone())
+                            };
+                            if let Some(layout_to_save) = layout_to_save {
+                                if let Err(err) =
+                                    save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist connected-device layout: {}",
+                                        err
+                                    );
+                                }
+                            }
                             DaemonResponse::Ack
                         }
                         Err(err) => DaemonResponse::Error(err.to_string()),
@@ -10383,9 +10416,13 @@ mod tests {
 
     #[test]
     fn mark_connected_tracks_unknown_inbound_device() {
+        use rshare_core::Direction;
+        use std::collections::HashSet;
+
         let remote_id = DeviceId::new_v4();
+        let local_id = DeviceId::new_v4();
         let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            DeviceId::new_v4(),
+            local_id,
             "local".to_string(),
             "local-host".to_string(),
             "127.0.0.1:27431".to_string(),
@@ -10399,6 +10436,15 @@ mod tests {
         assert_eq!(device.id, remote_id);
         assert!(device.connected);
         assert_eq!(device.hostname, "unknown");
+        assert!(state.layout.get_node(remote_id).is_some());
+
+        let connected_peers = HashSet::from([remote_id]);
+        assert_eq!(
+            state
+                .layout
+                .resolve_target(local_id, Direction::Right, &connected_peers),
+            Some(remote_id)
+        );
     }
 
     #[test]
