@@ -14,6 +14,7 @@ import {
 import {
   MOBILE_EXTRA_KEY_BUTTONS,
   MOBILE_LONG_PRESS_DRAG_DELAY_MS,
+  MOBILE_MODIFIER_KEY_BUTTONS,
   MOBILE_POINTER_SENSITIVITY,
   MOBILE_SHORTCUT_BUTTONS,
   MOBILE_TEXT_INPUT_HINTS,
@@ -779,6 +780,19 @@ export default function MobileController() {
           <HoldKeyButton label="右" keyboardKey="Right" onKeyState={keyState}>
             <ArrowRight size={20} />
           </HoldKeyButton>
+        </section>
+
+        <section className="grid grid-cols-4 gap-2">
+          {MOBILE_MODIFIER_KEY_BUTTONS.map((button) => (
+            <HoldKeyButton
+              key={button.key}
+              label={button.label}
+              keyboardKey={button.key}
+              onKeyState={keyState}
+            >
+              <span className="text-sm font-medium">{button.label}</span>
+            </HoldKeyButton>
+          ))}
         </section>
 
         <section className="grid grid-cols-4 gap-2">

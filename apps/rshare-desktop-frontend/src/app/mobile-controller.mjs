@@ -18,6 +18,13 @@ export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
   spellCheck: false,
 });
 
+export const MOBILE_MODIFIER_KEY_BUTTONS = Object.freeze([
+  Object.freeze({ label: "Ctrl", key: "ControlLeft" }),
+  Object.freeze({ label: "Shift", key: "ShiftLeft" }),
+  Object.freeze({ label: "Alt", key: "AltLeft" }),
+  Object.freeze({ label: "Win", key: "SuperLeft" }),
+]);
+
 export const MOBILE_EXTRA_KEY_BUTTONS = Object.freeze([
   Object.freeze({ label: "Esc", key: "Escape" }),
   Object.freeze({ label: "Tab", key: "Tab" }),

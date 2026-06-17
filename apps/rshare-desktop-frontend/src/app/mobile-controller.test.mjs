@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   MOBILE_TEXT_INPUT_HINTS,
   MOBILE_EXTRA_KEY_BUTTONS,
+  MOBILE_MODIFIER_KEY_BUTTONS,
   MOBILE_POINTER_SENSITIVITY,
   MOBILE_SHORTCUT_BUTTONS,
   buildKeyChordRequests,
@@ -85,6 +86,10 @@ test("desktop frontend exposes mobile PWA metadata", () => {
 
 test("mobile keyboard controls expose common non-text keys and shortcuts", () => {
   assert.deepEqual(
+    MOBILE_MODIFIER_KEY_BUTTONS.map((button) => button.key),
+    ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"],
+  );
+  assert.deepEqual(
     MOBILE_EXTRA_KEY_BUTTONS.map((button) => button.key),
     ["Escape", "Tab", "Space", "Delete"],
   );
@@ -97,6 +102,14 @@ test("mobile keyboard controls expose common non-text keys and shortcuts", () =>
       ["ControlLeft", "A"],
     ],
   );
+});
+
+test("mobile controller exposes holdable modifier keys for keyboard input", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /MOBILE_MODIFIER_KEY_BUTTONS/);
+  assert.match(source, /MOBILE_MODIFIER_KEY_BUTTONS\.map/);
+  assert.match(source, /keyboardKey=\{button\.key\}/);
 });
 
 test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {

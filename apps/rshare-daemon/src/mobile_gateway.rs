@@ -566,6 +566,12 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <button data-key="Right">右</button>
   </section>
   <section class="grid4">
+    <button data-key="ControlLeft">Ctrl</button>
+    <button data-key="ShiftLeft">Shift</button>
+    <button data-key="AltLeft">Alt</button>
+    <button data-key="SuperLeft">Win</button>
+  </section>
+  <section class="grid4">
     <button data-key="Escape">Esc</button>
     <button data-key="Tab">Tab</button>
     <button data-key="Space">Space</button>
@@ -1226,6 +1232,9 @@ mod tests {
     fn rendered_mobile_page_exposes_common_keyboard_keys_and_shortcuts() {
         let page = render_mobile_page();
 
+        for key in ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"] {
+            assert!(page.contains(&format!("data-key=\"{key}\"")));
+        }
         for key in ["Escape", "Tab", "Space", "Delete"] {
             assert!(page.contains(&format!("data-key=\"{key}\"")));
         }
