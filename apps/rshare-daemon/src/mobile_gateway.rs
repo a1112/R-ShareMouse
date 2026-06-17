@@ -252,7 +252,7 @@ async fn handle_mobile_gateway_client(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
-                render_mobile_page().into_bytes(),
+                render_mobile_page_with_token(access.token()).into_bytes(),
             )
             .await
         }
@@ -450,11 +450,7 @@ fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
 
 fn render_mobile_manifest(target: &str) -> Result<serde_json::Value> {
     let token = mobile_token_from_target(target).unwrap_or_default();
-    let token_query = if token.is_empty() {
-        String::new()
-    } else {
-        format!("?t={token}")
-    };
+    let token_query = mobile_token_query(&token);
 
     Ok(json!({
         "name": "R-ShareMouse Mobile",
@@ -488,6 +484,15 @@ fn render_mobile_icon_svg() -> String {
 }
 
 fn render_mobile_page() -> String {
+    render_mobile_page_with_token("")
+}
+
+fn render_mobile_page_with_token(token: &str) -> String {
+    let token_query = mobile_token_query(token);
+    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    let manifest_href = format!("/mobile.webmanifest{token_query}");
+    let icon_href = format!("/mobile-icon.svg{token_query}");
+
     r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -497,8 +502,9 @@ fn render_mobile_page() -> String {
   <meta name='mobile-web-app-capable' content='yes'>
   <meta name='apple-mobile-web-app-capable' content='yes'>
   <meta name='apple-mobile-web-app-title' content='R-ShareMouse'>
-  <link rel='icon' href='/mobile-icon.svg' type='image/svg+xml'>
-  <link rel='apple-touch-icon' href='/mobile-icon.svg'>
+  <link rel='manifest' href='__MOBILE_MANIFEST_HREF__'>
+  <link rel='icon' href='__MOBILE_ICON_HREF__' type='image/svg+xml'>
+  <link rel='apple-touch-icon' href='__MOBILE_ICON_HREF__'>
   <title>R-ShareMouse Mobile</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -568,15 +574,11 @@ fn render_mobile_page() -> String {
   </section>
 </main>
 <script>
-const token = new URLSearchParams(location.search).get("t") || "";
+const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
 const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
-const manifestLink = document.createElement("link");
-manifestLink.rel = "manifest";
-manifestLink.href = token ? `/mobile.webmanifest?t=${encodeURIComponent(token)}` : "/mobile.webmanifest";
-document.head.appendChild(manifestLink);
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
@@ -942,7 +944,17 @@ setInterval(refresh, 1500);
 </body>
 </html>
 "#
-    .to_string()
+    .replace("__MOBILE_MANIFEST_HREF__", &manifest_href)
+    .replace("__MOBILE_ICON_HREF__", &icon_href)
+    .replace("__MOBILE_TOKEN_JSON__", &token_json)
+}
+
+fn mobile_token_query(token: &str) -> String {
+    if token.is_empty() {
+        String::new()
+    } else {
+        format!("?t={token}")
+    }
 }
 
 #[cfg(test)]
@@ -1080,8 +1092,9 @@ mod tests {
     fn rendered_mobile_page_respects_ime_composition_before_text_commit() {
         let page = render_mobile_page();
 
-        assert!(page.contains("manifestLink.rel = \"manifest\""));
-        assert!(page.contains("/mobile.webmanifest?t=${encodeURIComponent(token)}"));
+        assert!(page.contains("<link rel='manifest' href='/mobile.webmanifest'>"));
+        assert!(page.contains("<link rel='icon' href='/mobile-icon.svg'"));
+        assert!(page.contains("<link rel='apple-touch-icon' href='/mobile-icon.svg'>"));
         assert!(page.contains("mobile-web-app-capable"));
         assert!(page.contains("apple-mobile-web-app-capable"));
         assert!(page.contains("theme-color"));
@@ -1090,6 +1103,19 @@ mod tests {
         assert!(page.contains("event.isComposing"));
         assert!(page.contains("event.keyCode !== 229"));
         assert!(page.contains("if (shouldSendTextOnKeydown(event))"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_scopes_install_assets_to_the_mobile_token() {
+        let page = render_mobile_page_with_token("mobile-secret");
+
+        assert!(page.contains("<link rel='manifest' href='/mobile.webmanifest?t=mobile-secret'>"));
+        assert!(page.contains("<link rel='icon' href='/mobile-icon.svg?t=mobile-secret'"));
+        assert!(
+            page.contains("<link rel='apple-touch-icon' href='/mobile-icon.svg?t=mobile-secret'>")
+        );
+        assert!(page.contains("const token = \"mobile-secret\" ||"));
+        assert!(!page.contains("href='/mobile-icon.svg'"));
     }
 
     #[test]
