@@ -103,10 +103,10 @@ impl MobileGatewayAccess {
             enabled: true,
             bind_address: self.bind_addr.to_string(),
             page_url: format!(
-                "http://{}:{}/mobile?t={}",
+                "http://{}:{}/mobile{}",
                 self.advertise_host,
                 self.bind_addr.port(),
-                self.token
+                mobile_token_query(&self.token)
             ),
             token: self.token.clone(),
             last_client_addr,
@@ -507,6 +507,24 @@ fn percent_decode_query_value(value: &str) -> String {
         index += 1;
     }
     String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    encoded
 }
 
 fn hex_digit_value(value: u8) -> Option<u8> {
@@ -1293,7 +1311,7 @@ fn mobile_token_query(token: &str) -> String {
     if token.is_empty() {
         String::new()
     } else {
-        format!("?t={token}")
+        format!("?t={}", percent_encode_query_value(token))
     }
 }
 
@@ -1490,14 +1508,19 @@ mod tests {
 
     #[test]
     fn rendered_mobile_page_scopes_install_assets_to_the_mobile_token() {
-        let page = render_mobile_page_with_token("mobile-secret");
+        let page = render_mobile_page_with_token("mobile+secret/token=");
 
-        assert!(page.contains("<link rel='manifest' href='/mobile.webmanifest?t=mobile-secret'>"));
-        assert!(page.contains("<link rel='icon' href='/mobile-icon.svg?t=mobile-secret'"));
+        assert!(page.contains(
+            "<link rel='manifest' href='/mobile.webmanifest?t=mobile%2Bsecret%2Ftoken%3D'>"
+        ));
         assert!(
-            page.contains("<link rel='apple-touch-icon' href='/mobile-icon.svg?t=mobile-secret'>")
+            page.contains("<link rel='icon' href='/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D'")
         );
-        assert!(page.contains("const token = \"mobile-secret\" ||"));
+        assert!(page.contains(
+            "<link rel='apple-touch-icon' href='/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D'>"
+        ));
+        assert!(page.contains("const token = \"mobile+secret/token=\" ||"));
+        assert!(!page.contains("?t=mobile+secret/token="));
         assert!(!page.contains("href='/mobile-icon.svg'"));
     }
 
@@ -1580,11 +1603,15 @@ mod tests {
 
     #[test]
     fn renders_mobile_manifest_with_token_scoped_start_url_and_icon() {
-        let manifest = render_mobile_manifest("/mobile.webmanifest?t=mobile-secret").unwrap();
+        let manifest =
+            render_mobile_manifest("/mobile.webmanifest?t=mobile%2Bsecret%2Ftoken%3D").unwrap();
 
         assert_eq!(manifest["name"], "R-ShareMouse Mobile");
         assert_eq!(manifest["short_name"], "R-ShareMouse");
-        assert_eq!(manifest["start_url"], "/mobile?t=mobile-secret");
+        assert_eq!(
+            manifest["start_url"],
+            "/mobile?t=mobile%2Bsecret%2Ftoken%3D"
+        );
         assert_eq!(manifest["scope"], "/");
         assert_eq!(manifest["display"], "standalone");
         assert_eq!(manifest["orientation"], "portrait");
@@ -1592,7 +1619,7 @@ mod tests {
         assert_eq!(manifest["background_color"], "#101214");
         assert_eq!(
             manifest["icons"][0]["src"],
-            "/mobile-icon.svg?t=mobile-secret"
+            "/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D"
         );
         assert_eq!(manifest["icons"][0]["type"], "image/svg+xml");
     }
@@ -1739,6 +1766,23 @@ mod tests {
         assert_eq!(snapshot.last_client_addr, None);
         assert_eq!(snapshot.last_client_seen_at_ms, None);
         assert_eq!(snapshot.client_count, 0);
+    }
+
+    #[test]
+    fn mobile_access_snapshot_percent_encodes_token_link() {
+        let access = MobileGatewayAccess::new(
+            SocketAddr::from(([127, 0, 0, 1], 27437)),
+            "mobile+secret/token=".to_string(),
+            "192.168.1.50".to_string(),
+        );
+
+        let snapshot = access.snapshot();
+
+        assert_eq!(
+            snapshot.page_url,
+            "http://192.168.1.50:27437/mobile?t=mobile%2Bsecret%2Ftoken%3D"
+        );
+        assert_eq!(snapshot.token, "mobile+secret/token=");
     }
 
     #[tokio::test]
