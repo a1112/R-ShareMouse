@@ -110,7 +110,7 @@ export function shouldCommitMobileTextOnKeyDown(event) {
   const keyCode = Number(event?.keyCode ?? event?.which ?? event?.nativeEvent?.keyCode ?? 0);
   const isComposing =
     event?.isComposing === true || event?.nativeEvent?.isComposing === true || keyCode === 229;
-  return event?.key === "Enter" && !isComposing;
+  return event?.key === "Enter" && event?.shiftKey !== true && !isComposing;
 }
 
 function daemonInjectRequest(deviceKind, payload, correlationId, options = {}) {

@@ -60,12 +60,17 @@ test("buildTextCommitRequest creates daemon IPC inject request for unicode input
 });
 
 test("mobile text input uses phone keyboard send hints", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
   assert.deepEqual(MOBILE_TEXT_INPUT_HINTS, {
     enterKeyHint: "send",
     autoCapitalize: "none",
     autoCorrect: "off",
     spellCheck: false,
   });
+  assert.match(source, /<textarea/);
+  assert.match(source, /rows=\{3\}/);
+  assert.doesNotMatch(source, /<input\s+[^>]*placeholder="文本"/);
 });
 
 test("desktop frontend exposes mobile PWA metadata", () => {
@@ -181,6 +186,13 @@ test("shouldCommitMobileTextOnKeyDown ignores IME composition enter", () => {
     shouldCommitMobileTextOnKeyDown({
       key: "Enter",
       nativeEvent: { isComposing: true },
+    }),
+    false,
+  );
+  assert.equal(
+    shouldCommitMobileTextOnKeyDown({
+      key: "Enter",
+      shiftKey: true,
     }),
     false,
   );

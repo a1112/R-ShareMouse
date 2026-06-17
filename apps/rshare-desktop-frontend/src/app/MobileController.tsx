@@ -823,12 +823,16 @@ export default function MobileController() {
         </section>
 
         <section className="flex gap-2">
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-3" style={{ background: "#171b1d", border: "1px solid #29302d" }}>
-            <Keyboard size={18} color="#8f9b96" />
-            <input
+          <div
+            className="flex min-w-0 flex-1 items-start gap-2 rounded-md px-3 py-2"
+            style={{ background: "#171b1d", border: "1px solid #29302d" }}
+          >
+            <Keyboard className="mt-2 shrink-0" size={18} color="#8f9b96" />
+            <textarea
               {...MOBILE_TEXT_INPUT_HINTS}
-              className="min-w-0 flex-1 bg-transparent py-3 text-base outline-none"
+              className="min-h-16 min-w-0 flex-1 resize-none bg-transparent py-1 text-base leading-snug outline-none"
               value={text}
+              rows={3}
               placeholder="文本"
               style={{ color: "#edf2ef" }}
               onChange={(event) => setText(event.target.value)}
@@ -841,7 +845,7 @@ export default function MobileController() {
             />
           </div>
           <button
-            className="flex h-12 w-14 items-center justify-center rounded-md"
+            className="flex w-14 items-center justify-center rounded-md"
             style={{ background: "#47c27a", color: "#07110b" }}
             title="发送"
             onClick={() => void commitText()}

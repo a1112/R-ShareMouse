@@ -520,7 +520,8 @@ fn render_mobile_page_with_token(token: &str) -> String {
     .dot { width: 12px; height: 12px; border-radius: 50%; background: #47c27a; box-shadow: 0 0 24px rgba(71,194,122,.5); }
     .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-    button, input { height: 48px; border-radius: 6px; font: inherit; font-size: 14px; }
+    button, input, textarea { border-radius: 6px; font: inherit; font-size: 14px; }
+    button, input { height: 48px; }
     button { border: 1px solid #29302d; background: #171b1d; color: #d8dedb; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     button:active { background: rgba(71,194,122,.18); border-color: #47c27a; }
     .textRow { display: flex; gap: 8px; }
@@ -528,8 +529,9 @@ fn render_mobile_page_with_token(token: &str) -> String {
     .rangeRow label { flex: 0 0 auto; font-size: 12px; font-weight: 600; }
     .rangeRow input { flex: 1; min-width: 0; height: 28px; accent-color: #47c27a; }
     .rangeValue { width: 42px; text-align: right; font-size: 12px; color: #8f9b96; }
-    .inputWrap { min-width: 0; flex: 1; height: 48px; display: flex; align-items: center; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 0 12px; }
-    input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #edf2ef; font-size: 16px; }
+    .inputWrap { min-width: 0; flex: 1; min-height: 76px; display: flex; align-items: flex-start; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 9px 12px; }
+    input, textarea { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #edf2ef; font-size: 16px; }
+    textarea { min-height: 56px; resize: none; line-height: 1.35; }
     .send { width: 58px; background: #47c27a; color: #07110b; border-color: #47c27a; }
   </style>
 </head>
@@ -590,7 +592,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <button data-shortcut="ControlLeft,A">全选</button>
   </section>
   <section class="textRow">
-    <div class="inputWrap"><input id="text" placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send"></div>
+    <div class="inputWrap"><textarea id="text" placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send" rows="3"></textarea></div>
     <button class="send" id="send">发送</button>
   </section>
 </main>
@@ -1025,7 +1027,7 @@ async function sendText() {
   }
 }
 function shouldSendTextOnKeydown(event) {
-  return event.key === "Enter" && !event.isComposing && event.keyCode !== 229;
+  return event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229;
 }
 document.getElementById("send").addEventListener("click", sendText);
 textInput.addEventListener("keydown", (event) => { if (shouldSendTextOnKeydown(event)) { event.preventDefault(); sendText(); } });
@@ -1194,6 +1196,16 @@ mod tests {
         assert!(page.contains("event.isComposing"));
         assert!(page.contains("event.keyCode !== 229"));
         assert!(page.contains("if (shouldSendTextOnKeydown(event))"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_uses_multiline_textarea_for_ime_input() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("<textarea id=\"text\""));
+        assert!(page.contains("rows=\"3\""));
+        assert!(page.contains("!event.shiftKey"));
+        assert!(!page.contains("<input id=\"text\""));
     }
 
     #[test]
