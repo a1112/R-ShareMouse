@@ -333,7 +333,23 @@ async fn handle_mobile_gateway_client(
             write_mobile_json(&mut stream, &DaemonResponse::LocalControls(snapshot)).await
         }
         MobileGatewayRoute::Inject => {
-            let request = mobile_inject_request_from_body(&request.body)?;
+            let request = match mobile_inject_request_from_body(&request.body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return write_mobile_response(
+                        &mut stream,
+                        400,
+                        "application/json; charset=utf-8",
+                        json!({
+                            "error": "invalid mobile inject request",
+                            "detail": error.to_string(),
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    )
+                    .await;
+                }
+            };
             let result = inject_endpoint_event(
                 &network_manager,
                 &inject_backend,
@@ -448,6 +464,7 @@ async fn write_mobile_response(
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         _ => "Error",
@@ -1848,6 +1865,71 @@ mod tests {
         );
         assert!(snapshot.last_client_seen_at_ms.unwrap_or_default() > 0);
         assert_eq!(snapshot.client_count, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_mobile_inject_request_returns_json_bad_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let body = b"{not-json";
+        let client_task = tokio::spawn(async move {
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let request = format!(
+                "POST /api/inject?t=mobile-secret HTTP/1.1\r\n\
+                 Host: mobile\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len()
+            );
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (server_stream, peer_addr) = listener.accept().await.unwrap();
+        let access = MobileGatewayAccess::new(
+            SocketAddr::from(([127, 0, 0, 1], 27437)),
+            "mobile-secret".to_string(),
+            "127.0.0.1".to_string(),
+        );
+        let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+            "0.0.0.0:27431".to_string(),
+            27432,
+            42,
+        ))));
+        {
+            let mut state = state.write().await;
+            state.mobile_access = access.clone();
+        }
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+        )));
+        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let (local_events_tx, _) = broadcast::channel(1);
+
+        handle_mobile_gateway_client(
+            server_stream,
+            peer_addr,
+            access,
+            state,
+            network_manager,
+            inject_backend,
+            local_events_tx,
+        )
+        .await
+        .unwrap();
+        let response = String::from_utf8_lossy(&client_task.await.unwrap()).to_string();
+
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("application/json"));
+        assert!(response.contains("\"error\":\"invalid mobile inject request\""));
     }
 
     #[tokio::test]
