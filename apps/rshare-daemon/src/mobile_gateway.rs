@@ -510,18 +510,18 @@ fn render_mobile_page_with_token(token: &str) -> String {
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
     html, body { width: 100%; min-height: 100%; margin: 0; overflow: auto; background: #101214; color: #edf2ef; }
-    body { overscroll-behavior: none; }
+    body { overscroll-behavior: none; touch-action: manipulation; -webkit-touch-callout: none; }
     main { min-height: 100dvh; display: flex; flex-direction: column; gap: 12px; padding: 12px; max-width: 720px; margin: 0 auto; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     h1 { margin: 0; font-size: 14px; line-height: 1.2; }
     .sub { margin-top: 3px; font-size: 12px; color: #8f9b96; }
     .status { border: 1px solid #2a302d; border-radius: 6px; padding: 5px 8px; color: #47c27a; font-size: 12px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #pad { flex: 1; min-height: min(260px, 42dvh); border: 1px solid #29302d; border-radius: 6px; background: linear-gradient(135deg, rgba(71,194,122,.08), rgba(255,255,255,.02)); touch-action: none; display: grid; place-items: center; user-select: none; }
+    #pad { flex: 1; min-height: min(260px, 42dvh); border: 1px solid #29302d; border-radius: 6px; background: linear-gradient(135deg, rgba(71,194,122,.08), rgba(255,255,255,.02)); touch-action: none; display: grid; place-items: center; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     .dot { width: 12px; height: 12px; border-radius: 50%; background: #47c27a; box-shadow: 0 0 24px rgba(71,194,122,.5); }
     .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
     button, input { height: 48px; border-radius: 6px; font: inherit; font-size: 14px; }
-    button { border: 1px solid #29302d; background: #171b1d; color: #d8dedb; }
+    button { border: 1px solid #29302d; background: #171b1d; color: #d8dedb; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     button:active { background: rgba(71,194,122,.18); border-color: #47c27a; }
     .textRow { display: flex; gap: 8px; }
     .inputWrap { min-width: 0; flex: 1; height: 48px; display: flex; align-items: center; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 0 12px; }
@@ -579,6 +579,7 @@ const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
+const mobileEventOptions = { capture: true, passive: false };
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
@@ -601,6 +602,43 @@ function formatMobileError(error, scope = "移动端") {
   }
   return `${scope}请求失败：${message || "未知错误"}`;
 }
+function editableMobileTarget(target) {
+  if (!target || typeof target !== "object") return false;
+  const tagName = String(target.tagName || "").toUpperCase();
+  if (tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT") return true;
+  if (target.isContentEditable === true) return true;
+  return Boolean(target.closest && target.closest("input, textarea, select, [contenteditable='true']"));
+}
+function shouldPreventBrowserNavigationEvent(event) {
+  const type = String(event?.type || "");
+  const button = Number(event?.button);
+  if (/^(mouse|pointer|auxclick)/i.test(type) && Number.isFinite(button) && (button === 3 || button === 4)) return true;
+  if (type === "keydown") {
+    const key = String(event?.key || "");
+    if (key === "BrowserBack" || key === "BrowserForward") return true;
+    if (event?.altKey && (key === "ArrowLeft" || key === "ArrowRight")) return true;
+  }
+  return false;
+}
+function preventBrowserNavigationEvent(event) {
+  if (!shouldPreventBrowserNavigationEvent(event)) return false;
+  event.preventDefault();
+  event.returnValue = false;
+  return true;
+}
+function preventMobileGestureDefault(event) {
+  if (editableMobileTarget(event.target)) return false;
+  if (!["contextmenu", "dragstart", "selectstart", "gesturestart", "gesturechange", "gestureend"].includes(String(event.type || "").toLowerCase())) return false;
+  event.preventDefault();
+  event.returnValue = false;
+  return true;
+}
+["mousedown", "mouseup", "auxclick", "pointerdown", "pointerup", "keydown"].forEach((eventName) => {
+  window.addEventListener(eventName, preventBrowserNavigationEvent, mobileEventOptions);
+});
+["contextmenu", "dragstart", "selectstart", "gesturestart", "gesturechange", "gestureend"].forEach((eventName) => {
+  document.addEventListener(eventName, preventMobileGestureDefault, mobileEventOptions);
+});
 async function api(path, options = {}) {
   const headers = { Authorization: `Bearer ${token}`, ...(options.headers || {}) };
   const response = await fetch(path, { ...options, headers });
@@ -1230,6 +1268,24 @@ mod tests {
             "document.addEventListener(\"visibilitychange\", releaseTouchpadInteractionWhenHidden);"
         ));
         assert!(page.contains("document.visibilityState === \"hidden\""));
+    }
+
+    #[test]
+    fn rendered_mobile_page_prevents_browser_navigation_and_default_gestures() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function shouldPreventBrowserNavigationEvent(event)"));
+        assert!(page.contains("function preventBrowserNavigationEvent(event)"));
+        assert!(page.contains("function preventMobileGestureDefault(event)"));
+        assert!(
+            page.contains("target.closest(\"input, textarea, select, [contenteditable='true']\")")
+        );
+        assert!(page.contains("[\"mousedown\", \"mouseup\", \"auxclick\", \"pointerdown\", \"pointerup\", \"keydown\"]"));
+        assert!(page.contains("[\"contextmenu\", \"dragstart\", \"selectstart\", \"gesturestart\", \"gesturechange\", \"gestureend\"]"));
+        assert!(page.contains("window.addEventListener(eventName, preventBrowserNavigationEvent, mobileEventOptions);"));
+        assert!(page.contains("document.addEventListener(eventName, preventMobileGestureDefault, mobileEventOptions);"));
+        assert!(page.contains("touch-action: manipulation"));
+        assert!(page.contains("-webkit-touch-callout: none"));
     }
 
     #[test]

@@ -32,6 +32,51 @@ export function formatMobileControllerError(error, scope = "移动端") {
   return `${scope}请求失败：${message || "未知错误"}`;
 }
 
+function isEditableMobileTarget(target) {
+  if (!target || typeof target !== "object") {
+    return false;
+  }
+  const tagName = String(target.tagName ?? "").toUpperCase();
+  if (tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT") {
+    return true;
+  }
+  if (target.isContentEditable === true) {
+    return true;
+  }
+  if (typeof target.closest === "function") {
+    return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  }
+  return false;
+}
+
+export function shouldPreventMobileGestureDefault(event) {
+  const type = String(event?.type ?? "").toLowerCase();
+  if (
+    ![
+      "contextmenu",
+      "dragstart",
+      "selectstart",
+      "gesturestart",
+      "gesturechange",
+      "gestureend",
+    ].includes(type)
+  ) {
+    return false;
+  }
+  return !isEditableMobileTarget(event?.target);
+}
+
+export function preventMobileGestureDefault(event) {
+  if (!shouldPreventMobileGestureDefault(event)) {
+    return false;
+  }
+  event?.preventDefault?.();
+  if ("returnValue" in event) {
+    event.returnValue = false;
+  }
+  return true;
+}
+
 export function shouldCommitMobileTextOnKeyDown(event) {
   const keyCode = Number(event?.keyCode ?? event?.which ?? event?.nativeEvent?.keyCode ?? 0);
   const isComposing =

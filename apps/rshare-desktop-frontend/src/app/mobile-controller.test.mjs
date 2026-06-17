@@ -23,7 +23,9 @@ import {
   isTouchpadTap,
   isTwoFingerTap,
   nextPointerPosition,
+  preventMobileGestureDefault,
   shouldCommitMobileTextOnKeyDown,
+  shouldPreventMobileGestureDefault,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
@@ -280,6 +282,54 @@ test("mobile controller releases touchpad drag when the page lifecycle cancels i
   assert.match(source, /window\.addEventListener\("pagehide", releaseTouchpadInteraction\)/);
   assert.match(source, /document\.addEventListener\("visibilitychange", releaseTouchpadInteractionWhenHidden\)/);
   assert.match(source, /document\.visibilityState === "hidden"/);
+});
+
+test("mobile controller installs browser navigation and gesture guards", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /preventBrowserNavigationEvent/);
+  assert.match(source, /preventMobileGestureDefault/);
+  assert.match(source, /window\.addEventListener\(eventName, handleBrowserNavigation, options\)/);
+  assert.match(source, /document\.addEventListener\(eventName, preventMobileGestureDefault, options\)/);
+  assert.match(source, /overscrollBehavior: "none"/);
+  assert.match(source, /WebkitTouchCallout: "none"/);
+});
+
+test("preventMobileGestureDefault blocks control-surface browser gestures but preserves text editing", () => {
+  const controlTarget = { closest: () => null, tagName: "DIV" };
+  const inputTarget = { closest: () => ({}), tagName: "INPUT" };
+
+  assert.equal(
+    shouldPreventMobileGestureDefault({ type: "contextmenu", target: controlTarget }),
+    true,
+  );
+  assert.equal(
+    shouldPreventMobileGestureDefault({ type: "gesturestart", target: controlTarget }),
+    true,
+  );
+  assert.equal(
+    shouldPreventMobileGestureDefault({ type: "selectstart", target: inputTarget }),
+    false,
+  );
+  assert.equal(
+    shouldPreventMobileGestureDefault({ type: "pointerdown", target: controlTarget }),
+    false,
+  );
+
+  const event = {
+    type: "contextmenu",
+    target: controlTarget,
+    returnValue: true,
+    preventDefaultCalled: false,
+    preventDefault() {
+      this.preventDefaultCalled = true;
+    },
+  };
+
+  assert.equal(preventMobileGestureDefault(event), true);
+  assert.equal(event.preventDefaultCalled, true);
+  assert.equal(event.returnValue, false);
+  assert.equal(preventMobileGestureDefault({ type: "contextmenu", target: inputTarget }), false);
 });
 
 test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {

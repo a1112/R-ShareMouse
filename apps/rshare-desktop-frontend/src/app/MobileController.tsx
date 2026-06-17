@@ -31,10 +31,12 @@ import {
   isTouchpadTap,
   isTwoFingerTap,
   nextPointerPosition,
+  preventMobileGestureDefault,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
+import { preventBrowserNavigationEvent } from "./desktop-shell.mjs";
 
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 
@@ -178,7 +180,50 @@ async function fetchPointerState() {
   return pointerFromLocalControls(responseVariant(response, "LocalControls"));
 }
 
+function useMobileBrowserGuards() {
+  useEffect(() => {
+    const options: AddEventListenerOptions = { capture: true, passive: false };
+    const handleBrowserNavigation = (event: Event) => {
+      preventBrowserNavigationEvent(event);
+    };
+    const browserEventNames = [
+      "mousedown",
+      "mouseup",
+      "auxclick",
+      "pointerdown",
+      "pointerup",
+      "keydown",
+    ];
+    const gestureEventNames = [
+      "contextmenu",
+      "dragstart",
+      "selectstart",
+      "gesturestart",
+      "gesturechange",
+      "gestureend",
+    ];
+
+    for (const eventName of browserEventNames) {
+      window.addEventListener(eventName, handleBrowserNavigation, options);
+    }
+    for (const eventName of gestureEventNames) {
+      document.addEventListener(eventName, preventMobileGestureDefault, options);
+    }
+
+    return () => {
+      for (const eventName of browserEventNames) {
+        window.removeEventListener(eventName, handleBrowserNavigation, options);
+      }
+      for (const eventName of gestureEventNames) {
+        document.removeEventListener(eventName, preventMobileGestureDefault, options);
+      }
+    };
+  }, []);
+}
+
 export default function MobileController() {
+  useMobileBrowserGuards();
+
   const [pointer, setPointer] = useState<PointerState>({
     x: 0,
     y: 0,
@@ -587,6 +632,8 @@ export default function MobileController() {
       style={{
         background: "#101214",
         color: "#edf2ef",
+        overscrollBehavior: "none",
+        WebkitTouchCallout: "none",
         fontFamily:
           'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       }}
