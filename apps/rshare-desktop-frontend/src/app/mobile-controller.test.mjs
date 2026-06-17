@@ -21,6 +21,7 @@ import {
   createHeldInputController,
   buildTextCommitRequest,
   createPointerMoveCoalescer,
+  formatMobileBackendStatus,
   formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
@@ -183,6 +184,42 @@ test("formatMobileControllerError hides raw browser fetch failures", () => {
   assert.equal(
     formatMobileControllerError(new Error("HTTP 401"), "移动端状态"),
     "移动端状态请求失败：HTTP 401",
+  );
+});
+
+test("formatMobileBackendStatus reports mobile injection readiness", () => {
+  assert.deepEqual(
+    formatMobileBackendStatus({
+      inject_backend: {
+        active: true,
+        kind: "Portable",
+        health: "Healthy",
+      },
+    }),
+    {
+      state: "ready",
+      label: "输入注入就绪",
+      detail: "Portable",
+    },
+  );
+  assert.deepEqual(formatMobileBackendStatus({}), {
+    state: "pending",
+    label: "等待输入后端",
+    detail: "尚未收到注入后端状态",
+  });
+  assert.deepEqual(
+    formatMobileBackendStatus({
+      inject_backend: {
+        active: false,
+        kind: "Portable",
+        health: { Degraded: { reason: "PermissionDenied" } },
+      },
+    }),
+    {
+      state: "blocked",
+      label: "输入注入不可用",
+      detail: "Portable: PermissionDenied",
+    },
   );
 });
 

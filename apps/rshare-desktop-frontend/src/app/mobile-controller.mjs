@@ -43,6 +43,49 @@ export const MOBILE_SHORTCUT_BUTTONS = Object.freeze([
   Object.freeze({ id: "select-all", label: "全选", keys: Object.freeze(["ControlLeft", "A"]) }),
 ]);
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function backendHealthReason(health) {
+  if (typeof health === "string") {
+    return health;
+  }
+  if (isRecord(health?.Degraded)) {
+    return String(health.Degraded.reason ?? "Degraded");
+  }
+  if (isRecord(health)) {
+    return String(Object.keys(health)[0] ?? "未知状态");
+  }
+  return "未知状态";
+}
+
+export function formatMobileBackendStatus(snapshot) {
+  const backend = isRecord(snapshot?.inject_backend) ? snapshot.inject_backend : null;
+  if (!backend || (backend.active == null && backend.health == null)) {
+    return {
+      state: "pending",
+      label: "等待输入后端",
+      detail: "尚未收到注入后端状态",
+    };
+  }
+
+  const kind = String(backend.kind ?? backend.mode ?? "未知后端");
+  if (backend.active === true || backend.health === "Healthy") {
+    return {
+      state: "ready",
+      label: "输入注入就绪",
+      detail: kind,
+    };
+  }
+
+  return {
+    state: "blocked",
+    label: "输入注入不可用",
+    detail: `${kind}: ${backendHealthReason(backend.health)}`,
+  };
+}
+
 export function formatMobileControllerError(error, scope = "移动端") {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {

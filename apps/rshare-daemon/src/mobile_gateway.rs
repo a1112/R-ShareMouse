@@ -541,6 +541,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <div>
       <h1>R-ShareMouse Mobile</h1>
       <div class="sub" id="pos">0, 0 / 1920x1080</div>
+      <div class="sub" id="backendStatus">等待输入后端</div>
     </div>
     <div class="status" id="status">连接中</div>
   </header>
@@ -603,6 +604,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
 const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
+const backendStatusEl = document.getElementById("backendStatus");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
 const sensitivityInput = document.getElementById("sensitivity");
@@ -728,6 +730,23 @@ function daemonRequest(deviceKind, payload, correlationId, mode = "BestEffort", 
     }
   };
 }
+function backendHealthReason(health) {
+  if (typeof health === "string") return health;
+  if (health?.Degraded && typeof health.Degraded === "object") return String(health.Degraded.reason || "Degraded");
+  if (health && typeof health === "object") return String(Object.keys(health)[0] || "未知状态");
+  return "未知状态";
+}
+function formatBackendStatus(snapshot) {
+  const backend = snapshot.inject_backend || {};
+  if (backend.active == null && backend.health == null) {
+    return { state: "pending", label: "等待输入后端", detail: "尚未收到注入后端状态" };
+  }
+  const kind = String(backend.kind || backend.mode || "未知后端");
+  if (backend.active === true || backend.health === "Healthy") {
+    return { state: "ready", label: "输入注入就绪", detail: kind };
+  }
+  return { state: "blocked", label: "输入注入不可用", detail: `${kind}: ${backendHealthReason(backend.health)}` };
+}
 async function inject(request) {
   try {
     const result = await api("/api/inject", {
@@ -765,6 +784,9 @@ async function refresh() {
       displayId: displayIdForPointer(displayEntries, Number(mouse.x || 0), Number(mouse.y || 0), mouse.current_display_id || primary.display_id || primary.id || null)
     };
     posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
+    const backendStatus = formatBackendStatus(snapshot);
+    backendStatusEl.textContent = `${backendStatus.label} · ${backendStatus.detail}`;
+    backendStatusEl.style.color = backendStatus.state === "ready" ? '#47c27a' : '#d6a64b';
     statusEl.textContent = "已连接";
   } catch (error) {
     statusEl.textContent = formatMobileError(error, "移动端状态");
@@ -1296,6 +1318,18 @@ mod tests {
         assert!(page.contains("return false;"));
         assert!(page.contains("if (await inject"));
         assert!(page.contains("textInput.value = \"\";"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_shows_injection_backend_readiness() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("id=\"backendStatus\""));
+        assert!(page.contains("function formatBackendStatus(snapshot)"));
+        assert!(page.contains("snapshot.inject_backend"));
+        assert!(page.contains("输入注入就绪"));
+        assert!(page.contains("输入注入不可用"));
+        assert!(page.contains("等待输入后端"));
     }
 
     #[test]

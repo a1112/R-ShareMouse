@@ -29,6 +29,7 @@ import {
   createHeldInputController,
   createMobileCorrelationId,
   createPointerMoveCoalescer,
+  formatMobileBackendStatus,
   formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
@@ -63,6 +64,7 @@ type TouchPoint = { id: number; x: number; y: number };
 type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
+type MobileBackendStatus = ReturnType<typeof formatMobileBackendStatus>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -200,9 +202,13 @@ function useHeldInputController(onState: (state: HeldInputState) => void) {
   return controllerRef.current;
 }
 
-async function fetchPointerState() {
+async function fetchMobileControlState() {
   const response = await daemonRequest("LocalControls");
-  return pointerFromLocalControls(responseVariant(response, "LocalControls"));
+  const snapshot = responseVariant(response, "LocalControls");
+  return {
+    pointer: pointerFromLocalControls(snapshot),
+    backendStatus: formatMobileBackendStatus(snapshot),
+  };
 }
 
 function useMobileBrowserGuards() {
@@ -274,6 +280,9 @@ export default function MobileController() {
   const [text, setText] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
   const [status, setStatus] = useState("连接中");
+  const [backendStatus, setBackendStatus] = useState<MobileBackendStatus>(() =>
+    formatMobileBackendStatus(null),
+  );
   const activePointerRef = useRef<number | null>(null);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
@@ -299,9 +308,10 @@ export default function MobileController() {
     let cancelled = false;
     async function refresh() {
       try {
-        const next = await fetchPointerState();
+        const next = await fetchMobileControlState();
         if (!cancelled) {
-          setPointer(next);
+          setPointer(next.pointer);
+          setBackendStatus(next.backendStatus);
           setStatus("已连接");
         }
       } catch (error) {
@@ -734,6 +744,13 @@ export default function MobileController() {
               <div className="text-sm font-semibold">R-ShareMouse Mobile</div>
               <div className="text-xs" style={{ color: "#8f9b96" }}>
                 {pointer.x}, {pointer.y} / {pointer.width}x{pointer.height}
+              </div>
+              <div
+                className="max-w-[220px] truncate text-xs"
+                title={backendStatus.detail}
+                style={{ color: backendStatus.state === "ready" ? "#47c27a" : "#d6a64b" }}
+              >
+                {backendStatus.label} · {backendStatus.detail}
               </div>
             </div>
           </div>
