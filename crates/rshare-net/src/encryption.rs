@@ -68,8 +68,20 @@ impl QuicTrustStore {
         }
         let data = fs::read(path)
             .with_context(|| format!("Failed to read QUIC trust store {}", path.display()))?;
-        serde_json::from_slice(&data)
-            .with_context(|| format!("Failed to parse QUIC trust store {}", path.display()))
+        if data.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        match serde_json::from_slice(&data) {
+            Ok(store) => Ok(store),
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring malformed QUIC trust store {}: {}",
+                    path.display(),
+                    error
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     pub fn save_default(&self) -> Result<()> {
@@ -273,6 +285,32 @@ mod tests {
         let loaded = QuicTrustStore::load(&path).unwrap();
         assert_eq!(loaded.fingerprint_for(&device_id), Some(&fingerprint));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_trust_store_file_loads_as_default() {
+        let dir = temp_dir("quic-trust-empty");
+        let path = dir.join("trust.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"").unwrap();
+
+        let loaded = QuicTrustStore::load(&path).unwrap();
+
+        assert!(loaded.peers.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_trust_store_file_loads_as_default() {
+        let dir = temp_dir("quic-trust-malformed");
+        let path = dir.join("trust.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"{ not valid json").unwrap();
+
+        let loaded = QuicTrustStore::load(&path).unwrap();
+
+        assert!(loaded.peers.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -212,6 +212,7 @@ impl NetworkManager {
         let discovered_devices = self.discovered_devices.clone();
         let auto_connect_config = self.config.clone();
         let auto_connect_connection = self.connection.clone();
+        let discovery_lost_connection = self.connection.clone();
         let local_device_id = self.local_device_id;
 
         let mut discovery = ServiceDiscovery::new(
@@ -282,7 +283,13 @@ impl NetworkManager {
                             devices.remove(&id);
                         }
 
-                        let _ = discovery_tx.try_send(NetworkEvent::DeviceDisconnected(id));
+                        let transport_connected = {
+                            let manager = discovery_lost_connection.lock().await;
+                            manager.is_connected(&id).await
+                        };
+                        if let Some(event) = discovery_lost_network_event(id, transport_connected) {
+                            let _ = discovery_tx.try_send(event);
+                        }
                     }
                     crate::discovery::DiscoveryEvent::Error(err) => {
                         tracing::error!("Discovery error: {}", err);
@@ -425,6 +432,17 @@ fn spawn_auto_connect_discovered_device(
     });
 }
 
+fn discovery_lost_network_event(
+    device_id: DeviceId,
+    transport_connected: bool,
+) -> Option<NetworkEvent> {
+    if transport_connected {
+        None
+    } else {
+        Some(NetworkEvent::DeviceDisconnected(device_id))
+    }
+}
+
 // Note: NetworkManager intentionally doesn't implement Clone
 // because it contains runtime resources like channels and connections
 
@@ -525,6 +543,23 @@ mod tests {
             auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
             None
         );
+    }
+
+    #[test]
+    fn discovery_lost_does_not_emit_disconnect_while_transport_is_connected() {
+        let device_id = DeviceId::new_v4();
+
+        assert!(discovery_lost_network_event(device_id, true).is_none());
+    }
+
+    #[test]
+    fn discovery_lost_emits_disconnect_when_transport_is_not_connected() {
+        let device_id = DeviceId::new_v4();
+
+        assert!(matches!(
+            discovery_lost_network_event(device_id, false),
+            Some(NetworkEvent::DeviceDisconnected(id)) if id == device_id
+        ));
     }
 
     #[test]
