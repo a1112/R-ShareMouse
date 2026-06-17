@@ -173,7 +173,7 @@ impl NetworkManager {
     /// Check if a device is connected
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let conn = self.connection.lock().await;
-        conn.is_connected(device_id)
+        conn.is_connected(device_id).await
     }
 
     /// Send a message to a device

@@ -239,8 +239,9 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
-        if self.connections.remove(device_id).is_some() {
-            self.pool.remove(device_id).await;
+        let removed_connection_info = self.connections.remove(device_id).is_some();
+        let removed_pool_connection = self.pool.remove(device_id).await.is_some();
+        if removed_connection_info || removed_pool_connection {
             let _ = self
                 .event_tx
                 .send(ManagerEvent::Disconnected(*device_id))
@@ -295,11 +296,17 @@ impl ConnectionManager {
         infos_by_id.into_values().collect()
     }
 
-    pub fn is_connected(&self, device_id: &DeviceId) -> bool {
-        self.connections
+    pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
+        if self
+            .connections
             .get(device_id)
             .map(|info| info.state == ConnectionState::Connected)
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        self.pool.diagnostics_for(device_id).await.is_some()
     }
 
     pub fn connected_count(&self) -> usize {
@@ -604,6 +611,11 @@ mod tests {
                 && info.transport == "quic"
                 && info.datagram_available
         }));
+        assert!(manager.is_connected(&remote_id).await);
+
+        manager.disconnect(&remote_id).await.unwrap();
+        assert!(!manager.is_connected(&remote_id).await);
+        assert!(manager.pool.diagnostics_for(&remote_id).await.is_none());
     }
 
     #[tokio::test]
@@ -661,6 +673,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(connected, remote_id);
-        assert!(manager.is_connected(&remote_id));
+        assert!(manager.is_connected(&remote_id).await);
     }
 }
