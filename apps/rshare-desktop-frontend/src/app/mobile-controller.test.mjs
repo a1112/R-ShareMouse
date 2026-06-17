@@ -21,6 +21,7 @@ import {
   formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
+  isTwoFingerTap,
   nextPointerPosition,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
@@ -384,6 +385,68 @@ test("twoFingerWheelDelta ignores single finger tiny or mismatched gestures", ()
       ],
     ),
     null,
+  );
+});
+
+test("isTwoFingerTap accepts short still two finger taps", () => {
+  assert.equal(
+    isTwoFingerTap(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 150, y: 100 },
+      ],
+      [
+        { id: 1, x: 104, y: 102 },
+        { id: 2, x: 153, y: 101 },
+      ],
+      { startTimeMs: 1000, endTimeMs: 1120 },
+    ),
+    true,
+  );
+});
+
+test("isTwoFingerTap rejects scrolls long presses and changed fingers", () => {
+  assert.equal(
+    isTwoFingerTap(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 150, y: 100 },
+      ],
+      [
+        { id: 1, x: 100, y: 140 },
+        { id: 2, x: 150, y: 140 },
+      ],
+      { startTimeMs: 1000, endTimeMs: 1120 },
+    ),
+    false,
+  );
+  assert.equal(
+    isTwoFingerTap(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 150, y: 100 },
+      ],
+      [
+        { id: 1, x: 104, y: 102 },
+        { id: 2, x: 153, y: 101 },
+      ],
+      { startTimeMs: 1000, endTimeMs: 1500 },
+    ),
+    false,
+  );
+  assert.equal(
+    isTwoFingerTap(
+      [
+        { id: 1, x: 100, y: 100 },
+        { id: 2, x: 150, y: 100 },
+      ],
+      [
+        { id: 1, x: 104, y: 102 },
+        { id: 3, x: 153, y: 101 },
+      ],
+      { startTimeMs: 1000, endTimeMs: 1120 },
+    ),
+    false,
   );
 });
 

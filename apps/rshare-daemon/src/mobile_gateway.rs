@@ -583,6 +583,7 @@ let lastPoint = null;
 let tapStart = null;
 let touchPoints = new Map();
 let lastWheelTouches = null;
+let twoFingerTapStart = null;
 let pendingMove = null;
 let pendingMoveFrame = 0;
 let dragTimer = 0;
@@ -728,8 +729,24 @@ function twoFingerWheelDelta(previousTouches, currentTouches) {
   const wheel = { deltaX: Math.round(dx * 0.12), deltaY: Math.round(dy * 0.12) };
   return wheel.deltaX || wheel.deltaY ? wheel : null;
 }
+function isTwoFingerTap(startTouches, endTouches, startTimeMs, endTimeMs) {
+  if (!startTouches || !endTouches || startTouches.length !== 2 || endTouches.length !== 2) return false;
+  if (startTouches[0].id !== endTouches[0].id || startTouches[1].id !== endTouches[1].id) return false;
+  const duration = endTimeMs - startTimeMs;
+  if (duration < 0 || duration > 260) return false;
+  const startCenter = centerOfTouches(startTouches);
+  const endCenter = centerOfTouches(endTouches);
+  if (Math.hypot(endCenter.x - startCenter.x, endCenter.y - startCenter.y) > 12) return false;
+  const startDistance = Math.hypot(startTouches[1].x - startTouches[0].x, startTouches[1].y - startTouches[0].y);
+  const endDistance = Math.hypot(endTouches[1].x - endTouches[0].x, endTouches[1].y - endTouches[0].y);
+  return Math.abs(endDistance - startDistance) <= 12;
+}
 function sendWheelDelta(wheel) {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: wheel.deltaX, delta_y: wheel.deltaY, x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
+}
+async function sendTwoFingerTapClick() {
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-down")));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-up")));
 }
 pad.addEventListener("pointerdown", (event) => {
   touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
@@ -743,7 +760,9 @@ pad.addEventListener("pointerdown", (event) => {
     clearDragTimer();
     releaseTouchpadDrag();
     flushMove();
-    lastWheelTouches = touchPoints.size === 2 ? touchPointsSnapshot() : null;
+    const touches = touchPoints.size === 2 ? touchPointsSnapshot() : null;
+    lastWheelTouches = touches;
+    twoFingerTapStart = touches ? { touches, timeMs: event.timeStamp } : null;
     activePointer = null;
     lastPoint = null;
     tapStart = null;
@@ -758,12 +777,16 @@ pad.addEventListener("pointermove", (event) => {
     releaseTouchpadDrag();
     if (touchPoints.size > 2) {
       lastWheelTouches = null;
+      twoFingerTapStart = null;
       return;
     }
     const currentTouches = touchPointsSnapshot();
     const wheel = twoFingerWheelDelta(lastWheelTouches, currentTouches);
     lastWheelTouches = currentTouches;
-    if (wheel) sendWheelDelta(wheel);
+    if (wheel) {
+      twoFingerTapStart = null;
+      sendWheelDelta(wheel);
+    }
     return;
   }
   if (activePointer !== event.pointerId || !lastPoint) return;
@@ -778,6 +801,17 @@ pad.addEventListener("pointermove", (event) => {
   scheduleMove(pointer);
 });
 function clearPointer(event) {
+  if (touchPoints.has(event.pointerId)) {
+    touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
+  }
+  if (touchPoints.size === 2 && twoFingerTapStart) {
+    const start = twoFingerTapStart;
+    const currentTouches = touchPointsSnapshot();
+    twoFingerTapStart = null;
+    if (isTwoFingerTap(start.touches, currentTouches, start.timeMs, event.timeStamp)) {
+      sendTwoFingerTapClick();
+    }
+  }
   if (activePointer === event.pointerId) {
     clearDragTimer();
     flushMove();
@@ -791,7 +825,10 @@ function clearPointer(event) {
     tapStart = null;
   }
   touchPoints.delete(event.pointerId);
-  if (touchPoints.size !== 2) lastWheelTouches = null;
+  if (touchPoints.size !== 2) {
+    lastWheelTouches = null;
+    twoFingerTapStart = null;
+  }
 }
 function cancelPointer(event) {
   if (activePointer === event.pointerId) {
@@ -803,7 +840,10 @@ function cancelPointer(event) {
     tapStart = null;
   }
   touchPoints.delete(event.pointerId);
-  if (touchPoints.size !== 2) lastWheelTouches = null;
+  if (touchPoints.size !== 2) {
+    lastWheelTouches = null;
+    twoFingerTapStart = null;
+  }
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
@@ -1003,6 +1043,18 @@ mod tests {
         assert!(page.contains("kind: \"MouseWheel\""));
         assert!(page.contains("lastWheelTouches ="));
         assert!(page.contains("touchPointsSnapshot()"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_turns_two_finger_taps_into_right_clicks() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function isTwoFingerTap"));
+        assert!(page.contains("function sendTwoFingerTapClick()"));
+        assert!(page.contains("sendTwoFingerTapClick();"));
+        assert!(page.contains("button: \"Right\", state: \"Pressed\""));
+        assert!(page.contains("button: \"Right\", state: \"Released\""));
+        assert!(page.contains("twoFingerTapStart"));
     }
 
     #[test]

@@ -312,6 +312,41 @@ export function twoFingerWheelDelta(previousTouches, currentTouches, options = {
   return { deltaX, deltaY };
 }
 
+export function isTwoFingerTap(startTouches, endTouches, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  const start = normalizedTwoFingerTouches(startTouches);
+  const end = normalizedTwoFingerTouches(endTouches);
+  if (!start || !end) {
+    return false;
+  }
+  if (start[0].id !== end[0].id || start[1].id !== end[1].id) {
+    return false;
+  }
+
+  const startTimeMs = Number(options.startTimeMs ?? 0);
+  const endTimeMs = Number(options.endTimeMs ?? startTimeMs);
+  const maxDurationMs = Number(options.maxDurationMs ?? 260);
+  const duration = endTimeMs - startTimeMs;
+  if (!Number.isFinite(duration) || duration < 0 || duration > maxDurationMs) {
+    return false;
+  }
+
+  const maxCenterDistancePx = Number(options.maxCenterDistancePx ?? 12);
+  const maxFingerDistanceDeltaPx = Number(options.maxFingerDistanceDeltaPx ?? 12);
+  const startCenter = centroid(start);
+  const endCenter = centroid(end);
+  const centerDistance = Math.hypot(endCenter.x - startCenter.x, endCenter.y - startCenter.y);
+  if (centerDistance > maxCenterDistancePx) {
+    return false;
+  }
+
+  const startDistance = Math.hypot(start[1].x - start[0].x, start[1].y - start[0].y);
+  const endDistance = Math.hypot(end[1].x - end[0].x, end[1].y - end[0].y);
+  return Math.abs(endDistance - startDistance) <= maxFingerDistanceDeltaPx;
+}
+
 export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
   const requestFrame =
     scheduler.requestFrame ??

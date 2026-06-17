@@ -29,6 +29,7 @@ import {
   formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
+  isTwoFingerTap,
   nextPointerPosition,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
@@ -49,6 +50,7 @@ type PointerState = {
 
 type SendState = "idle" | "sending" | "ok" | "error";
 type TouchPoint = { id: number; x: number; y: number };
+type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -192,6 +194,7 @@ export default function MobileController() {
   const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
   const touchPointsRef = useRef<Map<number, TouchPoint>>(new Map());
   const lastWheelTouchesRef = useRef<TouchPoint[] | null>(null);
+  const twoFingerTapStartRef = useRef<TwoFingerTapStart | null>(null);
   const dragTimerRef = useRef<number | null>(null);
   const dragPointerRef = useRef<number | null>(null);
   const pointerRef = useRef(pointer);
@@ -347,8 +350,9 @@ export default function MobileController() {
       clearDragTimer();
       releaseTouchpadDrag();
       moveCoalescerRef.current?.flush();
-      lastWheelTouchesRef.current =
-        touchPointsRef.current.size === 2 ? touchPointsSnapshot() : null;
+      const touches = touchPointsRef.current.size === 2 ? touchPointsSnapshot() : null;
+      lastWheelTouchesRef.current = touches;
+      twoFingerTapStartRef.current = touches ? { touches, timeMs: event.timeStamp } : null;
       activePointerRef.current = null;
       lastPointRef.current = null;
       tapStartRef.current = null;
@@ -368,12 +372,14 @@ export default function MobileController() {
       releaseTouchpadDrag();
       if (touchPointsRef.current.size > 2) {
         lastWheelTouchesRef.current = null;
+        twoFingerTapStartRef.current = null;
         return;
       }
       const currentTouches = touchPointsSnapshot();
       const wheelDelta = twoFingerWheelDelta(lastWheelTouchesRef.current, currentTouches);
       lastWheelTouchesRef.current = currentTouches;
       if (wheelDelta) {
+        twoFingerTapStartRef.current = null;
         wheel(wheelDelta.deltaY, wheelDelta.deltaX);
       }
       return;
@@ -405,6 +411,26 @@ export default function MobileController() {
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (touchPointsRef.current.has(event.pointerId)) {
+      touchPointsRef.current.set(event.pointerId, {
+        id: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+      });
+    }
+    if (touchPointsRef.current.size === 2 && twoFingerTapStartRef.current) {
+      const start = twoFingerTapStartRef.current;
+      const currentTouches = touchPointsSnapshot();
+      twoFingerTapStartRef.current = null;
+      if (
+        isTwoFingerTap(start.touches, currentTouches, {
+          startTimeMs: start.timeMs,
+          endTimeMs: event.timeStamp,
+        })
+      ) {
+        void mouseClick("Right");
+      }
+    }
     if (activePointerRef.current === event.pointerId) {
       clearDragTimer();
       moveCoalescerRef.current?.flush();
@@ -427,6 +453,7 @@ export default function MobileController() {
     touchPointsRef.current.delete(event.pointerId);
     if (touchPointsRef.current.size !== 2) {
       lastWheelTouchesRef.current = null;
+      twoFingerTapStartRef.current = null;
     }
   }
 
@@ -442,6 +469,7 @@ export default function MobileController() {
     touchPointsRef.current.delete(event.pointerId);
     if (touchPointsRef.current.size !== 2) {
       lastWheelTouchesRef.current = null;
+      twoFingerTapStartRef.current = null;
     }
   }
 
