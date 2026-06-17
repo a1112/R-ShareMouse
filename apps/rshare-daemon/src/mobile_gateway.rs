@@ -501,6 +501,9 @@ let touchPoints = new Map();
 let lastWheelTouches = null;
 let pendingMove = null;
 let pendingMoveFrame = 0;
+let dragTimer = 0;
+let dragPointer = null;
+const LONG_PRESS_DRAG_DELAY_MS = 420;
 function cid(prefix) {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
@@ -575,9 +578,40 @@ function isTouchpadTap(start, end) {
   if (duration < 0 || duration > 260) return false;
   return Math.hypot(end.x - start.x, end.y - start.y) <= 12;
 }
+function isTouchpadLongPressDrag(start, current) {
+  if (!start || !current) return false;
+  const duration = current.timeMs - start.timeMs;
+  if (duration < LONG_PRESS_DRAG_DELAY_MS) return false;
+  return Math.hypot(current.x - start.x, current.y - start.y) <= 12;
+}
 async function sendTapClick() {
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")));
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")));
+}
+function clearDragTimer() {
+  if (dragTimer) {
+    clearTimeout(dragTimer);
+    dragTimer = 0;
+  }
+}
+function sendDragButton(state) {
+  inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state, x: pointer.x, y: pointer.y } }, cid(`mobile-touchpad-drag-${state}`)));
+}
+function beginTouchpadDrag(pointerId) {
+  dragTimer = 0;
+  if (activePointer !== pointerId || dragPointer !== null || touchPoints.size !== 1) return;
+  const current = touchPoints.get(pointerId);
+  if (!tapStart || !current) return;
+  if (!isTouchpadLongPressDrag(tapStart, { ...current, timeMs: tapStart.timeMs + LONG_PRESS_DRAG_DELAY_MS })) return;
+  dragPointer = pointerId;
+  tapStart = null;
+  sendDragButton("Pressed");
+}
+function releaseTouchpadDrag(pointerId = null) {
+  if (dragPointer === null) return;
+  if (pointerId !== null && dragPointer !== pointerId) return;
+  dragPointer = null;
+  sendDragButton("Released");
 }
 function touchPointsSnapshot() {
   return Array.from(touchPoints.values()).sort((left, right) => left.id - right.id);
@@ -605,7 +639,11 @@ pad.addEventListener("pointerdown", (event) => {
   lastPoint = { x: event.clientX, y: event.clientY };
   tapStart = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
   pad.setPointerCapture(event.pointerId);
+  clearDragTimer();
+  dragTimer = setTimeout(() => beginTouchpadDrag(event.pointerId), LONG_PRESS_DRAG_DELAY_MS);
   if (touchPoints.size >= 2) {
+    clearDragTimer();
+    releaseTouchpadDrag();
     flushMove();
     lastWheelTouches = touchPoints.size === 2 ? touchPointsSnapshot() : null;
     activePointer = null;
@@ -618,6 +656,8 @@ pad.addEventListener("pointermove", (event) => {
     touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
   }
   if (touchPoints.size >= 2) {
+    clearDragTimer();
+    releaseTouchpadDrag();
     if (touchPoints.size > 2) {
       lastWheelTouches = null;
       return;
@@ -629,6 +669,9 @@ pad.addEventListener("pointermove", (event) => {
     return;
   }
   if (activePointer !== event.pointerId || !lastPoint) return;
+  if (tapStart && Math.hypot(event.clientX - tapStart.x, event.clientY - tapStart.y) > 12) {
+    clearDragTimer();
+  }
   const dx = Math.round((event.clientX - lastPoint.x) * 1.35);
   const dy = Math.round((event.clientY - lastPoint.y) * 1.35);
   lastPoint = { x: event.clientX, y: event.clientY };
@@ -638,8 +681,11 @@ pad.addEventListener("pointermove", (event) => {
 });
 function clearPointer(event) {
   if (activePointer === event.pointerId) {
+    clearDragTimer();
     flushMove();
-    if (isTouchpadTap(tapStart, { x: event.clientX, y: event.clientY, timeMs: event.timeStamp })) {
+    if (dragPointer === event.pointerId) {
+      releaseTouchpadDrag(event.pointerId);
+    } else if (isTouchpadTap(tapStart, { x: event.clientX, y: event.clientY, timeMs: event.timeStamp })) {
       sendTapClick();
     }
     activePointer = null;
@@ -651,6 +697,8 @@ function clearPointer(event) {
 }
 function cancelPointer(event) {
   if (activePointer === event.pointerId) {
+    clearDragTimer();
+    releaseTouchpadDrag(event.pointerId);
     flushMove();
     activePointer = null;
     lastPoint = null;
@@ -881,6 +929,18 @@ mod tests {
         assert!(page.contains("document.addEventListener(\"visibilitychange\""));
         assert!(page.contains("document.visibilityState === \"hidden\""));
         assert!(page.contains("release(true);"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_supports_touchpad_long_press_drag() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("const LONG_PRESS_DRAG_DELAY_MS"));
+        assert!(page.contains("function beginTouchpadDrag"));
+        assert!(page.contains("function clearDragTimer"));
+        assert!(page.contains("dragTimer = setTimeout"));
+        assert!(page.contains("sendDragButton(\"Pressed\")"));
+        assert!(page.contains("sendDragButton(\"Released\")"));
     }
 
     #[test]

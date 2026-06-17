@@ -1,6 +1,8 @@
 const DEFAULT_MOUSE_TIMEOUT_MS = 250;
 const DEFAULT_KEYBOARD_TIMEOUT_MS = 750;
 
+export const MOBILE_LONG_PRESS_DRAG_DELAY_MS = 420;
+
 export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
   enterKeyHint: "send",
   autoCapitalize: "none",
@@ -200,6 +202,24 @@ export function isTouchpadTap(start, end, options = {}) {
   }
   const dx = Number(end.x ?? 0) - Number(start.x ?? 0);
   const dy = Number(end.y ?? 0) - Number(start.y ?? 0);
+  return Math.hypot(dx, dy) <= maxDistancePx;
+}
+
+export function isTouchpadLongPressDrag(start, current, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  if (!start || !current) {
+    return false;
+  }
+  const minDurationMs = Number(options.minDurationMs ?? MOBILE_LONG_PRESS_DRAG_DELAY_MS);
+  const maxDistancePx = Number(options.maxDistancePx ?? 12);
+  const duration = Number(current.timeMs ?? 0) - Number(start.timeMs ?? 0);
+  if (!Number.isFinite(duration) || duration < minDurationMs) {
+    return false;
+  }
+  const dx = Number(current.x ?? 0) - Number(start.x ?? 0);
+  const dy = Number(current.y ?? 0) - Number(start.y ?? 0);
   return Math.hypot(dx, dy) <= maxDistancePx;
 }
 

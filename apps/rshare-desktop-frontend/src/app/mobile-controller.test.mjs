@@ -12,6 +12,7 @@ import {
   createHeldInputController,
   buildTextCommitRequest,
   createPointerMoveCoalescer,
+  isTouchpadLongPressDrag,
   isTouchpadTap,
   nextPointerPosition,
   shouldCommitMobileTextOnKeyDown,
@@ -161,6 +162,33 @@ test("createHeldInputController releases a held input once from pointer or globa
   assert.equal(held.releaseAll(), true);
   assert.equal(held.isPressed(), false);
   assert.deepEqual(states, ["Pressed", "Released", "Pressed", "Released"]);
+});
+
+test("isTouchpadLongPressDrag accepts still long presses and rejects early or moved gestures", () => {
+  assert.equal(
+    isTouchpadLongPressDrag(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 106, y: 104, timeMs: 1450 },
+      { minDurationMs: 420 },
+    ),
+    true,
+  );
+  assert.equal(
+    isTouchpadLongPressDrag(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 106, y: 104, timeMs: 1300 },
+      { minDurationMs: 420 },
+    ),
+    false,
+  );
+  assert.equal(
+    isTouchpadLongPressDrag(
+      { x: 100, y: 100, timeMs: 1000 },
+      { x: 126, y: 104, timeMs: 1450 },
+      { minDurationMs: 420, maxDistancePx: 12 },
+    ),
+    false,
+  );
 });
 
 test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {

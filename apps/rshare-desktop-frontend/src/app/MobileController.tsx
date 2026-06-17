@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import {
+  MOBILE_LONG_PRESS_DRAG_DELAY_MS,
   MOBILE_TEXT_INPUT_HINTS,
   buildKeyRequest,
   buildMouseButtonRequest,
@@ -22,6 +23,7 @@ import {
   createHeldInputController,
   createMobileCorrelationId,
   createPointerMoveCoalescer,
+  isTouchpadLongPressDrag,
   isTouchpadTap,
   nextPointerPosition,
   shouldCommitMobileTextOnKeyDown,
@@ -186,6 +188,8 @@ export default function MobileController() {
   const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
   const touchPointsRef = useRef<Map<number, TouchPoint>>(new Map());
   const lastWheelTouchesRef = useRef<TouchPoint[] | null>(null);
+  const dragTimerRef = useRef<number | null>(null);
+  const dragPointerRef = useRef<number | null>(null);
   const pointerRef = useRef(pointer);
   const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
@@ -257,6 +261,67 @@ export default function MobileController() {
     moveCoalescerRef.current?.schedule(next);
   }
 
+  function clearDragTimer() {
+    if (dragTimerRef.current != null) {
+      window.clearTimeout(dragTimerRef.current);
+      dragTimerRef.current = null;
+    }
+  }
+
+  function sendDragButton(state: "Pressed" | "Released") {
+    const current = pointerRef.current;
+    void sendRequest(
+      buildMouseButtonRequest(
+        "Left",
+        state,
+        current.x,
+        current.y,
+        createMobileCorrelationId(`mobile-touchpad-drag-${state.toLowerCase()}`),
+      ),
+    );
+  }
+
+  function releaseTouchpadDrag(pointerId: number | null = null) {
+    if (dragPointerRef.current == null) {
+      return;
+    }
+    if (pointerId != null && dragPointerRef.current !== pointerId) {
+      return;
+    }
+    dragPointerRef.current = null;
+    sendDragButton("Released");
+  }
+
+  function beginTouchpadDrag(pointerId: number) {
+    dragTimerRef.current = null;
+    if (
+      activePointerRef.current !== pointerId ||
+      dragPointerRef.current != null ||
+      touchPointsRef.current.size !== 1
+    ) {
+      return;
+    }
+    const start = tapStartRef.current;
+    const current = touchPointsRef.current.get(pointerId);
+    if (
+      !isTouchpadLongPressDrag(
+        start,
+        current
+          ? {
+              x: current.x,
+              y: current.y,
+              timeMs: Number(start?.timeMs ?? 0) + MOBILE_LONG_PRESS_DRAG_DELAY_MS,
+            }
+          : null,
+      )
+    ) {
+      return;
+    }
+    dragPointerRef.current = pointerId;
+    tapStartRef.current = null;
+    sendDragButton("Pressed");
+  }
+
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     touchPointsRef.current.set(event.pointerId, {
       id: event.pointerId,
@@ -267,7 +332,14 @@ export default function MobileController() {
     lastPointRef.current = { x: event.clientX, y: event.clientY };
     tapStartRef.current = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
     event.currentTarget.setPointerCapture(event.pointerId);
+    clearDragTimer();
+    dragTimerRef.current = window.setTimeout(
+      () => beginTouchpadDrag(event.pointerId),
+      MOBILE_LONG_PRESS_DRAG_DELAY_MS,
+    );
     if (touchPointsRef.current.size >= 2) {
+      clearDragTimer();
+      releaseTouchpadDrag();
       moveCoalescerRef.current?.flush();
       lastWheelTouchesRef.current =
         touchPointsRef.current.size === 2 ? touchPointsSnapshot() : null;
@@ -286,6 +358,8 @@ export default function MobileController() {
       });
     }
     if (touchPointsRef.current.size >= 2) {
+      clearDragTimer();
+      releaseTouchpadDrag();
       if (touchPointsRef.current.size > 2) {
         lastWheelTouchesRef.current = null;
         return;
@@ -300,6 +374,13 @@ export default function MobileController() {
     }
     if (activePointerRef.current !== event.pointerId || !lastPointRef.current) {
       return;
+    }
+    const tapStart = tapStartRef.current;
+    if (
+      tapStart &&
+      Math.hypot(event.clientX - tapStart.x, event.clientY - tapStart.y) > 12
+    ) {
+      clearDragTimer();
     }
     const last = lastPointRef.current;
     lastPointRef.current = { x: event.clientX, y: event.clientY };
@@ -319,10 +400,13 @@ export default function MobileController() {
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
     if (activePointerRef.current === event.pointerId) {
+      clearDragTimer();
       moveCoalescerRef.current?.flush();
       const tapStart = tapStartRef.current;
       tapStartRef.current = null;
-      if (
+      if (dragPointerRef.current === event.pointerId) {
+        releaseTouchpadDrag(event.pointerId);
+      } else if (
         isTouchpadTap(tapStart, {
           x: event.clientX,
           y: event.clientY,
@@ -342,6 +426,8 @@ export default function MobileController() {
 
   function handlePointerCancel(event: React.PointerEvent<HTMLDivElement>) {
     if (activePointerRef.current === event.pointerId) {
+      clearDragTimer();
+      releaseTouchpadDrag(event.pointerId);
       moveCoalescerRef.current?.flush();
       tapStartRef.current = null;
       activePointerRef.current = null;
