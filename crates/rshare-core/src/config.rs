@@ -83,9 +83,9 @@ pub struct FeatureConfig {
     pub suppress_local_shortcuts_when_remote: bool,
     /// Allow edge-triggered automatic forwarding of captured input to a remote target.
     ///
-    /// Disabled by default while Alpha endpoint diagnostics are being validated; manual
-    /// endpoint injection tests remain available through the daemon IPC.
-    #[serde(default)]
+    /// Enabled by default so a connected, linked peer can be controlled from the
+    /// local screen edge without requiring an extra diagnostics-only toggle.
+    #[serde(default = "default_true")]
     pub automatic_input_forwarding: bool,
     /// Ask the remote endpoint to run the reverse latency probe automatically.
     #[serde(default = "default_true")]
@@ -177,7 +177,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             suppress_local_shortcuts_when_remote: true,
-            automatic_input_forwarding: false,
+            automatic_input_forwarding: true,
             auto_endpoint_latency_probe: true,
             audio_capture: true,
             audio_forwarding: true,
@@ -246,8 +246,10 @@ impl Config {
 
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+        let mut config: Self = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.apply_legacy_default_migrations();
+        Ok(config)
     }
 
     /// Save configuration to a specific path.
@@ -293,10 +295,27 @@ impl Config {
         self.input.edge_threshold.max(1).min(100)
     }
 
+    fn apply_legacy_default_migrations(&mut self) {
+        if is_legacy_alpha_feature_default_with_disabled_forwarding(&self.features) {
+            self.features.automatic_input_forwarding = true;
+        }
+    }
+
     /// Legacy method for compatibility
     pub fn config_path() -> PathBuf {
         default_config_path().unwrap_or_else(|_| PathBuf::from("config.toml"))
     }
+}
+
+fn is_legacy_alpha_feature_default_with_disabled_forwarding(features: &FeatureConfig) -> bool {
+    features.suppress_local_shortcuts_when_remote
+        && !features.automatic_input_forwarding
+        && features.auto_endpoint_latency_probe
+        && features.audio_capture
+        && features.audio_forwarding
+        && !features.usb_forwarding_experimental
+        && features.usb_device_advertising
+        && features.usb_descriptor_probe
 }
 
 /// Get the default configuration file path.
@@ -375,7 +394,7 @@ mod tests {
         assert_eq!(config.gamepad.max_update_hz, 120);
         assert!(!config.gamepad.vibration);
         assert!(config.features.suppress_local_shortcuts_when_remote);
-        assert!(!config.features.automatic_input_forwarding);
+        assert!(config.features.automatic_input_forwarding);
         assert!(config.features.auto_endpoint_latency_probe);
         assert!(config.features.audio_capture);
         assert!(config.features.audio_forwarding);
@@ -429,11 +448,40 @@ mod tests {
 
         let partial: Config =
             toml::from_str("[features]\nusb_forwarding_experimental = true\n").unwrap();
+        assert!(partial.features.automatic_input_forwarding);
         assert!(partial.features.usb_forwarding_experimental);
         assert!(partial.features.audio_capture);
         assert!(partial.features.audio_forwarding);
         assert!(partial.features.usb_device_advertising);
         assert!(partial.features.usb_descriptor_probe);
+    }
+
+    #[test]
+    fn load_upgrades_legacy_alpha_automatic_forwarding_default() {
+        let path = temp_config_path("legacy-auto-forwarding");
+        let mut legacy = Config::default();
+        legacy.features.automatic_input_forwarding = false;
+        legacy.save_to_path(&path).unwrap();
+
+        let loaded = Config::load_from_path(&path).unwrap();
+
+        assert!(loaded.features.automatic_input_forwarding);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_preserves_disabled_automatic_forwarding_when_feature_config_was_customized() {
+        let path = temp_config_path("custom-auto-forwarding");
+        let mut config = Config::default();
+        config.features.automatic_input_forwarding = false;
+        config.features.usb_forwarding_experimental = true;
+        config.save_to_path(&path).unwrap();
+
+        let loaded = Config::load_from_path(&path).unwrap();
+
+        assert!(!loaded.features.automatic_input_forwarding);
+        assert!(loaded.features.usb_forwarding_experimental);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

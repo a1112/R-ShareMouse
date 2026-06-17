@@ -10471,7 +10471,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_input_does_not_auto_forward_when_disabled_by_default() {
+    fn captured_input_does_not_auto_forward_when_disabled_by_config() {
         use rshare_core::{Direction, LayoutLink};
 
         let local_id = DeviceId::new_v4();
@@ -10484,6 +10484,7 @@ mod tests {
             27432,
             1,
         ));
+        state.features.automatic_input_forwarding = false;
         state.layout.upsert_link_for_edge(LayoutLink::new(
             local_id,
             Direction::Right,
@@ -10521,7 +10522,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_input_forwards_when_explicitly_enabled() {
+    fn captured_input_forwards_by_default_when_layout_link_is_connected() {
         use rshare_core::{Direction, LayoutLink};
 
         let local_id = DeviceId::new_v4();
@@ -10534,7 +10535,6 @@ mod tests {
             27432,
             1,
         ));
-        state.features.automatic_input_forwarding = true;
         state.layout.upsert_link_for_edge(LayoutLink::new(
             local_id,
             Direction::Right,
