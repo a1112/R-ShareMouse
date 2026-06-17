@@ -875,25 +875,54 @@ async function sendDoubleClick(buttonName) {
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)));
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)));
 }
-async function sendReleaseAll() {
+function releaseAllRequests(prefix) {
   const mouseButtons = [
-    ["Left", "mobile-release-all-mouse-left"],
-    ["Middle", "mobile-release-all-mouse-middle"],
-    ["Right", "mobile-release-all-mouse-right"],
-    ["Back", "mobile-release-all-mouse-back"],
-    ["Forward", "mobile-release-all-mouse-forward"]
+    ["Left", `${prefix}-mouse-left`],
+    ["Middle", `${prefix}-mouse-middle`],
+    ["Right", `${prefix}-mouse-right`],
+    ["Back", `${prefix}-mouse-back`],
+    ["Forward", `${prefix}-mouse-forward`]
   ];
   const modifierKeys = [
-    ["ControlLeft", "mobile-release-all-key-controlleft"],
-    ["ShiftLeft", "mobile-release-all-key-shiftleft"],
-    ["AltLeft", "mobile-release-all-key-altleft"],
-    ["SuperLeft", "mobile-release-all-key-superleft"]
+    ["ControlLeft", `${prefix}-key-controlleft`],
+    ["ShiftLeft", `${prefix}-key-shiftleft`],
+    ["AltLeft", `${prefix}-key-altleft`],
+    ["SuperLeft", `${prefix}-key-superleft`]
   ];
-  for (const [buttonName, correlationId] of mouseButtons) {
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId)));
+  return [
+    ...mouseButtons.map(([buttonName, correlationId]) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId))),
+    ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750))
+  ];
+}
+async function sendReleaseAll() {
+  for (const request of releaseAllRequests("mobile-release-all")) {
+    await inject(request);
   }
-  for (const [key, correlationId] of modifierKeys) {
-    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750));
+}
+function keepaliveInject(request) {
+  const body = JSON.stringify(request);
+  const path = `/api/inject?t=${encodeURIComponent(token)}`;
+  try {
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon(path, blob)) return true;
+    }
+  } catch {}
+  try {
+    fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body,
+      keepalive: true
+    }).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+function releaseAllWithKeepalive() {
+  for (const request of releaseAllRequests("mobile-release-all-keepalive")) {
+    keepaliveInject(request);
   }
 }
 function clearDragTimer() {
@@ -936,6 +965,9 @@ function releaseTouchpadInteractionWhenHidden() {
   if (document.visibilityState === "hidden") {
     releaseTouchpadInteraction();
   }
+}
+function releaseAllWithKeepaliveWhenHidden() {
+  if (document.visibilityState === "hidden") releaseAllWithKeepalive();
 }
 function touchPointsSnapshot() {
   return Array.from(touchPoints.values()).sort((left, right) => left.id - right.id);
@@ -1077,7 +1109,9 @@ pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
 window.addEventListener("blur", releaseTouchpadInteraction);
 window.addEventListener("pagehide", releaseTouchpadInteraction);
+window.addEventListener("pagehide", releaseAllWithKeepalive);
 document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
+document.addEventListener("visibilitychange", releaseAllWithKeepaliveWhenHidden);
 function attachHeldButton(button, sendState) {
   let activePointer = null;
   function release(force, pointerId = null) {
@@ -1306,8 +1340,10 @@ mod tests {
 
         assert!(page.contains("data-release-all"));
         assert!(page.contains("function sendReleaseAll()"));
-        assert!(page.contains("mobile-release-all-mouse-left"));
-        assert!(page.contains("mobile-release-all-key-controlleft"));
+        assert!(page.contains("function releaseAllRequests(prefix)"));
+        assert!(page.contains("releaseAllRequests(\"mobile-release-all\")"));
+        assert!(page.contains("${prefix}-mouse-left"));
+        assert!(page.contains("${prefix}-key-controlleft"));
         assert!(page.contains(">释放全部</button>"));
     }
 
@@ -1540,6 +1576,19 @@ mod tests {
             "document.addEventListener(\"visibilitychange\", releaseTouchpadInteractionWhenHidden);"
         ));
         assert!(page.contains("document.visibilityState === \"hidden\""));
+    }
+
+    #[test]
+    fn rendered_mobile_page_uses_keepalive_release_all_when_page_lifecycle_ends() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function releaseAllWithKeepalive()"));
+        assert!(page.contains("navigator.sendBeacon"));
+        assert!(page.contains("keepalive: true"));
+        assert!(page.contains("mobile-release-all-keepalive"));
+        assert!(page.contains("window.addEventListener(\"pagehide\", releaseAllWithKeepalive);"));
+        assert!(page
+            .contains("if (document.visibilityState === \"hidden\") releaseAllWithKeepalive();"));
     }
 
     #[test]
