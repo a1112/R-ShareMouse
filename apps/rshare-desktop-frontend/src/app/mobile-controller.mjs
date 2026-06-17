@@ -10,6 +10,14 @@ export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
   spellCheck: false,
 });
 
+export function formatMobileControllerError(error, scope = "移动端") {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
+    return `${scope}网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络`;
+  }
+  return `${scope}请求失败：${message || "未知错误"}`;
+}
+
 export function shouldCommitMobileTextOnKeyDown(event) {
   const keyCode = Number(event?.keyCode ?? event?.which ?? event?.nativeEvent?.keyCode ?? 0);
   const isComposing =

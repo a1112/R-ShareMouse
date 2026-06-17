@@ -23,6 +23,7 @@ import {
   createHeldInputController,
   createMobileCorrelationId,
   createPointerMoveCoalescer,
+  formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   nextPointerPosition,
@@ -209,7 +210,7 @@ export default function MobileController() {
         }
       } catch (error) {
         if (!cancelled) {
-          setStatus(error instanceof Error ? error.message : String(error));
+          setStatus(formatMobileControllerError(error, "移动端状态"));
         }
       }
     }
@@ -232,9 +233,11 @@ export default function MobileController() {
         setSendState("ok");
       }
       setStatus("已连接");
+      return true;
     } catch (error) {
       setSendState("error");
-      setStatus(error instanceof Error ? error.message : String(error));
+      setStatus(formatMobileControllerError(error, "移动端注入"));
+      return false;
     }
   }
 
@@ -495,8 +498,12 @@ export default function MobileController() {
     if (!value) {
       return;
     }
-    await sendRequest(buildTextCommitRequest(value, createMobileCorrelationId("mobile-text")));
-    setText("");
+    const ok = await sendRequest(
+      buildTextCommitRequest(value, createMobileCorrelationId("mobile-text")),
+    );
+    if (ok) {
+      setText("");
+    }
   }
 
   const statusColor =

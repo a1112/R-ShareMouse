@@ -507,6 +507,13 @@ const LONG_PRESS_DRAG_DELAY_MS = 420;
 function cid(prefix) {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
+function formatMobileError(error, scope = "移动端") {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
+    return `${scope}网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络`;
+  }
+  return `${scope}请求失败：${message || "未知错误"}`;
+}
 async function api(path, options = {}) {
   const headers = { Authorization: `Bearer ${token}`, ...(options.headers || {}) };
   const response = await fetch(path, { ...options, headers });
@@ -523,12 +530,19 @@ function daemonRequest(deviceKind, payload, correlationId, mode = "BestEffort", 
   };
 }
 async function inject(request) {
-  const result = await api("/api/inject", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request)
-  });
-  statusEl.textContent = result.EndpointInjectResult?.accepted === false ? "注入失败" : "已连接";
+  try {
+    const result = await api("/api/inject", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    const accepted = result.EndpointInjectResult?.accepted !== false;
+    statusEl.textContent = accepted ? "已连接" : "注入失败";
+    return accepted;
+  } catch (error) {
+    statusEl.textContent = formatMobileError(error, "移动端注入");
+    return false;
+  }
 }
 async function refresh() {
   try {
@@ -547,7 +561,7 @@ async function refresh() {
     posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
     statusEl.textContent = "已连接";
   } catch (error) {
-    statusEl.textContent = error.message || String(error);
+    statusEl.textContent = formatMobileError(error, "移动端状态");
   }
 }
 function sendMoveNow(next) {
@@ -758,8 +772,9 @@ document.querySelectorAll("[data-key]").forEach((button) => {
 async function sendText() {
   const text = textInput.value;
   if (!text) return;
-  await inject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750));
-  textInput.value = "";
+  if (await inject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750))) {
+    textInput.value = "";
+  }
 }
 function shouldSendTextOnKeydown(event) {
   return event.key === "Enter" && !event.isComposing && event.keyCode !== 229;
@@ -903,6 +918,18 @@ mod tests {
         assert!(page.contains("event.isComposing"));
         assert!(page.contains("event.keyCode !== 229"));
         assert!(page.contains("if (shouldSendTextOnKeydown(event))"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_hides_raw_fetch_failures_and_keeps_text_on_failure() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function formatMobileError"));
+        assert!(page.contains("failed to fetch|networkerror|fetch failed|load failed"));
+        assert!(page.contains("网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络"));
+        assert!(page.contains("return false;"));
+        assert!(page.contains("if (await inject"));
+        assert!(page.contains("textInput.value = \"\";"));
     }
 
     #[test]

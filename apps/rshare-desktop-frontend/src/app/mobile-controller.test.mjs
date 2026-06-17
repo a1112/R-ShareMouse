@@ -12,6 +12,7 @@ import {
   createHeldInputController,
   buildTextCommitRequest,
   createPointerMoveCoalescer,
+  formatMobileControllerError,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   nextPointerPosition,
@@ -47,6 +48,17 @@ test("mobile text input uses phone keyboard send hints", () => {
     autoCorrect: "off",
     spellCheck: false,
   });
+});
+
+test("formatMobileControllerError hides raw browser fetch failures", () => {
+  assert.equal(
+    formatMobileControllerError(new TypeError("Failed to fetch"), "移动端注入"),
+    "移动端注入网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络",
+  );
+  assert.equal(
+    formatMobileControllerError(new Error("HTTP 401"), "移动端状态"),
+    "移动端状态请求失败：HTTP 401",
+  );
 });
 
 test("shouldCommitMobileTextOnKeyDown ignores IME composition enter", () => {
