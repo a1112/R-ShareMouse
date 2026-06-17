@@ -654,6 +654,7 @@ let pendingMove = null;
 let pendingMoveFrame = 0;
 let dragTimer = 0;
 let dragPointer = null;
+let wakeLock = null;
 const LONG_PRESS_DRAG_DELAY_MS = 420;
 const POINTER_SENSITIVITY_STORAGE_KEY = "rshare.mobile.pointerSensitivity";
 const POINTER_SENSITIVITY_DEFAULT = 1.35;
@@ -741,12 +742,31 @@ function preventMobileGestureDefault(event) {
   event.returnValue = false;
   return true;
 }
+async function requestMobileWakeLock() {
+  if (document.visibilityState !== "visible" || !navigator.wakeLock) return;
+  if (wakeLock && wakeLock.released === false) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => {
+      wakeLock = null;
+    });
+  } catch {
+    wakeLock = null;
+  }
+}
+function requestMobileWakeLockWhenVisible() {
+  if (document.visibilityState === "visible") {
+    requestMobileWakeLock();
+  }
+}
 ["mousedown", "mouseup", "auxclick", "pointerdown", "pointerup", "keydown"].forEach((eventName) => {
   window.addEventListener(eventName, preventBrowserNavigationEvent, mobileEventOptions);
 });
 ["contextmenu", "dragstart", "selectstart", "gesturestart", "gesturechange", "gestureend"].forEach((eventName) => {
   document.addEventListener(eventName, preventMobileGestureDefault, mobileEventOptions);
 });
+document.addEventListener("visibilitychange", requestMobileWakeLockWhenVisible);
+requestMobileWakeLock();
 async function api(path, options = {}) {
   const headers = { Authorization: `Bearer ${token}`, ...(options.headers || {}) };
   const response = await fetch(path, { ...options, headers });
@@ -1589,6 +1609,20 @@ mod tests {
         assert!(page.contains("window.addEventListener(\"pagehide\", releaseAllWithKeepalive);"));
         assert!(page
             .contains("if (document.visibilityState === \"hidden\") releaseAllWithKeepalive();"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_requests_screen_wake_lock_while_visible() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("let wakeLock = null"));
+        assert!(page.contains("async function requestMobileWakeLock()"));
+        assert!(page.contains("navigator.wakeLock.request(\"screen\")"));
+        assert!(page.contains("wakeLock.addEventListener(\"release\""));
+        assert!(page.contains(
+            "document.addEventListener(\"visibilitychange\", requestMobileWakeLockWhenVisible);"
+        ));
+        assert!(page.contains("requestMobileWakeLock();"));
     }
 
     #[test]

@@ -451,6 +451,17 @@ test("mobile controller releases touchpad drag when the page lifecycle cancels i
   assert.match(source, /document\.visibilityState === "hidden"/);
 });
 
+test("mobile controller requests screen wake lock while visible", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /wakeLockRef/);
+  assert.match(source, /async function requestMobileWakeLock\(\)/);
+  assert.match(source, /wakeLockApi\.request\("screen"\)/);
+  assert.match(source, /wakeLock\.addEventListener\?\.\("release"/);
+  assert.match(source, /requestMobileWakeLockWhenVisible/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", requestMobileWakeLockWhenVisible\)/);
+});
+
 test("mobile controller installs browser navigation and gesture guards", () => {
   const source = readAppFile("src/app/MobileController.tsx");
 
