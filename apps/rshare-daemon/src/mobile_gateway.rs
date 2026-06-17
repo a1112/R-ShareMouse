@@ -712,6 +712,22 @@ function releaseTouchpadDrag(pointerId = null) {
   dragPointer = null;
   sendDragButton("Released");
 }
+function releaseTouchpadInteraction() {
+  clearDragTimer();
+  flushMove();
+  releaseTouchpadDrag();
+  activePointer = null;
+  lastPoint = null;
+  tapStart = null;
+  lastWheelTouches = null;
+  twoFingerTapStart = null;
+  touchPoints.clear();
+}
+function releaseTouchpadInteractionWhenHidden() {
+  if (document.visibilityState === "hidden") {
+    releaseTouchpadInteraction();
+  }
+}
 function touchPointsSnapshot() {
   return Array.from(touchPoints.values()).sort((left, right) => left.id - right.id);
 }
@@ -847,6 +863,9 @@ function cancelPointer(event) {
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
+window.addEventListener("blur", releaseTouchpadInteraction);
+window.addEventListener("pagehide", releaseTouchpadInteraction);
+document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
 function attachHeldButton(button, sendState) {
   let activePointer = null;
   function release(force, pointerId = null) {
@@ -1171,6 +1190,20 @@ mod tests {
         assert!(page.contains("dragTimer = setTimeout"));
         assert!(page.contains("sendDragButton(\"Pressed\")"));
         assert!(page.contains("sendDragButton(\"Released\")"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_releases_touchpad_drag_when_page_lifecycle_cancels_input() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function releaseTouchpadInteraction()"));
+        assert!(page.contains("releaseTouchpadDrag();"));
+        assert!(page.contains("window.addEventListener(\"blur\", releaseTouchpadInteraction);"));
+        assert!(page.contains("window.addEventListener(\"pagehide\", releaseTouchpadInteraction);"));
+        assert!(page.contains(
+            "document.addEventListener(\"visibilitychange\", releaseTouchpadInteractionWhenHidden);"
+        ));
+        assert!(page.contains("document.visibilityState === \"hidden\""));
     }
 
     #[test]

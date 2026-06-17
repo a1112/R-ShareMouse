@@ -271,6 +271,17 @@ test("isTouchpadLongPressDrag accepts still long presses and rejects early or mo
   );
 });
 
+test("mobile controller releases touchpad drag when the page lifecycle cancels input", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /function releaseTouchpadInteraction\(\)/);
+  assert.match(source, /releaseTouchpadDrag\(\);/);
+  assert.match(source, /window\.addEventListener\("blur", releaseTouchpadInteraction\)/);
+  assert.match(source, /window\.addEventListener\("pagehide", releaseTouchpadInteraction\)/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", releaseTouchpadInteractionWhenHidden\)/);
+  assert.match(source, /document\.visibilityState === "hidden"/);
+});
+
 test("isTouchpadTap accepts short still taps and rejects drags or long presses", () => {
   assert.equal(
     isTouchpadTap(

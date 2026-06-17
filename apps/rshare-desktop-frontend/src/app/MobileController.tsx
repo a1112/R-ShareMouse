@@ -301,6 +301,18 @@ export default function MobileController() {
     sendDragButton("Released");
   }
 
+  function releaseTouchpadInteraction() {
+    clearDragTimer();
+    moveCoalescerRef.current?.flush();
+    releaseTouchpadDrag();
+    activePointerRef.current = null;
+    lastPointRef.current = null;
+    tapStartRef.current = null;
+    lastWheelTouchesRef.current = null;
+    twoFingerTapStartRef.current = null;
+    touchPointsRef.current.clear();
+  }
+
   function beginTouchpadDrag(pointerId: number) {
     dragTimerRef.current = null;
     if (
@@ -472,6 +484,25 @@ export default function MobileController() {
       twoFingerTapStartRef.current = null;
     }
   }
+
+  useEffect(() => {
+    function releaseTouchpadInteractionWhenHidden() {
+      if (document.visibilityState === "hidden") {
+        releaseTouchpadInteraction();
+      }
+    }
+
+    window.addEventListener("blur", releaseTouchpadInteraction);
+    window.addEventListener("pagehide", releaseTouchpadInteraction);
+    document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
+
+    return () => {
+      releaseTouchpadInteraction();
+      window.removeEventListener("blur", releaseTouchpadInteraction);
+      window.removeEventListener("pagehide", releaseTouchpadInteraction);
+      document.removeEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
+    };
+  }, []);
 
   async function mouseClick(button: "Left" | "Right" | "Middle") {
     const current = pointerRef.current;
