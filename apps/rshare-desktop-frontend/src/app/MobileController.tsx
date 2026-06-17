@@ -62,6 +62,7 @@ type SendState = "idle" | "sending" | "ok" | "error";
 type TouchPoint = { id: number; x: number; y: number };
 type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
+type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -606,7 +607,7 @@ export default function MobileController() {
     };
   }, []);
 
-  async function mouseClick(button: "Left" | "Right" | "Middle") {
+  async function mouseClick(button: MouseButtonName) {
     const current = pointerRef.current;
     const requests = buildMouseClickRequests(
       button,
@@ -620,7 +621,7 @@ export default function MobileController() {
   }
 
   async function mouseDoubleClick(
-    button: "Left" | "Right" | "Middle",
+    button: MouseButtonName,
     correlationPrefix = `mobile-${button.toLowerCase()}-double-click`,
   ) {
     const current = pointerRef.current;
@@ -638,7 +639,7 @@ export default function MobileController() {
     }
   }
 
-  function mouseButton(button: "Left" | "Right" | "Middle", state: "Pressed" | "Released") {
+  function mouseButton(button: MouseButtonName, state: "Pressed" | "Released") {
     void sendRequest(
       buildMouseButtonRequest(
         button,
@@ -790,7 +791,7 @@ export default function MobileController() {
           </span>
         </section>
 
-        <section className="grid grid-cols-4 gap-2">
+        <section className="grid grid-cols-3 gap-2">
           <PressButton
             label="左键"
             onDown={() => mouseButton("Left", "Pressed")}
@@ -805,6 +806,16 @@ export default function MobileController() {
             label="右键"
             onDown={() => mouseButton("Right", "Pressed")}
             onUp={() => mouseButton("Right", "Released")}
+          />
+          <PressButton
+            label="后退"
+            onDown={() => mouseButton("Back", "Pressed")}
+            onUp={() => mouseButton("Back", "Released")}
+          />
+          <PressButton
+            label="前进"
+            onDown={() => mouseButton("Forward", "Pressed")}
+            onUp={() => mouseButton("Forward", "Released")}
           />
           <IconButton label="双击" onClick={() => void mouseDoubleClick("Left", "mobile-left-double-click")}>
             <span className="text-sm font-medium">双击</span>

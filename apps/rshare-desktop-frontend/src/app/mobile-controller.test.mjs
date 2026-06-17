@@ -128,6 +128,15 @@ test("mobile controller exposes an explicit left double click control", () => {
   assert.match(source, /mobile-left-double-click/);
 });
 
+test("mobile controller exposes mouse back and forward side buttons", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /label="后退"/);
+  assert.match(source, /label="前进"/);
+  assert.match(source, /mouseButton\("Back", "Pressed"\)/);
+  assert.match(source, /mouseButton\("Forward", "Pressed"\)/);
+});
+
 test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {
   assert.deepEqual(MOBILE_POINTER_SENSITIVITY, {
     storageKey: "rshare.mobile.pointerSensitivity",

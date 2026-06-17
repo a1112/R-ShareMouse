@@ -550,10 +550,12 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <input id="sensitivity" type="range" aria-label="触控板灵敏度" min="0.5" max="3" step="0.05" value="1.35">
     <span class="rangeValue" id="sensitivityValue">1.35</span>
   </section>
-  <section class="grid4">
+  <section class="grid3">
     <button data-button="Left">左键</button>
     <button data-button="Middle">中键</button>
     <button data-button="Right">右键</button>
+    <button data-button="Back">后退</button>
+    <button data-button="Forward">前进</button>
     <button data-double-click="Left">双击</button>
   </section>
   <section class="grid4">
@@ -1208,6 +1210,16 @@ mod tests {
         assert!(page.contains("function sendDoubleClick"));
         assert!(page.contains("mobile-double-Left-1-down"));
         assert!(page.contains("mobile-double-Left-2-up"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_exposes_mouse_back_and_forward_buttons() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("data-button=\"Back\""));
+        assert!(page.contains("data-button=\"Forward\""));
+        assert!(page.contains(">后退</button>"));
+        assert!(page.contains(">前进</button>"));
     }
 
     #[test]
