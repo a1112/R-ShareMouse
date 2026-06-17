@@ -481,11 +481,41 @@ fn mobile_token_from_target(target: &str) -> Option<String> {
     query.split('&').find_map(|part| {
         let (key, value) = part.split_once('=')?;
         if key == "t" || key == "token" {
-            Some(value.to_string())
+            Some(percent_decode_query_value(value))
         } else {
             None
         }
     })
+}
+
+fn percent_decode_query_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (
+                hex_digit_value(bytes[index + 1]),
+                hex_digit_value(bytes[index + 2]),
+            ) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_digit_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {

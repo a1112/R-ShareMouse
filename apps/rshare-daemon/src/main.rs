@@ -10014,6 +10014,16 @@ mod tests {
             &header_request,
             "mobile-secret"
         ));
+
+        let encoded_query_request = mobile_gateway::MobileHttpRequest::new(
+            "GET",
+            "/mobile?t=mobile%2Bsecret%2Ftoken%3D",
+            Vec::new(),
+        );
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &encoded_query_request,
+            "mobile+secret/token="
+        ));
     }
 
     #[test]
