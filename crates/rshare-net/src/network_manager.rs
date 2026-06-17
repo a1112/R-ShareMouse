@@ -212,6 +212,7 @@ impl NetworkManager {
         let discovered_devices = self.discovered_devices.clone();
         let auto_connect_config = self.config.clone();
         let auto_connect_connection = self.connection.clone();
+        let local_device_id = self.local_device_id;
 
         let mut discovery = ServiceDiscovery::new(
             self.local_device_id,
@@ -255,6 +256,7 @@ impl NetworkManager {
                         spawn_auto_connect_discovered_device(
                             auto_connect_connection.clone(),
                             auto_connect_config.clone(),
+                            local_device_id,
                             device,
                         );
                     }
@@ -270,6 +272,7 @@ impl NetworkManager {
                         spawn_auto_connect_discovered_device(
                             auto_connect_connection.clone(),
                             auto_connect_config.clone(),
+                            local_device_id,
                             device,
                         );
                     }
@@ -363,9 +366,13 @@ fn normalize_discovered_connection_address(
 
 fn auto_connect_address_for_device(
     config: &NetworkManagerConfig,
+    local_device_id: DeviceId,
     device: &DiscoveredDevice,
 ) -> Option<String> {
     if !config.auto_connect {
+        return None;
+    }
+    if local_device_id > device.id {
         return None;
     }
 
@@ -380,9 +387,10 @@ fn auto_connect_address_for_device(
 fn spawn_auto_connect_discovered_device(
     connection: Arc<TokioMutex<ConnectionManager>>,
     config: NetworkManagerConfig,
+    local_device_id: DeviceId,
     device: DiscoveredDevice,
 ) {
-    let Some(address) = auto_connect_address_for_device(&config, &device) else {
+    let Some(address) = auto_connect_address_for_device(&config, local_device_id, &device) else {
         return;
     };
 
@@ -443,9 +451,16 @@ mod tests {
         );
     }
 
-    fn discovered_device_with_address(address: &str) -> DiscoveredDevice {
+    fn deterministic_device_id(byte: u8) -> DeviceId {
+        DeviceId::from_bytes([byte; 16])
+    }
+
+    fn discovered_device_with_id_and_address(
+        device_id: DeviceId,
+        address: &str,
+    ) -> DiscoveredDevice {
         DiscoveredDevice {
-            id: DeviceId::new_v4(),
+            id: device_id,
             name: "remote".to_string(),
             hostname: "remote-host".to_string(),
             addresses: vec![address.parse().unwrap()],
@@ -455,14 +470,36 @@ mod tests {
         }
     }
 
+    fn discovered_device_with_address(address: &str) -> DiscoveredDevice {
+        discovered_device_with_id_and_address(DeviceId::new_v4(), address)
+    }
+
     #[test]
     fn auto_connect_address_uses_discovered_connection_address_when_enabled() {
         let config = NetworkManagerConfig::default();
-        let device = discovered_device_with_address("192.168.1.241:27432");
+        let device = discovered_device_with_id_and_address(
+            deterministic_device_id(0xF0),
+            "192.168.1.241:27432",
+        );
 
         assert_eq!(
-            auto_connect_address_for_device(&config, &device),
+            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
             Some("192.168.1.241:27431".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_connect_address_is_none_when_local_device_wins_tie_breaker() {
+        let config = NetworkManagerConfig::default();
+        let local_id = deterministic_device_id(0xF0);
+        let remote = discovered_device_with_id_and_address(
+            deterministic_device_id(0x10),
+            "192.168.1.241:27432",
+        );
+
+        assert_eq!(
+            auto_connect_address_for_device(&config, local_id, &remote),
+            None
         );
     }
 
@@ -472,7 +509,10 @@ mod tests {
         config.auto_connect = false;
         let device = discovered_device_with_address("192.168.1.241:27432");
 
-        assert_eq!(auto_connect_address_for_device(&config, &device), None);
+        assert_eq!(
+            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
+            None
+        );
     }
 
     #[test]
@@ -481,7 +521,10 @@ mod tests {
         let mut device = discovered_device_with_address("192.168.1.241:27432");
         device.addresses.clear();
 
-        assert_eq!(auto_connect_address_for_device(&config, &device), None);
+        assert_eq!(
+            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
+            None
+        );
     }
 
     #[test]
