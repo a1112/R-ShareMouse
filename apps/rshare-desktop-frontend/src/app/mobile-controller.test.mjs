@@ -13,6 +13,7 @@ import {
   buildKeyChordRequests,
   buildKeyRequest,
   buildKeyTapRequests,
+  buildMobileReleaseAllRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
   buildMouseDoubleClickRequests,
@@ -136,6 +137,15 @@ test("mobile controller exposes mouse back and forward side buttons", () => {
   assert.match(source, /label="前进"/);
   assert.match(source, /mouseButton\("Back", "Pressed"\)/);
   assert.match(source, /mouseButton\("Forward", "Pressed"\)/);
+});
+
+test("mobile controller exposes a release-all input control", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /buildMobileReleaseAllRequests/);
+  assert.match(source, /function releaseAllInputs/);
+  assert.match(source, /label="释放全部"/);
+  assert.match(source, /mobile-release-all/);
 });
 
 test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {
@@ -320,6 +330,42 @@ test("buildMouseDoubleClickRequests emits two ordered click pairs at the current
       "mobile-double-click-2-down",
       "mobile-double-click-2-up",
     ],
+  );
+});
+
+test("buildMobileReleaseAllRequests releases mouse buttons and held modifiers", () => {
+  const requests = buildMobileReleaseAllRequests(320, 240, "mobile-release-all");
+
+  assert.deepEqual(
+    requests
+      .filter((request) => request.InjectEndpointEvent.request.device_kind === "Mouse")
+      .map((request) => request.InjectEndpointEvent.request.payload.data),
+    [
+      { button: "Left", state: "Released", x: 320, y: 240 },
+      { button: "Middle", state: "Released", x: 320, y: 240 },
+      { button: "Right", state: "Released", x: 320, y: 240 },
+      { button: "Back", state: "Released", x: 320, y: 240 },
+      { button: "Forward", state: "Released", x: 320, y: 240 },
+    ],
+  );
+  assert.deepEqual(
+    requests
+      .filter((request) => request.InjectEndpointEvent.request.device_kind === "Keyboard")
+      .map((request) => request.InjectEndpointEvent.request.payload.data),
+    [
+      { key: "ControlLeft", state: "Released" },
+      { key: "ShiftLeft", state: "Released" },
+      { key: "AltLeft", state: "Released" },
+      { key: "SuperLeft", state: "Released" },
+    ],
+  );
+  assert.equal(
+    requests.at(0).InjectEndpointEvent.request.correlation_id,
+    "mobile-release-all-mouse-left",
+  );
+  assert.equal(
+    requests.at(-1).InjectEndpointEvent.request.correlation_id,
+    "mobile-release-all-key-superleft",
   );
 });
 

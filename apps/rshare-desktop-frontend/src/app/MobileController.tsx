@@ -20,6 +20,7 @@ import {
   MOBILE_TEXT_INPUT_HINTS,
   buildKeyChordRequests,
   buildKeyRequest,
+  buildMobileReleaseAllRequests,
   buildMouseButtonRequest,
   buildMouseClickRequests,
   buildMouseDoubleClickRequests,
@@ -697,6 +698,22 @@ export default function MobileController() {
     }
   }
 
+  async function releaseAllInputs() {
+    releaseTouchpadInteraction();
+    const current = pointerRef.current;
+    const requests = buildMobileReleaseAllRequests(
+      current.x,
+      current.y,
+      createMobileCorrelationId("mobile-release-all"),
+    );
+    for (const request of requests) {
+      const ok = await sendRequest(request);
+      if (!ok) {
+        break;
+      }
+    }
+  }
+
   async function commitText() {
     const value = text;
     if (!value) {
@@ -836,6 +853,9 @@ export default function MobileController() {
           />
           <IconButton label="双击" onClick={() => void mouseDoubleClick("Left", "mobile-left-double-click")}>
             <span className="text-sm font-medium">双击</span>
+          </IconButton>
+          <IconButton label="释放全部" onClick={() => void releaseAllInputs()}>
+            <span className="text-sm font-medium">释放全部</span>
           </IconButton>
         </section>
 

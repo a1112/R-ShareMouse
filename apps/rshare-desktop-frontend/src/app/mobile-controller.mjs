@@ -221,6 +221,25 @@ export function buildKeyChordRequests(keys, correlationPrefix) {
   ];
 }
 
+export function buildMobileReleaseAllRequests(x, y, correlationPrefix) {
+  const mouseButtons = ["Left", "Middle", "Right", "Back", "Forward"];
+  const modifierKeys = ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"];
+  return [
+    ...mouseButtons.map((button) =>
+      buildMouseButtonRequest(
+        button,
+        "Released",
+        x,
+        y,
+        `${correlationPrefix}-mouse-${keyCorrelationSlug(button)}`,
+      ),
+    ),
+    ...modifierKeys.map((key) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-key-${keyCorrelationSlug(key)}`),
+    ),
+  ];
+}
+
 export function createHeldInputController(sendState) {
   let active = false;
   let activePointerId = null;

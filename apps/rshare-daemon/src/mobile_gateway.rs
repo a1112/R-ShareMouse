@@ -558,6 +558,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <button data-button="Back">后退</button>
     <button data-button="Forward">前进</button>
     <button data-double-click="Left">双击</button>
+    <button data-release-all>释放全部</button>
   </section>
   <section class="grid4">
     <button data-wheel="3">上滚</button>
@@ -843,6 +844,27 @@ async function sendDoubleClick(buttonName) {
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)));
   await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)));
 }
+async function sendReleaseAll() {
+  const mouseButtons = [
+    ["Left", "mobile-release-all-mouse-left"],
+    ["Middle", "mobile-release-all-mouse-middle"],
+    ["Right", "mobile-release-all-mouse-right"],
+    ["Back", "mobile-release-all-mouse-back"],
+    ["Forward", "mobile-release-all-mouse-forward"]
+  ];
+  const modifierKeys = [
+    ["ControlLeft", "mobile-release-all-key-controlleft"],
+    ["ShiftLeft", "mobile-release-all-key-shiftleft"],
+    ["AltLeft", "mobile-release-all-key-altleft"],
+    ["SuperLeft", "mobile-release-all-key-superleft"]
+  ];
+  for (const [buttonName, correlationId] of mouseButtons) {
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId)));
+  }
+  for (const [key, correlationId] of modifierKeys) {
+    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750));
+  }
+}
 function clearDragTimer() {
   if (dragTimer) {
     clearTimeout(dragTimer);
@@ -1061,6 +1083,9 @@ document.querySelectorAll("[data-button]").forEach((button) => {
 document.querySelectorAll("[data-double-click]").forEach((button) => button.addEventListener("click", () => {
   sendDoubleClick(button.dataset.doubleClick || "Left");
 }));
+document.querySelectorAll("[data-release-all]").forEach((button) => button.addEventListener("click", () => {
+  sendReleaseAll();
+}));
 document.querySelectorAll("[data-wheel]").forEach((button) => button.addEventListener("click", () => {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: 0, delta_y: Number(button.dataset.wheel), x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
 }));
@@ -1242,6 +1267,17 @@ mod tests {
         assert!(page.contains("data-button=\"Forward\""));
         assert!(page.contains(">后退</button>"));
         assert!(page.contains(">前进</button>"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_exposes_release_all_input_control() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("data-release-all"));
+        assert!(page.contains("function sendReleaseAll()"));
+        assert!(page.contains("mobile-release-all-mouse-left"));
+        assert!(page.contains("mobile-release-all-key-controlleft"));
+        assert!(page.contains(">释放全部</button>"));
     }
 
     #[test]
