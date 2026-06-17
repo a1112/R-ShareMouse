@@ -48,6 +48,8 @@ type TauriInvoke = (command: string, args?: Record<string, unknown>) => Promise<
 type PointerState = {
   x: number;
   y: number;
+  minX: number;
+  minY: number;
   width: number;
   height: number;
   displayId: string | null;
@@ -125,12 +127,24 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
   const displays = Array.isArray(display.displays) ? display.displays : [];
   const primary = displays.find((item) => isRecord(item) && item.primary) ?? displays[0];
   const primaryDisplay = isRecord(primary) ? primary : {};
-  const width = Number(display.primary_width ?? primaryDisplay.w ?? 1920);
-  const height = Number(display.primary_height ?? primaryDisplay.h ?? 1080);
+  const minX = Number(display.virtual_x ?? primaryDisplay.x ?? 0);
+  const minY = Number(display.virtual_y ?? primaryDisplay.y ?? 0);
+  const width = Number(
+    display.layout_width ?? display.primary_width ?? primaryDisplay.width ?? primaryDisplay.w ?? 1920,
+  );
+  const height = Number(
+    display.layout_height ??
+      display.primary_height ??
+      primaryDisplay.height ??
+      primaryDisplay.h ??
+      1080,
+  );
 
   return {
     x: Number(mouse.x ?? 0),
     y: Number(mouse.y ?? 0),
+    minX: Number.isFinite(minX) ? Math.floor(minX) : 0,
+    minY: Number.isFinite(minY) ? Math.floor(minY) : 0,
     width: Number.isFinite(width) && width > 0 ? Math.floor(width) : 1920,
     height: Number.isFinite(height) && height > 0 ? Math.floor(height) : 1080,
     displayId:
@@ -230,6 +244,8 @@ export default function MobileController() {
   const [pointer, setPointer] = useState<PointerState>({
     x: 0,
     y: 0,
+    minX: 0,
+    minY: 0,
     width: 1920,
     height: 1080,
     displayId: null,
@@ -479,7 +495,13 @@ export default function MobileController() {
       ...nextPointerPosition(
         current,
         { dx: event.clientX - last.x, dy: event.clientY - last.y },
-        { width: current.width, height: current.height, sensitivity: sensitivityRef.current },
+        {
+          x: current.minX,
+          y: current.minY,
+          width: current.width,
+          height: current.height,
+          sensitivity: sensitivityRef.current,
+        },
       ),
     };
     pointerRef.current = next;

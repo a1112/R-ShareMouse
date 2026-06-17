@@ -350,6 +350,15 @@ test("mobile controller exposes a persistent touchpad sensitivity control", () =
   assert.match(source, /sensitivity: sensitivityRef\.current/);
 });
 
+test("mobile controller uses the full virtual desktop bounds for pointer movement", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /virtual_x/);
+  assert.match(source, /virtual_y/);
+  assert.match(source, /layout_width/);
+  assert.match(source, /layout_height/);
+});
+
 test("preventMobileGestureDefault blocks control-surface browser gestures but preserves text editing", () => {
   const controlTarget = { closest: () => null, tagName: "DIV" };
   const inputTarget = { closest: () => ({}), tagName: "INPUT" };
@@ -435,6 +444,25 @@ test("nextPointerPosition applies sensitivity and clamps to desktop bounds", () 
       { width: 1920, height: 1080, sensitivity: 1 },
     ),
     { x: 1919, y: 1079 },
+  );
+});
+
+test("nextPointerPosition preserves negative coordinates inside a virtual desktop", () => {
+  assert.deepEqual(
+    nextPointerPosition(
+      { x: -2500, y: -230 },
+      { dx: -200, dy: -100 },
+      { x: -2560, y: -240, width: 4480, height: 1680, sensitivity: 1 },
+    ),
+    { x: -2560, y: -240 },
+  );
+  assert.deepEqual(
+    nextPointerPosition(
+      { x: 1900, y: 1430 },
+      { dx: 100, dy: 100 },
+      { x: -2560, y: -240, width: 4480, height: 1680, sensitivity: 1 },
+    ),
+    { x: 1919, y: 1439 },
   );
 });
 

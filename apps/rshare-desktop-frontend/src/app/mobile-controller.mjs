@@ -285,6 +285,8 @@ export function buildMouseWheelRequest(deltaX, deltaY, x, y, correlationId) {
 }
 
 export function nextPointerPosition(current, delta, bounds) {
+  const minX = Math.floor(Number(bounds?.x ?? bounds?.minX ?? 0));
+  const minY = Math.floor(Number(bounds?.y ?? bounds?.minY ?? 0));
   const width = Math.max(1, Math.floor(Number(bounds?.width ?? 1)));
   const height = Math.max(1, Math.floor(Number(bounds?.height ?? 1)));
   const sensitivity = Number.isFinite(Number(bounds?.sensitivity))
@@ -292,10 +294,12 @@ export function nextPointerPosition(current, delta, bounds) {
     : 1;
   const x = Math.round(Number(current?.x ?? 0) + Number(delta?.dx ?? 0) * sensitivity);
   const y = Math.round(Number(current?.y ?? 0) + Number(delta?.dy ?? 0) * sensitivity);
+  const maxX = minX + width - 1;
+  const maxY = minY + height - 1;
 
   return {
-    x: Math.max(0, Math.min(width - 1, x)),
-    y: Math.max(0, Math.min(height - 1, y)),
+    x: Math.max(minX, Math.min(maxX, x)),
+    y: Math.max(minY, Math.min(maxY, y)),
   };
 }
 

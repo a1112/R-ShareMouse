@@ -605,7 +605,7 @@ const textInput = document.getElementById("text");
 const sensitivityInput = document.getElementById("sensitivity");
 const sensitivityValue = document.getElementById("sensitivityValue");
 const mobileEventOptions = { capture: true, passive: false };
-let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
+let pointer = { x: 0, y: 0, minX: 0, minY: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
 let lastPoint = null;
 let tapStart = null;
@@ -731,11 +731,17 @@ async function refresh() {
     const mouse = snapshot.mouse || {};
     const display = snapshot.display || {};
     const primary = (display.displays || []).find((item) => item.primary) || (display.displays || [])[0] || {};
+    const minX = Number(display.virtual_x ?? primary.x ?? 0);
+    const minY = Number(display.virtual_y ?? primary.y ?? 0);
+    const layoutWidth = Number(display.layout_width ?? display.primary_width ?? primary.width ?? primary.w ?? 1920);
+    const layoutHeight = Number(display.layout_height ?? display.primary_height ?? primary.height ?? primary.h ?? 1080);
     pointer = {
       x: Number(mouse.x || 0),
       y: Number(mouse.y || 0),
-      width: Math.max(1, Number(display.primary_width || primary.w || 1920)),
-      height: Math.max(1, Number(display.primary_height || primary.h || 1080)),
+      minX: Number.isFinite(minX) ? Math.floor(minX) : 0,
+      minY: Number.isFinite(minY) ? Math.floor(minY) : 0,
+      width: Math.max(1, Math.floor(Number.isFinite(layoutWidth) ? layoutWidth : 1920)),
+      height: Math.max(1, Math.floor(Number.isFinite(layoutHeight) ? layoutHeight : 1080)),
       displayId: mouse.current_display_id || primary.id || null
     };
     posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
@@ -907,7 +913,9 @@ pad.addEventListener("pointermove", (event) => {
   const dx = Math.round((event.clientX - lastPoint.x) * pointerSensitivity);
   const dy = Math.round((event.clientY - lastPoint.y) * pointerSensitivity);
   lastPoint = { x: event.clientX, y: event.clientY };
-  pointer = { ...pointer, x: Math.max(0, Math.min(pointer.width - 1, pointer.x + dx)), y: Math.max(0, Math.min(pointer.height - 1, pointer.y + dy)) };
+  const maxX = pointer.minX + pointer.width - 1;
+  const maxY = pointer.minY + pointer.height - 1;
+  pointer = { ...pointer, x: Math.max(pointer.minX, Math.min(maxX, pointer.x + dx)), y: Math.max(pointer.minY, Math.min(maxY, pointer.y + dy)) };
   posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
   scheduleMove(pointer);
 });
@@ -1339,6 +1347,18 @@ mod tests {
         assert!(page.contains("localStorage.setItem(POINTER_SENSITIVITY_STORAGE_KEY"));
         assert!(page.contains("event.clientX - lastPoint.x) * pointerSensitivity"));
         assert!(page.contains("event.clientY - lastPoint.y) * pointerSensitivity"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_uses_virtual_desktop_bounds_for_pointer_movement() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("display.virtual_x"));
+        assert!(page.contains("display.virtual_y"));
+        assert!(page.contains("display.layout_width"));
+        assert!(page.contains("display.layout_height"));
+        assert!(page.contains("minX"));
+        assert!(page.contains("minY"));
     }
 
     #[test]
