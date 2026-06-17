@@ -435,14 +435,14 @@ fn render_mobile_page() -> String {
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #101214; color: #edf2ef; }
+    html, body { width: 100%; min-height: 100%; margin: 0; overflow: auto; background: #101214; color: #edf2ef; }
     body { overscroll-behavior: none; }
-    main { height: 100dvh; display: flex; flex-direction: column; gap: 12px; padding: 12px; max-width: 720px; margin: 0 auto; }
+    main { min-height: 100dvh; display: flex; flex-direction: column; gap: 12px; padding: 12px; max-width: 720px; margin: 0 auto; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     h1 { margin: 0; font-size: 14px; line-height: 1.2; }
     .sub { margin-top: 3px; font-size: 12px; color: #8f9b96; }
     .status { border: 1px solid #2a302d; border-radius: 6px; padding: 5px 8px; color: #47c27a; font-size: 12px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #pad { flex: 1; min-height: 320px; border: 1px solid #29302d; border-radius: 6px; background: linear-gradient(135deg, rgba(71,194,122,.08), rgba(255,255,255,.02)); touch-action: none; display: grid; place-items: center; user-select: none; }
+    #pad { flex: 1; min-height: min(260px, 42dvh); border: 1px solid #29302d; border-radius: 6px; background: linear-gradient(135deg, rgba(71,194,122,.08), rgba(255,255,255,.02)); touch-action: none; display: grid; place-items: center; user-select: none; }
     .dot { width: 12px; height: 12px; border-radius: 50%; background: #47c27a; box-shadow: 0 0 24px rgba(71,194,122,.5); }
     .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
@@ -481,6 +481,18 @@ fn render_mobile_page() -> String {
     <button data-key="Up">上</button>
     <button data-key="Down">下</button>
     <button data-key="Right">右</button>
+  </section>
+  <section class="grid4">
+    <button data-key="Escape">Esc</button>
+    <button data-key="Tab">Tab</button>
+    <button data-key="Space">Space</button>
+    <button data-key="Delete">Del</button>
+  </section>
+  <section class="grid4">
+    <button data-shortcut="ControlLeft,C">复制</button>
+    <button data-shortcut="ControlLeft,V">粘贴</button>
+    <button data-shortcut="ControlLeft,X">剪切</button>
+    <button data-shortcut="ControlLeft,A">全选</button>
   </section>
   <section class="textRow">
     <div class="inputWrap"><input id="text" placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send"></div>
@@ -763,12 +775,24 @@ function sendKeyState(button, state) {
   const key = button.dataset.key;
   return inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
 }
+async function sendKeyChord(keys) {
+  for (const key of keys) {
+    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-shortcut-${key}-down`), "RequireHealthyBackend", 750));
+  }
+  for (const key of [...keys].reverse()) {
+    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-shortcut-${key}-up`), "RequireHealthyBackend", 750));
+  }
+}
 document.querySelectorAll("[data-key]").forEach((button) => {
   attachHeldButton(button, (state) => {
     if (state === "Pressed") return sendKeyState(button, "Pressed");
     return sendKeyState(button, "Released");
   });
 });
+document.querySelectorAll("[data-shortcut]").forEach((button) => button.addEventListener("click", () => {
+  const keys = String(button.dataset.shortcut || "").split(",").filter(Boolean);
+  sendKeyChord(keys);
+}));
 async function sendText() {
   const text = textInput.value;
   if (!text) return;
@@ -943,6 +967,28 @@ mod tests {
         assert!(page.contains("button.addEventListener(\"pointercancel\""));
         assert!(page.contains("sendKeyState(button, \"Pressed\")"));
         assert!(page.contains("sendKeyState(button, \"Released\")"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_exposes_common_keyboard_keys_and_shortcuts() {
+        let page = render_mobile_page();
+
+        for key in ["Escape", "Tab", "Space", "Delete"] {
+            assert!(page.contains(&format!("data-key=\"{key}\"")));
+        }
+        for shortcut in [
+            "ControlLeft,C",
+            "ControlLeft,V",
+            "ControlLeft,X",
+            "ControlLeft,A",
+        ] {
+            assert!(page.contains(&format!("data-shortcut=\"{shortcut}\"")));
+        }
+        assert!(page.contains("async function sendKeyChord(keys)"));
+        assert!(page.contains("for (const key of keys)"));
+        assert!(page.contains("for (const key of [...keys].reverse())"));
+        assert!(page.contains("overflow: auto"));
+        assert!(page.contains("min-height: 100dvh"));
     }
 
     #[test]

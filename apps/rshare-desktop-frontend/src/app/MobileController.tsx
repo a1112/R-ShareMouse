@@ -12,8 +12,11 @@ import {
 } from "lucide-react";
 
 import {
+  MOBILE_EXTRA_KEY_BUTTONS,
   MOBILE_LONG_PRESS_DRAG_DELAY_MS,
+  MOBILE_SHORTCUT_BUTTONS,
   MOBILE_TEXT_INPUT_HINTS,
+  buildKeyChordRequests,
   buildKeyRequest,
   buildMouseButtonRequest,
   buildMouseClickRequests,
@@ -493,6 +496,16 @@ export default function MobileController() {
     );
   }
 
+  async function keyChord(keys: readonly string[], id: string) {
+    const requests = buildKeyChordRequests(
+      [...keys],
+      createMobileCorrelationId(`mobile-shortcut-${id}`),
+    );
+    for (const request of requests) {
+      await sendRequest(request);
+    }
+  }
+
   async function commitText() {
     const value = text;
     if (!value) {
@@ -511,7 +524,7 @@ export default function MobileController() {
 
   return (
     <main
-      className="min-h-screen overflow-hidden"
+      className="min-h-screen overflow-auto"
       style={{
         background: "#101214",
         color: "#edf2ef",
@@ -543,7 +556,7 @@ export default function MobileController() {
           style={{ background: "#161a1c", border: "1px solid #29302d" }}
         >
           <div
-            className="h-full min-h-[360px] touch-none select-none rounded-md"
+            className="h-full min-h-[260px] touch-none select-none rounded-md sm:min-h-[360px]"
             style={{
               background:
                 "linear-gradient(135deg, rgba(71,194,122,0.08), rgba(255,255,255,0.02))",
@@ -608,6 +621,33 @@ export default function MobileController() {
           <HoldKeyButton label="右" keyboardKey="Right" onKeyState={keyState}>
             <ArrowRight size={20} />
           </HoldKeyButton>
+        </section>
+
+        <section className="grid grid-cols-4 gap-2">
+          {MOBILE_EXTRA_KEY_BUTTONS.map((button) => (
+            <HoldKeyButton
+              key={button.key}
+              label={button.label}
+              keyboardKey={button.key}
+              onKeyState={keyState}
+            >
+              <span className="text-sm font-medium">{button.label}</span>
+            </HoldKeyButton>
+          ))}
+        </section>
+
+        <section className="grid grid-cols-4 gap-2">
+          {MOBILE_SHORTCUT_BUTTONS.map((button) => (
+            <button
+              key={button.id}
+              className="h-12 rounded-md text-sm font-medium"
+              style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
+              title={button.label}
+              onClick={() => void keyChord(button.keys, button.id)}
+            >
+              {button.label}
+            </button>
+          ))}
         </section>
 
         <section className="flex gap-2">

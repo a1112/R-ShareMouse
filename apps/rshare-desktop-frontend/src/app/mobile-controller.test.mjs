@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   MOBILE_TEXT_INPUT_HINTS,
+  MOBILE_EXTRA_KEY_BUTTONS,
+  MOBILE_SHORTCUT_BUTTONS,
+  buildKeyChordRequests,
   buildKeyRequest,
   buildKeyTapRequests,
   buildMouseButtonRequest,
@@ -48,6 +51,45 @@ test("mobile text input uses phone keyboard send hints", () => {
     autoCorrect: "off",
     spellCheck: false,
   });
+});
+
+test("mobile keyboard controls expose common non-text keys and shortcuts", () => {
+  assert.deepEqual(
+    MOBILE_EXTRA_KEY_BUTTONS.map((button) => button.key),
+    ["Escape", "Tab", "Space", "Delete"],
+  );
+  assert.deepEqual(
+    MOBILE_SHORTCUT_BUTTONS.map((button) => button.keys),
+    [
+      ["ControlLeft", "C"],
+      ["ControlLeft", "V"],
+      ["ControlLeft", "X"],
+      ["ControlLeft", "A"],
+    ],
+  );
+});
+
+test("buildKeyChordRequests presses keys in order and releases in reverse", () => {
+  const requests = buildKeyChordRequests(["ControlLeft", "C"], "mobile-copy");
+
+  assert.deepEqual(
+    requests.map((request) => request.InjectEndpointEvent.request.payload.data),
+    [
+      { key: "ControlLeft", state: "Pressed" },
+      { key: "C", state: "Pressed" },
+      { key: "C", state: "Released" },
+      { key: "ControlLeft", state: "Released" },
+    ],
+  );
+  assert.deepEqual(
+    requests.map((request) => request.InjectEndpointEvent.request.correlation_id),
+    [
+      "mobile-copy-down-0-controlleft",
+      "mobile-copy-down-1-c",
+      "mobile-copy-up-0-c",
+      "mobile-copy-up-1-controlleft",
+    ],
+  );
 });
 
 test("formatMobileControllerError hides raw browser fetch failures", () => {

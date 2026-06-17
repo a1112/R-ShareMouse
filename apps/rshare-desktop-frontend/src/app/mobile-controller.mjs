@@ -10,6 +10,20 @@ export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
   spellCheck: false,
 });
 
+export const MOBILE_EXTRA_KEY_BUTTONS = Object.freeze([
+  Object.freeze({ label: "Esc", key: "Escape" }),
+  Object.freeze({ label: "Tab", key: "Tab" }),
+  Object.freeze({ label: "Space", key: "Space" }),
+  Object.freeze({ label: "Del", key: "Delete" }),
+]);
+
+export const MOBILE_SHORTCUT_BUTTONS = Object.freeze([
+  Object.freeze({ id: "copy", label: "复制", keys: Object.freeze(["ControlLeft", "C"]) }),
+  Object.freeze({ id: "paste", label: "粘贴", keys: Object.freeze(["ControlLeft", "V"]) }),
+  Object.freeze({ id: "cut", label: "剪切", keys: Object.freeze(["ControlLeft", "X"]) }),
+  Object.freeze({ id: "select-all", label: "全选", keys: Object.freeze(["ControlLeft", "A"]) }),
+]);
+
 export function formatMobileControllerError(error, scope = "移动端") {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
@@ -71,6 +85,22 @@ export function buildKeyTapRequests(key, correlationPrefix) {
   return [
     buildKeyRequest(key, "Pressed", `${correlationPrefix}-down`),
     buildKeyRequest(key, "Released", `${correlationPrefix}-up`),
+  ];
+}
+
+function keyCorrelationSlug(key) {
+  return String(key).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+export function buildKeyChordRequests(keys, correlationPrefix) {
+  const normalizedKeys = Array.isArray(keys) ? keys.map(String).filter(Boolean) : [];
+  return [
+    ...normalizedKeys.map((key, index) =>
+      buildKeyRequest(key, "Pressed", `${correlationPrefix}-down-${index}-${keyCorrelationSlug(key)}`),
+    ),
+    ...[...normalizedKeys].reverse().map((key, index) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-up-${index}-${keyCorrelationSlug(key)}`),
+    ),
   ];
 }
 
