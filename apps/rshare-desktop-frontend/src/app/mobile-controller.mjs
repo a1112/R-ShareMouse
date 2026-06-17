@@ -3,6 +3,14 @@ const DEFAULT_KEYBOARD_TIMEOUT_MS = 750;
 
 export const MOBILE_LONG_PRESS_DRAG_DELAY_MS = 420;
 
+export const MOBILE_POINTER_SENSITIVITY = Object.freeze({
+  storageKey: "rshare.mobile.pointerSensitivity",
+  defaultValue: 1.35,
+  min: 0.5,
+  max: 3,
+  step: 0.05,
+});
+
 export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
   enterKeyHint: "send",
   autoCapitalize: "none",
@@ -30,6 +38,16 @@ export function formatMobileControllerError(error, scope = "移动端") {
     return `${scope}网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络`;
   }
   return `${scope}请求失败：${message || "未知错误"}`;
+}
+
+export function normalizeMobilePointerSensitivity(value, config = MOBILE_POINTER_SENSITIVITY) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return config.defaultValue;
+  }
+  const clamped = Math.max(config.min, Math.min(config.max, parsed));
+  const stepped = Math.round(clamped / config.step) * config.step;
+  return Number(stepped.toFixed(2));
 }
 
 function isEditableMobileTarget(target) {

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   MOBILE_TEXT_INPUT_HINTS,
   MOBILE_EXTRA_KEY_BUTTONS,
+  MOBILE_POINTER_SENSITIVITY,
   MOBILE_SHORTCUT_BUTTONS,
   buildKeyChordRequests,
   buildKeyRequest,
@@ -23,6 +24,7 @@ import {
   isTouchpadTap,
   isTwoFingerTap,
   nextPointerPosition,
+  normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
   shouldCommitMobileTextOnKeyDown,
   shouldPreventMobileGestureDefault,
@@ -95,6 +97,21 @@ test("mobile keyboard controls expose common non-text keys and shortcuts", () =>
       ["ControlLeft", "A"],
     ],
   );
+});
+
+test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {
+  assert.deepEqual(MOBILE_POINTER_SENSITIVITY, {
+    storageKey: "rshare.mobile.pointerSensitivity",
+    defaultValue: 1.35,
+    min: 0.5,
+    max: 3,
+    step: 0.05,
+  });
+  assert.equal(normalizeMobilePointerSensitivity(undefined), 1.35);
+  assert.equal(normalizeMobilePointerSensitivity("2.4"), 2.4);
+  assert.equal(normalizeMobilePointerSensitivity(0.1), 0.5);
+  assert.equal(normalizeMobilePointerSensitivity(9), 3);
+  assert.equal(normalizeMobilePointerSensitivity(Number.NaN), 1.35);
 });
 
 test("buildKeyChordRequests presses keys in order and releases in reverse", () => {
@@ -293,6 +310,19 @@ test("mobile controller installs browser navigation and gesture guards", () => {
   assert.match(source, /document\.addEventListener\(eventName, preventMobileGestureDefault, options\)/);
   assert.match(source, /overscrollBehavior: "none"/);
   assert.match(source, /WebkitTouchCallout: "none"/);
+});
+
+test("mobile controller exposes a persistent touchpad sensitivity control", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /MOBILE_POINTER_SENSITIVITY/);
+  assert.match(source, /normalizeMobilePointerSensitivity/);
+  assert.match(source, /sensitivityRef\.current/);
+  assert.match(source, /localStorage\.getItem\(MOBILE_POINTER_SENSITIVITY\.storageKey\)/);
+  assert.match(source, /localStorage\.setItem\(MOBILE_POINTER_SENSITIVITY\.storageKey/);
+  assert.match(source, /type="range"/);
+  assert.match(source, /aria-label="触控板灵敏度"/);
+  assert.match(source, /sensitivity: sensitivityRef\.current/);
 });
 
 test("preventMobileGestureDefault blocks control-surface browser gestures but preserves text editing", () => {

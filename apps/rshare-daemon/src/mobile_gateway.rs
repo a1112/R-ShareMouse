@@ -524,6 +524,10 @@ fn render_mobile_page_with_token(token: &str) -> String {
     button { border: 1px solid #29302d; background: #171b1d; color: #d8dedb; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     button:active { background: rgba(71,194,122,.18); border-color: #47c27a; }
     .textRow { display: flex; gap: 8px; }
+    .rangeRow { display: flex; align-items: center; gap: 10px; min-height: 40px; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 7px 10px; }
+    .rangeRow label { flex: 0 0 auto; font-size: 12px; font-weight: 600; }
+    .rangeRow input { flex: 1; min-width: 0; height: 28px; accent-color: #47c27a; }
+    .rangeValue { width: 42px; text-align: right; font-size: 12px; color: #8f9b96; }
     .inputWrap { min-width: 0; flex: 1; height: 48px; display: flex; align-items: center; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 0 12px; }
     input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #edf2ef; font-size: 16px; }
     .send { width: 58px; background: #47c27a; color: #07110b; border-color: #47c27a; }
@@ -539,6 +543,11 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <div class="status" id="status">连接中</div>
   </header>
   <section id="pad"><div class="dot"></div></section>
+  <section class="rangeRow">
+    <label for="sensitivity">灵敏度</label>
+    <input id="sensitivity" type="range" aria-label="触控板灵敏度" min="0.5" max="3" step="0.05" value="1.35">
+    <span class="rangeValue" id="sensitivityValue">1.35</span>
+  </section>
   <section class="grid3">
     <button data-button="Left">左键</button>
     <button data-button="Middle">中键</button>
@@ -579,6 +588,8 @@ const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
+const sensitivityInput = document.getElementById("sensitivity");
+const sensitivityValue = document.getElementById("sensitivityValue");
 const mobileEventOptions = { capture: true, passive: false };
 let pointer = { x: 0, y: 0, width: 1920, height: 1080, displayId: null };
 let activePointer = null;
@@ -592,6 +603,36 @@ let pendingMoveFrame = 0;
 let dragTimer = 0;
 let dragPointer = null;
 const LONG_PRESS_DRAG_DELAY_MS = 420;
+const POINTER_SENSITIVITY_STORAGE_KEY = "rshare.mobile.pointerSensitivity";
+const POINTER_SENSITIVITY_DEFAULT = 1.35;
+const POINTER_SENSITIVITY_MIN = 0.5;
+const POINTER_SENSITIVITY_MAX = 3;
+const POINTER_SENSITIVITY_STEP = 0.05;
+function clampPointerSensitivity(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return POINTER_SENSITIVITY_DEFAULT;
+  const clamped = Math.max(POINTER_SENSITIVITY_MIN, Math.min(POINTER_SENSITIVITY_MAX, parsed));
+  return Number((Math.round(clamped / POINTER_SENSITIVITY_STEP) * POINTER_SENSITIVITY_STEP).toFixed(2));
+}
+function loadPointerSensitivity() {
+  try {
+    return clampPointerSensitivity(localStorage.getItem(POINTER_SENSITIVITY_STORAGE_KEY));
+  } catch {
+    return POINTER_SENSITIVITY_DEFAULT;
+  }
+}
+let pointerSensitivity = clampPointerSensitivity(loadPointerSensitivity());
+function setPointerSensitivity(value) {
+  pointerSensitivity = clampPointerSensitivity(value);
+  sensitivityInput.value = String(pointerSensitivity);
+  sensitivityValue.textContent = pointerSensitivity.toFixed(2);
+  try {
+    localStorage.setItem(POINTER_SENSITIVITY_STORAGE_KEY, String(pointerSensitivity));
+  } catch {}
+}
+sensitivityInput.value = String(pointerSensitivity);
+sensitivityValue.textContent = pointerSensitivity.toFixed(2);
+sensitivityInput.addEventListener("input", (event) => setPointerSensitivity(event.target.value));
 function cid(prefix) {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
@@ -849,8 +890,8 @@ pad.addEventListener("pointermove", (event) => {
   if (tapStart && Math.hypot(event.clientX - tapStart.x, event.clientY - tapStart.y) > 12) {
     clearDragTimer();
   }
-  const dx = Math.round((event.clientX - lastPoint.x) * 1.35);
-  const dy = Math.round((event.clientY - lastPoint.y) * 1.35);
+  const dx = Math.round((event.clientX - lastPoint.x) * pointerSensitivity);
+  const dy = Math.round((event.clientY - lastPoint.y) * pointerSensitivity);
   lastPoint = { x: event.clientX, y: event.clientY };
   pointer = { ...pointer, x: Math.max(0, Math.min(pointer.width - 1, pointer.x + dx)), y: Math.max(0, Math.min(pointer.height - 1, pointer.y + dy)) };
   posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
@@ -1254,6 +1295,21 @@ mod tests {
         assert!(page.contains("dragTimer = setTimeout"));
         assert!(page.contains("sendDragButton(\"Pressed\")"));
         assert!(page.contains("sendDragButton(\"Released\")"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_exposes_persistent_touchpad_sensitivity() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("const POINTER_SENSITIVITY_STORAGE_KEY"));
+        assert!(page.contains("function clampPointerSensitivity"));
+        assert!(page.contains("let pointerSensitivity = clampPointerSensitivity"));
+        assert!(page.contains("<input id=\"sensitivity\" type=\"range\""));
+        assert!(page.contains("aria-label=\"触控板灵敏度\""));
+        assert!(page.contains("localStorage.getItem(POINTER_SENSITIVITY_STORAGE_KEY)"));
+        assert!(page.contains("localStorage.setItem(POINTER_SENSITIVITY_STORAGE_KEY"));
+        assert!(page.contains("event.clientX - lastPoint.x) * pointerSensitivity"));
+        assert!(page.contains("event.clientY - lastPoint.y) * pointerSensitivity"));
     }
 
     #[test]

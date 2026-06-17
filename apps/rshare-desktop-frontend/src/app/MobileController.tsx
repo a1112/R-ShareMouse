@@ -14,6 +14,7 @@ import {
 import {
   MOBILE_EXTRA_KEY_BUTTONS,
   MOBILE_LONG_PRESS_DRAG_DELAY_MS,
+  MOBILE_POINTER_SENSITIVITY,
   MOBILE_SHORTCUT_BUTTONS,
   MOBILE_TEXT_INPUT_HINTS,
   buildKeyChordRequests,
@@ -31,6 +32,7 @@ import {
   isTouchpadTap,
   isTwoFingerTap,
   nextPointerPosition,
+  normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
@@ -231,6 +233,18 @@ export default function MobileController() {
     height: 1080,
     displayId: null,
   });
+  const [pointerSensitivity, setPointerSensitivity] = useState(() => {
+    if (typeof window === "undefined") {
+      return MOBILE_POINTER_SENSITIVITY.defaultValue;
+    }
+    try {
+      return normalizeMobilePointerSensitivity(
+        localStorage.getItem(MOBILE_POINTER_SENSITIVITY.storageKey),
+      );
+    } catch {
+      return MOBILE_POINTER_SENSITIVITY.defaultValue;
+    }
+  });
   const [text, setText] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
   const [status, setStatus] = useState("连接中");
@@ -242,9 +256,14 @@ export default function MobileController() {
   const twoFingerTapStartRef = useRef<TwoFingerTapStart | null>(null);
   const dragTimerRef = useRef<number | null>(null);
   const dragPointerRef = useRef<number | null>(null);
+  const sensitivityRef = useRef(pointerSensitivity);
   const pointerRef = useRef(pointer);
   const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
+
+  useEffect(() => {
+    sensitivityRef.current = pointerSensitivity;
+  }, [pointerSensitivity]);
 
   useEffect(() => {
     pointerRef.current = pointer;
@@ -459,7 +478,7 @@ export default function MobileController() {
       ...nextPointerPosition(
         current,
         { dx: event.clientX - last.x, dy: event.clientY - last.y },
-        { width: current.width, height: current.height, sensitivity: 1.35 },
+        { width: current.width, height: current.height, sensitivity: sensitivityRef.current },
       ),
     };
     pointerRef.current = next;
@@ -623,6 +642,17 @@ export default function MobileController() {
     }
   }
 
+  function handleSensitivityChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const next = normalizeMobilePointerSensitivity(event.currentTarget.value);
+    sensitivityRef.current = next;
+    setPointerSensitivity(next);
+    try {
+      localStorage.setItem(MOBILE_POINTER_SENSITIVITY.storageKey, String(next));
+    } catch {
+      // Storage can be unavailable in restricted browser modes.
+    }
+  }
+
   const statusColor =
     sendState === "error" ? "#f87171" : sendState === "sending" ? "#fbbf24" : "#47c27a";
 
@@ -679,6 +709,28 @@ export default function MobileController() {
               />
             </div>
           </div>
+        </section>
+
+        <section
+          className="flex items-center gap-3 rounded-md px-3 py-2"
+          style={{ background: "#171b1d", border: "1px solid #29302d" }}
+        >
+          <label className="shrink-0 text-xs font-medium" htmlFor="mobile-pointer-sensitivity">
+            灵敏度
+          </label>
+          <input
+            id="mobile-pointer-sensitivity"
+            type="range"
+            aria-label="触控板灵敏度"
+            min={MOBILE_POINTER_SENSITIVITY.min}
+            max={MOBILE_POINTER_SENSITIVITY.max}
+            step={MOBILE_POINTER_SENSITIVITY.step}
+            value={pointerSensitivity}
+            onChange={handleSensitivityChange}
+          />
+          <span className="w-10 text-right text-xs" style={{ color: "#8f9b96" }}>
+            {pointerSensitivity.toFixed(2)}
+          </span>
         </section>
 
         <section className="grid grid-cols-3 gap-2">
