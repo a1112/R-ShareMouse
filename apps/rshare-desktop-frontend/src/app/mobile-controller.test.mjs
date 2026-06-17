@@ -91,7 +91,7 @@ test("mobile keyboard controls expose common non-text keys and shortcuts", () =>
   );
   assert.deepEqual(
     MOBILE_EXTRA_KEY_BUTTONS.map((button) => button.key),
-    ["Escape", "Tab", "Space", "Delete"],
+    ["Escape", "Tab", "Space", "Delete", "Home", "End", "PageUp", "PageDown"],
   );
   assert.deepEqual(
     MOBILE_SHORTCUT_BUTTONS.map((button) => button.keys),

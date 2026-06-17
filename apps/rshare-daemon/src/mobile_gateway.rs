@@ -578,6 +578,12 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <button data-key="Delete">Del</button>
   </section>
   <section class="grid4">
+    <button data-key="Home">Home</button>
+    <button data-key="End">End</button>
+    <button data-key="PageUp">PgUp</button>
+    <button data-key="PageDown">PgDn</button>
+  </section>
+  <section class="grid4">
     <button data-shortcut="ControlLeft,C">复制</button>
     <button data-shortcut="ControlLeft,V">粘贴</button>
     <button data-shortcut="ControlLeft,X">剪切</button>
@@ -1235,7 +1241,9 @@ mod tests {
         for key in ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"] {
             assert!(page.contains(&format!("data-key=\"{key}\"")));
         }
-        for key in ["Escape", "Tab", "Space", "Delete"] {
+        for key in [
+            "Escape", "Tab", "Space", "Delete", "Home", "End", "PageUp", "PageDown",
+        ] {
             assert!(page.contains(&format!("data-key=\"{key}\"")));
         }
         for shortcut in [

@@ -30,6 +30,10 @@ export const MOBILE_EXTRA_KEY_BUTTONS = Object.freeze([
   Object.freeze({ label: "Tab", key: "Tab" }),
   Object.freeze({ label: "Space", key: "Space" }),
   Object.freeze({ label: "Del", key: "Delete" }),
+  Object.freeze({ label: "Home", key: "Home" }),
+  Object.freeze({ label: "End", key: "End" }),
+  Object.freeze({ label: "PgUp", key: "PageUp" }),
+  Object.freeze({ label: "PgDn", key: "PageDown" }),
 ]);
 
 export const MOBILE_SHORTCUT_BUTTONS = Object.freeze([
