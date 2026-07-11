@@ -7766,16 +7766,7 @@ fn save_layout_to_path(layout: &LayoutGraph, path: impl AsRef<Path>) -> Result<(
 }
 
 fn load_config_with_env_overrides() -> Result<Config> {
-    let mut config = match Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load persisted config: {}. Falling back to default config.",
-                error
-            );
-            Config::default()
-        }
-    };
+    let mut config = load_config_or_fail_closed(Config::load);
 
     if let Ok(bind) = std::env::var("RSHARE_BIND") {
         config.network.bind_address = bind;
@@ -7786,6 +7777,22 @@ fn load_config_with_env_overrides() -> Result<Config> {
     }
 
     Ok(config)
+}
+
+fn load_config_or_fail_closed(load: impl FnOnce() -> Result<Config>) -> Config {
+    match load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load persisted config: {}. Disabling automatic input and mobile gateway access.",
+                error
+            );
+            let mut config = Config::default();
+            config.features.automatic_input_forwarding = false;
+            config.features.mobile_gateway_enabled = false;
+            config
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7812,6 +7819,33 @@ mod tests {
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.page_url, "不可用");
         assert!(snapshot.token.is_empty());
+    }
+
+    #[test]
+    fn config_load_failure_disables_automatic_input_and_mobile_gateway() {
+        let config = load_config_or_fail_closed(|| anyhow::bail!("persisted config is unreadable"));
+
+        assert!(!config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn successful_default_config_load_keeps_new_install_input_forwarding_enabled() {
+        let config = load_config_or_fail_closed(|| Ok(Config::default()));
+
+        assert!(config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn successful_config_load_preserves_explicitly_disabled_input_forwarding() {
+        let mut persisted = Config::default();
+        persisted.features.automatic_input_forwarding = false;
+
+        let config = load_config_or_fail_closed(|| Ok(persisted));
+
+        assert!(!config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
     }
 
     #[test]
