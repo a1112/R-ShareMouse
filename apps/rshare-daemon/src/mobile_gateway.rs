@@ -1993,6 +1993,9 @@ async function refresh() {
       if (error?.name === "AbortError") return;
       if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;
       if (requestedStatusRevision === statusRevision) {
+        textInput.disabled = true;
+        sendButton.disabled = true;
+        textCapabilityEl.hidden = false;
         statusEl.textContent = formatMobileError(error, "移动端状态");
       }
     } finally {
@@ -4389,6 +4392,37 @@ mod tests {
             .expect("missing backend status update");
         assert!(status_revision_gate < capability_update);
         assert!(capability_update < status_update);
+
+        let catch_start = refresh.find("} catch (error) {").unwrap();
+        let finally_start = refresh[catch_start..]
+            .find("} finally {")
+            .map(|offset| catch_start + offset)
+            .unwrap();
+        let catch = &refresh[catch_start..finally_start];
+        let abort_guard = catch
+            .find("if (error?.name === \"AbortError\") return;")
+            .expect("missing AbortError guard");
+        let generation_guard = catch
+            .find("if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;")
+            .expect("missing stale client generation guard");
+        let error_revision_gate = catch
+            .find("if (requestedStatusRevision === statusRevision) {")
+            .expect("missing error status revision gate");
+        let error_status_update = catch
+            .find("statusEl.textContent = formatMobileError(error, \"移动端状态\");")
+            .expect("missing current poll error status update");
+        for mutation in [
+            "textInput.disabled = true;",
+            "sendButton.disabled = true;",
+            "textCapabilityEl.hidden = false;",
+        ] {
+            let mutation_index = catch.find(mutation).expect("missing fail-closed mutation");
+            assert!(abort_guard < mutation_index);
+            assert!(generation_guard < mutation_index);
+            assert!(error_revision_gate < mutation_index);
+            assert!(mutation_index < error_status_update);
+        }
+        assert!(!catch.contains("textInput.value"));
 
         let send_text_start = page.find("async function sendText()").unwrap();
         let send_text_end = page[send_text_start..]

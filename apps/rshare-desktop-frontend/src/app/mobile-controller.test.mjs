@@ -1461,6 +1461,62 @@ test("mobile status result keeps backend status behind the status revision gate"
   ]);
 });
 
+test("current status refresh errors fail text capability closed but stale errors do not", async () => {
+  const currentPoll = deferred();
+  const stalePoll = deferred();
+  let pollCount = 0;
+  const applied = [];
+  const controller = createMobileStatusRefreshController(
+    () => (pollCount++ === 0 ? currentPoll.promise : stalePoll.promise),
+    (result, options) => {
+      mobileController.applyMobileStatusRefreshResult(result, options, {
+        applyTextCommitSupported(value) {
+          applied.push(["text-commit", value]);
+        },
+        applyError(error) {
+          applied.push(["error", error.message]);
+        },
+      });
+    },
+  );
+
+  const currentRefresh = controller.refresh();
+  currentPoll.resolve({ state: null, error: new Error("offline") });
+  await currentRefresh;
+  assert.deepEqual(applied, [
+    ["text-commit", false],
+    ["error", "offline"],
+  ]);
+
+  applied.length = 0;
+  const staleRefresh = controller.refresh();
+  controller.markStatusChanged();
+  stalePoll.resolve({ state: null, error: new Error("stale offline") });
+  await staleRefresh;
+  assert.deepEqual(applied, []);
+});
+
+test("aborted status refresh errors never overwrite the current text capability", () => {
+  const applied = [];
+  const abortError = new Error("aborted");
+  abortError.name = "AbortError";
+
+  mobileController.applyMobileStatusRefreshResult(
+    { state: null, error: abortError },
+    { applyPointer: false, applyStatus: true },
+    {
+      applyTextCommitSupported(value) {
+        applied.push(["text-commit", value]);
+      },
+      applyError(error) {
+        applied.push(["error", error.message]);
+      },
+    },
+  );
+
+  assert.deepEqual(applied, []);
+});
+
 test("held controls use click only for keyboard or assistive activation", () => {
   assert.equal(shouldActivateHeldControlFromClick({ detail: 0 }), true);
   assert.equal(shouldActivateHeldControlFromClick({ detail: 1 }), false);

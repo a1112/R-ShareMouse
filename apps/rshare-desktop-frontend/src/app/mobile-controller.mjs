@@ -939,7 +939,8 @@ export function applyMobileStatusRefreshResult(result, options, handlers = {}) {
     }
     return;
   }
-  if (options?.applyStatus) {
+  if (options?.applyStatus && result?.error?.name !== "AbortError") {
+    handlers.applyTextCommitSupported?.(false);
     handlers.applyError?.(result?.error);
   }
 }
