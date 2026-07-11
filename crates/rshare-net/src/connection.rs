@@ -2,9 +2,10 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::time::Instant;
 
 use rshare_core::{
@@ -73,10 +74,20 @@ pub enum ManagerEvent {
     Error { device_id: DeviceId, error: String },
 }
 
+#[derive(Clone)]
+struct CanonicalConnection {
+    generation: u64,
+    info: ConnectionInfo,
+}
+
+type CanonicalConnections = Arc<StdRwLock<HashMap<DeviceId, CanonicalConnection>>>;
+
 /// Connection manager for handling multiple device connections
 pub struct ConnectionManager {
     local_device_id: DeviceId,
-    connections: HashMap<DeviceId, ConnectionInfo>,
+    connections: CanonicalConnections,
+    next_generation: Arc<AtomicU64>,
+    lifecycle_lock: Arc<TokioMutex<()>>,
     transport: QuicTransport,
     pool: Arc<ConnectionPool>,
     event_tx: mpsc::Sender<ManagerEvent>,
@@ -85,39 +96,127 @@ pub struct ConnectionManager {
 
 fn spawn_message_reader(
     device_id: DeviceId,
+    generation: u64,
     mut messages: mpsc::Receiver<Message>,
     first_message: Option<Message>,
     event_tx: mpsc::Sender<ManagerEvent>,
+    connections: CanonicalConnections,
+    pool: Arc<ConnectionPool>,
+    lifecycle_lock: Arc<TokioMutex<()>>,
 ) {
     tokio::spawn(async move {
         if let Some(message) = first_message {
-            if event_tx
-                .send(ManagerEvent::MessageReceived {
-                    from: device_id,
-                    message,
-                })
-                .await
-                .is_err()
+            if !forward_message_for_generation(
+                &connections,
+                &lifecycle_lock,
+                &event_tx,
+                device_id,
+                generation,
+                message,
+            )
+            .await
             {
                 return;
             }
         }
 
         while let Some(message) = messages.recv().await {
-            if event_tx
-                .send(ManagerEvent::MessageReceived {
-                    from: device_id,
-                    message,
-                })
-                .await
-                .is_err()
+            if !forward_message_for_generation(
+                &connections,
+                &lifecycle_lock,
+                &event_tx,
+                device_id,
+                generation,
+                message,
+            )
+            .await
             {
                 break;
             }
         }
 
-        let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
+        retire_generation(
+            &connections,
+            &pool,
+            &lifecycle_lock,
+            &event_tx,
+            device_id,
+            generation,
+        )
+        .await;
     });
+}
+
+fn allocate_generation(next_generation: &AtomicU64) -> u64 {
+    next_generation
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .expect("connection generation counter exhausted")
+}
+
+fn is_current_generation(
+    connections: &CanonicalConnections,
+    device_id: DeviceId,
+    generation: u64,
+) -> bool {
+    connections
+        .read()
+        .expect("canonical connection registry poisoned")
+        .get(&device_id)
+        .is_some_and(|connection| connection.generation == generation)
+}
+
+async fn forward_message_for_generation(
+    connections: &CanonicalConnections,
+    lifecycle_lock: &TokioMutex<()>,
+    event_tx: &mpsc::Sender<ManagerEvent>,
+    device_id: DeviceId,
+    generation: u64,
+    message: Message,
+) -> bool {
+    let _lifecycle = lifecycle_lock.lock().await;
+    if !is_current_generation(connections, device_id, generation) {
+        return false;
+    }
+    event_tx
+        .send(ManagerEvent::MessageReceived {
+            from: device_id,
+            message,
+        })
+        .await
+        .is_ok()
+}
+
+async fn retire_generation(
+    connections: &CanonicalConnections,
+    pool: &ConnectionPool,
+    lifecycle_lock: &TokioMutex<()>,
+    event_tx: &mpsc::Sender<ManagerEvent>,
+    device_id: DeviceId,
+    generation: u64,
+) -> bool {
+    let _lifecycle = lifecycle_lock.lock().await;
+    let removed_current = {
+        let mut canonical = connections
+            .write()
+            .expect("canonical connection registry poisoned");
+        if canonical
+            .get(&device_id)
+            .is_some_and(|connection| connection.generation == generation)
+        {
+            canonical.remove(&device_id);
+            true
+        } else {
+            false
+        }
+    };
+
+    if removed_current {
+        pool.remove_generation(&device_id, generation).await;
+        let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
+    }
+    removed_current
 }
 
 impl ConnectionManager {
@@ -128,7 +227,9 @@ impl ConnectionManager {
 
         Self {
             local_device_id,
-            connections: HashMap::new(),
+            connections: Arc::new(StdRwLock::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(1)),
+            lifecycle_lock: Arc::new(TokioMutex::new(())),
             transport,
             pool,
             event_tx,
@@ -142,6 +243,9 @@ impl ConnectionManager {
         let mut incoming = self.transport.incoming();
         let event_tx = self.event_tx.clone();
         let pool = self.pool.clone();
+        let connections = self.connections.clone();
+        let next_generation = self.next_generation.clone();
+        let lifecycle_lock = self.lifecycle_lock.clone();
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -162,17 +266,44 @@ impl ConnectionManager {
                             (device_id, None)
                         }
                     };
+                let address = incoming.address.to_string();
+                let generation = allocate_generation(&next_generation);
                 incoming.connection.set_device_id(device_id);
                 let messages = incoming.connection.message_channel();
 
-                spawn_message_reader(device_id, messages, first_message, event_tx.clone());
-                pool.insert(device_id, incoming.connection).await;
+                let connected_event_sent = {
+                    let _lifecycle = lifecycle_lock.lock().await;
+                    connections
+                        .write()
+                        .expect("canonical connection registry poisoned")
+                        .remove(&device_id);
+                    pool.remove(&device_id).await;
+                    pool.insert_with_generation(device_id, generation, incoming.connection)
+                        .await;
+                    let mut info = ConnectionInfo::new(device_id, address);
+                    info.state = ConnectionState::Connected;
+                    connections
+                        .write()
+                        .expect("canonical connection registry poisoned")
+                        .insert(device_id, CanonicalConnection { generation, info });
+                    event_tx
+                        .send(ManagerEvent::Connected(device_id))
+                        .await
+                        .is_ok()
+                };
 
-                if event_tx
-                    .send(ManagerEvent::Connected(device_id))
-                    .await
-                    .is_err()
-                {
+                spawn_message_reader(
+                    device_id,
+                    generation,
+                    messages,
+                    first_message,
+                    event_tx.clone(),
+                    connections.clone(),
+                    pool.clone(),
+                    lifecycle_lock.clone(),
+                );
+
+                if !connected_event_sent {
                     break;
                 }
             }
@@ -182,12 +313,39 @@ impl ConnectionManager {
     }
 
     pub async fn connect(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
-        if self.connections.contains_key(&device_id) {
-            anyhow::bail!("Already connected to device {}", device_id);
-        }
+        let generation = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.pool.diagnostics_for(&device_id).await.is_some() {
+                anyhow::bail!("Already connected to device {}", device_id);
+            }
 
-        let info = ConnectionInfo::new(device_id, address.to_string());
-        self.connections.insert(device_id, info);
+            let removed_canonical = self
+                .connections
+                .write()
+                .expect("canonical connection registry poisoned")
+                .remove(&device_id)
+                .is_some();
+            let removed_pool = self.pool.remove(&device_id).await.is_some();
+            if removed_canonical || removed_pool {
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Disconnected(device_id))
+                    .await;
+            }
+
+            let generation = allocate_generation(&self.next_generation);
+            self.connections
+                .write()
+                .expect("canonical connection registry poisoned")
+                .insert(
+                    device_id,
+                    CanonicalConnection {
+                        generation,
+                        info: ConnectionInfo::new(device_id, address.to_string()),
+                    },
+                );
+            generation
+        };
 
         let connection_result = match self.transport.connect(address, device_id).await {
             Ok(mut conn) => match perform_outbound_handshake(&mut conn, self.local_device_id).await
@@ -206,34 +364,77 @@ impl ConnectionManager {
 
         match connection_result {
             Ok(mut conn) => {
-                self.update_connection_state(device_id, ConnectionState::Connected);
                 conn.set_device_id(device_id);
                 let messages = conn.message_channel();
-                spawn_message_reader(device_id, messages, None, self.event_tx.clone());
 
-                self.pool.insert(device_id, conn).await;
+                let installed = {
+                    let _lifecycle = self.lifecycle_lock.lock().await;
+                    if !is_current_generation(&self.connections, device_id, generation) {
+                        false
+                    } else {
+                        self.pool
+                            .insert_with_generation(device_id, generation, conn)
+                            .await;
+                        self.update_connection_state(
+                            device_id,
+                            generation,
+                            ConnectionState::Connected,
+                        );
+                        let _ = self.event_tx.send(ManagerEvent::Connected(device_id)).await;
+                        true
+                    }
+                };
 
-                let _ = self.event_tx.send(ManagerEvent::Connected(device_id)).await;
+                if !installed {
+                    anyhow::bail!(
+                        "Connection to device {} was superseded by a newer generation",
+                        device_id
+                    );
+                }
+
+                spawn_message_reader(
+                    device_id,
+                    generation,
+                    messages,
+                    None,
+                    self.event_tx.clone(),
+                    self.connections.clone(),
+                    self.pool.clone(),
+                    self.lifecycle_lock.clone(),
+                );
 
                 Ok(())
             }
             Err(e) => {
-                self.update_connection_state(device_id, ConnectionState::Error);
-                self.connections.remove(&device_id);
-                let _ = self
-                    .event_tx
-                    .send(ManagerEvent::Error {
-                        device_id,
-                        error: e.to_string(),
-                    })
-                    .await;
+                let _lifecycle = self.lifecycle_lock.lock().await;
+                if is_current_generation(&self.connections, device_id, generation) {
+                    self.update_connection_state(device_id, generation, ConnectionState::Error);
+                    self.connections
+                        .write()
+                        .expect("canonical connection registry poisoned")
+                        .remove(&device_id);
+                    self.pool.remove_generation(&device_id, generation).await;
+                    let _ = self
+                        .event_tx
+                        .send(ManagerEvent::Error {
+                            device_id,
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
                 Err(e)
             }
         }
     }
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
-        let removed_connection_info = self.connections.remove(device_id).is_some();
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let removed_connection_info = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .remove(device_id)
+            .is_some();
         let removed_pool_connection = self.pool.remove(device_id).await.is_some();
         if removed_connection_info || removed_pool_connection {
             let _ = self
@@ -247,9 +448,14 @@ impl ConnectionManager {
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
         self.pool.send_to(device_id, &message).await?;
 
-        if let Some(info) = self.connections.get_mut(device_id) {
-            info.messages_sent += 1;
-            info.last_activity = Instant::now();
+        if let Some(connection) = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(device_id)
+        {
+            connection.info.messages_sent += 1;
+            connection.info.last_activity = Instant::now();
         }
 
         Ok(())
@@ -263,16 +469,32 @@ impl ConnectionManager {
         self.event_rx.take()
     }
 
-    pub fn get_connection(&self, device_id: &DeviceId) -> Option<&ConnectionInfo> {
-        self.connections.get(device_id)
+    pub fn get_connection(&self, device_id: &DeviceId) -> Option<ConnectionInfo> {
+        self.connections
+            .read()
+            .expect("canonical connection registry poisoned")
+            .get(device_id)
+            .map(|connection| connection.info.clone())
     }
 
     pub fn connections(&self) -> Vec<ConnectionInfo> {
-        self.connections.values().cloned().collect()
+        self.connections
+            .read()
+            .expect("canonical connection registry poisoned")
+            .values()
+            .map(|connection| connection.info.clone())
+            .collect()
     }
 
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
-        let mut infos_by_id = self.connections.clone();
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let mut infos_by_id: HashMap<_, _> = self
+            .connections
+            .read()
+            .expect("canonical connection registry poisoned")
+            .iter()
+            .map(|(device_id, connection)| (*device_id, connection.info.clone()))
+            .collect();
         let active_diagnostics = self.pool.diagnostics_all().await;
         let active_device_ids: std::collections::HashSet<_> = active_diagnostics
             .iter()
@@ -307,28 +529,45 @@ impl ConnectionManager {
     }
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         self.pool.diagnostics_for(device_id).await.is_some()
     }
 
     pub fn connected_count(&self) -> usize {
         self.connections
+            .read()
+            .expect("canonical connection registry poisoned")
             .values()
-            .filter(|info| info.state == ConnectionState::Connected)
+            .filter(|connection| connection.info.state == ConnectionState::Connected)
             .count()
     }
 
-    fn update_connection_state(&mut self, device_id: DeviceId, state: ConnectionState) {
-        if let Some(info) = self.connections.get_mut(&device_id) {
-            info.state = state;
-            info.last_activity = Instant::now();
+    fn update_connection_state(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+        state: ConnectionState,
+    ) {
+        if let Some(connection) = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(&device_id)
+        {
+            if connection.generation == generation {
+                connection.info.state = state;
+                connection.info.last_activity = Instant::now();
+            }
         }
     }
 
     pub async fn cleanup_stale(&mut self, timeout: Duration) -> Vec<DeviceId> {
         let stale: Vec<DeviceId> = self
             .connections
+            .read()
+            .expect("canonical connection registry poisoned")
             .iter()
-            .filter(|(_, info)| info.is_stale(timeout))
+            .filter(|(_, connection)| connection.info.is_stale(timeout))
             .map(|(id, _)| *id)
             .collect();
 
@@ -435,6 +674,23 @@ mod tests {
             .join("trust.json")
     }
 
+    fn insert_test_canonical(manager: &ConnectionManager, connection_info: ConnectionInfo) -> u64 {
+        let device_id = connection_info.device_id;
+        let generation = allocate_generation(&manager.next_generation);
+        manager
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .insert(
+                device_id,
+                CanonicalConnection {
+                    generation,
+                    info: connection_info,
+                },
+            );
+        generation
+    }
+
     #[test]
     fn test_connection_info() {
         let info = ConnectionInfo::new(DeviceId::new_v4(), "192.168.1.100:27431".to_string());
@@ -450,10 +706,38 @@ mod tests {
     #[tokio::test]
     async fn message_reader_emits_disconnected_when_channel_closes() {
         let device_id = DeviceId::new_v4();
+        let mut manager = ConnectionManager::new(DeviceId::new_v4());
+        let generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id,
+                address: "127.0.0.1:27431".to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: false,
+                rtt_ms: None,
+                last_datagram_rx_ms: None,
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: None,
+            },
+        );
         let (_message_tx, message_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut event_rx = manager.events().unwrap();
 
-        spawn_message_reader(device_id, message_rx, None, event_tx);
+        spawn_message_reader(
+            device_id,
+            generation,
+            message_rx,
+            None,
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.pool.clone(),
+            manager.lifecycle_lock.clone(),
+        );
         drop(_message_tx);
 
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
@@ -462,6 +746,82 @@ mod tests {
             .unwrap();
 
         assert!(matches!(event, ManagerEvent::Disconnected(id) if id == device_id));
+    }
+
+    #[tokio::test]
+    async fn retirement_holds_lifecycle_until_disconnect_is_enqueued() {
+        let device_id = DeviceId::new_v4();
+        let mut manager = ConnectionManager::new(DeviceId::new_v4());
+        let generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id,
+                address: "127.0.0.1:27431".to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: false,
+                rtt_ms: None,
+                last_datagram_rx_ms: None,
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: None,
+            },
+        );
+        let mut events = manager.events().unwrap();
+        while manager
+            .event_tx
+            .try_send(ManagerEvent::Connected(DeviceId::new_v4()))
+            .is_ok()
+        {}
+        assert_eq!(manager.event_tx.capacity(), 0);
+
+        let (message_tx, message_rx) = mpsc::channel(1);
+        spawn_message_reader(
+            device_id,
+            generation,
+            message_rx,
+            None,
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.pool.clone(),
+            manager.lifecycle_lock.clone(),
+        );
+        drop(message_tx);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !is_current_generation(&manager.connections, device_id, generation) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old generation should be authorized for retirement");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), manager.lifecycle_lock.lock())
+                .await
+                .is_err(),
+            "retirement must retain lifecycle ordering until Disconnected is queued"
+        );
+
+        events.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await,
+                    Some(ManagerEvent::Disconnected(disconnected)) if disconnected == device_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the authorized Disconnected event should be queued after capacity is released");
     }
 
     #[tokio::test]
@@ -493,8 +853,8 @@ mod tests {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut manager = ConnectionManager::new(local_id);
-        manager.connections.insert(
-            remote_id,
+        insert_test_canonical(
+            &manager,
             ConnectionInfo {
                 device_id: remote_id,
                 address: "127.0.0.1:27431".to_string(),
@@ -527,9 +887,9 @@ mod tests {
     async fn connected_entry_without_active_transport_is_reported_disconnected() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut manager = ConnectionManager::new(local_id);
-        manager.connections.insert(
-            remote_id,
+        let manager = ConnectionManager::new(local_id);
+        insert_test_canonical(
+            &manager,
             ConnectionInfo {
                 device_id: remote_id,
                 address: "127.0.0.1:27431".to_string(),
@@ -713,6 +1073,125 @@ mod tests {
 
         assert_eq!(connected, remote_id);
         assert!(manager.is_connected(&remote_id).await);
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_live_transport_closes() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("reconnect");
+
+        let mut first_remote = ConnectionManager::new(remote_id);
+        first_remote.start_server("127.0.0.1:0").await.unwrap();
+        let first_address = first_remote.transport_local_addr().unwrap();
+
+        let mut manager = ConnectionManager::new(local_id);
+        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut events = manager.events().unwrap();
+        manager
+            .connect(remote_id, &first_address.to_string())
+            .await
+            .unwrap();
+        assert!(manager.is_connected(&remote_id).await);
+
+        // Keep a reader from the first canonical connection alive until after the
+        // replacement is installed. Its eventual close models a late old-reader
+        // notification that must not disconnect the replacement generation.
+        let first_generation = manager
+            .connections
+            .read()
+            .expect("canonical connection registry poisoned")
+            .get(&remote_id)
+            .expect("the first connection should be canonical")
+            .generation;
+        let (late_old_reader_tx, late_old_reader_rx) = mpsc::channel(1);
+        spawn_message_reader(
+            remote_id,
+            first_generation,
+            late_old_reader_rx,
+            None,
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.pool.clone(),
+            manager.lifecycle_lock.clone(),
+        );
+
+        first_remote.transport.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    events.recv().await,
+                    Some(ManagerEvent::Disconnected(device_id)) if device_id == remote_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first connection reader should report its closed transport");
+        assert!(!manager.is_connected(&remote_id).await);
+
+        let mut replacement_remote = ConnectionManager::new(remote_id);
+        replacement_remote
+            .start_server("127.0.0.1:0")
+            .await
+            .unwrap();
+        let replacement_address = replacement_remote.transport_local_addr().unwrap();
+
+        manager
+            .connect(remote_id, &replacement_address.to_string())
+            .await
+            .expect("a closed canonical connection must not block reconnect");
+
+        assert!(manager.is_connected(&remote_id).await);
+        assert_eq!(manager.connected_count(), 1);
+
+        let replacement_connected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(ManagerEvent::Connected(device_id)) = events.recv().await {
+                    if device_id == remote_id {
+                        break device_id;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the replacement connection should emit Connected");
+        assert_eq!(replacement_connected, remote_id);
+
+        drop(late_old_reader_tx);
+        let stale_disconnect = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match events.recv().await {
+                    Some(ManagerEvent::Disconnected(device_id)) if device_id == remote_id => {
+                        break Some(device_id);
+                    }
+                    Some(_) => {}
+                    None => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            stale_disconnect.is_err(),
+            "a stale reader must not emit Disconnected for the replacement generation"
+        );
+        assert!(manager.is_connected(&remote_id).await);
+
+        let infos = manager.connection_infos().await;
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| {
+                    info.device_id == remote_id && info.state == ConnectionState::Connected
+                })
+                .count(),
+            1
+        );
+
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[tokio::test]

@@ -534,7 +534,12 @@ impl QuicConnection {
 
 pub struct ConnectionPool {
     _local_device_id: DeviceId,
-    connections: Arc<TokioMutex<std::collections::HashMap<DeviceId, QuicConnection>>>,
+    connections: Arc<TokioMutex<std::collections::HashMap<DeviceId, PooledConnection>>>,
+}
+
+struct PooledConnection {
+    generation: u64,
+    connection: QuicConnection,
 }
 
 impl ConnectionPool {
@@ -546,8 +551,23 @@ impl ConnectionPool {
     }
 
     pub async fn insert(&self, device_id: DeviceId, conn: QuicConnection) {
+        self.insert_with_generation(device_id, 0, conn).await;
+    }
+
+    pub(crate) async fn insert_with_generation(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+        conn: QuicConnection,
+    ) {
         let mut conns = self.connections.lock().await;
-        conns.insert(device_id, conn);
+        conns.insert(
+            device_id,
+            PooledConnection {
+                generation,
+                connection: conn,
+            },
+        );
     }
 
     pub fn get(&self, _device_id: &DeviceId) -> Option<&'static QuicConnection> {
@@ -556,8 +576,8 @@ impl ConnectionPool {
 
     pub async fn send_to(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
         let conns = self.connections.lock().await;
-        if let Some(conn) = conns.get(device_id) {
-            conn.send_message(message).await?;
+        if let Some(entry) = conns.get(device_id) {
+            entry.connection.send_message(message).await?;
         } else {
             anyhow::bail!("No active connection for device {}", device_id);
         }
@@ -571,22 +591,38 @@ impl ConnectionPool {
         let conns = self.connections.lock().await;
         conns
             .get(device_id)
-            .filter(|conn| conn.is_connected())
-            .map(QuicConnection::diagnostics)
+            .filter(|entry| entry.connection.is_connected())
+            .map(|entry| entry.connection.diagnostics())
     }
 
     pub async fn diagnostics_all(&self) -> Vec<(DeviceId, TransportConnectionDiagnostics)> {
         let conns = self.connections.lock().await;
         conns
             .iter()
-            .filter(|(_, conn)| conn.is_connected())
-            .map(|(device_id, conn)| (*device_id, conn.diagnostics()))
+            .filter(|(_, entry)| entry.connection.is_connected())
+            .map(|(device_id, entry)| (*device_id, entry.connection.diagnostics()))
             .collect()
     }
 
     pub async fn remove(&self, device_id: &DeviceId) -> Option<QuicConnection> {
         let mut conns = self.connections.lock().await;
-        conns.remove(device_id)
+        conns.remove(device_id).map(|entry| entry.connection)
+    }
+
+    pub(crate) async fn remove_generation(
+        &self,
+        device_id: &DeviceId,
+        generation: u64,
+    ) -> Option<QuicConnection> {
+        let mut conns = self.connections.lock().await;
+        if conns
+            .get(device_id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            conns.remove(device_id).map(|entry| entry.connection)
+        } else {
+            None
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -596,15 +632,15 @@ impl ConnectionPool {
 
     pub async fn broadcast(&self, message: &Message) -> Result<()> {
         let conns = self.connections.lock().await;
-        for (_id, conn) in conns.iter() {
-            let _ = conn.send_message(message).await;
+        for (_id, entry) in conns.iter() {
+            let _ = entry.connection.send_message(message).await;
         }
         Ok(())
     }
 
     pub async fn cleanup(&self) {
         let mut conns = self.connections.lock().await;
-        conns.retain(|_id, conn| conn.is_connected());
+        conns.retain(|_id, entry| entry.connection.is_connected());
     }
 }
 
