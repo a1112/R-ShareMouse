@@ -1051,6 +1051,7 @@ enum ProvisionalHeldPress {
     MouseButton {
         identity: u8,
         introduced: bool,
+        previous_position: (i32, i32),
     },
 }
 
@@ -1140,6 +1141,7 @@ fn provision_mobile_held_press(
             x,
             y,
         }) => {
+            let previous_position = session.last_mouse_position;
             session.last_mouse_position = (x, y);
             let introduced = session
                 .held_mouse_buttons
@@ -1148,6 +1150,7 @@ fn provision_mobile_held_press(
             Some(ProvisionalHeldPress::MouseButton {
                 identity,
                 introduced,
+                previous_position,
             })
         }
         _ => None,
@@ -1167,9 +1170,13 @@ fn rollback_mobile_held_press(
         }
         Some(ProvisionalHeldPress::MouseButton {
             identity,
-            introduced: true,
+            introduced,
+            previous_position,
         }) => {
-            session.held_mouse_buttons.remove(&identity);
+            session.last_mouse_position = previous_position;
+            if introduced {
+                session.held_mouse_buttons.remove(&identity);
+            }
         }
         _ => {}
     }
@@ -1668,6 +1675,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
 const clientId = crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let mobileSequence = 0;
+let inputSuspended = false;
 const heldKeys = new Set();
 const heldMouseButtons = new Set();
 const statusEl = document.getElementById("status");
@@ -1862,13 +1870,19 @@ function formatInjectResultStatus(result) {
   const backendKind = injectResult.backend_kind ? ` · ${injectResult.backend_kind}` : "";
   return { accepted: false, status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}` };
 }
-async function inject(request) {
+function prepareOrdinaryInjectEnvelope(request) {
+  if (inputSuspended) return null;
   trackHeldInputBeforeInject(request);
+  return mobileEnvelope(request);
+}
+async function inject(request) {
+  const envelope = prepareOrdinaryInjectEnvelope(request);
+  if (!envelope) return false;
   try {
     const result = await api("/api/inject", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mobileEnvelope(request))
+      body: JSON.stringify(envelope)
     });
     const feedback = formatInjectResultStatus(result);
     clearReleasedHeldInput(request, feedback.accepted);
@@ -1880,8 +1894,10 @@ async function inject(request) {
   }
 }
 async function refresh() {
+  if (inputSuspended) return;
   try {
     const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(clientId)}`);
+    if (inputSuspended) return;
     const snapshot = payload.LocalControls || {};
     const mouse = snapshot.mouse || {};
     const display = snapshot.display || {};
@@ -2011,6 +2027,7 @@ function keepaliveReleaseBatch(requests) {
   }
 }
 function releaseAllWithKeepalive() {
+  inputSuspended = true;
   keepaliveReleaseBatch(releaseAllRequests("mobile-release-all-keepalive"));
 }
 function clearDragTimer() {
@@ -2056,6 +2073,14 @@ function releaseTouchpadInteractionWhenHidden() {
 }
 function releaseAllWithKeepaliveWhenHidden() {
   if (document.visibilityState === "hidden") releaseAllWithKeepalive();
+}
+function resumeMobileInput() {
+  if (!inputSuspended) return;
+  inputSuspended = false;
+  refresh();
+}
+function resumeMobileInputWhenVisible() {
+  if (document.visibilityState === "visible") resumeMobileInput();
 }
 function touchPointsSnapshot() {
   return Array.from(touchPoints.values()).sort((left, right) => left.id - right.id);
@@ -2280,6 +2305,9 @@ textInput.addEventListener("keydown", (event) => { if (shouldSendTextOnKeydown(e
 window.addEventListener("blur", releaseAllWithKeepalive);
 window.addEventListener("pagehide", releaseAllWithKeepalive);
 document.addEventListener("visibilitychange", releaseAllWithKeepaliveWhenHidden);
+window.addEventListener("focus", resumeMobileInput);
+window.addEventListener("pageshow", resumeMobileInput);
+document.addEventListener("visibilitychange", resumeMobileInputWhenVisible);
 refresh();
 setInterval(refresh, 1500);
 </script>
@@ -2435,6 +2463,44 @@ mod tests {
         fn inject(&mut self, event: InputEvent) -> Result<()> {
             self.attempted.lock().unwrap().push(event);
             bail!("test backend rejection")
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectSecondMousePressBackend {
+        injected: Arc<StdMutex<Vec<InputEvent>>>,
+        mouse_press_count: usize,
+    }
+
+    impl InjectBackend for RejectSecondMousePressBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            let mouse_pressed = matches!(
+                event,
+                InputEvent::MouseButton {
+                    state: rshare_input::ButtonState::Pressed,
+                    ..
+                }
+            );
+            self.injected.lock().unwrap().push(event);
+            if mouse_pressed {
+                self.mouse_press_count += 1;
+                if self.mouse_press_count == 2 {
+                    bail!("reject second mouse press")
+                }
+            }
+            Ok(())
         }
 
         fn is_active(&self) -> bool {
@@ -3214,6 +3280,53 @@ mod tests {
         assert_eq!(attempted.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn rejected_mouse_repress_restores_last_accepted_release_coordinates() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RejectSecondMousePressBackend {
+                injected: injected.clone(),
+                mouse_press_count: 0,
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        let first = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            mouse_button_envelope("mouse-rollback", 1, "Left", "Pressed", 11, 17),
+        )
+        .await
+        .unwrap();
+        assert!(first.accepted);
+        let rejected = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            mouse_button_envelope("mouse-rollback", 2, "Left", "Pressed", 91, 97),
+        )
+        .await
+        .unwrap();
+        assert!(!rejected.accepted);
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        let state = state.read().await;
+        let release = state.local_controls.recent_events.last().unwrap();
+        assert_eq!(
+            release.payload.get("state").map(String::as_str),
+            Some("Released")
+        );
+        assert_eq!(release.payload.get("x").map(String::as_str), Some("11"));
+        assert_eq!(release.payload.get("y").map(String::as_str), Some("17"));
+    }
+
     #[test]
     fn rendered_mobile_page_sequences_envelopes_and_releases_complete_held_sets() {
         let page = render_mobile_page();
@@ -3257,6 +3370,69 @@ mod tests {
                 .expect("missing held-button setup");
             assert!(batch_listener > per_button_setup);
         }
+    }
+
+    #[test]
+    fn rendered_mobile_page_suspends_async_input_and_polling_before_lifecycle_batch() {
+        let page = render_mobile_page();
+        assert!(page.contains("let inputSuspended = false"));
+
+        let prepare_start = page
+            .find("function prepareOrdinaryInjectEnvelope(request)")
+            .expect("missing ordinary-input gate");
+        let inject_start = page
+            .find("async function inject(request)")
+            .expect("missing inject function");
+        let prepare = &page[prepare_start..inject_start];
+        let gate = prepare.find("if (inputSuspended) return null;").unwrap();
+        let tracking = prepare
+            .find("trackHeldInputBeforeInject(request);")
+            .unwrap();
+        let sequence = prepare.find("return mobileEnvelope(request);").unwrap();
+        assert!(gate < tracking && tracking < sequence);
+
+        let refresh_start = page
+            .find("async function refresh()")
+            .expect("missing refresh function");
+        let inject = &page[inject_start..refresh_start];
+        assert!(
+            inject
+                .find("const envelope = prepareOrdinaryInjectEnvelope(request);")
+                .unwrap()
+                < inject.find("if (!envelope) return false;").unwrap()
+        );
+        assert!(
+            inject.find("if (!envelope) return false;").unwrap()
+                < inject.find("await api(\"/api/inject\"").unwrap()
+        );
+        assert!(!inject.contains("mobileEnvelope(request)"));
+        let refresh_end = page[refresh_start..]
+            .find("function sendMoveNow")
+            .map(|offset| refresh_start + offset)
+            .unwrap();
+        let refresh = &page[refresh_start..refresh_end];
+        assert!(
+            refresh.find("if (inputSuspended) return;").unwrap()
+                < refresh.find("api(`/api/local-controls").unwrap()
+        );
+
+        let lifecycle_start = page
+            .find("function releaseAllWithKeepalive()")
+            .expect("missing lifecycle release");
+        let lifecycle_end = page[lifecycle_start..]
+            .find("function clearDragTimer")
+            .map(|offset| lifecycle_start + offset)
+            .unwrap();
+        let lifecycle = &page[lifecycle_start..lifecycle_end];
+        assert!(
+            lifecycle.find("inputSuspended = true;").unwrap()
+                < lifecycle.find("keepaliveReleaseBatch").unwrap()
+        );
+        assert!(page.contains("window.addEventListener(\"focus\", resumeMobileInput);"));
+        assert!(page.contains("window.addEventListener(\"pageshow\", resumeMobileInput);"));
+        assert!(page.contains(
+            "document.addEventListener(\"visibilitychange\", resumeMobileInputWhenVisible);"
+        ));
     }
 
     #[test]
