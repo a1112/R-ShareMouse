@@ -8,7 +8,7 @@ use rshare_input::InjectBackend;
 use rshare_net::NetworkManager;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +87,12 @@ struct MobileClientSession {
     last_mouse_position: (i32, i32),
 }
 
+#[derive(Debug, Default)]
+struct MobileHeldOwnership {
+    key_owners: BTreeMap<HeldKeyIdentity, BTreeSet<String>>,
+    mouse_button_owners: BTreeMap<u8, BTreeSet<String>>,
+}
+
 impl MobileClientSession {
     fn new(now: Instant) -> Self {
         Self {
@@ -106,6 +112,7 @@ impl MobileClientSession {
 #[derive(Debug, Clone)]
 struct MobileClientSessions {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<MobileClientSession>>>>>,
+    ownership: Arc<Mutex<MobileHeldOwnership>>,
     max_sessions: usize,
     held_input_lease: Duration,
 }
@@ -114,6 +121,7 @@ impl MobileClientSessions {
     fn new(max_sessions: usize, held_input_lease: Duration) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            ownership: Arc::new(Mutex::new(MobileHeldOwnership::default())),
             max_sessions: max_sessions.max(1),
             held_input_lease,
         }
@@ -189,6 +197,7 @@ impl MobileClientSessions {
             release_held_inputs(
                 client_id,
                 &mut session,
+                &self.ownership,
                 network_manager,
                 inject_backend,
                 state,
@@ -214,6 +223,7 @@ impl MobileClientSessions {
             release_held_inputs(
                 &client_id,
                 &mut session,
+                &self.ownership,
                 network_manager,
                 inject_backend,
                 state,
@@ -236,17 +246,19 @@ impl MobileClientSessions {
 async fn release_held_inputs(
     client_id: &str,
     session: &mut MobileClientSession,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
     network_manager: &Arc<Mutex<NetworkManager>>,
     inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
 ) {
+    let mut ownership = ownership.lock().await;
     let held_keys = session
         .held_keys
         .iter()
         .map(|(identity, keycode)| (*identity, *keycode))
         .collect::<Vec<_>>();
-    for (identity, keycode) in held_keys {
+    for (_identity, keycode) in held_keys {
         let request = lease_release_request(
             client_id,
             EndpointEventKind::Keyboard,
@@ -255,18 +267,17 @@ async fn release_held_inputs(
                 state: "Released".to_string(),
             },
         );
-        let result = inject_endpoint_event(
+        let _ = process_mobile_request_locked(
+            client_id,
+            session,
+            &mut ownership,
             network_manager,
             inject_backend,
             state,
             local_events_tx,
-            EndpointInjectTarget::Local,
             request,
         )
         .await;
-        if result.accepted {
-            session.held_keys.remove(&identity);
-        }
     }
 
     let held_buttons = session
@@ -274,7 +285,7 @@ async fn release_held_inputs(
         .iter()
         .map(|(identity, button)| (*identity, *button))
         .collect::<Vec<_>>();
-    for (identity, button) in held_buttons {
+    for (_identity, button) in held_buttons {
         let (x, y) = session.last_mouse_position;
         let request = lease_release_request(
             client_id,
@@ -286,18 +297,17 @@ async fn release_held_inputs(
                 y,
             },
         );
-        let result = inject_endpoint_event(
+        let _ = process_mobile_request_locked(
+            client_id,
+            session,
+            &mut ownership,
             network_manager,
             inject_backend,
             state,
             local_events_tx,
-            EndpointInjectTarget::Local,
             request,
         )
         .await;
-        if result.accepted {
-            session.held_mouse_buttons.remove(&identity);
-        }
     }
 }
 
@@ -923,6 +933,67 @@ fn validate_mobile_sequence(sequence: u64) -> Result<()> {
     Ok(())
 }
 
+async fn process_mobile_request_locked(
+    client_id: &str,
+    session: &mut MobileClientSession,
+    ownership: &mut MobileHeldOwnership,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    request: EndpointInjectRequest,
+) -> Result<EndpointInjectResult> {
+    let held_transition = mobile_held_transition(&request)?;
+    validate_mobile_held_capacity(session, held_transition)?;
+
+    if mobile_release_is_noop(ownership, client_id, held_transition) {
+        apply_mobile_held_transition(session, held_transition);
+        apply_mobile_ownership_transition(ownership, client_id, held_transition);
+        return Ok(accepted_mobile_noop(&request, inject_backend).await);
+    }
+
+    let provisional_press = provision_mobile_held_press(session, held_transition);
+    let provisional_ownership =
+        provision_mobile_ownership_press(ownership, client_id, held_transition);
+    let result = inject_endpoint_event(
+        network_manager,
+        inject_backend,
+        state,
+        local_events_tx,
+        EndpointInjectTarget::Local,
+        request,
+    )
+    .await;
+    if result.accepted {
+        apply_mobile_held_transition(session, held_transition);
+        apply_mobile_ownership_transition(ownership, client_id, held_transition);
+    } else {
+        rollback_mobile_held_press(session, provisional_press);
+        rollback_mobile_ownership_press(ownership, client_id, provisional_ownership);
+    }
+    Ok(result)
+}
+
+async fn accepted_mobile_noop(
+    request: &EndpointInjectRequest,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+) -> EndpointInjectResult {
+    let (backend_kind, health) = {
+        let backend = inject_backend.lock().await;
+        (Some(backend.kind()), backend.health())
+    };
+    EndpointInjectResult {
+        correlation_id: request.correlation_id.clone(),
+        target: EndpointInjectTarget::Local,
+        accepted: true,
+        backend_kind,
+        health,
+        elapsed_ms: 0,
+        loopback_event_id: None,
+        error: None,
+    }
+}
+
 async fn process_mobile_inject_envelope(
     sessions: &MobileClientSessions,
     network_manager: &Arc<Mutex<NetworkManager>>,
@@ -943,24 +1014,18 @@ async fn process_mobile_inject_envelope(
         } => request,
         _ => bail!("mobile envelope only accepts a local InjectEndpointEvent"),
     };
-    let held_transition = mobile_held_transition(&request)?;
-    validate_mobile_held_capacity(&session, held_transition)?;
-    let provisional_press = provision_mobile_held_press(&mut session, held_transition);
-    let result = inject_endpoint_event(
+    let mut ownership = sessions.ownership.lock().await;
+    process_mobile_request_locked(
+        &envelope.client_id,
+        &mut session,
+        &mut ownership,
         network_manager,
         inject_backend,
         state,
         local_events_tx,
-        EndpointInjectTarget::Local,
-        request.clone(),
+        request,
     )
-    .await;
-    if result.accepted {
-        apply_mobile_held_transition(&mut session, held_transition);
-    } else {
-        rollback_mobile_held_press(&mut session, provisional_press);
-    }
-    Ok(result)
+    .await
 }
 
 async fn process_mobile_release_batch(
@@ -976,6 +1041,7 @@ async fn process_mobile_release_batch(
     let session = sessions.session_at(&batch.client_id, now).await?;
     let mut session = session.lock().await;
     accept_mobile_sequence(&mut session, batch.sequence, now)?;
+    let mut ownership = sessions.ownership.lock().await;
 
     let mut results = Vec::with_capacity(batch.requests.len());
     for request in batch.requests {
@@ -986,20 +1052,17 @@ async fn process_mobile_release_batch(
             } => request,
             _ => unreachable!("release batch was validated before processing"),
         };
-        let held_transition = mobile_held_transition(&request)
-            .expect("validated release request must have a held-input transition");
-        let result = inject_endpoint_event(
+        let result = process_mobile_request_locked(
+            &batch.client_id,
+            &mut session,
+            &mut ownership,
             network_manager,
             inject_backend,
             state,
             local_events_tx,
-            EndpointInjectTarget::Local,
-            request.clone(),
+            request,
         )
-        .await;
-        if result.accepted {
-            apply_mobile_held_transition(&mut session, held_transition);
-        }
+        .await?;
         results.push(result);
     }
     Ok(results)
@@ -1053,6 +1116,162 @@ enum ProvisionalHeldPress {
         introduced: bool,
         previous_position: (i32, i32),
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProvisionalMobileOwnership {
+    Key {
+        identity: HeldKeyIdentity,
+        introduced: bool,
+    },
+    MouseButton {
+        identity: u8,
+        introduced: bool,
+    },
+}
+
+fn mobile_release_is_noop(
+    ownership: &MobileHeldOwnership,
+    client_id: &str,
+    transition: Option<MobileHeldTransition>,
+) -> bool {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: false,
+            ..
+        }) => ownership
+            .key_owners
+            .get(&identity)
+            .map(|owners| !owners.contains(client_id) || owners.len() > 1)
+            .unwrap_or(true),
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: false,
+            ..
+        }) => ownership
+            .mouse_button_owners
+            .get(&identity)
+            .map(|owners| !owners.contains(client_id) || owners.len() > 1)
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn provision_mobile_ownership_press(
+    ownership: &mut MobileHeldOwnership,
+    client_id: &str,
+    transition: Option<MobileHeldTransition>,
+) -> Option<ProvisionalMobileOwnership> {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: true,
+            ..
+        }) => {
+            let introduced = ownership
+                .key_owners
+                .entry(identity)
+                .or_default()
+                .insert(client_id.to_string());
+            Some(ProvisionalMobileOwnership::Key {
+                identity,
+                introduced,
+            })
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: true,
+            ..
+        }) => {
+            let introduced = ownership
+                .mouse_button_owners
+                .entry(identity)
+                .or_default()
+                .insert(client_id.to_string());
+            Some(ProvisionalMobileOwnership::MouseButton {
+                identity,
+                introduced,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rollback_mobile_ownership_press(
+    ownership: &mut MobileHeldOwnership,
+    client_id: &str,
+    provisional: Option<ProvisionalMobileOwnership>,
+) {
+    match provisional {
+        Some(ProvisionalMobileOwnership::Key {
+            identity,
+            introduced: true,
+        }) => remove_mobile_owner(&mut ownership.key_owners, &identity, client_id),
+        Some(ProvisionalMobileOwnership::MouseButton {
+            identity,
+            introduced: true,
+        }) => remove_mobile_owner(&mut ownership.mouse_button_owners, &identity, client_id),
+        _ => {}
+    }
+}
+
+fn apply_mobile_ownership_transition(
+    ownership: &mut MobileHeldOwnership,
+    client_id: &str,
+    transition: Option<MobileHeldTransition>,
+) {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: true,
+            ..
+        }) => {
+            ownership
+                .key_owners
+                .entry(identity)
+                .or_default()
+                .insert(client_id.to_string());
+        }
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: false,
+            ..
+        }) => remove_mobile_owner(&mut ownership.key_owners, &identity, client_id),
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: true,
+            ..
+        }) => {
+            ownership
+                .mouse_button_owners
+                .entry(identity)
+                .or_default()
+                .insert(client_id.to_string());
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: false,
+            ..
+        }) => remove_mobile_owner(&mut ownership.mouse_button_owners, &identity, client_id),
+        _ => {}
+    }
+}
+
+fn remove_mobile_owner<K: Ord>(
+    owners_by_identity: &mut BTreeMap<K, BTreeSet<String>>,
+    identity: &K,
+    client_id: &str,
+) {
+    let remove_identity = if let Some(owners) = owners_by_identity.get_mut(identity) {
+        owners.remove(client_id);
+        owners.is_empty()
+    } else {
+        false
+    };
+    if remove_identity {
+        owners_by_identity.remove(identity);
+    }
 }
 
 fn mobile_held_transition(request: &EndpointInjectRequest) -> Result<Option<MobileHeldTransition>> {
@@ -3039,15 +3258,326 @@ mod tests {
 
         assert!(release.accepted);
         assert!(late_error.to_string().contains("sequence"));
-        let injected = injected.lock().unwrap();
-        assert_eq!(injected.len(), 1);
-        assert!(matches!(
-            injected[0],
-            InputEvent::Key {
-                keycode: rshare_input::KeyCode::Char(b'A'),
-                state: rshare_input::ButtonState::Released,
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "a release without ownership must be an accepted no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_without_ownership_cannot_release_another_clients_key() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("key-owner", 1, "A", "Pressed"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        let non_owner_release = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("key-intruder", 1, "A", "Released"),
+        )
+        .await
+        .unwrap();
+
+        assert!(non_owner_release.accepted);
+        assert_eq!(injected.lock().unwrap().len(), 1);
+        assert_eq!(state.read().await.local_controls.recent_events.len(), 1);
+
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("key-owner", 2, "A", "Released"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        assert_eq!(injected.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fixed_release_batch_from_never_pressed_client_is_a_noop() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for envelope in [
+            keyboard_envelope("batch-owner", 1, "A", "Pressed"),
+            mouse_button_envelope("batch-owner", 2, "Left", "Pressed", 5, 7),
+        ] {
+            assert!(
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    envelope,
+                )
+                .await
+                .unwrap()
+                .accepted
+            );
+        }
+        let releases = vec![
+            keyboard_envelope("ignored", 1, "A", "Released").request,
+            mouse_button_envelope("ignored", 2, "Left", "Released", 5, 7).request,
+        ];
+
+        let noops = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            MobileReleaseBatch {
+                client_id: "batch-intruder".to_string(),
+                sequence: 1,
+                requests: releases.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(noops.iter().all(|result| result.accepted));
+        assert_eq!(injected.lock().unwrap().len(), 2);
+        assert_eq!(state.read().await.local_controls.recent_events.len(), 2);
+
+        let owner_releases = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            MobileReleaseBatch {
+                client_id: "batch-owner".to_string(),
+                sequence: 3,
+                requests: releases,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(owner_releases.iter().all(|result| result.accepted));
+        assert_eq!(injected.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn key_and_mouse_release_reach_backend_only_for_the_last_owner() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for (client, sequence) in [("owner-one", 1), ("owner-two", 1)] {
+            for envelope in [
+                keyboard_envelope(client, sequence, "A", "Pressed"),
+                mouse_button_envelope(client, sequence + 1, "Left", "Pressed", 9, 11),
+            ] {
+                assert!(
+                    process_mobile_inject_envelope(
+                        &sessions,
+                        &network_manager,
+                        &inject_backend,
+                        &state,
+                        &local_events_tx,
+                        envelope,
+                    )
+                    .await
+                    .unwrap()
+                    .accepted
+                );
             }
-        ));
+        }
+        let releases = vec![
+            keyboard_envelope("ignored", 1, "A", "Released").request,
+            mouse_button_envelope("ignored", 2, "Left", "Released", 9, 11).request,
+        ];
+
+        let first = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            MobileReleaseBatch {
+                client_id: "owner-one".to_string(),
+                sequence: 3,
+                requests: releases.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(first.iter().all(|result| result.accepted));
+        assert_eq!(injected.lock().unwrap().len(), 4);
+
+        let last = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            MobileReleaseBatch {
+                client_id: "owner-two".to_string(),
+                sequence: 3,
+                requests: releases,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(last.iter().all(|result| result.accepted));
+        assert_eq!(injected.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn lease_reaper_keeps_shared_key_pressed_until_last_owner_expires() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let lease = Duration::from_millis(50);
+        let sessions = MobileClientSessions::new(8, lease);
+        for client in ["expired-owner", "active-owner"] {
+            assert!(
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope(client, 1, "A", "Pressed"),
+                )
+                .await
+                .unwrap()
+                .accepted
+            );
+        }
+        let now = Instant::now();
+        sessions
+            .session_at("expired-owner", now)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .last_seen = now.checked_sub(lease + Duration::from_millis(1)).unwrap();
+        sessions
+            .session_at("active-owner", now)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .last_seen = now;
+
+        sessions
+            .reap_expired_at(
+                now,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+            )
+            .await;
+        assert_eq!(injected.lock().unwrap().len(), 2);
+
+        sessions
+            .session_at("active-owner", now)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .last_seen = now.checked_sub(lease + Duration::from_millis(1)).unwrap();
+        sessions
+            .reap_expired_at(
+                now,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+            )
+            .await;
+        assert_eq!(injected.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn delayed_release_from_old_client_cannot_release_new_owner() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for envelope in [
+            keyboard_envelope("old-client", 1, "A", "Pressed"),
+            keyboard_envelope("old-client", 2, "A", "Released"),
+            keyboard_envelope("new-client", 1, "A", "Pressed"),
+        ] {
+            assert!(
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    envelope,
+                )
+                .await
+                .unwrap()
+                .accepted
+            );
+        }
+
+        let delayed = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("old-client", 3, "A", "Released"),
+        )
+        .await
+        .unwrap();
+        assert!(delayed.accepted);
+        assert_eq!(injected.lock().unwrap().len(), 3);
+
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("new-client", 2, "A", "Released"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        assert_eq!(injected.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -3351,6 +3881,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.lock().await.held_keys.len(), 1);
+
+        let retry_injected = Arc::new(StdMutex::new(Vec::new()));
+        *inject_backend.lock().await = Box::new(RecordingInjectBackend {
+            injected: retry_injected.clone(),
+        });
+        let retry = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("failed-release-batch", 3, "A", "Released"),
+        )
+        .await
+        .unwrap();
+        assert!(retry.accepted);
+        assert_eq!(
+            retry_injected.lock().unwrap().len(),
+            1,
+            "a rejected last-owner release must retain ownership for retry"
+        );
     }
 
     #[tokio::test]
