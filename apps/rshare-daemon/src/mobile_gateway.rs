@@ -1889,11 +1889,13 @@ async function inject(request, expectedGeneration = inputGeneration) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(envelope)
     });
+    if (inputSuspended || expectedGeneration !== inputGeneration) return false;
     const feedback = formatInjectResultStatus(result);
     clearReleasedHeldInput(request, feedback.accepted);
     statusEl.textContent = feedback.status;
     return feedback.accepted;
   } catch (error) {
+    if (inputSuspended || expectedGeneration !== inputGeneration) return false;
     statusEl.textContent = formatMobileError(error, "移动端注入");
     return false;
   }
@@ -2009,9 +2011,9 @@ function releaseAllRequests(prefix) {
   const knownModifierKeys = new Set(modifierKeys.map(([key]) => key));
   return [
     ...mouseButtons.map(([buttonName, correlationId]) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId))),
-    ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750)),
+    ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "BestEffort", 750)),
     ...Array.from(heldMouseButtons).filter((buttonName) => !knownMouseButtons.has(buttonName)).map((buttonName) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`${prefix}-mouse-${buttonName.toLowerCase()}`))),
-    ...Array.from(heldKeys).filter((key) => !knownModifierKeys.has(key)).map((key) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`${prefix}-key-${key.toLowerCase()}`), "RequireHealthyBackend", 750))
+    ...Array.from(heldKeys).filter((key) => !knownModifierKeys.has(key)).map((key) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`${prefix}-key-${key.toLowerCase()}`), "BestEffort", 750))
   ];
 }
 async function sendReleaseAll() {
@@ -3084,6 +3086,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_best_effort_release_batch_retains_server_held_state() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("failed-release-batch", 1, "A", "Pressed"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+
+        let attempted = Arc::new(StdMutex::new(Vec::new()));
+        *inject_backend.lock().await = Box::new(RejectingInjectBackend {
+            attempted: attempted.clone(),
+        });
+        let mut release = keyboard_envelope("ignored", 1, "A", "Released").request;
+        let DaemonRequest::InjectEndpointEvent { request, .. } = &mut release else {
+            unreachable!("keyboard helper must build an inject request");
+        };
+        request.mode = EndpointInjectMode::BestEffort;
+
+        let results = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            MobileReleaseBatch {
+                client_id: "failed-release-batch".to_string(),
+                sequence: 2,
+                requests: vec![release],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!results[0].accepted);
+        assert_eq!(attempted.lock().unwrap().len(), 1);
+        let session = sessions
+            .session_at("failed-release-batch", Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(session.lock().await.held_keys.len(), 1);
+    }
+
+    #[tokio::test]
     async fn rotated_client_traffic_cannot_stale_the_old_generation_cleanup() {
         let injected = Arc::new(StdMutex::new(Vec::new()));
         let (state, network_manager, inject_backend, local_events_tx) =
@@ -3615,6 +3673,72 @@ mod tests {
         assert!(page.contains(
             "document.addEventListener(\"visibilitychange\", resumeMobileInputWhenVisible);"
         ));
+    }
+
+    #[test]
+    fn rendered_mobile_page_discards_stale_inject_completion_before_mutation() {
+        let page = render_mobile_page();
+        let inject_start = page
+            .find("async function inject(request, expectedGeneration = inputGeneration)")
+            .expect("missing inject function");
+        let refresh_start = page[inject_start..]
+            .find("async function refresh()")
+            .map(|offset| inject_start + offset)
+            .expect("missing refresh function");
+        let inject = &page[inject_start..refresh_start];
+        let await_api = inject.find("await api(\"/api/inject\"").unwrap();
+        let catch_start = inject.find("} catch (error) {").unwrap();
+        let success = &inject[await_api..catch_start];
+        let generation_guard = success
+            .find("if (inputSuspended || expectedGeneration !== inputGeneration) return false;")
+            .expect("missing post-await generation guard");
+        for mutation in [
+            "clearReleasedHeldInput(request, feedback.accepted);",
+            "statusEl.textContent = feedback.status;",
+            "return feedback.accepted;",
+        ] {
+            assert!(generation_guard < success.find(mutation).unwrap());
+        }
+
+        let catch = &inject[catch_start..];
+        assert!(
+            catch
+                .find("if (inputSuspended || expectedGeneration !== inputGeneration) return false;")
+                .expect("missing catch generation guard")
+                < catch
+                    .find("statusEl.textContent = formatMobileError")
+                    .unwrap()
+        );
+
+        let send_text_start = page
+            .find("async function sendText()")
+            .expect("missing text flow");
+        let send_text_end = page[send_text_start..]
+            .find("function shouldSendTextOnKeydown")
+            .map(|offset| send_text_start + offset)
+            .unwrap();
+        let send_text = &page[send_text_start..send_text_end];
+        assert!(
+            send_text.find("if (await inject").unwrap()
+                < send_text.find("textInput.value = \"\";").unwrap()
+        );
+    }
+
+    #[test]
+    fn rendered_mobile_release_batch_uses_best_effort_for_keyboard_releases() {
+        let page = render_mobile_page();
+        let release_start = page
+            .find("function releaseAllRequests(prefix)")
+            .expect("missing release batch builder");
+        let release_end = page[release_start..]
+            .find("async function sendReleaseAll()")
+            .map(|offset| release_start + offset)
+            .unwrap();
+        let release = &page[release_start..release_end];
+
+        assert_eq!(release.matches("daemonRequest(\"Keyboard\"").count(), 2);
+        assert_eq!(release.matches("\"BestEffort\", 750").count(), 2);
+        assert!(!release.contains("RequireHealthyBackend"));
     }
 
     #[test]
