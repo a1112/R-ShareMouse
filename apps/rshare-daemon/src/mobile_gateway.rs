@@ -1681,6 +1681,12 @@ let mobileSequence = 0;
 let inputGeneration = 0;
 let inputSuspended = false;
 let refreshAbortController = null;
+let refreshInFlight = null;
+let gestureActive = false;
+let pointerRevision = 0;
+let statusRevision = 0;
+const pendingPointerWrites = new Set();
+let mobileRequestQueueTail = Promise.resolve();
 const heldKeys = new Set();
 const heldMouseButtons = new Set();
 const statusEl = document.getElementById("status");
@@ -1701,6 +1707,9 @@ let lastWheelTouches = null;
 let twoFingerTapStart = null;
 let pendingMove = null;
 let pendingMoveFrame = 0;
+let moveInFlight = null;
+let wheelResidualX = 0;
+let wheelResidualY = 0;
 let dragTimer = 0;
 let dragPointer = null;
 const LONG_PRESS_DRAG_DELAY_MS = 420;
@@ -1892,75 +1901,145 @@ async function inject(request, expectedGeneration = inputGeneration) {
     if (inputSuspended || expectedGeneration !== inputGeneration) return false;
     const feedback = formatInjectResultStatus(result);
     clearReleasedHeldInput(request, feedback.accepted);
+    statusRevision += 1;
     statusEl.textContent = feedback.status;
     return feedback.accepted;
   } catch (error) {
     if (inputSuspended || expectedGeneration !== inputGeneration) return false;
+    statusRevision += 1;
     statusEl.textContent = formatMobileError(error, "移动端注入");
     return false;
   }
 }
+function enqueueInjectBatch(requests, expectedGeneration = inputGeneration) {
+  const batch = Array.isArray(requests) ? [...requests] : [];
+  const result = mobileRequestQueueTail.then(async () => {
+    const accepted = [];
+    for (const request of batch) {
+      accepted.push(await inject(request, expectedGeneration));
+    }
+    return accepted;
+  });
+  mobileRequestQueueTail = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+function enqueueInject(request, expectedGeneration = inputGeneration) {
+  return enqueueInjectBatch([request], expectedGeneration).then(([accepted]) => accepted);
+}
 async function refresh() {
   if (inputSuspended) return;
-  if (refreshAbortController) refreshAbortController.abort();
+  if (refreshInFlight) return refreshInFlight;
   const controller = new AbortController();
   refreshAbortController = controller;
   const pollingClientId = clientId;
   const pollingGeneration = inputGeneration;
-  try {
-    const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(pollingClientId)}`, { signal: controller.signal });
-    if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;
-    const snapshot = payload.LocalControls || {};
-    const mouse = snapshot.mouse || {};
-    const display = snapshot.display || {};
-    displayEntries = Array.isArray(display.displays) ? display.displays : [];
-    const primary = displayEntries.find((item) => item.primary) || displayEntries[0] || {};
-    const minX = Number(display.virtual_x ?? primary.x ?? 0);
-    const minY = Number(display.virtual_y ?? primary.y ?? 0);
-    const layoutWidth = Number(display.layout_width ?? display.primary_width ?? primary.width ?? primary.w ?? 1920);
-    const layoutHeight = Number(display.layout_height ?? display.primary_height ?? primary.height ?? primary.h ?? 1080);
-    pointer = {
-      x: Number(mouse.x || 0),
-      y: Number(mouse.y || 0),
-      minX: Number.isFinite(minX) ? Math.floor(minX) : 0,
-      minY: Number.isFinite(minY) ? Math.floor(minY) : 0,
-      width: Math.max(1, Math.floor(Number.isFinite(layoutWidth) ? layoutWidth : 1920)),
-      height: Math.max(1, Math.floor(Number.isFinite(layoutHeight) ? layoutHeight : 1080)),
-      displayId: displayIdForPointer(displayEntries, Number(mouse.x || 0), Number(mouse.y || 0), mouse.current_display_id || primary.display_id || primary.id || null)
-    };
-    posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
-    const backendStatus = formatBackendStatus(snapshot);
-    backendStatusEl.textContent = `${backendStatus.label} · ${backendStatus.detail}`;
-    backendStatusEl.style.color = backendStatus.state === "ready" ? '#47c27a' : '#d6a64b';
-    statusEl.textContent = "已连接";
-  } catch (error) {
-    if (error?.name === "AbortError") return;
-    statusEl.textContent = formatMobileError(error, "移动端状态");
-  } finally {
-    if (refreshAbortController === controller) refreshAbortController = null;
-  }
+  const requestedPointerRevision = pointerRevision;
+  const requestedStatusRevision = statusRevision;
+  const request = (async () => {
+    try {
+      const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(pollingClientId)}`, { signal: controller.signal });
+      if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;
+      const snapshot = payload.LocalControls || {};
+      const mouse = snapshot.mouse || {};
+      const display = snapshot.display || {};
+      const nextDisplayEntries = Array.isArray(display.displays) ? display.displays : [];
+      const primary = nextDisplayEntries.find((item) => item.primary) || nextDisplayEntries[0] || {};
+      const minX = Number(display.virtual_x ?? primary.x ?? 0);
+      const minY = Number(display.virtual_y ?? primary.y ?? 0);
+      const layoutWidth = Number(display.layout_width ?? display.primary_width ?? primary.width ?? primary.w ?? 1920);
+      const layoutHeight = Number(display.layout_height ?? display.primary_height ?? primary.height ?? primary.h ?? 1080);
+      if (!gestureActive && pendingPointerWrites.size === 0 && requestedPointerRevision === pointerRevision) {
+        displayEntries = nextDisplayEntries;
+        pointer = {
+          x: Number(mouse.x || 0),
+          y: Number(mouse.y || 0),
+          minX: Number.isFinite(minX) ? Math.floor(minX) : 0,
+          minY: Number.isFinite(minY) ? Math.floor(minY) : 0,
+          width: Math.max(1, Math.floor(Number.isFinite(layoutWidth) ? layoutWidth : 1920)),
+          height: Math.max(1, Math.floor(Number.isFinite(layoutHeight) ? layoutHeight : 1080)),
+          displayId: displayIdForPointer(nextDisplayEntries, Number(mouse.x || 0), Number(mouse.y || 0), mouse.current_display_id || primary.display_id || primary.id || null)
+        };
+        posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
+      }
+      if (requestedStatusRevision === statusRevision) {
+        const backendStatus = formatBackendStatus(snapshot);
+        backendStatusEl.textContent = `${backendStatus.label} · ${backendStatus.detail}`;
+        backendStatusEl.style.color = backendStatus.state === "ready" ? '#47c27a' : '#d6a64b';
+        statusEl.textContent = "已连接";
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;
+      if (requestedStatusRevision === statusRevision) {
+        statusEl.textContent = formatMobileError(error, "移动端状态");
+      }
+    } finally {
+      if (refreshAbortController === controller) refreshAbortController = null;
+      if (refreshInFlight === request) refreshInFlight = null;
+    }
+  })();
+  refreshInFlight = request;
+  return refreshInFlight;
 }
-function sendMoveNow(next) {
-  inject(daemonRequest("Mouse", { kind: "MouseMove", data: { x: next.x, y: next.y, display_id: next.displayId } }, cid("mobile-move")));
+function setGestureActive(active) {
+  const next = Boolean(active);
+  if (next === gestureActive) return;
+  gestureActive = next;
+  pointerRevision += 1;
+}
+function markPointerChanged() {
+  pointerRevision += 1;
+}
+function beginPointerWrite() {
+  const token = {};
+  pendingPointerWrites.add(token);
+  pointerRevision += 1;
+  let completed = false;
+  return () => {
+    if (completed) return false;
+    completed = true;
+    if (!pendingPointerWrites.delete(token)) return false;
+    pointerRevision += 1;
+    return true;
+  };
+}
+function sendMoveNow(next, expectedGeneration = inputGeneration) {
+  const completePointerWrite = beginPointerWrite();
+  return enqueueInject(daemonRequest("Mouse", { kind: "MouseMove", data: { x: next.x, y: next.y, display_id: next.displayId } }, cid("mobile-move")), expectedGeneration)
+    .finally(completePointerWrite);
+}
+function queuePendingMove() {
+  const next = pendingMove;
+  pendingMove = null;
+  if (!next) return moveInFlight || Promise.resolve(false);
+  const generation = inputGeneration;
+  const queuedMove = Promise.resolve(sendMoveNow(next, generation)).catch(() => false);
+  moveInFlight = queuedMove;
+  void queuedMove.then(() => {
+    if (moveInFlight !== queuedMove) return;
+    moveInFlight = null;
+    if (pendingMove) queuePendingMove();
+  });
+  return queuedMove;
 }
 function scheduleMove(next) {
   pendingMove = { ...next };
-  if (pendingMoveFrame) return;
+  if (pendingMoveFrame || moveInFlight) return;
   pendingMoveFrame = requestAnimationFrame(() => {
     pendingMoveFrame = 0;
-    const next = pendingMove;
-    pendingMove = null;
-    if (next) sendMoveNow(next);
+    queuePendingMove();
   });
 }
 function flushMove() {
-  const next = pendingMove;
-  pendingMove = null;
   if (pendingMoveFrame) {
     cancelAnimationFrame(pendingMoveFrame);
     pendingMoveFrame = 0;
   }
-  if (next) sendMoveNow(next);
+  if (pendingMove) return queuePendingMove();
+  return moveInFlight || Promise.resolve(false);
 }
 function isTouchpadTap(start, end) {
   if (!start || !end) return false;
@@ -1976,22 +2055,29 @@ function isTouchpadLongPressDrag(start, current) {
 }
 async function sendTapClick() {
   const generation = inputGeneration;
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")), generation);
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")), generation);
+  flushMove();
+  return enqueueInjectBatch([
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")),
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up"))
+  ], generation);
 }
 async function sendDoubleClick(buttonName) {
   const generation = inputGeneration;
+  flushMove();
   if (buttonName === "Left") {
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-down")), generation);
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-up")), generation);
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-down")), generation);
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-up")), generation);
-    return;
+    return enqueueInjectBatch([
+      daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-down")),
+      daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-up")),
+      daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-down")),
+      daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-up"))
+    ], generation);
   }
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-down`)), generation);
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-up`)), generation);
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)), generation);
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)), generation);
+  return enqueueInjectBatch([
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-down`)),
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-up`)),
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)),
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`))
+  ], generation);
 }
 function releaseAllRequests(prefix) {
   const mouseButtons = [
@@ -2018,9 +2104,8 @@ function releaseAllRequests(prefix) {
 }
 async function sendReleaseAll() {
   const generation = inputGeneration;
-  for (const request of releaseAllRequests("mobile-release-all")) {
-    await inject(request, generation);
-  }
+  flushMove();
+  return enqueueInjectBatch(releaseAllRequests("mobile-release-all"), generation);
 }
 function keepaliveReleaseBatch(requests) {
   if (!Array.isArray(requests) || requests.length === 0) return false;
@@ -2047,10 +2132,18 @@ function keepaliveReleaseBatch(requests) {
 function releaseAllWithKeepalive() {
   inputSuspended = true;
   inputGeneration += 1;
+  setGestureActive(false);
+  pendingMove = null;
+  if (pendingMoveFrame) {
+    cancelAnimationFrame(pendingMoveFrame);
+    pendingMoveFrame = 0;
+  }
+  resetTwoFingerWheelAccumulator();
   if (refreshAbortController) {
     refreshAbortController.abort();
     refreshAbortController = null;
   }
+  refreshInFlight = null;
   keepaliveReleaseBatch(releaseAllRequests("mobile-release-all-keepalive"));
 }
 function clearDragTimer() {
@@ -2060,7 +2153,8 @@ function clearDragTimer() {
   }
 }
 function sendDragButton(state) {
-  inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state, x: pointer.x, y: pointer.y } }, cid(`mobile-touchpad-drag-${state}`)));
+  flushMove();
+  return enqueueInject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state, x: pointer.x, y: pointer.y } }, cid(`mobile-touchpad-drag-${state}`)));
 }
 function beginTouchpadDrag(pointerId) {
   dragTimer = 0;
@@ -2086,8 +2180,10 @@ function releaseTouchpadInteraction() {
   lastPoint = null;
   tapStart = null;
   lastWheelTouches = null;
+  resetTwoFingerWheelAccumulator();
   twoFingerTapStart = null;
   touchPoints.clear();
+  setGestureActive(false);
 }
 function releaseTouchpadInteractionWhenHidden() {
   if (document.visibilityState === "hidden") {
@@ -2101,6 +2197,13 @@ function rotateMobileClientSession() {
   clientId = newMobileClientId();
   mobileSequence = 0;
   inputGeneration += 1;
+  pointerRevision += 1;
+  statusRevision += 1;
+  pendingPointerWrites.clear();
+  mobileRequestQueueTail = Promise.resolve();
+  pendingMove = null;
+  moveInFlight = null;
+  resetTwoFingerWheelAccumulator();
   heldKeys.clear();
   heldMouseButtons.clear();
 }
@@ -2119,16 +2222,28 @@ function touchPointsSnapshot() {
 function centerOfTouches(touches) {
   return { x: (touches[0].x + touches[1].x) / 2, y: (touches[0].y + touches[1].y) / 2 };
 }
+function resetTwoFingerWheelAccumulator() {
+  wheelResidualX = 0;
+  wheelResidualY = 0;
+}
 function twoFingerWheelDelta(previousTouches, currentTouches) {
-  if (!previousTouches || !currentTouches || previousTouches.length !== 2 || currentTouches.length !== 2) return null;
-  if (previousTouches[0].id !== currentTouches[0].id || previousTouches[1].id !== currentTouches[1].id) return null;
+  if (!previousTouches || !currentTouches || previousTouches.length !== 2 || currentTouches.length !== 2) {
+    resetTwoFingerWheelAccumulator();
+    return null;
+  }
+  if (previousTouches[0].id !== currentTouches[0].id || previousTouches[1].id !== currentTouches[1].id) {
+    resetTwoFingerWheelAccumulator();
+    return null;
+  }
   const previousCenter = centerOfTouches(previousTouches);
   const currentCenter = centerOfTouches(currentTouches);
-  const dx = currentCenter.x - previousCenter.x;
-  const dy = currentCenter.y - previousCenter.y;
-  if (Math.max(Math.abs(dx), Math.abs(dy)) < 6) return null;
-  const wheel = { deltaX: Math.round(dx * 0.12), deltaY: Math.round(dy * 0.12) };
-  return wheel.deltaX || wheel.deltaY ? wheel : null;
+  wheelResidualX += currentCenter.x - previousCenter.x;
+  wheelResidualY += currentCenter.y - previousCenter.y;
+  if (Math.max(Math.abs(wheelResidualX), Math.abs(wheelResidualY)) < 6) return null;
+  const wheel = { deltaX: Math.round(wheelResidualX * 0.12), deltaY: Math.round(wheelResidualY * 0.12) };
+  if (!wheel.deltaX && !wheel.deltaY) return null;
+  resetTwoFingerWheelAccumulator();
+  return wheel;
 }
 function isTwoFingerTap(startTouches, endTouches, startTimeMs, endTimeMs) {
   if (!startTouches || !endTouches || startTouches.length !== 2 || endTouches.length !== 2) return false;
@@ -2143,18 +2258,23 @@ function isTwoFingerTap(startTouches, endTouches, startTimeMs, endTimeMs) {
   return Math.abs(endDistance - startDistance) <= 12;
 }
 function sendWheelDelta(wheel) {
-  inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: wheel.deltaX, delta_y: wheel.deltaY, x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
+  flushMove();
+  return enqueueInject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: wheel.deltaX, delta_y: wheel.deltaY, x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
 }
 async function sendTwoFingerTapClick() {
   const generation = inputGeneration;
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-down")), generation);
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-up")), generation);
+  flushMove();
+  return enqueueInjectBatch([
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-down")),
+    daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-up"))
+  ], generation);
 }
 pad.addEventListener("pointerdown", (event) => {
   touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
   activePointer = event.pointerId;
   lastPoint = { x: event.clientX, y: event.clientY };
   tapStart = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
+  setGestureActive(true);
   pad.setPointerCapture(event.pointerId);
   clearDragTimer();
   dragTimer = setTimeout(() => beginTouchpadDrag(event.pointerId), LONG_PRESS_DRAG_DELAY_MS);
@@ -2162,6 +2282,7 @@ pad.addEventListener("pointerdown", (event) => {
     clearDragTimer();
     releaseTouchpadDrag();
     flushMove();
+    resetTwoFingerWheelAccumulator();
     const touches = touchPoints.size === 2 ? touchPointsSnapshot() : null;
     lastWheelTouches = touches;
     twoFingerTapStart = touches ? { touches, timeMs: event.timeStamp } : null;
@@ -2179,6 +2300,7 @@ pad.addEventListener("pointermove", (event) => {
     releaseTouchpadDrag();
     if (touchPoints.size > 2) {
       lastWheelTouches = null;
+      resetTwoFingerWheelAccumulator();
       twoFingerTapStart = null;
       return;
     }
@@ -2202,6 +2324,7 @@ pad.addEventListener("pointermove", (event) => {
   const maxY = pointer.minY + pointer.height - 1;
   pointer = { ...pointer, x: Math.max(pointer.minX, Math.min(maxX, pointer.x + dx)), y: Math.max(pointer.minY, Math.min(maxY, pointer.y + dy)) };
   pointer.displayId = displayIdForPointer(displayEntries, pointer.x, pointer.y, pointer.displayId);
+  markPointerChanged();
   posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
   scheduleMove(pointer);
 });
@@ -2232,8 +2355,10 @@ function clearPointer(event) {
   touchPoints.delete(event.pointerId);
   if (touchPoints.size !== 2) {
     lastWheelTouches = null;
+    resetTwoFingerWheelAccumulator();
     twoFingerTapStart = null;
   }
+  setGestureActive(touchPoints.size > 0);
 }
 function cancelPointer(event) {
   if (activePointer === event.pointerId) {
@@ -2247,8 +2372,10 @@ function cancelPointer(event) {
   touchPoints.delete(event.pointerId);
   if (touchPoints.size !== 2) {
     lastWheelTouches = null;
+    resetTwoFingerWheelAccumulator();
     twoFingerTapStart = null;
   }
+  setGestureActive(touchPoints.size > 0);
 }
 pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
@@ -2256,26 +2383,75 @@ window.addEventListener("blur", releaseTouchpadInteraction);
 window.addEventListener("pagehide", releaseTouchpadInteraction);
 document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
 function attachHeldButton(button, sendState) {
-  let activePointer = null;
-  function resetHeldButtonPointerState() {
-    activePointer = null;
+  let activeSource = null;
+  let suppressSyntheticClick = false;
+  button.setAttribute("aria-pressed", "false");
+  function setHeldButtonPressed(pressed) {
+    if (pressed) {
+      button.setAttribute("aria-pressed", "true");
+    } else {
+      button.setAttribute("aria-pressed", "false");
+    }
   }
-  function release(force, pointerId = null) {
-    if (activePointer === null) return;
-    if (!force && pointerId !== null && activePointer !== pointerId) return;
-    activePointer = null;
+  function resetHeldButtonPointerState() {
+    activeSource = null;
+    suppressSyntheticClick = false;
+    setHeldButtonPressed(false);
+  }
+  function release(force, source = null) {
+    if (activeSource === null) return false;
+    if (!force && source !== null && activeSource !== source) return false;
+    activeSource = null;
+    setHeldButtonPressed(false);
     sendState("Released");
+    return true;
+  }
+  function press(source) {
+    if (activeSource === source) return false;
+    release(true);
+    activeSource = source;
+    setHeldButtonPressed(true);
+    sendState("Pressed");
+    return true;
+  }
+  function pointerSource(pointerId) {
+    return `pointer:${pointerId}`;
+  }
+  function isHeldControlActivationKey(event) {
+    return ["Enter", " ", "Spacebar"].includes(String(event.key || ""));
   }
   button.addEventListener("pointerdown", (event) => {
-    release(true);
-    activePointer = event.pointerId;
     button.setPointerCapture(event.pointerId);
-    sendState("Pressed");
+    press(pointerSource(event.pointerId));
   });
-  button.addEventListener("pointerup", (event) => release(false, event.pointerId));
-  button.addEventListener("pointercancel", (event) => release(false, event.pointerId));
+  button.addEventListener("pointerup", (event) => release(false, pointerSource(event.pointerId)));
+  button.addEventListener("pointercancel", (event) => release(false, pointerSource(event.pointerId)));
+  button.addEventListener("lostpointercapture", (event) => release(false, pointerSource(event.pointerId)));
   button.addEventListener("pointerleave", (event) => {
-    if (event.buttons) release(false, event.pointerId);
+    if (event.buttons) release(false, pointerSource(event.pointerId));
+  });
+  button.addEventListener("keydown", (event) => {
+    if (!isHeldControlActivationKey(event)) return;
+    event.preventDefault();
+    suppressSyntheticClick = true;
+    if (event.repeat) return;
+    press("keyboard");
+  });
+  button.addEventListener("keyup", (event) => {
+    if (!isHeldControlActivationKey(event)) return;
+    event.preventDefault();
+    release(false, "keyboard");
+    setTimeout(() => { suppressSyntheticClick = false; }, 0);
+  });
+  button.addEventListener("blur", () => {
+    release(false, "keyboard");
+    suppressSyntheticClick = false;
+  });
+  button.addEventListener("click", (event) => {
+    if (Number(event.detail || 0) !== 0) return;
+    if (suppressSyntheticClick) return;
+    press("assistive");
+    release(false, "assistive");
   });
   window.addEventListener("blur", resetHeldButtonPointerState);
   window.addEventListener("pagehide", resetHeldButtonPointerState);
@@ -2285,7 +2461,10 @@ function attachHeldButton(button, sendState) {
 }
 document.querySelectorAll("[data-button]").forEach((button) => {
   const name = button.dataset.button;
-  const sendButton = (state) => inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: name, state, x: pointer.x, y: pointer.y } }, cid(`mobile-${name}-${state}`)));
+  const sendButton = (state) => {
+    flushMove();
+    return enqueueInject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: name, state, x: pointer.x, y: pointer.y } }, cid(`mobile-${name}-${state}`)));
+  };
   attachHeldButton(button, (state) => {
     if (state === "Pressed") return sendButton("Pressed");
     return sendButton("Released");
@@ -2298,20 +2477,22 @@ document.querySelectorAll("[data-release-all]").forEach((button) => button.addEv
   sendReleaseAll();
 }));
 document.querySelectorAll("[data-wheel]").forEach((button) => button.addEventListener("click", () => {
-  inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: 0, delta_y: Number(button.dataset.wheel), x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
+  sendWheelDelta({ deltaX: 0, deltaY: Number(button.dataset.wheel) });
 }));
 function sendKeyState(button, state) {
   const key = button.dataset.key;
-  return inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
+  return enqueueInject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
 }
 async function sendKeyChord(keys) {
   const generation = inputGeneration;
+  const requests = [];
   for (const key of keys) {
-    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-shortcut-${key}-down`), "RequireHealthyBackend", 750), generation);
+    requests.push(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-shortcut-${key}-down`), "RequireHealthyBackend", 750));
   }
   for (const key of [...keys].reverse()) {
-    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-shortcut-${key}-up`), "RequireHealthyBackend", 750), generation);
+    requests.push(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-shortcut-${key}-up`), "RequireHealthyBackend", 750));
   }
+  return enqueueInjectBatch(requests, generation);
 }
 document.querySelectorAll("[data-key]").forEach((button) => {
   attachHeldButton(button, (state) => {
@@ -2326,7 +2507,7 @@ document.querySelectorAll("[data-shortcut]").forEach((button) => button.addEvent
 async function sendText() {
   const text = textInput.value;
   if (!text) return;
-  if (await inject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750))) {
+  if (await enqueueInject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750))) {
     textInput.value = "";
   }
 }
@@ -3719,7 +3900,7 @@ mod tests {
             .unwrap();
         let send_text = &page[send_text_start..send_text_end];
         assert!(
-            send_text.find("if (await inject").unwrap()
+            send_text.find("if (await enqueueInject").unwrap()
                 < send_text.find("textInput.value = \"\";").unwrap()
         );
     }
@@ -3787,6 +3968,140 @@ mod tests {
         ] {
             assert!(page.contains(flow), "missing generation capture in {flow}");
         }
+    }
+
+    #[test]
+    fn rendered_mobile_page_serializes_injects_and_allocates_sequence_at_dequeue() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("let mobileRequestQueueTail = Promise.resolve();"));
+        assert!(page.contains(
+            "function enqueueInjectBatch(requests, expectedGeneration = inputGeneration)"
+        ));
+        assert!(page.contains("mobileRequestQueueTail = result.then("));
+        assert!(page.contains("await inject(request, expectedGeneration)"));
+
+        let prepare_start = page
+            .find("function prepareOrdinaryInjectEnvelope(request, expectedGeneration)")
+            .expect("missing dequeue-time envelope preparation");
+        let inject_start = page
+            .find("async function inject(request, expectedGeneration = inputGeneration)")
+            .expect("missing queued inject worker");
+        let refresh_start = page[inject_start..]
+            .find("async function refresh()")
+            .map(|offset| inject_start + offset)
+            .expect("missing refresh function");
+        let prepare = &page[prepare_start..inject_start];
+        let generation_gate = prepare
+            .find("inputSuspended || expectedGeneration !== inputGeneration")
+            .expect("missing dequeue-time generation gate");
+        let sequence = prepare
+            .find("mobileEnvelope(request)")
+            .expect("missing dequeue-time sequence allocation");
+        let inject = &page[inject_start..refresh_start];
+        let network = inject
+            .find("await api(\"/api/inject\"")
+            .expect("missing inject request");
+        assert!(generation_gate < sequence);
+        assert!(inject.contains("prepareOrdinaryInjectEnvelope(request, expectedGeneration)"));
+        assert!(network > 0);
+
+        for batch_flow in [
+            "async function sendTapClick()",
+            "async function sendDoubleClick(buttonName)",
+            "async function sendTwoFingerTapClick()",
+            "async function sendKeyChord(keys)",
+        ] {
+            let start = page.find(batch_flow).expect("missing multi-step flow");
+            let end = page[start..]
+                .find("\n}")
+                .map(|offset| start + offset)
+                .expect("unterminated multi-step flow");
+            assert!(
+                page[start..end].contains("enqueueInjectBatch("),
+                "{batch_flow} must enqueue atomically"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_mobile_page_coalesces_one_inflight_move_and_flushes_before_actions() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("let moveInFlight = null;"));
+        assert!(page.contains("function queuePendingMove()"));
+        assert!(page.contains("if (pendingMoveFrame || moveInFlight) return;"));
+        assert!(page.contains("if (pendingMove) queuePendingMove();"));
+
+        for flow in [
+            "async function sendTapClick()",
+            "async function sendDoubleClick(buttonName)",
+            "function sendWheelDelta(wheel)",
+            "function sendDragButton(state)",
+        ] {
+            let start = page.find(flow).expect("missing ordered action flow");
+            let end = page[start..]
+                .find("\n}")
+                .map(|offset| start + offset)
+                .expect("unterminated ordered action flow");
+            let body = &page[start..end];
+            assert!(
+                body.find("flushMove();").unwrap() < body.find("enqueueInject").unwrap(),
+                "{flow} must enqueue the final move first"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_mobile_page_accumulates_wheel_residual_and_uses_fresh_polls() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("let wheelResidualX = 0;"));
+        assert!(page.contains("let wheelResidualY = 0;"));
+        assert!(page.contains("function resetTwoFingerWheelAccumulator()"));
+        assert!(page.contains("wheelResidualX += currentCenter.x - previousCenter.x;"));
+        assert!(page.contains("wheelResidualY += currentCenter.y - previousCenter.y;"));
+        assert!(page.contains("let refreshInFlight = null;"));
+        assert!(page.contains("let gestureActive = false;"));
+        assert!(page.contains("let pointerRevision = 0;"));
+        assert!(page.contains("let statusRevision = 0;"));
+        assert!(page.contains("const pendingPointerWrites = new Set();"));
+        assert!(page.contains("function beginPointerWrite()"));
+        assert!(page.contains("pendingPointerWrites.add(token);"));
+        assert!(page.contains("pendingPointerWrites.delete(token)"));
+
+        let refresh_start = page
+            .find("async function refresh()")
+            .expect("missing refresh function");
+        let refresh_end = page[refresh_start..]
+            .find("function sendMoveNow")
+            .map(|offset| refresh_start + offset)
+            .expect("missing move sender");
+        let refresh = &page[refresh_start..refresh_end];
+        assert!(refresh.contains("if (refreshInFlight) return refreshInFlight;"));
+        assert!(refresh.contains("requestedPointerRevision === pointerRevision"));
+        assert!(refresh.contains("requestedStatusRevision === statusRevision"));
+        assert!(refresh.contains("!gestureActive"));
+        assert!(refresh.contains("pendingPointerWrites.size === 0"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_held_controls_are_accessible_and_idempotent() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function isHeldControlActivationKey(event)"));
+        assert!(page.contains("button.setAttribute(\"aria-pressed\", \"false\")"));
+        assert!(page.contains("button.setAttribute(\"aria-pressed\", \"true\")"));
+        assert!(page.contains("button.addEventListener(\"lostpointercapture\""));
+        assert!(page.contains("button.addEventListener(\"keydown\""));
+        assert!(page.contains("button.addEventListener(\"keyup\""));
+        assert!(page.contains("if (event.repeat) return;"));
+        assert!(page.contains("event.preventDefault();"));
+        assert!(page.contains("Number(event.detail || 0) !== 0"));
+        assert!(page.contains("if (suppressSyntheticClick) return;"));
+        assert!(page.contains(
+            "button.addEventListener(\"blur\", () => {\n    release(false, \"keyboard\");\n    suppressSyntheticClick = false;\n  });"
+        ));
     }
 
     #[test]
@@ -3974,7 +4289,7 @@ mod tests {
         assert!(page.contains("failed to fetch|networkerror|fetch failed|load failed"));
         assert!(page.contains("网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络"));
         assert!(page.contains("return false;"));
-        assert!(page.contains("if (await inject"));
+        assert!(page.contains("if (await enqueueInject"));
         assert!(page.contains("textInput.value = \"\";"));
     }
 

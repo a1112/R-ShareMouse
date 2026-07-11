@@ -296,6 +296,9 @@ export function createHeldInputController(sendState) {
 
   return {
     press(pointerId) {
+      if (active && activePointerId === pointerId) {
+        return false;
+      }
       releasePointer(null, true);
       active = true;
       activePointerId = pointerId;
@@ -315,6 +318,14 @@ export function createHeldInputController(sendState) {
       return active;
     },
   };
+}
+
+export function shouldActivateHeldControlFromClick(event) {
+  return Number(event?.detail ?? 0) === 0;
+}
+
+export function isHeldControlActivationKey(event) {
+  return ["Enter", " ", "Spacebar"].includes(String(event?.key ?? ""));
 }
 
 export function buildMouseMoveRequest(x, y, displayId, correlationId) {
@@ -532,6 +543,54 @@ export function twoFingerWheelDelta(previousTouches, currentTouches, options = {
   return { deltaX, deltaY };
 }
 
+export function createTwoFingerWheelAccumulator(options = {}) {
+  const sensitivity = Number(options.sensitivity ?? 0.12);
+  const minDeltaPx = Number(options.minDeltaPx ?? 6);
+  let residualX = 0;
+  let residualY = 0;
+
+  function reset() {
+    residualX = 0;
+    residualY = 0;
+  }
+
+  return {
+    update(previousTouches, currentTouches) {
+      const previous = normalizedTwoFingerTouches(previousTouches);
+      const current = normalizedTwoFingerTouches(currentTouches);
+      if (
+        !previous ||
+        !current ||
+        previous[0].id !== current[0].id ||
+        previous[1].id !== current[1].id
+      ) {
+        reset();
+        return null;
+      }
+
+      const previousCenter = centroid(previous);
+      const currentCenter = centroid(current);
+      residualX += currentCenter.x - previousCenter.x;
+      residualY += currentCenter.y - previousCenter.y;
+      if (Math.max(Math.abs(residualX), Math.abs(residualY)) < minDeltaPx) {
+        return null;
+      }
+
+      const rawDeltaX = Math.round(residualX * sensitivity);
+      const rawDeltaY = Math.round(residualY * sensitivity);
+      const deltaX = Object.is(rawDeltaX, -0) ? 0 : rawDeltaX;
+      const deltaY = Object.is(rawDeltaY, -0) ? 0 : rawDeltaY;
+      if (deltaX === 0 && deltaY === 0) {
+        return null;
+      }
+
+      reset();
+      return { deltaX, deltaY };
+    },
+    reset,
+  };
+}
+
 export function isTwoFingerTap(startTouches, endTouches, options = {}) {
   if (options.cancelled) {
     return false;
@@ -567,6 +626,36 @@ export function isTwoFingerTap(startTouches, endTouches, options = {}) {
   return Math.abs(endDistance - startDistance) <= maxFingerDistanceDeltaPx;
 }
 
+export function createOrderedMobileRequestQueue(sendRequest) {
+  let tail = Promise.resolve();
+
+  function enqueueBatch(values) {
+    const batch = Array.isArray(values) ? [...values] : [];
+    const result = tail.then(async () => {
+      const responses = [];
+      for (const value of batch) {
+        responses.push(await sendRequest(value));
+      }
+      return responses;
+    });
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  return {
+    enqueue(value) {
+      return enqueueBatch([value]).then(([response]) => response);
+    },
+    enqueueBatch,
+    idle() {
+      return tail;
+    },
+  };
+}
+
 export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
   const requestFrame =
     scheduler.requestFrame ??
@@ -588,33 +677,131 @@ export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
   let pendingMove = null;
   let frameId = null;
 
-  function drain() {
-    frameId = null;
+  let lastQueuedMove = null;
+
+  function queuePendingMove() {
     const next = pendingMove;
     pendingMove = null;
-    if (next) {
-      sendMove(next);
+    if (!next) {
+      return lastQueuedMove ?? Promise.resolve();
     }
+
+    let sendResult;
+    try {
+      sendResult = sendMove(next);
+    } catch (error) {
+      sendResult = Promise.reject(error);
+    }
+    const queuedMove = Promise.resolve(sendResult).catch(() => undefined);
+    lastQueuedMove = queuedMove;
+    void queuedMove.then(() => {
+      if (lastQueuedMove !== queuedMove) {
+        return;
+      }
+      lastQueuedMove = null;
+      if (pendingMove) {
+        queuePendingMove();
+      }
+    });
+    return queuedMove;
+  }
+
+  function drain() {
+    frameId = null;
+    queuePendingMove();
   }
 
   return {
     schedule(next) {
       pendingMove = next;
-      if (frameId != null) {
+      if (frameId != null || lastQueuedMove) {
         return;
       }
       frameId = requestFrame(drain);
     },
     flush() {
-      const next = pendingMove;
-      pendingMove = null;
       if (frameId != null) {
         cancelFrame(frameId);
         frameId = null;
       }
-      if (next) {
-        sendMove(next);
+      if (pendingMove) {
+        return queuePendingMove();
       }
+      return lastQueuedMove ?? Promise.resolve();
+    },
+  };
+}
+
+export function createMobileStatusRefreshController(fetchState, applyState) {
+  let inFlight = null;
+  let gestureActive = false;
+  let pointerRevision = 0;
+  let statusRevision = 0;
+  const pendingPointerWrites = new Set();
+
+  function refresh() {
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const requestedPointerRevision = pointerRevision;
+    const requestedStatusRevision = statusRevision;
+    let fetched;
+    try {
+      fetched = fetchState();
+    } catch (error) {
+      fetched = Promise.reject(error);
+    }
+    const applied = Promise.resolve(fetched).then((snapshot) => {
+      applyState(snapshot, {
+        applyPointer:
+          !gestureActive &&
+          pendingPointerWrites.size === 0 &&
+          requestedPointerRevision === pointerRevision,
+        applyStatus: requestedStatusRevision === statusRevision,
+      });
+      return snapshot;
+    });
+    const tracked = applied.finally(() => {
+      if (inFlight === tracked) {
+        inFlight = null;
+      }
+    });
+    inFlight = tracked;
+    return tracked;
+  }
+
+  return {
+    refresh,
+    setGestureActive(active) {
+      const next = Boolean(active);
+      if (next !== gestureActive) {
+        gestureActive = next;
+        pointerRevision += 1;
+      }
+    },
+    markPointerChanged() {
+      pointerRevision += 1;
+    },
+    beginPointerWrite() {
+      const token = {};
+      pendingPointerWrites.add(token);
+      pointerRevision += 1;
+      let completed = false;
+      return () => {
+        if (completed) {
+          return false;
+        }
+        completed = true;
+        if (!pendingPointerWrites.delete(token)) {
+          return false;
+        }
+        pointerRevision += 1;
+        return true;
+      };
+    },
+    markStatusChanged() {
+      statusRevision += 1;
     },
   };
 }

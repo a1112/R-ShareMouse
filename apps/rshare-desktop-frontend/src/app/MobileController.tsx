@@ -29,10 +29,14 @@ import {
   buildTextCommitRequest,
   createHeldInputController,
   createMobileCorrelationId,
+  createMobileStatusRefreshController,
+  createOrderedMobileRequestQueue,
   createPointerMoveCoalescer,
+  createTwoFingerWheelAccumulator,
   formatMobileBackendStatus,
   formatMobileControllerError,
   formatMobileInjectResultStatus,
+  isHeldControlActivationKey,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   isTwoFingerTap,
@@ -40,9 +44,9 @@ import {
   normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
   resolveMobileDisplayIdAt,
+  shouldActivateHeldControlFromClick,
   shouldCommitMobileTextOnKeyDown,
   tauriInvocationForMobileRequest,
-  twoFingerWheelDelta,
 } from "./mobile-controller.mjs";
 import { preventBrowserNavigationEvent } from "./desktop-shell.mjs";
 
@@ -67,6 +71,7 @@ type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
 type MobileBackendStatus = ReturnType<typeof formatMobileBackendStatus>;
+type QueuedMobileRequest = { request: unknown; quiet: boolean };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -171,15 +176,21 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
 function useHeldInputController(onState: (state: HeldInputState) => void) {
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
+  const mountedRef = useRef(true);
+  const [isPressed, setIsPressed] = useState(false);
   const controllerRef = useRef<ReturnType<typeof createHeldInputController> | null>(null);
 
   if (!controllerRef.current) {
-    controllerRef.current = createHeldInputController((state: HeldInputState) =>
-      onStateRef.current(state),
-    );
+    controllerRef.current = createHeldInputController((state: HeldInputState) => {
+      if (mountedRef.current) {
+        setIsPressed(state === "Pressed");
+      }
+      onStateRef.current(state);
+    });
   }
 
   useEffect(() => {
+    mountedRef.current = true;
     const release = () => {
       controllerRef.current?.releaseAll();
     };
@@ -194,6 +205,7 @@ function useHeldInputController(onState: (state: HeldInputState) => void) {
     document.addEventListener("visibilitychange", releaseWhenHidden);
 
     return () => {
+      mountedRef.current = false;
       release();
       window.removeEventListener("blur", release);
       window.removeEventListener("pagehide", release);
@@ -201,7 +213,14 @@ function useHeldInputController(onState: (state: HeldInputState) => void) {
     };
   }, []);
 
-  return controllerRef.current;
+  const controller = controllerRef.current;
+  return {
+    press: controller.press,
+    release: controller.release,
+    releaseAll: controller.releaseAll,
+    releaseIfPointerStillDown: controller.releaseIfPointerStillDown,
+    isPressed,
+  };
 }
 
 async function fetchMobileControlState() {
@@ -290,13 +309,27 @@ export default function MobileController() {
   const tapStartRef = useRef<{ x: number; y: number; timeMs: number } | null>(null);
   const touchPointsRef = useRef<Map<number, TouchPoint>>(new Map());
   const lastWheelTouchesRef = useRef<TouchPoint[] | null>(null);
+  const wheelAccumulatorRef = useRef(createTwoFingerWheelAccumulator());
   const twoFingerTapStartRef = useRef<TwoFingerTapStart | null>(null);
   const dragTimerRef = useRef<number | null>(null);
   const dragPointerRef = useRef<number | null>(null);
   const sensitivityRef = useRef(pointerSensitivity);
   const pointerRef = useRef(pointer);
-  const sendMoveNowRef = useRef<(next: PointerState) => void>(() => {});
+  const sendRequestNowRef = useRef<(queued: QueuedMobileRequest) => Promise<boolean>>(async () =>
+    false,
+  );
+  const requestQueueRef = useRef<ReturnType<typeof createOrderedMobileRequestQueue> | null>(null);
+  const statusRefreshRef = useRef<ReturnType<
+    typeof createMobileStatusRefreshController
+  > | null>(null);
+  const sendMoveNowRef = useRef<(next: PointerState) => Promise<boolean>>(async () => false);
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
+
+  if (!requestQueueRef.current) {
+    requestQueueRef.current = createOrderedMobileRequestQueue((queued: QueuedMobileRequest) =>
+      sendRequestNowRef.current(queued),
+    );
+  }
 
   useEffect(() => {
     sensitivityRef.current = pointerSensitivity;
@@ -308,30 +341,55 @@ export default function MobileController() {
 
   useEffect(() => {
     let cancelled = false;
-    async function refresh() {
-      try {
-        const next = await fetchMobileControlState();
-        if (!cancelled) {
-          setPointer(next.pointer);
-          setBackendStatus(next.backendStatus);
-          setStatus("已连接");
+    const refreshController = createMobileStatusRefreshController(
+      async () => {
+        try {
+          return { state: await fetchMobileControlState(), error: null };
+        } catch (error) {
+          return { state: null, error };
         }
-      } catch (error) {
-        if (!cancelled) {
-          setStatus(formatMobileControllerError(error, "移动端状态"));
+      },
+      (
+        result: {
+          state: Awaited<ReturnType<typeof fetchMobileControlState>> | null;
+          error: unknown;
+        },
+        options: { applyPointer: boolean; applyStatus: boolean },
+      ) => {
+        if (cancelled) {
+          return;
         }
-      }
-    }
+        if (result.state) {
+          if (options.applyPointer) {
+            pointerRef.current = result.state.pointer;
+            setPointer(result.state.pointer);
+          }
+          setBackendStatus(result.state.backendStatus);
+          if (options.applyStatus) {
+            setStatus("已连接");
+          }
+        } else if (options.applyStatus) {
+          setStatus(formatMobileControllerError(result.error, "移动端状态"));
+        }
+      },
+    );
+    statusRefreshRef.current = refreshController;
 
-    void refresh();
+    const refresh = () => {
+      void refreshController.refresh();
+    };
+    refresh();
     const timer = window.setInterval(refresh, 1500);
     return () => {
       cancelled = true;
+      if (statusRefreshRef.current === refreshController) {
+        statusRefreshRef.current = null;
+      }
       window.clearInterval(timer);
     };
   }, []);
 
-  async function sendRequest(request: unknown, quiet = false) {
+  async function sendRequestNow({ request, quiet }: QueuedMobileRequest) {
     if (!quiet) {
       setSendState("sending");
     }
@@ -339,6 +397,7 @@ export default function MobileController() {
       const result = await sendInjectRequest(request);
       const feedback = formatMobileInjectResultStatus(result);
       if (!feedback.accepted) {
+        statusRefreshRef.current?.markStatusChanged();
         setSendState("error");
         setStatus(feedback.status);
         return false;
@@ -346,17 +405,33 @@ export default function MobileController() {
       if (!quiet) {
         setSendState("ok");
       }
+      statusRefreshRef.current?.markStatusChanged();
       setStatus(feedback.status);
       return true;
     } catch (error) {
+      statusRefreshRef.current?.markStatusChanged();
       setSendState("error");
       setStatus(formatMobileControllerError(error, "移动端注入"));
       return false;
     }
   }
 
+  sendRequestNowRef.current = sendRequestNow;
+
+  function sendRequest(request: unknown, quiet = false) {
+    return requestQueueRef.current!.enqueue({ request, quiet }) as Promise<boolean>;
+  }
+
+  async function sendRequestBatch(requests: readonly unknown[], quiet = false) {
+    const responses = (await requestQueueRef.current!.enqueueBatch(
+      requests.map((request) => ({ request, quiet })),
+    )) as boolean[];
+    return responses.every(Boolean);
+  }
+
   function sendMoveNow(next: PointerState) {
-    void sendRequest(
+    const completePointerWrite = statusRefreshRef.current?.beginPointerWrite();
+    return sendRequest(
       buildMouseMoveRequest(
         next.x,
         next.y,
@@ -364,7 +439,7 @@ export default function MobileController() {
         createMobileCorrelationId("mobile-move"),
       ),
       true,
-    );
+    ).finally(() => completePointerWrite?.());
   }
 
   sendMoveNowRef.current = sendMoveNow;
@@ -387,7 +462,7 @@ export default function MobileController() {
 
   function sendDragButton(state: "Pressed" | "Released") {
     const current = pointerRef.current;
-    void sendRequest(
+    return sendRequest(
       buildMouseButtonRequest(
         "Left",
         state,
@@ -400,25 +475,29 @@ export default function MobileController() {
 
   function releaseTouchpadDrag(pointerId: number | null = null) {
     if (dragPointerRef.current == null) {
-      return;
+      return null;
     }
     if (pointerId != null && dragPointerRef.current !== pointerId) {
-      return;
+      return null;
     }
     dragPointerRef.current = null;
-    sendDragButton("Released");
+    moveCoalescerRef.current?.flush();
+    return sendDragButton("Released");
   }
 
   function releaseTouchpadInteraction() {
     clearDragTimer();
-    moveCoalescerRef.current?.flush();
-    releaseTouchpadDrag();
+    const finalMove = moveCoalescerRef.current?.flush() ?? Promise.resolve();
+    const dragRelease = releaseTouchpadDrag();
     activePointerRef.current = null;
     lastPointRef.current = null;
     tapStartRef.current = null;
     lastWheelTouchesRef.current = null;
+    wheelAccumulatorRef.current.reset();
     twoFingerTapStartRef.current = null;
     touchPointsRef.current.clear();
+    statusRefreshRef.current?.setGestureActive(false);
+    return dragRelease ?? finalMove;
   }
 
   function beginTouchpadDrag(pointerId: number) {
@@ -448,7 +527,7 @@ export default function MobileController() {
     }
     dragPointerRef.current = pointerId;
     tapStartRef.current = null;
-    sendDragButton("Pressed");
+    void sendDragButton("Pressed");
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
@@ -457,6 +536,7 @@ export default function MobileController() {
       x: event.clientX,
       y: event.clientY,
     });
+    statusRefreshRef.current?.setGestureActive(true);
     activePointerRef.current = event.pointerId;
     lastPointRef.current = { x: event.clientX, y: event.clientY };
     tapStartRef.current = { x: event.clientX, y: event.clientY, timeMs: event.timeStamp };
@@ -470,6 +550,7 @@ export default function MobileController() {
       clearDragTimer();
       releaseTouchpadDrag();
       moveCoalescerRef.current?.flush();
+      wheelAccumulatorRef.current.reset();
       const touches = touchPointsRef.current.size === 2 ? touchPointsSnapshot() : null;
       lastWheelTouchesRef.current = touches;
       twoFingerTapStartRef.current = touches ? { touches, timeMs: event.timeStamp } : null;
@@ -492,11 +573,15 @@ export default function MobileController() {
       releaseTouchpadDrag();
       if (touchPointsRef.current.size > 2) {
         lastWheelTouchesRef.current = null;
+        wheelAccumulatorRef.current.reset();
         twoFingerTapStartRef.current = null;
         return;
       }
       const currentTouches = touchPointsSnapshot();
-      const wheelDelta = twoFingerWheelDelta(lastWheelTouchesRef.current, currentTouches);
+      const wheelDelta = wheelAccumulatorRef.current.update(
+        lastWheelTouchesRef.current,
+        currentTouches,
+      );
       lastWheelTouchesRef.current = currentTouches;
       if (wheelDelta) {
         twoFingerTapStartRef.current = null;
@@ -586,8 +671,10 @@ export default function MobileController() {
     touchPointsRef.current.delete(event.pointerId);
     if (touchPointsRef.current.size !== 2) {
       lastWheelTouchesRef.current = null;
+      wheelAccumulatorRef.current.reset();
       twoFingerTapStartRef.current = null;
     }
+    statusRefreshRef.current?.setGestureActive(touchPointsRef.current.size > 0);
   }
 
   function handlePointerCancel(event: React.PointerEvent<HTMLDivElement>) {
@@ -602,8 +689,10 @@ export default function MobileController() {
     touchPointsRef.current.delete(event.pointerId);
     if (touchPointsRef.current.size !== 2) {
       lastWheelTouchesRef.current = null;
+      wheelAccumulatorRef.current.reset();
       twoFingerTapStartRef.current = null;
     }
+    statusRefreshRef.current?.setGestureActive(touchPointsRef.current.size > 0);
   }
 
   useEffect(() => {
@@ -626,6 +715,7 @@ export default function MobileController() {
   }, []);
 
   async function mouseClick(button: MouseButtonName) {
+    moveCoalescerRef.current?.flush();
     const current = pointerRef.current;
     const requests = buildMouseClickRequests(
       button,
@@ -633,15 +723,14 @@ export default function MobileController() {
       current.y,
       createMobileCorrelationId(`mobile-${button.toLowerCase()}-click`),
     );
-    for (const request of requests) {
-      await sendRequest(request);
-    }
+    return sendRequestBatch(requests);
   }
 
   async function mouseDoubleClick(
     button: MouseButtonName,
     correlationPrefix = `mobile-${button.toLowerCase()}-double-click`,
   ) {
+    moveCoalescerRef.current?.flush();
     const current = pointerRef.current;
     const requests = buildMouseDoubleClickRequests(
       button,
@@ -649,16 +738,12 @@ export default function MobileController() {
       current.y,
       createMobileCorrelationId(correlationPrefix),
     );
-    for (const request of requests) {
-      const ok = await sendRequest(request);
-      if (!ok) {
-        break;
-      }
-    }
+    return sendRequestBatch(requests);
   }
 
   function mouseButton(button: MouseButtonName, state: "Pressed" | "Released") {
-    void sendRequest(
+    moveCoalescerRef.current?.flush();
+    return sendRequest(
       buildMouseButtonRequest(
         button,
         state,
@@ -674,6 +759,7 @@ export default function MobileController() {
   }
 
   function wheel(deltaY: number, deltaX = 0) {
+    moveCoalescerRef.current?.flush();
     void sendRequest(
       buildMouseWheelRequest(
         deltaX,
@@ -700,9 +786,7 @@ export default function MobileController() {
       [...keys],
       createMobileCorrelationId(`mobile-shortcut-${id}`),
     );
-    for (const request of requests) {
-      await sendRequest(request);
-    }
+    return sendRequestBatch(requests);
   }
 
   async function releaseAllInputs() {
@@ -713,12 +797,7 @@ export default function MobileController() {
       current.y,
       createMobileCorrelationId("mobile-release-all"),
     );
-    for (const request of requests) {
-      const ok = await sendRequest(request);
-      if (!ok) {
-        break;
-      }
-    }
+    return sendRequestBatch(requests);
   }
 
   async function commitText() {
@@ -1005,19 +1084,57 @@ function HoldKeyButton({
   onKeyState: (key: string, state: "Pressed" | "Released") => void;
 }) {
   const held = useHeldInputController((state) => onKeyState(keyboardKey, state));
+  const suppressKeyboardClickRef = useRef(false);
 
   return (
     <button
       className="flex h-12 touch-none items-center justify-center rounded-md"
       style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
       title={label}
+      aria-pressed={held.isPressed}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId);
         held.press(event.pointerId);
       }}
       onPointerUp={(event) => held.release(event.pointerId)}
       onPointerCancel={(event) => held.release(event.pointerId)}
+      onLostPointerCapture={(event) => held.release(event.pointerId)}
       onPointerLeave={(event) => held.releaseIfPointerStillDown(event.pointerId, event.buttons)}
+      onKeyDown={(event) => {
+        if (!isHeldControlActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        suppressKeyboardClickRef.current = true;
+        if (event.repeat) {
+          return;
+        }
+        held.press(-2);
+      }}
+      onKeyUp={(event) => {
+        if (!isHeldControlActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        held.release(-2);
+        window.setTimeout(() => {
+          suppressKeyboardClickRef.current = false;
+        }, 0);
+      }}
+      onBlur={() => {
+        held.release(-2);
+        suppressKeyboardClickRef.current = false;
+      }}
+      onClick={(event) => {
+        if (!shouldActivateHeldControlFromClick(event)) {
+          return;
+        }
+        if (suppressKeyboardClickRef.current) {
+          return;
+        }
+        held.press(-1);
+        held.release(-1);
+      }}
     >
       {children}
     </button>
@@ -1040,18 +1157,56 @@ function PressButton({
       onUp();
     }
   });
+  const suppressKeyboardClickRef = useRef(false);
 
   return (
     <button
       className="h-12 rounded-md text-sm font-medium"
       style={{ background: "#171b1d", border: "1px solid #29302d", color: "#d8dedb" }}
+      aria-pressed={held.isPressed}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId);
         held.press(event.pointerId);
       }}
       onPointerCancel={(event) => held.release(event.pointerId)}
+      onLostPointerCapture={(event) => held.release(event.pointerId)}
       onPointerLeave={(event) => held.releaseIfPointerStillDown(event.pointerId, event.buttons)}
       onPointerUp={(event) => held.release(event.pointerId)}
+      onKeyDown={(event) => {
+        if (!isHeldControlActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        suppressKeyboardClickRef.current = true;
+        if (event.repeat) {
+          return;
+        }
+        held.press(-2);
+      }}
+      onKeyUp={(event) => {
+        if (!isHeldControlActivationKey(event)) {
+          return;
+        }
+        event.preventDefault();
+        held.release(-2);
+        window.setTimeout(() => {
+          suppressKeyboardClickRef.current = false;
+        }, 0);
+      }}
+      onBlur={() => {
+        held.release(-2);
+        suppressKeyboardClickRef.current = false;
+      }}
+      onClick={(event) => {
+        if (!shouldActivateHeldControlFromClick(event)) {
+          return;
+        }
+        if (suppressKeyboardClickRef.current) {
+          return;
+        }
+        held.press(-1);
+        held.release(-1);
+      }}
     >
       {label}
     </button>

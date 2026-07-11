@@ -21,18 +21,23 @@ import {
   buildMouseWheelRequest,
   createHeldInputController,
   buildTextCommitRequest,
+  createMobileStatusRefreshController,
+  createOrderedMobileRequestQueue,
   createPointerMoveCoalescer,
+  createTwoFingerWheelAccumulator,
   formatMobileBackendStatus,
   formatMobileControllerError,
   formatMobileInjectResultStatus,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   isTwoFingerTap,
+  isHeldControlActivationKey,
   nextPointerPosition,
   normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
   resolveMobileDisplayIdAt,
   shouldCommitMobileTextOnKeyDown,
+  shouldActivateHeldControlFromClick,
   shouldPreventMobileGestureDefault,
   tauriInvocationForMobileRequest,
   twoFingerWheelDelta,
@@ -42,6 +47,16 @@ const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function readAppFile(path) {
   return readFileSync(resolve(APP_ROOT, path), "utf8");
+}
+
+function deferred() {
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 test("buildTextCommitRequest creates daemon IPC inject request for unicode input", () => {
@@ -439,6 +454,17 @@ test("createHeldInputController releases a held input once from pointer or globa
   assert.deepEqual(states, ["Pressed", "Released", "Pressed", "Released"]);
 });
 
+test("createHeldInputController ignores repeated presses and releases once after capture loss", () => {
+  const states = [];
+  const held = createHeldInputController((state) => states.push(state));
+
+  assert.equal(held.press(7), true);
+  assert.equal(held.press(7), false);
+  assert.equal(held.release(7), true);
+  assert.equal(held.releaseAll(), false);
+  assert.deepEqual(states, ["Pressed", "Released"]);
+});
+
 test("isTouchpadLongPressDrag accepts still long presses and rejects early or moved gestures", () => {
   assert.equal(
     isTouchpadLongPressDrag(
@@ -711,6 +737,60 @@ test("twoFingerWheelDelta ignores single finger tiny or mismatched gestures", ()
   );
 });
 
+test("two finger wheel residual accumulates repeated two pixel movement", () => {
+  const wheel = createTwoFingerWheelAccumulator({ sensitivity: 0.12, minDeltaPx: 6 });
+  let previous = [
+    { id: 1, x: 100, y: 100 },
+    { id: 2, x: 140, y: 100 },
+  ];
+
+  for (const y of [102, 104]) {
+    const current = [
+      { id: 1, x: 100, y },
+      { id: 2, x: 140, y },
+    ];
+    assert.equal(wheel.update(previous, current), null);
+    previous = current;
+  }
+
+  const current = [
+    { id: 1, x: 100, y: 106 },
+    { id: 2, x: 140, y: 106 },
+  ];
+  assert.deepEqual(wheel.update(previous, current), { deltaX: 0, deltaY: 1 });
+});
+
+test("two finger wheel residual preserves direction and reset clears partial motion", () => {
+  const wheel = createTwoFingerWheelAccumulator({ sensitivity: 0.12, minDeltaPx: 6 });
+  const at = (x) => [
+    { id: "a", x, y: 10 },
+    { id: "b", x, y: 50 },
+  ];
+
+  assert.equal(wheel.update(at(20), at(18)), null);
+  assert.equal(wheel.update(at(18), at(16)), null);
+  wheel.reset();
+  assert.equal(wheel.update(at(16), at(14)), null);
+  assert.equal(wheel.update(at(14), at(12)), null);
+  assert.deepEqual(wheel.update(at(12), at(10)), { deltaX: -1, deltaY: 0 });
+});
+
+test("two finger wheel residual cancels equal movement in the opposite direction", () => {
+  const wheel = createTwoFingerWheelAccumulator({ sensitivity: 0.12, minDeltaPx: 6 });
+  const at = (y) => [
+    { id: 1, x: 10, y },
+    { id: 2, x: 50, y },
+  ];
+
+  assert.equal(wheel.update(at(10), at(12)), null);
+  assert.equal(wheel.update(at(12), at(14)), null);
+  assert.equal(wheel.update(at(14), at(12)), null);
+  assert.equal(wheel.update(at(12), at(10)), null);
+  assert.equal(wheel.update(at(10), at(12)), null);
+  assert.equal(wheel.update(at(12), at(14)), null);
+  assert.deepEqual(wheel.update(at(14), at(16)), { deltaX: 0, deltaY: 1 });
+});
+
 test("isTwoFingerTap accepts short still two finger taps", () => {
   assert.equal(
     isTwoFingerTap(
@@ -819,6 +899,276 @@ test("createPointerMoveCoalescer flushes the final pending move without duplicat
   frameCallbacks.shift()();
 
   assert.deepEqual(sent, [{ x: 70, y: 80 }]);
+});
+
+test("ordered request queue never lets release overtake press", async () => {
+  const pressGate = deferred();
+  const releaseGate = deferred();
+  const seen = [];
+  const queue = createOrderedMobileRequestQueue(async (value) => {
+    seen.push(value);
+    await (value === "Pressed" ? pressGate.promise : releaseGate.promise);
+  });
+
+  const press = queue.enqueue("Pressed");
+  const release = queue.enqueue("Released");
+  await Promise.resolve();
+  assert.deepEqual(seen, ["Pressed"]);
+
+  pressGate.resolve();
+  await press;
+  await Promise.resolve();
+  assert.deepEqual(seen, ["Pressed", "Released"]);
+
+  releaseGate.resolve();
+  await Promise.all([press, release]);
+});
+
+test("ordered request queue continues after a failed request", async () => {
+  const seen = [];
+  const queue = createOrderedMobileRequestQueue(async (value) => {
+    seen.push(value);
+    if (value === "failed") {
+      throw new Error("expected failure");
+    }
+    return value;
+  });
+
+  await assert.rejects(queue.enqueue("failed"), /expected failure/);
+  assert.equal(await queue.enqueue("recovered"), "recovered");
+  assert.deepEqual(seen, ["failed", "recovered"]);
+});
+
+test("ordered request queue keeps a multi-step click atomic against later input", async () => {
+  const pressGate = deferred();
+  const seen = [];
+  const queue = createOrderedMobileRequestQueue(async (value) => {
+    seen.push(value);
+    if (value === "Pressed") await pressGate.promise;
+  });
+
+  const click = queue.enqueueBatch(["Pressed", "Released"]);
+  const wheel = queue.enqueue("Wheel");
+  await Promise.resolve();
+  assert.deepEqual(seen, ["Pressed"]);
+
+  pressGate.resolve();
+  await Promise.all([click, wheel]);
+  assert.deepEqual(seen, ["Pressed", "Released", "Wheel"]);
+});
+
+test("pointer move coalescer keeps only the latest move while one is in flight", async () => {
+  const firstGate = deferred();
+  const seen = [];
+  const frames = [];
+  const queue = createOrderedMobileRequestQueue(async (move) => {
+    seen.push(move);
+    if (seen.length === 1) {
+      await firstGate.promise;
+    }
+  });
+  const coalescer = createPointerMoveCoalescer((move) => queue.enqueue(move), {
+    requestFrame(callback) {
+      frames.push(callback);
+      return frames.length;
+    },
+    cancelFrame() {},
+  });
+
+  coalescer.schedule({ x: 1, y: 1 });
+  frames.shift()();
+  coalescer.schedule({ x: 2, y: 2 });
+  coalescer.schedule({ x: 3, y: 3 });
+  const flushed = coalescer.flush();
+
+  await Promise.resolve();
+  assert.deepEqual(seen, [{ x: 1, y: 1 }]);
+  firstGate.resolve();
+  await flushed;
+  assert.deepEqual(seen, [
+    { x: 1, y: 1 },
+    { x: 3, y: 3 },
+  ]);
+});
+
+test("pointer move flush completes before a queued release", async () => {
+  const firstMoveGate = deferred();
+  const secondMoveGate = deferred();
+  const secondMoveStarted = deferred();
+  const seen = [];
+  const frames = [];
+  const queue = createOrderedMobileRequestQueue(async (value) => {
+    seen.push(value);
+    if (value === "move-1") await firstMoveGate.promise;
+    if (value === "move-2") {
+      secondMoveStarted.resolve();
+      await secondMoveGate.promise;
+    }
+  });
+  const coalescer = createPointerMoveCoalescer((move) => queue.enqueue(move), {
+    requestFrame(callback) {
+      frames.push(callback);
+      return frames.length;
+    },
+    cancelFrame() {},
+  });
+
+  coalescer.schedule("move-1");
+  frames.shift()();
+  await Promise.resolve();
+  coalescer.schedule("move-2");
+  const release = (async () => {
+    await coalescer.flush();
+    await queue.enqueue("Released");
+  })();
+
+  assert.deepEqual(seen, ["move-1"]);
+  firstMoveGate.resolve();
+  await secondMoveStarted.promise;
+  assert.deepEqual(seen, ["move-1", "move-2"]);
+  secondMoveGate.resolve();
+  await release;
+  assert.deepEqual(seen, ["move-1", "move-2", "Released"]);
+});
+
+test("status refresh is single flight and ignores a poll invalidated by a gesture", async () => {
+  const pollGate = deferred();
+  const applied = [];
+  let fetchCount = 0;
+  const refresh = createMobileStatusRefreshController(
+    async () => {
+      fetchCount += 1;
+      return pollGate.promise;
+    },
+    (snapshot, options) => applied.push({ snapshot, options }),
+  );
+
+  const first = refresh.refresh();
+  const duplicate = refresh.refresh();
+  assert.equal(first, duplicate);
+  assert.equal(fetchCount, 1);
+
+  refresh.setGestureActive(true);
+  refresh.setGestureActive(false);
+  pollGate.resolve({ pointer: { x: 10, y: 20 }, status: "old" });
+  await first;
+  assert.deepEqual(applied, [
+    {
+      snapshot: { pointer: { x: 10, y: 20 }, status: "old" },
+      options: { applyPointer: false, applyStatus: true },
+    },
+  ]);
+});
+
+test("status refresh keeps active gesture coordinates and rejects stale status", async () => {
+  const activeGate = deferred();
+  const staleGate = deferred();
+  const gates = [activeGate, staleGate];
+  const applied = [];
+  const refresh = createMobileStatusRefreshController(
+    () => gates.shift().promise,
+    (snapshot, options) => applied.push({ snapshot, options }),
+  );
+
+  refresh.setGestureActive(true);
+  const activePoll = refresh.refresh();
+  activeGate.resolve({ pointer: { x: 1, y: 2 }, status: "connected" });
+  await activePoll;
+  assert.deepEqual(applied, [
+    {
+      snapshot: { pointer: { x: 1, y: 2 }, status: "connected" },
+      options: { applyPointer: false, applyStatus: true },
+    },
+  ]);
+
+  refresh.setGestureActive(false);
+  const stalePoll = refresh.refresh();
+  refresh.markStatusChanged();
+  staleGate.resolve({ pointer: { x: 3, y: 4 }, status: "stale" });
+  await stalePoll;
+  assert.deepEqual(applied[1], {
+    snapshot: { pointer: { x: 3, y: 4 }, status: "stale" },
+    options: { applyPointer: true, applyStatus: false },
+  });
+});
+
+test("status refresh waits for every pending pointer write before accepting coordinates", async () => {
+  const firstPoll = deferred();
+  const secondPoll = deferred();
+  const thirdPoll = deferred();
+  const polls = [firstPoll, secondPoll, thirdPoll];
+  const applied = [];
+  const refresh = createMobileStatusRefreshController(
+    () => polls.shift().promise,
+    (snapshot, options) => applied.push({ snapshot, options }),
+  );
+
+  refresh.setGestureActive(true);
+  const finishOldMove = refresh.beginPointerWrite();
+  refresh.setGestureActive(false);
+  const duringOldMove = refresh.refresh();
+  firstPoll.resolve({ pointer: { x: 1, y: 1 } });
+  await duringOldMove;
+  assert.equal(applied[0].options.applyPointer, false);
+
+  const finishNewMove = refresh.beginPointerWrite();
+  finishOldMove();
+  const duringNewMove = refresh.refresh();
+  secondPoll.resolve({ pointer: { x: 2, y: 2 } });
+  await duringNewMove;
+  assert.equal(applied[1].options.applyPointer, false);
+
+  finishNewMove();
+  const afterAllAcks = refresh.refresh();
+  thirdPoll.resolve({ pointer: { x: 3, y: 3 } });
+  await afterAllAcks;
+  assert.equal(applied[2].options.applyPointer, true);
+});
+
+test("held controls use click only for keyboard or assistive activation", () => {
+  assert.equal(shouldActivateHeldControlFromClick({ detail: 0 }), true);
+  assert.equal(shouldActivateHeldControlFromClick({ detail: 1 }), false);
+  assert.equal(shouldActivateHeldControlFromClick({ detail: 2 }), false);
+});
+
+test("held controls recognize Enter and Space even on repeat so browsers stay suppressed", () => {
+  assert.equal(isHeldControlActivationKey({ key: "Enter", repeat: false }), true);
+  assert.equal(isHeldControlActivationKey({ key: " ", repeat: false }), true);
+  assert.equal(isHeldControlActivationKey({ key: "Spacebar", repeat: false }), true);
+  assert.equal(isHeldControlActivationKey({ key: "Enter", repeat: true }), true);
+  assert.equal(isHeldControlActivationKey({ key: "ArrowDown", repeat: false }), false);
+});
+
+test("held control repeat keydowns prevent native clicks without sending another press", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(
+    source,
+    /onKeyDown=\{\(event\) => \{[\s\S]*?event\.preventDefault\(\);[\s\S]*?if \(event\.repeat\) \{[\s\S]*?return;[\s\S]*?held\.press\(-2\);/,
+  );
+  assert.doesNotMatch(
+    source,
+    /if \(suppressKeyboardClickRef\.current\) \{\s*suppressKeyboardClickRef\.current = false;/,
+  );
+});
+
+test("held control blur releases the key and restores assistive click activation", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(
+    source,
+    /onBlur=\{\(\) => \{\s*held\.release\(-2\);\s*suppressKeyboardClickRef\.current = false;\s*\}\}/,
+  );
+});
+
+test("mobile held controls expose pressed state and capture-loss cleanup", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /aria-pressed=\{held\.isPressed\}/);
+  assert.match(source, /onLostPointerCapture=/);
+  assert.match(source, /onKeyDown=/);
+  assert.match(source, /onKeyUp=/);
+  assert.match(source, /shouldActivateHeldControlFromClick\(event\)/);
 });
 
 test("tauriInvocationForMobileRequest maps mobile requests to desktop commands", () => {
