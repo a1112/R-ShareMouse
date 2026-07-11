@@ -945,6 +945,7 @@ async fn process_mobile_inject_envelope(
     };
     let held_transition = mobile_held_transition(&request)?;
     validate_mobile_held_capacity(&session, held_transition)?;
+    let provisional_press = provision_mobile_held_press(&mut session, held_transition);
     let result = inject_endpoint_event(
         network_manager,
         inject_backend,
@@ -956,6 +957,8 @@ async fn process_mobile_inject_envelope(
     .await;
     if result.accepted {
         apply_mobile_held_transition(&mut session, held_transition);
+    } else {
+        rollback_mobile_held_press(&mut session, provisional_press);
     }
     Ok(result)
 }
@@ -1039,6 +1042,18 @@ enum MobileHeldTransition {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProvisionalHeldPress {
+    Key {
+        identity: HeldKeyIdentity,
+        introduced: bool,
+    },
+    MouseButton {
+        identity: u8,
+        introduced: bool,
+    },
+}
+
 fn mobile_held_transition(request: &EndpointInjectRequest) -> Result<Option<MobileHeldTransition>> {
     match &request.payload {
         EndpointEventPayload::Keyboard { .. } => {
@@ -1099,6 +1114,64 @@ fn validate_mobile_held_capacity(
             bail!("mobile held mouse button limit reached")
         }
         _ => Ok(()),
+    }
+}
+
+fn provision_mobile_held_press(
+    session: &mut MobileClientSession,
+    transition: Option<MobileHeldTransition>,
+) -> Option<ProvisionalHeldPress> {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            keycode,
+            pressed: true,
+        }) => {
+            let introduced = session.held_keys.insert(identity, keycode).is_none();
+            Some(ProvisionalHeldPress::Key {
+                identity,
+                introduced,
+            })
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            button,
+            pressed: true,
+            x,
+            y,
+        }) => {
+            session.last_mouse_position = (x, y);
+            let introduced = session
+                .held_mouse_buttons
+                .insert(identity, button)
+                .is_none();
+            Some(ProvisionalHeldPress::MouseButton {
+                identity,
+                introduced,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rollback_mobile_held_press(
+    session: &mut MobileClientSession,
+    provisional: Option<ProvisionalHeldPress>,
+) {
+    match provisional {
+        Some(ProvisionalHeldPress::Key {
+            identity,
+            introduced: true,
+        }) => {
+            session.held_keys.remove(&identity);
+        }
+        Some(ProvisionalHeldPress::MouseButton {
+            identity,
+            introduced: true,
+        }) => {
+            session.held_mouse_buttons.remove(&identity);
+        }
+        _ => {}
     }
 }
 
@@ -2124,11 +2197,12 @@ pad.addEventListener("pointerup", clearPointer);
 pad.addEventListener("pointercancel", cancelPointer);
 window.addEventListener("blur", releaseTouchpadInteraction);
 window.addEventListener("pagehide", releaseTouchpadInteraction);
-window.addEventListener("pagehide", releaseAllWithKeepalive);
 document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
-document.addEventListener("visibilitychange", releaseAllWithKeepaliveWhenHidden);
 function attachHeldButton(button, sendState) {
   let activePointer = null;
+  function resetHeldButtonPointerState() {
+    activePointer = null;
+  }
   function release(force, pointerId = null) {
     if (activePointer === null) return;
     if (!force && pointerId !== null && activePointer !== pointerId) return;
@@ -2146,10 +2220,10 @@ function attachHeldButton(button, sendState) {
   button.addEventListener("pointerleave", (event) => {
     if (event.buttons) release(false, event.pointerId);
   });
-  window.addEventListener("blur", () => release(true));
-  window.addEventListener("pagehide", () => release(true));
+  window.addEventListener("blur", resetHeldButtonPointerState);
+  window.addEventListener("pagehide", resetHeldButtonPointerState);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") release(true);
+    if (document.visibilityState === "hidden") resetHeldButtonPointerState();
   });
 }
 document.querySelectorAll("[data-button]").forEach((button) => {
@@ -2203,6 +2277,9 @@ function shouldSendTextOnKeydown(event) {
 }
 document.getElementById("send").addEventListener("click", sendText);
 textInput.addEventListener("keydown", (event) => { if (shouldSendTextOnKeydown(event)) { event.preventDefault(); sendText(); } });
+window.addEventListener("blur", releaseAllWithKeepalive);
+window.addEventListener("pagehide", releaseAllWithKeepalive);
+document.addEventListener("visibilitychange", releaseAllWithKeepaliveWhenHidden);
 refresh();
 setInterval(refresh, 1500);
 </script>
@@ -2296,6 +2373,68 @@ mod tests {
         fn inject(&mut self, event: InputEvent) -> Result<()> {
             self.injected.lock().unwrap().push(event);
             Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct SignalingInjectBackend {
+        injected: Arc<StdMutex<Vec<InputEvent>>>,
+        pressed_injected: Arc<Notify>,
+    }
+
+    impl InjectBackend for SignalingInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            let pressed = matches!(
+                event,
+                InputEvent::Key {
+                    state: rshare_input::ButtonState::Pressed,
+                    ..
+                } | InputEvent::MouseButton {
+                    state: rshare_input::ButtonState::Pressed,
+                    ..
+                }
+            );
+            self.injected.lock().unwrap().push(event);
+            if pressed {
+                self.pressed_injected.notify_one();
+            }
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectingInjectBackend {
+        attempted: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InjectBackend for RejectingInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            self.attempted.lock().unwrap().push(event);
+            bail!("test backend rejection")
         }
 
         fn is_active(&self) -> bool {
@@ -2996,6 +3135,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_after_backend_press_still_has_shutdown_compensation() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let pressed_injected = Arc::new(Notify::new());
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(SignalingInjectBackend {
+                injected: injected.clone(),
+                pressed_injected: pressed_injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        let state_guard = state.write().await;
+        let task = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            tokio::spawn(async move {
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope("cancel-client", 1, "A", "Pressed"),
+                )
+                .await
+            })
+        };
+
+        timeout(Duration::from_secs(1), pressed_injected.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(state_guard);
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 2);
+        assert!(matches!(
+            injected[1],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_new_press_rolls_back_provisional_held_identity() {
+        let attempted = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RejectingInjectBackend {
+                attempted: attempted.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        let result = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("reject-client", 1, "A", "Pressed"),
+        )
+        .await
+        .unwrap();
+        assert!(!result.accepted);
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        assert_eq!(attempted.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn rendered_mobile_page_sequences_envelopes_and_releases_complete_held_sets() {
         let page = render_mobile_page();
@@ -3016,6 +3234,29 @@ mod tests {
         assert!(!page.contains(
             "for (const request of releaseAllRequests(\"mobile-release-all-keepalive\"))"
         ));
+    }
+
+    #[test]
+    fn rendered_mobile_page_makes_batch_the_final_lifecycle_network_action() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function resetHeldButtonPointerState()"));
+        assert!(!page.contains("window.addEventListener(\"blur\", () => release(true));"));
+        assert!(!page.contains("window.addEventListener(\"pagehide\", () => release(true));"));
+        assert!(!page.contains("if (document.visibilityState === \"hidden\") release(true);"));
+        for listener in [
+            "window.addEventListener(\"blur\", releaseAllWithKeepalive);",
+            "window.addEventListener(\"pagehide\", releaseAllWithKeepalive);",
+            "document.addEventListener(\"visibilitychange\", releaseAllWithKeepaliveWhenHidden);",
+        ] {
+            let batch_listener = page
+                .rfind(listener)
+                .expect("missing lifecycle batch listener");
+            let per_button_setup = page
+                .find("function attachHeldButton")
+                .expect("missing held-button setup");
+            assert!(batch_listener > per_button_setup);
+        }
     }
 
     #[test]
