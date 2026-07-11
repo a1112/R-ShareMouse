@@ -250,6 +250,22 @@ mod macos_impl {
             event.post(CGEventTapLocation::HID);
             Ok(())
         }
+
+        /// Commit Unicode text at the current insertion point.
+        pub fn send_text(&mut self, text: &str) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+            if text.is_empty() {
+                return Ok(());
+            }
+
+            let event = CGEvent::new_keyboard_event(new_event_source()?, 0, true)
+                .map_err(|_| anyhow!("Failed to create macOS text commit event"))?;
+            event.set_string(text);
+            event.post(CGEventTapLocation::HID);
+            Ok(())
+        }
     }
 
     impl Default for MacosInputEmulator {

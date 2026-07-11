@@ -41,6 +41,7 @@ import {
   formatMobileControllerError,
   formatMobileInjectResultStatus,
   isHeldControlActivationKey,
+  isMobileTextCommitSupported,
   isTouchpadLongPressDrag,
   isTouchpadTap,
   isTwoFingerTap,
@@ -252,6 +253,7 @@ async function fetchMobileControlState() {
   return {
     pointer: pointerFromLocalControls(snapshot),
     backendStatus: formatMobileBackendStatus(snapshot),
+    textCommitSupported: isMobileTextCommitSupported(snapshot),
   };
 }
 
@@ -322,6 +324,7 @@ export default function MobileController() {
     }
   });
   const [text, setText] = useState("");
+  const [textCommitSupported, setTextCommitSupported] = useState(false);
   const [sendState, setSendState] = useState<SendState>("idle");
   const [status, setStatus] = useState("连接中");
   const [backendStatus, setBackendStatus] = useState<MobileBackendStatus>(() =>
@@ -400,6 +403,9 @@ export default function MobileController() {
           },
           applyBackendStatus(next: MobileBackendStatus) {
             setBackendStatus(next);
+          },
+          applyTextCommitSupported(next: boolean) {
+            setTextCommitSupported(next);
           },
           applyStatus(next: string) {
             setStatus(next);
@@ -886,6 +892,9 @@ export default function MobileController() {
   }
 
   async function commitText() {
+    if (!textCommitSupported) {
+      return;
+    }
     const value = text;
     if (!value) {
       return;
@@ -1137,36 +1146,45 @@ export default function MobileController() {
           ))}
         </section>
 
-        <section className="flex gap-2">
-          <div
-            className="flex min-w-0 flex-1 items-start gap-2 rounded-md px-3 py-2"
-            style={{ background: "#171b1d", border: "1px solid #29302d" }}
-          >
-            <Keyboard className="mt-2 shrink-0" size={18} color="#8f9b96" />
-            <textarea
-              {...MOBILE_TEXT_INPUT_HINTS}
-              className="min-h-16 min-w-0 flex-1 resize-none bg-transparent py-1 text-base leading-snug outline-none"
-              value={text}
-              rows={3}
-              placeholder="文本"
-              style={{ color: "#edf2ef" }}
-              onChange={(event) => setText(event.target.value)}
-              onKeyDown={(event) => {
-                if (shouldCommitMobileTextOnKeyDown(event)) {
-                  event.preventDefault();
-                  void commitText();
-                }
-              }}
-            />
+        <section>
+          <div className="flex gap-2">
+            <div
+              className="flex min-w-0 flex-1 items-start gap-2 rounded-md px-3 py-2"
+              style={{ background: "#171b1d", border: "1px solid #29302d" }}
+            >
+              <Keyboard className="mt-2 shrink-0" size={18} color="#8f9b96" />
+              <textarea
+                {...MOBILE_TEXT_INPUT_HINTS}
+                className="min-h-16 min-w-0 flex-1 resize-none bg-transparent py-1 text-base leading-snug outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                value={text}
+                rows={3}
+                placeholder="文本"
+                style={{ color: "#edf2ef" }}
+                disabled={!textCommitSupported}
+                onChange={(event) => setText(event.target.value)}
+                onKeyDown={(event) => {
+                  if (shouldCommitMobileTextOnKeyDown(event)) {
+                    event.preventDefault();
+                    void commitText();
+                  }
+                }}
+              />
+            </div>
+            <button
+              className="flex w-14 items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-60"
+              style={{ background: "#47c27a", color: "#07110b" }}
+              title="发送"
+              disabled={!textCommitSupported}
+              onClick={() => void commitText()}
+            >
+              <Send size={20} />
+            </button>
           </div>
-          <button
-            className="flex w-14 items-center justify-center rounded-md"
-            style={{ background: "#47c27a", color: "#07110b" }}
-            title="发送"
-            onClick={() => void commitText()}
-          >
-            <Send size={20} />
-          </button>
+          {!textCommitSupported && (
+            <p className="mt-2 text-xs" style={{ color: "#d6a64b" }} role="status">
+              当前输入后端不支持文本输入，请使用按键控制。
+            </p>
+          )}
         </section>
       </div>
     </main>

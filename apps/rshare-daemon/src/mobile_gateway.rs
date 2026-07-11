@@ -1594,6 +1594,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     button, input { height: 48px; }
     button { border: 1px solid #29302d; background: #171b1d; color: #d8dedb; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     button:active { background: rgba(71,194,122,.18); border-color: #47c27a; }
+    button:disabled, textarea:disabled { cursor: not-allowed; opacity: .6; }
     .textRow { display: flex; gap: 8px; }
     .rangeRow { display: flex; align-items: center; gap: 10px; min-height: 40px; border: 1px solid #29302d; border-radius: 6px; background: #171b1d; padding: 7px 10px; }
     .rangeRow label { flex: 0 0 auto; font-size: 12px; font-weight: 600; }
@@ -1667,9 +1668,10 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <button data-shortcut="ControlLeft,A">全选</button>
   </section>
   <section class="textRow">
-    <div class="inputWrap"><textarea id="text" placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send" rows="3"></textarea></div>
-    <button class="send" id="send">发送</button>
+    <div class="inputWrap"><textarea id="text" disabled placeholder="文本" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="send" rows="3"></textarea></div>
+    <button class="send" id="send" disabled>发送</button>
   </section>
+  <div class="sub" id="textCapability" role="status">当前输入后端不支持文本输入，请使用按键控制。</div>
 </main>
 <script>
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
@@ -1696,6 +1698,8 @@ const posEl = document.getElementById("pos");
 const backendStatusEl = document.getElementById("backendStatus");
 const pad = document.getElementById("pad");
 const textInput = document.getElementById("text");
+const sendButton = document.getElementById("send");
+const textCapabilityEl = document.getElementById("textCapability");
 const sensitivityInput = document.getElementById("sensitivity");
 const sensitivityValue = document.getElementById("sensitivityValue");
 const mobileEventOptions = { capture: true, passive: false };
@@ -1864,6 +1868,9 @@ function formatBackendStatus(snapshot) {
   }
   return { state: "blocked", label: "输入注入不可用", detail: `${kind}: ${backendHealthReason(backend.health)}` };
 }
+function supportsTextCommit(snapshot) {
+  return snapshot?.inject_backend?.text_commit_supported === true;
+}
 function formatEndpointInjectError(error) {
   switch (String(error || "")) {
     case "BackendUnavailable": return "输入后端不可用";
@@ -1973,6 +1980,10 @@ async function refresh() {
         posEl.textContent = `${pointer.x}, ${pointer.y} / ${pointer.width}x${pointer.height}`;
       }
       if (requestedStatusRevision === statusRevision) {
+        const textCommitSupported = supportsTextCommit(snapshot);
+        textInput.disabled = !textCommitSupported;
+        sendButton.disabled = !textCommitSupported;
+        textCapabilityEl.hidden = textCommitSupported;
         const backendStatus = formatBackendStatus(snapshot);
         backendStatusEl.textContent = `${backendStatus.label} · ${backendStatus.detail}`;
         backendStatusEl.style.color = backendStatus.state === "ready" ? '#47c27a' : '#d6a64b';
@@ -2521,6 +2532,7 @@ document.querySelectorAll("[data-shortcut]").forEach((button) => button.addEvent
   sendKeyChord(keys);
 }));
 async function sendText() {
+  if (textInput.disabled) return;
   const text = textInput.value;
   if (!text) return;
   if (await enqueueInject(daemonRequest("Keyboard", { kind: "TextCommit", data: { text } }, cid("mobile-text"), "RequireHealthyBackend", 750))) {
@@ -2530,7 +2542,7 @@ async function sendText() {
 function shouldSendTextOnKeydown(event) {
   return event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229;
 }
-document.getElementById("send").addEventListener("click", sendText);
+sendButton.addEventListener("click", sendText);
 textInput.addEventListener("keydown", (event) => { if (shouldSendTextOnKeydown(event)) { event.preventDefault(); sendText(); } });
 window.addEventListener("blur", releaseAllWithKeepalive);
 window.addEventListener("pagehide", releaseAllWithKeepalive);
@@ -4344,6 +4356,46 @@ mod tests {
         assert!(page.contains("rows=\"3\""));
         assert!(page.contains("!event.shiftKey"));
         assert!(!page.contains("<input id=\"text\""));
+    }
+
+    #[test]
+    fn rendered_mobile_text_controls_fail_closed_until_capability_poll_succeeds() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("<textarea id=\"text\" disabled"));
+        assert!(page.contains("<button class=\"send\" id=\"send\" disabled>"));
+        assert!(page.contains("id=\"textCapability\""));
+        assert!(page.contains("当前输入后端不支持文本输入"));
+        assert!(page.contains("return snapshot?.inject_backend?.text_commit_supported === true;"));
+
+        let refresh_start = page.find("async function refresh()").unwrap();
+        let refresh_end = page[refresh_start..]
+            .find("function setGestureActive")
+            .map(|offset| refresh_start + offset)
+            .unwrap();
+        let refresh = &page[refresh_start..refresh_end];
+        assert!(refresh.contains("const textCommitSupported = supportsTextCommit(snapshot);"));
+        assert!(refresh.contains("textInput.disabled = !textCommitSupported;"));
+        assert!(refresh.contains("sendButton.disabled = !textCommitSupported;"));
+        assert!(refresh.contains("textCapabilityEl.hidden = textCommitSupported;"));
+        let status_revision_gate = refresh
+            .find("if (requestedStatusRevision === statusRevision) {")
+            .expect("missing status revision gate");
+        let capability_update = refresh
+            .find("const textCommitSupported = supportsTextCommit(snapshot);")
+            .expect("missing text capability update");
+        let status_update = refresh
+            .find("const backendStatus = formatBackendStatus(snapshot);")
+            .expect("missing backend status update");
+        assert!(status_revision_gate < capability_update);
+        assert!(capability_update < status_update);
+
+        let send_text_start = page.find("async function sendText()").unwrap();
+        let send_text_end = page[send_text_start..]
+            .find("function shouldSendTextOnKeydown")
+            .map(|offset| send_text_start + offset)
+            .unwrap();
+        assert!(page[send_text_start..send_text_end].contains("if (textInput.disabled) return;"));
     }
 
     #[test]

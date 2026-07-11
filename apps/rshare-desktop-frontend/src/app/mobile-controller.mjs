@@ -88,6 +88,10 @@ export function formatMobileBackendStatus(snapshot) {
   };
 }
 
+export function isMobileTextCommitSupported(snapshot) {
+  return snapshot?.inject_backend?.text_commit_supported === true;
+}
+
 export function formatMobileControllerError(error, scope = "移动端") {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
@@ -930,6 +934,7 @@ export function applyMobileStatusRefreshResult(result, options, handlers = {}) {
     }
     if (options?.applyStatus) {
       handlers.applyBackendStatus?.(result.state.backendStatus);
+      handlers.applyTextCommitSupported?.(result.state.textCommitSupported);
       handlers.applyStatus?.("已连接");
     }
     return;

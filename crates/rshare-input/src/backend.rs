@@ -55,6 +55,11 @@ pub trait InjectBackend: Debug + Send + Sync {
 
     /// Check if currently active.
     fn is_active(&self) -> bool;
+
+    /// Whether this backend can commit arbitrary Unicode text at the active insertion point.
+    fn supports_text_commit(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for privilege/session state tracking backends.
@@ -304,6 +309,10 @@ impl InjectBackend for PortableInjectBackend {
     fn is_active(&self) -> bool {
         self.emulator.is_active()
     }
+
+    fn supports_text_commit(&self) -> bool {
+        true
+    }
 }
 
 /// No-op privilege backend for platforms without privilege tracking.
@@ -365,6 +374,10 @@ impl InjectBackend for WindowsNativeInjectBackend {
 
     fn is_active(&self) -> bool {
         InputEmulator::is_active(&self.emulator)
+    }
+
+    fn supports_text_commit(&self) -> bool {
+        true
     }
 }
 
@@ -627,6 +640,10 @@ impl InjectBackend for VirtualHidInjectBackend {
 
     fn is_active(&self) -> bool {
         matches!(self.health, BackendHealth::Healthy)
+    }
+
+    fn supports_text_commit(&self) -> bool {
+        true
     }
 }
 
@@ -1201,10 +1218,70 @@ impl InjectBackend for UInputInjectBackend {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct CapabilityDefaultInjectBackend;
+
+    impl InjectBackend for CapabilityDefaultInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, _event: InputEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn inject_backend_text_commit_capability_fails_closed_by_default() {
+        let backend: Box<dyn InjectBackend> = Box::new(CapabilityDefaultInjectBackend);
+
+        assert!(!backend.supports_text_commit());
+    }
+
+    #[test]
+    fn portable_backend_reports_text_commit_support() {
+        let backend = PortableInjectBackend::new_for_test().unwrap();
+
+        assert!(backend.supports_text_commit());
+    }
+
     #[test]
     fn portable_backend_reports_portable_kind() {
         let backend = PortableInjectBackend::new_for_test().unwrap();
         assert_eq!(backend.kind(), BackendKind::Portable);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_backend_reports_text_commit_support() {
+        let backend = WindowsNativeInjectBackend::new_for_test().unwrap();
+
+        assert!(backend.supports_text_commit());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn virtual_hid_backend_declares_text_commit_support_without_requiring_the_driver() {
+        let source = include_str!("backend.rs");
+        let start = source
+            .find("impl InjectBackend for VirtualHidInjectBackend")
+            .expect("missing Virtual HID inject backend");
+        let end = source[start..]
+            .find("fn windows_driver_relative_mouse_steps")
+            .map(|offset| start + offset)
+            .expect("missing end of Virtual HID inject backend");
+
+        let virtual_hid_impl = source[start..end].replace("\r\n", "\n");
+        assert!(virtual_hid_impl
+            .contains("fn supports_text_commit(&self) -> bool {\n        true\n    }"));
     }
 
     #[test]

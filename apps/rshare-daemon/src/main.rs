@@ -588,7 +588,9 @@ impl DaemonState {
         mode: Option<ResolvedInputMode>,
         available: Vec<BackendKind>,
         capture_health: BackendHealth,
+        inject_kind: BackendKind,
         inject_health: BackendHealth,
+        text_commit_supported: bool,
         error: Option<String>,
     ) {
         self.backend_state.selected_mode = mode;
@@ -603,9 +605,10 @@ impl DaemonState {
         self.local_controls.capture_backend.active =
             matches!(capture_health, BackendHealth::Healthy);
         self.local_controls.inject_backend.mode = mode;
-        self.local_controls.inject_backend.kind = mode.map(backend_kind_from_resolved_mode);
+        self.local_controls.inject_backend.kind = Some(inject_kind);
         self.local_controls.inject_backend.health = Some(inject_health.clone());
         self.local_controls.inject_backend.active = matches!(inject_health, BackendHealth::Healthy);
+        self.local_controls.inject_backend.text_commit_supported = text_commit_supported;
         self.local_controls.privilege_state = Some(self.backend_state.privilege_state);
         self.local_controls.last_error = error;
 
@@ -6815,6 +6818,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(RwLock::new(daemon_state));
 
     let (inject_backend, inject_health, inject_error) = build_inject_backend(input_mode);
+    let inject_kind = inject_backend.kind();
+    let text_commit_supported = inject_backend.supports_text_commit();
     let last_backend_error = inject_error.or(backend_error);
 
     // Initialize backend state
@@ -6824,7 +6829,9 @@ async fn main() -> Result<()> {
             input_mode,
             available_backends,
             backend_health.clone(), // capture health
+            inject_kind,
             inject_health,
+            text_commit_supported,
             last_backend_error,
         );
     }
@@ -7776,6 +7783,31 @@ mod tests {
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.page_url, "不可用");
         assert!(snapshot.token.is_empty());
+    }
+
+    #[test]
+    fn backend_diagnostics_use_the_constructed_inject_backend_identity_and_capability() {
+        let mut state = test_daemon_state();
+
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::WindowsNative,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+
+        assert_eq!(
+            state.local_controls.inject_backend.mode,
+            Some(ResolvedInputMode::Portable)
+        );
+        assert_eq!(
+            state.local_controls.inject_backend.kind,
+            Some(BackendKind::WindowsNative)
+        );
+        assert!(state.local_controls.inject_backend.text_commit_supported);
     }
 
     fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {

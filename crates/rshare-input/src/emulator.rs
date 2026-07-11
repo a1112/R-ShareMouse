@@ -516,11 +516,7 @@ impl InputEmulator for MacosNativeInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
-            InputEvent::TextCommit { .. } => {
-                anyhow::bail!(
-                    "Text commit injection is not supported by the macOS native emulator"
-                );
-            }
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -577,8 +573,8 @@ impl InputEmulator for MacosNativeInputEmulator {
         self.release_key(keycode)
     }
 
-    fn commit_text(&mut self, _text: &str) -> Result<()> {
-        anyhow::bail!("Text commit injection is not supported by the macOS native emulator")
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.send_text(text)
     }
 
     fn is_active(&self) -> bool {
@@ -696,6 +692,10 @@ impl crate::backend::InjectBackend for WindowsNativeInputEmulator {
 
     fn is_active(&self) -> bool {
         self.active
+    }
+
+    fn supports_text_commit(&self) -> bool {
+        true
     }
 }
 
@@ -1120,6 +1120,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn macos_native_emulator_source_forwards_text_commit_to_platform() {
+        let source = include_str!("emulator.rs");
+        let start = source
+            .find("impl InputEmulator for MacosNativeInputEmulator")
+            .expect("missing macOS native emulator");
+        let end = source[start..]
+            .find("impl MacosNativeInputEmulator")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS native emulator trait implementation");
+        let macos_impl = &source[start..end];
+
+        assert!(macos_impl.contains("InputEvent::TextCommit { text } => self.commit_text(&text)?"));
+        assert!(macos_impl.contains("fn commit_text(&mut self, text: &str) -> Result<()>"));
+        assert!(macos_impl.contains("self.inner.send_text(text)"));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_native_backend_is_preferred_when_available() {
@@ -1144,6 +1161,16 @@ mod tests {
 
         assert!(InputEmulator::is_active(&emulator));
         assert!(emulator.platform_emulator_is_active_for_test());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_emulator_reports_text_commit_support() {
+        use crate::backend::InjectBackend;
+
+        let emulator = WindowsNativeInputEmulator::new().unwrap();
+
+        assert!(InjectBackend::supports_text_commit(&emulator));
     }
 
     #[cfg(target_os = "windows")]

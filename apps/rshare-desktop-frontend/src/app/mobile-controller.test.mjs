@@ -33,6 +33,7 @@ import {
   isTouchpadTap,
   isTwoFingerTap,
   isHeldControlActivationKey,
+  isMobileTextCommitSupported,
   nextPointerPosition,
   normalizeMobilePointerSensitivity,
   preventMobileGestureDefault,
@@ -273,6 +274,36 @@ test("formatMobileBackendStatus reports mobile injection readiness", () => {
       detail: "Portable: PermissionDenied",
     },
   );
+});
+
+test("text commit capability accepts only an explicit boolean true", () => {
+  assert.equal(
+    isMobileTextCommitSupported({ inject_backend: { text_commit_supported: true } }),
+    true,
+  );
+  for (const value of [false, undefined, null, 1, "true", {}, []]) {
+    assert.equal(
+      isMobileTextCommitSupported({ inject_backend: { text_commit_supported: value } }),
+      false,
+    );
+  }
+  assert.equal(isMobileTextCommitSupported({}), false);
+  assert.equal(isMobileTextCommitSupported(null), false);
+});
+
+test("mobile text controls stay disabled until the daemon explicitly reports support", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(
+    source,
+    /const \[textCommitSupported, setTextCommitSupported\] = useState\(false\)/,
+  );
+  assert.match(source, /textCommitSupported: isMobileTextCommitSupported\(snapshot\)/);
+  assert.match(source, /applyTextCommitSupported/);
+  assert.match(source, /if \(!textCommitSupported\) \{\s*return;\s*\}/);
+  assert.match(source, /<textarea[\s\S]*?disabled=\{!textCommitSupported\}/);
+  assert.match(source, /title="发送"\s+disabled=\{!textCommitSupported\}/);
+  assert.match(source, /当前输入后端不支持文本输入/);
 });
 
 test("shouldCommitMobileTextOnKeyDown ignores IME composition enter", () => {
@@ -1392,6 +1423,9 @@ test("mobile status result keeps backend status behind the status revision gate"
     applyBackendStatus(value) {
       applied.push(["backend", value]);
     },
+    applyTextCommitSupported(value) {
+      applied.push(["text-commit", value]);
+    },
     applyStatus(value) {
       applied.push(["status", value]);
     },
@@ -1400,7 +1434,11 @@ test("mobile status result keeps backend status behind the status revision gate"
     },
   };
   const result = {
-    state: { pointer: { x: 9, y: 8 }, backendStatus: { state: "blocked" } },
+    state: {
+      pointer: { x: 9, y: 8 },
+      backendStatus: { state: "blocked" },
+      textCommitSupported: true,
+    },
     error: null,
   };
 
@@ -1418,6 +1456,7 @@ test("mobile status result keeps backend status behind the status revision gate"
   );
   assert.deepEqual(applied.slice(1), [
     ["backend", { state: "blocked" }],
+    ["text-commit", true],
     ["status", "已连接"],
   ]);
 });

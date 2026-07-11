@@ -105,6 +105,28 @@ pub trait ClipboardListener: Send + Sync {
     async fn get_current_clipboard(&self) -> anyhow::Result<ClipboardContent>;
 }
 
+#[cfg(test)]
+mod platform_source_contract_tests {
+    #[test]
+    fn macos_text_commit_uses_core_graphics_unicode_events() {
+        let source = include_str!("macos.rs");
+        let start = source
+            .find("pub fn send_text(&mut self, text: &str)")
+            .expect("missing macOS text commit implementation");
+        let end = source[start..]
+            .find("impl Default for MacosInputEmulator")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS input emulator implementation");
+        let send_text = &source[start..end];
+
+        assert!(send_text.contains("if !self.active"));
+        assert!(send_text.contains("if text.is_empty()"));
+        assert!(send_text.contains("CGEvent::new_keyboard_event"));
+        assert!(send_text.contains("event.set_string(text);"));
+        assert!(send_text.contains("event.post(CGEventTapLocation::HID);"));
+    }
+}
+
 /// Platform-specific clipboard listener type alias
 #[cfg(windows)]
 pub type PlatformClipboardListener = clipboard::WindowsClipboardListener;

@@ -847,6 +847,8 @@ pub struct LocalBackendDiagnosticState {
     pub health: Option<BackendHealth>,
     #[serde(default)]
     pub active: bool,
+    #[serde(default)]
+    pub text_commit_supported: bool,
 }
 
 impl Default for LocalBackendDiagnosticState {
@@ -856,6 +858,7 @@ impl Default for LocalBackendDiagnosticState {
             kind: None,
             health: None,
             active: false,
+            text_commit_supported: false,
         }
     }
 }
@@ -1054,5 +1057,26 @@ mod tests {
         assert_eq!(driver.filter_mouse_connects, 0);
         assert_eq!(driver.filter_keyboard_events, 0);
         assert_eq!(driver.filter_mouse_events, 0);
+    }
+
+    #[test]
+    fn text_commit_capability_defaults_to_false_for_older_backend_snapshots() {
+        let backend: LocalBackendDiagnosticState =
+            serde_json::from_str(r#"{"active":true}"#).unwrap();
+
+        assert!(!backend.text_commit_supported);
+    }
+
+    #[test]
+    fn text_commit_capability_round_trips_when_supported() {
+        let backend = LocalBackendDiagnosticState {
+            text_commit_supported: true,
+            ..LocalBackendDiagnosticState::default()
+        };
+
+        let json = serde_json::to_string(&backend).unwrap();
+        let restored: LocalBackendDiagnosticState = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.text_commit_supported);
     }
 }
