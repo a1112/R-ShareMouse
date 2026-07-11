@@ -1069,7 +1069,6 @@ impl DaemonState {
                 self.local_controls.keyboard.event_count =
                     self.local_controls.keyboard.event_count.saturating_add(1);
                 self.local_controls.keyboard.last_key = Some("TextCommit".to_string());
-                payload.insert("text".to_string(), text.clone());
                 payload.insert("char_count".to_string(), text.chars().count().to_string());
                 (
                     LocalInputDeviceKind::Keyboard,
@@ -4007,7 +4006,6 @@ fn endpoint_inject_diagnostic_payload(
             )
         }
         rshare_core::EndpointEventPayload::TextCommit { text } => {
-            payload.insert("text".to_string(), text.clone());
             payload.insert("char_count".to_string(), text.chars().count().to_string());
             (
                 "text".to_string(),
@@ -10007,7 +10005,7 @@ mod tests {
             "local".to_string(),
             "local".to_string(),
         )));
-        let (events, _rx) = broadcast::channel(4);
+        let (events, mut rx) = broadcast::channel(4);
 
         let result = inject_endpoint_event(
             &network_manager,
@@ -10034,6 +10032,56 @@ mod tests {
             &injected[0],
             rshare_input::InputEvent::TextCommit { text } if text == "你好🙂"
         ));
+        drop(injected);
+
+        let diagnostic = rx.recv().await.unwrap();
+        let diagnostic_json = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(
+            diagnostic.payload.get("char_count").map(String::as_str),
+            Some("3")
+        );
+        assert!(!diagnostic.payload.contains_key("text"));
+        assert!(!diagnostic_json.contains("你好🙂"));
+        assert!(!diagnostic_json.contains("\"text\":"));
+
+        let mut state = state.write().await;
+        let endpoint_events = state.endpoint_events(
+            &EndpointEventFilter {
+                kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        let endpoint_json = serde_json::to_string(&endpoint_events).unwrap();
+        assert!(endpoint_json.contains("char_count"));
+        assert!(!endpoint_json.contains("你好🙂"));
+        assert!(!endpoint_json.contains("\"text\":"));
+    }
+
+    #[test]
+    fn captured_text_commit_diagnostics_never_retain_raw_content() {
+        let mut state = test_daemon_state();
+
+        let diagnostic = state.record_local_input_event(&rshare_input::InputEvent::TextCommit {
+            text: "私密文本🙂".to_string(),
+        });
+        let endpoint = state.endpoint_event_from_local(diagnostic.clone());
+
+        assert_eq!(
+            diagnostic.payload.get("char_count").map(String::as_str),
+            Some("5")
+        );
+        assert!(!diagnostic.payload.contains_key("text"));
+        for serialized in [
+            serde_json::to_string(&diagnostic).unwrap(),
+            serde_json::to_string(&endpoint).unwrap(),
+        ] {
+            assert!(!serialized.contains("私密文本🙂"));
+            assert!(!serialized.contains("\"text\":"));
+            assert!(serialized.contains("char_count"));
+        }
     }
 
     #[test]

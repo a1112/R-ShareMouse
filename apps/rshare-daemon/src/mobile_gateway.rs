@@ -1,23 +1,265 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rshare_core::{
-    DaemonRequest, DaemonResponse, EndpointInjectRequest, EndpointInjectTarget,
-    LocalInputDiagnosticEvent, MobileAccessSnapshot,
+    DaemonRequest, DaemonResponse, EndpointEventKind, EndpointEventPayload, EndpointInjectMode,
+    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LocalInputDiagnosticEvent,
+    MobileAccessSnapshot,
 };
 use rshare_input::InjectBackend;
 use rshare_net::NetworkManager;
+use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 use crate::{endpoint_runtime::inject_endpoint_event, DaemonState};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024;
+const MAX_MOBILE_CLIENT_ID_BYTES: usize = 128;
+
+#[derive(Debug, Clone)]
+struct MobileGatewayLimits {
+    max_active_clients: usize,
+    max_client_sessions: usize,
+    read_deadline: Duration,
+    write_deadline: Duration,
+    held_input_lease: Duration,
+    accept_error_initial_backoff: Duration,
+    accept_error_max_backoff: Duration,
+}
+
+impl Default for MobileGatewayLimits {
+    fn default() -> Self {
+        Self {
+            max_active_clients: 64,
+            max_client_sessions: 512,
+            read_deadline: Duration::from_secs(5),
+            write_deadline: Duration::from_secs(5),
+            held_input_lease: Duration::from_secs(15),
+            accept_error_initial_backoff: Duration::from_millis(25),
+            accept_error_max_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MobileInjectEnvelope {
+    client_id: String,
+    sequence: u64,
+    request: DaemonRequest,
+}
+
+#[derive(Debug)]
+struct MobileClientSession {
+    last_sequence: u64,
+    last_seen: Instant,
+    held_keys: BTreeSet<String>,
+    held_mouse_buttons: BTreeSet<String>,
+    last_mouse_position: (i32, i32),
+}
+
+impl MobileClientSession {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sequence: 0,
+            last_seen: now,
+            held_keys: BTreeSet::new(),
+            held_mouse_buttons: BTreeSet::new(),
+            last_mouse_position: (0, 0),
+        }
+    }
+
+    fn has_held_input(&self) -> bool {
+        !self.held_keys.is_empty() || !self.held_mouse_buttons.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MobileClientSessions {
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<MobileClientSession>>>>>,
+    max_sessions: usize,
+    held_input_lease: Duration,
+}
+
+impl MobileClientSessions {
+    fn new(max_sessions: usize, held_input_lease: Duration) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions: max_sessions.max(1),
+            held_input_lease,
+        }
+    }
+
+    async fn session_at(
+        &self,
+        client_id: &str,
+        now: Instant,
+    ) -> Result<Arc<Mutex<MobileClientSession>>> {
+        validate_mobile_client_id(client_id)?;
+        let mut sessions = self.sessions.lock().await;
+        self.prune_idle_locked(&mut sessions, now);
+        if let Some(session) = sessions.get(client_id) {
+            return Ok(session.clone());
+        }
+        if sessions.len() >= self.max_sessions {
+            bail!("mobile client session limit reached");
+        }
+        let session = Arc::new(Mutex::new(MobileClientSession::new(now)));
+        sessions.insert(client_id.to_string(), session.clone());
+        Ok(session)
+    }
+
+    fn prune_idle_locked(
+        &self,
+        sessions: &mut HashMap<String, Arc<Mutex<MobileClientSession>>>,
+        now: Instant,
+    ) {
+        let prune_after = self
+            .held_input_lease
+            .checked_mul(2)
+            .unwrap_or(Duration::MAX);
+        sessions.retain(|_, session| {
+            if Arc::strong_count(session) != 1 {
+                return true;
+            }
+            let Ok(session) = session.try_lock() else {
+                return true;
+            };
+            session.has_held_input()
+                || now
+                    .checked_duration_since(session.last_seen)
+                    .unwrap_or_default()
+                    < prune_after
+        });
+    }
+
+    async fn refresh_client_at(&self, client_id: &str, now: Instant) -> Result<()> {
+        let session = self.session_at(client_id, now).await?;
+        session.lock().await.last_seen = now;
+        Ok(())
+    }
+
+    async fn reap_expired_at(
+        &self,
+        now: Instant,
+        network_manager: &Arc<Mutex<NetworkManager>>,
+        inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+        state: &Arc<RwLock<DaemonState>>,
+        local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    ) {
+        let sessions = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .map(|(client_id, session)| (client_id.clone(), session.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        for (client_id, session) in &sessions {
+            let mut session = session.lock().await;
+            let elapsed = now
+                .checked_duration_since(session.last_seen)
+                .unwrap_or_default();
+            if elapsed < self.held_input_lease || !session.has_held_input() {
+                continue;
+            }
+
+            let held_keys = session.held_keys.iter().cloned().collect::<Vec<_>>();
+            for key in held_keys {
+                let request = lease_release_request(
+                    client_id,
+                    EndpointEventKind::Keyboard,
+                    EndpointEventPayload::Keyboard {
+                        key: key.clone(),
+                        state: "Released".to_string(),
+                    },
+                );
+                let result = inject_endpoint_event(
+                    network_manager,
+                    inject_backend,
+                    state,
+                    local_events_tx,
+                    EndpointInjectTarget::Local,
+                    request,
+                )
+                .await;
+                if result.accepted {
+                    session.held_keys.remove(&key);
+                }
+            }
+
+            let held_buttons = session
+                .held_mouse_buttons
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for button in held_buttons {
+                let (x, y) = session.last_mouse_position;
+                let request = lease_release_request(
+                    client_id,
+                    EndpointEventKind::Mouse,
+                    EndpointEventPayload::MouseButton {
+                        button: button.clone(),
+                        state: "Released".to_string(),
+                        x,
+                        y,
+                    },
+                );
+                let result = inject_endpoint_event(
+                    network_manager,
+                    inject_backend,
+                    state,
+                    local_events_tx,
+                    EndpointInjectTarget::Local,
+                    request,
+                )
+                .await;
+                if result.accepted {
+                    session.held_mouse_buttons.remove(&button);
+                }
+            }
+        }
+        drop(sessions);
+
+        let mut sessions = self.sessions.lock().await;
+        self.prune_idle_locked(&mut sessions, now);
+    }
+}
+
+fn validate_mobile_client_id(client_id: &str) -> Result<()> {
+    if client_id.is_empty() || client_id.len() > MAX_MOBILE_CLIENT_ID_BYTES {
+        bail!("mobile client_id must contain 1-{MAX_MOBILE_CLIENT_ID_BYTES} bytes");
+    }
+    if !client_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("mobile client_id contains unsupported characters");
+    }
+    Ok(())
+}
+
+fn lease_release_request(
+    client_id: &str,
+    device_kind: EndpointEventKind,
+    payload: EndpointEventPayload,
+) -> EndpointInjectRequest {
+    EndpointInjectRequest {
+        correlation_id: format!("mobile-lease-{}-{}", client_id, mobile_timestamp_ms_now()),
+        device_kind,
+        payload,
+        mode: EndpointInjectMode::RequireHealthyBackend,
+        timeout_ms: 750,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MobileGatewayAccess {
@@ -226,17 +468,107 @@ pub(crate) async fn run_mobile_gateway_server(
     };
     tracing::info!("Mobile gateway listening on {}", access.bind_addr());
 
+    run_mobile_gateway_server_on_listener(
+        listener,
+        access,
+        state,
+        network_manager,
+        inject_backend,
+        local_events_tx,
+        shutdown_rx,
+        MobileGatewayLimits::default(),
+    )
+    .await
+}
+
+async fn run_mobile_gateway_server_on_listener(
+    listener: TcpListener,
+    access: MobileGatewayAccess,
+    state: Arc<RwLock<DaemonState>>,
+    network_manager: Arc<Mutex<NetworkManager>>,
+    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    limits: MobileGatewayLimits,
+) -> Result<()> {
+    let active_clients = Arc::new(Semaphore::new(limits.max_active_clients.max(1)));
+    let sessions = MobileClientSessions::new(limits.max_client_sessions, limits.held_input_lease);
+    let mut client_tasks = JoinSet::new();
+    let mut accept_backoff = limits.accept_error_initial_backoff;
+
+    let reaper_sessions = sessions.clone();
+    let reaper_network_manager = network_manager.clone();
+    let reaper_inject_backend = inject_backend.clone();
+    let reaper_state = state.clone();
+    let reaper_local_events_tx = local_events_tx.clone();
+    let reaper_lease = limits.held_input_lease;
+    let mut reaper_shutdown_rx = shutdown_rx.resubscribe();
+    let reaper_task = tokio::spawn(async move {
+        let interval_duration = (reaper_lease / 2).max(Duration::from_millis(25));
+        let mut interval = tokio::time::interval(interval_duration);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    reaper_sessions.reap_expired_at(
+                        Instant::now(),
+                        &reaper_network_manager,
+                        &reaper_inject_backend,
+                        &reaper_state,
+                        &reaper_local_events_tx,
+                    ).await;
+                }
+                _ = reaper_shutdown_rx.recv() => break,
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, peer_addr) = result?;
+                let (mut stream, peer_addr) = match result {
+                    Ok(accepted) => {
+                        accept_backoff = limits.accept_error_initial_backoff;
+                        accepted
+                    }
+                    Err(error) => {
+                        tracing::warn!("Mobile gateway accept failed: {error}");
+                        let delay = accept_backoff.min(limits.accept_error_max_backoff);
+                        accept_backoff = accept_backoff
+                            .checked_mul(2)
+                            .unwrap_or(limits.accept_error_max_backoff)
+                            .min(limits.accept_error_max_backoff);
+                        tokio::select! {
+                            _ = sleep(delay) => {}
+                            _ = shutdown_rx.recv() => break,
+                        }
+                        continue;
+                    }
+                };
+                let permit = match active_clients.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let _ = write_mobile_response_with_deadline(
+                            &mut stream,
+                            503,
+                            "application/json; charset=utf-8",
+                            json!({ "error": "mobile gateway busy" }).to_string().into_bytes(),
+                            limits.write_deadline,
+                        ).await;
+                        continue;
+                    }
+                };
                 let access = access.clone();
                 let state = state.clone();
                 let network_manager = network_manager.clone();
                 let inject_backend = inject_backend.clone();
                 let local_events_tx = local_events_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_mobile_gateway_client(
+                let sessions = sessions.clone();
+                let limits = limits.clone();
+                client_tasks.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_mobile_gateway_client_with_context(
                         stream,
                         peer_addr,
                         access,
@@ -244,6 +576,8 @@ pub(crate) async fn run_mobile_gateway_server(
                         network_manager,
                         inject_backend,
                         local_events_tx,
+                        sessions,
+                        limits,
                     )
                     .await
                     {
@@ -252,14 +586,24 @@ pub(crate) async fn run_mobile_gateway_server(
                 });
             }
             _ = shutdown_rx.recv() => break,
+            Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!("Mobile gateway client task failed: {error}");
+                }
+            }
         }
     }
 
+    client_tasks.abort_all();
+    while client_tasks.join_next().await.is_some() {}
+    reaper_task.abort();
+    let _ = reaper_task.await;
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_mobile_gateway_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer_addr: SocketAddr,
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
@@ -267,25 +611,54 @@ async fn handle_mobile_gateway_client(
     inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
 ) -> Result<()> {
-    let request = read_mobile_http_request(&mut stream).await?;
+    let limits = MobileGatewayLimits::default();
+    let sessions = MobileClientSessions::new(limits.max_client_sessions, limits.held_input_lease);
+    handle_mobile_gateway_client_with_context(
+        stream,
+        peer_addr,
+        access,
+        state,
+        network_manager,
+        inject_backend,
+        local_events_tx,
+        sessions,
+        limits,
+    )
+    .await
+}
+
+async fn handle_mobile_gateway_client_with_context(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    access: MobileGatewayAccess,
+    state: Arc<RwLock<DaemonState>>,
+    network_manager: Arc<Mutex<NetworkManager>>,
+    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    sessions: MobileClientSessions,
+    limits: MobileGatewayLimits,
+) -> Result<()> {
+    let request = read_mobile_http_request_with_deadline(&mut stream, limits.read_deadline).await?;
     let route = route_mobile_http_request(&request.method, &request.target);
 
     if route == MobileGatewayRoute::NotFound {
-        return write_mobile_response(
+        return write_mobile_response_with_deadline(
             &mut stream,
             404,
             "application/json; charset=utf-8",
             json!({ "error": "not found" }).to_string().into_bytes(),
+            limits.write_deadline,
         )
         .await;
     }
 
     if !is_authorized_mobile_request(&request, access.token()) {
-        return write_mobile_response(
+        return write_mobile_response_with_deadline(
             &mut stream,
             401,
             "application/json; charset=utf-8",
             json!({ "error": "unauthorized" }).to_string().into_bytes(),
+            limits.write_deadline,
         )
         .await;
     }
@@ -293,27 +666,50 @@ async fn handle_mobile_gateway_client(
 
     match route {
         MobileGatewayRoute::Page => {
-            write_mobile_response(
+            write_mobile_response_with_deadline(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
                 render_mobile_page_with_token(access.token()).into_bytes(),
+                limits.write_deadline,
             )
             .await
         }
         MobileGatewayRoute::LocalControls => {
+            if let Some(client_id) = mobile_query_value(&request.target, "client_id") {
+                if let Err(error) = sessions.refresh_client_at(&client_id, Instant::now()).await {
+                    return write_mobile_response_with_deadline(
+                        &mut stream,
+                        400,
+                        "application/json; charset=utf-8",
+                        json!({
+                            "error": "invalid mobile client",
+                            "detail": error.to_string(),
+                        })
+                        .to_string()
+                        .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await;
+                }
+            }
             let snapshot = {
                 let mut state = state.write().await;
                 state.refresh_local_controls_platform();
                 state.local_control_snapshot()
             };
-            write_mobile_json(&mut stream, &DaemonResponse::LocalControls(snapshot)).await
+            write_mobile_json_with_deadline(
+                &mut stream,
+                &DaemonResponse::LocalControls(snapshot),
+                limits.write_deadline,
+            )
+            .await
         }
         MobileGatewayRoute::Inject => {
-            let request = match mobile_inject_request_from_body(&request.body) {
-                Ok(request) => request,
+            let envelope = match mobile_inject_envelope_from_body(&request.body) {
+                Ok(envelope) => envelope,
                 Err(error) => {
-                    return write_mobile_response(
+                    return write_mobile_response_with_deadline(
                         &mut stream,
                         400,
                         "application/json; charset=utf-8",
@@ -323,53 +719,182 @@ async fn handle_mobile_gateway_client(
                         })
                         .to_string()
                         .into_bytes(),
+                        limits.write_deadline,
                     )
                     .await;
                 }
             };
-            let result = inject_endpoint_event(
+            let result = match process_mobile_inject_envelope(
+                &sessions,
                 &network_manager,
                 &inject_backend,
                 &state,
                 &local_events_tx,
-                EndpointInjectTarget::Local,
-                request,
+                envelope,
             )
-            .await;
-            write_mobile_json(&mut stream, &DaemonResponse::EndpointInjectResult(result)).await
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return write_mobile_response_with_deadline(
+                        &mut stream,
+                        409,
+                        "application/json; charset=utf-8",
+                        json!({
+                            "error": "mobile inject rejected",
+                            "detail": error.to_string(),
+                        })
+                        .to_string()
+                        .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await;
+                }
+            };
+            write_mobile_json_with_deadline(
+                &mut stream,
+                &DaemonResponse::EndpointInjectResult(result),
+                limits.write_deadline,
+            )
+            .await
         }
         MobileGatewayRoute::NotFound => unreachable!("handled above"),
     }
 }
 
-fn mobile_inject_request_from_body(body: &[u8]) -> Result<EndpointInjectRequest> {
+fn mobile_inject_envelope_from_body(body: &[u8]) -> Result<MobileInjectEnvelope> {
     if body.is_empty() {
         bail!("empty mobile inject body");
     }
 
-    if let Ok(DaemonRequest::InjectEndpointEvent { target, request }) =
-        serde_json::from_slice::<DaemonRequest>(body)
-    {
-        match target {
-            EndpointInjectTarget::Local => return Ok(request),
-            EndpointInjectTarget::Remote(_) => {
-                bail!("mobile gateway only injects into the local endpoint")
-            }
-        }
+    let envelope = serde_json::from_slice::<MobileInjectEnvelope>(body)
+        .context("failed to decode mobile inject envelope")?;
+    validate_mobile_client_id(&envelope.client_id)?;
+    if envelope.sequence == 0 {
+        bail!("mobile sequence must be greater than zero");
     }
-
-    serde_json::from_slice::<EndpointInjectRequest>(body)
-        .context("failed to decode mobile inject request")
+    match &envelope.request {
+        DaemonRequest::InjectEndpointEvent {
+            target: EndpointInjectTarget::Local,
+            ..
+        } => Ok(envelope),
+        DaemonRequest::InjectEndpointEvent {
+            target: EndpointInjectTarget::Remote(_),
+            ..
+        } => bail!("mobile gateway only injects into the local endpoint"),
+        _ => bail!("mobile envelope only accepts InjectEndpointEvent"),
+    }
 }
 
-async fn write_mobile_json<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
-    write_mobile_response(
+async fn process_mobile_inject_envelope(
+    sessions: &MobileClientSessions,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    envelope: MobileInjectEnvelope,
+) -> Result<EndpointInjectResult> {
+    let now = Instant::now();
+    let session = sessions.session_at(&envelope.client_id, now).await?;
+    let mut session = session.lock().await;
+    if envelope.sequence <= session.last_sequence {
+        bail!(
+            "mobile sequence {} is not greater than last sequence {}",
+            envelope.sequence,
+            session.last_sequence
+        );
+    }
+    session.last_sequence = envelope.sequence;
+    session.last_seen = now;
+
+    let request = match envelope.request {
+        DaemonRequest::InjectEndpointEvent {
+            target: EndpointInjectTarget::Local,
+            request,
+        } => request,
+        _ => bail!("mobile envelope only accepts a local InjectEndpointEvent"),
+    };
+    let result = inject_endpoint_event(
+        network_manager,
+        inject_backend,
+        state,
+        local_events_tx,
+        EndpointInjectTarget::Local,
+        request.clone(),
+    )
+    .await;
+    if result.accepted {
+        update_mobile_held_input(&mut session, &request);
+    }
+    Ok(result)
+}
+
+fn update_mobile_held_input(session: &mut MobileClientSession, request: &EndpointInjectRequest) {
+    match &request.payload {
+        EndpointEventPayload::Keyboard { key, state } => {
+            if mobile_state_is_pressed(state) {
+                session.held_keys.insert(key.clone());
+            } else if mobile_state_is_released(state) {
+                session.held_keys.remove(key);
+            }
+        }
+        EndpointEventPayload::MouseMove { x, y, .. }
+        | EndpointEventPayload::MouseWheel { x, y, .. } => {
+            session.last_mouse_position = (*x, *y);
+        }
+        EndpointEventPayload::MouseButton {
+            button,
+            state,
+            x,
+            y,
+        } => {
+            session.last_mouse_position = (*x, *y);
+            if mobile_state_is_pressed(state) {
+                session.held_mouse_buttons.insert(button.clone());
+            } else if mobile_state_is_released(state) {
+                session.held_mouse_buttons.remove(button);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mobile_state_is_pressed(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "pressed" | "press" | "down" | "true" | "1"
+    )
+}
+
+fn mobile_state_is_released(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "released" | "release" | "up" | "false" | "0"
+    )
+}
+
+async fn write_mobile_json_with_deadline<T: serde::Serialize>(
+    stream: &mut TcpStream,
+    value: &T,
+    deadline: Duration,
+) -> Result<()> {
+    write_mobile_response_with_deadline(
         stream,
         200,
         "application/json; charset=utf-8",
         serde_json::to_vec(value)?,
+        deadline,
     )
     .await
+}
+
+async fn read_mobile_http_request_with_deadline(
+    stream: &mut TcpStream,
+    deadline: Duration,
+) -> Result<MobileHttpRequest> {
+    timeout(deadline, read_mobile_http_request(stream))
+        .await
+        .context("mobile HTTP read deadline exceeded")?
 }
 
 async fn read_mobile_http_request(stream: &mut TcpStream) -> Result<MobileHttpRequest> {
@@ -401,21 +926,50 @@ async fn read_mobile_http_request(stream: &mut TcpStream) -> Result<MobileHttpRe
         .next()
         .ok_or_else(|| anyhow!("missing mobile HTTP target"))?
         .to_string();
+    let version = request_parts
+        .next()
+        .ok_or_else(|| anyhow!("missing mobile HTTP version"))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || request_parts.next().is_some() {
+        bail!("invalid mobile HTTP request line");
+    }
 
     let mut headers = BTreeMap::new();
+    let mut content_length = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid mobile HTTP header"))?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if key.is_empty() {
+            bail!("invalid empty mobile HTTP header name");
         }
+        if key == "transfer-encoding" {
+            bail!("unsupported mobile HTTP Transfer-Encoding");
+        }
+        if key == "content-length" {
+            if content_length.is_some() {
+                bail!("duplicate Content-Length header");
+            }
+            if value.is_empty() || value.starts_with(['+', '-']) {
+                bail!("invalid Content-Length header");
+            }
+            let parsed = value
+                .parse::<u64>()
+                .context("invalid Content-Length header")?;
+            let parsed = usize::try_from(parsed).context("Content-Length overflow")?;
+            content_length = Some(parsed);
+        }
+        headers.insert(key, value.to_string());
     }
 
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
+    if method == "POST" && content_length.is_none() {
+        bail!("missing Content-Length header for POST request");
+    }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         bail!("mobile HTTP body exceeded limit");
     }
@@ -443,7 +997,9 @@ async fn write_mobile_response(
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        409 => "Conflict",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let header = format!(
@@ -460,6 +1016,21 @@ async fn write_mobile_response(
     Ok(())
 }
 
+async fn write_mobile_response_with_deadline(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    deadline: Duration,
+) -> Result<()> {
+    timeout(
+        deadline,
+        write_mobile_response(stream, status, content_type, body),
+    )
+    .await
+    .context("mobile HTTP write deadline exceeded")?
+}
+
 fn mobile_token_from_authorization(value: Option<&str>) -> Option<String> {
     let value = value?;
     value
@@ -471,14 +1042,14 @@ fn mobile_token_from_authorization(value: Option<&str>) -> Option<String> {
 }
 
 fn mobile_token_from_target(target: &str) -> Option<String> {
+    mobile_query_value(target, "t").or_else(|| mobile_query_value(target, "token"))
+}
+
+fn mobile_query_value(target: &str, expected_key: &str) -> Option<String> {
     let query = target.split_once('?')?.1;
     query.split('&').find_map(|part| {
         let (key, value) = part.split_once('=')?;
-        if key == "t" || key == "token" {
-            Some(percent_decode_query_value(value))
-        } else {
-            None
-        }
+        (key == expected_key).then(|| percent_decode_query_value(value))
     })
 }
 
@@ -649,6 +1220,10 @@ fn render_mobile_page_with_token(token: &str) -> String {
 </main>
 <script>
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
+const clientId = crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+let mobileSequence = 0;
+const heldKeys = new Set();
+const heldMouseButtons = new Set();
 const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const backendStatusEl = document.getElementById("backendStatus");
@@ -702,6 +1277,31 @@ sensitivityValue.textContent = pointerSensitivity.toFixed(2);
 sensitivityInput.addEventListener("input", (event) => setPointerSensitivity(event.target.value));
 function cid(prefix) {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+}
+function mobileEnvelope(request) {
+  return { client_id: clientId, sequence: ++mobileSequence, request };
+}
+function mobileInjectPayload(request) {
+  return request?.InjectEndpointEvent?.request?.payload || null;
+}
+function trackHeldInputBeforeInject(request) {
+  const payload = mobileInjectPayload(request);
+  const kind = String(payload?.kind || "");
+  const data = payload?.data || {};
+  const state = String(data.state || "").toLowerCase();
+  if (state !== "pressed") return;
+  if (kind === "Keyboard" && data.key) heldKeys.add(String(data.key));
+  if (kind === "MouseButton" && data.button) heldMouseButtons.add(String(data.button));
+}
+function clearReleasedHeldInput(request, accepted) {
+  if (!accepted) return;
+  const payload = mobileInjectPayload(request);
+  const kind = String(payload?.kind || "");
+  const data = payload?.data || {};
+  const state = String(data.state || "").toLowerCase();
+  if (state !== "released") return;
+  if (kind === "Keyboard" && data.key) heldKeys.delete(String(data.key));
+  if (kind === "MouseButton" && data.button) heldMouseButtons.delete(String(data.button));
 }
 function formatMobileError(error, scope = "移动端") {
   const message = error instanceof Error ? error.message : String(error || "");
@@ -817,13 +1417,15 @@ function formatInjectResultStatus(result) {
   return { accepted: false, status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}` };
 }
 async function inject(request) {
+  trackHeldInputBeforeInject(request);
   try {
     const result = await api("/api/inject", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request)
+      body: JSON.stringify(mobileEnvelope(request))
     });
     const feedback = formatInjectResultStatus(result);
+    clearReleasedHeldInput(request, feedback.accepted);
     statusEl.textContent = feedback.status;
     return feedback.accepted;
   } catch (error) {
@@ -833,7 +1435,7 @@ async function inject(request) {
 }
 async function refresh() {
   try {
-    const payload = await api("/api/local-controls");
+    const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(clientId)}`);
     const snapshot = payload.LocalControls || {};
     const mouse = snapshot.mouse || {};
     const display = snapshot.display || {};
@@ -926,9 +1528,13 @@ function releaseAllRequests(prefix) {
     ["AltLeft", `${prefix}-key-altleft`],
     ["SuperLeft", `${prefix}-key-superleft`]
   ];
+  const knownMouseButtons = new Set(mouseButtons.map(([buttonName]) => buttonName));
+  const knownModifierKeys = new Set(modifierKeys.map(([key]) => key));
   return [
     ...mouseButtons.map(([buttonName, correlationId]) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId))),
-    ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750))
+    ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "RequireHealthyBackend", 750)),
+    ...Array.from(heldMouseButtons).filter((buttonName) => !knownMouseButtons.has(buttonName)).map((buttonName) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`${prefix}-mouse-${buttonName.toLowerCase()}`))),
+    ...Array.from(heldKeys).filter((key) => !knownModifierKeys.has(key)).map((key) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`${prefix}-key-${key.toLowerCase()}`), "RequireHealthyBackend", 750))
   ];
 }
 async function sendReleaseAll() {
@@ -937,7 +1543,7 @@ async function sendReleaseAll() {
   }
 }
 function keepaliveInject(request) {
-  const body = JSON.stringify(request);
+  const body = JSON.stringify(mobileEnvelope(request));
   const path = `/api/inject?t=${encodeURIComponent(token)}`;
   try {
     if (navigator.sendBeacon) {
@@ -1251,7 +1857,16 @@ mod tests {
     };
     use rshare_input::InputEvent;
     use std::fmt;
+    use tokio::sync::Notify;
     use tokio::time::{sleep, timeout, Duration};
+
+    async fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
 
     struct NoopInjectBackend;
 
@@ -1279,6 +1894,399 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RecordingInjectBackend {
+        injected: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InjectBackend for RecordingInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            self.injected.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    fn test_mobile_runtime(
+        backend: Box<dyn InjectBackend>,
+    ) -> (
+        Arc<RwLock<DaemonState>>,
+        Arc<Mutex<NetworkManager>>,
+        Arc<Mutex<Box<dyn InjectBackend>>>,
+        broadcast::Sender<LocalInputDiagnosticEvent>,
+    ) {
+        let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+            "0.0.0.0:27431".to_string(),
+            27432,
+            42,
+        ))));
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local-host".to_string(),
+        )));
+        let inject_backend = Arc::new(Mutex::new(backend));
+        let (local_events_tx, _) = broadcast::channel(32);
+        (state, network_manager, inject_backend, local_events_tx)
+    }
+
+    fn keyboard_envelope(
+        client_id: &str,
+        sequence: u64,
+        key: &str,
+        state: &str,
+    ) -> MobileInjectEnvelope {
+        MobileInjectEnvelope {
+            client_id: client_id.to_string(),
+            sequence,
+            request: DaemonRequest::InjectEndpointEvent {
+                target: EndpointInjectTarget::Local,
+                request: EndpointInjectRequest {
+                    correlation_id: format!("{client_id}-{sequence}"),
+                    device_kind: EndpointEventKind::Keyboard,
+                    payload: EndpointEventPayload::Keyboard {
+                        key: key.to_string(),
+                        state: state.to_string(),
+                    },
+                    mode: EndpointInjectMode::RequireHealthyBackend,
+                    timeout_ms: 750,
+                },
+            },
+        }
+    }
+
+    fn mouse_button_envelope(
+        client_id: &str,
+        sequence: u64,
+        button: &str,
+        state: &str,
+        x: i32,
+        y: i32,
+    ) -> MobileInjectEnvelope {
+        MobileInjectEnvelope {
+            client_id: client_id.to_string(),
+            sequence,
+            request: DaemonRequest::InjectEndpointEvent {
+                target: EndpointInjectTarget::Local,
+                request: EndpointInjectRequest {
+                    correlation_id: format!("{client_id}-{sequence}"),
+                    device_kind: EndpointEventKind::Mouse,
+                    payload: EndpointEventPayload::MouseButton {
+                        button: button.to_string(),
+                        state: state.to_string(),
+                        x,
+                        y,
+                    },
+                    mode: EndpointInjectMode::RequireHealthyBackend,
+                    timeout_ms: 750,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_mobile_header_expires_at_the_overall_read_deadline() {
+        let (mut client, mut server) = connected_tcp_pair().await;
+        client
+            .write_all(b"GET /mobile HTTP/1.1\r\nHost: mobile")
+            .await
+            .unwrap();
+
+        let result =
+            read_mobile_http_request_with_deadline(&mut server, Duration::from_millis(25)).await;
+
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_length_is_rejected_instead_of_overwritten() {
+        let (mut client, mut server) = connected_tcp_pair().await;
+        client
+            .write_all(
+                b"POST /api/inject HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            )
+            .await
+            .unwrap();
+
+        let error = read_mobile_http_request(&mut server).await.unwrap_err();
+
+        assert!(error.to_string().contains("duplicate Content-Length"));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_lengths_and_transfer_encoding_are_rejected() {
+        for request in [
+            b"POST /api/inject HTTP/1.1\r\n\r\n".as_slice(),
+            b"POST /api/inject HTTP/1.1\r\nContent-Length: nope\r\n\r\n".as_slice(),
+            b"POST /api/inject HTTP/1.1\r\nContent-Length: -1\r\n\r\n".as_slice(),
+            b"POST /api/inject HTTP/1.1\r\nContent-Length: 999999999999999999999999\r\n\r\n"
+                .as_slice(),
+            b"POST /api/inject HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+        ] {
+            let (mut client, mut server) = connected_tcp_pair().await;
+            client.write_all(request).await.unwrap();
+            let result = timeout(
+                Duration::from_millis(100),
+                read_mobile_http_request(&mut server),
+            )
+            .await
+            .expect("strict parser must not wait for an invalid request body");
+            assert!(result.is_err(), "request should be rejected: {request:?}");
+        }
+    }
+
+    #[test]
+    fn mobile_inject_requires_client_sequence_envelope() {
+        let request = DaemonRequest::InjectEndpointEvent {
+            target: EndpointInjectTarget::Local,
+            request: EndpointInjectRequest {
+                correlation_id: "mobile-envelope-1".to_string(),
+                device_kind: EndpointEventKind::Keyboard,
+                payload: EndpointEventPayload::Keyboard {
+                    key: "A".to_string(),
+                    state: "Pressed".to_string(),
+                },
+                mode: EndpointInjectMode::RequireHealthyBackend,
+                timeout_ms: 750,
+            },
+        };
+        let body = serde_json::to_vec(&json!({
+            "client_id": "page-client-1",
+            "sequence": 1,
+            "request": request,
+        }))
+        .unwrap();
+
+        let decoded = mobile_inject_envelope_from_body(&body).unwrap();
+
+        assert_eq!(decoded.client_id, "page-client-1");
+        assert_eq!(decoded.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn connection_limit_refuses_an_extra_socket_without_spawning_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access =
+            MobileGatewayAccess::new(addr, "mobile-secret".to_string(), "127.0.0.1".to_string());
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(NoopInjectBackend));
+        state.write().await.mobile_access = access.clone();
+        let mut limits = MobileGatewayLimits::default();
+        limits.max_active_clients = 1;
+        limits.read_deadline = Duration::from_secs(2);
+        limits.write_deadline = Duration::from_millis(100);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(
+            listener,
+            access,
+            state,
+            network_manager,
+            inject_backend,
+            local_events_tx,
+            shutdown_rx,
+            limits,
+        ));
+
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"GET /mobile HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(25)).await;
+
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut response = Vec::new();
+        let read_result = timeout(Duration::from_millis(500), extra.read_to_end(&mut response))
+            .await
+            .unwrap();
+        if let Err(error) = read_result {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+
+        assert!(String::from_utf8_lossy(&response).contains("503 Service Unavailable"));
+        let _ = shutdown_tx.send(());
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_sequence_one_press_cannot_inject_after_sequence_two_release() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        let allow_late_sequence = Arc::new(Notify::new());
+        let late_task = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            let allow_late_sequence = allow_late_sequence.clone();
+            tokio::spawn(async move {
+                allow_late_sequence.notified().await;
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope("ordered-client", 1, "A", "Pressed"),
+                )
+                .await
+            })
+        };
+
+        let release = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("ordered-client", 2, "A", "Released"),
+        )
+        .await
+        .unwrap();
+        allow_late_sequence.notify_one();
+        let late_error = late_task.await.unwrap().unwrap_err();
+
+        assert!(release.accepted);
+        assert!(late_error.to_string().contains("sequence"));
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 1);
+        assert!(matches!(
+            injected[0],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_lease_releases_every_dynamic_key_and_mouse_button() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let lease = Duration::from_millis(50);
+        let sessions = MobileClientSessions::new(8, lease);
+
+        for envelope in [
+            keyboard_envelope("lease-client", 1, "A", "Pressed"),
+            keyboard_envelope("lease-client", 2, "F12", "Pressed"),
+            mouse_button_envelope("lease-client", 3, "Back", "Pressed", 17, 23),
+            mouse_button_envelope("lease-client", 4, "Other(9)", "Pressed", 31, 37),
+        ] {
+            assert!(
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    envelope,
+                )
+                .await
+                .unwrap()
+                .accepted
+            );
+        }
+
+        sessions
+            .reap_expired_at(
+                tokio::time::Instant::now() + lease + Duration::from_millis(1),
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+            )
+            .await;
+        let after_first_reap = injected.lock().unwrap().len();
+        sessions
+            .reap_expired_at(
+                tokio::time::Instant::now() + lease + Duration::from_secs(1),
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+            )
+            .await;
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(after_first_reap, 8);
+        assert_eq!(
+            injected.len(),
+            8,
+            "successfully released controls must be cleared"
+        );
+        assert!(injected.iter().any(|event| matches!(
+            event,
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+        assert!(injected.iter().any(|event| matches!(
+            event,
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::F12,
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+        assert!(injected.iter().any(|event| matches!(
+            event,
+            InputEvent::MouseButton {
+                button: rshare_input::MouseButton::Back,
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+        assert!(injected.iter().any(|event| matches!(
+            event,
+            InputEvent::MouseButton {
+                button: rshare_input::MouseButton::Other(9),
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+    }
+
+    #[test]
+    fn rendered_mobile_page_sequences_envelopes_and_releases_complete_held_sets() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("const clientId ="));
+        assert!(page.contains("let mobileSequence = 0"));
+        assert!(page.contains("function mobileEnvelope(request)"));
+        assert!(page.contains("sequence: ++mobileSequence"));
+        assert!(page.contains("client_id: clientId"));
+        assert!(page.contains("/api/local-controls?client_id="));
+        assert!(page.contains("const heldKeys = new Set()"));
+        assert!(page.contains("const heldMouseButtons = new Set()"));
+        assert!(page.contains("Array.from(heldKeys)"));
+        assert!(page.contains("Array.from(heldMouseButtons)"));
+    }
+
     #[test]
     fn decodes_mobile_daemon_inject_request_as_local_only() {
         let request = DaemonRequest::InjectEndpointEvent {
@@ -1293,13 +2301,24 @@ mod tests {
                 timeout_ms: 750,
             },
         };
-        let body = serde_json::to_vec(&request).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "client_id": "page-client-1",
+            "sequence": 1,
+            "request": request,
+        }))
+        .unwrap();
 
-        let decoded = mobile_inject_request_from_body(&body).unwrap();
+        let decoded = mobile_inject_envelope_from_body(&body).unwrap();
 
         assert!(matches!(
-            decoded.payload,
-            EndpointEventPayload::TextCommit { text } if text == "你好"
+            decoded.request,
+            DaemonRequest::InjectEndpointEvent {
+                request: EndpointInjectRequest {
+                    payload: EndpointEventPayload::TextCommit { text },
+                    ..
+                },
+                ..
+            } if text == "你好"
         ));
     }
 
@@ -1318,9 +2337,14 @@ mod tests {
                 timeout_ms: 250,
             },
         };
-        let body = serde_json::to_vec(&request).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "client_id": "page-client-1",
+            "sequence": 1,
+            "request": request,
+        }))
+        .unwrap();
 
-        let error = mobile_inject_request_from_body(&body).unwrap_err();
+        let error = mobile_inject_envelope_from_body(&body).unwrap_err();
 
         assert!(error.to_string().contains("local endpoint"));
     }
