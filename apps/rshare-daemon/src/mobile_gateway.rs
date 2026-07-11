@@ -8,7 +8,7 @@ use rshare_input::InjectBackend;
 use rshare_net::NetworkManager;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,9 @@ use crate::{endpoint_runtime::inject_endpoint_event, DaemonState};
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_MOBILE_CLIENT_ID_BYTES: usize = 128;
+const MAX_MOBILE_RELEASE_BATCH_REQUESTS: usize = 96;
+const MAX_MOBILE_HELD_KEYS: usize = 64;
+const MAX_MOBILE_HELD_MOUSE_BUTTONS: usize = 16;
 
 #[derive(Debug, Clone)]
 struct MobileGatewayLimits {
@@ -57,12 +60,30 @@ struct MobileInjectEnvelope {
     request: DaemonRequest,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MobileReleaseBatch {
+    client_id: String,
+    sequence: u64,
+    requests: Vec<DaemonRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MobileInjectBody {
+    Single(MobileInjectEnvelope),
+    ReleaseBatch(MobileReleaseBatch),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HeldKeyIdentity(u64);
+
 #[derive(Debug)]
 struct MobileClientSession {
     last_sequence: u64,
     last_seen: Instant,
-    held_keys: BTreeSet<String>,
-    held_mouse_buttons: BTreeSet<String>,
+    held_keys: BTreeMap<HeldKeyIdentity, rshare_input::KeyCode>,
+    held_mouse_buttons: BTreeMap<u8, rshare_input::MouseButton>,
     last_mouse_position: (i32, i32),
 }
 
@@ -71,8 +92,8 @@ impl MobileClientSession {
         Self {
             last_sequence: 0,
             last_seen: now,
-            held_keys: BTreeSet::new(),
-            held_mouse_buttons: BTreeSet::new(),
+            held_keys: BTreeMap::new(),
+            held_mouse_buttons: BTreeMap::new(),
             last_mouse_position: (0, 0),
         }
     }
@@ -155,13 +176,7 @@ impl MobileClientSessions {
         state: &Arc<RwLock<DaemonState>>,
         local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     ) {
-        let sessions = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .iter()
-                .map(|(client_id, session)| (client_id.clone(), session.clone()))
-                .collect::<Vec<_>>()
-        };
+        let sessions = self.snapshot().await;
 
         for (client_id, session) in &sessions {
             let mut session = session.lock().await;
@@ -171,66 +186,118 @@ impl MobileClientSessions {
             if elapsed < self.held_input_lease || !session.has_held_input() {
                 continue;
             }
-
-            let held_keys = session.held_keys.iter().cloned().collect::<Vec<_>>();
-            for key in held_keys {
-                let request = lease_release_request(
-                    client_id,
-                    EndpointEventKind::Keyboard,
-                    EndpointEventPayload::Keyboard {
-                        key: key.clone(),
-                        state: "Released".to_string(),
-                    },
-                );
-                let result = inject_endpoint_event(
-                    network_manager,
-                    inject_backend,
-                    state,
-                    local_events_tx,
-                    EndpointInjectTarget::Local,
-                    request,
-                )
-                .await;
-                if result.accepted {
-                    session.held_keys.remove(&key);
-                }
-            }
-
-            let held_buttons = session
-                .held_mouse_buttons
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            for button in held_buttons {
-                let (x, y) = session.last_mouse_position;
-                let request = lease_release_request(
-                    client_id,
-                    EndpointEventKind::Mouse,
-                    EndpointEventPayload::MouseButton {
-                        button: button.clone(),
-                        state: "Released".to_string(),
-                        x,
-                        y,
-                    },
-                );
-                let result = inject_endpoint_event(
-                    network_manager,
-                    inject_backend,
-                    state,
-                    local_events_tx,
-                    EndpointInjectTarget::Local,
-                    request,
-                )
-                .await;
-                if result.accepted {
-                    session.held_mouse_buttons.remove(&button);
-                }
-            }
+            release_held_inputs(
+                client_id,
+                &mut session,
+                network_manager,
+                inject_backend,
+                state,
+                local_events_tx,
+            )
+            .await;
         }
         drop(sessions);
 
         let mut sessions = self.sessions.lock().await;
         self.prune_idle_locked(&mut sessions, now);
+    }
+
+    async fn release_all_held_inputs(
+        &self,
+        network_manager: &Arc<Mutex<NetworkManager>>,
+        inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+        state: &Arc<RwLock<DaemonState>>,
+        local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    ) {
+        for (client_id, session) in self.snapshot().await {
+            let mut session = session.lock().await;
+            release_held_inputs(
+                &client_id,
+                &mut session,
+                network_manager,
+                inject_backend,
+                state,
+                local_events_tx,
+            )
+            .await;
+        }
+    }
+
+    async fn snapshot(&self) -> Vec<(String, Arc<Mutex<MobileClientSession>>)> {
+        self.sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(client_id, session)| (client_id.clone(), session.clone()))
+            .collect()
+    }
+}
+
+async fn release_held_inputs(
+    client_id: &str,
+    session: &mut MobileClientSession,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+) {
+    let held_keys = session
+        .held_keys
+        .iter()
+        .map(|(identity, keycode)| (*identity, *keycode))
+        .collect::<Vec<_>>();
+    for (identity, keycode) in held_keys {
+        let request = lease_release_request(
+            client_id,
+            EndpointEventKind::Keyboard,
+            EndpointEventPayload::Keyboard {
+                key: canonical_key_release_name(keycode),
+                state: "Released".to_string(),
+            },
+        );
+        let result = inject_endpoint_event(
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            EndpointInjectTarget::Local,
+            request,
+        )
+        .await;
+        if result.accepted {
+            session.held_keys.remove(&identity);
+        }
+    }
+
+    let held_buttons = session
+        .held_mouse_buttons
+        .iter()
+        .map(|(identity, button)| (*identity, *button))
+        .collect::<Vec<_>>();
+    for (identity, button) in held_buttons {
+        let (x, y) = session.last_mouse_position;
+        let request = lease_release_request(
+            client_id,
+            EndpointEventKind::Mouse,
+            EndpointEventPayload::MouseButton {
+                button: canonical_mouse_button_release_name(button),
+                state: "Released".to_string(),
+                x,
+                y,
+            },
+        );
+        let result = inject_endpoint_event(
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            EndpointInjectTarget::Local,
+            request,
+        )
+        .await;
+        if result.accepted {
+            session.held_mouse_buttons.remove(&identity);
+        }
     }
 }
 
@@ -598,6 +665,9 @@ async fn run_mobile_gateway_server_on_listener(
     while client_tasks.join_next().await.is_some() {}
     reaper_task.abort();
     let _ = reaper_task.await;
+    sessions
+        .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+        .await;
     Ok(())
 }
 
@@ -706,8 +776,8 @@ async fn handle_mobile_gateway_client_with_context(
             .await
         }
         MobileGatewayRoute::Inject => {
-            let envelope = match mobile_inject_envelope_from_body(&request.body) {
-                Ok(envelope) => envelope,
+            let body = match mobile_inject_body_from_body(&request.body) {
+                Ok(body) => body,
                 Err(error) => {
                     return write_mobile_response_with_deadline(
                         &mut stream,
@@ -724,17 +794,33 @@ async fn handle_mobile_gateway_client_with_context(
                     .await;
                 }
             };
-            let result = match process_mobile_inject_envelope(
-                &sessions,
-                &network_manager,
-                &inject_backend,
-                &state,
-                &local_events_tx,
-                envelope,
-            )
-            .await
-            {
-                Ok(result) => result,
+            let response = match body {
+                MobileInjectBody::Single(envelope) => process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    envelope,
+                )
+                .await
+                .map(|result| {
+                    serde_json::to_value(DaemonResponse::EndpointInjectResult(result))
+                        .expect("daemon response must serialize")
+                }),
+                MobileInjectBody::ReleaseBatch(batch) => process_mobile_release_batch(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    batch,
+                )
+                .await
+                .map(|results| json!({ "MobileReleaseBatchResult": { "results": results } })),
+            };
+            let response = match response {
+                Ok(response) => response,
                 Err(error) => {
                     return write_mobile_response_with_deadline(
                         &mut stream,
@@ -751,17 +837,13 @@ async fn handle_mobile_gateway_client_with_context(
                     .await;
                 }
             };
-            write_mobile_json_with_deadline(
-                &mut stream,
-                &DaemonResponse::EndpointInjectResult(result),
-                limits.write_deadline,
-            )
-            .await
+            write_mobile_json_with_deadline(&mut stream, &response, limits.write_deadline).await
         }
         MobileGatewayRoute::NotFound => unreachable!("handled above"),
     }
 }
 
+#[cfg(test)]
 fn mobile_inject_envelope_from_body(body: &[u8]) -> Result<MobileInjectEnvelope> {
     if body.is_empty() {
         bail!("empty mobile inject body");
@@ -769,21 +851,76 @@ fn mobile_inject_envelope_from_body(body: &[u8]) -> Result<MobileInjectEnvelope>
 
     let envelope = serde_json::from_slice::<MobileInjectEnvelope>(body)
         .context("failed to decode mobile inject envelope")?;
-    validate_mobile_client_id(&envelope.client_id)?;
-    if envelope.sequence == 0 {
-        bail!("mobile sequence must be greater than zero");
+    validate_mobile_inject_envelope(&envelope)?;
+    Ok(envelope)
+}
+
+fn mobile_inject_body_from_body(body: &[u8]) -> Result<MobileInjectBody> {
+    if body.is_empty() {
+        bail!("empty mobile inject body");
     }
+    let body = serde_json::from_slice::<MobileInjectBody>(body)
+        .context("failed to decode mobile inject body")?;
+    match &body {
+        MobileInjectBody::Single(envelope) => validate_mobile_inject_envelope(envelope)?,
+        MobileInjectBody::ReleaseBatch(batch) => validate_mobile_release_batch(batch)?,
+    }
+    Ok(body)
+}
+
+fn validate_mobile_inject_envelope(envelope: &MobileInjectEnvelope) -> Result<()> {
+    validate_mobile_client_id(&envelope.client_id)?;
+    validate_mobile_sequence(envelope.sequence)?;
     match &envelope.request {
         DaemonRequest::InjectEndpointEvent {
             target: EndpointInjectTarget::Local,
             ..
-        } => Ok(envelope),
+        } => Ok(()),
         DaemonRequest::InjectEndpointEvent {
             target: EndpointInjectTarget::Remote(_),
             ..
         } => bail!("mobile gateway only injects into the local endpoint"),
         _ => bail!("mobile envelope only accepts InjectEndpointEvent"),
     }
+}
+
+fn validate_mobile_release_batch(batch: &MobileReleaseBatch) -> Result<()> {
+    validate_mobile_client_id(&batch.client_id)?;
+    validate_mobile_sequence(batch.sequence)?;
+    if batch.requests.is_empty() || batch.requests.len() > MAX_MOBILE_RELEASE_BATCH_REQUESTS {
+        bail!("mobile release batch must contain 1-{MAX_MOBILE_RELEASE_BATCH_REQUESTS} requests");
+    }
+    for request in &batch.requests {
+        let request = match request {
+            DaemonRequest::InjectEndpointEvent {
+                target: EndpointInjectTarget::Local,
+                request,
+            } => request,
+            _ => bail!("mobile release batch only accepts local InjectEndpointEvent requests"),
+        };
+        let event = crate::endpoint_payload_to_input_event(request)
+            .context("invalid mobile release batch event")?;
+        if !matches!(
+            event,
+            rshare_input::InputEvent::Key {
+                state: rshare_input::ButtonState::Released,
+                ..
+            } | rshare_input::InputEvent::MouseButton {
+                state: rshare_input::ButtonState::Released,
+                ..
+            }
+        ) {
+            bail!("mobile release batch only accepts released key or mouse button events");
+        }
+    }
+    Ok(())
+}
+
+fn validate_mobile_sequence(sequence: u64) -> Result<()> {
+    if sequence == 0 {
+        bail!("mobile sequence must be greater than zero");
+    }
+    Ok(())
 }
 
 async fn process_mobile_inject_envelope(
@@ -797,15 +934,7 @@ async fn process_mobile_inject_envelope(
     let now = Instant::now();
     let session = sessions.session_at(&envelope.client_id, now).await?;
     let mut session = session.lock().await;
-    if envelope.sequence <= session.last_sequence {
-        bail!(
-            "mobile sequence {} is not greater than last sequence {}",
-            envelope.sequence,
-            session.last_sequence
-        );
-    }
-    session.last_sequence = envelope.sequence;
-    session.last_seen = now;
+    accept_mobile_sequence(&mut session, envelope.sequence, now)?;
 
     let request = match envelope.request {
         DaemonRequest::InjectEndpointEvent {
@@ -814,6 +943,8 @@ async fn process_mobile_inject_envelope(
         } => request,
         _ => bail!("mobile envelope only accepts a local InjectEndpointEvent"),
     };
+    let held_transition = mobile_held_transition(&request)?;
+    validate_mobile_held_capacity(&session, held_transition)?;
     let result = inject_endpoint_event(
         network_manager,
         inject_backend,
@@ -824,53 +955,295 @@ async fn process_mobile_inject_envelope(
     )
     .await;
     if result.accepted {
-        update_mobile_held_input(&mut session, &request);
+        apply_mobile_held_transition(&mut session, held_transition);
     }
     Ok(result)
 }
 
-fn update_mobile_held_input(session: &mut MobileClientSession, request: &EndpointInjectRequest) {
+async fn process_mobile_release_batch(
+    sessions: &MobileClientSessions,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    batch: MobileReleaseBatch,
+) -> Result<Vec<EndpointInjectResult>> {
+    validate_mobile_release_batch(&batch)?;
+    let now = Instant::now();
+    let session = sessions.session_at(&batch.client_id, now).await?;
+    let mut session = session.lock().await;
+    accept_mobile_sequence(&mut session, batch.sequence, now)?;
+
+    let mut results = Vec::with_capacity(batch.requests.len());
+    for request in batch.requests {
+        let request = match request {
+            DaemonRequest::InjectEndpointEvent {
+                target: EndpointInjectTarget::Local,
+                request,
+            } => request,
+            _ => unreachable!("release batch was validated before processing"),
+        };
+        let held_transition = mobile_held_transition(&request)
+            .expect("validated release request must have a held-input transition");
+        let result = inject_endpoint_event(
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            EndpointInjectTarget::Local,
+            request.clone(),
+        )
+        .await;
+        if result.accepted {
+            apply_mobile_held_transition(&mut session, held_transition);
+        }
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn accept_mobile_sequence(
+    session: &mut MobileClientSession,
+    sequence: u64,
+    now: Instant,
+) -> Result<()> {
+    if sequence <= session.last_sequence {
+        bail!(
+            "mobile sequence {} is not greater than last sequence {}",
+            sequence,
+            session.last_sequence
+        );
+    }
+    session.last_sequence = sequence;
+    session.last_seen = now;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MobileHeldTransition {
+    Key {
+        identity: HeldKeyIdentity,
+        keycode: rshare_input::KeyCode,
+        pressed: bool,
+    },
+    MouseButton {
+        identity: u8,
+        button: rshare_input::MouseButton,
+        pressed: bool,
+        x: i32,
+        y: i32,
+    },
+    MousePosition {
+        x: i32,
+        y: i32,
+    },
+}
+
+fn mobile_held_transition(request: &EndpointInjectRequest) -> Result<Option<MobileHeldTransition>> {
     match &request.payload {
-        EndpointEventPayload::Keyboard { key, state } => {
-            if mobile_state_is_pressed(state) {
-                session.held_keys.insert(key.clone());
-            } else if mobile_state_is_released(state) {
-                session.held_keys.remove(key);
-            }
+        EndpointEventPayload::Keyboard { .. } => {
+            let event = crate::endpoint_payload_to_input_event(request)?;
+            let rshare_input::InputEvent::Key { keycode, state } = event else {
+                bail!("mobile keyboard payload did not produce a key event");
+            };
+            let keycode = canonical_key_code(keycode);
+            Ok(Some(MobileHeldTransition::Key {
+                identity: held_key_identity(keycode),
+                keycode,
+                pressed: state.is_pressed(),
+            }))
+        }
+        EndpointEventPayload::MouseButton { x, y, .. } => {
+            let event = crate::endpoint_payload_to_input_event(request)?;
+            let rshare_input::InputEvent::MouseButton { button, state } = event else {
+                bail!("mobile mouse-button payload did not produce a button event");
+            };
+            let button = canonical_mouse_button(button);
+            Ok(Some(MobileHeldTransition::MouseButton {
+                identity: button.to_code(),
+                button,
+                pressed: state.is_pressed(),
+                x: *x,
+                y: *y,
+            }))
         }
         EndpointEventPayload::MouseMove { x, y, .. }
         | EndpointEventPayload::MouseWheel { x, y, .. } => {
-            session.last_mouse_position = (*x, *y);
+            Ok(Some(MobileHeldTransition::MousePosition { x: *x, y: *y }))
         }
-        EndpointEventPayload::MouseButton {
-            button,
-            state,
-            x,
-            y,
-        } => {
-            session.last_mouse_position = (*x, *y);
-            if mobile_state_is_pressed(state) {
-                session.held_mouse_buttons.insert(button.clone());
-            } else if mobile_state_is_released(state) {
-                session.held_mouse_buttons.remove(button);
-            }
-        }
-        _ => {}
+        _ => Ok(None),
     }
 }
 
-fn mobile_state_is_pressed(state: &str) -> bool {
-    matches!(
-        state.to_ascii_lowercase().as_str(),
-        "pressed" | "press" | "down" | "true" | "1"
-    )
+fn validate_mobile_held_capacity(
+    session: &MobileClientSession,
+    transition: Option<MobileHeldTransition>,
+) -> Result<()> {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: true,
+            ..
+        }) if !session.held_keys.contains_key(&identity)
+            && session.held_keys.len() >= MAX_MOBILE_HELD_KEYS =>
+        {
+            bail!("mobile held key limit reached")
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: true,
+            ..
+        }) if !session.held_mouse_buttons.contains_key(&identity)
+            && session.held_mouse_buttons.len() >= MAX_MOBILE_HELD_MOUSE_BUTTONS =>
+        {
+            bail!("mobile held mouse button limit reached")
+        }
+        _ => Ok(()),
+    }
 }
 
-fn mobile_state_is_released(state: &str) -> bool {
-    matches!(
-        state.to_ascii_lowercase().as_str(),
-        "released" | "release" | "up" | "false" | "0"
-    )
+fn apply_mobile_held_transition(
+    session: &mut MobileClientSession,
+    transition: Option<MobileHeldTransition>,
+) {
+    match transition {
+        Some(MobileHeldTransition::Key {
+            identity,
+            keycode,
+            pressed: true,
+        }) => {
+            session.held_keys.insert(identity, keycode);
+        }
+        Some(MobileHeldTransition::Key {
+            identity,
+            pressed: false,
+            ..
+        }) => {
+            session.held_keys.remove(&identity);
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            button,
+            pressed: true,
+            x,
+            y,
+        }) => {
+            session.last_mouse_position = (x, y);
+            session.held_mouse_buttons.insert(identity, button);
+        }
+        Some(MobileHeldTransition::MouseButton {
+            identity,
+            pressed: false,
+            x,
+            y,
+            ..
+        }) => {
+            session.last_mouse_position = (x, y);
+            session.held_mouse_buttons.remove(&identity);
+        }
+        Some(MobileHeldTransition::MousePosition { x, y }) => {
+            session.last_mouse_position = (x, y);
+        }
+        None => {}
+    }
+}
+
+fn canonical_key_code(keycode: rshare_input::KeyCode) -> rshare_input::KeyCode {
+    use rshare_input::KeyCode;
+    match keycode {
+        KeyCode::Char(value) => KeyCode::Char(value.to_ascii_uppercase()),
+        other => other,
+    }
+}
+
+fn held_key_identity(keycode: rshare_input::KeyCode) -> HeldKeyIdentity {
+    use rshare_input::KeyCode;
+    const NAMED_CLASS: u64 = 0;
+    const CHAR_CLASS: u64 = 1;
+    const RAW_CLASS: u64 = 2;
+    let (class, value) = match keycode {
+        KeyCode::Char(value) => (CHAR_CLASS, value as u32),
+        KeyCode::Raw(value) => (RAW_CLASS, value),
+        other => (NAMED_CLASS, other.to_raw()),
+    };
+    HeldKeyIdentity((class << 32) | value as u64)
+}
+
+fn canonical_key_release_name(keycode: rshare_input::KeyCode) -> String {
+    use rshare_input::KeyCode;
+    match keycode {
+        KeyCode::Char(value) => (value as char).to_string(),
+        KeyCode::Escape => "Escape".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::ShiftLeft => "ShiftLeft".to_string(),
+        KeyCode::ShiftRight => "ShiftRight".to_string(),
+        KeyCode::ControlLeft => "ControlLeft".to_string(),
+        KeyCode::ControlRight => "ControlRight".to_string(),
+        KeyCode::AltLeft => "AltLeft".to_string(),
+        KeyCode::AltRight => "AltRight".to_string(),
+        KeyCode::SuperLeft => "SuperLeft".to_string(),
+        KeyCode::SuperRight => "SuperRight".to_string(),
+        KeyCode::F1 => "F1".to_string(),
+        KeyCode::F2 => "F2".to_string(),
+        KeyCode::F3 => "F3".to_string(),
+        KeyCode::F4 => "F4".to_string(),
+        KeyCode::F5 => "F5".to_string(),
+        KeyCode::F6 => "F6".to_string(),
+        KeyCode::F7 => "F7".to_string(),
+        KeyCode::F8 => "F8".to_string(),
+        KeyCode::F9 => "F9".to_string(),
+        KeyCode::F10 => "F10".to_string(),
+        KeyCode::F11 => "F11".to_string(),
+        KeyCode::F12 => "F12".to_string(),
+        KeyCode::Space => "Space".to_string(),
+        KeyCode::CapsLock => "CapsLock".to_string(),
+        KeyCode::NumLock => "NumLock".to_string(),
+        KeyCode::Keypad0 => "Keypad0".to_string(),
+        KeyCode::Keypad1 => "Keypad1".to_string(),
+        KeyCode::Keypad2 => "Keypad2".to_string(),
+        KeyCode::Keypad3 => "Keypad3".to_string(),
+        KeyCode::Keypad4 => "Keypad4".to_string(),
+        KeyCode::Keypad5 => "Keypad5".to_string(),
+        KeyCode::Keypad6 => "Keypad6".to_string(),
+        KeyCode::Keypad7 => "Keypad7".to_string(),
+        KeyCode::Keypad8 => "Keypad8".to_string(),
+        KeyCode::Keypad9 => "Keypad9".to_string(),
+        KeyCode::KeypadAdd => "KeypadAdd".to_string(),
+        KeyCode::KeypadSubtract => "KeypadSubtract".to_string(),
+        KeyCode::KeypadMultiply => "KeypadMultiply".to_string(),
+        KeyCode::KeypadDivide => "KeypadDivide".to_string(),
+        KeyCode::KeypadDecimal => "KeypadDecimal".to_string(),
+        KeyCode::KeypadEnter => "KeypadEnter".to_string(),
+        KeyCode::Raw(value) => format!("Raw({value})"),
+    }
+}
+
+fn canonical_mouse_button(button: rshare_input::MouseButton) -> rshare_input::MouseButton {
+    rshare_input::MouseButton::from_code(button.to_code())
+}
+
+fn canonical_mouse_button_release_name(button: rshare_input::MouseButton) -> String {
+    use rshare_input::MouseButton;
+    match button {
+        MouseButton::Left => "Left".to_string(),
+        MouseButton::Middle => "Middle".to_string(),
+        MouseButton::Right => "Right".to_string(),
+        MouseButton::Back => "Back".to_string(),
+        MouseButton::Forward => "Forward".to_string(),
+        MouseButton::Other(value) => format!("Other({value})"),
+    }
 }
 
 async fn write_mobile_json_with_deadline<T: serde::Serialize>(
@@ -1542,8 +1915,9 @@ async function sendReleaseAll() {
     await inject(request);
   }
 }
-function keepaliveInject(request) {
-  const body = JSON.stringify(mobileEnvelope(request));
+function keepaliveReleaseBatch(requests) {
+  if (!Array.isArray(requests) || requests.length === 0) return false;
+  const body = JSON.stringify({ client_id: clientId, sequence: ++mobileSequence, requests: requests });
   const path = `/api/inject?t=${encodeURIComponent(token)}`;
   try {
     if (navigator.sendBeacon) {
@@ -1564,9 +1938,7 @@ function keepaliveInject(request) {
   }
 }
 function releaseAllWithKeepalive() {
-  for (const request of releaseAllRequests("mobile-release-all-keepalive")) {
-    keepaliveInject(request);
-  }
+  keepaliveReleaseBatch(releaseAllRequests("mobile-release-all-keepalive"));
 }
 function clearDragTimer() {
   if (dragTimer) {
@@ -1866,6 +2238,19 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
+    }
+
+    async fn post_mobile_json(addr: SocketAddr, body: Vec<u8>) -> Vec<u8> {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /api/inject?t=mobile-secret HTTP/1.1\r\nHost: mobile\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        response
     }
 
     struct NoopInjectBackend;
@@ -2271,6 +2656,346 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn shutdown_cleanup_releases_every_tracked_control() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for envelope in [
+            keyboard_envelope("shutdown-client", 1, "A", "Pressed"),
+            mouse_button_envelope("shutdown-client", 2, "Left", "Pressed", 9, 11),
+        ] {
+            assert!(
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    envelope,
+                )
+                .await
+                .unwrap()
+                .accepted
+            );
+        }
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 4);
+        assert!(matches!(
+            injected[2],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+        assert!(matches!(
+            injected[3],
+            InputEvent::MouseButton {
+                button: rshare_input::MouseButton::Left,
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_releases_held_controls_before_server_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access =
+            MobileGatewayAccess::new(addr, "mobile-secret".to_string(), "127.0.0.1".to_string());
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        state.write().await.mobile_access = access.clone();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(
+            listener,
+            access,
+            state,
+            network_manager,
+            inject_backend,
+            local_events_tx,
+            shutdown_rx,
+            MobileGatewayLimits::default(),
+        ));
+
+        for envelope in [
+            keyboard_envelope("shutdown-http", 1, "A", "Pressed"),
+            mouse_button_envelope("shutdown-http", 2, "Left", "Pressed", 21, 34),
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "client_id": envelope.client_id,
+                "sequence": envelope.sequence,
+                "request": envelope.request,
+            }))
+            .unwrap();
+            let response = post_mobile_json(addr, body).await;
+            assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+        }
+
+        let _ = shutdown_tx.send(());
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 4);
+        assert!(injected[2..].iter().all(|event| matches!(
+            event,
+            InputEvent::Key {
+                state: rshare_input::ButtonState::Released,
+                ..
+            } | InputEvent::MouseButton {
+                state: rshare_input::ButtonState::Released,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn release_batch_is_processed_atomically_under_one_sequence() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for envelope in [
+            keyboard_envelope("batch-client", 1, "A", "Pressed"),
+            mouse_button_envelope("batch-client", 2, "Left", "Pressed", 5, 7),
+        ] {
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                envelope,
+            )
+            .await
+            .unwrap();
+        }
+        let batch = MobileReleaseBatch {
+            client_id: "batch-client".to_string(),
+            sequence: 3,
+            requests: vec![
+                keyboard_envelope("ignored", 1, "A", "Released").request,
+                mouse_button_envelope("ignored", 2, "Left", "Released", 5, 7).request,
+            ],
+        };
+
+        let results = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            batch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.accepted));
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+        assert_eq!(injected.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn inject_route_accepts_one_bounded_release_batch_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access =
+            MobileGatewayAccess::new(addr, "mobile-secret".to_string(), "127.0.0.1".to_string());
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        state.write().await.mobile_access = access.clone();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(
+            listener,
+            access,
+            state,
+            network_manager,
+            inject_backend,
+            local_events_tx,
+            shutdown_rx,
+            MobileGatewayLimits::default(),
+        ));
+
+        for envelope in [
+            keyboard_envelope("batch-http", 1, "A", "Pressed"),
+            mouse_button_envelope("batch-http", 2, "Left", "Pressed", 4, 6),
+        ] {
+            let response = post_mobile_json(
+                addr,
+                serde_json::to_vec(&json!({
+                    "client_id": envelope.client_id,
+                    "sequence": envelope.sequence,
+                    "request": envelope.request,
+                }))
+                .unwrap(),
+            )
+            .await;
+            assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+        }
+        let batch_body = serde_json::to_vec(&json!({
+            "client_id": "batch-http",
+            "sequence": 3,
+            "requests": [
+                keyboard_envelope("ignored", 1, "A", "Released").request,
+                mouse_button_envelope("ignored", 2, "Left", "Released", 4, 6).request,
+            ],
+        }))
+        .unwrap();
+
+        let response = post_mobile_json(addr, batch_body).await;
+
+        assert!(String::from_utf8_lossy(&response).contains("MobileReleaseBatchResult"));
+        let _ = shutdown_tx.send(());
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(injected.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn held_key_cap_rejects_a_new_press_before_backend_injection() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        for index in 0..64u64 {
+            let result = process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope(
+                    "capacity-client",
+                    index + 1,
+                    &format!("Raw({})", 1_000 + index),
+                    "Pressed",
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.accepted);
+        }
+        let error = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("capacity-client", 65, "Raw(2000)", "Pressed"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("held key limit"));
+        assert_eq!(injected.lock().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn raw_values_stay_canonical_and_named_aliases_collapse() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        for envelope in [
+            keyboard_envelope("canonical-client", 1, "Raw(65)", "Pressed"),
+            keyboard_envelope("canonical-client", 2, "A", "Pressed"),
+            keyboard_envelope("canonical-client", 3, "Esc", "Pressed"),
+            keyboard_envelope("canonical-client", 4, "Escape", "Pressed"),
+            mouse_button_envelope("canonical-client", 5, "Other(1)", "Pressed", 3, 4),
+            mouse_button_envelope("canonical-client", 6, "Left", "Pressed", 7, 8),
+        ] {
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                envelope,
+            )
+            .await
+            .unwrap();
+        }
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 10, "named aliases must share one release");
+        let releases = &injected[6..];
+        assert!(releases.iter().any(|event| matches!(
+            event,
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Raw(65),
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+        assert!(releases.iter().any(|event| matches!(
+            event,
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        )));
+        assert_eq!(
+            releases
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    InputEvent::Key {
+                        keycode: rshare_input::KeyCode::Escape,
+                        state: rshare_input::ButtonState::Released,
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            releases
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    InputEvent::MouseButton {
+                        button: rshare_input::MouseButton::Left,
+                        state: rshare_input::ButtonState::Released,
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn rendered_mobile_page_sequences_envelopes_and_releases_complete_held_sets() {
         let page = render_mobile_page();
@@ -2285,6 +3010,12 @@ mod tests {
         assert!(page.contains("const heldMouseButtons = new Set()"));
         assert!(page.contains("Array.from(heldKeys)"));
         assert!(page.contains("Array.from(heldMouseButtons)"));
+        assert!(page.contains("function keepaliveReleaseBatch(requests)"));
+        assert!(page.contains("requests: requests"));
+        assert!(page.contains("keepaliveReleaseBatch(releaseAllRequests"));
+        assert!(!page.contains(
+            "for (const request of releaseAllRequests(\"mobile-release-all-keepalive\"))"
+        ));
     }
 
     #[test]
