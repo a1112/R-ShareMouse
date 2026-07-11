@@ -155,8 +155,6 @@ impl MobileHttpRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobileGatewayRoute {
     Page,
-    Manifest,
-    Icon,
     LocalControls,
     Inject,
     NotFound,
@@ -170,8 +168,6 @@ pub(crate) fn route_mobile_http_request(method: &str, target: &str) -> MobileGat
         .trim_end_matches('/');
     match (method.to_ascii_uppercase().as_str(), path) {
         ("GET", "" | "/mobile") => MobileGatewayRoute::Page,
-        ("GET", "/mobile.webmanifest") => MobileGatewayRoute::Manifest,
-        ("GET", "/mobile-icon.svg") => MobileGatewayRoute::Icon,
         ("GET", "/api/local-controls") => MobileGatewayRoute::LocalControls,
         ("POST", "/api/inject") => MobileGatewayRoute::Inject,
         _ => MobileGatewayRoute::NotFound,
@@ -302,25 +298,6 @@ async fn handle_mobile_gateway_client(
                 200,
                 "text/html; charset=utf-8",
                 render_mobile_page_with_token(access.token()).into_bytes(),
-            )
-            .await
-        }
-        MobileGatewayRoute::Manifest => {
-            let manifest = render_mobile_manifest(&request.target)?;
-            write_mobile_response(
-                &mut stream,
-                200,
-                "application/manifest+json; charset=utf-8",
-                serde_json::to_vec(&manifest)?,
-            )
-            .await
-        }
-        MobileGatewayRoute::Icon => {
-            write_mobile_response(
-                &mut stream,
-                200,
-                "image/svg+xml; charset=utf-8",
-                render_mobile_icon_svg().into_bytes(),
             )
             .await
         }
@@ -562,63 +539,18 @@ fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
-fn render_mobile_manifest(target: &str) -> Result<serde_json::Value> {
-    let token = mobile_token_from_target(target).unwrap_or_default();
-    let token_query = mobile_token_query(&token);
-
-    Ok(json!({
-        "name": "R-ShareMouse Mobile",
-        "short_name": "R-ShareMouse",
-        "description": "Phone touchpad, keyboard shortcuts, and IME text input for R-ShareMouse.",
-        "start_url": format!("/mobile{token_query}"),
-        "scope": "/",
-        "display": "standalone",
-        "orientation": "portrait",
-        "theme_color": "#101214",
-        "background_color": "#101214",
-        "icons": [
-            {
-                "src": format!("/mobile-icon.svg{token_query}"),
-                "sizes": "any",
-                "type": "image/svg+xml",
-                "purpose": "any maskable"
-            }
-        ]
-    }))
-}
-
-fn render_mobile_icon_svg() -> String {
-    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
-  <title id="title">R-ShareMouse Mobile</title>
-  <rect width="512" height="512" rx="112" fill="#101214"/>
-  <path d="M152 104l224 152-118 28-42 124-64-304z" fill="#47c27a"/>
-  <path d="M196 177l33 157 22-65 62-15-117-77z" fill="#101214"/>
-</svg>"##
-        .to_string()
-}
-
 fn render_mobile_page() -> String {
     render_mobile_page_with_token("")
 }
 
 fn render_mobile_page_with_token(token: &str) -> String {
-    let token_query = mobile_token_query(token);
     let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
-    let manifest_href = format!("/mobile.webmanifest{token_query}");
-    let icon_href = format!("/mobile-icon.svg{token_query}");
 
     r#"<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name='theme-color' content='#101214'>
-  <meta name='mobile-web-app-capable' content='yes'>
-  <meta name='apple-mobile-web-app-capable' content='yes'>
-  <meta name='apple-mobile-web-app-title' content='R-ShareMouse'>
-  <link rel='manifest' href='__MOBILE_MANIFEST_HREF__'>
-  <link rel='icon' href='__MOBILE_ICON_HREF__' type='image/svg+xml'>
-  <link rel='apple-touch-icon' href='__MOBILE_ICON_HREF__'>
   <title>R-ShareMouse Mobile</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -737,7 +669,6 @@ let pendingMove = null;
 let pendingMoveFrame = 0;
 let dragTimer = 0;
 let dragPointer = null;
-let wakeLock = null;
 const LONG_PRESS_DRAG_DELAY_MS = 420;
 const POINTER_SENSITIVITY_STORAGE_KEY = "rshare.mobile.pointerSensitivity";
 const POINTER_SENSITIVITY_DEFAULT = 1.35;
@@ -825,31 +756,12 @@ function preventMobileGestureDefault(event) {
   event.returnValue = false;
   return true;
 }
-async function requestMobileWakeLock() {
-  if (document.visibilityState !== "visible" || !navigator.wakeLock) return;
-  if (wakeLock && wakeLock.released === false) return;
-  try {
-    wakeLock = await navigator.wakeLock.request("screen");
-    wakeLock.addEventListener("release", () => {
-      wakeLock = null;
-    });
-  } catch {
-    wakeLock = null;
-  }
-}
-function requestMobileWakeLockWhenVisible() {
-  if (document.visibilityState === "visible") {
-    requestMobileWakeLock();
-  }
-}
 ["mousedown", "mouseup", "auxclick", "pointerdown", "pointerup", "keydown"].forEach((eventName) => {
   window.addEventListener(eventName, preventBrowserNavigationEvent, mobileEventOptions);
 });
 ["contextmenu", "dragstart", "selectstart", "gesturestart", "gesturechange", "gestureend"].forEach((eventName) => {
   document.addEventListener(eventName, preventMobileGestureDefault, mobileEventOptions);
 });
-document.addEventListener("visibilitychange", requestMobileWakeLockWhenVisible);
-requestMobileWakeLock();
 async function api(path, options = {}) {
   const headers = { Authorization: `Bearer ${token}`, ...(options.headers || {}) };
   const response = await fetch(path, { ...options, headers });
@@ -1319,8 +1231,6 @@ setInterval(refresh, 1500);
 </body>
 </html>
 "#
-    .replace("__MOBILE_MANIFEST_HREF__", &manifest_href)
-    .replace("__MOBILE_ICON_HREF__", &icon_href)
     .replace("__MOBILE_TOKEN_JSON__", &token_json)
 }
 
@@ -1500,12 +1410,6 @@ mod tests {
     fn rendered_mobile_page_respects_ime_composition_before_text_commit() {
         let page = render_mobile_page();
 
-        assert!(page.contains("<link rel='manifest' href='/mobile.webmanifest'>"));
-        assert!(page.contains("<link rel='icon' href='/mobile-icon.svg'"));
-        assert!(page.contains("<link rel='apple-touch-icon' href='/mobile-icon.svg'>"));
-        assert!(page.contains("mobile-web-app-capable"));
-        assert!(page.contains("apple-mobile-web-app-capable"));
-        assert!(page.contains("theme-color"));
         assert!(page.contains("enterkeyhint=\"send\""));
         assert!(page.contains("function shouldSendTextOnKeydown"));
         assert!(page.contains("event.isComposing"));
@@ -1524,21 +1428,16 @@ mod tests {
     }
 
     #[test]
-    fn rendered_mobile_page_scopes_install_assets_to_the_mobile_token() {
+    fn rendered_mobile_page_does_not_advertise_installable_pwa_assets() {
         let page = render_mobile_page_with_token("mobile+secret/token=");
 
-        assert!(page.contains(
-            "<link rel='manifest' href='/mobile.webmanifest?t=mobile%2Bsecret%2Ftoken%3D'>"
-        ));
-        assert!(
-            page.contains("<link rel='icon' href='/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D'")
-        );
-        assert!(page.contains(
-            "<link rel='apple-touch-icon' href='/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D'>"
-        ));
+        assert!(!page.contains("rel='manifest'"));
+        assert!(!page.contains("mobile.webmanifest"));
+        assert!(!page.contains("mobile-icon.svg"));
+        assert!(!page.contains("theme-color"));
+        assert!(!page.contains("mobile-web-app-capable"));
+        assert!(!page.contains("apple-mobile-web-app-capable"));
         assert!(page.contains("const token = \"mobile+secret/token=\" ||"));
-        assert!(!page.contains("?t=mobile+secret/token="));
-        assert!(!page.contains("href='/mobile-icon.svg'"));
     }
 
     #[test]
@@ -1619,35 +1518,15 @@ mod tests {
     }
 
     #[test]
-    fn renders_mobile_manifest_with_token_scoped_start_url_and_icon() {
-        let manifest =
-            render_mobile_manifest("/mobile.webmanifest?t=mobile%2Bsecret%2Ftoken%3D").unwrap();
-
-        assert_eq!(manifest["name"], "R-ShareMouse Mobile");
-        assert_eq!(manifest["short_name"], "R-ShareMouse");
+    fn removed_install_assets_are_not_routable() {
         assert_eq!(
-            manifest["start_url"],
-            "/mobile?t=mobile%2Bsecret%2Ftoken%3D"
+            route_mobile_http_request("GET", "/mobile.webmanifest?t=secret"),
+            MobileGatewayRoute::NotFound
         );
-        assert_eq!(manifest["scope"], "/");
-        assert_eq!(manifest["display"], "standalone");
-        assert_eq!(manifest["orientation"], "portrait");
-        assert_eq!(manifest["theme_color"], "#101214");
-        assert_eq!(manifest["background_color"], "#101214");
         assert_eq!(
-            manifest["icons"][0]["src"],
-            "/mobile-icon.svg?t=mobile%2Bsecret%2Ftoken%3D"
+            route_mobile_http_request("GET", "/mobile-icon.svg?t=secret"),
+            MobileGatewayRoute::NotFound
         );
-        assert_eq!(manifest["icons"][0]["type"], "image/svg+xml");
-    }
-
-    #[test]
-    fn renders_mobile_icon_svg_for_pwa_installation() {
-        let icon = render_mobile_icon_svg();
-
-        assert!(icon.contains("<svg"));
-        assert!(icon.contains("R-ShareMouse"));
-        assert!(icon.contains("#47c27a"));
     }
 
     #[test]
@@ -1739,17 +1618,12 @@ mod tests {
     }
 
     #[test]
-    fn rendered_mobile_page_requests_screen_wake_lock_while_visible() {
+    fn rendered_mobile_page_does_not_claim_wake_lock_over_plain_http() {
         let page = render_mobile_page();
 
-        assert!(page.contains("let wakeLock = null"));
-        assert!(page.contains("async function requestMobileWakeLock()"));
-        assert!(page.contains("navigator.wakeLock.request(\"screen\")"));
-        assert!(page.contains("wakeLock.addEventListener(\"release\""));
-        assert!(page.contains(
-            "document.addEventListener(\"visibilitychange\", requestMobileWakeLockWhenVisible);"
-        ));
-        assert!(page.contains("requestMobileWakeLock();"));
+        assert!(!page.contains("wakeLock"));
+        assert!(!page.contains("requestMobileWakeLock"));
+        assert!(!page.contains("navigator.wakeLock"));
     }
 
     #[test]

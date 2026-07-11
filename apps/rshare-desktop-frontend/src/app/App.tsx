@@ -9721,7 +9721,7 @@ function SettingsPage({
           </div>
           <div className="min-w-0 self-center">
             <div className="mb-2 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
-              手机访问链接
+              {mobileAccessView.urlLabel}
             </div>
             <div className="break-all font-medium">{mobileAccessView.url}</div>
             <div className="mt-2 text-sm leading-6" style={{ color: theme.textMuted }}>

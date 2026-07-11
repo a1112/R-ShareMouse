@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -78,20 +78,16 @@ test("mobile text input uses phone keyboard send hints", () => {
   assert.doesNotMatch(source, /<input\s+[^>]*placeholder="文本"/);
 });
 
-test("desktop frontend exposes mobile PWA metadata", () => {
+test("desktop frontend does not advertise mobile PWA installation over plain HTTP", () => {
   const index = readAppFile("index.html");
-  const manifest = JSON.parse(readAppFile("public/mobile.webmanifest"));
 
-  assert.match(index, /<link rel="manifest" href="\/mobile\.webmanifest"/);
-  assert.match(index, /<meta name="theme-color" content="#101214"/);
-  assert.match(index, /<meta name="mobile-web-app-capable" content="yes"/);
-  assert.match(index, /<meta name="apple-mobile-web-app-capable" content="yes"/);
-  assert.equal(manifest.name, "R-ShareMouse Mobile");
-  assert.equal(manifest.start_url, "/mobile");
-  assert.equal(manifest.display, "standalone");
-  assert.equal(manifest.orientation, "portrait");
-  assert.equal(manifest.theme_color, "#101214");
-  assert.ok(manifest.icons.some((icon) => icon.src === "/mobile-icon.svg"));
+  assert.doesNotMatch(index, /rel="manifest"/);
+  assert.doesNotMatch(index, /theme-color/);
+  assert.doesNotMatch(index, /mobile-web-app-capable/);
+  assert.doesNotMatch(index, /apple-mobile-web-app-capable/);
+  assert.doesNotMatch(index, /mobile-icon\.svg/);
+  assert.equal(existsSync(new URL("../../public/mobile.webmanifest", import.meta.url)), false);
+  assert.equal(existsSync(new URL("../../public/mobile-icon.svg", import.meta.url)), false);
 });
 
 test("mobile keyboard controls expose common non-text keys and shortcuts", () => {
@@ -481,15 +477,12 @@ test("mobile controller releases touchpad drag when the page lifecycle cancels i
   assert.match(source, /document\.visibilityState === "hidden"/);
 });
 
-test("mobile controller requests screen wake lock while visible", () => {
+test("mobile controller does not claim wake lock over plain HTTP", () => {
   const source = readAppFile("src/app/MobileController.tsx");
 
-  assert.match(source, /wakeLockRef/);
-  assert.match(source, /async function requestMobileWakeLock\(\)/);
-  assert.match(source, /wakeLockApi\.request\("screen"\)/);
-  assert.match(source, /wakeLock\.addEventListener\?\.\("release"/);
-  assert.match(source, /requestMobileWakeLockWhenVisible/);
-  assert.match(source, /document\.addEventListener\("visibilitychange", requestMobileWakeLockWhenVisible\)/);
+  assert.doesNotMatch(source, /wakeLockRef/);
+  assert.doesNotMatch(source, /requestMobileWakeLock/);
+  assert.doesNotMatch(source, /wakeLockApi\.request/);
 });
 
 test("mobile controller installs browser navigation and gesture guards", () => {

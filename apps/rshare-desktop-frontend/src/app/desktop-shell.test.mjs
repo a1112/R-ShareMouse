@@ -200,3 +200,10 @@ test("display settings refreshes system topology after virtual display operation
   );
   assert.equal(topologyRefreshes?.length, 2);
 });
+
+test("mobile settings renders the truthful gateway URL label", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /\{mobileAccessView\.urlLabel\}/);
+  assert.doesNotMatch(source, />手机访问链接</);
+});

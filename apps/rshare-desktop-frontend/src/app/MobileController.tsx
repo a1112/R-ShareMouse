@@ -67,16 +67,6 @@ type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
 type MobileBackendStatus = ReturnType<typeof formatMobileBackendStatus>;
-type MobileWakeLockSentinel = {
-  released?: boolean;
-  release?: () => Promise<void>;
-  addEventListener?: (type: "release", listener: () => void) => void;
-};
-type MobileWakeLockNavigator = Navigator & {
-  wakeLock?: {
-    request: (type: "screen") => Promise<MobileWakeLockSentinel>;
-  };
-};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -264,58 +254,8 @@ function useMobileBrowserGuards() {
   }, []);
 }
 
-function useMobileWakeLock() {
-  const wakeLockRef = useRef<MobileWakeLockSentinel | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function requestMobileWakeLock() {
-      const wakeLockApi = (navigator as MobileWakeLockNavigator).wakeLock;
-      if (document.visibilityState !== "visible" || !wakeLockApi) {
-        return;
-      }
-      if (wakeLockRef.current && wakeLockRef.current.released === false) {
-        return;
-      }
-      try {
-        const wakeLock = await wakeLockApi.request("screen");
-        if (cancelled) {
-          void wakeLock.release?.();
-          return;
-        }
-        wakeLockRef.current = wakeLock;
-        wakeLock.addEventListener?.("release", () => {
-          if (wakeLockRef.current === wakeLock) {
-            wakeLockRef.current = null;
-          }
-        });
-      } catch {
-        wakeLockRef.current = null;
-      }
-    }
-
-    function requestMobileWakeLockWhenVisible() {
-      if (document.visibilityState === "visible") {
-        void requestMobileWakeLock();
-      }
-    }
-
-    void requestMobileWakeLock();
-    document.addEventListener("visibilitychange", requestMobileWakeLockWhenVisible);
-
-    return () => {
-      cancelled = true;
-      document.removeEventListener("visibilitychange", requestMobileWakeLockWhenVisible);
-      void wakeLockRef.current?.release?.();
-      wakeLockRef.current = null;
-    };
-  }, []);
-}
-
 export default function MobileController() {
   useMobileBrowserGuards();
-  useMobileWakeLock();
 
   const [pointer, setPointer] = useState<PointerState>({
     x: 0,

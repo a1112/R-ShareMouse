@@ -6741,10 +6741,12 @@ async fn main() -> Result<()> {
     tracing::info!("R-ShareMouse daemon starting...");
     tracing::info!("Log file: {}", log_file.display());
 
+    let config = load_config_with_env_overrides()?;
+
     // Configure firewall on Windows to allow discovery and service ports
     #[cfg(windows)]
     {
-        match firewall::configure_firewall() {
+        match firewall::configure_firewall(config.features.mobile_gateway_enabled) {
             Ok(result) => {
                 if result.is_success() {
                     tracing::info!("Firewall configured successfully for R-ShareMouse");
@@ -6758,8 +6760,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    let config = load_config_with_env_overrides()?;
 
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
@@ -10089,11 +10089,11 @@ mod tests {
         );
         assert_eq!(
             mobile_gateway::route_mobile_http_request("GET", "/mobile.webmanifest?t=token"),
-            mobile_gateway::MobileGatewayRoute::Manifest
+            mobile_gateway::MobileGatewayRoute::NotFound
         );
         assert_eq!(
             mobile_gateway::route_mobile_http_request("GET", "/mobile-icon.svg?t=token"),
-            mobile_gateway::MobileGatewayRoute::Icon
+            mobile_gateway::MobileGatewayRoute::NotFound
         );
         assert_eq!(
             mobile_gateway::route_mobile_http_request("GET", "/api/local-controls?t=token"),

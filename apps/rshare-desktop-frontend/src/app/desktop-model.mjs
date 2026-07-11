@@ -119,9 +119,10 @@ export function buildMobileAccessViewModel(snapshot, options = {}) {
         : "网关不可用",
     qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(url) : null,
     qrCodeAlt: "移动端控制二维码",
+    urlLabel: enabled ? "实验性明文局域网控制 URL" : "移动网关未启用",
     summary: enabled
-      ? "用手机浏览器打开链接，即可把手机作为触控板和输入法。"
-      : "移动端控制网关不可用，请先启动守护进程。",
+      ? "实验性明文局域网控制：该 HTTP 链接未加密，仅应在可信局域网中临时使用。"
+      : "移动端控制默认关闭；如需实验，请在配置中设置 mobile_gateway_enabled=true 后重启守护进程。",
   };
 }
 

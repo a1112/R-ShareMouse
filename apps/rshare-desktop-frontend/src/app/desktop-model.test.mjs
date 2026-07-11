@@ -110,13 +110,23 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
   assert.equal(view.port, 27437);
   assert.equal(view.clientStatus, "已连接手机");
   assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 5 秒前 · 2 次请求");
-  assert.match(view.summary, /手机浏览器/);
+  assert.equal(view.urlLabel, "实验性明文局域网控制 URL");
+  assert.match(view.summary, /实验性明文局域网控制/);
+  assert.match(view.summary, /未加密/);
 
-  const offline = buildMobileAccessViewModel(null);
-  assert.equal(offline.available, false);
-  assert.equal(offline.url, "不可用");
-  assert.equal(offline.port, null);
-  assert.equal(offline.clientStatus, "未连接");
+  const disabled = buildMobileAccessViewModel({
+    enabled: false,
+    bind_address: "不可用",
+    page_url: null,
+    token: null,
+  });
+  assert.equal(disabled.available, false);
+  assert.equal(disabled.url, "不可用");
+  assert.equal(disabled.token, "");
+  assert.equal(disabled.port, null);
+  assert.equal(disabled.clientStatus, "未连接");
+  assert.equal(disabled.urlLabel, "移动网关未启用");
+  assert.match(disabled.summary, /mobile_gateway_enabled=true/);
 
   const stale = buildMobileAccessViewModel(
     {
