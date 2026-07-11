@@ -1,39 +1,12 @@
-use rshare_core::{
-    VirtualDisplayCreateRequest, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
-};
+use rshare_core::{VirtualDisplayCreateRequest, VirtualDisplayOperationStatus};
 
-fn assert_create_status(status: VirtualDisplayOperationStatus) {
-    if cfg!(windows) {
-        assert!(
-            matches!(
-                status,
-                VirtualDisplayOperationStatus::Created
-                    | VirtualDisplayOperationStatus::DriverUnavailable
-            ),
-            "unexpected virtual display create status: {status:?}"
-        );
-    } else {
-        assert_eq!(status, VirtualDisplayOperationStatus::Unsupported);
-    }
-}
-
-fn assert_remove_status(status: VirtualDisplayOperationStatus) {
-    if cfg!(windows) {
-        assert!(
-            matches!(
-                status,
-                VirtualDisplayOperationStatus::Removed
-                    | VirtualDisplayOperationStatus::DriverUnavailable
-            ),
-            "unexpected virtual display remove status: {status:?}"
-        );
-    } else {
-        assert_eq!(status, VirtualDisplayOperationStatus::Unsupported);
-    }
-}
+#[cfg(windows)]
+const DRIVER_TEST_ENV: &str = "RSHARE_RUN_VDISPLAY_DRIVER_TESTS";
+#[cfg(windows)]
+const DRIVER_TEST_DISPLAY_ID: &str = "rshare-vdisplay-driver-test";
 
 #[test]
-fn rejects_zero_sized_virtual_display() {
+fn rejects_zero_sized_virtual_display_without_accessing_driver() {
     let result =
         rshare_platform::virtual_display::create_virtual_display(&VirtualDisplayCreateRequest {
             id: Some("vd-zero".to_string()),
@@ -48,44 +21,120 @@ fn rejects_zero_sized_virtual_display() {
     assert!(result.display.is_none());
 }
 
+#[cfg(not(windows))]
 #[test]
-fn reports_platform_create_result_without_faking_display() {
+fn reports_virtual_display_as_unsupported_off_windows() {
     let result =
         rshare_platform::virtual_display::create_virtual_display(&VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
+            id: Some("vd-unsupported".to_string()),
             width: 1920,
             height: 1080,
             refresh_rate_millihz: Some(60_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
+            name: None,
         })
-        .expect("platform availability should be reported as an operation result");
+        .expect("unsupported platform should return an operation result");
 
-    assert_create_status(result.status);
-    assert_eq!(
-        result.display.as_ref().map(|display| display.id.as_str()),
-        Some("vd-1")
-    );
-    if result.status == VirtualDisplayOperationStatus::Created {
-        let _ = rshare_platform::virtual_display::remove_virtual_display(
-            &VirtualDisplayRemoveRequest {
-                id: "vd-1".to_string(),
-            },
-        );
+    assert_eq!(result.status, VirtualDisplayOperationStatus::Unsupported);
+}
+
+#[cfg(windows)]
+struct VirtualDisplayCleanup {
+    id: String,
+    armed: bool,
+}
+
+#[cfg(windows)]
+impl VirtualDisplayCleanup {
+    fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-#[test]
-fn reports_platform_remove_result_without_faking_display() {
-    let result =
-        rshare_platform::virtual_display::remove_virtual_display(&VirtualDisplayRemoveRequest {
-            id: "vd-1".to_string(),
-        })
-        .expect("platform availability should be reported as an operation result");
+#[cfg(windows)]
+impl Drop for VirtualDisplayCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
 
-    assert_remove_status(result.status);
-    if result.status == VirtualDisplayOperationStatus::Removed {
-        assert!(result.display.is_some());
-    } else {
-        assert!(result.display.is_none());
+        let request = rshare_core::VirtualDisplayRemoveRequest {
+            id: self.id.clone(),
+        };
+        match rshare_platform::virtual_display::remove_virtual_display(&request) {
+            Ok(result) if result.status == VirtualDisplayOperationStatus::Removed => {}
+            Ok(result) => eprintln!(
+                "virtual display cleanup returned {:?}: {}",
+                result.status,
+                result.message.as_deref().unwrap_or("no diagnostic")
+            ),
+            Err(error) => eprintln!("virtual display cleanup failed: {error}"),
+        }
     }
+}
+
+/// Manual Windows driver validation only.
+///
+/// PowerShell:
+/// `$env:RSHARE_RUN_VDISPLAY_DRIVER_TESTS='1'; cargo test -p rshare-platform --test virtual_display -- --test-threads=1`
+#[cfg(windows)]
+#[test]
+fn windows_virtual_display_driver_round_trip_requires_explicit_opt_in() {
+    if std::env::var(DRIVER_TEST_ENV).as_deref() != Ok("1") {
+        eprintln!(
+            "skipping real virtual display driver test; set {DRIVER_TEST_ENV}=1 and run `cargo test -p rshare-platform --test virtual_display -- --test-threads=1`"
+        );
+        return;
+    }
+
+    let mut cleanup = VirtualDisplayCleanup::new(DRIVER_TEST_DISPLAY_ID);
+    let create_result =
+        rshare_platform::virtual_display::create_virtual_display(&VirtualDisplayCreateRequest {
+            id: Some(DRIVER_TEST_DISPLAY_ID.to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display Driver Test".to_string()),
+        })
+        .expect("opt-in virtual display driver create call should complete");
+
+    assert_eq!(
+        create_result.status,
+        VirtualDisplayOperationStatus::Created,
+        "opt-in driver test requires an installed, available driver: {}",
+        create_result
+            .message
+            .as_deref()
+            .unwrap_or("no driver diagnostic")
+    );
+    let display = create_result
+        .display
+        .as_ref()
+        .expect("created virtual display should include a snapshot");
+    assert_eq!(display.id, DRIVER_TEST_DISPLAY_ID);
+
+    let remove_result = rshare_platform::virtual_display::remove_virtual_display(
+        &rshare_core::VirtualDisplayRemoveRequest {
+            id: DRIVER_TEST_DISPLAY_ID.to_string(),
+        },
+    )
+    .expect("opt-in virtual display driver remove call should complete");
+    if remove_result.status == VirtualDisplayOperationStatus::Removed {
+        cleanup.disarm();
+    }
+    assert_eq!(
+        remove_result.status,
+        VirtualDisplayOperationStatus::Removed,
+        "opt-in driver cleanup should remove the display: {}",
+        remove_result
+            .message
+            .as_deref()
+            .unwrap_or("no driver diagnostic")
+    );
 }

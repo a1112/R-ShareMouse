@@ -157,6 +157,20 @@ impl VirtualDisplayManager {
     }
 
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
+        self.create_with(
+            request,
+            rshare_platform::virtual_display::create_virtual_display,
+        )
+    }
+
+    fn create_with<F>(
+        &mut self,
+        request: VirtualDisplayCreateRequest,
+        create_virtual_display: F,
+    ) -> VirtualDisplayOperationResult
+    where
+        F: FnOnce(&VirtualDisplayCreateRequest) -> Result<VirtualDisplayOperationResult>,
+    {
         let id = virtual_display_request_id(request.id.as_deref());
         if let Some(existing) = self.displays.get(&id) {
             if !virtual_display_status_allows_create_retry(existing.status)
@@ -183,7 +197,7 @@ impl VirtualDisplayManager {
 
         let mut platform_request = request;
         platform_request.id = Some(id.clone());
-        match rshare_platform::virtual_display::create_virtual_display(&platform_request) {
+        match create_virtual_display(&platform_request) {
             Ok(result) => {
                 if let Some(display) = result.display.clone() {
                     self.displays.insert(display.id.clone(), display);
@@ -199,6 +213,20 @@ impl VirtualDisplayManager {
     }
 
     fn remove(&mut self, request: VirtualDisplayRemoveRequest) -> VirtualDisplayOperationResult {
+        self.remove_with(
+            request,
+            rshare_platform::virtual_display::remove_virtual_display,
+        )
+    }
+
+    fn remove_with<F>(
+        &mut self,
+        request: VirtualDisplayRemoveRequest,
+        remove_virtual_display: F,
+    ) -> VirtualDisplayOperationResult
+    where
+        F: FnOnce(&VirtualDisplayRemoveRequest) -> Result<VirtualDisplayOperationResult>,
+    {
         let id = request.id.trim().to_string();
         if id.is_empty() {
             return VirtualDisplayOperationResult {
@@ -208,7 +236,7 @@ impl VirtualDisplayManager {
             };
         }
 
-        let platform_result = rshare_platform::virtual_display::remove_virtual_display(&request);
+        let platform_result = remove_virtual_display(&request);
         self.displays.remove(&id);
         platform_result.unwrap_or_else(|error| VirtualDisplayOperationResult {
             status: VirtualDisplayOperationStatus::Failed,
@@ -7763,6 +7791,7 @@ fn load_config_with_env_overrides() -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::path::PathBuf;
 
     fn test_daemon_state() -> DaemonState {
@@ -7818,69 +7847,153 @@ mod tests {
         info
     }
 
-    fn assert_virtual_display_create_status(status: rshare_core::VirtualDisplayOperationStatus) {
-        if cfg!(windows) {
-            assert!(
-                matches!(
-                    status,
-                    rshare_core::VirtualDisplayOperationStatus::Created
-                        | rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-                ),
-                "unexpected virtual display create status: {status:?}"
-            );
-        } else {
-            assert_eq!(
-                status,
-                rshare_core::VirtualDisplayOperationStatus::Unsupported
-            );
-        }
+    fn fake_virtual_display_create_result(
+        request: &VirtualDisplayCreateRequest,
+        operation_status: VirtualDisplayOperationStatus,
+        display_status: VirtualDisplayStatus,
+    ) -> Result<VirtualDisplayOperationResult> {
+        Ok(VirtualDisplayOperationResult {
+            status: operation_status,
+            display: Some(VirtualDisplaySnapshot {
+                id: request.id.clone().expect("manager should normalize the id"),
+                width: request.width,
+                height: request.height,
+                refresh_rate_millihz: request.refresh_rate_millihz.or(Some(60_000)),
+                name: request.name.clone(),
+                status: display_status,
+                display_id: (display_status == VirtualDisplayStatus::Active)
+                    .then(|| "windows-display-rshare".to_string()),
+                message: None,
+            }),
+            message: None,
+        })
     }
 
-    fn assert_virtual_display_remove_status(status: rshare_core::VirtualDisplayOperationStatus) {
-        if cfg!(windows) {
-            assert!(
-                matches!(
-                    status,
-                    rshare_core::VirtualDisplayOperationStatus::Removed
-                        | rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-                ),
-                "unexpected virtual display remove status: {status:?}"
-            );
-        } else {
-            assert_eq!(
-                status,
-                rshare_core::VirtualDisplayOperationStatus::Unsupported
-            );
-        }
+    fn fake_virtual_display_created(
+        request: &VirtualDisplayCreateRequest,
+    ) -> Result<VirtualDisplayOperationResult> {
+        fake_virtual_display_create_result(
+            request,
+            VirtualDisplayOperationStatus::Created,
+            VirtualDisplayStatus::Active,
+        )
     }
 
-    fn cleanup_created_virtual_display(
-        id: &str,
-        status: rshare_core::VirtualDisplayOperationStatus,
-    ) {
-        if status == rshare_core::VirtualDisplayOperationStatus::Created {
-            let _ = rshare_platform::virtual_display::remove_virtual_display(
-                &rshare_core::VirtualDisplayRemoveRequest { id: id.to_string() },
-            );
-        }
+    fn fake_virtual_display_driver_unavailable(
+        request: &VirtualDisplayCreateRequest,
+    ) -> Result<VirtualDisplayOperationResult> {
+        fake_virtual_display_create_result(
+            request,
+            VirtualDisplayOperationStatus::DriverUnavailable,
+            VirtualDisplayStatus::DriverUnavailable,
+        )
+    }
+
+    #[test]
+    fn virtual_display_manager_skips_platform_create_for_matching_active_display() {
+        let mut manager = VirtualDisplayManager::default();
+        let platform_create_calls = Cell::new(0);
+        let request = VirtualDisplayCreateRequest {
+            id: Some("vd-1".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: Some("R-ShareMouse Virtual Display".to_string()),
+        };
+
+        let first = manager.create_with(request.clone(), |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_created(request)
+        });
+        let duplicate = manager.create_with(request, |_| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            panic!("matching active display must not call the platform")
+        });
+
+        assert_eq!(first.status, VirtualDisplayOperationStatus::Created);
+        assert_eq!(
+            duplicate.status,
+            VirtualDisplayOperationStatus::AlreadyExists
+        );
+        assert_eq!(platform_create_calls.get(), 1);
+    }
+
+    #[test]
+    fn virtual_display_manager_removes_snapshot_through_platform_callback() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "vd-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+            status: VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+        let platform_remove_calls = Cell::new(0);
+
+        let result = manager.remove_with(
+            VirtualDisplayRemoveRequest {
+                id: "vd-1".to_string(),
+            },
+            |request| {
+                platform_remove_calls.set(platform_remove_calls.get() + 1);
+                Ok(VirtualDisplayOperationResult {
+                    status: VirtualDisplayOperationStatus::Removed,
+                    display: Some(VirtualDisplaySnapshot {
+                        id: request.id.clone(),
+                        width: 1920,
+                        height: 1080,
+                        refresh_rate_millihz: Some(60_000),
+                        name: None,
+                        status: VirtualDisplayStatus::Removed,
+                        display_id: None,
+                        message: None,
+                    }),
+                    message: None,
+                })
+            },
+        );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Removed);
+        assert_eq!(platform_remove_calls.get(), 1);
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn virtual_display_manager_rejects_empty_remove_id_without_platform_call() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let result = manager.remove_with(
+            VirtualDisplayRemoveRequest {
+                id: "  ".to_string(),
+            },
+            |_| panic!("empty virtual display id must not call the platform"),
+        );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Failed);
+        assert!(manager.list().is_empty());
     }
 
     #[test]
     fn virtual_display_manager_records_platform_create_result() {
         let mut manager = VirtualDisplayManager::default();
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-1".to_string()),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
 
-        assert_virtual_display_create_status(result.status);
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Created);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
-        cleanup_created_virtual_display("vd-1", result.status);
     }
 
     #[test]
@@ -7904,7 +8017,9 @@ mod tests {
             display_id: Some("windows-display-rshare".to_string()),
             message: None,
         }]);
-        let result = manager.create(request);
+        let result = manager.create_with(request, |_| {
+            panic!("matching active display must not call the platform")
+        });
 
         assert_eq!(
             result.status,
@@ -7927,25 +8042,26 @@ mod tests {
             message: None,
         }]);
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: Some(144_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
-
-        assert_virtual_display_create_status(result.status);
-        assert_ne!(
-            result.status,
-            rshare_core::VirtualDisplayOperationStatus::AlreadyExists
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-1".to_string()),
+                width: 2560,
+                height: 1440,
+                refresh_rate_millihz: Some(144_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
         );
-        cleanup_created_virtual_display("vd-1", result.status);
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Created);
+        assert_eq!(manager.list()[0].width, 2560);
+        assert_eq!(manager.list()[0].height, 1440);
     }
 
     #[test]
-    fn virtual_display_manager_handles_retry_after_platform_create_result() {
+    fn virtual_display_manager_retries_after_driver_unavailable_result() {
         let mut manager = VirtualDisplayManager::default();
+        let platform_create_calls = Cell::new(0);
         let request = rshare_core::VirtualDisplayCreateRequest {
             id: Some("vd-1".to_string()),
             width: 1920,
@@ -7954,41 +8070,49 @@ mod tests {
             name: Some("R-ShareMouse Virtual Display".to_string()),
         };
 
-        let first = manager.create(request.clone());
-        let retry = manager.create(request);
+        let first = manager.create_with(request.clone(), |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_driver_unavailable(request)
+        });
+        let retry = manager.create_with(request, |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_driver_unavailable(request)
+        });
 
-        assert_virtual_display_create_status(first.status);
-        if first.status == rshare_core::VirtualDisplayOperationStatus::Created {
-            assert_eq!(
-                retry.status,
-                rshare_core::VirtualDisplayOperationStatus::AlreadyExists
-            );
-        } else {
-            assert_eq!(retry.status, first.status);
-        }
+        assert_eq!(
+            first.status,
+            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
+        );
+        assert_eq!(retry.status, first.status);
+        assert_eq!(platform_create_calls.get(), 2);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
-        cleanup_created_virtual_display("vd-1", first.status);
     }
 
     #[test]
     fn virtual_display_manager_reuses_default_id_after_existing_default_record() {
         let mut manager = VirtualDisplayManager::default();
 
-        let first = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: None,
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
-        let retry = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: None,
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: Some(144_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
+        let first = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: None,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
+        let retry = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: None,
+                width: 2560,
+                height: 1440,
+                refresh_rate_millihz: Some(144_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
 
         assert_eq!(
             first.display.as_ref().map(|display| display.id.as_str()),
@@ -7999,45 +8123,27 @@ mod tests {
             Some("rshare-vdisplay-1")
         );
         assert_eq!(manager.list().len(), 1);
-        cleanup_created_virtual_display(DEFAULT_VIRTUAL_DISPLAY_ID, first.status);
-        cleanup_created_virtual_display(DEFAULT_VIRTUAL_DISPLAY_ID, retry.status);
     }
 
     #[test]
     fn virtual_display_manager_rejects_invalid_modes() {
         let mut manager = VirtualDisplayManager::default();
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-invalid".to_string()),
-            width: 0,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: None,
-        });
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-invalid".to_string()),
+                width: 0,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: None,
+            },
+            |_| panic!("invalid mode must not call the platform"),
+        );
 
         assert_eq!(
             result.status,
             rshare_core::VirtualDisplayOperationStatus::InvalidMode
         );
-        assert!(manager.list().is_empty());
-    }
-
-    #[test]
-    fn virtual_display_manager_removes_requested_snapshot() {
-        let mut manager = VirtualDisplayManager::default();
-        let _ = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: None,
-        });
-
-        let result = manager.remove(rshare_core::VirtualDisplayRemoveRequest {
-            id: "vd-1".to_string(),
-        });
-
-        assert_virtual_display_remove_status(result.status);
         assert!(manager.list().is_empty());
     }
 
