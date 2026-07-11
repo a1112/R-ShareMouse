@@ -1689,6 +1689,8 @@ const pendingPointerWrites = new Set();
 let mobileRequestQueueTail = Promise.resolve();
 const heldKeys = new Set();
 const heldMouseButtons = new Set();
+const heldButtonSilentResetters = new Set();
+let heldButtonStateRevision = 0;
 const statusEl = document.getElementById("status");
 const posEl = document.getElementById("pos");
 const backendStatusEl = document.getElementById("backendStatus");
@@ -2110,8 +2112,13 @@ function releaseAllRequests(prefix) {
 }
 async function sendReleaseAll() {
   const generation = inputGeneration;
+  const resetRevision = heldButtonStateRevision;
   flushMove();
-  return enqueueInjectBatchFactory(() => releaseAllRequests("mobile-release-all"), generation);
+  const accepted = await enqueueInjectBatchFactory(() => releaseAllRequests("mobile-release-all"), generation);
+  if (accepted.length > 0 && accepted.every(Boolean) && resetRevision === heldButtonStateRevision) {
+    heldButtonSilentResetters.forEach((reset) => reset());
+  }
+  return accepted;
 }
 function keepaliveReleaseBatch(requests) {
   if (!Array.isArray(requests) || requests.length === 0) return false;
@@ -2404,10 +2411,12 @@ function attachHeldButton(button, sendState) {
     suppressSyntheticClick = false;
     setHeldButtonPressed(false);
   }
+  heldButtonSilentResetters.add(resetHeldButtonPointerState);
   function release(force, source = null) {
     if (activeSource === null) return false;
     if (!force && source !== null && activeSource !== source) return false;
     activeSource = null;
+    heldButtonStateRevision += 1;
     setHeldButtonPressed(false);
     sendState("Released");
     return true;
@@ -2416,6 +2425,7 @@ function attachHeldButton(button, sendState) {
     if (activeSource === source) return false;
     release(true);
     activeSource = source;
+    heldButtonStateRevision += 1;
     setHeldButtonPressed(true);
     sendState("Pressed");
     return true;
@@ -4059,6 +4069,37 @@ mod tests {
             "enqueueInjectBatchFactory(() => releaseAllRequests(\"mobile-release-all\"), generation)"
         ));
         assert!(!release.contains("enqueueInjectBatch(releaseAllRequests"));
+    }
+
+    #[test]
+    fn rendered_mobile_page_silently_resets_held_controls_only_after_release_all_success() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("const heldButtonSilentResetters = new Set();"));
+        assert!(page.contains("heldButtonSilentResetters.add(resetHeldButtonPointerState);"));
+        let reset_start = page
+            .find("function resetHeldButtonPointerState()")
+            .expect("missing held control reset");
+        let reset_end = page[reset_start..]
+            .find("function release(")
+            .map(|offset| reset_start + offset)
+            .expect("missing held release function");
+        assert!(!page[reset_start..reset_end].contains("sendState("));
+
+        let release_start = page
+            .find("async function sendReleaseAll()")
+            .expect("missing release-all flow");
+        let release_end = page[release_start..]
+            .find("function keepaliveReleaseBatch")
+            .map(|offset| release_start + offset)
+            .expect("missing keepalive release");
+        let release = &page[release_start..release_end];
+        assert!(release.contains("const resetRevision = heldButtonStateRevision;"));
+        assert!(release.contains("const accepted = await enqueueInjectBatchFactory"));
+        assert!(release.contains(
+            "if (accepted.length > 0 && accepted.every(Boolean) && resetRevision === heldButtonStateRevision)"
+        ));
+        assert!(release.contains("heldButtonSilentResetters.forEach((reset) => reset());"));
     }
 
     #[test]

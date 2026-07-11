@@ -19,6 +19,7 @@ import {
   MOBILE_SHORTCUT_BUTTONS,
   MOBILE_TEXT_INPUT_HINTS,
   applyMobileStatusRefreshResult,
+  buildHeldIntentReleaseRequests,
   buildKeyChordRequests,
   buildKeyRequest,
   buildMobileReleaseAllRequests,
@@ -29,6 +30,7 @@ import {
   buildMouseWheelRequest,
   buildTextCommitRequest,
   createHeldInputController,
+  createHeldInputResetRegistry,
   createMobileHeldIntentTracker,
   createMobileCorrelationId,
   createMobileStatusRefreshController,
@@ -73,6 +75,8 @@ type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
 type MobileBackendStatus = ReturnType<typeof formatMobileBackendStatus>;
+type HeldInputResetRegistry = ReturnType<typeof createHeldInputResetRegistry>;
+type HeldIntentOutcome = "accepted" | "rejected" | "unknown";
 type QueuedMobileRequest = { request: unknown; quiet: boolean; heldIntent: unknown };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -178,6 +182,7 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
 function useHeldInputController(
   onState: (state: HeldInputState) => void,
   onLifecycleReset: () => void,
+  resetRegistry: HeldInputResetRegistry,
 ) {
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
@@ -189,6 +194,7 @@ function useHeldInputController(
 
   if (!controllerRef.current) {
     controllerRef.current = createHeldInputController((state: HeldInputState) => {
+      resetRegistry.markChanged();
       if (mountedRef.current) {
         setIsPressed(state === "Pressed");
       }
@@ -198,6 +204,14 @@ function useHeldInputController(
 
   useEffect(() => {
     mountedRef.current = true;
+    const resetSilently = () => {
+      controllerRef.current?.resetSilently();
+      if (mountedRef.current) {
+        setIsPressed(false);
+      }
+      onLifecycleResetRef.current();
+    };
+    const unregisterSilentReset = resetRegistry.register(resetSilently);
     const releaseForLifecycle = () => {
       controllerRef.current?.releaseAll();
       onLifecycleResetRef.current();
@@ -218,8 +232,9 @@ function useHeldInputController(
       window.removeEventListener("blur", releaseForLifecycle);
       window.removeEventListener("pagehide", releaseForLifecycle);
       document.removeEventListener("visibilitychange", releaseWhenHidden);
+      unregisterSilentReset();
     };
-  }, []);
+  }, [resetRegistry]);
 
   const controller = controllerRef.current;
   return {
@@ -323,6 +338,7 @@ export default function MobileController() {
   const dragPointerRef = useRef<number | null>(null);
   const sensitivityRef = useRef(pointerSensitivity);
   const pointerRef = useRef(pointer);
+  const heldInputResetRegistryRef = useRef<HeldInputResetRegistry | null>(null);
   const heldIntentTrackerRef = useRef<ReturnType<typeof createMobileHeldIntentTracker> | null>(
     null,
   );
@@ -338,6 +354,9 @@ export default function MobileController() {
 
   if (!heldIntentTrackerRef.current) {
     heldIntentTrackerRef.current = createMobileHeldIntentTracker();
+  }
+  if (!heldInputResetRegistryRef.current) {
+    heldInputResetRegistryRef.current = createHeldInputResetRegistry();
   }
 
   if (!requestQueueRef.current) {
@@ -408,17 +427,21 @@ export default function MobileController() {
   }, []);
 
   async function sendRequestNow({ request, quiet, heldIntent }: QueuedMobileRequest) {
-    let accepted = false;
+    let outcome: HeldIntentOutcome = "unknown";
     if (!quiet) {
       setSendState("sending");
     }
     try {
       if ((heldIntent as { allowed?: boolean } | null)?.allowed === false) {
-        throw new Error("同时按住的移动端按键数量超过安全限制");
+        outcome = "rejected";
+        statusRefreshRef.current?.markStatusChanged();
+        setSendState("error");
+        setStatus("移动端注入请求失败：同时按住的按键数量超过安全限制");
+        return false;
       }
       const result = await sendInjectRequest(request);
       const feedback = formatMobileInjectResultStatus(result);
-      accepted = feedback.accepted;
+      outcome = feedback.accepted ? "accepted" : "rejected";
       if (!feedback.accepted) {
         statusRefreshRef.current?.markStatusChanged();
         setSendState("error");
@@ -437,7 +460,7 @@ export default function MobileController() {
       setStatus(formatMobileControllerError(error, "移动端注入"));
       return false;
     } finally {
-      heldIntentTrackerRef.current!.settle(heldIntent, accepted);
+      heldIntentTrackerRef.current!.settle(heldIntent, outcome);
     }
   }
 
@@ -460,6 +483,25 @@ export default function MobileController() {
       requests.map((request) => queuedRequest(request, quiet)),
     )) as boolean[];
     return responses.every(Boolean);
+  }
+
+  function releaseTrackedInputsForLifecycle() {
+    const current = pointerRef.current;
+    const requests = buildHeldIntentReleaseRequests(
+      current.x,
+      current.y,
+      createMobileCorrelationId("mobile-lifecycle-release"),
+      heldIntentTrackerRef.current!.snapshot(),
+    );
+    if (requests.length === 0) {
+      return;
+    }
+    const resetRevision = heldInputResetRegistryRef.current!.capture();
+    void sendRequestBatch(requests, true).then((released) => {
+      if (released) {
+        heldInputResetRegistryRef.current!.resetAll(resetRevision);
+      }
+    });
   }
 
   function sendMoveNow(next: PointerState) {
@@ -729,21 +771,25 @@ export default function MobileController() {
   }
 
   useEffect(() => {
-    function releaseTouchpadInteractionWhenHidden() {
+    function releaseMobileInteractionForLifecycle() {
+      releaseTouchpadInteraction();
+      releaseTrackedInputsForLifecycle();
+    }
+    function releaseMobileInteractionWhenHidden() {
       if (document.visibilityState === "hidden") {
-        releaseTouchpadInteraction();
+        releaseMobileInteractionForLifecycle();
       }
     }
 
-    window.addEventListener("blur", releaseTouchpadInteraction);
-    window.addEventListener("pagehide", releaseTouchpadInteraction);
-    document.addEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
+    window.addEventListener("blur", releaseMobileInteractionForLifecycle);
+    window.addEventListener("pagehide", releaseMobileInteractionForLifecycle);
+    document.addEventListener("visibilitychange", releaseMobileInteractionWhenHidden);
 
     return () => {
-      releaseTouchpadInteraction();
-      window.removeEventListener("blur", releaseTouchpadInteraction);
-      window.removeEventListener("pagehide", releaseTouchpadInteraction);
-      document.removeEventListener("visibilitychange", releaseTouchpadInteractionWhenHidden);
+      releaseMobileInteractionForLifecycle();
+      window.removeEventListener("blur", releaseMobileInteractionForLifecycle);
+      window.removeEventListener("pagehide", releaseMobileInteractionForLifecycle);
+      document.removeEventListener("visibilitychange", releaseMobileInteractionWhenHidden);
     };
   }, []);
 
@@ -831,7 +877,12 @@ export default function MobileController() {
       createMobileCorrelationId("mobile-release-all"),
       heldIntentTrackerRef.current!.snapshot(),
     );
-    return sendRequestBatch(requests);
+    const resetRevision = heldInputResetRegistryRef.current!.capture();
+    const released = await sendRequestBatch(requests);
+    if (released) {
+      heldInputResetRegistryRef.current!.resetAll(resetRevision);
+    }
+    return released;
   }
 
   async function commitText() {
@@ -950,26 +1001,31 @@ export default function MobileController() {
             label="左键"
             onDown={() => mouseButton("Left", "Pressed")}
             onUp={() => mouseButton("Left", "Released")}
+            resetRegistry={heldInputResetRegistryRef.current!}
           />
           <PressButton
             label="中键"
             onDown={() => mouseButton("Middle", "Pressed")}
             onUp={() => mouseButton("Middle", "Released")}
+            resetRegistry={heldInputResetRegistryRef.current!}
           />
           <PressButton
             label="右键"
             onDown={() => mouseButton("Right", "Pressed")}
             onUp={() => mouseButton("Right", "Released")}
+            resetRegistry={heldInputResetRegistryRef.current!}
           />
           <PressButton
             label="后退"
             onDown={() => mouseButton("Back", "Pressed")}
             onUp={() => mouseButton("Back", "Released")}
+            resetRegistry={heldInputResetRegistryRef.current!}
           />
           <PressButton
             label="前进"
             onDown={() => mouseButton("Forward", "Pressed")}
             onUp={() => mouseButton("Forward", "Released")}
+            resetRegistry={heldInputResetRegistryRef.current!}
           />
           <IconButton label="双击" onClick={() => void mouseDoubleClick("Left", "mobile-left-double-click")}>
             <span className="text-sm font-medium">双击</span>
@@ -986,25 +1042,55 @@ export default function MobileController() {
           <IconButton label="下滚" onClick={() => wheel(-3)}>
             <ArrowDown size={20} />
           </IconButton>
-          <HoldKeyButton label="退格" keyboardKey="Backspace" onKeyState={keyState}>
+          <HoldKeyButton
+            label="退格"
+            keyboardKey="Backspace"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <Delete size={20} />
           </HoldKeyButton>
-          <HoldKeyButton label="回车" keyboardKey="Enter" onKeyState={keyState}>
+          <HoldKeyButton
+            label="回车"
+            keyboardKey="Enter"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <CornerDownLeft size={20} />
           </HoldKeyButton>
         </section>
 
         <section className="grid grid-cols-4 gap-2">
-          <HoldKeyButton label="左" keyboardKey="Left" onKeyState={keyState}>
+          <HoldKeyButton
+            label="左"
+            keyboardKey="Left"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <ArrowLeft size={20} />
           </HoldKeyButton>
-          <HoldKeyButton label="上" keyboardKey="Up" onKeyState={keyState}>
+          <HoldKeyButton
+            label="上"
+            keyboardKey="Up"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <ArrowUp size={20} />
           </HoldKeyButton>
-          <HoldKeyButton label="下" keyboardKey="Down" onKeyState={keyState}>
+          <HoldKeyButton
+            label="下"
+            keyboardKey="Down"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <ArrowDown size={20} />
           </HoldKeyButton>
-          <HoldKeyButton label="右" keyboardKey="Right" onKeyState={keyState}>
+          <HoldKeyButton
+            label="右"
+            keyboardKey="Right"
+            onKeyState={keyState}
+            resetRegistry={heldInputResetRegistryRef.current!}
+          >
             <ArrowRight size={20} />
           </HoldKeyButton>
         </section>
@@ -1016,6 +1102,7 @@ export default function MobileController() {
               label={button.label}
               keyboardKey={button.key}
               onKeyState={keyState}
+              resetRegistry={heldInputResetRegistryRef.current!}
             >
               <span className="text-sm font-medium">{button.label}</span>
             </HoldKeyButton>
@@ -1029,6 +1116,7 @@ export default function MobileController() {
               label={button.label}
               keyboardKey={button.key}
               onKeyState={keyState}
+              resetRegistry={heldInputResetRegistryRef.current!}
             >
               <span className="text-sm font-medium">{button.label}</span>
             </HoldKeyButton>
@@ -1111,11 +1199,13 @@ function HoldKeyButton({
   label,
   keyboardKey,
   onKeyState,
+  resetRegistry,
 }: {
   children: React.ReactNode;
   label: string;
   keyboardKey: string;
   onKeyState: (key: string, state: "Pressed" | "Released") => void;
+  resetRegistry: HeldInputResetRegistry;
 }) {
   const suppressKeyboardClickRef = useRef(false);
   const resetSyntheticClickSuppression = () => {
@@ -1124,6 +1214,7 @@ function HoldKeyButton({
   const held = useHeldInputController(
     (state) => onKeyState(keyboardKey, state),
     resetSyntheticClickSuppression,
+    resetRegistry,
   );
 
   return (
@@ -1183,10 +1274,12 @@ function PressButton({
   label,
   onDown,
   onUp,
+  resetRegistry,
 }: {
   label: string;
   onDown: () => void;
   onUp: () => void;
+  resetRegistry: HeldInputResetRegistry;
 }) {
   const suppressKeyboardClickRef = useRef(false);
   const resetSyntheticClickSuppression = () => {
@@ -1201,6 +1294,7 @@ function PressButton({
       }
     },
     resetSyntheticClickSuppression,
+    resetRegistry,
   );
 
   return (

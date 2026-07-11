@@ -295,6 +295,33 @@ export function buildMobileReleaseAllRequests(x, y, correlationPrefix, heldInten
   ];
 }
 
+export function buildHeldIntentReleaseRequests(x, y, correlationPrefix, heldIntent = {}) {
+  const mouseButtons = (Array.isArray(heldIntent?.mouseButtons) ? heldIntent.mouseButtons : [])
+    .map(String)
+    .filter(Boolean)
+    .filter((button, index, values) => values.indexOf(button) === index)
+    .slice(0, DEFAULT_MAX_HELD_MOUSE_BUTTONS);
+  const keys = (Array.isArray(heldIntent?.keys) ? heldIntent.keys : [])
+    .map(String)
+    .filter(Boolean)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .slice(0, DEFAULT_MAX_HELD_KEYS);
+  return [
+    ...mouseButtons.map((button) =>
+      buildMouseButtonRequest(
+        button,
+        "Released",
+        x,
+        y,
+        `${correlationPrefix}-mouse-${keyCorrelationSlug(button)}`,
+      ),
+    ),
+    ...keys.map((key) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-key-${keyCorrelationSlug(key)}`),
+    ),
+  ];
+}
+
 function heldInputTransition(request) {
   const endpointRequest = request?.InjectEndpointEvent?.request;
   const payload = endpointRequest?.payload;
@@ -363,7 +390,7 @@ export function createMobileHeldIntentTracker(options = {}) {
       entry.pendingPressCount += 1;
       return token;
     },
-    settle(token, accepted) {
+    settle(token, outcome) {
       if (!token || token.settled) {
         return false;
       }
@@ -382,13 +409,13 @@ export function createMobileHeldIntentTracker(options = {}) {
         if (token.pendingPress) {
           entry.pendingPressCount = Math.max(0, entry.pendingPressCount - 1);
         }
-        if (accepted) {
+        if (outcome === "accepted" || outcome === "unknown") {
           entry.accepted = true;
         }
         cleanup(store, identity, entry);
         return true;
       }
-      if (accepted && entry) {
+      if (outcome === "accepted" && entry) {
         entry.accepted = false;
         cleanup(store, identity, entry);
       }
@@ -444,8 +471,42 @@ export function createHeldInputController(sendState) {
     releaseIfPointerStillDown(pointerId, buttons) {
       return buttons ? releasePointer(pointerId) : false;
     },
+    resetSilently() {
+      const changed = active;
+      active = false;
+      activePointerId = null;
+      return changed;
+    },
     isPressed() {
       return active;
+    },
+  };
+}
+
+export function createHeldInputResetRegistry() {
+  const resetters = new Set();
+  let revision = 0;
+  return {
+    register(reset) {
+      resetters.add(reset);
+      return () => resetters.delete(reset);
+    },
+    markChanged() {
+      revision += 1;
+    },
+    capture() {
+      return revision;
+    },
+    resetAll(expectedRevision = revision) {
+      if (expectedRevision !== revision) {
+        return 0;
+      }
+      let resetCount = 0;
+      for (const reset of [...resetters]) {
+        reset();
+        resetCount += 1;
+      }
+      return resetCount;
     },
   };
 }

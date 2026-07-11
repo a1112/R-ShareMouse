@@ -442,23 +442,23 @@ test("held intent tracker rolls back rejected presses and retains failed release
 
   const firstPress = tracker.provision(backspaceDown);
   assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
-  tracker.settle(firstPress, true);
+  tracker.settle(firstPress, "accepted");
 
   const repeatedPress = tracker.provision(backspaceDown);
-  tracker.settle(repeatedPress, false);
+  tracker.settle(repeatedPress, "rejected");
   assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
 
   const failedRelease = tracker.provision(backspaceUp);
-  tracker.settle(failedRelease, false);
+  tracker.settle(failedRelease, "rejected");
   assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
 
   const acceptedRelease = tracker.provision(backspaceUp);
-  tracker.settle(acceptedRelease, true);
+  tracker.settle(acceptedRelease, "accepted");
   assert.deepEqual(tracker.snapshot().keys, []);
 
   const rejectedNewPress = tracker.provision(buildKeyRequest("Enter", "Pressed", "enter-down"));
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
-  tracker.settle(rejectedNewPress, false);
+  tracker.settle(rejectedNewPress, "rejected");
   assert.deepEqual(tracker.snapshot().keys, []);
 });
 
@@ -472,15 +472,15 @@ test("held intent tracker keeps atomic press-release intent until outcomes are k
   const release = tracker.provision(up);
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
 
-  tracker.settle(press, true);
-  tracker.settle(release, false);
+  tracker.settle(press, "accepted");
+  tracker.settle(release, "rejected");
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
 
   const acceptedRelease = tracker.provision(up);
   const laterPress = tracker.provision(down);
-  tracker.settle(acceptedRelease, true);
+  tracker.settle(acceptedRelease, "accepted");
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
-  tracker.settle(laterPress, true);
+  tracker.settle(laterPress, "accepted");
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
 });
 
@@ -494,7 +494,7 @@ test("held intent tracker bounds new identities without losing existing state", 
   assert.equal(overflow.allowed, false);
   assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
 
-  tracker.settle(first, false);
+  tracker.settle(first, "rejected");
   const recovered = tracker.provision(buildKeyRequest("Enter", "Pressed", "recovered"));
   assert.equal(recovered.allowed, true);
   assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
@@ -506,7 +506,7 @@ test("release-all snapshot includes a press still waiting in the ordered queue",
   const tracker = mobileController.createMobileHeldIntentTracker();
   const queue = createOrderedMobileRequestQueue(async ({ intent }) => {
     await pressGate.promise;
-    tracker.settle(intent, true);
+    tracker.settle(intent, "accepted");
     return true;
   });
   const pressRequest = buildKeyRequest("ArrowLeft", "Pressed", "slow-left-down");
@@ -529,6 +529,132 @@ test("release-all snapshot includes a press still waiting in the ordered queue",
 
   pressGate.resolve();
   await press;
+});
+
+test("held intent tracker distinguishes unknown outcomes from explicit rejection", () => {
+  assert.equal(typeof mobileController.createMobileHeldIntentTracker, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const down = buildKeyRequest("Backspace", "Pressed", "unknown-down");
+  const up = buildKeyRequest("Backspace", "Released", "unknown-up");
+
+  const unknownPress = tracker.provision(down);
+  tracker.settle(unknownPress, "unknown");
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+
+  const unknownRelease = tracker.provision(up);
+  tracker.settle(unknownRelease, "unknown");
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+
+  const acceptedRelease = tracker.provision(up);
+  tracker.settle(acceptedRelease, "accepted");
+  assert.deepEqual(tracker.snapshot().keys, []);
+
+  const rejectedPress = tracker.provision(buildKeyRequest("Enter", "Pressed", "rejected"));
+  tracker.settle(rejectedPress, "rejected");
+  assert.deepEqual(tracker.snapshot().keys, []);
+});
+
+test("transport-unknown press remains in the release-all retry snapshot", async () => {
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const queue = createOrderedMobileRequestQueue(async ({ intent }) => {
+    try {
+      throw new Error("response lost after invoke");
+    } catch {
+      tracker.settle(intent, "unknown");
+      return false;
+    }
+  });
+  const request = buildKeyRequest("PageDown", "Pressed", "unknown-page-down");
+  const intent = tracker.provision(request);
+
+  assert.equal(await queue.enqueue({ request, intent }), false);
+  assert.deepEqual(tracker.snapshot().keys, ["PageDown"]);
+  const releases = buildMobileReleaseAllRequests(0, 0, "retry", tracker.snapshot());
+  assert.equal(
+    releases.some(
+      (release) => release.InjectEndpointEvent.request.payload.data.key === "PageDown",
+    ),
+    true,
+  );
+});
+
+test("held controller reset registry clears local state without sending release", () => {
+  assert.equal(typeof mobileController.createHeldInputResetRegistry, "function");
+  const states = [];
+  const held = createHeldInputController((state) => states.push(state));
+  const registry = mobileController.createHeldInputResetRegistry();
+  registry.register(() => held.resetSilently());
+
+  held.press(4);
+  assert.equal(registry.resetAll(), 1);
+  assert.equal(held.isPressed(), false);
+  assert.deepEqual(states, ["Pressed"]);
+});
+
+test("held controller reset registry never clears input newer than the release batch", () => {
+  const registry = mobileController.createHeldInputResetRegistry();
+  let resetCount = 0;
+  registry.register(() => {
+    resetCount += 1;
+  });
+
+  const releaseRevision = registry.capture();
+  registry.markChanged();
+  assert.equal(registry.resetAll(releaseRevision), 0);
+  assert.equal(resetCount, 0);
+
+  assert.equal(registry.resetAll(registry.capture()), 1);
+  assert.equal(resetCount, 1);
+});
+
+test("tracked lifecycle retry releases a failed pointer-up without hardcoded keys", async () => {
+  assert.equal(typeof mobileController.buildHeldIntentReleaseRequests, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const down = buildKeyRequest("Backspace", "Pressed", "down");
+  const up = buildKeyRequest("Backspace", "Released", "up");
+  tracker.settle(tracker.provision(down), "accepted");
+  tracker.settle(tracker.provision(up), "unknown");
+
+  const releases = mobileController.buildHeldIntentReleaseRequests(
+    5,
+    6,
+    "lifecycle",
+    tracker.snapshot(),
+  );
+  assert.deepEqual(
+    releases.map((request) => request.InjectEndpointEvent.request.payload.data),
+    [{ key: "Backspace", state: "Released" }],
+  );
+  const releaseIntent = tracker.provision(releases[0]);
+  tracker.settle(releaseIntent, "accepted");
+  assert.deepEqual(tracker.snapshot().keys, []);
+});
+
+test("mobile controller retries tracked lifecycle releases and silently resets on success", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /heldInputResetRegistryRef/);
+  assert.match(source, /function releaseTrackedInputsForLifecycle\(\)/);
+  assert.match(source, /buildHeldIntentReleaseRequests\([\s\S]*heldIntentTrackerRef\.current!\.snapshot\(\)/);
+  assert.match(
+    source,
+    /function releaseMobileInteractionForLifecycle\(\) \{\s*releaseTouchpadInteraction\(\);\s*releaseTrackedInputsForLifecycle\(\);/,
+  );
+  assert.match(
+    source,
+    /window\.addEventListener\("pagehide", releaseMobileInteractionForLifecycle\)/,
+  );
+  assert.match(source, /document\.visibilityState === "hidden"/);
+  const releaseAllStart = source.indexOf("async function releaseAllInputs()");
+  const releaseAllEnd = source.indexOf("async function commitText()", releaseAllStart);
+  const releaseAll = source.slice(releaseAllStart, releaseAllEnd);
+  assert.match(releaseAll, /const resetRevision = heldInputResetRegistryRef\.current!\.capture\(\);/);
+  assert.match(
+    releaseAll,
+    /const released = await sendRequestBatch\(requests\);\s*if \(released\) \{\s*heldInputResetRegistryRef\.current!\.resetAll\(resetRevision\);/,
+  );
+  const mouseClickStart = source.indexOf("async function mouseClick(");
+  assert.doesNotMatch(source.slice(mouseClickStart, releaseAllStart), /resetAll\(\)/);
 });
 
 test("buildKeyTapRequests emits press and release requests with stable ordering", () => {
@@ -618,9 +744,19 @@ test("mobile controller releases touchpad drag when the page lifecycle cancels i
 
   assert.match(source, /function releaseTouchpadInteraction\(\)/);
   assert.match(source, /releaseTouchpadDrag\(\);/);
-  assert.match(source, /window\.addEventListener\("blur", releaseTouchpadInteraction\)/);
-  assert.match(source, /window\.addEventListener\("pagehide", releaseTouchpadInteraction\)/);
-  assert.match(source, /document\.addEventListener\("visibilitychange", releaseTouchpadInteractionWhenHidden\)/);
+  assert.match(source, /releaseMobileInteractionForLifecycle/);
+  assert.match(
+    source,
+    /window\.addEventListener\("blur", releaseMobileInteractionForLifecycle\)/,
+  );
+  assert.match(
+    source,
+    /window\.addEventListener\("pagehide", releaseMobileInteractionForLifecycle\)/,
+  );
+  assert.match(
+    source,
+    /document\.addEventListener\("visibilitychange", releaseMobileInteractionWhenHidden\)/,
+  );
   assert.match(source, /document\.visibilityState === "hidden"/);
 });
 
@@ -1331,8 +1467,9 @@ test("held control lifecycle release also clears synthetic click suppression", (
     /const releaseForLifecycle = \(\) => \{\s*controllerRef\.current\?\.releaseAll\(\);\s*onLifecycleResetRef\.current\(\);\s*\};/,
   );
   assert.equal(
-    (source.match(/useHeldInputController\([\s\S]*?resetSyntheticClickSuppression,\s*\);/g) ?? [])
-      .length,
+    (source.match(
+      /useHeldInputController\([\s\S]*?resetSyntheticClickSuppression,\s*resetRegistry,\s*\);/g,
+    ) ?? []).length,
     2,
   );
 });
