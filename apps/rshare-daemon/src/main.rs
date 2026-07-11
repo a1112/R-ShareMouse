@@ -6743,6 +6743,26 @@ fn forward_input_events_to_captured_channel(
     });
 }
 
+fn flatten_daemon_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn complete_mobile_gateway_shutdown(
+    shutdown_tx: &broadcast::Sender<()>,
+    mobile_gateway_task: Option<&mut tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let _ = shutdown_tx.send(());
+    match mobile_gateway_task {
+        Some(task) => flatten_daemon_task_result(task.await),
+        None => Ok(()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_file = get_log_file_path();
@@ -7007,8 +7027,8 @@ async fn main() -> Result<()> {
     let mobile_gateway_network_manager = network_manager.clone();
     let mobile_gateway_inject_backend = inject_backend.clone();
     let mobile_gateway_local_events_tx = local_events_tx.clone();
-    let mobile_gateway_shutdown_rx = shutdown_tx.subscribe();
-    let mobile_gateway_task = async move {
+    let mut mobile_gateway_shutdown_rx = shutdown_tx.subscribe();
+    let mut mobile_gateway_task = tokio::spawn(async move {
         if mobile_gateway_enabled {
             mobile_gateway::run_mobile_gateway_server(
                 mobile_access,
@@ -7021,9 +7041,10 @@ async fn main() -> Result<()> {
             .await
         } else {
             tracing::info!("Mobile gateway disabled by configuration");
-            std::future::pending::<Result<()>>().await
+            let _ = mobile_gateway_shutdown_rx.recv().await;
+            Ok(())
         }
-    };
+    });
 
     let input_forwarding_task = tokio::spawn(run_input_forwarding_loop(
         input_rx,
@@ -7140,37 +7161,51 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!("Entering tokio::select! loop");
-    tokio::select! {
+    let mut mobile_gateway_finished = false;
+    let shutdown_reason: Result<()> = tokio::select! {
         result = signal::ctrl_c() => {
             match result {
                 Ok(()) => tracing::info!("Shutdown signal received"),
                 Err(e) => tracing::warn!("Ctrl-C handler error: {}", e),
             }
+            Ok(())
         }
         _ = shutdown_rx.recv() => {
             tracing::info!("Shutdown requested over IPC");
+            Ok(())
         }
         result = ipc_task => {
             tracing::info!("IPC task completed");
-            result??;
+            flatten_daemon_task_result(result)
         }
         result = local_controls_ws_task => {
             tracing::info!("Local controls websocket task completed");
-            result??;
+            flatten_daemon_task_result(result)
         }
-        result = mobile_gateway_task => {
+        result = &mut mobile_gateway_task => {
             tracing::info!("Mobile gateway task completed");
-            result?;
+            mobile_gateway_finished = true;
+            flatten_daemon_task_result(result)
         }
         result = event_task => {
             tracing::info!("Event task completed");
-            result?;
+            result.map_err(Into::into)
         }
         result = input_forwarding_task => {
             tracing::info!("Input forwarding task completed");
-            result??;
+            flatten_daemon_task_result(result)
         }
-    }
+    };
+
+    let mobile_shutdown_result = complete_mobile_gateway_shutdown(
+        &shutdown_tx,
+        if mobile_gateway_finished {
+            None
+        } else {
+            Some(&mut mobile_gateway_task)
+        },
+    )
+    .await;
 
     tracing::info!("tokio::select! exited, cleaning up");
     set_local_shortcut_suppression(false);
@@ -7178,7 +7213,11 @@ async fn main() -> Result<()> {
     audio_runtime.stop_render();
     audio_runtime.shutdown();
     // Input listener cleanup is handled automatically by task drops
-    network_manager.lock().await.stop().await?;
+    let network_stop_result = network_manager.lock().await.stop().await;
+
+    shutdown_reason?;
+    mobile_shutdown_result?;
+    network_stop_result?;
 
     tracing::info!("R-ShareMouse daemon stopped");
     std::process::exit(0);
@@ -7846,6 +7885,27 @@ mod tests {
 
         assert!(!config.features.automatic_input_forwarding);
         assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_waits_for_mobile_cleanup_before_returning() {
+        let (shutdown_tx, _) = broadcast::channel::<()>(4);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut mobile_task = tokio::spawn(async move {
+            events_tx.send("Pressed").unwrap();
+            let _ = shutdown_rx.recv().await;
+            tokio::task::yield_now().await;
+            events_tx.send("Released").unwrap();
+            Ok(())
+        });
+
+        assert_eq!(events_rx.recv().await, Some("Pressed"));
+        complete_mobile_gateway_shutdown(&shutdown_tx, Some(&mut mobile_task))
+            .await
+            .unwrap();
+
+        assert_eq!(events_rx.try_recv(), Ok("Released"));
     }
 
     #[test]
