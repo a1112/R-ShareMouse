@@ -105,33 +105,35 @@ fn spawn_message_reader(
     lifecycle_lock: Arc<TokioMutex<()>>,
 ) {
     tokio::spawn(async move {
-        if let Some(message) = first_message {
-            if !forward_message_for_generation(
-                &connections,
-                &lifecycle_lock,
-                &event_tx,
-                device_id,
-                generation,
-                message,
-            )
-            .await
-            {
-                return;
+        'forwarding: {
+            if let Some(message) = first_message {
+                if !forward_message_for_generation(
+                    &connections,
+                    &lifecycle_lock,
+                    &event_tx,
+                    device_id,
+                    generation,
+                    message,
+                )
+                .await
+                {
+                    break 'forwarding;
+                }
             }
-        }
 
-        while let Some(message) = messages.recv().await {
-            if !forward_message_for_generation(
-                &connections,
-                &lifecycle_lock,
-                &event_tx,
-                device_id,
-                generation,
-                message,
-            )
-            .await
-            {
-                break;
+            while let Some(message) = messages.recv().await {
+                if !forward_message_for_generation(
+                    &connections,
+                    &lifecycle_lock,
+                    &event_tx,
+                    device_id,
+                    generation,
+                    message,
+                )
+                .await
+                {
+                    break 'forwarding;
+                }
             }
         }
 
@@ -782,6 +784,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_message_delivery_failure_retires_generation() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("first-message-receiver-closed");
+
+        let mut server = QuicTransport::new(remote_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let accepted = tokio::spawn(async move { incoming.recv().await.unwrap().connection });
+
+        let mut client = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut connection = client
+            .connect(&address.to_string(), remote_id)
+            .await
+            .unwrap();
+        let _server_connection = accepted.await.unwrap();
+        connection.confirm_peer_identity(remote_id).unwrap();
+        connection.set_device_id(remote_id);
+        let messages = connection.message_channel();
+
+        let mut manager = ConnectionManager::new(local_id);
+        drop(manager.events().unwrap());
+        let generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: remote_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: None,
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+            },
+        );
+        manager
+            .pool
+            .insert_with_generation(remote_id, generation, connection)
+            .await;
+
+        spawn_message_reader(
+            remote_id,
+            generation,
+            messages,
+            Some(Message::MouseMove { x: 3, y: 5 }),
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.pool.clone(),
+            manager.lifecycle_lock.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !is_current_generation(&manager.connections, remote_id, generation)
+                    && manager.pool.diagnostics_for(&remote_id).await.is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a reader must retire when its first event cannot be delivered");
+
+        server.close().await.unwrap();
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
     async fn retirement_waiting_for_event_capacity_does_not_hold_lifecycle() {
         let device_id = DeviceId::new_v4();
         let mut manager = ConnectionManager::new(DeviceId::new_v4());
@@ -856,6 +935,150 @@ mod tests {
             device_id,
             generation
         ));
+    }
+
+    #[tokio::test]
+    async fn reserved_old_retirement_cannot_disconnect_new_generation() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("reserved-retirement-race");
+
+        let mut server = QuicTransport::new(remote_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut first_client =
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut old_connection = first_client
+            .connect(&address.to_string(), remote_id)
+            .await
+            .unwrap();
+        let _first_server_connection = incoming.recv().await.unwrap().connection;
+        old_connection.confirm_peer_identity(remote_id).unwrap();
+        old_connection.set_device_id(remote_id);
+
+        let mut second_client =
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut new_connection = second_client
+            .connect(&address.to_string(), remote_id)
+            .await
+            .unwrap();
+        let _second_server_connection = incoming.recv().await.unwrap().connection;
+        new_connection.confirm_peer_identity(remote_id).unwrap();
+        new_connection.set_device_id(remote_id);
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+        let old_generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: remote_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: None,
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+            },
+        );
+        manager
+            .pool
+            .insert_with_generation(remote_id, old_generation, old_connection)
+            .await;
+
+        let connected_permit = manager.event_tx.reserve().await.unwrap();
+        let lifecycle = manager.lifecycle_lock.lock().await;
+        let retire_task = tokio::spawn({
+            let connections = manager.connections.clone();
+            let pool = manager.pool.clone();
+            let lifecycle_lock = manager.lifecycle_lock.clone();
+            let event_tx = manager.event_tx.clone();
+            async move {
+                retire_generation(
+                    &connections,
+                    &pool,
+                    &lifecycle_lock,
+                    &event_tx,
+                    remote_id,
+                    old_generation,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.event_tx.capacity() == 98 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old retirement should reserve capacity before waiting on lifecycle");
+        assert!(!retire_task.is_finished());
+
+        let new_generation = allocate_generation(&manager.next_generation);
+        manager
+            .pool
+            .insert_with_generation(remote_id, new_generation, new_connection)
+            .await;
+        manager
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .insert(
+                remote_id,
+                CanonicalConnection {
+                    generation: new_generation,
+                    info: ConnectionInfo {
+                        device_id: remote_id,
+                        address: address.to_string(),
+                        state: ConnectionState::Connected,
+                        last_activity: Instant::now(),
+                        messages_sent: 0,
+                        messages_received: 0,
+                        transport: "quic".to_string(),
+                        datagram_available: true,
+                        rtt_ms: Some(1),
+                        last_datagram_rx_ms: None,
+                        datagram_tx_dropped: 0,
+                        reliable_stream_reset_count: 0,
+                        cert_trust_state: Some("trusted".to_string()),
+                    },
+                },
+            );
+        connected_permit.send(ManagerEvent::Connected(remote_id));
+        drop(lifecycle);
+
+        assert!(!retire_task.await.unwrap());
+        assert!(matches!(
+            events.recv().await,
+            Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(is_current_generation(
+            &manager.connections,
+            remote_id,
+            new_generation
+        ));
+        assert!(manager.pool.diagnostics_for(&remote_id).await.is_some());
+
+        server.close().await.unwrap();
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[tokio::test]
