@@ -48,13 +48,36 @@ impl VirtualDisplayCleanup {
     fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            armed: true,
+            armed: false,
         }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
     }
 
     fn disarm(&mut self) {
         self.armed = false;
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn virtual_display_cleanup_starts_disarmed() {
+    let cleanup = std::mem::ManuallyDrop::new(VirtualDisplayCleanup::new("vd-test"));
+
+    assert!(!cleanup.armed);
+}
+
+#[cfg(windows)]
+#[test]
+fn virtual_display_cleanup_can_be_armed_after_create_and_disarmed_after_remove() {
+    let mut cleanup = std::mem::ManuallyDrop::new(VirtualDisplayCleanup::new("vd-test"));
+
+    cleanup.arm();
+    assert!(cleanup.armed);
+    cleanup.disarm();
+    assert!(!cleanup.armed);
 }
 
 #[cfg(windows)]
@@ -113,6 +136,7 @@ fn windows_virtual_display_driver_round_trip_requires_explicit_opt_in() {
             .as_deref()
             .unwrap_or("no driver diagnostic")
     );
+    cleanup.arm();
     let display = create_result
         .display
         .as_ref()
