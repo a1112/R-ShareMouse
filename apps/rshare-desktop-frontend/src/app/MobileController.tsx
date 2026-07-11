@@ -18,6 +18,7 @@ import {
   MOBILE_POINTER_SENSITIVITY,
   MOBILE_SHORTCUT_BUTTONS,
   MOBILE_TEXT_INPUT_HINTS,
+  applyMobileStatusRefreshResult,
   buildKeyChordRequests,
   buildKeyRequest,
   buildMobileReleaseAllRequests,
@@ -28,6 +29,7 @@ import {
   buildMouseWheelRequest,
   buildTextCommitRequest,
   createHeldInputController,
+  createMobileHeldIntentTracker,
   createMobileCorrelationId,
   createMobileStatusRefreshController,
   createOrderedMobileRequestQueue,
@@ -71,7 +73,7 @@ type TwoFingerTapStart = { touches: TouchPoint[]; timeMs: number };
 type HeldInputState = "Pressed" | "Released";
 type MouseButtonName = "Left" | "Right" | "Middle" | "Back" | "Forward";
 type MobileBackendStatus = ReturnType<typeof formatMobileBackendStatus>;
-type QueuedMobileRequest = { request: unknown; quiet: boolean };
+type QueuedMobileRequest = { request: unknown; quiet: boolean; heldIntent: unknown };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -321,6 +323,9 @@ export default function MobileController() {
   const dragPointerRef = useRef<number | null>(null);
   const sensitivityRef = useRef(pointerSensitivity);
   const pointerRef = useRef(pointer);
+  const heldIntentTrackerRef = useRef<ReturnType<typeof createMobileHeldIntentTracker> | null>(
+    null,
+  );
   const sendRequestNowRef = useRef<(queued: QueuedMobileRequest) => Promise<boolean>>(async () =>
     false,
   );
@@ -330,6 +335,10 @@ export default function MobileController() {
   > | null>(null);
   const sendMoveNowRef = useRef<(next: PointerState) => Promise<boolean>>(async () => false);
   const moveCoalescerRef = useRef<ReturnType<typeof createPointerMoveCoalescer> | null>(null);
+
+  if (!heldIntentTrackerRef.current) {
+    heldIntentTrackerRef.current = createMobileHeldIntentTracker();
+  }
 
   if (!requestQueueRef.current) {
     requestQueueRef.current = createOrderedMobileRequestQueue((queued: QueuedMobileRequest) =>
@@ -365,18 +374,21 @@ export default function MobileController() {
         if (cancelled) {
           return;
         }
-        if (result.state) {
-          if (options.applyPointer) {
-            pointerRef.current = result.state.pointer;
-            setPointer(result.state.pointer);
-          }
-          setBackendStatus(result.state.backendStatus);
-          if (options.applyStatus) {
-            setStatus("已连接");
-          }
-        } else if (options.applyStatus) {
-          setStatus(formatMobileControllerError(result.error, "移动端状态"));
-        }
+        applyMobileStatusRefreshResult(result, options, {
+          applyPointer(next: PointerState) {
+            pointerRef.current = next;
+            setPointer(next);
+          },
+          applyBackendStatus(next: MobileBackendStatus) {
+            setBackendStatus(next);
+          },
+          applyStatus(next: string) {
+            setStatus(next);
+          },
+          applyError(error: unknown) {
+            setStatus(formatMobileControllerError(error, "移动端状态"));
+          },
+        });
       },
     );
     statusRefreshRef.current = refreshController;
@@ -395,13 +407,18 @@ export default function MobileController() {
     };
   }, []);
 
-  async function sendRequestNow({ request, quiet }: QueuedMobileRequest) {
+  async function sendRequestNow({ request, quiet, heldIntent }: QueuedMobileRequest) {
+    let accepted = false;
     if (!quiet) {
       setSendState("sending");
     }
     try {
+      if ((heldIntent as { allowed?: boolean } | null)?.allowed === false) {
+        throw new Error("同时按住的移动端按键数量超过安全限制");
+      }
       const result = await sendInjectRequest(request);
       const feedback = formatMobileInjectResultStatus(result);
+      accepted = feedback.accepted;
       if (!feedback.accepted) {
         statusRefreshRef.current?.markStatusChanged();
         setSendState("error");
@@ -419,18 +436,28 @@ export default function MobileController() {
       setSendState("error");
       setStatus(formatMobileControllerError(error, "移动端注入"));
       return false;
+    } finally {
+      heldIntentTrackerRef.current!.settle(heldIntent, accepted);
     }
   }
 
   sendRequestNowRef.current = sendRequestNow;
 
+  function queuedRequest(request: unknown, quiet: boolean): QueuedMobileRequest {
+    return {
+      request,
+      quiet,
+      heldIntent: heldIntentTrackerRef.current!.provision(request),
+    };
+  }
+
   function sendRequest(request: unknown, quiet = false) {
-    return requestQueueRef.current!.enqueue({ request, quiet }) as Promise<boolean>;
+    return requestQueueRef.current!.enqueue(queuedRequest(request, quiet)) as Promise<boolean>;
   }
 
   async function sendRequestBatch(requests: readonly unknown[], quiet = false) {
     const responses = (await requestQueueRef.current!.enqueueBatch(
-      requests.map((request) => ({ request, quiet })),
+      requests.map((request) => queuedRequest(request, quiet)),
     )) as boolean[];
     return responses.every(Boolean);
   }
@@ -802,6 +829,7 @@ export default function MobileController() {
       current.x,
       current.y,
       createMobileCorrelationId("mobile-release-all"),
+      heldIntentTrackerRef.current!.snapshot(),
     );
     return sendRequestBatch(requests);
   }

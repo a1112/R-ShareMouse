@@ -1911,9 +1911,11 @@ async function inject(request, expectedGeneration = inputGeneration) {
     return false;
   }
 }
-function enqueueInjectBatch(requests, expectedGeneration = inputGeneration) {
-  const batch = Array.isArray(requests) ? [...requests] : [];
+function enqueueInjectBatchFactory(buildRequests, expectedGeneration = inputGeneration) {
   const result = mobileRequestQueueTail.then(async () => {
+    if (inputSuspended || expectedGeneration !== inputGeneration) return [];
+    const batch = buildRequests();
+    if (!Array.isArray(batch)) return [];
     const accepted = [];
     for (const request of batch) {
       accepted.push(await inject(request, expectedGeneration));
@@ -1925,6 +1927,10 @@ function enqueueInjectBatch(requests, expectedGeneration = inputGeneration) {
     () => undefined
   );
   return result;
+}
+function enqueueInjectBatch(requests, expectedGeneration = inputGeneration) {
+  const batch = Array.isArray(requests) ? [...requests] : [];
+  return enqueueInjectBatchFactory(() => batch, expectedGeneration);
 }
 function enqueueInject(request, expectedGeneration = inputGeneration) {
   return enqueueInjectBatch([request], expectedGeneration).then(([accepted]) => accepted);
@@ -2105,7 +2111,7 @@ function releaseAllRequests(prefix) {
 async function sendReleaseAll() {
   const generation = inputGeneration;
   flushMove();
-  return enqueueInjectBatch(releaseAllRequests("mobile-release-all"), generation);
+  return enqueueInjectBatchFactory(() => releaseAllRequests("mobile-release-all"), generation);
 }
 function keepaliveReleaseBatch(requests) {
   if (!Array.isArray(requests) || requests.length === 0) return false;
@@ -4022,6 +4028,37 @@ mod tests {
                 "{batch_flow} must enqueue atomically"
             );
         }
+    }
+
+    #[test]
+    fn rendered_mobile_page_builds_release_all_from_held_intent_at_dequeue() {
+        let page = render_mobile_page();
+
+        let factory_start = page
+            .find("function enqueueInjectBatchFactory(buildRequests, expectedGeneration = inputGeneration)")
+            .expect("missing lazy batch factory");
+        let factory_end = page[factory_start..]
+            .find("function enqueueInjectBatch(requests, expectedGeneration = inputGeneration)")
+            .map(|offset| factory_start + offset)
+            .expect("missing ordinary batch wrapper");
+        let factory = &page[factory_start..factory_end];
+        assert!(
+            factory.find("mobileRequestQueueTail.then").unwrap()
+                < factory.find("const batch = buildRequests();").unwrap()
+        );
+
+        let release_start = page
+            .find("async function sendReleaseAll()")
+            .expect("missing release-all flow");
+        let release_end = page[release_start..]
+            .find("function keepaliveReleaseBatch")
+            .map(|offset| release_start + offset)
+            .expect("missing keepalive release function");
+        let release = &page[release_start..release_end];
+        assert!(release.contains(
+            "enqueueInjectBatchFactory(() => releaseAllRequests(\"mobile-release-all\"), generation)"
+        ));
+        assert!(!release.contains("enqueueInjectBatch(releaseAllRequests"));
     }
 
     #[test]

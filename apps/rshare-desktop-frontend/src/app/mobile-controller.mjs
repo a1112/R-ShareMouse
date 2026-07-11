@@ -1,5 +1,7 @@
 const DEFAULT_MOUSE_TIMEOUT_MS = 250;
 const DEFAULT_KEYBOARD_TIMEOUT_MS = 750;
+const DEFAULT_MAX_HELD_KEYS = 64;
+const DEFAULT_MAX_HELD_MOUSE_BUTTONS = 16;
 
 export const MOBILE_LONG_PRESS_DRAG_DELAY_MS = 420;
 
@@ -258,11 +260,27 @@ export function buildKeyChordRequests(keys, correlationPrefix) {
   ];
 }
 
-export function buildMobileReleaseAllRequests(x, y, correlationPrefix) {
+export function buildMobileReleaseAllRequests(x, y, correlationPrefix, heldIntent = {}) {
   const mouseButtons = ["Left", "Middle", "Right", "Back", "Forward"];
   const modifierKeys = ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"];
+  const allMouseButtons = [
+    ...mouseButtons,
+    ...(Array.isArray(heldIntent?.mouseButtons) ? heldIntent.mouseButtons : []),
+  ]
+    .map(String)
+    .filter(Boolean)
+    .filter((button, index, values) => values.indexOf(button) === index)
+    .slice(0, mouseButtons.length + DEFAULT_MAX_HELD_MOUSE_BUTTONS);
+  const allKeys = [
+    ...modifierKeys,
+    ...(Array.isArray(heldIntent?.keys) ? heldIntent.keys : []),
+  ]
+    .map(String)
+    .filter(Boolean)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .slice(0, modifierKeys.length + DEFAULT_MAX_HELD_KEYS);
   return [
-    ...mouseButtons.map((button) =>
+    ...allMouseButtons.map((button) =>
       buildMouseButtonRequest(
         button,
         "Released",
@@ -271,10 +289,122 @@ export function buildMobileReleaseAllRequests(x, y, correlationPrefix) {
         `${correlationPrefix}-mouse-${keyCorrelationSlug(button)}`,
       ),
     ),
-    ...modifierKeys.map((key) =>
+    ...allKeys.map((key) =>
       buildKeyRequest(key, "Released", `${correlationPrefix}-key-${keyCorrelationSlug(key)}`),
     ),
   ];
+}
+
+function heldInputTransition(request) {
+  const endpointRequest = request?.InjectEndpointEvent?.request;
+  const payload = endpointRequest?.payload;
+  const data = payload?.data;
+  const state = String(data?.state ?? "").toLowerCase();
+  if (state !== "pressed" && state !== "released") {
+    return null;
+  }
+  if (endpointRequest?.device_kind === "Keyboard" && payload?.kind === "Keyboard") {
+    const identity = String(data?.key ?? "");
+    return identity ? { kind: "key", identity, state } : null;
+  }
+  if (endpointRequest?.device_kind === "Mouse" && payload?.kind === "MouseButton") {
+    const identity = String(data?.button ?? "");
+    return identity ? { kind: "mouseButton", identity, state } : null;
+  }
+  return null;
+}
+
+export function createMobileHeldIntentTracker(options = {}) {
+  function positiveBound(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : fallback;
+  }
+  const maxKeys = positiveBound(options.maxKeys, DEFAULT_MAX_HELD_KEYS);
+  const maxMouseButtons = positiveBound(
+    options.maxMouseButtons,
+    DEFAULT_MAX_HELD_MOUSE_BUTTONS,
+  );
+  const keyEntries = new Map();
+  const mouseButtonEntries = new Map();
+
+  function storeFor(kind) {
+    return kind === "key" ? keyEntries : mouseButtonEntries;
+  }
+
+  function limitFor(kind) {
+    return kind === "key" ? maxKeys : maxMouseButtons;
+  }
+
+  function cleanup(store, identity, entry) {
+    if (!entry.accepted && entry.pendingPressCount === 0 && store.get(identity) === entry) {
+      store.delete(identity);
+    }
+  }
+
+  return {
+    provision(request) {
+      const transition = heldInputTransition(request);
+      const token = { allowed: true, settled: false, transition, pendingPress: false };
+      if (!transition || transition.state !== "pressed") {
+        return token;
+      }
+
+      const store = storeFor(transition.kind);
+      let entry = store.get(transition.identity);
+      if (!entry) {
+        if (store.size >= limitFor(transition.kind)) {
+          token.allowed = false;
+          return token;
+        }
+        entry = { accepted: false, pendingPressCount: 0 };
+        store.set(transition.identity, entry);
+      }
+      token.pendingPress = true;
+      entry.pendingPressCount += 1;
+      return token;
+    },
+    settle(token, accepted) {
+      if (!token || token.settled) {
+        return false;
+      }
+      token.settled = true;
+      if (!token.allowed || !token.transition) {
+        return false;
+      }
+
+      const { kind, identity, state } = token.transition;
+      const store = storeFor(kind);
+      const entry = store.get(identity);
+      if (state === "pressed") {
+        if (!entry) {
+          return false;
+        }
+        if (token.pendingPress) {
+          entry.pendingPressCount = Math.max(0, entry.pendingPressCount - 1);
+        }
+        if (accepted) {
+          entry.accepted = true;
+        }
+        cleanup(store, identity, entry);
+        return true;
+      }
+      if (accepted && entry) {
+        entry.accepted = false;
+        cleanup(store, identity, entry);
+      }
+      return true;
+    },
+    snapshot() {
+      return {
+        keys: [...keyEntries.entries()]
+          .filter(([, entry]) => entry.accepted || entry.pendingPressCount > 0)
+          .map(([identity]) => identity),
+        mouseButtons: [...mouseButtonEntries.entries()]
+          .filter(([, entry]) => entry.accepted || entry.pendingPressCount > 0)
+          .map(([identity]) => identity),
+      };
+    },
+  };
 }
 
 export function createHeldInputController(sendState) {
@@ -730,6 +860,22 @@ export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
       return lastQueuedMove ?? Promise.resolve();
     },
   };
+}
+
+export function applyMobileStatusRefreshResult(result, options, handlers = {}) {
+  if (result?.state) {
+    if (options?.applyPointer) {
+      handlers.applyPointer?.(result.state.pointer);
+    }
+    if (options?.applyStatus) {
+      handlers.applyBackendStatus?.(result.state.backendStatus);
+      handlers.applyStatus?.("已连接");
+    }
+    return;
+  }
+  if (options?.applyStatus) {
+    handlers.applyError?.(result?.error);
+  }
 }
 
 export function createMobileStatusRefreshController(fetchState, applyState) {

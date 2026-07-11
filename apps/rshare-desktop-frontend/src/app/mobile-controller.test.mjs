@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as mobileController from "./mobile-controller.mjs";
 
 import {
   MOBILE_TEXT_INPUT_HINTS,
@@ -408,6 +409,126 @@ test("buildMobileReleaseAllRequests releases mouse buttons and held modifiers", 
     requests.at(-1).InjectEndpointEvent.request.correlation_id,
     "mobile-release-all-key-superleft",
   );
+});
+
+test("buildMobileReleaseAllRequests unions dynamic held keys and buttons without duplicates", () => {
+  const requests = buildMobileReleaseAllRequests(10, 20, "mobile-release-all", {
+    keys: ["Backspace", "Enter", "ControlLeft"],
+    mouseButtons: ["Back", "Raw:8"],
+  });
+  const keyboard = requests
+    .filter((request) => request.InjectEndpointEvent.request.device_kind === "Keyboard")
+    .map((request) => request.InjectEndpointEvent.request.payload.data.key);
+  const mouse = requests
+    .filter((request) => request.InjectEndpointEvent.request.device_kind === "Mouse")
+    .map((request) => request.InjectEndpointEvent.request.payload.data.button);
+
+  assert.deepEqual(keyboard, [
+    "ControlLeft",
+    "ShiftLeft",
+    "AltLeft",
+    "SuperLeft",
+    "Backspace",
+    "Enter",
+  ]);
+  assert.deepEqual(mouse, ["Left", "Middle", "Right", "Back", "Forward", "Raw:8"]);
+});
+
+test("held intent tracker rolls back rejected presses and retains failed releases", () => {
+  assert.equal(typeof mobileController.createMobileHeldIntentTracker, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const backspaceDown = buildKeyRequest("Backspace", "Pressed", "backspace-down");
+  const backspaceUp = buildKeyRequest("Backspace", "Released", "backspace-up");
+
+  const firstPress = tracker.provision(backspaceDown);
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+  tracker.settle(firstPress, true);
+
+  const repeatedPress = tracker.provision(backspaceDown);
+  tracker.settle(repeatedPress, false);
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+
+  const failedRelease = tracker.provision(backspaceUp);
+  tracker.settle(failedRelease, false);
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+
+  const acceptedRelease = tracker.provision(backspaceUp);
+  tracker.settle(acceptedRelease, true);
+  assert.deepEqual(tracker.snapshot().keys, []);
+
+  const rejectedNewPress = tracker.provision(buildKeyRequest("Enter", "Pressed", "enter-down"));
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+  tracker.settle(rejectedNewPress, false);
+  assert.deepEqual(tracker.snapshot().keys, []);
+});
+
+test("held intent tracker keeps atomic press-release intent until outcomes are known", () => {
+  assert.equal(typeof mobileController.createMobileHeldIntentTracker, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const down = buildKeyRequest("Enter", "Pressed", "enter-down");
+  const up = buildKeyRequest("Enter", "Released", "enter-up");
+
+  const press = tracker.provision(down);
+  const release = tracker.provision(up);
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+
+  tracker.settle(press, true);
+  tracker.settle(release, false);
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+
+  const acceptedRelease = tracker.provision(up);
+  const laterPress = tracker.provision(down);
+  tracker.settle(acceptedRelease, true);
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+  tracker.settle(laterPress, true);
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+});
+
+test("held intent tracker bounds new identities without losing existing state", () => {
+  assert.equal(typeof mobileController.createMobileHeldIntentTracker, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker({ maxKeys: 1, maxMouseButtons: 1 });
+  const first = tracker.provision(buildKeyRequest("Backspace", "Pressed", "first"));
+  const overflow = tracker.provision(buildKeyRequest("Enter", "Pressed", "overflow"));
+
+  assert.equal(first.allowed, true);
+  assert.equal(overflow.allowed, false);
+  assert.deepEqual(tracker.snapshot().keys, ["Backspace"]);
+
+  tracker.settle(first, false);
+  const recovered = tracker.provision(buildKeyRequest("Enter", "Pressed", "recovered"));
+  assert.equal(recovered.allowed, true);
+  assert.deepEqual(tracker.snapshot().keys, ["Enter"]);
+});
+
+test("release-all snapshot includes a press still waiting in the ordered queue", async () => {
+  const pressGate = deferred();
+  assert.equal(typeof mobileController.createMobileHeldIntentTracker, "function");
+  const tracker = mobileController.createMobileHeldIntentTracker();
+  const queue = createOrderedMobileRequestQueue(async ({ intent }) => {
+    await pressGate.promise;
+    tracker.settle(intent, true);
+    return true;
+  });
+  const pressRequest = buildKeyRequest("ArrowLeft", "Pressed", "slow-left-down");
+  const intent = tracker.provision(pressRequest);
+  const press = queue.enqueue({ request: pressRequest, intent });
+
+  await Promise.resolve();
+  const releaseRequests = buildMobileReleaseAllRequests(
+    0,
+    0,
+    "release-slow",
+    tracker.snapshot(),
+  );
+  assert.equal(
+    releaseRequests.some(
+      (request) => request.InjectEndpointEvent.request.payload.data.key === "ArrowLeft",
+    ),
+    true,
+  );
+
+  pressGate.resolve();
+  await press;
 });
 
 test("buildKeyTapRequests emits press and release requests with stable ordering", () => {
@@ -1123,6 +1244,46 @@ test("status refresh waits for every pending pointer write before accepting coor
   thirdPoll.resolve({ pointer: { x: 3, y: 3 } });
   await afterAllAcks;
   assert.equal(applied[2].options.applyPointer, true);
+});
+
+test("mobile status result keeps backend status behind the status revision gate", () => {
+  assert.equal(typeof mobileController.applyMobileStatusRefreshResult, "function");
+  const applied = [];
+  const handlers = {
+    applyPointer(value) {
+      applied.push(["pointer", value]);
+    },
+    applyBackendStatus(value) {
+      applied.push(["backend", value]);
+    },
+    applyStatus(value) {
+      applied.push(["status", value]);
+    },
+    applyError(value) {
+      applied.push(["error", value]);
+    },
+  };
+  const result = {
+    state: { pointer: { x: 9, y: 8 }, backendStatus: { state: "blocked" } },
+    error: null,
+  };
+
+  mobileController.applyMobileStatusRefreshResult(
+    result,
+    { applyPointer: true, applyStatus: false },
+    handlers,
+  );
+  assert.deepEqual(applied, [["pointer", { x: 9, y: 8 }]]);
+
+  mobileController.applyMobileStatusRefreshResult(
+    result,
+    { applyPointer: false, applyStatus: true },
+    handlers,
+  );
+  assert.deepEqual(applied.slice(1), [
+    ["backend", { state: "blocked" }],
+    ["status", "已连接"],
+  ]);
 });
 
 test("held controls use click only for keyboard or assistive activation", () => {
