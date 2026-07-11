@@ -323,7 +323,7 @@ fn lease_release_request(
         correlation_id: format!("mobile-lease-{}-{}", client_id, mobile_timestamp_ms_now()),
         device_kind,
         payload,
-        mode: EndpointInjectMode::RequireHealthyBackend,
+        mode: EndpointInjectMode::BestEffort,
         timeout_ms: 750,
     }
 }
@@ -1673,9 +1673,14 @@ fn render_mobile_page_with_token(token: &str) -> String {
 </main>
 <script>
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
-const clientId = crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function newMobileClientId() {
+  return crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+let clientId = newMobileClientId();
 let mobileSequence = 0;
+let inputGeneration = 0;
 let inputSuspended = false;
+let refreshAbortController = null;
 const heldKeys = new Set();
 const heldMouseButtons = new Set();
 const statusEl = document.getElementById("status");
@@ -1870,13 +1875,13 @@ function formatInjectResultStatus(result) {
   const backendKind = injectResult.backend_kind ? ` · ${injectResult.backend_kind}` : "";
   return { accepted: false, status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}` };
 }
-function prepareOrdinaryInjectEnvelope(request) {
-  if (inputSuspended) return null;
+function prepareOrdinaryInjectEnvelope(request, expectedGeneration) {
+  if (inputSuspended || expectedGeneration !== inputGeneration) return null;
   trackHeldInputBeforeInject(request);
   return mobileEnvelope(request);
 }
-async function inject(request) {
-  const envelope = prepareOrdinaryInjectEnvelope(request);
+async function inject(request, expectedGeneration = inputGeneration) {
+  const envelope = prepareOrdinaryInjectEnvelope(request, expectedGeneration);
   if (!envelope) return false;
   try {
     const result = await api("/api/inject", {
@@ -1895,9 +1900,14 @@ async function inject(request) {
 }
 async function refresh() {
   if (inputSuspended) return;
+  if (refreshAbortController) refreshAbortController.abort();
+  const controller = new AbortController();
+  refreshAbortController = controller;
+  const pollingClientId = clientId;
+  const pollingGeneration = inputGeneration;
   try {
-    const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(clientId)}`);
-    if (inputSuspended) return;
+    const payload = await api(`/api/local-controls?client_id=${encodeURIComponent(pollingClientId)}`, { signal: controller.signal });
+    if (inputSuspended || pollingGeneration !== inputGeneration || pollingClientId !== clientId) return;
     const snapshot = payload.LocalControls || {};
     const mouse = snapshot.mouse || {};
     const display = snapshot.display || {};
@@ -1922,7 +1932,10 @@ async function refresh() {
     backendStatusEl.style.color = backendStatus.state === "ready" ? '#47c27a' : '#d6a64b';
     statusEl.textContent = "已连接";
   } catch (error) {
+    if (error?.name === "AbortError") return;
     statusEl.textContent = formatMobileError(error, "移动端状态");
+  } finally {
+    if (refreshAbortController === controller) refreshAbortController = null;
   }
 }
 function sendMoveNow(next) {
@@ -1960,21 +1973,23 @@ function isTouchpadLongPressDrag(start, current) {
   return Math.hypot(current.x - start.x, current.y - start.y) <= 12;
 }
 async function sendTapClick() {
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")));
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")));
+  const generation = inputGeneration;
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-tap-down")), generation);
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-tap-up")), generation);
 }
 async function sendDoubleClick(buttonName) {
+  const generation = inputGeneration;
   if (buttonName === "Left") {
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-down")));
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-up")));
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-down")));
-    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-up")));
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-down")), generation);
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-1-up")), generation);
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-down")), generation);
+    await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Left", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-double-Left-2-up")), generation);
     return;
   }
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-down`)));
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-up`)));
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)));
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)));
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-down`)), generation);
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-1-up`)), generation);
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Pressed", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-down`)), generation);
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`mobile-double-${buttonName}-2-up`)), generation);
 }
 function releaseAllRequests(prefix) {
   const mouseButtons = [
@@ -2000,8 +2015,9 @@ function releaseAllRequests(prefix) {
   ];
 }
 async function sendReleaseAll() {
+  const generation = inputGeneration;
   for (const request of releaseAllRequests("mobile-release-all")) {
-    await inject(request);
+    await inject(request, generation);
   }
 }
 function keepaliveReleaseBatch(requests) {
@@ -2028,6 +2044,11 @@ function keepaliveReleaseBatch(requests) {
 }
 function releaseAllWithKeepalive() {
   inputSuspended = true;
+  inputGeneration += 1;
+  if (refreshAbortController) {
+    refreshAbortController.abort();
+    refreshAbortController = null;
+  }
   keepaliveReleaseBatch(releaseAllRequests("mobile-release-all-keepalive"));
 }
 function clearDragTimer() {
@@ -2074,8 +2095,16 @@ function releaseTouchpadInteractionWhenHidden() {
 function releaseAllWithKeepaliveWhenHidden() {
   if (document.visibilityState === "hidden") releaseAllWithKeepalive();
 }
+function rotateMobileClientSession() {
+  clientId = newMobileClientId();
+  mobileSequence = 0;
+  inputGeneration += 1;
+  heldKeys.clear();
+  heldMouseButtons.clear();
+}
 function resumeMobileInput() {
   if (!inputSuspended) return;
+  rotateMobileClientSession();
   inputSuspended = false;
   refresh();
 }
@@ -2115,8 +2144,9 @@ function sendWheelDelta(wheel) {
   inject(daemonRequest("Mouse", { kind: "MouseWheel", data: { delta_x: wheel.deltaX, delta_y: wheel.deltaY, x: pointer.x, y: pointer.y } }, cid("mobile-wheel")));
 }
 async function sendTwoFingerTapClick() {
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-down")));
-  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-up")));
+  const generation = inputGeneration;
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Pressed", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-down")), generation);
+  await inject(daemonRequest("Mouse", { kind: "MouseButton", data: { button: "Right", state: "Released", x: pointer.x, y: pointer.y } }, cid("mobile-two-finger-tap-up")), generation);
 }
 pad.addEventListener("pointerdown", (event) => {
   touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
@@ -2273,11 +2303,12 @@ function sendKeyState(button, state) {
   return inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state } }, cid(`mobile-${key}-${state}`), "RequireHealthyBackend", 750));
 }
 async function sendKeyChord(keys) {
+  const generation = inputGeneration;
   for (const key of keys) {
-    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-shortcut-${key}-down`), "RequireHealthyBackend", 750));
+    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Pressed" } }, cid(`mobile-shortcut-${key}-down`), "RequireHealthyBackend", 750), generation);
   }
   for (const key of [...keys].reverse()) {
-    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-shortcut-${key}-up`), "RequireHealthyBackend", 750));
+    await inject(daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`mobile-shortcut-${key}-up`), "RequireHealthyBackend", 750), generation);
   }
 }
 document.querySelectorAll("[data-key]").forEach((button) => {
@@ -2329,11 +2360,12 @@ fn mobile_token_query(token: &str) -> String {
 mod tests {
     use super::*;
     use rshare_core::{
-        BackendHealth, BackendKind, DeviceId, EndpointEventKind, EndpointEventPayload,
-        EndpointInjectMode, EndpointInjectRequest, ServiceStatusSnapshot,
+        BackendFailureReason, BackendHealth, BackendKind, DeviceId, EndpointEventKind,
+        EndpointEventPayload, EndpointInjectMode, EndpointInjectRequest, ServiceStatusSnapshot,
     };
     use rshare_input::InputEvent;
     use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
     use tokio::time::{sleep, timeout, Duration};
 
@@ -2505,6 +2537,37 @@ mod tests {
 
         fn is_active(&self) -> bool {
             true
+        }
+    }
+
+    #[derive(Debug)]
+    struct DegradingInjectBackend {
+        active: Arc<AtomicBool>,
+        injected: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InjectBackend for DegradingInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            if self.active.load(Ordering::SeqCst) {
+                BackendHealth::Healthy
+            } else {
+                BackendHealth::Degraded {
+                    reason: BackendFailureReason::Unavailable,
+                }
+            }
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            self.injected.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::SeqCst)
         }
     }
 
@@ -3021,6 +3084,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotated_client_traffic_cannot_stale_the_old_generation_cleanup() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("generation-old", 1, "A", "Pressed"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+                keyboard_envelope("generation-new", 1, "B", "Pressed"),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        let old_cleanup = MobileReleaseBatch {
+            client_id: "generation-old".to_string(),
+            sequence: 2,
+            requests: vec![keyboard_envelope("ignored", 1, "A", "Released").request],
+        };
+
+        let cleanup = process_mobile_release_batch(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            old_cleanup,
+        )
+        .await
+        .unwrap();
+
+        assert!(cleanup[0].accepted);
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 4);
+        assert!(matches!(
+            injected[2],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+        assert!(matches!(
+            injected[3],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'B'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn inject_route_accepts_one_bounded_release_batch_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3327,11 +3463,53 @@ mod tests {
         assert_eq!(release.payload.get("y").map(String::as_str), Some("17"));
     }
 
+    #[tokio::test]
+    async fn compensation_attempts_release_after_backend_becomes_inactive() {
+        let active = Arc::new(AtomicBool::new(true));
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(DegradingInjectBackend {
+                active: active.clone(),
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        let press = process_mobile_inject_envelope(
+            &sessions,
+            &network_manager,
+            &inject_backend,
+            &state,
+            &local_events_tx,
+            keyboard_envelope("degraded-cleanup", 1, "A", "Pressed"),
+        )
+        .await
+        .unwrap();
+        assert!(press.accepted);
+        active.store(false, Ordering::SeqCst);
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 2, "accepted cleanup must clear held state");
+        assert!(matches!(
+            injected[1],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
+    }
+
     #[test]
     fn rendered_mobile_page_sequences_envelopes_and_releases_complete_held_sets() {
         let page = render_mobile_page();
 
-        assert!(page.contains("const clientId ="));
+        assert!(page.contains("let clientId = newMobileClientId();"));
         assert!(page.contains("let mobileSequence = 0"));
         assert!(page.contains("function mobileEnvelope(request)"));
         assert!(page.contains("sequence: ++mobileSequence"));
@@ -3378,13 +3556,15 @@ mod tests {
         assert!(page.contains("let inputSuspended = false"));
 
         let prepare_start = page
-            .find("function prepareOrdinaryInjectEnvelope(request)")
+            .find("function prepareOrdinaryInjectEnvelope(request, expectedGeneration)")
             .expect("missing ordinary-input gate");
         let inject_start = page
-            .find("async function inject(request)")
+            .find("async function inject(request, expectedGeneration = inputGeneration)")
             .expect("missing inject function");
         let prepare = &page[prepare_start..inject_start];
-        let gate = prepare.find("if (inputSuspended) return null;").unwrap();
+        let gate = prepare
+            .find("if (inputSuspended || expectedGeneration !== inputGeneration) return null;")
+            .unwrap();
         let tracking = prepare
             .find("trackHeldInputBeforeInject(request);")
             .unwrap();
@@ -3397,7 +3577,9 @@ mod tests {
         let inject = &page[inject_start..refresh_start];
         assert!(
             inject
-                .find("const envelope = prepareOrdinaryInjectEnvelope(request);")
+                .find(
+                    "const envelope = prepareOrdinaryInjectEnvelope(request, expectedGeneration);"
+                )
                 .unwrap()
                 < inject.find("if (!envelope) return false;").unwrap()
         );
@@ -3433,6 +3615,54 @@ mod tests {
         assert!(page.contains(
             "document.addEventListener(\"visibilitychange\", resumeMobileInputWhenVisible);"
         ));
+    }
+
+    #[test]
+    fn rendered_mobile_page_rotates_client_generation_before_resume() {
+        let page = render_mobile_page();
+
+        assert!(page.contains("function newMobileClientId()"));
+        assert!(page.contains("let clientId = newMobileClientId();"));
+        assert!(page.contains("let inputGeneration = 0;"));
+        let rotate_start = page
+            .find("function rotateMobileClientSession()")
+            .expect("missing client-session rotation");
+        let resume_start = page
+            .find("function resumeMobileInput()")
+            .expect("missing lifecycle resume");
+        let rotate = &page[rotate_start..resume_start];
+        assert!(rotate.contains("clientId = newMobileClientId();"));
+        assert!(rotate.contains("mobileSequence = 0;"));
+        assert!(rotate.contains("heldKeys.clear();"));
+        assert!(rotate.contains("heldMouseButtons.clear();"));
+
+        let resume_end = page[resume_start..]
+            .find("function resumeMobileInputWhenVisible")
+            .map(|offset| resume_start + offset)
+            .unwrap();
+        let resume = &page[resume_start..resume_end];
+        assert!(
+            resume.find("rotateMobileClientSession();").unwrap()
+                < resume.find("inputSuspended = false;").unwrap()
+        );
+        assert!(
+            resume.find("inputSuspended = false;").unwrap() < resume.find("refresh();").unwrap()
+        );
+
+        assert!(page.contains("expectedGeneration !== inputGeneration"));
+        assert!(
+            page.contains("async function inject(request, expectedGeneration = inputGeneration)")
+        );
+        assert!(page.contains("const pollingClientId = clientId;"));
+        assert!(page.contains("encodeURIComponent(pollingClientId)"));
+        for flow in [
+            "async function sendTapClick() {\n  const generation = inputGeneration;",
+            "async function sendDoubleClick(buttonName) {\n  const generation = inputGeneration;",
+            "async function sendTwoFingerTapClick() {\n  const generation = inputGeneration;",
+            "async function sendKeyChord(keys) {\n  const generation = inputGeneration;",
+        ] {
+            assert!(page.contains(flow), "missing generation capture in {flow}");
+        }
     }
 
     #[test]
