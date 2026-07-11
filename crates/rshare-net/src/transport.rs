@@ -527,6 +527,7 @@ impl QuicConnection {
     }
 
     pub async fn close(self) {
+        self.inner.connection.close(0u32.into(), b"shutdown");
         drop(self);
         info!("Connection closed");
     }

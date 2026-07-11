@@ -267,29 +267,44 @@ impl ConnectionManager {
                         }
                     };
                 let address = incoming.address.to_string();
-                let generation = allocate_generation(&next_generation);
                 incoming.connection.set_device_id(device_id);
-                let messages = incoming.connection.message_channel();
 
-                let connected_event_sent = {
+                let installed = {
                     let _lifecycle = lifecycle_lock.lock().await;
-                    connections
-                        .write()
-                        .expect("canonical connection registry poisoned")
-                        .remove(&device_id);
-                    pool.remove(&device_id).await;
-                    pool.insert_with_generation(device_id, generation, incoming.connection)
-                        .await;
-                    let mut info = ConnectionInfo::new(device_id, address);
-                    info.state = ConnectionState::Connected;
-                    connections
-                        .write()
-                        .expect("canonical connection registry poisoned")
-                        .insert(device_id, CanonicalConnection { generation, info });
-                    event_tx
-                        .send(ManagerEvent::Connected(device_id))
-                        .await
-                        .is_ok()
+                    if pool.diagnostics_for(&device_id).await.is_some() {
+                        incoming.connection.close().await;
+                        None
+                    } else {
+                        let removed_canonical = connections
+                            .write()
+                            .expect("canonical connection registry poisoned")
+                            .remove(&device_id)
+                            .is_some();
+                        let removed_pool = pool.remove(&device_id).await.is_some();
+                        if removed_canonical || removed_pool {
+                            let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
+                        }
+
+                        let generation = allocate_generation(&next_generation);
+                        let messages = incoming.connection.message_channel();
+                        pool.insert_with_generation(device_id, generation, incoming.connection)
+                            .await;
+                        let mut info = ConnectionInfo::new(device_id, address);
+                        info.state = ConnectionState::Connected;
+                        connections
+                            .write()
+                            .expect("canonical connection registry poisoned")
+                            .insert(device_id, CanonicalConnection { generation, info });
+                        let connected_event_sent = event_tx
+                            .send(ManagerEvent::Connected(device_id))
+                            .await
+                            .is_ok();
+                        Some((generation, messages, connected_event_sent))
+                    }
+                };
+
+                let Some((generation, messages, connected_event_sent)) = installed else {
+                    continue;
                 };
 
                 spawn_message_reader(
@@ -533,13 +548,9 @@ impl ConnectionManager {
         self.pool.diagnostics_for(device_id).await.is_some()
     }
 
-    pub fn connected_count(&self) -> usize {
-        self.connections
-            .read()
-            .expect("canonical connection registry poisoned")
-            .values()
-            .filter(|connection| connection.info.state == ConnectionState::Connected)
-            .count()
+    pub async fn connected_count(&self) -> usize {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.pool.diagnostics_all().await.len()
     }
 
     fn update_connection_state(
@@ -700,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn test_manager_new() {
         let manager = ConnectionManager::new(DeviceId::new_v4());
-        assert_eq!(manager.connected_count(), 0);
+        assert_eq!(manager.connected_count().await, 0);
     }
 
     #[tokio::test]
@@ -920,6 +931,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_pool_transport_is_not_counted_before_reader_retirement() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("closed-count");
+
+        let mut server = QuicTransport::new(remote_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let accepted = tokio::spawn(async move { incoming.recv().await.unwrap().connection });
+
+        let mut client = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut connection = client
+            .connect(&address.to_string(), remote_id)
+            .await
+            .unwrap();
+        let _server_connection = accepted.await.unwrap();
+        connection.confirm_peer_identity(remote_id).unwrap();
+        connection.set_device_id(remote_id);
+        let _held_messages = connection.message_channel();
+
+        let manager = ConnectionManager::new(local_id);
+        let generation = allocate_generation(&manager.next_generation);
+        manager
+            .pool
+            .insert_with_generation(remote_id, generation, connection)
+            .await;
+        manager
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .insert(
+                remote_id,
+                CanonicalConnection {
+                    generation,
+                    info: ConnectionInfo {
+                        device_id: remote_id,
+                        address: address.to_string(),
+                        state: ConnectionState::Connected,
+                        last_activity: Instant::now(),
+                        messages_sent: 0,
+                        messages_received: 0,
+                        transport: "quic".to_string(),
+                        datagram_available: true,
+                        rtt_ms: Some(1),
+                        last_datagram_rx_ms: None,
+                        datagram_tx_dropped: 0,
+                        reliable_stream_reset_count: 0,
+                        cert_trust_state: Some("trusted".to_string()),
+                    },
+                },
+            );
+
+        server.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.pool.diagnostics_for(&remote_id).await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the closed QUIC transport should become inactive");
+
+        assert!(!manager.is_connected(&remote_id).await);
+        assert_eq!(manager.connected_count().await, 0);
+        assert!(manager
+            .connection_infos()
+            .await
+            .iter()
+            .all(|info| info.device_id != remote_id || info.state != ConnectionState::Connected));
+
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
     async fn manager_emits_message_received_for_connected_device() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
@@ -1047,6 +1137,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_duplicate_keeps_live_canonical_connection() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("incoming-duplicate");
+
+        let mut manager = ConnectionManager::new(local_id);
+        let mut events = manager.events().unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
+
+        let mut first_peer = ConnectionManager::new(remote_id);
+        first_peer.transport =
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone());
+        first_peer
+            .connect(local_id, &address.to_string())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await,
+                    Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first inbound connection should become canonical");
+        let first_generation = manager
+            .connections
+            .read()
+            .expect("canonical connection registry poisoned")
+            .get(&remote_id)
+            .expect("the first inbound connection should be present")
+            .generation;
+
+        let mut duplicate_peer = ConnectionManager::new(remote_id);
+        duplicate_peer.transport =
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone());
+        duplicate_peer
+            .connect(local_id, &address.to_string())
+            .await
+            .unwrap();
+
+        let duplicate_connected = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if matches!(
+                    events.recv().await,
+                    Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            duplicate_connected.is_err(),
+            "a live canonical connection must not be replaced by a duplicate inbound peer"
+        );
+        assert_eq!(
+            manager
+                .connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&remote_id)
+                .expect("the first inbound connection should remain present")
+                .generation,
+            first_generation
+        );
+
+        first_peer
+            .send_to(&local_id, Message::MouseMove { x: 31, y: 37 })
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(ManagerEvent::MessageReceived { from, message }) = events.recv().await {
+                    break (from, message);
+                }
+            }
+        })
+        .await
+        .expect("the original inbound connection should remain usable");
+        assert_eq!(received.0, remote_id);
+        assert!(matches!(received.1, Message::MouseMove { x: 31, y: 37 }));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !duplicate_peer.is_connected(&local_id).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the duplicate inbound transport should be closed");
+
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
     async fn outbound_connect_accepts_hello_back_identity() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
@@ -1144,7 +1338,7 @@ mod tests {
             .expect("a closed canonical connection must not block reconnect");
 
         assert!(manager.is_connected(&remote_id).await);
-        assert_eq!(manager.connected_count(), 1);
+        assert_eq!(manager.connected_count().await, 1);
 
         let replacement_connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
