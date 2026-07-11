@@ -247,6 +247,7 @@ fn virtual_display_matches_create_request(
 
 #[derive(Debug, Clone)]
 struct RuntimeFeatureConfig {
+    mobile_gateway_enabled: bool,
     suppress_local_shortcuts_when_remote: bool,
     automatic_input_forwarding: bool,
     auto_endpoint_latency_probe: bool,
@@ -260,6 +261,7 @@ struct RuntimeFeatureConfig {
 impl RuntimeFeatureConfig {
     fn from_config(config: &Config) -> Self {
         Self {
+            mobile_gateway_enabled: config.features.mobile_gateway_enabled,
             suppress_local_shortcuts_when_remote: config
                 .features
                 .suppress_local_shortcuts_when_remote,
@@ -279,6 +281,7 @@ impl RuntimeFeatureConfig {
 
     fn to_feature_config(&self) -> FeatureConfig {
         let mut features = FeatureConfig::default();
+        features.mobile_gateway_enabled = self.mobile_gateway_enabled;
         features.suppress_local_shortcuts_when_remote = self.suppress_local_shortcuts_when_remote;
         features.automatic_input_forwarding = self.automatic_input_forwarding;
         features.auto_endpoint_latency_probe = self.auto_endpoint_latency_probe;
@@ -321,7 +324,12 @@ struct DaemonState {
 }
 
 impl DaemonState {
+    #[cfg(test)]
     fn new(status: ServiceStatusSnapshot) -> Self {
+        Self::new_with_features(status, RuntimeFeatureConfig::default())
+    }
+
+    fn new_with_features(status: ServiceStatusSnapshot, features: RuntimeFeatureConfig) -> Self {
         let local_id = status.device_id;
         let mut layout = LayoutGraph::new(local_id);
         let local_screen = current_primary_screen_info();
@@ -335,14 +343,19 @@ impl DaemonState {
 
         let mut backend_state = BackendRuntimeState::new();
         backend_state.available_backends = vec![BackendKind::Portable];
-        let features = RuntimeFeatureConfig::default();
         let local_controls =
             default_local_control_snapshot(local_screen.width, local_screen.height, &features);
-        let mobile_access = mobile_gateway::MobileGatewayAccess::new(
-            default_mobile_gateway_addr(),
-            DeviceId::new_v4().simple().to_string(),
-            mobile_gateway::preferred_mobile_advertise_host(&status.hostname),
-        );
+        let mobile_access = if features.mobile_gateway_enabled {
+            mobile_gateway::MobileGatewayAccess::new(
+                default_mobile_gateway_addr(),
+                DeviceId::new_v4().simple().to_string(),
+                mobile_gateway::preferred_mobile_advertise_host(&status.hostname),
+            )
+        } else {
+            mobile_gateway::MobileGatewayAccess::disabled(
+                "mobile gateway disabled by configuration".to_string(),
+            )
+        };
 
         Self {
             status,
@@ -6784,15 +6797,17 @@ async fn main() -> Result<()> {
         available_backends
     );
 
-    let mut daemon_state = DaemonState::new(ServiceStatusSnapshot::new(
-        device_id,
-        device_name.clone(),
-        hostname.clone(),
-        bind_address.clone(),
-        27432,
-        pid,
-    ));
-    daemon_state.features = RuntimeFeatureConfig::from_config(&config);
+    let mut daemon_state = DaemonState::new_with_features(
+        ServiceStatusSnapshot::new(
+            device_id,
+            device_name.clone(),
+            hostname.clone(),
+            bind_address.clone(),
+            27432,
+            pid,
+        ),
+        RuntimeFeatureConfig::from_config(&config),
+    );
     daemon_state.refresh_local_controls_platform();
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
     let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
@@ -6948,18 +6963,34 @@ async fn main() -> Result<()> {
         local_events_tx.clone(),
         shutdown_tx.subscribe(),
     ));
-    let mobile_access = {
+    let (mobile_gateway_enabled, mobile_access) = {
         let state = state.read().await;
-        state.mobile_access.clone()
+        (
+            state.features.mobile_gateway_enabled,
+            state.mobile_access.clone(),
+        )
     };
-    let mobile_gateway_task = tokio::spawn(mobile_gateway::run_mobile_gateway_server(
-        mobile_access,
-        state.clone(),
-        network_manager.clone(),
-        inject_backend.clone(),
-        local_events_tx.clone(),
-        shutdown_tx.subscribe(),
-    ));
+    let mobile_gateway_state = state.clone();
+    let mobile_gateway_network_manager = network_manager.clone();
+    let mobile_gateway_inject_backend = inject_backend.clone();
+    let mobile_gateway_local_events_tx = local_events_tx.clone();
+    let mobile_gateway_shutdown_rx = shutdown_tx.subscribe();
+    let mobile_gateway_task = async move {
+        if mobile_gateway_enabled {
+            mobile_gateway::run_mobile_gateway_server(
+                mobile_access,
+                mobile_gateway_state,
+                mobile_gateway_network_manager,
+                mobile_gateway_inject_backend,
+                mobile_gateway_local_events_tx,
+                mobile_gateway_shutdown_rx,
+            )
+            .await
+        } else {
+            tracing::info!("Mobile gateway disabled by configuration");
+            std::future::pending::<Result<()>>().await
+        }
+    };
 
     let input_forwarding_task = tokio::spawn(run_input_forwarding_loop(
         input_rx,
@@ -7096,7 +7127,7 @@ async fn main() -> Result<()> {
         }
         result = mobile_gateway_task => {
             tracing::info!("Mobile gateway task completed");
-            result??;
+            result?;
         }
         result = event_task => {
             tracing::info!("Event task completed");
@@ -7738,6 +7769,15 @@ mod tests {
             27432,
             42,
         ))
+    }
+
+    #[test]
+    fn default_daemon_state_disables_mobile_access_without_credentials() {
+        let snapshot = test_daemon_state().mobile_access.snapshot();
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.page_url, "不可用");
+        assert!(snapshot.token.is_empty());
     }
 
     fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {
