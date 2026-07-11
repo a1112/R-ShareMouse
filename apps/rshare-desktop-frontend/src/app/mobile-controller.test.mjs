@@ -1157,7 +1157,22 @@ test("held control blur releases the key and restores assistive click activation
 
   assert.match(
     source,
-    /onBlur=\{\(\) => \{\s*held\.release\(-2\);\s*suppressKeyboardClickRef\.current = false;\s*\}\}/,
+    /onBlur=\{\(\) => \{\s*held\.release\(-2\);\s*resetSyntheticClickSuppression\(\);\s*\}\}/,
+  );
+});
+
+test("held control lifecycle release also clears synthetic click suppression", () => {
+  const source = readAppFile("src/app/MobileController.tsx");
+
+  assert.match(source, /const onLifecycleResetRef = useRef\(onLifecycleReset\);/);
+  assert.match(
+    source,
+    /const releaseForLifecycle = \(\) => \{\s*controllerRef\.current\?\.releaseAll\(\);\s*onLifecycleResetRef\.current\(\);\s*\};/,
+  );
+  assert.equal(
+    (source.match(/useHeldInputController\([\s\S]*?resetSyntheticClickSuppression,\s*\);/g) ?? [])
+      .length,
+    2,
   );
 });
 

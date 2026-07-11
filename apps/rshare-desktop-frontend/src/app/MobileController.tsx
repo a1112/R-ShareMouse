@@ -173,9 +173,14 @@ function pointerFromLocalControls(snapshot: unknown): PointerState {
   };
 }
 
-function useHeldInputController(onState: (state: HeldInputState) => void) {
+function useHeldInputController(
+  onState: (state: HeldInputState) => void,
+  onLifecycleReset: () => void,
+) {
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
+  const onLifecycleResetRef = useRef(onLifecycleReset);
+  onLifecycleResetRef.current = onLifecycleReset;
   const mountedRef = useRef(true);
   const [isPressed, setIsPressed] = useState(false);
   const controllerRef = useRef<ReturnType<typeof createHeldInputController> | null>(null);
@@ -191,24 +196,25 @@ function useHeldInputController(onState: (state: HeldInputState) => void) {
 
   useEffect(() => {
     mountedRef.current = true;
-    const release = () => {
+    const releaseForLifecycle = () => {
       controllerRef.current?.releaseAll();
+      onLifecycleResetRef.current();
     };
     const releaseWhenHidden = () => {
       if (document.visibilityState === "hidden") {
-        release();
+        releaseForLifecycle();
       }
     };
 
-    window.addEventListener("blur", release);
-    window.addEventListener("pagehide", release);
+    window.addEventListener("blur", releaseForLifecycle);
+    window.addEventListener("pagehide", releaseForLifecycle);
     document.addEventListener("visibilitychange", releaseWhenHidden);
 
     return () => {
       mountedRef.current = false;
-      release();
-      window.removeEventListener("blur", release);
-      window.removeEventListener("pagehide", release);
+      releaseForLifecycle();
+      window.removeEventListener("blur", releaseForLifecycle);
+      window.removeEventListener("pagehide", releaseForLifecycle);
       document.removeEventListener("visibilitychange", releaseWhenHidden);
     };
   }, []);
@@ -1083,8 +1089,14 @@ function HoldKeyButton({
   keyboardKey: string;
   onKeyState: (key: string, state: "Pressed" | "Released") => void;
 }) {
-  const held = useHeldInputController((state) => onKeyState(keyboardKey, state));
   const suppressKeyboardClickRef = useRef(false);
+  const resetSyntheticClickSuppression = () => {
+    suppressKeyboardClickRef.current = false;
+  };
+  const held = useHeldInputController(
+    (state) => onKeyState(keyboardKey, state),
+    resetSyntheticClickSuppression,
+  );
 
   return (
     <button
@@ -1117,13 +1129,11 @@ function HoldKeyButton({
         }
         event.preventDefault();
         held.release(-2);
-        window.setTimeout(() => {
-          suppressKeyboardClickRef.current = false;
-        }, 0);
+        window.setTimeout(resetSyntheticClickSuppression, 0);
       }}
       onBlur={() => {
         held.release(-2);
-        suppressKeyboardClickRef.current = false;
+        resetSyntheticClickSuppression();
       }}
       onClick={(event) => {
         if (!shouldActivateHeldControlFromClick(event)) {
@@ -1150,14 +1160,20 @@ function PressButton({
   onDown: () => void;
   onUp: () => void;
 }) {
-  const held = useHeldInputController((state) => {
-    if (state === "Pressed") {
-      onDown();
-    } else {
-      onUp();
-    }
-  });
   const suppressKeyboardClickRef = useRef(false);
+  const resetSyntheticClickSuppression = () => {
+    suppressKeyboardClickRef.current = false;
+  };
+  const held = useHeldInputController(
+    (state) => {
+      if (state === "Pressed") {
+        onDown();
+      } else {
+        onUp();
+      }
+    },
+    resetSyntheticClickSuppression,
+  );
 
   return (
     <button
@@ -1189,13 +1205,11 @@ function PressButton({
         }
         event.preventDefault();
         held.release(-2);
-        window.setTimeout(() => {
-          suppressKeyboardClickRef.current = false;
-        }, 0);
+        window.setTimeout(resetSyntheticClickSuppression, 0);
       }}
       onBlur={() => {
         held.release(-2);
-        suppressKeyboardClickRef.current = false;
+        resetSyntheticClickSuppression();
       }}
       onClick={(event) => {
         if (!shouldActivateHeldControlFromClick(event)) {
