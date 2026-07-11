@@ -5,15 +5,20 @@ use rshare_core::DeviceId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const QUIC_CERT_FILE: &str = "quic-cert.der";
 const QUIC_KEY_FILE: &str = "quic-key.pkcs8.der";
 const QUIC_TRUST_FILE: &str = "quic-trust.json";
 static IDENTITY_LOCK: Mutex<()> = Mutex::new(());
+static TRUST_STORE_LOCK: Mutex<()> = Mutex::new(());
+static TRUST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct QuicIdentity {
@@ -68,20 +73,8 @@ impl QuicTrustStore {
         }
         let data = fs::read(path)
             .with_context(|| format!("Failed to read QUIC trust store {}", path.display()))?;
-        if data.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Self::default());
-        }
-        match serde_json::from_slice(&data) {
-            Ok(store) => Ok(store),
-            Err(error) => {
-                tracing::warn!(
-                    "Ignoring malformed QUIC trust store {}: {}",
-                    path.display(),
-                    error
-                );
-                Ok(Self::default())
-            }
-        }
+        serde_json::from_slice(&data)
+            .with_context(|| format!("Failed to parse QUIC trust store {}", path.display()))
     }
 
     pub fn save_default(&self) -> Result<()> {
@@ -90,35 +83,78 @@ impl QuicTrustStore {
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create QUIC trust store parent {}",
-                    parent.display()
-                )
-            })?;
+        let _guard = TRUST_STORE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("QUIC trust store lock poisoned"))?;
+        let mut merged = Self::load(path)?;
+        for (device_id, fingerprint) in &self.peers {
+            match merged.peers.get(device_id) {
+                Some(existing) if existing != fingerprint => {
+                    anyhow::bail!(
+                        "Refusing to overwrite QUIC trust pin for {}: existing {}, requested {}",
+                        device_id,
+                        existing,
+                        fingerprint
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    merged.peers.insert(*device_id, fingerprint.clone());
+                }
+            }
         }
-        let data = serde_json::to_vec_pretty(self)?;
-        fs::write(path, data)
-            .with_context(|| format!("Failed to write QUIC trust store {}", path.display()))
+        write_trust_store_atomic(path, &merged)
     }
 
-    pub fn verify_or_trust(
+    pub fn check(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &PeerCertificateFingerprint,
+    ) -> QuicTrustDecision {
+        match self.peers.get(&device_id) {
+            None => QuicTrustDecision::FirstSeen,
+            Some(expected) if expected == fingerprint => QuicTrustDecision::Trusted,
+            Some(expected) => QuicTrustDecision::Rejected {
+                expected: expected.clone(),
+                actual: fingerprint.clone(),
+            },
+        }
+    }
+
+    pub fn trust_first_seen(
         &mut self,
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
     ) -> QuicTrustDecision {
-        match self.peers.get(&device_id) {
-            None => {
-                self.peers.insert(device_id, fingerprint);
-                QuicTrustDecision::FirstSeen
-            }
-            Some(expected) if expected == &fingerprint => QuicTrustDecision::Trusted,
-            Some(expected) => QuicTrustDecision::Rejected {
-                expected: expected.clone(),
-                actual: fingerprint,
-            },
+        let decision = self.check(device_id, &fingerprint);
+        if decision == QuicTrustDecision::FirstSeen {
+            self.peers.insert(device_id, fingerprint);
         }
+        decision
+    }
+
+    pub fn trust_first_seen_default(
+        device_id: DeviceId,
+        fingerprint: PeerCertificateFingerprint,
+    ) -> Result<QuicTrustDecision> {
+        Self::trust_first_seen_at(trust_store_path()?, device_id, fingerprint)
+    }
+
+    pub fn trust_first_seen_at(
+        path: impl AsRef<Path>,
+        device_id: DeviceId,
+        fingerprint: PeerCertificateFingerprint,
+    ) -> Result<QuicTrustDecision> {
+        let path = path.as_ref();
+        let _guard = TRUST_STORE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("QUIC trust store lock poisoned"))?;
+        let mut store = Self::load(path)?;
+        let decision = store.trust_first_seen(device_id, fingerprint);
+        if decision == QuicTrustDecision::FirstSeen {
+            write_trust_store_atomic(path, &store)?;
+        }
+        Ok(decision)
     }
 
     pub fn fingerprint_for(&self, device_id: &DeviceId) -> Option<&PeerCertificateFingerprint> {
@@ -214,6 +250,115 @@ pub fn trust_store_path() -> Result<PathBuf> {
     Ok(rshare_core::service::state_dir()?.join(QUIC_TRUST_FILE))
 }
 
+fn write_trust_store_atomic(path: &Path, store: &QuicTrustStore) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create QUIC trust store parent {}",
+            parent.display()
+        )
+    })?;
+
+    let data = serde_json::to_vec_pretty(store)?;
+    let (temp_path, mut temp_file) = create_trust_temp_file(path, parent)?;
+    let write_result = temp_file
+        .write_all(&data)
+        .and_then(|_| temp_file.sync_all())
+        .with_context(|| {
+            format!(
+                "Failed to write temporary QUIC trust store {}",
+                temp_path.display()
+            )
+        });
+    drop(temp_file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = atomic_replace(&temp_path, path).with_context(|| {
+        format!(
+            "Failed to replace QUIC trust store {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    }) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn create_trust_temp_file(path: &Path, parent: &Path) -> Result<(PathBuf, File)> {
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("QUIC trust store path has no file name: {}", path.display())
+    })?;
+
+    for _ in 0..16 {
+        let counter = TRUST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+        let temp_path = parent.join(temp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to create temporary QUIC trust store {}",
+                        temp_path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to allocate a unique temporary QUIC trust store beside {}",
+        path.display()
+    )
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -256,18 +401,23 @@ mod tests {
         let device_id = DeviceId::new_v4();
         let fingerprint_a = PeerCertificateFingerprint::from_der(b"cert-a");
         let fingerprint_b = PeerCertificateFingerprint::from_der(b"cert-b");
-        let mut store = QuicTrustStore::default();
+        let store = QuicTrustStore::default();
 
         assert_eq!(
-            store.verify_or_trust(device_id, fingerprint_a.clone()),
+            store.check(device_id, &fingerprint_a),
+            QuicTrustDecision::FirstSeen
+        );
+        let mut store = store;
+        assert_eq!(
+            store.trust_first_seen(device_id, fingerprint_a.clone()),
             QuicTrustDecision::FirstSeen
         );
         assert_eq!(
-            store.verify_or_trust(device_id, fingerprint_a),
+            store.check(device_id, &fingerprint_a),
             QuicTrustDecision::Trusted
         );
         assert!(matches!(
-            store.verify_or_trust(device_id, fingerprint_b),
+            store.check(device_id, &fingerprint_b),
             QuicTrustDecision::Rejected { .. }
         ));
     }
@@ -279,7 +429,7 @@ mod tests {
         let device_id = DeviceId::new_v4();
         let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
         let mut store = QuicTrustStore::default();
-        store.verify_or_trust(device_id, fingerprint.clone());
+        store.trust_first_seen(device_id, fingerprint.clone());
         store.save(&path).unwrap();
 
         let loaded = QuicTrustStore::load(&path).unwrap();
@@ -289,28 +439,99 @@ mod tests {
     }
 
     #[test]
-    fn empty_trust_store_file_loads_as_default() {
+    fn checking_first_seen_peer_does_not_mutate_store() {
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        let store = QuicTrustStore::default();
+
+        assert_eq!(
+            store.check(device_id, &fingerprint),
+            QuicTrustDecision::FirstSeen
+        );
+        assert!(store.fingerprint_for(&device_id).is_none());
+    }
+
+    #[test]
+    fn empty_trust_store_file_fails_closed() {
         let dir = temp_dir("quic-trust-empty");
         let path = dir.join("trust.json");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, b"").unwrap();
 
-        let loaded = QuicTrustStore::load(&path).unwrap();
-
-        assert!(loaded.peers.is_empty());
+        assert!(QuicTrustStore::load(&path).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn malformed_trust_store_file_loads_as_default() {
+    fn malformed_trust_store_file_fails_closed() {
         let dir = temp_dir("quic-trust-malformed");
         let path = dir.join("trust.json");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, b"{ not valid json").unwrap();
 
-        let loaded = QuicTrustStore::load(&path).unwrap();
+        assert!(QuicTrustStore::load(&path).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
 
-        assert!(loaded.peers.is_empty());
+    #[test]
+    fn stale_saves_preserve_existing_peer_pins() {
+        let dir = temp_dir("quic-trust-merge");
+        let path = dir.join("trust.json");
+        let first_id = DeviceId::new_v4();
+        let second_id = DeviceId::new_v4();
+        let first_fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        let second_fingerprint = PeerCertificateFingerprint::from_der(b"cert-b");
+        let mut first = QuicTrustStore::load(&path).unwrap();
+        let mut stale = QuicTrustStore::load(&path).unwrap();
+
+        first.trust_first_seen(first_id, first_fingerprint.clone());
+        first.save(&path).unwrap();
+        stale.trust_first_seen(second_id, second_fingerprint.clone());
+        stale.save(&path).unwrap();
+
+        let loaded = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(loaded.fingerprint_for(&first_id), Some(&first_fingerprint));
+        assert_eq!(
+            loaded.fingerprint_for(&second_id),
+            Some(&second_fingerprint)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_first_seen_commits_preserve_all_peer_pins() {
+        let dir = temp_dir("quic-trust-concurrent");
+        let path = dir.join("trust.json");
+        let first_id = DeviceId::new_v4();
+        let second_id = DeviceId::new_v4();
+        let first_fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        let second_fingerprint = PeerCertificateFingerprint::from_der(b"cert-b");
+
+        let first_path = path.clone();
+        let first_fingerprint_for_thread = first_fingerprint.clone();
+        let first = std::thread::spawn(move || {
+            QuicTrustStore::trust_first_seen_at(&first_path, first_id, first_fingerprint_for_thread)
+                .unwrap()
+        });
+        let second_path = path.clone();
+        let second_fingerprint_for_thread = second_fingerprint.clone();
+        let second = std::thread::spawn(move || {
+            QuicTrustStore::trust_first_seen_at(
+                &second_path,
+                second_id,
+                second_fingerprint_for_thread,
+            )
+            .unwrap()
+        });
+
+        assert_eq!(first.join().unwrap(), QuicTrustDecision::FirstSeen);
+        assert_eq!(second.join().unwrap(), QuicTrustDecision::FirstSeen);
+        let loaded = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(loaded.fingerprint_for(&first_id), Some(&first_fingerprint));
+        assert_eq!(
+            loaded.fingerprint_for(&second_id),
+            Some(&second_fingerprint)
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

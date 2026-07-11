@@ -13,6 +13,7 @@ use rustls::{
 };
 use std::any::Any;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
@@ -75,6 +76,7 @@ pub struct QuicTransport {
     local_device_id: DeviceId,
     incoming_tx: mpsc::Sender<IncomingConnection>,
     incoming_rx: Option<mpsc::Receiver<IncomingConnection>>,
+    trust_store_path: Option<PathBuf>,
 }
 
 pub struct IncomingConnection {
@@ -104,11 +106,17 @@ impl QuicTransport {
             local_device_id,
             incoming_tx,
             incoming_rx: Some(incoming_rx),
+            trust_store_path: None,
         }
     }
 
     pub fn with_config(mut self, config: TransportConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_trust_store_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.trust_store_path = Some(path.into());
         self
     }
 
@@ -202,7 +210,12 @@ impl QuicTransport {
             .await
             .with_context(|| format!("QUIC handshake failed for {remote_addr}"))?;
 
-        let trust_decision = verify_outbound_peer_trust(&connection, device_id).await?;
+        let trust_store_path = match &self.trust_store_path {
+            Some(path) => path.clone(),
+            None => super::encryption::trust_store_path()?,
+        };
+        let pending_peer_trust =
+            inspect_outbound_peer_trust(&connection, device_id, trust_store_path).await?;
 
         info!("Connected to QUIC peer {}", connection.remote_address());
 
@@ -212,7 +225,7 @@ impl QuicTransport {
             self.local_device_id,
             remote_addr,
             self.config.clone(),
-            Some(trust_state_label(&trust_decision).to_string()),
+            Some(pending_peer_trust),
         ))
     }
 
@@ -278,6 +291,15 @@ pub struct QuicConnection {
     _local_device_id: DeviceId,
     inner: Arc<QuicConnectionInner>,
     cert_trust_state: Option<String>,
+    pending_peer_trust: Option<PendingPeerTrust>,
+}
+
+#[derive(Debug)]
+struct PendingPeerTrust {
+    expected_device_id: DeviceId,
+    fingerprint: PeerCertificateFingerprint,
+    trust_store_path: PathBuf,
+    decision: QuicTrustDecision,
 }
 
 struct OutboundFrame {
@@ -292,7 +314,7 @@ impl QuicConnection {
         local_device_id: DeviceId,
         remote_addr: SocketAddr,
         config: TransportConfig,
-        cert_trust_state: Option<String>,
+        pending_peer_trust: Option<PendingPeerTrust>,
     ) -> Self {
         let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(128);
         let (message_tx, message_rx): (mpsc::Sender<Message>, _) = mpsc::channel(256);
@@ -341,6 +363,13 @@ impl QuicConnection {
             });
         }
 
+        let cert_trust_state = pending_peer_trust
+            .as_ref()
+            .map(|pending| match pending.decision {
+                QuicTrustDecision::FirstSeen => "first_seen_pending".to_string(),
+                _ => trust_state_label(&pending.decision).to_string(),
+            });
+
         Self {
             device_id: None,
             remote_addr,
@@ -349,6 +378,7 @@ impl QuicConnection {
             _local_device_id: local_device_id,
             inner,
             cert_trust_state,
+            pending_peer_trust,
         }
     }
 
@@ -358,6 +388,62 @@ impl QuicConnection {
 
     pub fn set_device_id(&mut self, device_id: DeviceId) {
         self.device_id = Some(device_id);
+    }
+
+    pub fn confirm_peer_identity(&mut self, actual_device_id: DeviceId) -> Result<()> {
+        let pending = self
+            .pending_peer_trust
+            .take()
+            .ok_or_else(|| anyhow!("No pending outbound peer identity"))?;
+        if actual_device_id != pending.expected_device_id {
+            self.inner
+                .connection
+                .close(0u32.into(), b"peer identity mismatch");
+            anyhow::bail!(
+                "QUIC peer identity mismatch: expected {}, got {}",
+                pending.expected_device_id,
+                actual_device_id
+            );
+        }
+
+        let decision = match pending.decision {
+            QuicTrustDecision::FirstSeen => QuicTrustStore::trust_first_seen_at(
+                &pending.trust_store_path,
+                pending.expected_device_id,
+                pending.fingerprint,
+            ),
+            decision => Ok(decision),
+        };
+        match decision {
+            Ok(QuicTrustDecision::FirstSeen) | Ok(QuicTrustDecision::Trusted) => {
+                self.cert_trust_state = Some("trusted".to_string());
+                Ok(())
+            }
+            Ok(QuicTrustDecision::Rejected { expected, actual }) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"certificate fingerprint mismatch");
+                anyhow::bail!(
+                    "QUIC certificate fingerprint changed for {} while confirming identity: expected {}, got {}",
+                    actual_device_id,
+                    expected,
+                    actual
+                );
+            }
+            Err(error) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"failed to persist peer trust");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn reject_pending_peer_identity(&mut self) {
+        self.pending_peer_trust = None;
+        self.inner
+            .connection
+            .close(0u32.into(), b"peer identity unavailable");
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -734,16 +820,28 @@ fn make_quinn_transport_config(config: &TransportConfig) -> Result<QuinnTranspor
     Ok(transport)
 }
 
-async fn verify_outbound_peer_trust(
+async fn inspect_outbound_peer_trust(
     connection: &quinn::Connection,
     device_id: DeviceId,
-) -> Result<QuicTrustDecision> {
-    let fingerprint = peer_certificate_fingerprint(connection)
-        .ok_or_else(|| anyhow!("QUIC peer did not present a certificate"))?;
-    let mut store = QuicTrustStore::load_default()?;
-    let decision = store.verify_or_trust(device_id, fingerprint);
+    trust_store_path: PathBuf,
+) -> Result<PendingPeerTrust> {
+    let fingerprint = match peer_certificate_fingerprint(connection) {
+        Some(fingerprint) => fingerprint,
+        None => {
+            connection.close(0u32.into(), b"peer certificate unavailable");
+            anyhow::bail!("QUIC peer did not present a certificate");
+        }
+    };
+    let store = match QuicTrustStore::load(&trust_store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            connection.close(0u32.into(), b"peer trust store unavailable");
+            return Err(error);
+        }
+    };
+    let decision = store.check(device_id, &fingerprint);
     match &decision {
-        QuicTrustDecision::FirstSeen => store.save_default()?,
+        QuicTrustDecision::FirstSeen => {}
         QuicTrustDecision::Trusted => {}
         QuicTrustDecision::Rejected { expected, actual } => {
             connection.close(0u32.into(), b"certificate fingerprint mismatch");
@@ -755,7 +853,12 @@ async fn verify_outbound_peer_trust(
             );
         }
     }
-    Ok(decision)
+    Ok(PendingPeerTrust {
+        expected_device_id: device_id,
+        fingerprint,
+        trust_store_path,
+        decision,
+    })
 }
 
 fn peer_certificate_fingerprint(

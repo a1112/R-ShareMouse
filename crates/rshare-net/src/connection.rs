@@ -189,33 +189,27 @@ impl ConnectionManager {
         let info = ConnectionInfo::new(device_id, address.to_string());
         self.connections.insert(device_id, info);
 
-        match self.transport.connect(address, device_id).await {
-            Ok(mut conn) => {
-                let first_message =
-                    match perform_outbound_handshake(&mut conn, self.local_device_id).await {
-                        OutboundHandshake::HelloBack {
-                            device_id: remote_id,
-                        } => {
-                            if remote_id != device_id {
-                                tracing::warn!(
-                                    "Connected device id mismatch: expected {}, got {}",
-                                    device_id,
-                                    remote_id
-                                );
-                            }
-                            None
-                        }
-                        OutboundHandshake::Prefetched(message) => Some(message),
-                        OutboundHandshake::Unavailable(error) => {
-                            tracing::debug!("Outbound handshake unavailable: {}", error);
-                            None
-                        }
-                    };
+        let connection_result = match self.transport.connect(address, device_id).await {
+            Ok(mut conn) => match perform_outbound_handshake(&mut conn, self.local_device_id).await
+            {
+                Ok(remote_id) => match conn.confirm_peer_identity(remote_id) {
+                    Ok(()) => Ok(conn),
+                    Err(error) => Err(error),
+                },
+                Err(error) => {
+                    conn.reject_pending_peer_identity();
+                    Err(error)
+                }
+            },
+            Err(error) => Err(error),
+        };
 
+        match connection_result {
+            Ok(mut conn) => {
                 self.update_connection_state(device_id, ConnectionState::Connected);
                 conn.set_device_id(device_id);
                 let messages = conn.message_channel();
-                spawn_message_reader(device_id, messages, first_message, self.event_tx.clone());
+                spawn_message_reader(device_id, messages, None, self.event_tx.clone());
 
                 self.pool.insert(device_id, conn).await;
 
@@ -355,12 +349,6 @@ impl ConnectionManager {
     }
 }
 
-enum OutboundHandshake {
-    HelloBack { device_id: DeviceId },
-    Prefetched(Message),
-    Unavailable(anyhow::Error),
-}
-
 async fn receive_incoming_handshake(
     conn: &mut super::transport::QuicConnection,
     local_device_id: DeviceId,
@@ -397,20 +385,16 @@ async fn receive_incoming_handshake(
 async fn perform_outbound_handshake(
     conn: &mut super::transport::QuicConnection,
     local_device_id: DeviceId,
-) -> OutboundHandshake {
-    if let Err(error) = conn
-        .send_message(&hello_message(
-            local_device_id,
-            "R-ShareMouse".to_string(),
-            hostname::get()
-                .unwrap_or_else(|_| "unknown".into())
-                .to_string_lossy()
-                .to_string(),
-        ))
-        .await
-    {
-        return OutboundHandshake::Unavailable(error);
-    }
+) -> Result<DeviceId> {
+    conn.send_message(&hello_message(
+        local_device_id,
+        "R-ShareMouse".to_string(),
+        hostname::get()
+            .unwrap_or_else(|_| "unknown".into())
+            .to_string_lossy()
+            .to_string(),
+    ))
+    .await?;
 
     match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
         Ok(Ok(Message::HelloBack {
@@ -421,11 +405,11 @@ async fn perform_outbound_handshake(
         })) if protocol_version == PROTOCOL_VERSION
             && app_id.eq_ignore_ascii_case(rshare_core::DISCOVERY_APP_ID) =>
         {
-            OutboundHandshake::HelloBack { device_id }
+            Ok(device_id)
         }
-        Ok(Ok(message)) => OutboundHandshake::Prefetched(message),
-        Ok(Err(error)) => OutboundHandshake::Unavailable(error),
-        Err(_) => OutboundHandshake::Unavailable(anyhow::anyhow!("Handshake timed out")),
+        Ok(Ok(_)) => anyhow::bail!("QUIC peer did not return a valid HelloBack identity"),
+        Ok(Err(error)) => Err(error),
+        Err(_) => anyhow::bail!("QUIC peer identity handshake timed out"),
     }
 }
 
@@ -438,6 +422,18 @@ pub fn create_shared_manager(local_device_id: DeviceId) -> SharedConnectionManag
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encryption::QuicTrustStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_trust_store_path(name: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rshare-{name}-{suffix}"))
+            .join("trust.json")
+    }
 
     #[test]
     fn test_connection_info() {
@@ -717,5 +713,98 @@ mod tests {
 
         assert_eq!(connected, remote_id);
         assert!(manager.is_connected(&remote_id).await);
+    }
+
+    #[tokio::test]
+    async fn outbound_connect_rejects_mismatched_hello_back_without_pinning() {
+        let local_id = DeviceId::new_v4();
+        let expected_id = DeviceId::new_v4();
+        let returned_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("hello-back-mismatch");
+
+        let mut server = QuicTransport::new(returned_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let responder = tokio::spawn(async move {
+            let mut connection = incoming.recv().await.unwrap().connection;
+            assert!(matches!(
+                connection.receive_message().await.unwrap(),
+                Message::Hello { .. }
+            ));
+            connection
+                .send_message(&hello_back_message(
+                    returned_id,
+                    "unexpected".to_string(),
+                    "unexpected-host".to_string(),
+                    ScreenInfo::primary(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut manager = ConnectionManager::new(local_id);
+        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let error = manager
+            .connect(expected_id, &address.to_string())
+            .await
+            .expect_err("mismatched HelloBack identity must fail");
+
+        assert!(error.to_string().contains("identity mismatch"));
+        assert!(!manager.is_connected(&expected_id).await);
+        assert!(QuicTrustStore::load(&trust_path)
+            .unwrap()
+            .fingerprint_for(&expected_id)
+            .is_none());
+        assert!(QuicTrustStore::load(&trust_path)
+            .unwrap()
+            .fingerprint_for(&returned_id)
+            .is_none());
+
+        responder.await.unwrap();
+        server.close().await.unwrap();
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_connect_rejects_unavailable_identity_without_pinning() {
+        let local_id = DeviceId::new_v4();
+        let expected_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("hello-back-unavailable");
+
+        let mut server = QuicTransport::new(expected_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let responder = tokio::spawn(async move {
+            let mut connection = incoming.recv().await.unwrap().connection;
+            assert!(matches!(
+                connection.receive_message().await.unwrap(),
+                Message::Hello { .. }
+            ));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let mut manager = ConnectionManager::new(local_id);
+        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let error = manager
+            .connect(expected_id, &address.to_string())
+            .await
+            .expect_err("missing HelloBack identity must fail");
+
+        assert!(error.to_string().contains("identity handshake timed out"));
+        assert!(!manager.is_connected(&expected_id).await);
+        assert!(QuicTrustStore::load(&trust_path)
+            .unwrap()
+            .fingerprint_for(&expected_id)
+            .is_none());
+
+        responder.await.unwrap();
+        server.close().await.unwrap();
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }

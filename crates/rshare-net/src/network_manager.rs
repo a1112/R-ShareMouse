@@ -36,7 +36,7 @@ pub struct NetworkManagerConfig {
     pub discovery_port: u16,
     /// Transport bind address
     pub bind_address: String,
-    /// Auto-connect to discovered devices
+    /// Retained for configuration compatibility; unpaired discovery is observational only.
     pub auto_connect: bool,
     /// Discovery broadcast interval
     pub broadcast_interval: Duration,
@@ -49,7 +49,7 @@ impl Default for NetworkManagerConfig {
         Self {
             discovery_port: 27432,
             bind_address: "0.0.0.0:27431".to_string(),
-            auto_connect: true,
+            auto_connect: false,
             broadcast_interval: Duration::from_secs(5),
             device_timeout: Duration::from_secs(30),
         }
@@ -210,10 +210,7 @@ impl NetworkManager {
         // Start discovery with event channel
         let discovery_tx = self.event_tx.clone();
         let discovered_devices = self.discovered_devices.clone();
-        let auto_connect_config = self.config.clone();
-        let auto_connect_connection = self.connection.clone();
         let discovery_lost_connection = self.connection.clone();
-        let local_device_id = self.local_device_id;
 
         let mut discovery = ServiceDiscovery::new(
             self.local_device_id,
@@ -254,12 +251,6 @@ impl NetworkManager {
                         }
 
                         let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device.clone()));
-                        spawn_auto_connect_discovered_device(
-                            auto_connect_connection.clone(),
-                            auto_connect_config.clone(),
-                            local_device_id,
-                            device,
-                        );
                     }
                     crate::discovery::DiscoveryEvent::DeviceUpdated(device) => {
                         let device_id = device.id;
@@ -270,12 +261,6 @@ impl NetworkManager {
                         }
 
                         let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device.clone()));
-                        spawn_auto_connect_discovered_device(
-                            auto_connect_connection.clone(),
-                            auto_connect_config.clone(),
-                            local_device_id,
-                            device,
-                        );
                     }
                     crate::discovery::DiscoveryEvent::DeviceLost(id) => {
                         {
@@ -371,67 +356,6 @@ fn normalize_discovered_connection_address(
     socket_addr.to_string()
 }
 
-fn auto_connect_address_for_device(
-    config: &NetworkManagerConfig,
-    local_device_id: DeviceId,
-    device: &DiscoveredDevice,
-) -> Option<String> {
-    if !config.auto_connect {
-        return None;
-    }
-    if local_device_id > device.id {
-        return None;
-    }
-
-    let address = device.addresses.first()?;
-    Some(normalize_discovered_connection_address(
-        &address.to_string(),
-        config.discovery_port,
-        connection_port(&config.bind_address),
-    ))
-}
-
-fn spawn_auto_connect_discovered_device(
-    connection: Arc<TokioMutex<ConnectionManager>>,
-    config: NetworkManagerConfig,
-    local_device_id: DeviceId,
-    device: DiscoveredDevice,
-) {
-    let Some(address) = auto_connect_address_for_device(&config, local_device_id, &device) else {
-        return;
-    };
-
-    tokio::spawn(async move {
-        let already_connecting_or_connected = {
-            let manager = connection.lock().await;
-            manager.connection_infos().await.into_iter().any(|info| {
-                info.device_id == device.id
-                    && matches!(
-                        info.state,
-                        crate::connection::ConnectionState::Connecting
-                            | crate::connection::ConnectionState::Connected
-                    )
-            })
-        };
-        if already_connecting_or_connected {
-            return;
-        }
-
-        let result = {
-            let mut manager = connection.lock().await;
-            manager.connect(device.id, &address).await
-        };
-        if let Err(error) = result {
-            tracing::debug!(
-                "Auto-connect to discovered device {} at {} failed: {}",
-                device.id,
-                address,
-                error
-            );
-        }
-    });
-}
-
 fn discovery_lost_network_event(
     device_id: DeviceId,
     transport_connected: bool,
@@ -454,7 +378,7 @@ mod tests {
     fn test_network_manager_config_default() {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
-        assert!(config.auto_connect);
+        assert!(!config.auto_connect);
     }
 
     #[test]
@@ -466,82 +390,6 @@ mod tests {
         assert_eq!(
             normalize_discovered_connection_address("192.168.1.241:27431", 27432, Some(27431)),
             "192.168.1.241:27431"
-        );
-    }
-
-    fn deterministic_device_id(byte: u8) -> DeviceId {
-        DeviceId::from_bytes([byte; 16])
-    }
-
-    fn discovered_device_with_id_and_address(
-        device_id: DeviceId,
-        address: &str,
-    ) -> DiscoveredDevice {
-        DiscoveredDevice {
-            id: device_id,
-            name: "remote".to_string(),
-            hostname: "remote-host".to_string(),
-            addresses: vec![address.parse().unwrap()],
-            screen_info: None,
-            capabilities: rshare_core::DeviceCapabilities::default(),
-            last_seen: tokio::time::Instant::now(),
-        }
-    }
-
-    fn discovered_device_with_address(address: &str) -> DiscoveredDevice {
-        discovered_device_with_id_and_address(DeviceId::new_v4(), address)
-    }
-
-    #[test]
-    fn auto_connect_address_uses_discovered_connection_address_when_enabled() {
-        let config = NetworkManagerConfig::default();
-        let device = discovered_device_with_id_and_address(
-            deterministic_device_id(0xF0),
-            "192.168.1.241:27432",
-        );
-
-        assert_eq!(
-            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
-            Some("192.168.1.241:27431".to_string())
-        );
-    }
-
-    #[test]
-    fn auto_connect_address_is_none_when_local_device_wins_tie_breaker() {
-        let config = NetworkManagerConfig::default();
-        let local_id = deterministic_device_id(0xF0);
-        let remote = discovered_device_with_id_and_address(
-            deterministic_device_id(0x10),
-            "192.168.1.241:27432",
-        );
-
-        assert_eq!(
-            auto_connect_address_for_device(&config, local_id, &remote),
-            None
-        );
-    }
-
-    #[test]
-    fn auto_connect_address_is_none_when_auto_connect_is_disabled() {
-        let mut config = NetworkManagerConfig::default();
-        config.auto_connect = false;
-        let device = discovered_device_with_address("192.168.1.241:27432");
-
-        assert_eq!(
-            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
-            None
-        );
-    }
-
-    #[test]
-    fn auto_connect_address_is_none_without_discovered_addresses() {
-        let config = NetworkManagerConfig::default();
-        let mut device = discovered_device_with_address("192.168.1.241:27432");
-        device.addresses.clear();
-
-        assert_eq!(
-            auto_connect_address_for_device(&config, deterministic_device_id(0x10), &device),
-            None
         );
     }
 
