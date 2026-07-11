@@ -175,17 +175,20 @@ async fn forward_message_for_generation(
     generation: u64,
     message: Message,
 ) -> bool {
+    let permit = event_tx.reserve().await.ok();
     let _lifecycle = lifecycle_lock.lock().await;
     if !is_current_generation(connections, device_id, generation) {
         return false;
     }
-    event_tx
-        .send(ManagerEvent::MessageReceived {
+    if let Some(permit) = permit {
+        permit.send(ManagerEvent::MessageReceived {
             from: device_id,
             message,
-        })
-        .await
-        .is_ok()
+        });
+        true
+    } else {
+        false
+    }
 }
 
 async fn retire_generation(
@@ -196,6 +199,10 @@ async fn retire_generation(
     device_id: DeviceId,
     generation: u64,
 ) -> bool {
+    if !is_current_generation(connections, device_id, generation) {
+        return false;
+    }
+    let permit = event_tx.reserve().await.ok();
     let _lifecycle = lifecycle_lock.lock().await;
     let removed_current = {
         let mut canonical = connections
@@ -214,7 +221,9 @@ async fn retire_generation(
 
     if removed_current {
         pool.remove_generation(&device_id, generation).await;
-        let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
+        if let Some(permit) = permit {
+            permit.send(ManagerEvent::Disconnected(device_id));
+        }
     }
     removed_current
 }
@@ -268,6 +277,7 @@ impl ConnectionManager {
                     };
                 let address = incoming.address.to_string();
                 incoming.connection.set_device_id(device_id);
+                let mut event_permits = event_tx.reserve_many(2).await.ok();
 
                 let installed = {
                     let _lifecycle = lifecycle_lock.lock().await;
@@ -282,7 +292,11 @@ impl ConnectionManager {
                             .is_some();
                         let removed_pool = pool.remove(&device_id).await.is_some();
                         if removed_canonical || removed_pool {
-                            let _ = event_tx.send(ManagerEvent::Disconnected(device_id)).await;
+                            if let Some(permit) =
+                                event_permits.as_mut().and_then(|permits| permits.next())
+                            {
+                                permit.send(ManagerEvent::Disconnected(device_id));
+                            }
                         }
 
                         let generation = allocate_generation(&next_generation);
@@ -295,10 +309,14 @@ impl ConnectionManager {
                             .write()
                             .expect("canonical connection registry poisoned")
                             .insert(device_id, CanonicalConnection { generation, info });
-                        let connected_event_sent = event_tx
-                            .send(ManagerEvent::Connected(device_id))
-                            .await
-                            .is_ok();
+                        let connected_event_sent = if let Some(permit) =
+                            event_permits.as_mut().and_then(|permits| permits.next())
+                        {
+                            permit.send(ManagerEvent::Connected(device_id));
+                            true
+                        } else {
+                            false
+                        };
                         Some((generation, messages, connected_event_sent))
                     }
                 };
@@ -328,6 +346,7 @@ impl ConnectionManager {
     }
 
     pub async fn connect(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
+        let mut stale_permit = self.event_tx.reserve().await.ok();
         let generation = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.pool.diagnostics_for(&device_id).await.is_some() {
@@ -342,10 +361,9 @@ impl ConnectionManager {
                 .is_some();
             let removed_pool = self.pool.remove(&device_id).await.is_some();
             if removed_canonical || removed_pool {
-                let _ = self
-                    .event_tx
-                    .send(ManagerEvent::Disconnected(device_id))
-                    .await;
+                if let Some(permit) = stale_permit.take() {
+                    permit.send(ManagerEvent::Disconnected(device_id));
+                }
             }
 
             let generation = allocate_generation(&self.next_generation);
@@ -361,6 +379,7 @@ impl ConnectionManager {
                 );
             generation
         };
+        drop(stale_permit);
 
         let connection_result = match self.transport.connect(address, device_id).await {
             Ok(mut conn) => match perform_outbound_handshake(&mut conn, self.local_device_id).await
@@ -381,6 +400,7 @@ impl ConnectionManager {
             Ok(mut conn) => {
                 conn.set_device_id(device_id);
                 let messages = conn.message_channel();
+                let connected_permit = self.event_tx.reserve().await.ok();
 
                 let installed = {
                     let _lifecycle = self.lifecycle_lock.lock().await;
@@ -395,7 +415,9 @@ impl ConnectionManager {
                             generation,
                             ConnectionState::Connected,
                         );
-                        let _ = self.event_tx.send(ManagerEvent::Connected(device_id)).await;
+                        if let Some(permit) = connected_permit {
+                            permit.send(ManagerEvent::Connected(device_id));
+                        }
                         true
                     }
                 };
@@ -421,6 +443,7 @@ impl ConnectionManager {
                 Ok(())
             }
             Err(e) => {
+                let error_permit = self.event_tx.reserve().await.ok();
                 let _lifecycle = self.lifecycle_lock.lock().await;
                 if is_current_generation(&self.connections, device_id, generation) {
                     self.update_connection_state(device_id, generation, ConnectionState::Error);
@@ -429,13 +452,12 @@ impl ConnectionManager {
                         .expect("canonical connection registry poisoned")
                         .remove(&device_id);
                     self.pool.remove_generation(&device_id, generation).await;
-                    let _ = self
-                        .event_tx
-                        .send(ManagerEvent::Error {
+                    if let Some(permit) = error_permit {
+                        permit.send(ManagerEvent::Error {
                             device_id,
                             error: e.to_string(),
-                        })
-                        .await;
+                        });
+                    }
                 }
                 Err(e)
             }
@@ -443,6 +465,7 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
+        let disconnected_permit = self.event_tx.reserve().await.ok();
         let _lifecycle = self.lifecycle_lock.lock().await;
         let removed_connection_info = self
             .connections
@@ -452,10 +475,9 @@ impl ConnectionManager {
             .is_some();
         let removed_pool_connection = self.pool.remove(device_id).await.is_some();
         if removed_connection_info || removed_pool_connection {
-            let _ = self
-                .event_tx
-                .send(ManagerEvent::Disconnected(*device_id))
-                .await;
+            if let Some(permit) = disconnected_permit {
+                permit.send(ManagerEvent::Disconnected(*device_id));
+            }
         }
         Ok(())
     }
@@ -760,7 +782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retirement_holds_lifecycle_until_disconnect_is_enqueued() {
+    async fn retirement_waiting_for_event_capacity_does_not_hold_lifecycle() {
         let device_id = DeviceId::new_v4();
         let mut manager = ConnectionManager::new(DeviceId::new_v4());
         let generation = insert_test_canonical(
@@ -789,6 +811,7 @@ mod tests {
         {}
         assert_eq!(manager.event_tx.capacity(), 0);
 
+        let lifecycle = manager.lifecycle_lock.lock().await;
         let (message_tx, message_rx) = mpsc::channel(1);
         spawn_message_reader(
             device_id,
@@ -801,24 +824,19 @@ mod tests {
             manager.lifecycle_lock.clone(),
         );
         drop(message_tx);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if !is_current_generation(&manager.connections, device_id, generation) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the old generation should be authorized for retirement");
+        tokio::task::yield_now().await;
+        drop(lifecycle);
+        tokio::task::yield_now().await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), manager.lifecycle_lock.lock())
                 .await
-                .is_err(),
-            "retirement must retain lifecycle ordering until Disconnected is queued"
+                .is_ok(),
+            "event-channel backpressure must not hold the global lifecycle lock"
         );
+        tokio::time::timeout(Duration::from_millis(50), manager.connection_infos())
+            .await
+            .expect("status queries must remain available while retirement waits for capacity");
 
         events.recv().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -833,6 +851,11 @@ mod tests {
         })
         .await
         .expect("the authorized Disconnected event should be queued after capacity is released");
+        assert!(!is_current_generation(
+            &manager.connections,
+            device_id,
+            generation
+        ));
     }
 
     #[tokio::test]
