@@ -1,5 +1,56 @@
 //! macOS platform-specific implementations.
 
+#[cfg(any(test, target_os = "macos"))]
+const MAX_MACOS_UNICODE_SCALARS_PER_EVENT: usize = 20;
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacosTextOperation<'a> {
+    Unicode(&'a str),
+    TabClick,
+    GuardedControl(char),
+}
+
+#[cfg(test)]
+impl MacosTextOperation<'_> {
+    pub(crate) fn unicode_scalar_count(&self) -> usize {
+        match self {
+            Self::Unicode(text) => text.chars().count(),
+            Self::TabClick | Self::GuardedControl(_) => 1,
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn macos_text_operation_plan(mut text: &str) -> Vec<MacosTextOperation<'_>> {
+    let mut operations = Vec::new();
+    while !text.is_empty() {
+        let chunk_end = text
+            .char_indices()
+            .nth(MAX_MACOS_UNICODE_SCALARS_PER_EVENT)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+        let mut chunk = &text[..chunk_end];
+        text = &text[chunk_end..];
+
+        loop {
+            match chunk.chars().next() {
+                Some('\t') => operations.push(MacosTextOperation::TabClick),
+                Some(control @ ('\r' | '\n')) => {
+                    operations.push(MacosTextOperation::GuardedControl(control));
+                }
+                _ => break,
+            }
+            chunk = &chunk[1..];
+        }
+
+        if !chunk.is_empty() {
+            operations.push(MacosTextOperation::Unicode(chunk));
+        }
+    }
+    operations
+}
+
 cfg_if::cfg_if! {
     if #[cfg(target_os = "macos")] {
         pub use macos_impl::*;
@@ -8,6 +59,7 @@ cfg_if::cfg_if! {
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
+    use super::{macos_text_operation_plan, MacosTextOperation};
     use anyhow::{anyhow, bail, Result};
     use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardItem, NSURLPboardType};
     use cocoa::base::{id, nil};
@@ -260,6 +312,28 @@ mod macos_impl {
                 return Ok(());
             }
 
+            for operation in macos_text_operation_plan(text) {
+                match operation {
+                    MacosTextOperation::Unicode(chunk) => self.post_unicode_text(chunk)?,
+                    MacosTextOperation::TabClick => {
+                        self.send_key(0x09, true)?;
+                        self.send_key(0x09, false)?;
+                    }
+                    MacosTextOperation::GuardedControl('\r') => {
+                        self.post_unicode_text("\u{200B}\r")?;
+                    }
+                    MacosTextOperation::GuardedControl('\n') => {
+                        self.post_unicode_text("\u{200B}\n")?;
+                    }
+                    MacosTextOperation::GuardedControl(_) => {
+                        unreachable!("text planner only guards carriage returns and line feeds")
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn post_unicode_text(&mut self, text: &str) -> Result<()> {
             let event = CGEvent::new_keyboard_event(new_event_source()?, 0, true)
                 .map_err(|_| anyhow!("Failed to create macOS text commit event"))?;
             event.set_string(text);
