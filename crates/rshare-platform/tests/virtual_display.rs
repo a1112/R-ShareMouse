@@ -4,6 +4,86 @@ use rshare_core::{VirtualDisplayCreateRequest, VirtualDisplayOperationStatus};
 const DRIVER_TEST_ENV: &str = "RSHARE_RUN_VDISPLAY_DRIVER_TESTS";
 #[cfg(windows)]
 const DRIVER_TEST_DISPLAY_ID: &str = "rshare-vdisplay-driver-test";
+#[cfg(windows)]
+const DRIVER_OPERATION_MUTEX_NAME: &str = "Global\\RShareMouseVirtualDisplayOperation";
+
+#[cfg(windows)]
+fn require_idle_virtual_display_driver(
+    existing: &[rshare_core::VirtualDisplaySnapshot],
+) -> Result<(), String> {
+    if existing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to replace the existing R-ShareMouse virtual display ({:?}); remove it and stop every R-ShareMouse daemon before running this destructive opt-in test",
+            existing[0].status
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct VirtualDisplayTestOperationGuard {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl VirtualDisplayTestOperationGuard {
+    fn acquire() -> Result<Self, String> {
+        let mut name = DRIVER_OPERATION_MUTEX_NAME
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        name.push(0);
+        let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if handle == 0 {
+            return Err(format!(
+                "failed to create virtual display test mutex: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(format!(
+                "failed to acquire virtual display test mutex: {error}"
+            ));
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VirtualDisplayTestOperationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+        self.handle = 0;
+    }
+}
+
+#[cfg(windows)]
+const INFINITE: u32 = u32::MAX;
+#[cfg(windows)]
+const WAIT_OBJECT_0: u32 = 0;
+#[cfg(windows)]
+const WAIT_ABANDONED: u32 = 0x0000_0080;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateMutexW(
+        lpMutexAttributes: *mut std::ffi::c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> isize;
+    fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
+    fn ReleaseMutex(hMutex: isize) -> i32;
+    fn CloseHandle(hObject: isize) -> i32;
+}
 
 #[test]
 fn rejects_zero_sized_virtual_display_without_accessing_driver() {
@@ -81,6 +161,26 @@ fn virtual_display_cleanup_can_be_armed_after_create_and_disarmed_after_remove()
 }
 
 #[cfg(windows)]
+#[test]
+fn real_driver_preflight_rejects_an_existing_singleton_display() {
+    let existing = rshare_core::VirtualDisplaySnapshot {
+        id: "already-active".to_string(),
+        width: 1920,
+        height: 1080,
+        refresh_rate_millihz: Some(60_000),
+        name: None,
+        status: rshare_core::VirtualDisplayStatus::Active,
+        display_id: Some("existing-display".to_string()),
+        message: None,
+    };
+
+    let error = require_idle_virtual_display_driver(&[existing]).unwrap_err();
+
+    assert!(error.contains("refusing to replace"));
+    assert!(error.contains("stop every R-ShareMouse daemon"));
+}
+
+#[cfg(windows)]
 impl Drop for VirtualDisplayCleanup {
     fn drop(&mut self) {
         if !self.armed {
@@ -105,6 +205,7 @@ impl Drop for VirtualDisplayCleanup {
 /// Manual Windows driver validation only.
 ///
 /// PowerShell:
+/// Stop every R-ShareMouse daemon, then run:
 /// `$env:RSHARE_RUN_VDISPLAY_DRIVER_TESTS='1'; cargo test -p rshare-platform --test virtual_display -- --test-threads=1`
 #[cfg(windows)]
 #[test]
@@ -115,6 +216,13 @@ fn windows_virtual_display_driver_round_trip_requires_explicit_opt_in() {
         );
         return;
     }
+
+    let _operation_guard = VirtualDisplayTestOperationGuard::acquire()
+        .expect("opt-in driver test must acquire the cross-process operation mutex");
+    let existing = rshare_platform::virtual_display::list_virtual_displays()
+        .expect("opt-in driver test must query existing virtual display state");
+    require_idle_virtual_display_driver(&existing)
+        .expect("opt-in driver test refuses to replace an existing singleton display");
 
     let mut cleanup = VirtualDisplayCleanup::new(DRIVER_TEST_DISPLAY_ID);
     let create_result =
