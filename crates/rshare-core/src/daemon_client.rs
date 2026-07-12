@@ -16,9 +16,10 @@ use crate::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, ServiceStatusSnapshot,
-    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
-    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, MobileAccessSnapshot,
+    ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDeviceDescriptor,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
+    VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -289,6 +290,14 @@ pub async fn request_endpoint_inject(
 ) -> Result<EndpointInjectResult> {
     match send_request(DaemonRequest::InjectEndpointEvent { target, request }).await? {
         DaemonResponse::EndpointInjectResult(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_mobile_access() -> Result<MobileAccessSnapshot> {
+    match send_request(DaemonRequest::MobileAccess).await? {
+        DaemonResponse::MobileAccess(snapshot) => Ok(snapshot),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

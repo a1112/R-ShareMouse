@@ -1,0 +1,1051 @@
+const DEFAULT_MOUSE_TIMEOUT_MS = 250;
+const DEFAULT_KEYBOARD_TIMEOUT_MS = 750;
+const DEFAULT_MAX_HELD_KEYS = 64;
+const DEFAULT_MAX_HELD_MOUSE_BUTTONS = 16;
+
+export const MOBILE_LONG_PRESS_DRAG_DELAY_MS = 420;
+
+export const MOBILE_POINTER_SENSITIVITY = Object.freeze({
+  storageKey: "rshare.mobile.pointerSensitivity",
+  defaultValue: 1.35,
+  min: 0.5,
+  max: 3,
+  step: 0.05,
+});
+
+export const MOBILE_TEXT_INPUT_HINTS = Object.freeze({
+  enterKeyHint: "send",
+  autoCapitalize: "none",
+  autoCorrect: "off",
+  spellCheck: false,
+});
+
+export const MOBILE_MODIFIER_KEY_BUTTONS = Object.freeze([
+  Object.freeze({ label: "Ctrl", key: "ControlLeft" }),
+  Object.freeze({ label: "Shift", key: "ShiftLeft" }),
+  Object.freeze({ label: "Alt", key: "AltLeft" }),
+  Object.freeze({ label: "Win", key: "SuperLeft" }),
+]);
+
+export const MOBILE_EXTRA_KEY_BUTTONS = Object.freeze([
+  Object.freeze({ label: "Esc", key: "Escape" }),
+  Object.freeze({ label: "Tab", key: "Tab" }),
+  Object.freeze({ label: "Space", key: "Space" }),
+  Object.freeze({ label: "Del", key: "Delete" }),
+  Object.freeze({ label: "Home", key: "Home" }),
+  Object.freeze({ label: "End", key: "End" }),
+  Object.freeze({ label: "PgUp", key: "PageUp" }),
+  Object.freeze({ label: "PgDn", key: "PageDown" }),
+]);
+
+export const MOBILE_SHORTCUT_BUTTONS = Object.freeze([
+  Object.freeze({ id: "copy", label: "复制", keys: Object.freeze(["ControlLeft", "C"]) }),
+  Object.freeze({ id: "paste", label: "粘贴", keys: Object.freeze(["ControlLeft", "V"]) }),
+  Object.freeze({ id: "cut", label: "剪切", keys: Object.freeze(["ControlLeft", "X"]) }),
+  Object.freeze({ id: "select-all", label: "全选", keys: Object.freeze(["ControlLeft", "A"]) }),
+]);
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function backendHealthReason(health) {
+  if (typeof health === "string") {
+    return health;
+  }
+  if (isRecord(health?.Degraded)) {
+    return String(health.Degraded.reason ?? "Degraded");
+  }
+  if (isRecord(health)) {
+    return String(Object.keys(health)[0] ?? "未知状态");
+  }
+  return "未知状态";
+}
+
+export function formatMobileBackendStatus(snapshot) {
+  const backend = isRecord(snapshot?.inject_backend) ? snapshot.inject_backend : null;
+  if (!backend || (backend.active == null && backend.health == null)) {
+    return {
+      state: "pending",
+      label: "等待输入后端",
+      detail: "尚未收到注入后端状态",
+    };
+  }
+
+  const kind = String(backend.kind ?? backend.mode ?? "未知后端");
+  if (backend.active === true || backend.health === "Healthy") {
+    return {
+      state: "ready",
+      label: "输入注入就绪",
+      detail: kind,
+    };
+  }
+
+  return {
+    state: "blocked",
+    label: "输入注入不可用",
+    detail: `${kind}: ${backendHealthReason(backend.health)}`,
+  };
+}
+
+export function isMobileTextCommitSupported(snapshot) {
+  return snapshot?.inject_backend?.text_commit_supported === true;
+}
+
+export function formatMobileControllerError(error, scope = "移动端") {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/failed to fetch|networkerror|fetch failed|load failed/i.test(message)) {
+    return `${scope}网关不可用，请确认桌面服务正在运行并且手机与电脑在同一网络`;
+  }
+  return `${scope}请求失败：${message || "未知错误"}`;
+}
+
+function formatEndpointInjectError(error) {
+  switch (String(error ?? "")) {
+    case "BackendUnavailable":
+      return "输入后端不可用";
+    case "BackendDegraded":
+      return "输入后端异常";
+    case "PermissionDenied":
+      return "权限不足";
+    case "UnsupportedEvent":
+      return "当前输入事件不支持";
+    case "TargetDisconnected":
+      return "目标设备已断开";
+    case "Timeout":
+      return "注入超时";
+    case "RejectedByPolicy":
+      return "请求被策略拒绝";
+    case "TransportFailed":
+      return "传输失败";
+    case "Failed":
+      return "注入失败";
+    default:
+      return "未知错误";
+  }
+}
+
+export function formatMobileInjectResultStatus(result) {
+  const injectResult = result?.EndpointInjectResult ?? result ?? {};
+  if (injectResult.accepted !== false) {
+    return { accepted: true, status: "已连接" };
+  }
+  const backendKind = injectResult.backend_kind ? ` · ${injectResult.backend_kind}` : "";
+  return {
+    accepted: false,
+    status: `注入失败：${formatEndpointInjectError(injectResult.error)}${backendKind}`,
+  };
+}
+
+export function normalizeMobilePointerSensitivity(value, config = MOBILE_POINTER_SENSITIVITY) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return config.defaultValue;
+  }
+  const clamped = Math.max(config.min, Math.min(config.max, parsed));
+  const stepped = Math.round(clamped / config.step) * config.step;
+  return Number(stepped.toFixed(2));
+}
+
+function isEditableMobileTarget(target) {
+  if (!target || typeof target !== "object") {
+    return false;
+  }
+  const tagName = String(target.tagName ?? "").toUpperCase();
+  if (tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT") {
+    return true;
+  }
+  if (target.isContentEditable === true) {
+    return true;
+  }
+  if (typeof target.closest === "function") {
+    return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  }
+  return false;
+}
+
+export function shouldPreventMobileGestureDefault(event) {
+  const type = String(event?.type ?? "").toLowerCase();
+  if (
+    ![
+      "contextmenu",
+      "dragstart",
+      "selectstart",
+      "gesturestart",
+      "gesturechange",
+      "gestureend",
+    ].includes(type)
+  ) {
+    return false;
+  }
+  return !isEditableMobileTarget(event?.target);
+}
+
+export function preventMobileGestureDefault(event) {
+  if (!shouldPreventMobileGestureDefault(event)) {
+    return false;
+  }
+  event?.preventDefault?.();
+  if ("returnValue" in event) {
+    event.returnValue = false;
+  }
+  return true;
+}
+
+export function shouldCommitMobileTextOnKeyDown(event) {
+  const keyCode = Number(event?.keyCode ?? event?.which ?? event?.nativeEvent?.keyCode ?? 0);
+  const isComposing =
+    event?.isComposing === true || event?.nativeEvent?.isComposing === true || keyCode === 229;
+  return event?.key === "Enter" && event?.shiftKey !== true && !isComposing;
+}
+
+function daemonInjectRequest(deviceKind, payload, correlationId, options = {}) {
+  return {
+    InjectEndpointEvent: {
+      target: "Local",
+      request: {
+        correlation_id: correlationId,
+        device_kind: deviceKind,
+        payload,
+        mode: options.mode ?? "RequireHealthyBackend",
+        timeout_ms: options.timeoutMs ?? DEFAULT_KEYBOARD_TIMEOUT_MS,
+      },
+    },
+  };
+}
+
+export function buildTextCommitRequest(text, correlationId) {
+  return daemonInjectRequest(
+    "Keyboard",
+    {
+      kind: "TextCommit",
+      data: {
+        text,
+      },
+    },
+    correlationId,
+  );
+}
+
+export function buildKeyRequest(key, state, correlationId) {
+  return daemonInjectRequest(
+    "Keyboard",
+    {
+      kind: "Keyboard",
+      data: {
+        key,
+        state,
+      },
+    },
+    correlationId,
+  );
+}
+
+export function buildKeyTapRequests(key, correlationPrefix) {
+  return [
+    buildKeyRequest(key, "Pressed", `${correlationPrefix}-down`),
+    buildKeyRequest(key, "Released", `${correlationPrefix}-up`),
+  ];
+}
+
+function keyCorrelationSlug(key) {
+  return String(key).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+export function buildKeyChordRequests(keys, correlationPrefix) {
+  const normalizedKeys = Array.isArray(keys) ? keys.map(String).filter(Boolean) : [];
+  return [
+    ...normalizedKeys.map((key, index) =>
+      buildKeyRequest(key, "Pressed", `${correlationPrefix}-down-${index}-${keyCorrelationSlug(key)}`),
+    ),
+    ...[...normalizedKeys].reverse().map((key, index) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-up-${index}-${keyCorrelationSlug(key)}`),
+    ),
+  ];
+}
+
+export function buildMobileReleaseAllRequests(x, y, correlationPrefix, heldIntent = {}) {
+  const mouseButtons = ["Left", "Middle", "Right", "Back", "Forward"];
+  const modifierKeys = ["ControlLeft", "ShiftLeft", "AltLeft", "SuperLeft"];
+  const allMouseButtons = [
+    ...mouseButtons,
+    ...(Array.isArray(heldIntent?.mouseButtons) ? heldIntent.mouseButtons : []),
+  ]
+    .map(String)
+    .filter(Boolean)
+    .filter((button, index, values) => values.indexOf(button) === index)
+    .slice(0, mouseButtons.length + DEFAULT_MAX_HELD_MOUSE_BUTTONS);
+  const allKeys = [
+    ...modifierKeys,
+    ...(Array.isArray(heldIntent?.keys) ? heldIntent.keys : []),
+  ]
+    .map(String)
+    .filter(Boolean)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .slice(0, modifierKeys.length + DEFAULT_MAX_HELD_KEYS);
+  return [
+    ...allMouseButtons.map((button) =>
+      buildMouseButtonRequest(
+        button,
+        "Released",
+        x,
+        y,
+        `${correlationPrefix}-mouse-${keyCorrelationSlug(button)}`,
+      ),
+    ),
+    ...allKeys.map((key) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-key-${keyCorrelationSlug(key)}`),
+    ),
+  ];
+}
+
+export function buildHeldIntentReleaseRequests(x, y, correlationPrefix, heldIntent = {}) {
+  const mouseButtons = (Array.isArray(heldIntent?.mouseButtons) ? heldIntent.mouseButtons : [])
+    .map(String)
+    .filter(Boolean)
+    .filter((button, index, values) => values.indexOf(button) === index)
+    .slice(0, DEFAULT_MAX_HELD_MOUSE_BUTTONS);
+  const keys = (Array.isArray(heldIntent?.keys) ? heldIntent.keys : [])
+    .map(String)
+    .filter(Boolean)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .slice(0, DEFAULT_MAX_HELD_KEYS);
+  return [
+    ...mouseButtons.map((button) =>
+      buildMouseButtonRequest(
+        button,
+        "Released",
+        x,
+        y,
+        `${correlationPrefix}-mouse-${keyCorrelationSlug(button)}`,
+      ),
+    ),
+    ...keys.map((key) =>
+      buildKeyRequest(key, "Released", `${correlationPrefix}-key-${keyCorrelationSlug(key)}`),
+    ),
+  ];
+}
+
+function heldInputTransition(request) {
+  const endpointRequest = request?.InjectEndpointEvent?.request;
+  const payload = endpointRequest?.payload;
+  const data = payload?.data;
+  const state = String(data?.state ?? "").toLowerCase();
+  if (state !== "pressed" && state !== "released") {
+    return null;
+  }
+  if (endpointRequest?.device_kind === "Keyboard" && payload?.kind === "Keyboard") {
+    const identity = String(data?.key ?? "");
+    return identity ? { kind: "key", identity, state } : null;
+  }
+  if (endpointRequest?.device_kind === "Mouse" && payload?.kind === "MouseButton") {
+    const identity = String(data?.button ?? "");
+    return identity ? { kind: "mouseButton", identity, state } : null;
+  }
+  return null;
+}
+
+export function createMobileHeldIntentTracker(options = {}) {
+  function positiveBound(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : fallback;
+  }
+  const maxKeys = positiveBound(options.maxKeys, DEFAULT_MAX_HELD_KEYS);
+  const maxMouseButtons = positiveBound(
+    options.maxMouseButtons,
+    DEFAULT_MAX_HELD_MOUSE_BUTTONS,
+  );
+  const keyEntries = new Map();
+  const mouseButtonEntries = new Map();
+
+  function storeFor(kind) {
+    return kind === "key" ? keyEntries : mouseButtonEntries;
+  }
+
+  function limitFor(kind) {
+    return kind === "key" ? maxKeys : maxMouseButtons;
+  }
+
+  function cleanup(store, identity, entry) {
+    if (!entry.accepted && entry.pendingPressCount === 0 && store.get(identity) === entry) {
+      store.delete(identity);
+    }
+  }
+
+  return {
+    provision(request) {
+      const transition = heldInputTransition(request);
+      const token = { allowed: true, settled: false, transition, pendingPress: false };
+      if (!transition || transition.state !== "pressed") {
+        return token;
+      }
+
+      const store = storeFor(transition.kind);
+      let entry = store.get(transition.identity);
+      if (!entry) {
+        if (store.size >= limitFor(transition.kind)) {
+          token.allowed = false;
+          return token;
+        }
+        entry = { accepted: false, pendingPressCount: 0 };
+        store.set(transition.identity, entry);
+      }
+      token.pendingPress = true;
+      entry.pendingPressCount += 1;
+      return token;
+    },
+    settle(token, outcome) {
+      if (!token || token.settled) {
+        return false;
+      }
+      token.settled = true;
+      if (!token.allowed || !token.transition) {
+        return false;
+      }
+
+      const { kind, identity, state } = token.transition;
+      const store = storeFor(kind);
+      const entry = store.get(identity);
+      if (state === "pressed") {
+        if (!entry) {
+          return false;
+        }
+        if (token.pendingPress) {
+          entry.pendingPressCount = Math.max(0, entry.pendingPressCount - 1);
+        }
+        if (outcome === "accepted" || outcome === "unknown") {
+          entry.accepted = true;
+        }
+        cleanup(store, identity, entry);
+        return true;
+      }
+      if (outcome === "accepted" && entry) {
+        entry.accepted = false;
+        cleanup(store, identity, entry);
+      }
+      return true;
+    },
+    snapshot() {
+      return {
+        keys: [...keyEntries.entries()]
+          .filter(([, entry]) => entry.accepted || entry.pendingPressCount > 0)
+          .map(([identity]) => identity),
+        mouseButtons: [...mouseButtonEntries.entries()]
+          .filter(([, entry]) => entry.accepted || entry.pendingPressCount > 0)
+          .map(([identity]) => identity),
+      };
+    },
+  };
+}
+
+export function createHeldInputController(sendState) {
+  let active = false;
+  let activePointerId = null;
+
+  function releasePointer(pointerId, force = false) {
+    if (!active) {
+      return false;
+    }
+    if (!force && pointerId != null && activePointerId !== pointerId) {
+      return false;
+    }
+    active = false;
+    activePointerId = null;
+    sendState("Released");
+    return true;
+  }
+
+  return {
+    press(pointerId) {
+      if (active && activePointerId === pointerId) {
+        return false;
+      }
+      releasePointer(null, true);
+      active = true;
+      activePointerId = pointerId;
+      sendState("Pressed");
+      return true;
+    },
+    release(pointerId) {
+      return releasePointer(pointerId);
+    },
+    releaseAll() {
+      return releasePointer(null, true);
+    },
+    releaseIfPointerStillDown(pointerId, buttons) {
+      return buttons ? releasePointer(pointerId) : false;
+    },
+    resetSilently() {
+      const changed = active;
+      active = false;
+      activePointerId = null;
+      return changed;
+    },
+    isPressed() {
+      return active;
+    },
+  };
+}
+
+export function createHeldInputResetRegistry() {
+  const resetters = new Set();
+  let revision = 0;
+  return {
+    register(reset) {
+      resetters.add(reset);
+      return () => resetters.delete(reset);
+    },
+    markChanged() {
+      revision += 1;
+    },
+    capture() {
+      return revision;
+    },
+    resetAll(expectedRevision = revision) {
+      if (expectedRevision !== revision) {
+        return 0;
+      }
+      let resetCount = 0;
+      for (const reset of [...resetters]) {
+        reset();
+        resetCount += 1;
+      }
+      return resetCount;
+    },
+  };
+}
+
+export function shouldActivateHeldControlFromClick(event) {
+  return Number(event?.detail ?? 0) === 0;
+}
+
+export function isHeldControlActivationKey(event) {
+  return ["Enter", " ", "Spacebar"].includes(String(event?.key ?? ""));
+}
+
+export function buildMouseMoveRequest(x, y, displayId, correlationId) {
+  return daemonInjectRequest(
+    "Mouse",
+    {
+      kind: "MouseMove",
+      data: {
+        x,
+        y,
+        display_id: displayId ?? null,
+      },
+    },
+    correlationId,
+    {
+      mode: "BestEffort",
+      timeoutMs: DEFAULT_MOUSE_TIMEOUT_MS,
+    },
+  );
+}
+
+export function buildMouseButtonRequest(button, state, x, y, correlationId) {
+  return daemonInjectRequest(
+    "Mouse",
+    {
+      kind: "MouseButton",
+      data: {
+        button,
+        state,
+        x,
+        y,
+      },
+    },
+    correlationId,
+    {
+      mode: "BestEffort",
+      timeoutMs: DEFAULT_MOUSE_TIMEOUT_MS,
+    },
+  );
+}
+
+export function buildMouseClickRequests(button, x, y, correlationPrefix) {
+  return [
+    buildMouseButtonRequest(button, "Pressed", x, y, `${correlationPrefix}-down`),
+    buildMouseButtonRequest(button, "Released", x, y, `${correlationPrefix}-up`),
+  ];
+}
+
+export function buildMouseDoubleClickRequests(button, x, y, correlationPrefix) {
+  return [
+    ...buildMouseClickRequests(button, x, y, `${correlationPrefix}-1`),
+    ...buildMouseClickRequests(button, x, y, `${correlationPrefix}-2`),
+  ];
+}
+
+export function buildMouseWheelRequest(deltaX, deltaY, x, y, correlationId) {
+  return daemonInjectRequest(
+    "Mouse",
+    {
+      kind: "MouseWheel",
+      data: {
+        delta_x: deltaX,
+        delta_y: deltaY,
+        x,
+        y,
+      },
+    },
+    correlationId,
+    {
+      mode: "BestEffort",
+      timeoutMs: DEFAULT_MOUSE_TIMEOUT_MS,
+    },
+  );
+}
+
+export function nextPointerPosition(current, delta, bounds) {
+  const minX = Math.floor(Number(bounds?.x ?? bounds?.minX ?? 0));
+  const minY = Math.floor(Number(bounds?.y ?? bounds?.minY ?? 0));
+  const width = Math.max(1, Math.floor(Number(bounds?.width ?? 1)));
+  const height = Math.max(1, Math.floor(Number(bounds?.height ?? 1)));
+  const sensitivity = Number.isFinite(Number(bounds?.sensitivity))
+    ? Number(bounds.sensitivity)
+    : 1;
+  const x = Math.round(Number(current?.x ?? 0) + Number(delta?.dx ?? 0) * sensitivity);
+  const y = Math.round(Number(current?.y ?? 0) + Number(delta?.dy ?? 0) * sensitivity);
+  const maxX = minX + width - 1;
+  const maxY = minY + height - 1;
+
+  return {
+    x: Math.max(minX, Math.min(maxX, x)),
+    y: Math.max(minY, Math.min(maxY, y)),
+  };
+}
+
+export function resolveMobileDisplayIdAt(displays, x, y, fallbackId = null) {
+  const pointerX = Number(x);
+  const pointerY = Number(y);
+  if (!Number.isFinite(pointerX) || !Number.isFinite(pointerY) || !Array.isArray(displays)) {
+    return fallbackId ?? null;
+  }
+
+  for (const display of displays) {
+    if (!display || typeof display !== "object") {
+      continue;
+    }
+    const displayId = display.display_id ?? display.id;
+    const left = Number(display.x ?? 0);
+    const top = Number(display.y ?? 0);
+    const width = Number(display.width ?? display.w ?? 0);
+    const height = Number(display.height ?? display.h ?? 0);
+    if (
+      displayId != null &&
+      Number.isFinite(left) &&
+      Number.isFinite(top) &&
+      Number.isFinite(width) &&
+      Number.isFinite(height) &&
+      width > 0 &&
+      height > 0 &&
+      pointerX >= left &&
+      pointerX < left + width &&
+      pointerY >= top &&
+      pointerY < top + height
+    ) {
+      return String(displayId);
+    }
+  }
+
+  return fallbackId ?? null;
+}
+
+export function isTouchpadTap(start, end, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  if (!start || !end) {
+    return false;
+  }
+  const maxDurationMs = Number(options.maxDurationMs ?? 260);
+  const maxDistancePx = Number(options.maxDistancePx ?? 12);
+  const duration = Number(end.timeMs ?? 0) - Number(start.timeMs ?? 0);
+  if (!Number.isFinite(duration) || duration < 0 || duration > maxDurationMs) {
+    return false;
+  }
+  const dx = Number(end.x ?? 0) - Number(start.x ?? 0);
+  const dy = Number(end.y ?? 0) - Number(start.y ?? 0);
+  return Math.hypot(dx, dy) <= maxDistancePx;
+}
+
+export function isTouchpadLongPressDrag(start, current, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  if (!start || !current) {
+    return false;
+  }
+  const minDurationMs = Number(options.minDurationMs ?? MOBILE_LONG_PRESS_DRAG_DELAY_MS);
+  const maxDistancePx = Number(options.maxDistancePx ?? 12);
+  const duration = Number(current.timeMs ?? 0) - Number(start.timeMs ?? 0);
+  if (!Number.isFinite(duration) || duration < minDurationMs) {
+    return false;
+  }
+  const dx = Number(current.x ?? 0) - Number(start.x ?? 0);
+  const dy = Number(current.y ?? 0) - Number(start.y ?? 0);
+  return Math.hypot(dx, dy) <= maxDistancePx;
+}
+
+function normalizedTwoFingerTouches(touches) {
+  if (!Array.isArray(touches) || touches.length !== 2) {
+    return null;
+  }
+  return touches
+    .map((touch) => ({
+      id: String(touch?.id ?? ""),
+      x: Number(touch?.x ?? 0),
+      y: Number(touch?.y ?? 0),
+    }))
+    .filter((touch) => touch.id && Number.isFinite(touch.x) && Number.isFinite(touch.y))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function centroid(touches) {
+  return {
+    x: (touches[0].x + touches[1].x) / 2,
+    y: (touches[0].y + touches[1].y) / 2,
+  };
+}
+
+export function twoFingerWheelDelta(previousTouches, currentTouches, options = {}) {
+  const previous = normalizedTwoFingerTouches(previousTouches);
+  const current = normalizedTwoFingerTouches(currentTouches);
+  if (!previous || !current) {
+    return null;
+  }
+  if (previous[0].id !== current[0].id || previous[1].id !== current[1].id) {
+    return null;
+  }
+
+  const sensitivity = Number(options.sensitivity ?? 0.12);
+  const minDeltaPx = Number(options.minDeltaPx ?? 6);
+  const previousCenter = centroid(previous);
+  const currentCenter = centroid(current);
+  const dx = currentCenter.x - previousCenter.x;
+  const dy = currentCenter.y - previousCenter.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < minDeltaPx) {
+    return null;
+  }
+
+  const rawDeltaX = Math.round(dx * sensitivity);
+  const rawDeltaY = Math.round(dy * sensitivity);
+  const deltaX = Object.is(rawDeltaX, -0) ? 0 : rawDeltaX;
+  const deltaY = Object.is(rawDeltaY, -0) ? 0 : rawDeltaY;
+  if (deltaX === 0 && deltaY === 0) {
+    return null;
+  }
+  return { deltaX, deltaY };
+}
+
+export function createTwoFingerWheelAccumulator(options = {}) {
+  const sensitivity = Number(options.sensitivity ?? 0.12);
+  const minDeltaPx = Number(options.minDeltaPx ?? 6);
+  let residualX = 0;
+  let residualY = 0;
+
+  function reset() {
+    residualX = 0;
+    residualY = 0;
+  }
+
+  return {
+    update(previousTouches, currentTouches) {
+      const previous = normalizedTwoFingerTouches(previousTouches);
+      const current = normalizedTwoFingerTouches(currentTouches);
+      if (
+        !previous ||
+        !current ||
+        previous[0].id !== current[0].id ||
+        previous[1].id !== current[1].id
+      ) {
+        reset();
+        return null;
+      }
+
+      const previousCenter = centroid(previous);
+      const currentCenter = centroid(current);
+      residualX += currentCenter.x - previousCenter.x;
+      residualY += currentCenter.y - previousCenter.y;
+      if (Math.max(Math.abs(residualX), Math.abs(residualY)) < minDeltaPx) {
+        return null;
+      }
+
+      const rawDeltaX = Math.round(residualX * sensitivity);
+      const rawDeltaY = Math.round(residualY * sensitivity);
+      const deltaX = Object.is(rawDeltaX, -0) ? 0 : rawDeltaX;
+      const deltaY = Object.is(rawDeltaY, -0) ? 0 : rawDeltaY;
+      if (deltaX === 0 && deltaY === 0) {
+        return null;
+      }
+
+      reset();
+      return { deltaX, deltaY };
+    },
+    reset,
+  };
+}
+
+export function isTwoFingerTap(startTouches, endTouches, options = {}) {
+  if (options.cancelled) {
+    return false;
+  }
+  const start = normalizedTwoFingerTouches(startTouches);
+  const end = normalizedTwoFingerTouches(endTouches);
+  if (!start || !end) {
+    return false;
+  }
+  if (start[0].id !== end[0].id || start[1].id !== end[1].id) {
+    return false;
+  }
+
+  const startTimeMs = Number(options.startTimeMs ?? 0);
+  const endTimeMs = Number(options.endTimeMs ?? startTimeMs);
+  const maxDurationMs = Number(options.maxDurationMs ?? 260);
+  const duration = endTimeMs - startTimeMs;
+  if (!Number.isFinite(duration) || duration < 0 || duration > maxDurationMs) {
+    return false;
+  }
+
+  const maxCenterDistancePx = Number(options.maxCenterDistancePx ?? 12);
+  const maxFingerDistanceDeltaPx = Number(options.maxFingerDistanceDeltaPx ?? 12);
+  const startCenter = centroid(start);
+  const endCenter = centroid(end);
+  const centerDistance = Math.hypot(endCenter.x - startCenter.x, endCenter.y - startCenter.y);
+  if (centerDistance > maxCenterDistancePx) {
+    return false;
+  }
+
+  const startDistance = Math.hypot(start[1].x - start[0].x, start[1].y - start[0].y);
+  const endDistance = Math.hypot(end[1].x - end[0].x, end[1].y - end[0].y);
+  return Math.abs(endDistance - startDistance) <= maxFingerDistanceDeltaPx;
+}
+
+export function createOrderedMobileRequestQueue(sendRequest) {
+  let tail = Promise.resolve();
+
+  function enqueueBatch(values) {
+    const batch = Array.isArray(values) ? [...values] : [];
+    const result = tail.then(async () => {
+      const responses = [];
+      for (const value of batch) {
+        responses.push(await sendRequest(value));
+      }
+      return responses;
+    });
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  return {
+    enqueue(value) {
+      return enqueueBatch([value]).then(([response]) => response);
+    },
+    enqueueBatch,
+    idle() {
+      return tail;
+    },
+  };
+}
+
+export function createPointerMoveCoalescer(sendMove, scheduler = {}) {
+  const requestFrame =
+    scheduler.requestFrame ??
+    ((callback) => {
+      if (typeof requestAnimationFrame === "function") {
+        return requestAnimationFrame(callback);
+      }
+      return setTimeout(callback, 16);
+    });
+  const cancelFrame =
+    scheduler.cancelFrame ??
+    ((frameId) => {
+      if (typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(frameId);
+      } else {
+        clearTimeout(frameId);
+      }
+    });
+  let pendingMove = null;
+  let frameId = null;
+
+  let lastQueuedMove = null;
+
+  function queuePendingMove() {
+    const next = pendingMove;
+    pendingMove = null;
+    if (!next) {
+      return lastQueuedMove ?? Promise.resolve();
+    }
+
+    let sendResult;
+    try {
+      sendResult = sendMove(next);
+    } catch (error) {
+      sendResult = Promise.reject(error);
+    }
+    const queuedMove = Promise.resolve(sendResult).catch(() => undefined);
+    lastQueuedMove = queuedMove;
+    void queuedMove.then(() => {
+      if (lastQueuedMove !== queuedMove) {
+        return;
+      }
+      lastQueuedMove = null;
+      if (pendingMove) {
+        queuePendingMove();
+      }
+    });
+    return queuedMove;
+  }
+
+  function drain() {
+    frameId = null;
+    queuePendingMove();
+  }
+
+  return {
+    schedule(next) {
+      pendingMove = next;
+      if (frameId != null || lastQueuedMove) {
+        return;
+      }
+      frameId = requestFrame(drain);
+    },
+    flush() {
+      if (frameId != null) {
+        cancelFrame(frameId);
+        frameId = null;
+      }
+      if (pendingMove) {
+        return queuePendingMove();
+      }
+      return lastQueuedMove ?? Promise.resolve();
+    },
+  };
+}
+
+export function applyMobileStatusRefreshResult(result, options, handlers = {}) {
+  if (result?.state) {
+    if (options?.applyPointer) {
+      handlers.applyPointer?.(result.state.pointer);
+    }
+    if (options?.applyStatus) {
+      handlers.applyBackendStatus?.(result.state.backendStatus);
+      handlers.applyTextCommitSupported?.(result.state.textCommitSupported);
+      handlers.applyStatus?.("已连接");
+    }
+    return;
+  }
+  if (options?.applyStatus && result?.error?.name !== "AbortError") {
+    handlers.applyTextCommitSupported?.(false);
+    handlers.applyError?.(result?.error);
+  }
+}
+
+export function createMobileStatusRefreshController(fetchState, applyState) {
+  let inFlight = null;
+  let gestureActive = false;
+  let pointerRevision = 0;
+  let statusRevision = 0;
+  const pendingPointerWrites = new Set();
+
+  function refresh() {
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const requestedPointerRevision = pointerRevision;
+    const requestedStatusRevision = statusRevision;
+    let fetched;
+    try {
+      fetched = fetchState();
+    } catch (error) {
+      fetched = Promise.reject(error);
+    }
+    const applied = Promise.resolve(fetched).then((snapshot) => {
+      applyState(snapshot, {
+        applyPointer:
+          !gestureActive &&
+          pendingPointerWrites.size === 0 &&
+          requestedPointerRevision === pointerRevision,
+        applyStatus: requestedStatusRevision === statusRevision,
+      });
+      return snapshot;
+    });
+    const tracked = applied.finally(() => {
+      if (inFlight === tracked) {
+        inFlight = null;
+      }
+    });
+    inFlight = tracked;
+    return tracked;
+  }
+
+  return {
+    refresh,
+    setGestureActive(active) {
+      const next = Boolean(active);
+      if (next !== gestureActive) {
+        gestureActive = next;
+        pointerRevision += 1;
+      }
+    },
+    markPointerChanged() {
+      pointerRevision += 1;
+    },
+    beginPointerWrite() {
+      const token = {};
+      pendingPointerWrites.add(token);
+      pointerRevision += 1;
+      let completed = false;
+      return () => {
+        if (completed) {
+          return false;
+        }
+        completed = true;
+        if (!pendingPointerWrites.delete(token)) {
+          return false;
+        }
+        pointerRevision += 1;
+        return true;
+      };
+    },
+    markStatusChanged() {
+      statusRevision += 1;
+    },
+  };
+}
+
+export function tauriInvocationForMobileRequest(request) {
+  if (request === "LocalControls") {
+    return {
+      command: "local_controls_state",
+      args: {},
+      responseVariant: "LocalControls",
+    };
+  }
+
+  const inject = request?.InjectEndpointEvent;
+  if (inject) {
+    return {
+      command: "inject_endpoint_event",
+      args: {
+        target: inject.target,
+        request: inject.request,
+      },
+      responseVariant: "EndpointInjectResult",
+    };
+  }
+
+  return null;
+}
+
+export function createMobileCorrelationId(prefix) {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}

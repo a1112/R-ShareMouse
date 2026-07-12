@@ -1,10 +1,10 @@
 use anyhow::Result;
+#[cfg(any(not(windows), test))]
+use rshare_core::DisplayOperationStatus;
 use rshare_core::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, LocalDisplayState,
 };
-#[cfg(any(not(windows), test))]
-use rshare_core::DisplayOperationStatus;
 #[cfg(target_os = "linux")]
 use rshare_core::{
     DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities, LocalDisplayInfo,

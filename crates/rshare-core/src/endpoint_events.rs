@@ -174,6 +174,9 @@ pub enum EndpointEventPayload {
         key: String,
         state: String,
     },
+    TextCommit {
+        text: String,
+    },
     MouseMove {
         x: i32,
         y: i32,
@@ -264,6 +267,10 @@ pub enum EndpointInjectError {
 impl EndpointEventPayload {
     fn from_diagnostic(event: &LocalInputDiagnosticEvent) -> Self {
         match event.device_kind {
+            LocalInputDeviceKind::Keyboard if event.event_kind == "text" => Self::Generic {
+                summary: event.summary.clone(),
+                fields: event.payload.clone(),
+            },
             LocalInputDeviceKind::Keyboard => Self::Keyboard {
                 key: payload_string(&event.payload, "key", &event.summary),
                 state: payload_string(&event.payload, "state", &event.event_kind),
@@ -514,5 +521,30 @@ mod tests {
             ..EndpointEventFilter::default()
         }
         .matches(&event));
+    }
+
+    #[test]
+    fn text_diagnostic_serialization_keeps_count_without_a_text_field() {
+        let mut payload = BTreeMap::new();
+        payload.insert("char_count".to_string(), "4".to_string());
+        let event = EndpointEvent::from_local_diagnostic(
+            DeviceId::new_v4(),
+            LocalInputDiagnosticEvent {
+                sequence: 1,
+                timestamp_ms: 101,
+                device_kind: LocalInputDeviceKind::Keyboard,
+                event_kind: "text".to_string(),
+                summary: "Text commit 4 chars".to_string(),
+                device_id: None,
+                device_instance_id: None,
+                capture_path: None,
+                source: LocalInputEventSource::Hardware,
+                payload,
+            },
+        );
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(serialized.contains("char_count"));
+        assert!(!serialized.contains("\"text\":"));
     }
 }

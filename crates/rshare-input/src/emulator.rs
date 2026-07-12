@@ -40,6 +40,9 @@ pub trait InputEmulator {
     /// Type a key (press and release)
     fn type_key(&mut self, keycode: KeyCode) -> Result<()>;
 
+    /// Commit text at the active text insertion point.
+    fn commit_text(&mut self, text: &str) -> Result<()>;
+
     /// Check if emulator is active
     fn is_active(&self) -> bool;
 }
@@ -210,6 +213,7 @@ impl InputEmulator for EnigoInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -368,6 +372,19 @@ impl InputEmulator for EnigoInputEmulator {
         self.release_key(keycode)
     }
 
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        let mut enigo = self
+            .enigo
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock enigo: {}", e))?;
+
+        enigo
+            .text(text)
+            .map_err(|e| anyhow::anyhow!("Failed to commit text: {:?}", e))?;
+
+        Ok(())
+    }
+
     fn is_active(&self) -> bool {
         self.active
     }
@@ -499,6 +516,7 @@ impl InputEmulator for MacosNativeInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -553,6 +571,10 @@ impl InputEmulator for MacosNativeInputEmulator {
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
         self.press_key(keycode)?;
         self.release_key(keycode)
+    }
+
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.send_text(text)
     }
 
     fn is_active(&self) -> bool {
@@ -670,6 +692,10 @@ impl crate::backend::InjectBackend for WindowsNativeInputEmulator {
 
     fn is_active(&self) -> bool {
         self.active
+    }
+
+    fn supports_text_commit(&self) -> bool {
+        true
     }
 }
 
@@ -800,6 +826,7 @@ impl InputEmulator for WindowsNativeInputEmulator {
                 alt,
                 meta,
             } => self.emulate_key_with_modifiers(keycode, state, shift, ctrl, alt, meta)?,
+            InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadState { .. } => {
@@ -854,6 +881,10 @@ impl InputEmulator for WindowsNativeInputEmulator {
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
         self.press_key(keycode)?;
         self.release_key(keycode)
+    }
+
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.send_text(text)
     }
 
     fn is_active(&self) -> bool {
@@ -991,6 +1022,10 @@ impl<E: InputEmulator> InputEmulator for BatchEmulator<E> {
         self.inner.type_key(keycode)
     }
 
+    fn commit_text(&mut self, text: &str) -> Result<()> {
+        self.inner.commit_text(text)
+    }
+
     fn is_active(&self) -> bool {
         self.inner.is_active()
     }
@@ -1085,6 +1120,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn macos_native_emulator_source_forwards_text_commit_to_platform() {
+        let source = include_str!("emulator.rs");
+        let start = source
+            .find("impl InputEmulator for MacosNativeInputEmulator")
+            .expect("missing macOS native emulator");
+        let end = source[start..]
+            .find("impl MacosNativeInputEmulator")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS native emulator trait implementation");
+        let macos_impl = &source[start..end];
+
+        assert!(macos_impl.contains("InputEvent::TextCommit { text } => self.commit_text(&text)?"));
+        assert!(macos_impl.contains("fn commit_text(&mut self, text: &str) -> Result<()>"));
+        assert!(macos_impl.contains("self.inner.send_text(text)"));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_native_backend_is_preferred_when_available() {
@@ -1109,6 +1161,16 @@ mod tests {
 
         assert!(InputEmulator::is_active(&emulator));
         assert!(emulator.platform_emulator_is_active_for_test());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_emulator_reports_text_commit_support() {
+        use crate::backend::InjectBackend;
+
+        let emulator = WindowsNativeInputEmulator::new().unwrap();
+
+        assert!(InjectBackend::supports_text_commit(&emulator));
     }
 
     #[cfg(target_os = "windows")]

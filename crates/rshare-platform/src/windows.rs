@@ -1375,26 +1375,64 @@ mod windows_impl {
         }
     }
 
+    /// Map a physical virtual-desktop point into the coordinate range expected by SendInput.
+    fn normalize_virtual_desktop_point(
+        x: i32,
+        y: i32,
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+    ) -> (i32, i32) {
+        fn normalize_axis(point: i32, origin: i32, span: i32) -> i32 {
+            let last_pixel = i64::from(span).saturating_sub(1);
+            if last_pixel <= 0 {
+                return 0;
+            }
+
+            let offset = (i64::from(point) - i64::from(origin)).clamp(0, last_pixel);
+            ((offset * 65_535) / last_pixel) as i32
+        }
+
+        (
+            normalize_axis(x, origin_x, width),
+            normalize_axis(y, origin_y, height),
+        )
+    }
+
+    fn current_virtual_desktop_metrics() -> (i32, i32, i32, i32) {
+        extern "system" {
+            fn GetSystemMetrics(index: i32) -> i32;
+        }
+
+        unsafe {
+            let virtual_metrics = (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            );
+            if virtual_metrics.2 > 0 && virtual_metrics.3 > 0 {
+                return virtual_metrics;
+            }
+
+            (
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN).max(1),
+                GetSystemMetrics(SM_CYSCREEN).max(1),
+            )
+        }
+    }
+
     /// Windows input emulator using SendInput
     pub struct WindowsInputEmulator {
         active: bool,
-        screen_width: u32,
-        screen_height: u32,
     }
 
     impl WindowsInputEmulator {
         pub fn new() -> Self {
-            extern "system" {
-                fn GetSystemMetrics(nIndex: i32) -> i32;
-            }
-
-            unsafe {
-                Self {
-                    active: false,
-                    screen_width: GetSystemMetrics(0) as u32,
-                    screen_height: GetSystemMetrics(1) as u32,
-                }
-            }
+            Self { active: false }
         }
 
         pub fn activate(&mut self) -> Result<()> {
@@ -1419,21 +1457,13 @@ mod windows_impl {
                 return Ok(());
             }
 
+            ensure_display_dpi_awareness();
             tracing::trace!("Windows: mouse move to ({}, {})", x, y);
 
-            // Convert to normalized coordinates (0-65535)
-            let sw = self.screen_width.saturating_sub(1) as i32;
-            let sh = self.screen_height.saturating_sub(1) as i32;
-            let nx = if sw > 0 {
-                (x * 65535 / sw).max(0).min(65535)
-            } else {
-                0
-            };
-            let ny = if sh > 0 {
-                (y * 65535 / sh).max(0).min(65535)
-            } else {
-                0
-            };
+            // Read the virtual layout for every absolute move so monitor hot-plug changes
+            // cannot leave the emulator with stale dimensions.
+            let (origin_x, origin_y, width, height) = current_virtual_desktop_metrics();
+            let (nx, ny) = normalize_virtual_desktop_point(x, y, origin_x, origin_y, width, height);
 
             unsafe {
                 send_mouse_move_input(nx, ny)?;
@@ -1537,6 +1567,16 @@ mod windows_impl {
 
             Ok(())
         }
+
+        /// Commit Unicode text at the current text insertion point.
+        pub fn send_text(&mut self, text: &str) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+
+            tracing::trace!("Windows: text commit ({} chars)", text.chars().count());
+            send_unicode_text(text)
+        }
     }
 
     impl Default for WindowsInputEmulator {
@@ -1632,11 +1672,20 @@ mod windows_impl {
     const MOUSEEVENTF_WHEEL: u32 = 0x0800;
     const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
     const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+    const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
+
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
 
     const WHEEL_DELTA: i32 = 120;
 
     const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_UNICODE: u32 = 0x0004;
     const KEYEVENTF_SCANCODE: u32 = 0x0008;
     const RSHARE_KEYPAD_ENTER_RAW: u16 = 0xE01C;
     const INPUT_MOUSE: u32 = 0;
@@ -2631,21 +2680,24 @@ mod windows_impl {
 
     /// Send mouse move via SendInput using the native INPUT ABI.
     unsafe fn send_mouse_move_input(dx: i32, dy: i32) -> Result<()> {
+        let mouse = mouse_input_for_absolute_move(dx, dy);
         let input = Input {
             kind: INPUT_MOUSE,
-            payload: InputPayload {
-                mouse: MouseInput {
-                    dx,
-                    dy,
-                    mouse_data: 0,
-                    flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    time: 0,
-                    extra_info: 0,
-                },
-            },
+            payload: InputPayload { mouse },
         };
 
         send_input(&input, "mouse move")
+    }
+
+    fn mouse_input_for_absolute_move(dx: i32, dy: i32) -> MouseInput {
+        MouseInput {
+            dx,
+            dy,
+            mouse_data: 0,
+            flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            time: 0,
+            extra_info: 0,
+        }
     }
 
     /// Send mouse button via SendInput using the native INPUT ABI.
@@ -2697,6 +2749,26 @@ mod windows_impl {
         send_input(&input, "keyboard")
     }
 
+    pub fn send_unicode_text(text: &str) -> Result<()> {
+        unsafe {
+            for unit in text.encode_utf16() {
+                send_unicode_unit_input(unit, true)?;
+                send_unicode_unit_input(unit, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn send_unicode_unit_input(unit: u16, down: bool) -> Result<()> {
+        let keyboard = keyboard_input_for_unicode_unit(unit, down);
+        let input = Input {
+            kind: INPUT_KEYBOARD,
+            payload: InputPayload { keyboard },
+        };
+
+        send_input(&input, "unicode text")
+    }
+
     fn keyboard_input_for_key(vk: u16, down: bool) -> KeyboardInput {
         let (vk, scan, flags) = if vk == RSHARE_KEYPAD_ENTER_RAW {
             (0, 0x1C, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
@@ -2708,6 +2780,16 @@ mod windows_impl {
             vk,
             scan,
             flags: flags | if down { 0 } else { KEYEVENTF_KEYUP },
+            time: 0,
+            extra_info: 0,
+        }
+    }
+
+    fn keyboard_input_for_unicode_unit(unit: u16, down: bool) -> KeyboardInput {
+        KeyboardInput {
+            vk: 0,
+            scan: unit,
+            flags: KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP },
             time: 0,
             extra_info: 0,
         }
@@ -4548,6 +4630,108 @@ mod windows_impl {
             assert_eq!(
                 up.flags,
                 KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+            );
+        }
+
+        #[test]
+        fn unicode_text_sendinput_uses_unicode_scan_units() {
+            let down = keyboard_input_for_unicode_unit('你' as u16, true);
+            assert_eq!(down.vk, 0);
+            assert_eq!(down.scan, '你' as u16);
+            assert_eq!(down.flags, KEYEVENTF_UNICODE);
+
+            let up = keyboard_input_for_unicode_unit('你' as u16, false);
+            assert_eq!(up.vk, 0);
+            assert_eq!(up.scan, '你' as u16);
+            assert_eq!(up.flags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        }
+
+        #[test]
+        fn virtual_desktop_coordinates_preserve_negative_monitor_origins() {
+            assert_eq!(
+                normalize_virtual_desktop_point(-1920, 120, -1920, 0, 3840, 1080),
+                (0, 7288)
+            );
+        }
+
+        #[test]
+        fn virtual_desktop_coordinates_map_the_last_pixel_to_the_sendinput_maximum() {
+            assert_eq!(
+                normalize_virtual_desktop_point(1919, 1079, -1920, 0, 3840, 1080),
+                (65535, 65535)
+            );
+        }
+
+        #[test]
+        fn virtual_desktop_coordinates_clamp_points_outside_the_layout() {
+            assert_eq!(
+                normalize_virtual_desktop_point(-3000, -100, -1920, 0, 3840, 1080),
+                (0, 0)
+            );
+            assert_eq!(
+                normalize_virtual_desktop_point(3000, 2000, -1920, 0, 3840, 1080),
+                (65535, 65535)
+            );
+        }
+
+        #[test]
+        fn virtual_desktop_coordinates_handle_i32_extremes_without_overflow() {
+            assert_eq!(
+                normalize_virtual_desktop_point(
+                    i32::MIN,
+                    i32::MIN,
+                    i32::MIN,
+                    i32::MIN,
+                    i32::MAX,
+                    i32::MAX,
+                ),
+                (0, 0)
+            );
+            assert_eq!(
+                normalize_virtual_desktop_point(
+                    i32::MAX,
+                    i32::MAX,
+                    i32::MIN,
+                    i32::MIN,
+                    i32::MAX,
+                    i32::MAX,
+                ),
+                (65535, 65535)
+            );
+            assert_eq!(normalize_virtual_desktop_point(10, 20, 0, 0, 0, -1), (0, 0));
+        }
+
+        #[test]
+        fn absolute_mouse_move_targets_the_entire_virtual_desktop() {
+            let input = mouse_input_for_absolute_move(123, 456);
+
+            assert_eq!(input.dx, 123);
+            assert_eq!(input.dy, 456);
+            assert_eq!(
+                input.flags,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+            );
+        }
+
+        #[test]
+        fn absolute_mouse_move_enables_dpi_awareness_before_reading_virtual_metrics() {
+            let source = include_str!("windows.rs");
+            let start = source
+                .find("pub fn send_mouse_move(&mut self")
+                .expect("missing absolute mouse move implementation");
+            let end = source[start..]
+                .find("pub fn send_button(&mut self")
+                .map(|offset| start + offset)
+                .expect("missing mouse button implementation");
+            let send_mouse_move = &source[start..end];
+
+            assert!(
+                send_mouse_move
+                    .find("ensure_display_dpi_awareness();")
+                    .expect("mouse injection must opt into per-monitor DPI coordinates")
+                    < send_mouse_move
+                        .find("current_virtual_desktop_metrics()")
+                        .expect("mouse injection must read current virtual metrics")
             );
         }
 

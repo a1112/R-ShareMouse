@@ -31,6 +31,9 @@ pub enum InputEvent {
         alt: bool,
         meta: bool,
     },
+    TextCommit {
+        text: String,
+    },
     GamepadConnected {
         info: GamepadDeviceInfo,
     },
@@ -286,6 +289,10 @@ impl InputEvent {
         }
     }
 
+    pub fn text_commit(text: String) -> Self {
+        Self::TextCommit { text }
+    }
+
     pub fn gamepad_connected(info: GamepadDeviceInfo) -> Self {
         Self::GamepadConnected { info }
     }
@@ -306,6 +313,7 @@ impl InputEvent {
             InputEvent::MouseWheel { .. } => "MouseWheel",
             InputEvent::Key { .. } => "Key",
             InputEvent::KeyExtended { .. } => "KeyExtended",
+            InputEvent::TextCommit { .. } => "TextCommit",
             InputEvent::GamepadConnected { .. } => "GamepadConnected",
             InputEvent::GamepadDisconnected { .. } => "GamepadDisconnected",
             InputEvent::GamepadState { .. } => "GamepadState",
@@ -321,6 +329,7 @@ impl InputEvent {
                 | InputEvent::MouseWheel { .. }
                 | InputEvent::Key { .. }
                 | InputEvent::KeyExtended { .. }
+                | InputEvent::TextCommit { .. }
                 | InputEvent::GamepadConnected { .. }
                 | InputEvent::GamepadDisconnected { .. }
                 | InputEvent::GamepadState { .. }
@@ -701,6 +710,18 @@ mod tests {
                 assert_eq!(keycode, KeyCode::Space);
                 assert_eq!(state, ButtonState::Pressed);
             }
+            _ => panic!("Wrong event type"),
+        }
+    }
+
+    #[test]
+    fn text_commit_event_serializes_unicode_text() {
+        let event = InputEvent::text_commit("你好🙂".to_string());
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: InputEvent = serde_json::from_str(&serialized).unwrap();
+
+        match deserialized {
+            InputEvent::TextCommit { text } => assert_eq!(text, "你好🙂"),
             _ => panic!("Wrong event type"),
         }
     }

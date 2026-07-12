@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
-    discovery::{DiscoveredDevice, ServiceDiscovery},
+    discovery::{DiscoveredDevice, DiscoveryEvent, ServiceDiscovery},
 };
 use rshare_core::{DeviceId, Message};
 
@@ -36,7 +36,7 @@ pub struct NetworkManagerConfig {
     pub discovery_port: u16,
     /// Transport bind address
     pub bind_address: String,
-    /// Auto-connect to discovered devices
+    /// Retained for configuration compatibility; unpaired discovery is observational only.
     pub auto_connect: bool,
     /// Discovery broadcast interval
     pub broadcast_interval: Duration,
@@ -49,7 +49,7 @@ impl Default for NetworkManagerConfig {
         Self {
             discovery_port: 27432,
             bind_address: "0.0.0.0:27431".to_string(),
-            auto_connect: true,
+            auto_connect: false,
             broadcast_interval: Duration::from_secs(5),
             device_timeout: Duration::from_secs(30),
         }
@@ -98,6 +98,53 @@ fn spawn_connection_event_forwarder(
             }
         }
     });
+}
+
+async fn handle_discovery_event(
+    event: DiscoveryEvent,
+    config: &NetworkManagerConfig,
+    discovered_devices: &Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
+    discovery_tx: &mpsc::Sender<NetworkEvent>,
+    connection: &Arc<TokioMutex<ConnectionManager>>,
+) {
+    if config.auto_connect
+        && matches!(
+            &event,
+            DiscoveryEvent::DeviceFound(_) | DiscoveryEvent::DeviceUpdated(_)
+        )
+    {
+        tracing::debug!(
+            "Ignoring legacy auto_connect=true; unpaired discovery remains observational"
+        );
+    }
+
+    match event {
+        DiscoveryEvent::DeviceFound(device) | DiscoveryEvent::DeviceUpdated(device) => {
+            let device_id = device.id;
+            {
+                let mut devices = discovered_devices.write().await;
+                devices.insert(device_id, device.clone());
+            }
+            let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device));
+        }
+        DiscoveryEvent::DeviceLost(id) => {
+            {
+                let mut devices = discovered_devices.write().await;
+                devices.remove(&id);
+            }
+
+            let transport_connected = {
+                let manager = connection.lock().await;
+                manager.is_connected(&id).await
+            };
+            if let Some(event) = discovery_lost_network_event(id, transport_connected) {
+                let _ = discovery_tx.try_send(event);
+            }
+        }
+        DiscoveryEvent::Error(error) => {
+            tracing::error!("Discovery error: {}", error);
+        }
+    }
 }
 
 impl NetworkManager {
@@ -173,7 +220,7 @@ impl NetworkManager {
     /// Check if a device is connected
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let conn = self.connection.lock().await;
-        conn.is_connected(device_id)
+        conn.is_connected(device_id).await
     }
 
     /// Send a message to a device
@@ -210,6 +257,8 @@ impl NetworkManager {
         // Start discovery with event channel
         let discovery_tx = self.event_tx.clone();
         let discovered_devices = self.discovered_devices.clone();
+        let discovery_lost_connection = self.connection.clone();
+        let discovery_event_config = self.config.clone();
 
         let mut discovery = ServiceDiscovery::new(
             self.local_device_id,
@@ -240,39 +289,14 @@ impl NetworkManager {
             });
 
             while let Some(event) = rx.recv().await {
-                match event {
-                    crate::discovery::DiscoveryEvent::DeviceFound(device) => {
-                        let device_id = device.id;
-
-                        {
-                            let mut devices = discovered_devices.write().await;
-                            devices.insert(device_id, device.clone());
-                        }
-
-                        let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device));
-                    }
-                    crate::discovery::DiscoveryEvent::DeviceUpdated(device) => {
-                        let device_id = device.id;
-
-                        {
-                            let mut devices = discovered_devices.write().await;
-                            devices.insert(device_id, device.clone());
-                        }
-
-                        let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device));
-                    }
-                    crate::discovery::DiscoveryEvent::DeviceLost(id) => {
-                        {
-                            let mut devices = discovered_devices.write().await;
-                            devices.remove(&id);
-                        }
-
-                        let _ = discovery_tx.try_send(NetworkEvent::DeviceDisconnected(id));
-                    }
-                    crate::discovery::DiscoveryEvent::Error(err) => {
-                        tracing::error!("Discovery error: {}", err);
-                    }
-                }
+                handle_discovery_event(
+                    event,
+                    &discovery_event_config,
+                    &discovered_devices,
+                    &discovery_tx,
+                    &discovery_lost_connection,
+                )
+                .await;
             }
 
             discovery_task.abort();
@@ -349,6 +373,17 @@ fn normalize_discovered_connection_address(
     socket_addr.to_string()
 }
 
+fn discovery_lost_network_event(
+    device_id: DeviceId,
+    transport_connected: bool,
+) -> Option<NetworkEvent> {
+    if transport_connected {
+        None
+    } else {
+        Some(NetworkEvent::DeviceDisconnected(device_id))
+    }
+}
+
 // Note: NetworkManager intentionally doesn't implement Clone
 // because it contains runtime resources like channels and connections
 
@@ -356,11 +391,23 @@ fn normalize_discovered_connection_address(
 mod tests {
     use super::*;
 
+    fn discovered_device(device_id: DeviceId, address: SocketAddr, name: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            id: device_id,
+            name: name.to_string(),
+            hostname: "remote-host".to_string(),
+            addresses: vec![address],
+            screen_info: None,
+            capabilities: rshare_core::DeviceCapabilities::default(),
+            last_seen: tokio::time::Instant::now(),
+        }
+    }
+
     #[test]
     fn test_network_manager_config_default() {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
-        assert!(config.auto_connect);
+        assert!(!config.auto_connect);
     }
 
     #[test]
@@ -376,6 +423,23 @@ mod tests {
     }
 
     #[test]
+    fn discovery_lost_does_not_emit_disconnect_while_transport_is_connected() {
+        let device_id = DeviceId::new_v4();
+
+        assert!(discovery_lost_network_event(device_id, true).is_none());
+    }
+
+    #[test]
+    fn discovery_lost_emits_disconnect_when_transport_is_not_connected() {
+        let device_id = DeviceId::new_v4();
+
+        assert!(matches!(
+            discovery_lost_network_event(device_id, false),
+            Some(NetworkEvent::DeviceDisconnected(id)) if id == device_id
+        ));
+    }
+
+    #[test]
     fn test_network_manager_new() {
         let manager = NetworkManager::new(
             DeviceId::new_v4(),
@@ -383,6 +447,68 @@ mod tests {
             "test-host".to_string(),
         );
         assert!(!manager.running);
+    }
+
+    #[tokio::test]
+    async fn legacy_auto_connect_true_keeps_found_and_updated_devices_observational() {
+        let local_id = DeviceId::from_bytes([0x10; 16]);
+        let remote_id = DeviceId::from_bytes([0xf0; 16]);
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = NetworkManagerConfig {
+            discovery_port: 0,
+            auto_connect: true,
+            ..NetworkManagerConfig::default()
+        };
+        let mut manager =
+            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string())
+                .with_config(config);
+        let mut events = manager.events();
+
+        let found = discovered_device(remote_id, probe.local_addr().unwrap(), "first");
+        handle_discovery_event(
+            crate::discovery::DiscoveryEvent::DeviceFound(found.clone()),
+            &manager.config,
+            &manager.discovered_devices,
+            &manager.event_tx,
+            &manager.connection,
+        )
+        .await;
+        let mut updated = found;
+        updated.name = "updated".to_string();
+        handle_discovery_event(
+            crate::discovery::DiscoveryEvent::DeviceUpdated(updated.clone()),
+            &manager.config,
+            &manager.discovered_devices,
+            &manager.event_tx,
+            &manager.connection,
+        )
+        .await;
+
+        for expected_name in ["first", "updated"] {
+            let event = events.recv().await.unwrap();
+            assert!(matches!(
+                event,
+                NetworkEvent::DeviceFound(device) if device.name == expected_name
+            ));
+        }
+        assert_eq!(
+            manager
+                .discovered_devices()
+                .await
+                .into_iter()
+                .find(|device| device.id == remote_id)
+                .unwrap()
+                .name,
+            "updated"
+        );
+        let mut packet = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), probe.recv_from(&mut packet))
+                .await
+                .is_err(),
+            "discovery must not send a QUIC connection attempt"
+        );
+        assert!(manager.connection_infos().await.is_empty());
     }
 
     #[tokio::test]

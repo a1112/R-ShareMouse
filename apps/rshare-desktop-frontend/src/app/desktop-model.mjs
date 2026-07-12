@@ -1,3 +1,5 @@
+import qrcode from "qrcode-generator";
+
 const DEVICE_COLORS = ["#5b8bd6", "#49b35c", "#d6a64b", "#9b6ef3", "#e56b6f"];
 const LOCAL_DEVICE_COLOR = "#60a5fa";
 const LAYOUT_SCALE = 0.12;
@@ -5,6 +7,7 @@ const CANVAS_ORIGIN_X = 80;
 const CANVAS_ORIGIN_Y = 170;
 const LAYOUT_COMMIT_SNAP_DISTANCE = Math.ceil(12 / LAYOUT_SCALE);
 const LATENCY_HEALTHY_RTT_MS = 50;
+const MOBILE_CLIENT_STALE_MS = 15_000;
 const VIRTUAL_DISPLAY_CREATE_MODES = [
   { width: 1920, height: 1080, refreshRateMillihz: 60_000 },
   { width: 1920, height: 1080, refreshRateMillihz: 144_000 },
@@ -19,6 +22,19 @@ const VIRTUAL_DISPLAY_CREATE_MODES = [
   { width: 1024, height: 768, refreshRateMillihz: 75_000 },
   { width: 1024, height: 768, refreshRateMillihz: 60_000 },
 ];
+
+function buildQrCodeSvgDataUri(value) {
+  if (!value || value === "不可用") {
+    return null;
+  }
+
+  const qr = qrcode(0, "M");
+  qr.addData(value);
+  qr.make();
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+    qr.createSvgTag({ cellSize: 4, margin: 3, scalable: true }),
+  )}`;
+}
 
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
@@ -40,6 +56,73 @@ function buildLocalDevice(status) {
     address: status?.bind_address ?? "不可用",
     port: status?.discovery_port ?? null,
     lastSeenLabel: online ? "当前机器" : "守护进程离线",
+  };
+}
+
+function formatMobileClientAge(seenAtMs, nowMs) {
+  if (!Number.isFinite(seenAtMs) || !Number.isFinite(nowMs) || nowMs < seenAtMs) {
+    return null;
+  }
+  const ageSeconds = Math.floor((nowMs - seenAtMs) / 1000);
+  if (ageSeconds < 1) {
+    return "刚刚";
+  }
+  if (ageSeconds < 60) {
+    return `${ageSeconds} 秒前`;
+  }
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) {
+    return `${ageMinutes} 分钟前`;
+  }
+  const ageHours = Math.floor(ageMinutes / 60);
+  return `${ageHours} 小时前`;
+}
+
+export function buildMobileAccessViewModel(snapshot, options = {}) {
+  const enabled = Boolean(snapshot?.enabled);
+  const url = typeof snapshot?.page_url === "string" && snapshot.page_url.length
+    ? snapshot.page_url
+    : "不可用";
+  const bindAddress = typeof snapshot?.bind_address === "string" ? snapshot.bind_address : "不可用";
+  const portText = bindAddress.includes(":") ? bindAddress.split(":").pop() : "";
+  const port = portText ? Number(portText) : null;
+  const lastClientAddr =
+    typeof snapshot?.last_client_addr === "string" && snapshot.last_client_addr.length
+      ? snapshot.last_client_addr
+      : null;
+  const clientCount = Math.max(0, Math.floor(Number(snapshot?.client_count ?? 0)));
+  const lastClientSeenAtMs = Number(snapshot?.last_client_seen_at_ms);
+  const hasSeenAt = Number.isFinite(lastClientSeenAtMs) && lastClientSeenAtMs > 0;
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const clientAgeLabel = hasSeenAt ? formatMobileClientAge(lastClientSeenAtMs, nowMs) : null;
+  const clientStale =
+    hasSeenAt && Number.isFinite(nowMs) && nowMs - lastClientSeenAtMs > MOBILE_CLIENT_STALE_MS;
+  const clientDetailParts = lastClientAddr
+    ? [
+        `最近 ${lastClientAddr}`,
+        clientAgeLabel,
+        `${clientCount} 次请求`,
+      ].filter(Boolean)
+    : [];
+
+  return {
+    available: enabled && url !== "不可用",
+    url,
+    token: typeof snapshot?.token === "string" ? snapshot.token : "",
+    bindAddress,
+    port: Number.isFinite(port) && port > 0 ? port : null,
+    clientStatus: lastClientAddr ? (clientStale ? "最近离线" : "已连接手机") : "未连接",
+    clientDetail: lastClientAddr
+      ? clientDetailParts.join(" · ")
+      : enabled
+        ? "等待手机扫码或打开链接"
+        : "网关不可用",
+    qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(url) : null,
+    qrCodeAlt: "移动端控制二维码",
+    urlLabel: enabled ? "实验性明文局域网控制 URL" : "移动网关未启用",
+    summary: enabled
+      ? "实验性明文局域网控制：该 HTTP 链接未加密，仅应在可信局域网中临时使用。"
+      : "移动端控制默认关闭；如需实验，请在配置中设置 mobile_gateway_enabled=true 后重启守护进程。",
   };
 }
 

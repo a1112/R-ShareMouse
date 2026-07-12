@@ -1,7 +1,7 @@
 use rshare_core::{
     ipc::{
-        default_ipc_addr, read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest,
-        DaemonResponse, ServiceStatusSnapshot,
+        default_ipc_addr, default_mobile_gateway_addr, read_json_line, write_json_line,
+        DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
     BackgroundProcessOwner, BackgroundRunMode, CapabilityRegistrySnapshot, DeviceAttribution,
@@ -14,10 +14,11 @@ use rshare_core::{
     LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioEndpointFormFactor,
     LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioTestRequest,
     LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
-    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, TrayRuntimeState,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor, UsbDeviceSpeed,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    LocalInputEventSource, LocalInputTestKind, LocalInputTestRequest, MobileAccessSnapshot,
+    TrayRuntimeState, UsbDescriptorProbeResult, UsbDescriptorProbeStatus, UsbDeviceDescriptor,
+    UsbDeviceSpeed, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -338,6 +339,28 @@ async fn endpoint_inject_request_round_trips_over_json_lines() {
             payload: EndpointEventPayload::Keyboard {
                 key: "ShiftLeft".to_string(),
                 state: "Pressed".to_string(),
+            },
+            mode: EndpointInjectMode::RequireHealthyBackend,
+            timeout_ms: 750,
+        },
+    };
+
+    let (mut writer, mut reader) = duplex(4096);
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+}
+
+#[tokio::test]
+async fn endpoint_text_commit_request_round_trips_over_json_lines() {
+    let request = DaemonRequest::InjectEndpointEvent {
+        target: EndpointInjectTarget::Local,
+        request: EndpointInjectRequest {
+            correlation_id: "mobile-text-1".to_string(),
+            device_kind: EndpointEventKind::Keyboard,
+            payload: EndpointEventPayload::TextCommit {
+                text: "你好🙂".to_string(),
             },
             mode: EndpointInjectMode::RequireHealthyBackend,
             timeout_ms: 750,
@@ -787,4 +810,48 @@ fn default_ipc_addr_binds_to_loopback() {
 
     assert!(addr.ip().is_loopback());
     assert_eq!(addr.port(), 27435);
+}
+
+#[tokio::test]
+async fn mobile_access_request_round_trips_over_json_lines() {
+    let (mut writer, mut reader) = duplex(2048);
+    let request = DaemonRequest::MobileAccess;
+
+    write_json_line(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, request);
+
+    let snapshot = MobileAccessSnapshot {
+        enabled: true,
+        bind_address: "0.0.0.0:27437".to_string(),
+        page_url: "http://192.168.1.50:27437/mobile?t=abc123".to_string(),
+        token: "abc123".to_string(),
+        last_client_addr: Some("192.168.1.80:53120".to_string()),
+        last_client_seen_at_ms: Some(1_800_000),
+        client_count: 2,
+    };
+    let response = DaemonResponse::MobileAccess(snapshot.clone());
+    let (mut writer, mut reader) = duplex(2048);
+
+    write_json_line(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, response);
+    assert!(snapshot.page_url.contains(&snapshot.token));
+    assert_eq!(
+        snapshot.last_client_addr.as_deref(),
+        Some("192.168.1.80:53120")
+    );
+    assert_eq!(snapshot.last_client_seen_at_ms, Some(1_800_000));
+    assert_eq!(snapshot.client_count, 2);
+}
+
+#[test]
+fn default_mobile_gateway_addr_uses_separate_port() {
+    let ipc_addr = default_ipc_addr();
+    let mobile_addr = default_mobile_gateway_addr();
+
+    assert_ne!(mobile_addr.port(), ipc_addr.port());
+    assert_eq!(mobile_addr.port(), 27437);
 }

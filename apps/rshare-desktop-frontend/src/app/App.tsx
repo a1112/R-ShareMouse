@@ -9,7 +9,9 @@ import {
 import {
   ChevronDown,
   ChevronRight,
+  Copy,
   Download,
+  ExternalLink,
   FileText,
   Gamepad2,
   HardDrive,
@@ -20,8 +22,10 @@ import {
   Monitor,
   MousePointer2,
   Play,
+  QrCode,
   RotateCcw,
   Settings,
+  Smartphone,
   Square,
   Upload,
   Volume2,
@@ -33,6 +37,7 @@ import MonitorManager, {
   DeviceData as LayoutDevice,
   MonitorData,
 } from "./components/MonitorManager";
+import MobileController from "./MobileController";
 import {
   buildDesktopViewModel,
   buildDisplaySettingsViewModel,
@@ -41,6 +46,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildLocalDeviceSelectItems,
+  buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   buildVirtualDisplayViewModel,
@@ -81,6 +87,7 @@ type DesktopPage = "layout" | "devices" | "logs" | "settings";
 type SettingsSectionKey =
   | "local"
   | "service"
+  | "mobile"
   | "hardware"
   | "input"
   | "appearance"
@@ -471,6 +478,16 @@ type LocalInputTestResult = {
   maxElapsedMs?: number | null;
 };
 
+type MobileAccessSnapshot = {
+  enabled: boolean;
+  bind_address: string;
+  page_url: string;
+  token: string;
+  last_client_addr?: string | null;
+  last_client_seen_at_ms?: number | null;
+  client_count?: number;
+};
+
 type RemoteLatencySummary = {
   state: "idle" | "pending" | "pass" | "warn" | "fail";
   message: string;
@@ -623,6 +640,7 @@ const NETWORK_COMMANDS = new Set([
   "get_layout",
   "set_layout",
   "local_controls_state",
+  "mobile_access",
   "endpoint_events_state",
   "inject_endpoint_event",
   "start_local_controls_stream",
@@ -1051,6 +1069,8 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonRequestValue<T>({ SetLayout: { layout: args?.layout } }, "Ack");
     case "local_controls_state":
       return await daemonRequestValue<T>("LocalControls", "LocalControls");
+    case "mobile_access":
+      return await daemonRequestValue<T>("MobileAccess", "MobileAccess");
     case "endpoint_events_state":
       return await daemonRequestValue<T>(
         {
@@ -1904,7 +1924,21 @@ function getLayoutMonitors(
   }));
 }
 
+function isMobileControllerPath() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.location.pathname.replace(/\/+$/, "") === "/mobile";
+}
+
 export default function App() {
+  if (isMobileControllerPath()) {
+    return <MobileController />;
+  }
+  return <DesktopApp />;
+}
+
+function DesktopApp() {
   usePreventBrowserNavigationEvents();
 
   const [page, setPage] = useState<DesktopPage>("layout");
@@ -1915,6 +1949,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [localControls, setLocalControls] = useState<LocalControlsSnapshot | null>(null);
   const [localControlsError, setLocalControlsError] = useState<string | null>(null);
+  const [mobileAccess, setMobileAccess] = useState<MobileAccessSnapshot | null>(null);
+  const [mobileAccessError, setMobileAccessError] = useState<string | null>(null);
   const [localInputTestResult, setLocalInputTestResult] =
     useState<LocalInputTestResult | null>(null);
   const [remoteLatencyTestResult, setRemoteLatencyTestResult] =
@@ -1974,6 +2010,17 @@ export default function App() {
     }
   }
 
+  async function refreshMobileAccess() {
+    try {
+      const snapshot = await invokeCommand<MobileAccessSnapshot>("mobile_access");
+      setMobileAccess(snapshot);
+      setMobileAccessError(null);
+    } catch (mobileError) {
+      setMobileAccess(null);
+      setMobileAccessError(errorMessage(mobileError));
+    }
+  }
+
   async function refreshHardwareAssets() {
     setHardwareAssetCatalog((current) => ({ ...current, loading: true, error: null }));
     try {
@@ -1998,6 +2045,7 @@ export default function App() {
     await refreshDashboard();
     setRefreshTick((value) => value + 1);
     void refreshLocalControls();
+    void refreshMobileAccess();
     void refreshHardwareAssets();
   }
 
@@ -2042,11 +2090,13 @@ export default function App() {
     refreshDashboard().finally(() => {
       if (!cancelled) {
         void refreshLocalControls();
+        void refreshMobileAccess();
       }
     });
     refreshHardwareAssets();
     const dashboardTimer = window.setInterval(() => {
       refreshDashboard();
+      refreshMobileAccess();
       setRefreshTick((value) => value + 1);
     }, POLL_INTERVAL_MS);
 
@@ -2711,6 +2761,8 @@ export default function App() {
               localDevice={model.settings.localDevice}
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
+              mobileAccess={mobileAccess}
+              mobileAccessError={mobileAccessError}
               service={model.service}
               themeMode={themeMode}
               onThemeModeChange={setThemeMode}
@@ -9473,6 +9525,8 @@ function SettingsPage({
   localDevice,
   inputMode,
   privilegeState,
+  mobileAccess,
+  mobileAccessError,
   service,
   themeMode,
   onThemeModeChange,
@@ -9516,6 +9570,8 @@ function SettingsPage({
     reason: string | null;
   };
   privilegeState: string;
+  mobileAccess: MobileAccessSnapshot | null;
+  mobileAccessError: string | null;
   service: {
     online: boolean;
     healthy: boolean;
@@ -9541,9 +9597,11 @@ function SettingsPage({
     background: "rgba(255,255,255,0.04)",
     color: theme.textSub,
   };
+  const mobileAccessView = buildMobileAccessViewModel(mobileAccess);
   const sectionSummary: Record<SettingsSectionKey, string> = {
     local: localDevice.name,
     service: service.online ? "运行中" : "已停止",
+    mobile: mobileAccessView.available ? `端口 ${mobileAccessView.port ?? "未知"}` : "不可用",
     hardware: "贴图设置",
     input: inputMode.current,
     appearance:
@@ -9608,6 +9666,105 @@ function SettingsPage({
         >
           {service.online ? "停止服务" : "启动服务"}
         </button>
+      </section>
+    );
+  } else if (selectedSection === "mobile") {
+    sectionContent = (
+      <section className="p-5" style={panelStyle}>
+        {renderSectionHeader(
+          <Smartphone size={18} />,
+          "移动端控制",
+          "用手机浏览器连接本机移动网关，模拟鼠标、按键和手机输入法文本。",
+          true,
+        )}
+
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <InfoRow
+            label="网关"
+            value={mobileAccessView.available ? "可用" : "不可用"}
+            theme={theme}
+          />
+          <InfoRow label="监听地址" value={mobileAccessView.bindAddress} theme={theme} />
+          <InfoRow label="端口" value={mobileAccessView.port == null ? "不可用" : String(mobileAccessView.port)} theme={theme} />
+          <InfoRow
+            label="访问令牌"
+            value={mobileAccessView.token ? `${mobileAccessView.token.slice(0, 8)}...` : "不可用"}
+            theme={theme}
+          />
+          <InfoRow
+            label="手机连接"
+            value={`${mobileAccessView.clientStatus} · ${mobileAccessView.clientDetail}`}
+            theme={theme}
+          />
+        </div>
+
+        <div
+          className="mt-4 grid gap-4 rounded-md px-4 py-3 text-sm lg:grid-cols-[148px_minmax(0,1fr)]"
+          style={{ border: `1px solid ${theme.border}`, background: theme.frame }}
+        >
+          <div
+            className="flex h-[148px] w-[148px] items-center justify-center rounded-md"
+            style={{
+              background: mobileAccessView.qrCodeSvgDataUri ? "#ffffff" : theme.surface,
+              border: `1px solid ${theme.border}`,
+            }}
+          >
+            {mobileAccessView.qrCodeSvgDataUri ? (
+              <img
+                className="h-[132px] w-[132px]"
+                src={mobileAccessView.qrCodeSvgDataUri}
+                alt={mobileAccessView.qrCodeAlt}
+              />
+            ) : (
+              <QrCode size={42} style={{ color: theme.textMuted }} />
+            )}
+          </div>
+          <div className="min-w-0 self-center">
+            <div className="mb-2 text-xs uppercase tracking-[0.16em]" style={{ color: theme.textMuted }}>
+              {mobileAccessView.urlLabel}
+            </div>
+            <div className="break-all font-medium">{mobileAccessView.url}</div>
+            <div className="mt-2 text-sm leading-6" style={{ color: theme.textMuted }}>
+              {mobileAccessError ?? mobileAccessView.summary}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="flex items-center gap-2 rounded-md px-4 py-2 text-sm transition"
+            style={{
+              background: theme.accentSoft,
+              color: theme.accent,
+              border: `1px solid ${theme.accent}`,
+              opacity: mobileAccessView.available ? 1 : 0.6,
+            }}
+            disabled={!mobileAccessView.available}
+            onClick={() => {
+              void navigator.clipboard?.writeText(mobileAccessView.url);
+            }}
+          >
+            <Copy size={14} />
+            复制链接
+          </button>
+          <a
+            className="flex items-center gap-2 rounded-md px-4 py-2 text-sm transition"
+            style={{
+              background: theme.frame,
+              color: mobileAccessView.available ? theme.text : theme.textMuted,
+              border: `1px solid ${theme.border}`,
+              pointerEvents: mobileAccessView.available ? "auto" : "none",
+              opacity: mobileAccessView.available ? 1 : 0.6,
+            }}
+            href={mobileAccessView.available ? mobileAccessView.url : undefined}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <ExternalLink size={14} />
+            打开
+          </a>
+        </div>
       </section>
     );
   } else if (selectedSection === "hardware") {

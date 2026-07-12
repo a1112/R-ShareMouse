@@ -19,6 +19,73 @@ mod windows_impl {
     /// Default ports used by R-ShareMouse
     pub const DISCOVERY_PORT: u16 = 27432;
     pub const SERVICE_PORT: u16 = 27431;
+    pub const MOBILE_GATEWAY_PORT: u16 = 27437;
+
+    const DISCOVERY_RULE_NAME: &str = "R-ShareMouse Discovery (UDP-In)";
+    const TRANSPORT_RULE_NAME: &str = "R-ShareMouse Transport (QUIC UDP-In)";
+    const MOBILE_GATEWAY_RULE_NAME: &str = "R-ShareMouse Mobile Gateway (TCP-In)";
+
+    #[derive(Debug, Clone, Copy)]
+    enum FirewallRuleTarget {
+        Discovery,
+        Transport,
+        MobileGateway,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FirewallRuleSpec {
+        name: &'static str,
+        port: &'static str,
+        protocol: &'static str,
+        target: FirewallRuleTarget,
+    }
+
+    fn required_firewall_rules(mobile_gateway_enabled: bool) -> Vec<FirewallRuleSpec> {
+        let mut rules = vec![
+            FirewallRuleSpec {
+                name: DISCOVERY_RULE_NAME,
+                port: "27432",
+                protocol: "UDP",
+                target: FirewallRuleTarget::Discovery,
+            },
+            FirewallRuleSpec {
+                name: TRANSPORT_RULE_NAME,
+                port: "27431",
+                protocol: "UDP",
+                target: FirewallRuleTarget::Transport,
+            },
+        ];
+        if mobile_gateway_enabled {
+            rules.push(FirewallRuleSpec {
+                name: MOBILE_GATEWAY_RULE_NAME,
+                port: "27437",
+                protocol: "TCP",
+                target: FirewallRuleTarget::MobileGateway,
+            });
+        }
+        rules
+    }
+
+    fn firewall_rule_names_for_removal() -> [&'static str; 3] {
+        [
+            DISCOVERY_RULE_NAME,
+            TRANSPORT_RULE_NAME,
+            MOBILE_GATEWAY_RULE_NAME,
+        ]
+    }
+
+    fn manual_firewall_instructions(mobile_gateway_enabled: bool) -> String {
+        required_firewall_rules(mobile_gateway_enabled)
+            .into_iter()
+            .map(|rule| {
+                format!(
+                    "netsh advfirewall firewall add rule name=\"{}\" dir=in action=allow protocol={} localport={}",
+                    rule.name, rule.protocol, rule.port
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// Configure Windows Firewall to allow R-ShareMouse
     ///
@@ -31,65 +98,50 @@ mod windows_impl {
     /// Returns an error if:
     /// - The process is not running with administrator privileges
     /// - `netsh` command fails
-    pub fn configure_firewall() -> Result<FirewallConfigResult> {
-        let mut result = FirewallConfigResult::default();
+    pub fn configure_firewall(mobile_gateway_enabled: bool) -> Result<FirewallConfigResult> {
+        let mut result = FirewallConfigResult::for_mobile_gateway(mobile_gateway_enabled);
 
         // Check if running as admin
         if !is_elevated() {
             return Err(anyhow::anyhow!(
                 "Administrator privileges required to configure firewall. \
-             Please restart as administrator or manually add firewall rules:\n\
-             netsh advfirewall firewall add rule name=\"R-ShareMouse Discovery (UDP-In)\" \
-             dir=in action=allow protocol=UDP localport=27432\n\
-             netsh advfirewall firewall add rule name=\"R-ShareMouse Transport (QUIC UDP-In)\" \
-             dir=in action=allow protocol=UDP localport=27431"
+                 Please restart as administrator or manually add firewall rules:\n{}",
+                manual_firewall_instructions(mobile_gateway_enabled)
             ));
         }
 
-        // Add UDP discovery rule
-        match add_firewall_rule("R-ShareMouse Discovery (UDP-In)", "27432", "UDP") {
-            Ok(existed) => {
-                result.udp_discovery = if existed {
-                    FirewallRuleStatus::AlreadyExisted
-                } else {
-                    FirewallRuleStatus::Created
-                };
-            }
-            Err(e) => {
-                tracing::warn!("Failed to add UDP discovery rule: {}", e);
-                result.udp_discovery = FirewallRuleStatus::Failed(e.to_string());
-            }
-        }
-
-        // Add QUIC device transport rule
-        match add_firewall_rule("R-ShareMouse Transport (QUIC UDP-In)", "27431", "UDP") {
-            Ok(existed) => {
-                result.quic_transport = if existed {
-                    FirewallRuleStatus::AlreadyExisted
-                } else {
-                    FirewallRuleStatus::Created
-                };
-            }
-            Err(e) => {
-                tracing::warn!("Failed to add QUIC transport rule: {}", e);
-                result.quic_transport = FirewallRuleStatus::Failed(e.to_string());
-            }
+        for rule in required_firewall_rules(mobile_gateway_enabled) {
+            let status = match add_firewall_rule(rule.name, rule.port, rule.protocol) {
+                Ok(existed) => {
+                    if existed {
+                        FirewallRuleStatus::AlreadyExisted
+                    } else {
+                        FirewallRuleStatus::Created
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to add firewall rule '{}': {}", rule.name, error);
+                    FirewallRuleStatus::Failed(error.to_string())
+                }
+            };
+            result.set_status(rule.target, status);
         }
 
         Ok(result)
     }
 
-    /// Check if a firewall rule exists
-    pub fn check_firewall_rules() -> bool {
+    /// Check if every required firewall rule exists.
+    pub fn check_firewall_rules(mobile_gateway_enabled: bool) -> bool {
         if !is_elevated() {
             return false;
         }
 
-        check_rule_exists("R-ShareMouse Discovery (UDP-In)")
-            && check_rule_exists("R-ShareMouse Transport (QUIC UDP-In)")
+        required_firewall_rules(mobile_gateway_enabled)
+            .into_iter()
+            .all(|rule| check_rule_exists(rule.name))
     }
 
-    /// Remove R-ShareMouse firewall rules
+    /// Remove R-ShareMouse firewall rules, including legacy optional rules.
     pub fn remove_firewall_rules() -> Result<()> {
         if !is_elevated() {
             return Err(anyhow::anyhow!(
@@ -97,8 +149,9 @@ mod windows_impl {
             ));
         }
 
-        let _ = remove_firewall_rule("R-ShareMouse Discovery (UDP-In)");
-        let _ = remove_firewall_rule("R-ShareMouse Transport (QUIC UDP-In)");
+        for name in firewall_rule_names_for_removal() {
+            let _ = remove_firewall_rule(name);
+        }
 
         Ok(())
     }
@@ -108,18 +161,41 @@ mod windows_impl {
     pub struct FirewallConfigResult {
         pub udp_discovery: FirewallRuleStatus,
         pub quic_transport: FirewallRuleStatus,
+        pub mobile_gateway: Option<FirewallRuleStatus>,
     }
 
     impl FirewallConfigResult {
-        /// Check if all rules were successfully configured
+        fn for_mobile_gateway(enabled: bool) -> Self {
+            Self {
+                mobile_gateway: if enabled {
+                    Some(FirewallRuleStatus::default())
+                } else {
+                    None
+                },
+                ..Self::default()
+            }
+        }
+
+        fn set_status(&mut self, target: FirewallRuleTarget, status: FirewallRuleStatus) {
+            match target {
+                FirewallRuleTarget::Discovery => self.udp_discovery = status,
+                FirewallRuleTarget::Transport => self.quic_transport = status,
+                FirewallRuleTarget::MobileGateway => self.mobile_gateway = Some(status),
+            }
+        }
+
+        /// Check if all required rules were successfully configured
         pub fn is_success(&self) -> bool {
-            matches!(
-                self.udp_discovery,
-                FirewallRuleStatus::Created | FirewallRuleStatus::AlreadyExisted
-            ) && matches!(
-                self.quic_transport,
-                FirewallRuleStatus::Created | FirewallRuleStatus::AlreadyExisted
-            )
+            fn succeeded(status: &FirewallRuleStatus) -> bool {
+                matches!(
+                    status,
+                    FirewallRuleStatus::AlreadyExisted | FirewallRuleStatus::Created
+                )
+            }
+
+            succeeded(&self.udp_discovery)
+                && succeeded(&self.quic_transport)
+                && self.mobile_gateway.as_ref().map(succeeded).unwrap_or(true)
         }
     }
 
@@ -297,6 +373,60 @@ mod windows_impl {
             result.quic_transport = FirewallRuleStatus::AlreadyExisted;
             assert!(result.is_success());
         }
+
+        #[test]
+        fn mobile_gateway_rule_is_required_only_when_enabled() {
+            let disabled_rules = required_firewall_rules(false);
+            assert!(!disabled_rules
+                .iter()
+                .any(|rule| { rule.protocol == "TCP" && rule.port == "27437" }));
+
+            let enabled_rules = required_firewall_rules(true);
+            assert!(enabled_rules.iter().any(|rule| {
+                rule.name == "R-ShareMouse Mobile Gateway (TCP-In)"
+                    && rule.protocol == "TCP"
+                    && rule.port == "27437"
+            }));
+        }
+
+        #[test]
+        fn disabled_mobile_gateway_does_not_affect_configuration_success() {
+            let mut result = FirewallConfigResult::for_mobile_gateway(false);
+            result.udp_discovery = FirewallRuleStatus::Created;
+            result.quic_transport = FirewallRuleStatus::AlreadyExisted;
+
+            assert!(result.mobile_gateway.is_none());
+            assert!(result.is_success());
+        }
+
+        #[test]
+        fn enabled_mobile_gateway_requires_a_successful_tcp_rule() {
+            let mut result = FirewallConfigResult::for_mobile_gateway(true);
+            result.udp_discovery = FirewallRuleStatus::Created;
+            result.quic_transport = FirewallRuleStatus::AlreadyExisted;
+
+            assert!(result.mobile_gateway.is_some());
+            assert!(!result.is_success());
+
+            result.mobile_gateway = Some(FirewallRuleStatus::Created);
+            assert!(result.is_success());
+        }
+
+        #[test]
+        fn firewall_removal_always_includes_the_legacy_mobile_rule() {
+            assert!(
+                firewall_rule_names_for_removal().contains(&"R-ShareMouse Mobile Gateway (TCP-In)")
+            );
+        }
+
+        #[test]
+        fn manual_instructions_include_mobile_tcp_only_when_enabled() {
+            let disabled = manual_firewall_instructions(false);
+            assert!(!disabled.contains("localport=27437"));
+
+            let enabled = manual_firewall_instructions(true);
+            assert!(enabled.contains("protocol=TCP localport=27437"));
+        }
     }
 }
 
@@ -307,10 +437,11 @@ mod no_op_impl {
 
     pub const DISCOVERY_PORT: u16 = 27432;
     pub const SERVICE_PORT: u16 = 27431;
+    pub const MOBILE_GATEWAY_PORT: u16 = 27437;
 
     #[derive(Debug, Clone, Default)]
     pub struct FirewallConfigResult {
-        pub dummy: bool,
+        pub mobile_gateway: Option<FirewallRuleStatus>,
     }
 
     impl FirewallConfigResult {
@@ -332,11 +463,13 @@ mod no_op_impl {
         }
     }
 
-    pub fn configure_firewall() -> Result<FirewallConfigResult> {
-        Ok(FirewallConfigResult::default())
+    pub fn configure_firewall(mobile_gateway_enabled: bool) -> Result<FirewallConfigResult> {
+        Ok(FirewallConfigResult {
+            mobile_gateway: mobile_gateway_enabled.then_some(FirewallRuleStatus::Created),
+        })
     }
 
-    pub fn check_firewall_rules() -> bool {
+    pub fn check_firewall_rules(_mobile_gateway_enabled: bool) -> bool {
         true
     }
 

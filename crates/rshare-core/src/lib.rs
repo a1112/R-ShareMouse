@@ -59,8 +59,9 @@ pub use capabilities::{
 // Re-exports from local daemon IPC
 pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
-    read_json_line, write_json_line, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
-    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LocalInputFeedback, NetworkTransportSnapshot,
+    default_mobile_gateway_addr, read_json_line, write_json_line, DaemonDeviceSnapshot,
+    DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
+    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot,
     RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
     UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };

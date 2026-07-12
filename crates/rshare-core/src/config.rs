@@ -78,14 +78,17 @@ pub struct GamepadConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeatureConfig {
+    /// Enable the experimental plaintext LAN mobile controller gateway.
+    #[serde(default)]
+    pub mobile_gateway_enabled: bool,
     /// Suppress local OS shortcuts while this machine is controlling a remote target.
     #[serde(default = "default_true")]
     pub suppress_local_shortcuts_when_remote: bool,
     /// Allow edge-triggered automatic forwarding of captured input to a remote target.
     ///
-    /// Disabled by default while Alpha endpoint diagnostics are being validated; manual
-    /// endpoint injection tests remain available through the daemon IPC.
-    #[serde(default)]
+    /// Enabled by default so a connected, linked peer can be controlled from the
+    /// local screen edge without requiring an extra diagnostics-only toggle.
+    #[serde(default = "default_true")]
     pub automatic_input_forwarding: bool,
     /// Ask the remote endpoint to run the reverse latency probe automatically.
     #[serde(default = "default_true")]
@@ -176,8 +179,9 @@ impl Default for GamepadConfig {
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
+            mobile_gateway_enabled: false,
             suppress_local_shortcuts_when_remote: true,
-            automatic_input_forwarding: false,
+            automatic_input_forwarding: true,
             auto_endpoint_latency_probe: true,
             audio_capture: true,
             audio_forwarding: true,
@@ -375,7 +379,7 @@ mod tests {
         assert_eq!(config.gamepad.max_update_hz, 120);
         assert!(!config.gamepad.vibration);
         assert!(config.features.suppress_local_shortcuts_when_remote);
-        assert!(!config.features.automatic_input_forwarding);
+        assert!(config.features.automatic_input_forwarding);
         assert!(config.features.auto_endpoint_latency_probe);
         assert!(config.features.audio_capture);
         assert!(config.features.audio_forwarding);
@@ -385,6 +389,11 @@ mod tests {
         assert!(!config.security.password_required);
         assert!(config.security.encryption);
         assert!(config.security.lan_only);
+    }
+
+    #[test]
+    fn mobile_gateway_is_disabled_by_default() {
+        assert!(!Config::default().features.mobile_gateway_enabled);
     }
 
     #[test]
@@ -429,11 +438,33 @@ mod tests {
 
         let partial: Config =
             toml::from_str("[features]\nusb_forwarding_experimental = true\n").unwrap();
+        assert!(partial.features.automatic_input_forwarding);
         assert!(partial.features.usb_forwarding_experimental);
         assert!(partial.features.audio_capture);
         assert!(partial.features.audio_forwarding);
         assert!(partial.features.usb_device_advertising);
         assert!(partial.features.usb_descriptor_probe);
+    }
+
+    #[test]
+    fn missing_mobile_gateway_field_defaults_to_disabled() {
+        let loaded: Config =
+            toml::from_str("[features]\nautomatic_input_forwarding = true\n").unwrap();
+
+        assert!(!loaded.features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn load_preserves_explicit_automatic_forwarding_opt_out() {
+        let path = temp_config_path("explicit-forwarding-opt-out");
+        let mut config = Config::default();
+        config.features.automatic_input_forwarding = false;
+        config.save_to_path(&path).unwrap();
+
+        let loaded = Config::load_from_path(&path).unwrap();
+
+        assert!(!loaded.features.automatic_input_forwarding);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

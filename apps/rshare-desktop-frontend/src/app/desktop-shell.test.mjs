@@ -166,6 +166,7 @@ test("getSettingsLayoutSections exposes a left navigation order for settings", (
   assert.deepEqual(getSettingsLayoutSections(), [
     { key: "local", label: "本机信息", description: "设备名称、主机与监听端口" },
     { key: "service", label: "服务状态", description: "守护进程运行状态" },
+    { key: "mobile", label: "移动端控制", description: "手机触控板和输入法入口" },
     { key: "hardware", label: "硬件资产", description: "贴图和导入包" },
     { key: "input", label: "输入后端", description: "捕获模式与健康度" },
     { key: "appearance", label: "界面风格", description: "主题外观" },
@@ -198,4 +199,11 @@ test("display settings refreshes system topology after virtual display operation
     /await refreshVirtualDisplays\(\);\s*await onRefreshLocalControls\?\.\(\);/g,
   );
   assert.equal(topologyRefreshes?.length, 2);
+});
+
+test("mobile settings renders the truthful gateway URL label", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /\{mobileAccessView\.urlLabel\}/);
+  assert.doesNotMatch(source, />手机访问链接</);
 });

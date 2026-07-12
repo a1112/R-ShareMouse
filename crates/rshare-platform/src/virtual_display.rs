@@ -29,6 +29,8 @@ const RSHARE_VDISPLAY_ACTIVITY_ACTIVE: u16 = 1;
 const RSHARE_VDISPLAY_ACTIVITY_PENDING: u16 = 2;
 const REFRESH_RATE_MATCH_TOLERANCE_MILLIHZ: u32 = 1_000;
 const RSHARE_VDISPLAY_EDID_HARDWARE_ID: &str = "rsm0001";
+#[cfg(windows)]
+const RSHARE_VDISPLAY_OPERATION_MUTEX_NAME: &str = "Global\\RShareMouseVirtualDisplayOperation";
 const RSHARE_VDISPLAY_SUPPORTED_MODES: &[(u32, u32, u32)] = &[
     (1920, 1080, 60_000),
     (1920, 1080, 144_000),
@@ -381,6 +383,7 @@ fn operation_from_driver_state_with_displays(
 
 #[cfg(windows)]
 fn windows_list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
+    let _operation_guard = WindowsVirtualDisplayOperationGuard::acquire()?;
     let client = match WindowsVirtualDisplayClient::open() {
         Ok(client) => client,
         Err(_) => return Ok(Vec::new()),
@@ -405,6 +408,7 @@ fn windows_list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
 fn windows_create_virtual_display(
     request: &VirtualDisplayCreateRequest,
 ) -> Result<VirtualDisplayOperationResult> {
+    let _operation_guard = WindowsVirtualDisplayOperationGuard::acquire()?;
     let raw_request = driver_request_from_create(request)?;
     let id = virtual_display_id(request.id.as_deref());
     let client = match WindowsVirtualDisplayClient::open() {
@@ -416,15 +420,23 @@ fn windows_create_virtual_display(
         return Ok(driver_unavailable_create_result(request, error.to_string()));
     }
 
-    if let Err(error) = client.create_or_update(raw_request) {
-        return Ok(VirtualDisplayOperationResult {
-            status: VirtualDisplayOperationStatus::Failed,
-            display: None,
-            message: Some(error.to_string()),
-        });
-    }
-
-    let state = client.query_state()?;
+    let previous_state = client.query_state()?;
+    let state = match run_windows_virtual_display_create_transaction(
+        previous_state.active,
+        || client.create_or_update(raw_request),
+        || client.query_state(),
+        || client.remove(),
+    ) {
+        Ok(state) => state,
+        Err(WindowsVirtualDisplayCreateError::Create(error)) => {
+            return Ok(VirtualDisplayOperationResult {
+                status: VirtualDisplayOperationStatus::Failed,
+                display: None,
+                message: Some(error.to_string()),
+            });
+        }
+        Err(WindowsVirtualDisplayCreateError::Query(error)) => return Err(error),
+    };
     let display_state = crate::display::query_display_state().ok();
     Ok(operation_from_driver_state_with_displays(
         VirtualDisplayOperationStatus::Created,
@@ -440,6 +452,7 @@ fn windows_create_virtual_display(
 fn windows_remove_virtual_display(
     request: &VirtualDisplayRemoveRequest,
 ) -> Result<VirtualDisplayOperationResult> {
+    let _operation_guard = WindowsVirtualDisplayOperationGuard::acquire()?;
     let client = match WindowsVirtualDisplayClient::open() {
         Ok(client) => client,
         Err(error) => {
@@ -470,6 +483,41 @@ fn windows_remove_virtual_display(
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
+enum WindowsVirtualDisplayCreateError {
+    Create(anyhow::Error),
+    Query(anyhow::Error),
+}
+
+#[cfg(windows)]
+fn run_windows_virtual_display_create_transaction(
+    previous_activity: u16,
+    create: impl FnOnce() -> Result<()>,
+    query: impl FnOnce() -> Result<RShareVdisplayStateRaw>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> std::result::Result<RShareVdisplayStateRaw, WindowsVirtualDisplayCreateError> {
+    create().map_err(WindowsVirtualDisplayCreateError::Create)?;
+    match query() {
+        Ok(state) => Ok(state),
+        Err(query_error) => {
+            if previous_activity == RSHARE_VDISPLAY_ACTIVITY_REMOVED {
+                let rollback_diagnostic = match rollback() {
+                    Ok(()) => "new virtual display was rolled back".to_string(),
+                    Err(error) => format!("virtual display rollback also failed: {error}"),
+                };
+                Err(WindowsVirtualDisplayCreateError::Query(anyhow::anyhow!(
+                    "virtual display was created but its state could not be queried: {query_error}; {rollback_diagnostic}"
+                )))
+            } else {
+                Err(WindowsVirtualDisplayCreateError::Query(anyhow::anyhow!(
+                    "updated virtual display state could not be queried: {query_error}; existing display was left intact"
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn driver_unavailable_create_result(
     request: &VirtualDisplayCreateRequest,
     error: String,
@@ -496,6 +544,47 @@ fn driver_unavailable_create_result(
 struct WindowsVirtualDisplayClient {
     handle: isize,
     device_path: String,
+}
+
+#[cfg(windows)]
+struct WindowsVirtualDisplayOperationGuard {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl WindowsVirtualDisplayOperationGuard {
+    fn acquire() -> Result<Self> {
+        let name = wide_null(RSHARE_VDISPLAY_OPERATION_MUTEX_NAME);
+        let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if handle == 0 {
+            anyhow::bail!(
+                "failed to create virtual display operation mutex: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            anyhow::bail!("failed to acquire virtual display operation mutex: {error}");
+        }
+
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsVirtualDisplayOperationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+        self.handle = 0;
+    }
 }
 
 #[cfg(windows)]
@@ -771,10 +860,21 @@ const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: isize = -1isize;
+#[cfg(windows)]
+const INFINITE: u32 = u32::MAX;
+#[cfg(windows)]
+const WAIT_OBJECT_0: u32 = 0;
+#[cfg(windows)]
+const WAIT_ABANDONED: u32 = 0x0000_0080;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn CreateMutexW(
+        lpMutexAttributes: *mut std::ffi::c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> isize;
     fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: u32,
@@ -795,11 +895,79 @@ unsafe extern "system" {
         lpOverlapped: *mut std::ffi::c_void,
     ) -> i32;
     fn CloseHandle(hObject: isize) -> i32;
+    fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
+    fn ReleaseMutex(hMutex: isize) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn create_transaction_does_not_remove_when_create_ioctl_fails() {
+        let remove_calls = std::cell::Cell::new(0);
+
+        let result = run_windows_virtual_display_create_transaction(
+            RSHARE_VDISPLAY_ACTIVITY_REMOVED,
+            || anyhow::bail!("create failed"),
+            || panic!("query must not run after a failed create"),
+            || {
+                remove_calls.set(remove_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WindowsVirtualDisplayCreateError::Create(_))
+        ));
+        assert_eq!(remove_calls.get(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_transaction_rolls_back_new_display_when_post_create_query_fails() {
+        let remove_calls = std::cell::Cell::new(0);
+
+        let result = run_windows_virtual_display_create_transaction(
+            RSHARE_VDISPLAY_ACTIVITY_REMOVED,
+            || Ok(()),
+            || anyhow::bail!("query failed"),
+            || {
+                remove_calls.set(remove_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WindowsVirtualDisplayCreateError::Query(_))
+        ));
+        assert_eq!(remove_calls.get(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_transaction_never_removes_preexisting_display_on_query_failure() {
+        let remove_calls = std::cell::Cell::new(0);
+
+        let result = run_windows_virtual_display_create_transaction(
+            RSHARE_VDISPLAY_ACTIVITY_ACTIVE,
+            || Ok(()),
+            || anyhow::bail!("query failed"),
+            || {
+                remove_calls.set(remove_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WindowsVirtualDisplayCreateError::Query(_))
+        ));
+        assert_eq!(remove_calls.get(), 0);
+    }
 
     #[test]
     fn active_driver_state_without_topology_match_has_no_display_id() {

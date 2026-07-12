@@ -13,7 +13,7 @@ pub use anyhow::Context;
 #[cfg(windows)]
 pub mod windows;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod macos;
 
 #[cfg(target_os = "linux")]
@@ -103,6 +103,95 @@ pub trait ClipboardListener: Send + Sync {
 
     /// Get current clipboard content
     async fn get_current_clipboard(&self) -> anyhow::Result<ClipboardContent>;
+}
+
+#[cfg(test)]
+mod platform_source_contract_tests {
+    use crate::macos::{macos_text_operation_plan, MacosTextOperation};
+
+    #[test]
+    fn macos_text_plan_chunks_by_unicode_scalar_without_splitting_emoji() {
+        let text = format!("{}🙂Z", "a".repeat(19));
+
+        let plan = macos_text_operation_plan(&text);
+
+        assert_eq!(
+            plan,
+            vec![
+                MacosTextOperation::Unicode(&text[..text.len() - 1]),
+                MacosTextOperation::Unicode("Z"),
+            ]
+        );
+        assert_eq!(
+            plan.iter()
+                .map(MacosTextOperation::unicode_scalar_count)
+                .sum::<usize>(),
+            21
+        );
+    }
+
+    #[test]
+    fn macos_text_plan_limits_every_unicode_chunk_to_twenty_scalars() {
+        let text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO";
+
+        let plan = macos_text_operation_plan(text);
+
+        assert_eq!(
+            plan,
+            vec![
+                MacosTextOperation::Unicode("abcdefghijklmnopqrst"),
+                MacosTextOperation::Unicode("uvwxyzABCDEFGHIJKLMN"),
+                MacosTextOperation::Unicode("O"),
+            ]
+        );
+        assert!(plan
+            .iter()
+            .all(|operation| operation.unicode_scalar_count() <= 20));
+    }
+
+    #[test]
+    fn macos_text_plan_handles_leading_controls_at_chunk_boundaries() {
+        let text = format!("{}\t\r\nnext", "x".repeat(20));
+
+        let plan = macos_text_operation_plan(&text);
+
+        assert_eq!(
+            plan,
+            vec![
+                MacosTextOperation::Unicode(&text[..20]),
+                MacosTextOperation::TabClick,
+                MacosTextOperation::GuardedControl('\r'),
+                MacosTextOperation::GuardedControl('\n'),
+                MacosTextOperation::Unicode("next"),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_text_plan_keeps_multiline_content_and_peels_only_leading_controls() {
+        let plan = macos_text_operation_plan("one\ntwo\tend");
+
+        assert_eq!(plan, vec![MacosTextOperation::Unicode("one\ntwo\tend")]);
+    }
+
+    #[test]
+    fn macos_text_commit_uses_core_graphics_unicode_events() {
+        let source = include_str!("macos.rs");
+        let start = source
+            .find("pub fn send_text(&mut self, text: &str)")
+            .expect("missing macOS text commit implementation");
+        let end = source[start..]
+            .find("impl Default for MacosInputEmulator")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS input emulator implementation");
+        let send_text = &source[start..end];
+
+        assert!(send_text.contains("if !self.active"));
+        assert!(send_text.contains("if text.is_empty()"));
+        assert!(send_text.contains("CGEvent::new_keyboard_event"));
+        assert!(send_text.contains("event.set_string(text);"));
+        assert!(send_text.contains("event.post(CGEventTapLocation::HID);"));
+    }
 }
 
 /// Platform-specific clipboard listener type alias

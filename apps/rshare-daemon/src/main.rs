@@ -4,22 +4,23 @@
 
 mod audio_runtime;
 mod endpoint_runtime;
+mod mobile_gateway;
 
 use anyhow::Result;
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::SinkExt;
 use rshare_core::{
-    default_ipc_addr, default_local_controls_ws_addr, local_capability_snapshots, read_json_line,
-    remote_capability_snapshots, write_json_line, AudioFormat, BackendFailureReason, BackendHealth,
-    BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
-    CaptureSessionStateMachine, Config, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, Direction,
-    DisplayCaptureResult, DisplayIdentifyResult, DisplayNode, DisplayOperationStatus,
-    DisplaySettingsUpdateResult, EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent,
-    EndpointEventFilter, EndpointEventStore, EndpointInjectError, EndpointInjectRequest,
-    EndpointInjectResult, EndpointInjectTarget, FeatureConfig, LatencyFeedbackSnapshot,
-    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
+    local_capability_snapshots, read_json_line, remote_capability_snapshots, write_json_line,
+    AudioFormat, BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
+    CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine, Config,
+    ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
+    DeviceCapabilitySnapshot, DeviceId, Direction, DisplayCaptureResult, DisplayIdentifyResult,
+    DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
+    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
+    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
+    FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph, LayoutNode,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
@@ -156,6 +157,20 @@ impl VirtualDisplayManager {
     }
 
     fn create(&mut self, request: VirtualDisplayCreateRequest) -> VirtualDisplayOperationResult {
+        self.create_with(
+            request,
+            rshare_platform::virtual_display::create_virtual_display,
+        )
+    }
+
+    fn create_with<F>(
+        &mut self,
+        request: VirtualDisplayCreateRequest,
+        create_virtual_display: F,
+    ) -> VirtualDisplayOperationResult
+    where
+        F: FnOnce(&VirtualDisplayCreateRequest) -> Result<VirtualDisplayOperationResult>,
+    {
         let id = virtual_display_request_id(request.id.as_deref());
         if let Some(existing) = self.displays.get(&id) {
             if !virtual_display_status_allows_create_retry(existing.status)
@@ -182,7 +197,7 @@ impl VirtualDisplayManager {
 
         let mut platform_request = request;
         platform_request.id = Some(id.clone());
-        match rshare_platform::virtual_display::create_virtual_display(&platform_request) {
+        match create_virtual_display(&platform_request) {
             Ok(result) => {
                 if let Some(display) = result.display.clone() {
                     self.displays.insert(display.id.clone(), display);
@@ -198,6 +213,20 @@ impl VirtualDisplayManager {
     }
 
     fn remove(&mut self, request: VirtualDisplayRemoveRequest) -> VirtualDisplayOperationResult {
+        self.remove_with(
+            request,
+            rshare_platform::virtual_display::remove_virtual_display,
+        )
+    }
+
+    fn remove_with<F>(
+        &mut self,
+        request: VirtualDisplayRemoveRequest,
+        remove_virtual_display: F,
+    ) -> VirtualDisplayOperationResult
+    where
+        F: FnOnce(&VirtualDisplayRemoveRequest) -> Result<VirtualDisplayOperationResult>,
+    {
         let id = request.id.trim().to_string();
         if id.is_empty() {
             return VirtualDisplayOperationResult {
@@ -207,7 +236,7 @@ impl VirtualDisplayManager {
             };
         }
 
-        let platform_result = rshare_platform::virtual_display::remove_virtual_display(&request);
+        let platform_result = remove_virtual_display(&request);
         self.displays.remove(&id);
         platform_result.unwrap_or_else(|error| VirtualDisplayOperationResult {
             status: VirtualDisplayOperationStatus::Failed,
@@ -246,6 +275,7 @@ fn virtual_display_matches_create_request(
 
 #[derive(Debug, Clone)]
 struct RuntimeFeatureConfig {
+    mobile_gateway_enabled: bool,
     suppress_local_shortcuts_when_remote: bool,
     automatic_input_forwarding: bool,
     auto_endpoint_latency_probe: bool,
@@ -259,6 +289,7 @@ struct RuntimeFeatureConfig {
 impl RuntimeFeatureConfig {
     fn from_config(config: &Config) -> Self {
         Self {
+            mobile_gateway_enabled: config.features.mobile_gateway_enabled,
             suppress_local_shortcuts_when_remote: config
                 .features
                 .suppress_local_shortcuts_when_remote,
@@ -278,6 +309,7 @@ impl RuntimeFeatureConfig {
 
     fn to_feature_config(&self) -> FeatureConfig {
         let mut features = FeatureConfig::default();
+        features.mobile_gateway_enabled = self.mobile_gateway_enabled;
         features.suppress_local_shortcuts_when_remote = self.suppress_local_shortcuts_when_remote;
         features.automatic_input_forwarding = self.automatic_input_forwarding;
         features.auto_endpoint_latency_probe = self.auto_endpoint_latency_probe;
@@ -316,10 +348,16 @@ struct DaemonState {
     pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
     pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
     virtual_displays: VirtualDisplayManager,
+    mobile_access: mobile_gateway::MobileGatewayAccess,
 }
 
 impl DaemonState {
+    #[cfg(test)]
     fn new(status: ServiceStatusSnapshot) -> Self {
+        Self::new_with_features(status, RuntimeFeatureConfig::default())
+    }
+
+    fn new_with_features(status: ServiceStatusSnapshot, features: RuntimeFeatureConfig) -> Self {
         let local_id = status.device_id;
         let mut layout = LayoutGraph::new(local_id);
         let local_screen = current_primary_screen_info();
@@ -333,9 +371,19 @@ impl DaemonState {
 
         let mut backend_state = BackendRuntimeState::new();
         backend_state.available_backends = vec![BackendKind::Portable];
-        let features = RuntimeFeatureConfig::default();
         let local_controls =
             default_local_control_snapshot(local_screen.width, local_screen.height, &features);
+        let mobile_access = if features.mobile_gateway_enabled {
+            mobile_gateway::MobileGatewayAccess::new(
+                default_mobile_gateway_addr(),
+                DeviceId::new_v4().simple().to_string(),
+                mobile_gateway::preferred_mobile_advertise_host(&status.hostname),
+            )
+        } else {
+            mobile_gateway::MobileGatewayAccess::disabled(
+                "mobile gateway disabled by configuration".to_string(),
+            )
+        };
 
         Self {
             status,
@@ -355,6 +403,7 @@ impl DaemonState {
             pending_usb_transfers: HashMap::new(),
             pending_endpoint_injects: HashMap::new(),
             virtual_displays: VirtualDisplayManager::default(),
+            mobile_access,
         }
     }
 
@@ -398,7 +447,7 @@ impl DaemonState {
             .retain(|_, probe| probe.target != id);
     }
 
-    fn mark_connected(&mut self, id: &DeviceId, connected: bool) {
+    fn mark_connected(&mut self, id: &DeviceId, connected: bool) -> bool {
         if let Some(device) = self.devices.get_mut(id) {
             device.connected = connected;
             device.last_seen_at = Instant::now();
@@ -416,6 +465,10 @@ impl DaemonState {
                 },
             );
         }
+        let mut layout_changed = false;
+        if connected {
+            layout_changed = self.layout.merge_discovered_peers_to_right([*id]);
+        }
         if !connected {
             self.clear_pending_latency_probes_for(*id);
         }
@@ -424,6 +477,7 @@ impl DaemonState {
                 device.connected = connected;
             }
         }
+        layout_changed
     }
 
     fn status_snapshot(&self) -> ServiceStatusSnapshot {
@@ -562,7 +616,9 @@ impl DaemonState {
         mode: Option<ResolvedInputMode>,
         available: Vec<BackendKind>,
         capture_health: BackendHealth,
+        inject_kind: BackendKind,
         inject_health: BackendHealth,
+        text_commit_supported: bool,
         error: Option<String>,
     ) {
         self.backend_state.selected_mode = mode;
@@ -577,9 +633,10 @@ impl DaemonState {
         self.local_controls.capture_backend.active =
             matches!(capture_health, BackendHealth::Healthy);
         self.local_controls.inject_backend.mode = mode;
-        self.local_controls.inject_backend.kind = mode.map(backend_kind_from_resolved_mode);
+        self.local_controls.inject_backend.kind = Some(inject_kind);
         self.local_controls.inject_backend.health = Some(inject_health.clone());
         self.local_controls.inject_backend.active = matches!(inject_health, BackendHealth::Healthy);
+        self.local_controls.inject_backend.text_commit_supported = text_commit_supported;
         self.local_controls.privilege_state = Some(self.backend_state.privilege_state);
         self.local_controls.last_error = error;
 
@@ -1036,6 +1093,18 @@ impl DaemonState {
                     LocalInputDeviceKind::Keyboard,
                     "key".to_string(),
                     format!("Key {} {:?}", key, state),
+                )
+            }
+            InputEvent::TextCommit { text } => {
+                self.local_controls.keyboard.detected = true;
+                self.local_controls.keyboard.event_count =
+                    self.local_controls.keyboard.event_count.saturating_add(1);
+                self.local_controls.keyboard.last_key = Some("TextCommit".to_string());
+                payload.insert("char_count".to_string(), text.chars().count().to_string());
+                (
+                    LocalInputDeviceKind::Keyboard,
+                    "text".to_string(),
+                    format!("Text commit {} chars", text.chars().count()),
                 )
             }
             InputEvent::GamepadConnected { info } => {
@@ -3172,6 +3241,7 @@ fn input_event_to_raw_event(
             alt,
             meta,
         }),
+        rshare_input::InputEvent::TextCommit { .. } => None,
         rshare_input::InputEvent::GamepadConnected { info } => {
             Some(rshare_core::engine::RawInputEvent::GamepadConnected { info })
         }
@@ -3647,7 +3717,7 @@ async fn inject_remote_message(
 
 fn injected_input_loopback_device_kind(event: &InputEvent) -> Option<LocalInputDeviceKind> {
     match event {
-        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } => {
+        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } | InputEvent::TextCommit { .. } => {
             Some(LocalInputDeviceKind::Keyboard)
         }
         InputEvent::MouseMove { .. }
@@ -3716,6 +3786,10 @@ fn endpoint_payload_to_input_event(request: &EndpointInjectRequest) -> Result<In
             parse_key_code(key)?,
             parse_button_state(state)?,
         )),
+        (
+            rshare_core::EndpointEventKind::Keyboard,
+            rshare_core::EndpointEventPayload::TextCommit { text },
+        ) => Ok(InputEvent::text_commit(text.clone())),
         (
             rshare_core::EndpointEventKind::Mouse,
             rshare_core::EndpointEventPayload::MouseMove { x, y, .. },
@@ -3959,6 +4033,14 @@ fn endpoint_inject_diagnostic_payload(
             (
                 "key".to_string(),
                 format!("Injected {key} {state}"),
+                payload,
+            )
+        }
+        rshare_core::EndpointEventPayload::TextCommit { text } => {
+            payload.insert("char_count".to_string(), text.chars().count().to_string());
+            (
+                "text".to_string(),
+                format!("Injected text commit ({} chars)", text.chars().count()),
                 payload,
             )
         }
@@ -6661,6 +6743,26 @@ fn forward_input_events_to_captured_channel(
     });
 }
 
+fn flatten_daemon_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn complete_mobile_gateway_shutdown(
+    shutdown_tx: &broadcast::Sender<()>,
+    mobile_gateway_task: Option<&mut tokio::task::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let _ = shutdown_tx.send(());
+    match mobile_gateway_task {
+        Some(task) => flatten_daemon_task_result(task.await),
+        None => Ok(()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_file = get_log_file_path();
@@ -6688,10 +6790,12 @@ async fn main() -> Result<()> {
     tracing::info!("R-ShareMouse daemon starting...");
     tracing::info!("Log file: {}", log_file.display());
 
+    let config = load_config_with_env_overrides()?;
+
     // Configure firewall on Windows to allow discovery and service ports
     #[cfg(windows)]
     {
-        match firewall::configure_firewall() {
+        match firewall::configure_firewall(config.features.mobile_gateway_enabled) {
             Ok(result) => {
                 if result.is_success() {
                     tracing::info!("Firewall configured successfully for R-ShareMouse");
@@ -6705,8 +6809,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    let config = load_config_with_env_overrides()?;
 
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
@@ -6744,15 +6846,17 @@ async fn main() -> Result<()> {
         available_backends
     );
 
-    let mut daemon_state = DaemonState::new(ServiceStatusSnapshot::new(
-        device_id,
-        device_name.clone(),
-        hostname.clone(),
-        bind_address.clone(),
-        27432,
-        pid,
-    ));
-    daemon_state.features = RuntimeFeatureConfig::from_config(&config);
+    let mut daemon_state = DaemonState::new_with_features(
+        ServiceStatusSnapshot::new(
+            device_id,
+            device_name.clone(),
+            hostname.clone(),
+            bind_address.clone(),
+            27432,
+            pid,
+        ),
+        RuntimeFeatureConfig::from_config(&config),
+    );
     daemon_state.refresh_local_controls_platform();
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
     let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
@@ -6762,6 +6866,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(RwLock::new(daemon_state));
 
     let (inject_backend, inject_health, inject_error) = build_inject_backend(input_mode);
+    let inject_kind = inject_backend.kind();
+    let text_commit_supported = inject_backend.supports_text_commit();
     let last_backend_error = inject_error.or(backend_error);
 
     // Initialize backend state
@@ -6771,7 +6877,9 @@ async fn main() -> Result<()> {
             input_mode,
             available_backends,
             backend_health.clone(), // capture health
+            inject_kind,
             inject_health,
+            text_commit_supported,
             last_backend_error,
         );
     }
@@ -6908,6 +7016,35 @@ async fn main() -> Result<()> {
         local_events_tx.clone(),
         shutdown_tx.subscribe(),
     ));
+    let (mobile_gateway_enabled, mobile_access) = {
+        let state = state.read().await;
+        (
+            state.features.mobile_gateway_enabled,
+            state.mobile_access.clone(),
+        )
+    };
+    let mobile_gateway_state = state.clone();
+    let mobile_gateway_network_manager = network_manager.clone();
+    let mobile_gateway_inject_backend = inject_backend.clone();
+    let mobile_gateway_local_events_tx = local_events_tx.clone();
+    let mut mobile_gateway_shutdown_rx = shutdown_tx.subscribe();
+    let mut mobile_gateway_task = tokio::spawn(async move {
+        if mobile_gateway_enabled {
+            mobile_gateway::run_mobile_gateway_server(
+                mobile_access,
+                mobile_gateway_state,
+                mobile_gateway_network_manager,
+                mobile_gateway_inject_backend,
+                mobile_gateway_local_events_tx,
+                mobile_gateway_shutdown_rx,
+            )
+            .await
+        } else {
+            tracing::info!("Mobile gateway disabled by configuration");
+            let _ = mobile_gateway_shutdown_rx.recv().await;
+            Ok(())
+        }
+    });
 
     let input_forwarding_task = tokio::spawn(run_input_forwarding_loop(
         input_rx,
@@ -6957,11 +7094,24 @@ async fn main() -> Result<()> {
                         }
                     }
                     NetworkEvent::DeviceConnected(id) => {
-                        let should_advertise_usb = {
+                        let (should_advertise_usb, layout_to_save) = {
                             let mut state = state.write().await;
-                            state.mark_connected(&id, true);
-                            state.features.usb_advertising_enabled()
+                            let layout_changed = state.mark_connected(&id, true);
+                            (
+                                state.features.usb_advertising_enabled(),
+                                layout_changed.then(|| state.layout.clone()),
+                            )
                         };
+                        if let Some(layout_to_save) = layout_to_save {
+                            if let Err(err) =
+                                save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                            {
+                                tracing::warn!(
+                                    "Failed to persist connected-device layout: {}",
+                                    err
+                                );
+                            }
+                        }
                         if should_advertise_usb {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
@@ -7011,33 +7161,51 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!("Entering tokio::select! loop");
-    tokio::select! {
+    let mut mobile_gateway_finished = false;
+    let shutdown_reason: Result<()> = tokio::select! {
         result = signal::ctrl_c() => {
             match result {
                 Ok(()) => tracing::info!("Shutdown signal received"),
                 Err(e) => tracing::warn!("Ctrl-C handler error: {}", e),
             }
+            Ok(())
         }
         _ = shutdown_rx.recv() => {
             tracing::info!("Shutdown requested over IPC");
+            Ok(())
         }
         result = ipc_task => {
             tracing::info!("IPC task completed");
-            result??;
+            flatten_daemon_task_result(result)
         }
         result = local_controls_ws_task => {
             tracing::info!("Local controls websocket task completed");
-            result??;
+            flatten_daemon_task_result(result)
+        }
+        result = &mut mobile_gateway_task => {
+            tracing::info!("Mobile gateway task completed");
+            mobile_gateway_finished = true;
+            flatten_daemon_task_result(result)
         }
         result = event_task => {
             tracing::info!("Event task completed");
-            result?;
+            result.map_err(Into::into)
         }
         result = input_forwarding_task => {
             tracing::info!("Input forwarding task completed");
-            result??;
+            flatten_daemon_task_result(result)
         }
-    }
+    };
+
+    let mobile_shutdown_result = complete_mobile_gateway_shutdown(
+        &shutdown_tx,
+        if mobile_gateway_finished {
+            None
+        } else {
+            Some(&mut mobile_gateway_task)
+        },
+    )
+    .await;
 
     tracing::info!("tokio::select! exited, cleaning up");
     set_local_shortcut_suppression(false);
@@ -7045,7 +7213,11 @@ async fn main() -> Result<()> {
     audio_runtime.stop_render();
     audio_runtime.shutdown();
     // Input listener cleanup is handled automatically by task drops
-    network_manager.lock().await.stop().await?;
+    let network_stop_result = network_manager.lock().await.stop().await;
+
+    shutdown_reason?;
+    mobile_shutdown_result?;
+    network_stop_result?;
 
     tracing::info!("R-ShareMouse daemon stopped");
     std::process::exit(0);
@@ -7278,7 +7450,22 @@ async fn handle_ipc_client(
 
                     match result {
                         Ok(_) => {
-                            state.write().await.mark_connected(&device_id, true);
+                            let layout_to_save = {
+                                let mut state = state.write().await;
+                                state
+                                    .mark_connected(&device_id, true)
+                                    .then(|| state.layout.clone())
+                            };
+                            if let Some(layout_to_save) = layout_to_save {
+                                if let Err(err) =
+                                    save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist connected-device layout: {}",
+                                        err
+                                    );
+                                }
+                            }
                             DaemonResponse::Ack
                         }
                         Err(err) => DaemonResponse::Error(err.to_string()),
@@ -7350,6 +7537,10 @@ async fn handle_ipc_client(
             request_remote_endpoint_events(&network_manager, &state, &filter).await;
             let mut state = state.write().await;
             DaemonResponse::EndpointEvents(state.endpoint_events(&filter, after_sequence, limit))
+        }
+        DaemonRequest::MobileAccess => {
+            let state = state.read().await;
+            DaemonResponse::MobileAccess(state.mobile_access.snapshot())
         }
         DaemonRequest::InjectEndpointEvent { target, request } => {
             DaemonResponse::EndpointInjectResult(
@@ -7614,16 +7805,7 @@ fn save_layout_to_path(layout: &LayoutGraph, path: impl AsRef<Path>) -> Result<(
 }
 
 fn load_config_with_env_overrides() -> Result<Config> {
-    let mut config = match Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load persisted config: {}. Falling back to default config.",
-                error
-            );
-            Config::default()
-        }
-    };
+    let mut config = load_config_or_fail_closed(Config::load);
 
     if let Ok(bind) = std::env::var("RSHARE_BIND") {
         config.network.bind_address = bind;
@@ -7636,9 +7818,26 @@ fn load_config_with_env_overrides() -> Result<Config> {
     Ok(config)
 }
 
+fn load_config_or_fail_closed(load: impl FnOnce() -> Result<Config>) -> Config {
+    match load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load persisted config: {}. Disabling automatic input and mobile gateway access.",
+                error
+            );
+            let mut config = Config::default();
+            config.features.automatic_input_forwarding = false;
+            config.features.mobile_gateway_enabled = false;
+            config
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::path::PathBuf;
 
     fn test_daemon_state() -> DaemonState {
@@ -7652,6 +7851,88 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn default_daemon_state_disables_mobile_access_without_credentials() {
+        let snapshot = test_daemon_state().mobile_access.snapshot();
+
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.page_url, "不可用");
+        assert!(snapshot.token.is_empty());
+    }
+
+    #[test]
+    fn config_load_failure_disables_automatic_input_and_mobile_gateway() {
+        let config = load_config_or_fail_closed(|| anyhow::bail!("persisted config is unreadable"));
+
+        assert!(!config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn successful_default_config_load_keeps_new_install_input_forwarding_enabled() {
+        let config = load_config_or_fail_closed(|| Ok(Config::default()));
+
+        assert!(config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn successful_config_load_preserves_explicitly_disabled_input_forwarding() {
+        let mut persisted = Config::default();
+        persisted.features.automatic_input_forwarding = false;
+
+        let config = load_config_or_fail_closed(|| Ok(persisted));
+
+        assert!(!config.features.automatic_input_forwarding);
+        assert!(!config.features.mobile_gateway_enabled);
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_waits_for_mobile_cleanup_before_returning() {
+        let (shutdown_tx, _) = broadcast::channel::<()>(4);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut mobile_task = tokio::spawn(async move {
+            events_tx.send("Pressed").unwrap();
+            let _ = shutdown_rx.recv().await;
+            tokio::task::yield_now().await;
+            events_tx.send("Released").unwrap();
+            Ok(())
+        });
+
+        assert_eq!(events_rx.recv().await, Some("Pressed"));
+        complete_mobile_gateway_shutdown(&shutdown_tx, Some(&mut mobile_task))
+            .await
+            .unwrap();
+
+        assert_eq!(events_rx.try_recv(), Ok("Released"));
+    }
+
+    #[test]
+    fn backend_diagnostics_use_the_constructed_inject_backend_identity_and_capability() {
+        let mut state = test_daemon_state();
+
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::WindowsNative,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+
+        assert_eq!(
+            state.local_controls.inject_backend.mode,
+            Some(ResolvedInputMode::Portable)
+        );
+        assert_eq!(
+            state.local_controls.inject_backend.kind,
+            Some(BackendKind::WindowsNative)
+        );
+        assert!(state.local_controls.inject_backend.text_commit_supported);
+    }
+
     fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {
         let mut info = ConnectionInfo::new(device_id, "127.0.0.1:27431".to_string());
         info.state = rshare_net::connection::ConnectionState::Connected;
@@ -7660,24 +7941,151 @@ mod tests {
         info
     }
 
-    #[test]
-    fn virtual_display_manager_records_driver_unavailable_create_result() {
-        let mut manager = VirtualDisplayManager::default();
+    fn fake_virtual_display_create_result(
+        request: &VirtualDisplayCreateRequest,
+        operation_status: VirtualDisplayOperationStatus,
+        display_status: VirtualDisplayStatus,
+    ) -> Result<VirtualDisplayOperationResult> {
+        Ok(VirtualDisplayOperationResult {
+            status: operation_status,
+            display: Some(VirtualDisplaySnapshot {
+                id: request.id.clone().expect("manager should normalize the id"),
+                width: request.width,
+                height: request.height,
+                refresh_rate_millihz: request.refresh_rate_millihz.or(Some(60_000)),
+                name: request.name.clone(),
+                status: display_status,
+                display_id: (display_status == VirtualDisplayStatus::Active)
+                    .then(|| "windows-display-rshare".to_string()),
+                message: None,
+            }),
+            message: None,
+        })
+    }
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
+    fn fake_virtual_display_created(
+        request: &VirtualDisplayCreateRequest,
+    ) -> Result<VirtualDisplayOperationResult> {
+        fake_virtual_display_create_result(
+            request,
+            VirtualDisplayOperationStatus::Created,
+            VirtualDisplayStatus::Active,
+        )
+    }
+
+    fn fake_virtual_display_driver_unavailable(
+        request: &VirtualDisplayCreateRequest,
+    ) -> Result<VirtualDisplayOperationResult> {
+        fake_virtual_display_create_result(
+            request,
+            VirtualDisplayOperationStatus::DriverUnavailable,
+            VirtualDisplayStatus::DriverUnavailable,
+        )
+    }
+
+    #[test]
+    fn virtual_display_manager_skips_platform_create_for_matching_active_display() {
+        let mut manager = VirtualDisplayManager::default();
+        let platform_create_calls = Cell::new(0);
+        let request = VirtualDisplayCreateRequest {
             id: Some("vd-1".to_string()),
             width: 1920,
             height: 1080,
             refresh_rate_millihz: Some(60_000),
             name: Some("R-ShareMouse Virtual Display".to_string()),
+        };
+
+        let first = manager.create_with(request.clone(), |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_created(request)
+        });
+        let duplicate = manager.create_with(request, |_| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            panic!("matching active display must not call the platform")
         });
 
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
+        assert_eq!(first.status, VirtualDisplayOperationStatus::Created);
+        assert_eq!(
+            duplicate.status,
+            VirtualDisplayOperationStatus::AlreadyExists
+        );
+        assert_eq!(platform_create_calls.get(), 1);
+    }
+
+    #[test]
+    fn virtual_display_manager_removes_snapshot_through_platform_callback() {
+        let mut manager = VirtualDisplayManager::default();
+        let _ = manager.sync_platform_displays(vec![VirtualDisplaySnapshot {
+            id: "vd-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+            status: VirtualDisplayStatus::Active,
+            display_id: Some("windows-display-rshare".to_string()),
+            message: None,
+        }]);
+        let platform_remove_calls = Cell::new(0);
+
+        let result = manager.remove_with(
+            VirtualDisplayRemoveRequest {
+                id: "vd-1".to_string(),
+            },
+            |request| {
+                platform_remove_calls.set(platform_remove_calls.get() + 1);
+                Ok(VirtualDisplayOperationResult {
+                    status: VirtualDisplayOperationStatus::Removed,
+                    display: Some(VirtualDisplaySnapshot {
+                        id: request.id.clone(),
+                        width: 1920,
+                        height: 1080,
+                        refresh_rate_millihz: Some(60_000),
+                        name: None,
+                        status: VirtualDisplayStatus::Removed,
+                        display_id: None,
+                        message: None,
+                    }),
+                    message: None,
+                })
+            },
+        );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Removed);
+        assert_eq!(platform_remove_calls.get(), 1);
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn virtual_display_manager_rejects_empty_remove_id_without_platform_call() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let result = manager.remove_with(
+            VirtualDisplayRemoveRequest {
+                id: "  ".to_string(),
+            },
+            |_| panic!("empty virtual display id must not call the platform"),
+        );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Failed);
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn virtual_display_manager_records_platform_create_result() {
+        let mut manager = VirtualDisplayManager::default();
+
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-1".to_string()),
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Created);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
     }
@@ -7703,7 +8111,9 @@ mod tests {
             display_id: Some("windows-display-rshare".to_string()),
             message: None,
         }]);
-        let result = manager.create(request);
+        let result = manager.create_with(request, |_| {
+            panic!("matching active display must not call the platform")
+        });
 
         assert_eq!(
             result.status,
@@ -7726,29 +8136,26 @@ mod tests {
             message: None,
         }]);
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: Some(144_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
-
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
-        assert_ne!(
-            result.status,
-            rshare_core::VirtualDisplayOperationStatus::AlreadyExists
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-1".to_string()),
+                width: 2560,
+                height: 1440,
+                refresh_rate_millihz: Some(144_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
         );
+
+        assert_eq!(result.status, VirtualDisplayOperationStatus::Created);
+        assert_eq!(manager.list()[0].width, 2560);
+        assert_eq!(manager.list()[0].height, 1440);
     }
 
     #[test]
-    fn virtual_display_manager_allows_retry_after_unavailable_create_result() {
+    fn virtual_display_manager_retries_after_driver_unavailable_result() {
         let mut manager = VirtualDisplayManager::default();
+        let platform_create_calls = Cell::new(0);
         let request = rshare_core::VirtualDisplayCreateRequest {
             id: Some("vd-1".to_string()),
             width: 1920,
@@ -7757,16 +8164,21 @@ mod tests {
             name: Some("R-ShareMouse Virtual Display".to_string()),
         };
 
-        let first = manager.create(request.clone());
-        let retry = manager.create(request);
+        let first = manager.create_with(request.clone(), |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_driver_unavailable(request)
+        });
+        let retry = manager.create_with(request, |request| {
+            platform_create_calls.set(platform_create_calls.get() + 1);
+            fake_virtual_display_driver_unavailable(request)
+        });
 
-        let expected = if cfg!(windows) {
+        assert_eq!(
+            first.status,
             rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(first.status, expected);
-        assert_eq!(retry.status, expected);
+        );
+        assert_eq!(retry.status, first.status);
+        assert_eq!(platform_create_calls.get(), 2);
         assert_eq!(manager.list().len(), 1);
         assert_eq!(manager.list()[0].id, "vd-1");
     }
@@ -7775,20 +8187,26 @@ mod tests {
     fn virtual_display_manager_reuses_default_id_after_existing_default_record() {
         let mut manager = VirtualDisplayManager::default();
 
-        let first = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: None,
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
-        let retry = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: None,
-            width: 2560,
-            height: 1440,
-            refresh_rate_millihz: Some(144_000),
-            name: Some("R-ShareMouse Virtual Display".to_string()),
-        });
+        let first = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: None,
+                width: 1920,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
+        let retry = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: None,
+                width: 2560,
+                height: 1440,
+                refresh_rate_millihz: Some(144_000),
+                name: Some("R-ShareMouse Virtual Display".to_string()),
+            },
+            fake_virtual_display_created,
+        );
 
         assert_eq!(
             first.display.as_ref().map(|display| display.id.as_str()),
@@ -7805,42 +8223,21 @@ mod tests {
     fn virtual_display_manager_rejects_invalid_modes() {
         let mut manager = VirtualDisplayManager::default();
 
-        let result = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-invalid".to_string()),
-            width: 0,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: None,
-        });
+        let result = manager.create_with(
+            rshare_core::VirtualDisplayCreateRequest {
+                id: Some("vd-invalid".to_string()),
+                width: 0,
+                height: 1080,
+                refresh_rate_millihz: Some(60_000),
+                name: None,
+            },
+            |_| panic!("invalid mode must not call the platform"),
+        );
 
         assert_eq!(
             result.status,
             rshare_core::VirtualDisplayOperationStatus::InvalidMode
         );
-        assert!(manager.list().is_empty());
-    }
-
-    #[test]
-    fn virtual_display_manager_removes_requested_snapshot() {
-        let mut manager = VirtualDisplayManager::default();
-        let _ = manager.create(rshare_core::VirtualDisplayCreateRequest {
-            id: Some("vd-1".to_string()),
-            width: 1920,
-            height: 1080,
-            refresh_rate_millihz: Some(60_000),
-            name: None,
-        });
-
-        let result = manager.remove(rshare_core::VirtualDisplayRemoveRequest {
-            id: "vd-1".to_string(),
-        });
-
-        let expected = if cfg!(windows) {
-            rshare_core::VirtualDisplayOperationStatus::DriverUnavailable
-        } else {
-            rshare_core::VirtualDisplayOperationStatus::Unsupported
-        };
-        assert_eq!(result.status, expected);
         assert!(manager.list().is_empty());
     }
 
@@ -9827,6 +10224,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inject_endpoint_event_accepts_unicode_text_commit() {
+        let injected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
+            Arc::new(Mutex::new(Box::new(RecordingKindInjectBackend {
+                kind: BackendKind::Portable,
+                injected: injected.clone(),
+            })));
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let network_manager = Arc::new(Mutex::new(NetworkManager::new(
+            DeviceId::new_v4(),
+            "local".to_string(),
+            "local".to_string(),
+        )));
+        let (events, mut rx) = broadcast::channel(4);
+
+        let result = inject_endpoint_event(
+            &network_manager,
+            &backend,
+            &state,
+            &events,
+            rshare_core::EndpointInjectTarget::Local,
+            rshare_core::EndpointInjectRequest {
+                correlation_id: "mobile-text-1".to_string(),
+                device_kind: rshare_core::EndpointEventKind::Keyboard,
+                payload: rshare_core::EndpointEventPayload::TextCommit {
+                    text: "你好🙂".to_string(),
+                },
+                mode: rshare_core::EndpointInjectMode::RequireHealthyBackend,
+                timeout_ms: 750,
+            },
+        )
+        .await;
+
+        assert!(result.accepted);
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 1);
+        assert!(matches!(
+            &injected[0],
+            rshare_input::InputEvent::TextCommit { text } if text == "你好🙂"
+        ));
+        drop(injected);
+
+        let diagnostic = rx.recv().await.unwrap();
+        let diagnostic_json = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(
+            diagnostic.payload.get("char_count").map(String::as_str),
+            Some("3")
+        );
+        assert!(!diagnostic.payload.contains_key("text"));
+        assert!(!diagnostic_json.contains("你好🙂"));
+        assert!(!diagnostic_json.contains("\"text\":"));
+
+        let mut state = state.write().await;
+        let endpoint_events = state.endpoint_events(
+            &EndpointEventFilter {
+                kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        let endpoint_json = serde_json::to_string(&endpoint_events).unwrap();
+        assert!(endpoint_json.contains("char_count"));
+        assert!(!endpoint_json.contains("你好🙂"));
+        assert!(!endpoint_json.contains("\"text\":"));
+    }
+
+    #[test]
+    fn captured_text_commit_diagnostics_never_retain_raw_content() {
+        let mut state = test_daemon_state();
+
+        let diagnostic = state.record_local_input_event(&rshare_input::InputEvent::TextCommit {
+            text: "私密文本🙂".to_string(),
+        });
+        let endpoint = state.endpoint_event_from_local(diagnostic.clone());
+
+        assert_eq!(
+            diagnostic.payload.get("char_count").map(String::as_str),
+            Some("5")
+        );
+        assert!(!diagnostic.payload.contains_key("text"));
+        for serialized in [
+            serde_json::to_string(&diagnostic).unwrap(),
+            serde_json::to_string(&endpoint).unwrap(),
+        ] {
+            assert!(!serialized.contains("私密文本🙂"));
+            assert!(!serialized.contains("\"text\":"));
+            assert!(serialized.contains("char_count"));
+        }
+    }
+
+    #[test]
+    fn mobile_gateway_authorizes_query_or_bearer_token() {
+        let query_request =
+            mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=mobile-secret", Vec::new());
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &query_request,
+            "mobile-secret"
+        ));
+
+        let header_request = mobile_gateway::MobileHttpRequest::new(
+            "POST",
+            "/api/inject",
+            vec![("authorization", "Bearer mobile-secret")],
+        );
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &header_request,
+            "mobile-secret"
+        ));
+
+        let encoded_query_request = mobile_gateway::MobileHttpRequest::new(
+            "GET",
+            "/mobile?t=mobile%2Bsecret%2Ftoken%3D",
+            Vec::new(),
+        );
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &encoded_query_request,
+            "mobile+secret/token="
+        ));
+    }
+
+    #[test]
+    fn mobile_gateway_rejects_missing_or_wrong_token() {
+        let missing = mobile_gateway::MobileHttpRequest::new("GET", "/mobile", Vec::new());
+        assert!(!mobile_gateway::is_authorized_mobile_request(
+            &missing,
+            "mobile-secret"
+        ));
+
+        let wrong = mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=wrong", Vec::new());
+        assert!(!mobile_gateway::is_authorized_mobile_request(
+            &wrong,
+            "mobile-secret"
+        ));
+    }
+
+    #[test]
+    fn mobile_gateway_routes_only_mobile_page_status_and_inject() {
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile?t=token"),
+            mobile_gateway::MobileGatewayRoute::Page
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile.webmanifest?t=token"),
+            mobile_gateway::MobileGatewayRoute::NotFound
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/mobile-icon.svg?t=token"),
+            mobile_gateway::MobileGatewayRoute::NotFound
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("GET", "/api/local-controls?t=token"),
+            mobile_gateway::MobileGatewayRoute::LocalControls
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("POST", "/api/inject?t=token"),
+            mobile_gateway::MobileGatewayRoute::Inject
+        );
+        assert_eq!(
+            mobile_gateway::route_mobile_http_request("POST", "/api/shutdown?t=token"),
+            mobile_gateway::MobileGatewayRoute::NotFound
+        );
+    }
+
+    #[tokio::test]
     async fn remote_endpoint_inject_returns_transport_failure_without_connection() {
         let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
             Arc::new(Mutex::new(Box::new(TestInjectBackend {
@@ -10191,9 +10754,13 @@ mod tests {
 
     #[test]
     fn mark_connected_tracks_unknown_inbound_device() {
+        use rshare_core::Direction;
+        use std::collections::HashSet;
+
         let remote_id = DeviceId::new_v4();
+        let local_id = DeviceId::new_v4();
         let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            DeviceId::new_v4(),
+            local_id,
             "local".to_string(),
             "local-host".to_string(),
             "127.0.0.1:27431".to_string(),
@@ -10207,6 +10774,15 @@ mod tests {
         assert_eq!(device.id, remote_id);
         assert!(device.connected);
         assert_eq!(device.hostname, "unknown");
+        assert!(state.layout.get_node(remote_id).is_some());
+
+        let connected_peers = HashSet::from([remote_id]);
+        assert_eq!(
+            state
+                .layout
+                .resolve_target(local_id, Direction::Right, &connected_peers),
+            Some(remote_id)
+        );
     }
 
     #[test]
@@ -10279,7 +10855,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_input_does_not_auto_forward_when_disabled_by_default() {
+    fn captured_input_does_not_auto_forward_when_disabled_by_config() {
         use rshare_core::{Direction, LayoutLink};
 
         let local_id = DeviceId::new_v4();
@@ -10292,6 +10868,7 @@ mod tests {
             27432,
             1,
         ));
+        state.features.automatic_input_forwarding = false;
         state.layout.upsert_link_for_edge(LayoutLink::new(
             local_id,
             Direction::Right,
@@ -10329,7 +10906,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_input_forwards_when_explicitly_enabled() {
+    fn captured_input_forwards_by_default_when_layout_link_is_connected() {
         use rshare_core::{Direction, LayoutLink};
 
         let local_id = DeviceId::new_v4();
@@ -10342,7 +10919,6 @@ mod tests {
             27432,
             1,
         ));
-        state.features.automatic_input_forwarding = true;
         state.layout.upsert_link_for_edge(LayoutLink::new(
             local_id,
             Direction::Right,

@@ -14,6 +14,7 @@ import {
   buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
+  buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
   buildVirtualDisplayViewModel,
@@ -90,6 +91,75 @@ test("buildCapabilityOverview falls back cleanly when registry is missing", () =
 
   assert.equal(overview.available, false);
   assert.deepEqual(overview.devices, []);
+});
+
+test("buildMobileAccessViewModel exposes mobile controller link and token state", () => {
+  const view = buildMobileAccessViewModel({
+    enabled: true,
+    bind_address: "0.0.0.0:27437",
+    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    token: "abc123",
+    last_client_addr: "192.168.1.80:53120",
+    last_client_seen_at_ms: 1_000,
+    client_count: 2,
+  }, { nowMs: 6_000 });
+
+  assert.equal(view.available, true);
+  assert.equal(view.url, "http://192.168.1.50:27437/mobile?t=abc123");
+  assert.equal(view.token, "abc123");
+  assert.equal(view.port, 27437);
+  assert.equal(view.clientStatus, "已连接手机");
+  assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 5 秒前 · 2 次请求");
+  assert.equal(view.urlLabel, "实验性明文局域网控制 URL");
+  assert.match(view.summary, /实验性明文局域网控制/);
+  assert.match(view.summary, /未加密/);
+
+  const disabled = buildMobileAccessViewModel({
+    enabled: false,
+    bind_address: "不可用",
+    page_url: null,
+    token: null,
+  });
+  assert.equal(disabled.available, false);
+  assert.equal(disabled.url, "不可用");
+  assert.equal(disabled.token, "");
+  assert.equal(disabled.port, null);
+  assert.equal(disabled.clientStatus, "未连接");
+  assert.equal(disabled.urlLabel, "移动网关未启用");
+  assert.match(disabled.summary, /mobile_gateway_enabled=true/);
+
+  const stale = buildMobileAccessViewModel(
+    {
+      enabled: true,
+      bind_address: "0.0.0.0:27437",
+      page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+      token: "abc123",
+      last_client_addr: "192.168.1.80:53120",
+      last_client_seen_at_ms: 1_000,
+      client_count: 9,
+    },
+    { nowMs: 22_000 },
+  );
+  assert.equal(stale.clientStatus, "最近离线");
+  assert.equal(stale.clientDetail, "最近 192.168.1.80:53120 · 21 秒前 · 9 次请求");
+});
+
+test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile link", () => {
+  const view = buildMobileAccessViewModel({
+    enabled: true,
+    bind_address: "0.0.0.0:27437",
+    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    token: "abc123",
+  });
+
+  assert.match(view.qrCodeSvgDataUri, /^data:image\/svg\+xml;charset=utf-8,/);
+  const svg = decodeURIComponent(view.qrCodeSvgDataUri.split(",", 2)[1]);
+  assert.match(svg, /<svg/);
+  assert.match(svg, /<path/);
+  assert.equal(view.qrCodeAlt, "移动端控制二维码");
+
+  const offline = buildMobileAccessViewModel(null);
+  assert.equal(offline.qrCodeSvgDataUri, null);
 });
 
 test("buildDisplaySettingsViewModel exposes system display settings", () => {
