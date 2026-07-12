@@ -1685,6 +1685,7 @@ async fn write_mobile_response(
     );
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(&body).await?;
+    stream.shutdown().await?;
     Ok(())
 }
 
