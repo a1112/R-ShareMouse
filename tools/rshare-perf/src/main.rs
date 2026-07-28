@@ -12,11 +12,20 @@ use compare::{
 };
 use quic::{LoadKind, QuicScenario};
 use report::{
-    scenario_config_sha256, validate_json_schema, PerfReport, ScenarioContract, VerdictStatus,
-    REQUIRED_COUNTERS,
+    parse_and_validate_report, scenario_config_sha256, Availability, DurationSpec,
+    HardwareFingerprint, MeasurementProvenance, MetricSummary, PerfReport, QueueSummary,
+    ScenarioContract, ToolchainFingerprint, VerdictStatus, PERF_SCHEMA_VERSION,
 };
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -59,8 +68,6 @@ struct CompareArgs {
     candidate: PathBuf,
     #[arg(long)]
     budget: PathBuf,
-    #[arg(long, default_value = "perf/baselines/manifest.toml")]
-    manifest: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -98,6 +105,10 @@ fn run_dual(args: DualArgs) -> Result<()> {
 }
 
 fn run_quic(args: QuicArgs) -> Result<()> {
+    run_quic_with_duration(args, None)
+}
+
+fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) -> Result<()> {
     let scenario = if args.slow_fast_isolation {
         QuicScenario::SlowFastPeerIsolation
     } else if let Some(stall_ms) = args.stall_ms {
@@ -115,28 +126,272 @@ fn run_quic(args: QuicArgs) -> Result<()> {
     }
 
     let parameters = serde_json::to_value(&scenario)?;
-    let mut report = control::not_run_without_framed_ipc();
-    report.scenario = "quic-control-v3".into();
-    report.scenario_parameters = match parameters.clone() {
-        serde_json::Value::Object(values) => values.into_iter().collect(),
-        _ => Default::default(),
-    };
-    report.scenario_config_sha256 = scenario_config_sha256(&parameters)?;
-    report.availability = report::Availability::NotRun {
-        reason: "scenario is declared, but no fixed-runner QUIC measurement was executed".into(),
-    };
-    report.errors =
-        vec!["no synthetic daemon IPC or hard-coded localhost daemon port was substituted".into()];
-    report.verdict = VerdictStatus::NotRun;
-
+    let config_hash = scenario_config_sha256(&parameters)?;
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    let queue_samples = Arc::new(Mutex::new(Vec::<BTreeMap<String, QueueSummary>>::new()));
+    let runtime = tokio::runtime::Runtime::new()?;
+    let mut orchestration = runtime.block_on(quic::orchestrate_five_run_batches(
+        &config_hash,
+        |batch_id, run_index| {
+            let scenario = scenario.clone();
+            let queue_samples = Arc::clone(&queue_samples);
+            let mut options = quic::LoopbackRunOptions::measured(batch_id.to_string(), run_index);
+            options.effective_duration = effective_duration;
+            async move {
+                let measurement = quic::run_loopback_once(&scenario, options).await?;
+                queue_samples
+                    .lock()
+                    .expect("queue sample mutex poisoned")
+                    .push(measurement.queues);
+                Ok(measurement.run)
+            }
+        },
+    ))?;
+
+    let stem = args
+        .output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("quic");
+    let output_directory = args.output.parent().unwrap_or_else(|| Path::new("."));
+    let mut sidecar_hashes = Vec::with_capacity(orchestration.batches.len());
+    for (index, batch) in orchestration.batches.iter_mut().enumerate() {
+        let sidecar_path = output_directory.join(format!("{stem}.batch-{}.json", index + 1));
+        batch.artifact_path = sidecar_path.display().to_string();
+        let bytes = serde_json::to_vec_pretty(batch)?;
+        fs::write(&sidecar_path, &bytes)?;
+        sidecar_hashes.push((
+            batch.artifact_path.clone(),
+            format!("{:x}", Sha256::digest(&bytes)),
+        ));
+    }
+
+    let selected_index = orchestration
+        .selected_batch
+        .unwrap_or_else(|| orchestration.batches.len().saturating_sub(1));
+    let selected = orchestration
+        .batches
+        .get(selected_index)
+        .context("QUIC orchestrator did not produce a batch")?;
+    let mut runs = selected.runs.clone();
+    for run in &mut runs {
+        run.schema_valid = true;
+    }
+    let metrics = summarize_metrics(&runs);
+    let queues = summarize_queues(&queue_samples.lock().expect("queue sample mutex poisoned"));
+    let evidence = sidecar_hashes.get(selected_index);
+    let measurement_provenance = metrics
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                MeasurementProvenance {
+                    method: "real_quic_loopback_send_to_receive_monotonic".into(),
+                    uncertainty_us: Some(1),
+                    evidence_path: evidence.map(|(path, _)| path.clone()),
+                    evidence_sha256: evidence.map(|(_, hash)| hash.clone()),
+                    estimate_only: false,
+                },
+            )
+        })
+        .collect();
+    let mut errors = Vec::new();
+    if let Some(reason) = &orchestration.infrastructure_failure {
+        errors.push(reason.clone());
+    }
+    let verdict = if orchestration.selected_batch.is_some() {
+        VerdictStatus::Pass
+    } else {
+        VerdictStatus::Unstable
+    };
+    let fingerprints = collect_fingerprints()?;
+    let report = PerfReport {
+        schema_version: PERF_SCHEMA_VERSION,
+        scenario: "quic-control-v3".into(),
+        scenario_parameters: serde_json::from_value(parameters)?,
+        scenario_config_sha256: config_hash,
+        random_seed: 0,
+        commit: fingerprints.commit,
+        dirty: fingerprints.dirty,
+        binary_sha256: fingerprints.binary_sha256,
+        cargo_lock_sha256: fingerprints.cargo_lock_sha256,
+        build_profile: if cfg!(debug_assertions) {
+            "debug".into()
+        } else {
+            "release".into()
+        },
+        cargo_features: vec![],
+        rustflags: std::env::var("RUSTFLAGS").unwrap_or_default(),
+        runner_id: fingerprints.runner_id,
+        runner_fingerprint: fingerprints.runner_fingerprint,
+        availability: Availability::Available,
+        toolchain: fingerprints.toolchain,
+        hardware: fingerprints.hardware,
+        warmup: DurationSpec { millis: 0 },
+        runs,
+        metrics,
+        queues,
+        errors,
+        rss: None,
+        measurement_provenance,
+        verdict,
+        local_schema_validated: false,
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    let report = parse_and_validate_report(&bytes, &schema)?;
     fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
-    bail!(
-        "wrote a fail-closed not_run artifact to {}; fixed-runner execution is required",
-        args.output.display()
-    )
+    if let Some(reason) = orchestration.infrastructure_failure {
+        bail!(
+            "wrote an available but unstable artifact to {}: {reason}",
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
+struct Fingerprints {
+    commit: String,
+    dirty: bool,
+    binary_sha256: BTreeMap<String, String>,
+    cargo_lock_sha256: String,
+    runner_id: String,
+    runner_fingerprint: String,
+    toolchain: ToolchainFingerprint,
+    hardware: HardwareFingerprint,
+}
+
+fn collect_fingerprints() -> Result<Fingerprints> {
+    let repository_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
+    let commit = git_output(["rev-parse", "HEAD"])?;
+    let dirty = !git_output(["status", "--porcelain", "--untracked-files=no"])?.is_empty();
+    let binary = std::env::current_exe()?;
+    let binary_sha256 = BTreeMap::from([("rshare-perf".into(), digest_file(&binary)?)]);
+    let cargo_lock_sha256 = digest_file(&repository_root.join("Cargo.lock"))?;
+    let rustc = process_output("rustc", &["--version"])?;
+    let cargo = process_output("cargo", &["--version"])?;
+    let verbose_rustc = process_output("rustc", &["-vV"])?;
+    let target = verbose_rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or(std::env::consts::ARCH)
+        .to_string();
+    let toolchain = ToolchainFingerprint {
+        rustc,
+        cargo,
+        target,
+    };
+    let hardware = HardwareFingerprint {
+        os: std::env::consts::OS.into(),
+        cpu: std::env::var("PROCESSOR_IDENTIFIER")
+            .or_else(|_| std::env::var("HOSTTYPE"))
+            .unwrap_or_else(|_| "unknown".into()),
+        logical_cores: std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(0),
+        memory_bytes: 0,
+    };
+    let runner_id = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+    let runner_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(&runner_id, &toolchain, &hardware))?)
+    );
+    Ok(Fingerprints {
+        commit,
+        dirty,
+        binary_sha256,
+        cargo_lock_sha256,
+        runner_id,
+        runner_fingerprint,
+        toolchain,
+        hardware,
+    })
+}
+
+fn process_output(program: &str, args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new(program).args(args).output()?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn digest_file(path: &Path) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+}
+
+fn summarize_metrics(runs: &[report::PerfRun]) -> BTreeMap<String, MetricSummary> {
+    let names = runs
+        .iter()
+        .flat_map(|run| run.metrics.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut values: Vec<_> = runs
+                .iter()
+                .filter_map(|run| run.metrics.get(&name).copied())
+                .collect();
+            values.sort_by(f64::total_cmp);
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = if values.len() > 1 {
+                values
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / (values.len() - 1) as f64
+            } else {
+                0.0
+            };
+            let summary = MetricSummary {
+                unit: "us".into(),
+                samples: values.len() as u64,
+                median: percentile(&values, 0.50),
+                p95: percentile(&values, 0.95),
+                p99: percentile(&values, 0.99),
+                max: values.last().copied().unwrap_or(0.0),
+                coefficient_of_variation: if mean == 0.0 {
+                    0.0
+                } else {
+                    variance.sqrt() / mean.abs()
+                },
+            };
+            (name, summary)
+        })
+        .collect()
+}
+
+fn percentile(values: &[f64], quantile: f64) -> f64 {
+    let index = ((values.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
+    values.get(index).copied().unwrap_or(0.0)
+}
+
+fn summarize_queues(samples: &[BTreeMap<String, QueueSummary>]) -> BTreeMap<String, QueueSummary> {
+    let mut result = BTreeMap::new();
+    for queues in samples {
+        for (name, queue) in queues {
+            let aggregate = result.entry(name.clone()).or_insert(QueueSummary {
+                capacity: queue.capacity,
+                high_watermark: 0,
+                overwrites: 0,
+                overflows: 0,
+            });
+            aggregate.capacity = aggregate.capacity.max(queue.capacity);
+            aggregate.high_watermark = aggregate.high_watermark.max(queue.high_watermark);
+            aggregate.overwrites += queue.overwrites;
+            aggregate.overflows += queue.overflows;
+        }
+    }
+    result
 }
 
 fn run_compare(args: CompareArgs) -> Result<()> {
@@ -161,37 +416,32 @@ fn run_compare(args: CompareArgs) -> Result<()> {
         bail!("unstable policy must retry one whole batch and preserve every batch");
     }
 
+    let repository_root = git_output(["rev-parse", "--show-toplevel"])?;
+    let repository_root = PathBuf::from(repository_root);
+    let manifest_path = repository_root.join("perf/baselines/manifest.toml");
     let manifest: BaselineManifest = toml::from_str(
-        &fs::read_to_string(&args.manifest)
-            .with_context(|| format!("read manifest {}", args.manifest.display()))?,
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read protected manifest {}", manifest_path.display()))?,
     )?;
+    let expected_repository =
+        canonical_github_repository(&git_output(["remote", "get-url", "origin"])?)
+            .context("origin is not a canonical GitHub repository")?;
     let entry = manifest
         .baseline
         .iter()
         .find(|entry| entry.id == args.baseline_id)
         .context("baseline id is absent from the reviewed manifest")?;
-    let approval = verify_github_approval(entry, &args.manifest).map_err(anyhow::Error::msg)?;
+    let approval = verify_github_approval(entry, &manifest_path, &expected_repository)
+        .map_err(anyhow::Error::msg)?;
     compare::resolve_reviewed_entry(&manifest, &args.baseline_id, Some(&approval))
         .map_err(anyhow::Error::msg)?;
     let baseline_report = load_reviewed_baseline(&manifest, &args.baseline_id, &approval)
         .map_err(anyhow::Error::msg)?;
     let candidate_bytes = fs::read(&args.candidate)?;
-    let candidate_value: serde_json::Value = serde_json::from_slice(&candidate_bytes)?;
     let schema: serde_json::Value =
-        serde_json::from_slice(&fs::read("perf/baselines/schema.json")?)?;
-    validate_json_schema(&candidate_value, &schema)?;
-    let candidate_report: PerfReport = serde_json::from_value(candidate_value)?;
-    let contract = ScenarioContract {
-        metrics: baseline_report
-            .runs
-            .first()
-            .map(|run| run.metrics.keys().cloned().collect())
-            .unwrap_or_default(),
-        counters: REQUIRED_COUNTERS
-            .iter()
-            .map(|counter| counter.to_string())
-            .collect(),
-    };
+        serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
+    let candidate_report = parse_and_validate_report(&candidate_bytes, &schema)?;
+    let contract = ScenarioContract::for_report(&baseline_report)?;
     baseline_report.validate_complete(&contract)?;
     candidate_report.validate_complete(&contract)?;
 
@@ -204,6 +454,27 @@ fn run_compare(args: CompareArgs) -> Result<()> {
         VerdictStatus::Pass => Ok(()),
         other => bail!("performance gate did not pass: {other:?}"),
     }
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Result<String> {
+    let output = ProcessCommand::new("git").args(args).output()?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn canonical_github_repository(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    (parts.next().is_none() && !owner.is_empty() && !repository.is_empty())
+        .then(|| format!("{owner}/{repository}"))
 }
 
 fn batch_from_artifact(report: PerfReport) -> ReportBatch {
@@ -224,6 +495,7 @@ fn batch_from_artifact(report: PerfReport) -> ReportBatch {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn quic_command_accepts_the_documented_control_load() {
@@ -256,5 +528,52 @@ mod tests {
             "budget.toml",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn quic_cli_executes_five_real_runs_and_writes_batch_sidecars() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rshare-perf-cli-{}-{nonce}", std::process::id()));
+        let output = directory.join("quic.json");
+        let args = QuicArgs {
+            rate_hz: Some(125),
+            duration_secs: Some(10),
+            load: vec![],
+            slow_fast_isolation: false,
+            stall_ms: None,
+            output: output.clone(),
+        };
+
+        let _result = run_quic_with_duration(args, Some(Duration::from_millis(40)));
+
+        let bytes = fs::read(&output).expect("CLI must write its primary artifact");
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let report = parse_and_validate_report(&bytes, &schema).unwrap();
+        assert!(matches!(report.availability, Availability::Available));
+        assert_eq!(report.runs.len(), 5);
+        assert!(report.runs.iter().all(|run| run.process_exit_success));
+
+        let sidecars: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("quic.batch-"))
+            })
+            .collect();
+        assert!(!sidecars.is_empty());
+        for sidecar in sidecars {
+            let batch: quic::ArchivedBatch =
+                serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+            assert_eq!(batch.runs.len(), 5);
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

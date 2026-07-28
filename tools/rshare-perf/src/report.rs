@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub const PERF_SCHEMA_VERSION: u16 = 1;
 pub const REQUIRED_COUNTERS: [&str; 5] = [
@@ -40,6 +40,8 @@ pub struct PerfReport {
     pub rss: Option<RssSummary>,
     pub measurement_provenance: BTreeMap<String, MeasurementProvenance>,
     pub verdict: VerdictStatus,
+    #[serde(skip)]
+    pub(crate) local_schema_validated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -138,6 +140,50 @@ pub enum VerdictStatus {
 pub struct ScenarioContract {
     pub metrics: Vec<String>,
     pub counters: Vec<String>,
+    pub binary_roles: Vec<String>,
+}
+
+impl ScenarioContract {
+    pub fn for_scenario(scenario: &str) -> Result<Self, ReportError> {
+        let (metrics, binary_roles) = match scenario {
+            "quic-control-v3" => (vec!["median_us", "p95_us", "p99_us"], vec!["rshare-perf"]),
+            "daemon-control" => (
+                vec!["median_us", "p95_us", "p99_us"],
+                vec!["rshare-daemon", "rshare-perf"],
+            ),
+            "desktop-control" | "windows-media" => (
+                vec!["median_us", "p95_us", "p99_us"],
+                vec!["rshare-daemon", "rshare-desktop", "rshare-perf"],
+            ),
+            other => return Err(ReportError::UnknownScenario(other.into())),
+        };
+        Ok(Self {
+            metrics: metrics.into_iter().map(str::to_string).collect(),
+            counters: REQUIRED_COUNTERS
+                .iter()
+                .map(|counter| counter.to_string())
+                .collect(),
+            binary_roles: binary_roles.into_iter().map(str::to_string).collect(),
+        })
+    }
+
+    pub fn for_report(report: &PerfReport) -> Result<Self, ReportError> {
+        let mut contract = Self::for_scenario(&report.scenario)?;
+        if report.scenario == "quic-control-v3" {
+            match report
+                .scenario_parameters
+                .get("kind")
+                .and_then(Value::as_str)
+            {
+                Some("stall_recovery") => contract.metrics.push("stall_recovery_us".into()),
+                Some("slow_fast_peer_isolation") => {
+                    contract.metrics.push("fast_peer_p99_us".into())
+                }
+                _ => {}
+            }
+        }
+        Ok(contract)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -162,6 +208,14 @@ pub enum ReportError {
     InvalidFingerprint { field: String },
     #[error("JSON schema validation failed: {reason}")]
     SchemaValidation { reason: String },
+    #[error("scenario {0} has no predefined performance contract")]
+    UnknownScenario(String),
+    #[error("complete report requires exactly five runs, got {actual}")]
+    RunCount { actual: usize },
+    #[error("complete report repeats run id {0}")]
+    DuplicateRunId(String),
+    #[error("report was not validated locally against the repository JSON schema")]
+    LocalSchemaValidationMissing,
 }
 
 impl PerfReport {
@@ -188,7 +242,28 @@ impl PerfReport {
                 reason: format!("verdict is {:?}", self.verdict),
             });
         }
+        if !self.local_schema_validated {
+            return Err(ReportError::LocalSchemaValidationMissing);
+        }
         self.validate_reproducibility()?;
+        if self.runs.len() != 5 {
+            return Err(ReportError::RunCount {
+                actual: self.runs.len(),
+            });
+        }
+        let mut run_ids = HashSet::with_capacity(5);
+        for run in &self.runs {
+            if !run_ids.insert(run.run_id.as_str()) {
+                return Err(ReportError::DuplicateRunId(run.run_id.clone()));
+            }
+        }
+        for role in &contract.binary_roles {
+            if !self.binary_sha256.contains_key(role) {
+                return Err(ReportError::InvalidFingerprint {
+                    field: format!("binary_sha256.{role}"),
+                });
+            }
+        }
 
         for run in &self.runs {
             if !run.process_exit_success {
@@ -340,7 +415,12 @@ impl PerfReport {
             rss: None,
             measurement_provenance: BTreeMap::new(),
             verdict: VerdictStatus::Pass,
+            local_schema_validated: true,
         }
+    }
+
+    pub fn locally_schema_validated(&self) -> bool {
+        self.local_schema_validated
     }
 }
 
@@ -361,46 +441,32 @@ pub fn scenario_config_sha256(value: &Value) -> Result<String, serde_json::Error
 }
 
 pub fn validate_json_schema(value: &Value, schema: &Value) -> Result<(), ReportError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ReportError::SchemaValidation {
-            reason: "artifact must be a JSON object".into(),
+    let validator =
+        jsonschema::validator_for(schema).map_err(|error| ReportError::SchemaValidation {
+            reason: format!("invalid schema: {error}"),
         })?;
-    let schema_object = schema
-        .as_object()
-        .ok_or_else(|| ReportError::SchemaValidation {
-            reason: "schema must be a JSON object".into(),
+    validator
+        .validate(value)
+        .map_err(|error| ReportError::SchemaValidation {
+            reason: error.to_string(),
+        })
+}
+
+pub fn parse_and_validate_report(bytes: &[u8], schema: &Value) -> Result<PerfReport, ReportError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| ReportError::SchemaValidation {
+            reason: error.to_string(),
         })?;
-    let required = schema_object
-        .get("required")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ReportError::SchemaValidation {
-            reason: "schema must declare required fields".into(),
+    validate_json_schema(&value, schema)?;
+    let mut report: PerfReport =
+        serde_json::from_value(value).map_err(|error| ReportError::SchemaValidation {
+            reason: error.to_string(),
         })?;
-    for field in required {
-        let field = field
-            .as_str()
-            .ok_or_else(|| ReportError::SchemaValidation {
-                reason: "required field names must be strings".into(),
-            })?;
-        if !object.contains_key(field) {
-            return Err(ReportError::SchemaValidation {
-                reason: format!("missing required field {field}"),
-            });
-        }
+    report.local_schema_validated = true;
+    for run in &mut report.runs {
+        run.schema_valid = true;
     }
-    if let Some(expected) = schema_object
-        .get("properties")
-        .and_then(|value| value.get("schema_version"))
-        .and_then(|value| value.get("const"))
-    {
-        if object.get("schema_version") != Some(expected) {
-            return Err(ReportError::SchemaValidation {
-                reason: "schema_version does not match the schema".into(),
-            });
-        }
-    }
-    Ok(())
+    Ok(report)
 }
 
 fn canonicalize_json(value: &Value) -> Value {
@@ -504,6 +570,87 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn schema_validation_rejects_nested_unknown_and_wrong_type() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["nested"],
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["count"],
+                    "properties": {"count": {"type": "integer", "minimum": 1}}
+                }
+            }
+        });
+        assert!(validate_json_schema(
+            &json!({"nested": {"count": "one", "unexpected": true}}),
+            &schema
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn schema_validation_enforces_refs_patterns_and_min_lengths() {
+        let schema = json!({
+            "$defs": {
+                "fingerprint": {
+                    "type": "string",
+                    "minLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                }
+            },
+            "type": "object",
+            "required": ["fingerprint"],
+            "properties": {
+                "fingerprint": {"$ref": "#/$defs/fingerprint"}
+            }
+        });
+        assert!(validate_json_schema(&json!({"fingerprint": "not-a-hash"}), &schema).is_err());
+    }
+
+    #[test]
+    fn scenario_contracts_predeclare_metrics_and_participating_binary_roles() {
+        let loopback = ScenarioContract::for_scenario("quic-control-v3").unwrap();
+        assert_eq!(loopback.metrics, vec!["median_us", "p95_us", "p99_us"]);
+        assert_eq!(loopback.binary_roles, vec!["rshare-perf"]);
+
+        let daemon = ScenarioContract::for_scenario("daemon-control").unwrap();
+        assert_eq!(daemon.binary_roles, vec!["rshare-daemon", "rshare-perf"]);
+        assert!(ScenarioContract::for_scenario("unknown").is_err());
+    }
+
+    #[test]
+    fn complete_report_requires_exactly_five_unique_run_ids() {
+        let mut report = valid_report();
+        let run = report.runs[0].clone();
+        report.runs = vec![run; 5];
+        assert!(report.validate_complete(&required_contract()).is_err());
+    }
+
+    #[test]
+    fn malicious_schema_valid_true_cannot_bypass_local_schema_validation() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let mut value = serde_json::to_value(valid_report()).unwrap();
+        value["runner_fingerprint"] = Value::String("malicious".into());
+        value["runs"][0]["schema_valid"] = Value::Bool(true);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(parse_and_validate_report(&bytes, &schema).is_err());
+    }
+
+    #[test]
+    fn local_schema_validation_derives_run_validation_state() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let bytes = serde_json::to_vec(&valid_report()).unwrap();
+        let report = parse_and_validate_report(&bytes, &schema).unwrap();
+        assert!(report.locally_schema_validated());
+        assert!(report.runs.iter().all(|run| run.schema_valid));
+    }
+
     fn required_contract() -> ScenarioContract {
         ScenarioContract {
             metrics: vec!["latency_us".into()],
@@ -511,6 +658,7 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string())
                 .collect(),
+            binary_roles: vec!["rshare-perf".into()],
         }
     }
 
@@ -521,19 +669,18 @@ mod tests {
         }
         let mut run_metrics = BTreeMap::new();
         run_metrics.insert("latency_us".into(), 100.0);
-        PerfReport::test_fixture(
-            "batch-a",
-            "runner-a",
-            vec![PerfRun {
-                run_id: "run-1".into(),
+        let runs = (1..=5)
+            .map(|index| PerfRun {
+                run_id: format!("run-{index}"),
                 batch_id: "batch-a".into(),
                 process_exit_success: true,
                 schema_valid: true,
                 scenario_config_sha256: "config".into(),
-                metrics: run_metrics,
-                counters,
+                metrics: run_metrics.clone(),
+                counters: counters.clone(),
                 errors: vec![],
-            }],
-        )
+            })
+            .collect();
+        PerfReport::test_fixture("batch-a", "runner-a", runs)
     }
 }

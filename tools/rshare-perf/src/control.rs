@@ -50,6 +50,7 @@ pub fn not_run_without_framed_ipc() -> PerfReport {
         rss: None,
         measurement_provenance: BTreeMap::new(),
         verdict: VerdictStatus::NotRun,
+        local_schema_validated: false,
     }
 }
 
