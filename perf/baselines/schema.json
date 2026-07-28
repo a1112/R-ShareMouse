@@ -23,6 +23,7 @@
     "toolchain",
     "hardware",
     "warmup",
+    "batch_artifacts",
     "runs",
     "metrics",
     "queues",
@@ -100,6 +101,10 @@
       "required": ["millis"],
       "properties": { "millis": { "type": "integer", "minimum": 0 } }
     },
+    "batch_artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/batch_artifact" }
+    },
     "runs": {
       "type": "array",
       "items": { "$ref": "#/$defs/run" }
@@ -125,6 +130,17 @@
     }
   },
   "$defs": {
+    "batch_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batch_id", "path", "sha256", "verdict"],
+      "properties": {
+        "batch_id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "verdict": { "enum": ["pass", "fail", "unstable", "unsupported", "not_run"] }
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-fA-F]{64}$"
@@ -148,7 +164,11 @@
         "process_exit_success": { "const": true },
         "schema_valid": { "const": true },
         "scenario_config_sha256": { "$ref": "#/$defs/sha256" },
-        "metrics": { "type": "object", "minProperties": 1 },
+        "metrics": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0 }
+        },
         "counters": {
           "type": "object",
           "required": [

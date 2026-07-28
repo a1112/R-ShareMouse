@@ -1,13 +1,17 @@
-use crate::report::{PerfRun, QueueSummary, VerdictStatus, REQUIRED_COUNTERS};
-use anyhow::{Context, Result};
+use crate::report::{percentile, PerfRun, QueueSummary, VerdictStatus, REQUIRED_COUNTERS};
+use anyhow::{anyhow, Context, Result};
 use rshare_core::{AudioFormat, AudioFramePayload, DeviceId, Message};
-use rshare_net::QuicTransport;
+use rshare_net::{ConnectionPool, QuicTransport};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +125,8 @@ pub fn scenario_matrix() -> Vec<QuicScenario> {
 #[derive(Debug, Clone)]
 pub struct LoopbackRunOptions {
     pub effective_duration: Option<Duration>,
+    pub global_deadline: Option<Duration>,
+    pub bind_addr: Option<String>,
     pub batch_id: String,
     pub run_index: usize,
 }
@@ -129,6 +135,8 @@ impl LoopbackRunOptions {
     pub fn measured(batch_id: String, run_index: usize) -> Self {
         Self {
             effective_duration: None,
+            global_deadline: None,
+            bind_addr: None,
             batch_id,
             run_index,
         }
@@ -138,6 +146,8 @@ impl LoopbackRunOptions {
     fn test(duration: Duration) -> Self {
         Self {
             effective_duration: Some(duration),
+            global_deadline: None,
+            bind_addr: None,
             batch_id: "test-batch".into(),
             run_index: 0,
         }
@@ -252,6 +262,46 @@ pub async fn run_loopback_once(
     options: LoopbackRunOptions,
 ) -> Result<LoopbackMeasurement> {
     scenario.validate()?;
+    let configured_duration = match scenario {
+        QuicScenario::Rate { duration_secs, .. } => Duration::from_secs(*duration_secs),
+        QuicScenario::SlowFastPeerIsolation | QuicScenario::StallRecovery { .. } => {
+            Duration::from_secs(10)
+        }
+    };
+    let measurement_duration = options.effective_duration.unwrap_or(configured_duration);
+    let global_deadline = options
+        .global_deadline
+        .unwrap_or(measurement_duration + Duration::from_secs(5));
+    let bind_addr = options.bind_addr.as_deref().unwrap_or("127.0.0.1:0");
+    let local_id = DeviceId::new_v4();
+    let mut server = QuicTransport::new(local_id);
+    server.start_server(bind_addr).await?;
+    let result = timeout(
+        global_deadline,
+        run_loopback_once_started(scenario, options, local_id, &mut server),
+    )
+    .await
+    .map_err(|_| anyhow!("QUIC loopback run exceeded global deadline"));
+    let close_result = server.close().await;
+    match result {
+        Ok(result) => {
+            close_result?;
+            result
+        }
+        Err(error) => {
+            let _ = close_result;
+            Err(error)
+        }
+    }
+}
+
+async fn run_loopback_once_started(
+    scenario: &QuicScenario,
+    options: LoopbackRunOptions,
+    local_id: DeviceId,
+    server: &mut QuicTransport,
+) -> Result<LoopbackMeasurement> {
+    scenario.validate()?;
     let (rate_hz, configured_duration, load, stall_ms, slow_fast) = match scenario {
         QuicScenario::Rate {
             rate_hz,
@@ -276,16 +326,13 @@ pub async fn run_loopback_once(
         ),
     };
     let duration = options.effective_duration.unwrap_or(configured_duration);
-    let local_id = DeviceId::new_v4();
-    let remote_id = DeviceId::new_v4();
-    let mut server = QuicTransport::new(local_id);
-    server.start_server("127.0.0.1:0").await?;
+    let fast_id = DeviceId::new_v4();
     let address = server
         .local_addr()
         .context("QUIC loopback server did not expose its ephemeral address")?;
     let mut incoming = server.incoming();
 
-    let mut fast_client = QuicTransport::new(remote_id);
+    let mut fast_client = QuicTransport::new(fast_id);
     let fast_sender = fast_client
         .connect(&address.to_string(), local_id)
         .await
@@ -297,151 +344,344 @@ pub async fn run_loopback_once(
         .connection;
     let mut fast_messages = fast_receiver.message_channel();
 
-    let mut slow_sender = None;
-    let mut _slow_receiver = None;
+    let pool = ConnectionPool::new(local_id);
+    pool.insert(fast_id, fast_sender).await;
+    let mut slow_id = None;
+    let mut slow_receiver = None;
     if slow_fast {
-        let slow_id = DeviceId::new_v4();
-        let mut slow_client = QuicTransport::new(slow_id);
+        let id = DeviceId::new_v4();
+        let mut slow_client = QuicTransport::new(id);
         let sender = slow_client.connect(&address.to_string(), local_id).await?;
         let receiver = timeout(Duration::from_secs(3), incoming.recv())
             .await
             .context("timed out accepting slow QUIC peer")?
             .context("slow QUIC accept channel closed")?
             .connection;
-        slow_sender = Some(sender);
-        _slow_receiver = Some(receiver);
+        pool.insert(id, sender).await;
+        slow_id = Some(id);
+        slow_receiver = Some(receiver);
     }
 
+    let expected_sent = ((duration.as_secs_f64() * rate_hz as f64).round() as u64).max(1);
+    let channel_capacity = usize::try_from(expected_sent.min(4_096)).unwrap_or(4_096);
+    let (fast_tx, mut fast_rx) = mpsc::channel::<u64>(channel_capacity);
+    let (slow_tx, mut slow_rx) = mpsc::channel::<u64>(channel_capacity);
+    let sent_times = Arc::new(Mutex::new(HashMap::<u64, Instant>::new()));
+    let receive_state = Arc::new(Mutex::new(ReceiveState::default()));
+    let actual_sent = Arc::new(AtomicU64::new(0));
+    let producer_dropped = Arc::new(AtomicU64::new(0));
+    let send_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let slow_send_us = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let mut tasks = JoinSet::new();
+    let mut task_count = 0_usize;
+
+    let receiver_state = Arc::clone(&receive_state);
+    let receiver_sent_times = Arc::clone(&sent_times);
+    let stall_trigger_sequence = (expected_sent / 2).max(1);
+    tasks.spawn(async move {
+        while let Some(message) = fast_messages.recv().await {
+            let Message::MouseMove { x, .. } = message else {
+                continue;
+            };
+            let sequence = x as u64;
+            let should_stall = {
+                let mut state = receiver_state
+                    .lock()
+                    .expect("receiver state mutex poisoned");
+                if stall_ms.is_some()
+                    && state.stall_started.is_none()
+                    && sequence >= stall_trigger_sequence
+                {
+                    state.stall_started = Some(Instant::now());
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_stall {
+                tokio::time::sleep(Duration::from_millis(stall_ms.unwrap())).await;
+            }
+
+            let received_at = Instant::now();
+            let sent_at = receiver_sent_times
+                .lock()
+                .expect("sent time mutex poisoned")
+                .remove(&sequence);
+            let mut state = receiver_state
+                .lock()
+                .expect("receiver state mutex poisoned");
+            if let Some(sent_at) = sent_at {
+                state
+                    .latencies_us
+                    .push(received_at.duration_since(sent_at).as_micros() as f64);
+            }
+            let consecutive = state
+                .last_received
+                .is_some_and(|previous| sequence == previous + 1);
+            if let Some(previous) = state.last_received {
+                if sequence == previous {
+                    state.duplicate += 1;
+                } else if sequence < previous {
+                    state.out_of_order += 1;
+                } else if sequence > previous + 1 {
+                    state.gap += sequence - previous - 1;
+                }
+            }
+            if let Some(stall_started) = state.stall_started {
+                if state.stall_recovery_us.is_none() {
+                    state.post_stall_consecutive = if consecutive {
+                        state.post_stall_consecutive + 1
+                    } else {
+                        1
+                    };
+                    if state.post_stall_consecutive >= 3 {
+                        state.stall_recovery_us = Some(stall_started.elapsed().as_micros() as f64);
+                        state.stall_recovery_consecutive_deliveries = state.post_stall_consecutive;
+                    }
+                }
+            }
+            state.last_received = Some(sequence);
+            if sequence >= expected_sent {
+                break;
+            }
+        }
+    });
+    task_count += 1;
+
+    let fast_pool = pool.clone();
+    let fast_sent_times = Arc::clone(&sent_times);
+    let fast_actual_sent = Arc::clone(&actual_sent);
+    let fast_errors = Arc::clone(&send_errors);
+    let load_messages = load.to_vec();
+    tasks.spawn(async move {
+        while let Some(sequence) = fast_rx.recv().await {
+            fast_sent_times
+                .lock()
+                .expect("sent time mutex poisoned")
+                .insert(sequence, Instant::now());
+            let message = Message::MouseMove {
+                x: sequence as i32,
+                y: sequence.wrapping_neg() as i32,
+            };
+            match fast_pool.send_to(&fast_id, &message).await {
+                Ok(()) => {
+                    fast_actual_sent.fetch_add(1, Ordering::Relaxed);
+                    if sequence % 100 == 0 {
+                        for kind in &load_messages {
+                            if let Err(error) = fast_pool
+                                .send_to(&fast_id, &load_message(kind, sequence))
+                                .await
+                            {
+                                fast_errors
+                                    .lock()
+                                    .expect("send error mutex poisoned")
+                                    .push(error.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    fast_sent_times
+                        .lock()
+                        .expect("sent time mutex poisoned")
+                        .remove(&sequence);
+                    fast_errors
+                        .lock()
+                        .expect("send error mutex poisoned")
+                        .push(error.to_string());
+                }
+            }
+        }
+    });
+    task_count += 1;
+
+    if let Some(id) = slow_id {
+        let slow_pool = pool.clone();
+        let slow_costs = Arc::clone(&slow_send_us);
+        let slow_errors = Arc::clone(&send_errors);
+        tasks.spawn(async move {
+            while let Some(sequence) = slow_rx.recv().await {
+                let started = Instant::now();
+                if let Err(error) = slow_pool
+                    .send_to(
+                        &id,
+                        &Message::MouseMove {
+                            x: sequence as i32,
+                            y: -1,
+                        },
+                    )
+                    .await
+                {
+                    slow_errors
+                        .lock()
+                        .expect("send error mutex poisoned")
+                        .push(error.to_string());
+                }
+                slow_costs
+                    .lock()
+                    .expect("slow send mutex poisoned")
+                    .push(started.elapsed().as_micros() as f64);
+            }
+        });
+        task_count += 1;
+    }
+
+    let producer_started = Instant::now();
     let period = Duration::from_secs_f64(1.0 / rate_hz as f64);
-    let mut ticker = interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let started = Instant::now();
-    let mut sequence = 0_u64;
-    let mut last_received = None;
-    let mut latencies_us = Vec::new();
+    for sequence in 1..=expected_sent {
+        let deadline = producer_started + period.mul_f64((sequence - 1) as f64);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        if fast_tx.try_send(sequence).is_err() {
+            producer_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        if slow_fast && slow_tx.try_send(sequence).is_err() {
+            producer_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    drop(fast_tx);
+    drop(slow_tx);
+    for _ in 0..task_count {
+        match timeout(Duration::from_secs(2), tasks.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => send_errors
+                .lock()
+                .expect("send error mutex poisoned")
+                .push(format!("QUIC loopback task failed: {error}")),
+            Ok(None) => break,
+            Err(_) => {
+                tasks.abort_all();
+                send_errors
+                    .lock()
+                    .expect("send error mutex poisoned")
+                    .push("QUIC loopback task exceeded cleanup deadline".into());
+                break;
+            }
+        }
+    }
+
+    let fast_diagnostics = pool
+        .diagnostics_for(&fast_id)
+        .await
+        .context("fast QUIC transport diagnostics unavailable")?;
+    let slow_diagnostics = if let Some(id) = slow_id {
+        pool.diagnostics_for(&id).await
+    } else {
+        None
+    };
+    let state = receive_state.lock().expect("receiver state mutex poisoned");
     let mut counters = BTreeMap::from(
         REQUIRED_COUNTERS
             .into_iter()
             .map(|counter| (counter.to_string(), 0_u64))
             .collect::<BTreeMap<_, _>>(),
     );
-    let mut queue_high_watermark = 1_u64;
-    let mut stall_applied = false;
+    counters.insert("expected_sent".into(), expected_sent);
+    counters.insert("actual_sent".into(), actual_sent.load(Ordering::Relaxed));
+    counters.insert("independent_producer".into(), 1);
+    counters.insert(
+        "producer_queue_dropped".into(),
+        producer_dropped.load(Ordering::Relaxed),
+    );
+    counters.insert("shared_pool_fanout".into(), u64::from(slow_fast));
+    counters.insert(
+        "stall_recovery_consecutive_deliveries".into(),
+        state.stall_recovery_consecutive_deliveries,
+    );
+    counters.insert("gap".into(), state.gap);
+    counters.insert("duplicate".into(), state.duplicate);
+    counters.insert("out_of_order".into(), state.out_of_order);
+    let datagram_drops = fast_diagnostics.datagram_tx_dropped
+        + slow_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.datagram_tx_dropped)
+            .unwrap_or(0);
+    let reliable_resets = fast_diagnostics.reliable_stream_reset_count
+        + slow_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.reliable_stream_reset_count)
+            .unwrap_or(0);
+    counters.insert("overwrite".into(), datagram_drops);
+    counters.insert("reliable_overflow".into(), reliable_resets);
 
-    while started.elapsed() < duration {
-        ticker.tick().await;
-        sequence += 1;
-        if let Some(sender) = &slow_sender {
-            if sender
-                .send_message(&Message::MouseMove {
-                    x: sequence as i32,
-                    y: -1,
-                })
-                .await
-                .is_err()
-            {
-                counters
-                    .entry("overwrite".into())
-                    .and_modify(|value| *value += 1);
-            }
-        }
-
-        if sequence % 100 == 0 {
-            for kind in load {
-                fast_sender
-                    .send_message(&load_message(kind, sequence))
-                    .await?;
-            }
-            queue_high_watermark = queue_high_watermark.max((load.len() + 1) as u64);
-        }
-
-        let sent = Instant::now();
-        fast_sender
-            .send_message(&Message::MouseMove {
-                x: sequence as i32,
-                y: sequence.wrapping_neg() as i32,
-            })
-            .await?;
-        if !stall_applied && stall_ms.is_some() && started.elapsed() >= duration / 2 {
-            tokio::time::sleep(Duration::from_millis(stall_ms.unwrap())).await;
-            stall_applied = true;
-        }
-
-        let received_sequence = loop {
-            let message = timeout(Duration::from_secs(2), fast_messages.recv())
-                .await
-                .context("timed out receiving QUIC loopback data")?
-                .context("QUIC loopback receive channel closed")?;
-            if let Message::MouseMove { x, .. } = message {
-                break x as u64;
-            }
-        };
-        latencies_us.push(sent.elapsed().as_micros() as f64);
-        if let Some(previous) = last_received {
-            if received_sequence == previous {
-                counters
-                    .entry("duplicate".into())
-                    .and_modify(|value| *value += 1);
-            } else if received_sequence < previous {
-                counters
-                    .entry("out_of_order".into())
-                    .and_modify(|value| *value += 1);
-            } else if received_sequence > previous + 1 {
-                counters
-                    .entry("gap".into())
-                    .and_modify(|value| *value += received_sequence - previous - 1);
-            }
-        }
-        last_received = Some(received_sequence);
-    }
-
-    let diagnostics = fast_sender.diagnostics();
-    *counters.get_mut("overwrite").unwrap() += diagnostics.datagram_tx_dropped;
-    *counters.get_mut("reliable_overflow").unwrap() += diagnostics.reliable_stream_reset_count;
+    let mut latencies_us = state.latencies_us.clone();
+    let stall_recovery_us = state.stall_recovery_us;
+    drop(state);
     latencies_us.sort_by(f64::total_cmp);
     let median = percentile(&latencies_us, 0.50);
     let p95 = percentile(&latencies_us, 0.95);
     let p99 = percentile(&latencies_us, 0.99);
+    let achieved_hz = actual_sent.load(Ordering::Relaxed) as f64 / duration.as_secs_f64();
     let mut metrics = BTreeMap::from([
         ("median_us".into(), median),
         ("p95_us".into(), p95),
         ("p99_us".into(), p99),
+        ("achieved_hz".into(), achieved_hz),
     ]);
-    if stall_applied {
-        metrics.insert("stall_recovery_us".into(), p99);
+    if let Some(recovery) = stall_recovery_us {
+        metrics.insert("stall_recovery_us".into(), recovery);
     }
     if slow_fast {
         metrics.insert("fast_peer_p99_us".into(), p99);
+        let mut costs = slow_send_us
+            .lock()
+            .expect("slow send mutex poisoned")
+            .clone();
+        costs.sort_by(f64::total_cmp);
+        metrics.insert("slow_send_p99_us".into(), percentile(&costs, 0.99));
     }
-    let queues = BTreeMap::from([(
-        "control_outbound".into(),
-        QueueSummary {
-            capacity: 128,
-            high_watermark: queue_high_watermark.min(128),
-            overwrites: counters["overwrite"],
-            overflows: counters["reliable_overflow"],
-        },
-    )]);
+    let mut errors = send_errors
+        .lock()
+        .expect("send error mutex poisoned")
+        .clone();
+    if actual_sent.load(Ordering::Relaxed) * 100 < expected_sent * 90 {
+        errors.push(format!(
+            "achieved send rate {:.2} Hz is below 90% of configured {rate_hz} Hz",
+            achieved_hz
+        ));
+    }
+    if stall_ms.is_some() && stall_recovery_us.is_none() {
+        errors.push("stall recovery did not reach three consecutive deliveries".into());
+    }
     let run = PerfRun {
         run_id: format!("{}-{}", options.batch_id, options.run_index),
         batch_id: options.batch_id,
-        process_exit_success: true,
+        process_exit_success: errors.is_empty(),
         schema_valid: false,
         scenario_config_sha256: String::new(),
         metrics,
         counters,
-        errors: vec![],
+        errors,
     };
-    fast_sender.close().await;
-    if let Some(sender) = slow_sender {
-        sender.close().await;
+    if let Some(connection) = pool.remove(&fast_id).await {
+        connection.close().await;
     }
-    server.close().await?;
+    if let Some(id) = slow_id {
+        if let Some(connection) = pool.remove(&id).await {
+            connection.close().await;
+        }
+    }
+    fast_receiver.close().await;
+    if let Some(receiver) = slow_receiver {
+        receiver.close().await;
+    }
     Ok(LoopbackMeasurement {
         run,
-        queues,
+        queues: BTreeMap::new(),
         transport_handshake_completed: true,
     })
+}
+
+#[derive(Default)]
+struct ReceiveState {
+    latencies_us: Vec<f64>,
+    last_received: Option<u64>,
+    gap: u64,
+    duplicate: u64,
+    out_of_order: u64,
+    stall_started: Option<Instant>,
+    stall_recovery_us: Option<f64>,
+    post_stall_consecutive: u64,
+    stall_recovery_consecutive_deliveries: u64,
 }
 
 fn load_message(kind: &LoadKind, sequence: u64) -> Message {
@@ -470,11 +710,6 @@ fn load_message(kind: &LoadKind, sequence: u64) -> Message {
             data: vec![0; 64 * 1024],
         },
     }
-}
-
-fn percentile(values: &[f64], quantile: f64) -> f64 {
-    let index = ((values.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
-    values.get(index).copied().unwrap_or(0.0)
 }
 
 fn now_millis() -> u64 {
@@ -554,7 +789,93 @@ mod tests {
         assert!(REQUIRED_COUNTERS
             .iter()
             .all(|counter| measured.run.counters.contains_key(*counter)));
-        assert!(measured.queues["control_outbound"].high_watermark > 0);
+        assert!(
+            measured.queues.is_empty(),
+            "transport does not expose real queue capacity/high-watermark diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_runner_records_independent_producer_rate_gate() {
+        let measured = run_loopback_once(
+            &QuicScenario::Rate {
+                rate_hz: 1_000,
+                duration_secs: 60,
+                load: vec![],
+            },
+            LoopbackRunOptions::test(Duration::from_millis(120)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(measured.run.counters["expected_sent"], 120);
+        assert_eq!(
+            measured.run.counters["actual_sent"],
+            measured.run.counters["expected_sent"]
+        );
+        assert!(measured.run.metrics["achieved_hz"] >= 900.0);
+        assert_eq!(measured.run.counters["independent_producer"], 1);
+    }
+
+    #[tokio::test]
+    async fn slow_fast_isolation_uses_shared_pool_fanout_and_measures_slow_cost() {
+        let measured = run_loopback_once(
+            &QuicScenario::SlowFastPeerIsolation,
+            LoopbackRunOptions::test(Duration::from_millis(120)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(measured.run.counters["shared_pool_fanout"], 1);
+        assert!(measured.run.metrics.contains_key("fast_peer_p99_us"));
+        assert!(measured.run.metrics.contains_key("slow_send_p99_us"));
+        assert_eq!(
+            measured.run.counters["actual_sent"],
+            measured.run.counters["expected_sent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_recovery_uses_sequence_timeline_not_whole_run_p99() {
+        let measured = run_loopback_once(
+            &QuicScenario::StallRecovery { stall_ms: 100 },
+            LoopbackRunOptions::test(Duration::from_millis(250)),
+        )
+        .await
+        .unwrap();
+
+        assert!(measured.run.metrics["stall_recovery_us"] >= 100_000.0);
+        assert_ne!(
+            measured.run.metrics["stall_recovery_us"],
+            measured.run.metrics["p99_us"]
+        );
+        assert!(measured.run.counters["stall_recovery_consecutive_deliveries"] >= 3);
+    }
+
+    #[tokio::test]
+    async fn global_deadline_closes_loopback_endpoint_and_aborts_tasks() {
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind_addr = reservation.local_addr().unwrap().to_string();
+        drop(reservation);
+        let mut options = LoopbackRunOptions::test(Duration::from_secs(2));
+        options.global_deadline = Some(Duration::from_millis(20));
+        options.bind_addr = Some(bind_addr.clone());
+
+        let result = run_loopback_once(
+            &QuicScenario::Rate {
+                rate_hz: 125,
+                duration_secs: 10,
+                load: vec![],
+            },
+            options,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let mut replacement = QuicTransport::new(DeviceId::new_v4());
+        replacement.start_server(&bind_addr).await.unwrap();
+        assert!(replacement.is_running());
+        replacement.close().await.unwrap();
     }
 
     #[tokio::test]

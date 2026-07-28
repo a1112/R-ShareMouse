@@ -43,6 +43,7 @@ pub fn not_run_without_framed_ipc() -> PerfReport {
             memory_bytes: 0,
         },
         warmup: DurationSpec { millis: 0 },
+        batch_artifacts: vec![],
         runs: vec![],
         metrics: BTreeMap::new(),
         queues: BTreeMap::new(),

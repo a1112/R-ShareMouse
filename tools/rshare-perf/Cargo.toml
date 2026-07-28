@@ -18,3 +18,10 @@ toml = { workspace = true }
 tokio = { workspace = true }
 rshare-core = { path = "../../crates/rshare-core" }
 rshare-net = { path = "../../crates/rshare-net" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }

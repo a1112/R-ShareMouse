@@ -12,18 +12,23 @@ use compare::{
 };
 use quic::{LoadKind, QuicScenario};
 use report::{
-    parse_and_validate_report, scenario_config_sha256, Availability, DurationSpec,
-    HardwareFingerprint, MeasurementProvenance, MetricSummary, PerfReport, QueueSummary,
-    ScenarioContract, ToolchainFingerprint, VerdictStatus, PERF_SCHEMA_VERSION,
+    parse_and_validate_report, percentile, scenario_config_sha256, Availability,
+    BatchArtifactReference, DurationSpec, HardwareFingerprint, MeasurementProvenance,
+    MetricSummary, PerfReport, QueueSummary, ScenarioContract, ToolchainFingerprint, VerdictStatus,
+    PERF_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -125,7 +130,15 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         bail!("scenario is not part of the predeclared QUIC matrix");
     }
 
-    let parameters = serde_json::to_value(&scenario)?;
+    let mut parameters = serde_json::to_value(&scenario)?;
+    if let Some(duration) = effective_duration {
+        let duration_ms = u64::try_from(duration.as_millis())
+            .context("effective QUIC measurement duration exceeds u64 milliseconds")?;
+        parameters
+            .as_object_mut()
+            .context("serialized QUIC scenario is not an object")?
+            .insert("measurement_duration_ms".into(), duration_ms.into());
+    }
     let config_hash = scenario_config_sha256(&parameters)?;
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;
@@ -189,7 +202,7 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
             None,
         )?;
         let (report, bytes) = validate_complete_report(report, &schema)?;
-        fs::write(&sidecar_path, &bytes)?;
+        atomic_write(&sidecar_path, &bytes)?;
         sidecar_hashes.push((
             batch.artifact_path.clone(),
             format!("{:x}", Sha256::digest(&bytes)),
@@ -212,6 +225,17 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
     if let Some(reason) = &orchestration.infrastructure_failure {
         report.errors.push(reason.clone());
     }
+    report.batch_artifacts = orchestration
+        .batches
+        .iter()
+        .zip(&sidecar_hashes)
+        .map(|(batch, (path, sha256))| BatchArtifactReference {
+            batch_id: batch.batch_id.clone(),
+            path: path.clone(),
+            sha256: sha256.clone(),
+            verdict: batch.verdict,
+        })
+        .collect();
 
     write_primary_report(&args.output, report, &schema)?;
     if let Some(reason) = orchestration.infrastructure_failure {
@@ -267,7 +291,7 @@ fn build_quic_report(
         } else {
             "release".into()
         },
-        cargo_features: vec![],
+        cargo_features: enabled_cargo_features(),
         rustflags: std::env::var("RUSTFLAGS").unwrap_or_default(),
         runner_id: fingerprints.runner_id.clone(),
         runner_fingerprint: fingerprints.runner_fingerprint.clone(),
@@ -275,6 +299,7 @@ fn build_quic_report(
         toolchain: fingerprints.toolchain.clone(),
         hardware: fingerprints.hardware.clone(),
         warmup: DurationSpec { millis: 0 },
+        batch_artifacts: vec![],
         runs,
         metrics,
         queues,
@@ -304,8 +329,84 @@ fn write_primary_report(
     schema: &serde_json::Value,
 ) -> Result<PerfReport> {
     let (report, bytes) = validate_complete_report(report, schema)?;
-    fs::write(path, bytes)?;
+    atomic_write(path, &bytes)?;
     Ok(report)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_pre_rename(path, bytes, || Ok(()))
+}
+
+fn atomic_write_with_pre_rename<F>(path: &Path, bytes: &[u8], before_rename: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let temp_path = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        before_rename()?;
+        replace_file(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let succeeded = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination)?;
+    if let Some(parent) = destination.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -323,7 +424,7 @@ struct Fingerprints {
 fn collect_fingerprints() -> Result<Fingerprints> {
     let repository_root = PathBuf::from(git_output(["rev-parse", "--show-toplevel"])?);
     let commit = git_output(["rev-parse", "HEAD"])?;
-    let dirty = !git_output(["status", "--porcelain", "--untracked-files=no"])?.is_empty();
+    let dirty = repository_is_dirty(&repository_root)?;
     let binary = std::env::current_exe()?;
     let binary_sha256 = BTreeMap::from([("rshare-perf".into(), digest_file(&binary)?)]);
     let cargo_lock_sha256 = digest_file(&repository_root.join("Cargo.lock"))?;
@@ -348,7 +449,7 @@ fn collect_fingerprints() -> Result<Fingerprints> {
         logical_cores: std::thread::available_parallelism()
             .map(|value| value.get() as u32)
             .unwrap_or(0),
-        memory_bytes: 0,
+        memory_bytes: physical_memory_bytes()?,
     };
     let runner_id = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -367,6 +468,62 @@ fn collect_fingerprints() -> Result<Fingerprints> {
         toolchain,
         hardware,
     })
+}
+
+fn repository_is_dirty(repository_root: &Path) -> Result<bool> {
+    let output = ProcessCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repository_root)
+        .output()?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn enabled_cargo_features() -> Vec<String> {
+    // rshare-perf currently declares no opt-in Cargo features. Keep this function
+    // adjacent to report construction so any future feature declaration must also
+    // be reflected in the reproducibility fingerprint.
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn physical_memory_bytes() -> Result<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>())
+        .context("MEMORYSTATUSEX size does not fit in DWORD")?;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(status.ullTotalPhys)
+}
+
+#[cfg(target_os = "linux")]
+fn physical_memory_bytes() -> Result<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo")?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.split_whitespace().next())
+        .context("/proc/meminfo does not contain MemTotal")?
+        .parse::<u64>()?;
+    kib.checked_mul(1024)
+        .context("physical memory size overflowed u64")
+}
+
+#[cfg(target_os = "macos")]
+fn physical_memory_bytes() -> Result<u64> {
+    process_output("sysctl", &["-n", "hw.memsize"])?
+        .parse::<u64>()
+        .context("sysctl hw.memsize did not return a byte count")
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn physical_memory_bytes() -> Result<u64> {
+    bail!("physical memory fingerprint is unsupported on this operating system")
 }
 
 fn process_output(program: &str, args: &[&str]) -> Result<String> {
@@ -423,11 +580,6 @@ fn summarize_metrics(runs: &[report::PerfRun]) -> BTreeMap<String, MetricSummary
             (name, summary)
         })
         .collect()
-}
-
-fn percentile(values: &[f64], quantile: f64) -> f64 {
-    let index = ((values.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
-    values.get(index).copied().unwrap_or(0.0)
 }
 
 fn summarize_queues(samples: &[BTreeMap<String, QueueSummary>]) -> BTreeMap<String, QueueSummary> {
@@ -490,8 +642,9 @@ fn run_compare(args: CompareArgs) -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     compare::resolve_reviewed_entry(&manifest, &args.baseline_id, Some(&approval))
         .map_err(anyhow::Error::msg)?;
-    let baseline_report = load_reviewed_baseline(&manifest, &args.baseline_id, &approval)
-        .map_err(anyhow::Error::msg)?;
+    let baseline_report =
+        load_reviewed_baseline(&manifest, &args.baseline_id, &approval, &repository_root)
+            .map_err(anyhow::Error::msg)?;
     let candidate_bytes = fs::read(&args.candidate)?;
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
@@ -612,6 +765,15 @@ mod tests {
         assert!(matches!(report.availability, Availability::Available));
         assert_eq!(report.runs.len(), 5);
         assert!(report.runs.iter().all(|run| run.process_exit_success));
+        assert_eq!(
+            report.scenario_parameters["measurement_duration_ms"],
+            serde_json::json!(40)
+        );
+        assert_eq!(
+            report.scenario_config_sha256,
+            scenario_config_sha256(&serde_json::to_value(&report.scenario_parameters).unwrap())
+                .unwrap()
+        );
 
         let sidecars: Vec<_> = fs::read_dir(&directory)
             .unwrap()
@@ -624,6 +786,11 @@ mod tests {
             })
             .collect();
         assert!(!sidecars.is_empty());
+        assert_eq!(report.batch_artifacts.len(), sidecars.len());
+        for reference in &report.batch_artifacts {
+            let bytes = fs::read(&reference.path).unwrap();
+            assert_eq!(format!("{:x}", Sha256::digest(&bytes)), reference.sha256);
+        }
         for sidecar in sidecars {
             let bytes = fs::read(sidecar).unwrap();
             let batch = parse_and_validate_report(&bytes, &schema).unwrap();
@@ -635,6 +802,33 @@ mod tests {
             assert_eq!(unique_run_ids.len(), 5);
             assert!(batch.runs.iter().all(|run| run.schema_valid));
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hardware_fingerprint_reports_real_physical_memory() {
+        assert!(physical_memory_bytes().unwrap() > 0);
+    }
+
+    #[test]
+    fn dirty_fingerprint_includes_untracked_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rshare-perf-dirty-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&directory)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(directory.join("untracked.txt"), b"reproducibility input").unwrap();
+
+        assert!(repository_is_dirty(&directory).unwrap());
+
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -653,8 +847,9 @@ mod tests {
         let mut missing_metric = complete_report_fixture();
         missing_metric.runs[2].metrics.remove("p95_us");
         let metric_path = directory.join("missing-metric.json");
+        fs::write(&metric_path, b"old-metric-artifact").unwrap();
         assert!(write_primary_report(&metric_path, missing_metric, &schema).is_err());
-        assert!(!metric_path.exists());
+        assert_eq!(fs::read(&metric_path).unwrap(), b"old-metric-artifact");
 
         let mut missing_role = complete_report_fixture();
         missing_role.binary_sha256.clear();
@@ -662,8 +857,31 @@ mod tests {
             .binary_sha256
             .insert("unrelated-role".into(), format!("{:064x}", 7));
         let role_path = directory.join("missing-role.json");
+        fs::write(&role_path, b"old-role-artifact").unwrap();
         assert!(write_primary_report(&role_path, missing_role, &schema).is_err());
-        assert!(!role_path.exists());
+        assert_eq!(fs::read(&role_path).unwrap(), b"old-role-artifact");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_writer_failure_before_rename_preserves_existing_artifact() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rshare-perf-atomic-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("artifact.json");
+        fs::write(&path, b"reviewed-old-artifact").unwrap();
+
+        let result = atomic_write_with_pre_rename(&path, b"partial-new-artifact", || {
+            anyhow::bail!("simulated interruption before rename")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"reviewed-old-artifact");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 

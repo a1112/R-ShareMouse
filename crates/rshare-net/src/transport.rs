@@ -256,6 +256,7 @@ impl QuicTransport {
         }
         if let Some(task) = self.server_task.take() {
             task.abort();
+            let _ = task.await;
         }
         info!("Transport closed");
         Ok(())
@@ -305,6 +306,28 @@ struct PendingPeerTrust {
 struct OutboundFrame {
     message: Message,
     ack: oneshot::Sender<std::result::Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct OutboundSender {
+    send_channel: mpsc::Sender<OutboundFrame>,
+}
+
+impl OutboundSender {
+    async fn send_message(&self, message: &Message) -> Result<()> {
+        let (ack, written) = oneshot::channel();
+        self.send_channel
+            .send(OutboundFrame {
+                message: message.clone(),
+                ack,
+            })
+            .await
+            .map_err(|_| anyhow!("Send channel closed"))?;
+        written
+            .await
+            .map_err(|_| anyhow!("Write confirmation channel closed"))?
+            .map_err(|error| anyhow!("Write failed: {error}"))
+    }
 }
 
 impl QuicConnection {
@@ -451,20 +474,13 @@ impl QuicConnection {
     }
 
     pub async fn send_message(&self, message: &Message) -> Result<()> {
-        let (ack, written) = oneshot::channel();
+        self.outbound_sender().send_message(message).await
+    }
 
-        self.send_channel
-            .send(OutboundFrame {
-                message: message.clone(),
-                ack,
-            })
-            .await
-            .map_err(|_| anyhow!("Send channel closed"))?;
-
-        written
-            .await
-            .map_err(|_| anyhow!("Write confirmation channel closed"))?
-            .map_err(|error| anyhow!("Write failed: {error}"))
+    fn outbound_sender(&self) -> OutboundSender {
+        OutboundSender {
+            send_channel: self.send_channel.clone(),
+        }
     }
 
     pub async fn receive_message(&mut self) -> Result<Message> {
@@ -540,6 +556,7 @@ pub struct ConnectionPool {
 
 struct PooledConnection {
     generation: u64,
+    outbound: OutboundSender,
     connection: QuicConnection,
 }
 
@@ -566,6 +583,7 @@ impl ConnectionPool {
             device_id,
             PooledConnection {
                 generation,
+                outbound: conn.outbound_sender(),
                 connection: conn,
             },
         );
@@ -576,13 +594,14 @@ impl ConnectionPool {
     }
 
     pub async fn send_to(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
-        let conns = self.connections.lock().await;
-        if let Some(entry) = conns.get(device_id) {
-            entry.connection.send_message(message).await?;
-        } else {
-            anyhow::bail!("No active connection for device {}", device_id);
-        }
-        Ok(())
+        let outbound = self
+            .connections
+            .lock()
+            .await
+            .get(device_id)
+            .map(|entry| entry.outbound.clone())
+            .ok_or_else(|| anyhow!("No active connection for device {}", device_id))?;
+        outbound.send_message(message).await
     }
 
     pub async fn diagnostics_for(
@@ -965,6 +984,7 @@ impl ServerCertVerifier for TofuServerVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[test]
     fn test_transport_new() {
@@ -1004,6 +1024,54 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("No active connection"));
+    }
+
+    #[tokio::test]
+    async fn connection_pool_does_not_hold_global_lock_while_target_send_waits() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(local_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(remote_id);
+        let sender = client
+            .connect(&server_addr.to_string(), local_id)
+            .await
+            .unwrap();
+        let receiver = incoming.recv().await.unwrap().connection;
+        let pool = ConnectionPool::new(remote_id);
+        pool.insert(local_id, sender).await;
+
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        {
+            let mut connections = pool.connections.lock().await;
+            connections.get_mut(&local_id).unwrap().outbound = OutboundSender {
+                send_channel: blocked_tx,
+            };
+        }
+
+        let sending_pool = pool.clone();
+        let send_task = tokio::spawn(async move {
+            sending_pool
+                .send_to(&local_id, &Message::MouseMove { x: 1, y: 2 })
+                .await
+        });
+        let blocked_frame = timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let lock = timeout(Duration::from_millis(50), pool.connections.lock()).await;
+        assert!(
+            lock.is_ok(),
+            "a slow target send must not retain the pool-wide mutex"
+        );
+
+        drop(blocked_frame);
+        assert!(send_task.await.unwrap().is_err());
+        drop(receiver);
+        server.close().await.unwrap();
     }
 
     #[tokio::test]

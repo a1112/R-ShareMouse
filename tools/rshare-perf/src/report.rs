@@ -12,6 +12,11 @@ pub const REQUIRED_COUNTERS: [&str; 5] = [
     "reliable_overflow",
 ];
 
+pub fn percentile(sorted_values: &[f64], quantile: f64) -> f64 {
+    let index = ((sorted_values.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
+    sorted_values.get(index).copied().unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PerfReport {
@@ -33,6 +38,7 @@ pub struct PerfReport {
     pub toolchain: ToolchainFingerprint,
     pub hardware: HardwareFingerprint,
     pub warmup: DurationSpec,
+    pub batch_artifacts: Vec<BatchArtifactReference>,
     pub runs: Vec<PerfRun>,
     pub metrics: BTreeMap<String, MetricSummary>,
     pub queues: BTreeMap<String, QueueSummary>,
@@ -42,6 +48,15 @@ pub struct PerfReport {
     pub verdict: VerdictStatus,
     #[serde(skip)]
     pub(crate) local_schema_validated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BatchArtifactReference {
+    pub batch_id: String,
+    pub path: String,
+    pub sha256: String,
+    pub verdict: VerdictStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,7 +161,10 @@ pub struct ScenarioContract {
 impl ScenarioContract {
     pub fn for_scenario(scenario: &str) -> Result<Self, ReportError> {
         let (metrics, binary_roles) = match scenario {
-            "quic-control-v3" => (vec!["median_us", "p95_us", "p99_us"], vec!["rshare-perf"]),
+            "quic-control-v3" => (
+                vec!["median_us", "p95_us", "p99_us", "achieved_hz"],
+                vec!["rshare-perf"],
+            ),
             "daemon-control" => (
                 vec!["median_us", "p95_us", "p99_us"],
                 vec!["rshare-daemon", "rshare-perf"],
@@ -177,7 +195,8 @@ impl ScenarioContract {
             {
                 Some("stall_recovery") => contract.metrics.push("stall_recovery_us".into()),
                 Some("slow_fast_peer_isolation") => {
-                    contract.metrics.push("fast_peer_p99_us".into())
+                    contract.metrics.push("fast_peer_p99_us".into());
+                    contract.metrics.push("slow_send_p99_us".into());
                 }
                 _ => {}
             }
@@ -202,6 +221,12 @@ pub enum ReportError {
     },
     #[error("run {run_id} is missing metric {metric}")]
     MissingMetric { run_id: String, metric: String },
+    #[error("report summary is missing metric {metric}")]
+    MissingMetricSummary { metric: String },
+    #[error("{location} contains metric {metric} outside the scenario contract")]
+    UnexpectedMetric { location: String, metric: String },
+    #[error("{location} metric {metric} contains a negative or non-finite value")]
+    InvalidMetricValue { location: String, metric: String },
     #[error("run {run_id} is missing counter {counter}")]
     MissingCounter { run_id: String, counter: String },
     #[error("invalid reproducibility field: {field}")]
@@ -264,6 +289,37 @@ impl PerfReport {
                 });
             }
         }
+        for metric in &contract.metrics {
+            if !self.metrics.contains_key(metric) {
+                return Err(ReportError::MissingMetricSummary {
+                    metric: metric.clone(),
+                });
+            }
+        }
+        for (metric, summary) in &self.metrics {
+            if !contract.metrics.contains(metric) {
+                return Err(ReportError::UnexpectedMetric {
+                    location: "report summary".into(),
+                    metric: metric.clone(),
+                });
+            }
+            let values = [
+                summary.median,
+                summary.p95,
+                summary.p99,
+                summary.max,
+                summary.coefficient_of_variation,
+            ];
+            if values
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return Err(ReportError::InvalidMetricValue {
+                    location: "report summary".into(),
+                    metric: metric.clone(),
+                });
+            }
+        }
 
         for run in &self.runs {
             if !run.process_exit_success {
@@ -295,6 +351,20 @@ impl PerfReport {
                 if !run.metrics.contains_key(metric) {
                     return Err(ReportError::MissingMetric {
                         run_id: run.run_id.clone(),
+                        metric: metric.clone(),
+                    });
+                }
+            }
+            for (metric, value) in &run.metrics {
+                if !contract.metrics.contains(metric) {
+                    return Err(ReportError::UnexpectedMetric {
+                        location: format!("run {}", run.run_id),
+                        metric: metric.clone(),
+                    });
+                }
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(ReportError::InvalidMetricValue {
+                        location: format!("run {}", run.run_id),
                         metric: metric.clone(),
                     });
                 }
@@ -408,6 +478,7 @@ impl PerfReport {
                 memory_bytes: 16 * 1024 * 1024 * 1024,
             },
             warmup: DurationSpec { millis: 1_000 },
+            batch_artifacts: vec![],
             runs,
             metrics: BTreeMap::new(),
             queues: BTreeMap::new(),
@@ -557,6 +628,13 @@ mod tests {
     }
 
     #[test]
+    fn shared_percentile_uses_one_nearest_rank_boundary_rule() {
+        assert_eq!(percentile(&[], 0.95), 0.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.50), 3.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 0.95), 5.0);
+    }
+
+    #[test]
     fn schema_validation_rejects_missing_required_fields() {
         let schema = json!({
             "type": "object",
@@ -614,8 +692,24 @@ mod tests {
     #[test]
     fn scenario_contracts_predeclare_metrics_and_participating_binary_roles() {
         let loopback = ScenarioContract::for_scenario("quic-control-v3").unwrap();
-        assert_eq!(loopback.metrics, vec!["median_us", "p95_us", "p99_us"]);
+        assert_eq!(
+            loopback.metrics,
+            vec!["median_us", "p95_us", "p99_us", "achieved_hz"]
+        );
         assert_eq!(loopback.binary_roles, vec!["rshare-perf"]);
+
+        let mut slow_fast = valid_report();
+        slow_fast.scenario_parameters = BTreeMap::from([(
+            "kind".into(),
+            Value::String("slow_fast_peer_isolation".into()),
+        )]);
+        let slow_fast_contract = ScenarioContract::for_report(&slow_fast).unwrap();
+        assert!(slow_fast_contract
+            .metrics
+            .contains(&"fast_peer_p99_us".into()));
+        assert!(slow_fast_contract
+            .metrics
+            .contains(&"slow_send_p99_us".into()));
 
         let daemon = ScenarioContract::for_scenario("daemon-control").unwrap();
         assert_eq!(daemon.binary_roles, vec!["rshare-daemon", "rshare-perf"]);
@@ -651,6 +745,55 @@ mod tests {
         assert!(report.runs.iter().all(|run| run.schema_valid));
     }
 
+    #[test]
+    fn repository_schema_rejects_negative_run_metrics() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let mut value = serde_json::to_value(valid_report()).unwrap();
+        value["runs"][0]["metrics"]["latency_us"] = json!(-1.0);
+
+        assert!(validate_json_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn complete_report_rejects_negative_or_non_finite_run_and_summary_metrics() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut run_report = valid_report();
+            run_report.runs[0]
+                .metrics
+                .insert("latency_us".into(), invalid);
+            assert!(run_report.validate_complete(&required_contract()).is_err());
+
+            let mut summary_report = valid_report();
+            summary_report.metrics.get_mut("latency_us").unwrap().p99 = invalid;
+            assert!(summary_report
+                .validate_complete(&required_contract())
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn complete_report_rejects_metrics_outside_the_exact_scenario_contract() {
+        let mut report = valid_report();
+        for run in &mut report.runs {
+            run.metrics.insert("uncontracted_us".into(), 1.0);
+        }
+        report.metrics.insert(
+            "uncontracted_us".into(),
+            MetricSummary {
+                unit: "us".into(),
+                samples: 5,
+                median: 1.0,
+                p95: 1.0,
+                p99: 1.0,
+                max: 1.0,
+                coefficient_of_variation: 0.0,
+            },
+        );
+
+        assert!(report.validate_complete(&required_contract()).is_err());
+    }
+
     fn required_contract() -> ScenarioContract {
         ScenarioContract {
             metrics: vec!["latency_us".into()],
@@ -681,6 +824,19 @@ mod tests {
                 errors: vec![],
             })
             .collect();
-        PerfReport::test_fixture("batch-a", "runner-a", runs)
+        let mut report = PerfReport::test_fixture("batch-a", "runner-a", runs);
+        report.metrics.insert(
+            "latency_us".into(),
+            MetricSummary {
+                unit: "us".into(),
+                samples: 5,
+                median: 100.0,
+                p95: 100.0,
+                p99: 100.0,
+                max: 100.0,
+                coefficient_of_variation: 0.0,
+            },
+        );
+        report
     }
 }
