@@ -131,26 +131,32 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         fs::create_dir_all(parent)?;
     }
 
-    let queue_samples = Arc::new(Mutex::new(Vec::<BTreeMap<String, QueueSummary>>::new()));
+    let queue_samples = Arc::new(Mutex::new(
+        Vec::<(String, BTreeMap<String, QueueSummary>)>::new(),
+    ));
     let runtime = tokio::runtime::Runtime::new()?;
     let mut orchestration = runtime.block_on(quic::orchestrate_five_run_batches(
         &config_hash,
         |batch_id, run_index| {
             let scenario = scenario.clone();
             let queue_samples = Arc::clone(&queue_samples);
-            let mut options = quic::LoopbackRunOptions::measured(batch_id.to_string(), run_index);
+            let batch_id = batch_id.to_string();
+            let mut options = quic::LoopbackRunOptions::measured(batch_id.clone(), run_index);
             options.effective_duration = effective_duration;
             async move {
                 let measurement = quic::run_loopback_once(&scenario, options).await?;
                 queue_samples
                     .lock()
                     .expect("queue sample mutex poisoned")
-                    .push(measurement.queues);
+                    .push((batch_id, measurement.queues));
                 Ok(measurement.run)
             }
         },
     ))?;
 
+    let fingerprints = collect_fingerprints()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
     let stem = args
         .output
         .file_stem()
@@ -158,31 +164,79 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         .unwrap_or("quic");
     let output_directory = args.output.parent().unwrap_or_else(|| Path::new("."));
     let mut sidecar_hashes = Vec::with_capacity(orchestration.batches.len());
+    let mut batch_reports = Vec::with_capacity(orchestration.batches.len());
     for (index, batch) in orchestration.batches.iter_mut().enumerate() {
         let sidecar_path = output_directory.join(format!("{stem}.batch-{}.json", index + 1));
         batch.artifact_path = sidecar_path.display().to_string();
-        let bytes = serde_json::to_vec_pretty(batch)?;
+        let batch_queue_samples: Vec<_> = queue_samples
+            .lock()
+            .expect("queue sample mutex poisoned")
+            .iter()
+            .filter(|(batch_id, _)| batch_id == &batch.batch_id)
+            .map(|(_, queues)| queues.clone())
+            .collect();
+        let errors = (batch.verdict == VerdictStatus::Unstable)
+            .then(|| vec!["complete batch exceeded the coefficient-of-variation limit".into()])
+            .unwrap_or_default();
+        let report = build_quic_report(
+            &parameters,
+            &config_hash,
+            batch.runs.clone(),
+            summarize_queues(&batch_queue_samples),
+            batch.verdict,
+            errors,
+            &fingerprints,
+            None,
+        )?;
+        let (report, bytes) = validate_complete_report(report, &schema)?;
         fs::write(&sidecar_path, &bytes)?;
         sidecar_hashes.push((
             batch.artifact_path.clone(),
             format!("{:x}", Sha256::digest(&bytes)),
         ));
+        batch_reports.push(report);
     }
 
     let selected_index = orchestration
         .selected_batch
         .unwrap_or_else(|| orchestration.batches.len().saturating_sub(1));
-    let selected = orchestration
-        .batches
+    let mut report = batch_reports
         .get(selected_index)
-        .context("QUIC orchestrator did not produce a batch")?;
-    let mut runs = selected.runs.clone();
+        .context("QUIC orchestrator did not produce a batch")?
+        .clone();
+    let evidence = sidecar_hashes.get(selected_index).cloned();
+    for provenance in report.measurement_provenance.values_mut() {
+        provenance.evidence_path = evidence.as_ref().map(|(path, _)| path.clone());
+        provenance.evidence_sha256 = evidence.as_ref().map(|(_, hash)| hash.clone());
+    }
+    if let Some(reason) = &orchestration.infrastructure_failure {
+        report.errors.push(reason.clone());
+    }
+
+    write_primary_report(&args.output, report, &schema)?;
+    if let Some(reason) = orchestration.infrastructure_failure {
+        bail!(
+            "wrote an available but unstable artifact to {}: {reason}",
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
+fn build_quic_report(
+    parameters: &serde_json::Value,
+    config_hash: &str,
+    mut runs: Vec<report::PerfRun>,
+    queues: BTreeMap<String, QueueSummary>,
+    verdict: VerdictStatus,
+    errors: Vec<String>,
+    fingerprints: &Fingerprints,
+    evidence: Option<&(String, String)>,
+) -> Result<PerfReport> {
     for run in &mut runs {
         run.schema_valid = true;
     }
     let metrics = summarize_metrics(&runs);
-    let queues = summarize_queues(&queue_samples.lock().expect("queue sample mutex poisoned"));
-    let evidence = sidecar_hashes.get(selected_index);
     let measurement_provenance = metrics
         .keys()
         .map(|name| {
@@ -198,26 +252,16 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
             )
         })
         .collect();
-    let mut errors = Vec::new();
-    if let Some(reason) = &orchestration.infrastructure_failure {
-        errors.push(reason.clone());
-    }
-    let verdict = if orchestration.selected_batch.is_some() {
-        VerdictStatus::Pass
-    } else {
-        VerdictStatus::Unstable
-    };
-    let fingerprints = collect_fingerprints()?;
-    let report = PerfReport {
+    Ok(PerfReport {
         schema_version: PERF_SCHEMA_VERSION,
         scenario: "quic-control-v3".into(),
-        scenario_parameters: serde_json::from_value(parameters)?,
-        scenario_config_sha256: config_hash,
+        scenario_parameters: serde_json::from_value(parameters.clone())?,
+        scenario_config_sha256: config_hash.into(),
         random_seed: 0,
-        commit: fingerprints.commit,
+        commit: fingerprints.commit.clone(),
         dirty: fingerprints.dirty,
-        binary_sha256: fingerprints.binary_sha256,
-        cargo_lock_sha256: fingerprints.cargo_lock_sha256,
+        binary_sha256: fingerprints.binary_sha256.clone(),
+        cargo_lock_sha256: fingerprints.cargo_lock_sha256.clone(),
         build_profile: if cfg!(debug_assertions) {
             "debug".into()
         } else {
@@ -225,11 +269,11 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         },
         cargo_features: vec![],
         rustflags: std::env::var("RUSTFLAGS").unwrap_or_default(),
-        runner_id: fingerprints.runner_id,
-        runner_fingerprint: fingerprints.runner_fingerprint,
+        runner_id: fingerprints.runner_id.clone(),
+        runner_fingerprint: fingerprints.runner_fingerprint.clone(),
         availability: Availability::Available,
-        toolchain: fingerprints.toolchain,
-        hardware: fingerprints.hardware,
+        toolchain: fingerprints.toolchain.clone(),
+        hardware: fingerprints.hardware.clone(),
         warmup: DurationSpec { millis: 0 },
         runs,
         metrics,
@@ -239,21 +283,32 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         measurement_provenance,
         verdict,
         local_schema_validated: false,
-    };
-    let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
-    let bytes = serde_json::to_vec_pretty(&report)?;
-    let report = parse_and_validate_report(&bytes, &schema)?;
-    fs::write(&args.output, serde_json::to_vec_pretty(&report)?)?;
-    if let Some(reason) = orchestration.infrastructure_failure {
-        bail!(
-            "wrote an available but unstable artifact to {}: {reason}",
-            args.output.display()
-        );
-    }
-    Ok(())
+    })
 }
 
+fn validate_complete_report(
+    report: PerfReport,
+    schema: &serde_json::Value,
+) -> Result<(PerfReport, Vec<u8>)> {
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    let report = parse_and_validate_report(&bytes, &schema)?;
+    let contract = ScenarioContract::for_report(&report)?;
+    report.validate_complete(&contract)?;
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    Ok((report, bytes))
+}
+
+fn write_primary_report(
+    path: &Path,
+    report: PerfReport,
+    schema: &serde_json::Value,
+) -> Result<PerfReport> {
+    let (report, bytes) = validate_complete_report(report, schema)?;
+    fs::write(path, bytes)?;
+    Ok(report)
+}
+
+#[derive(Clone)]
 struct Fingerprints {
     commit: String,
     dirty: bool,
@@ -570,10 +625,68 @@ mod tests {
             .collect();
         assert!(!sidecars.is_empty());
         for sidecar in sidecars {
-            let batch: quic::ArchivedBatch =
-                serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+            let bytes = fs::read(sidecar).unwrap();
+            let batch = parse_and_validate_report(&bytes, &schema).unwrap();
+            let contract = ScenarioContract::for_report(&batch).unwrap();
+            batch.validate_complete(&contract).unwrap();
             assert_eq!(batch.runs.len(), 5);
+            let unique_run_ids: std::collections::HashSet<_> =
+                batch.runs.iter().map(|run| &run.run_id).collect();
+            assert_eq!(unique_run_ids.len(), 5);
+            assert!(batch.runs.iter().all(|run| run.schema_valid));
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn primary_artifact_gate_rejects_missing_metric_or_binary_role_without_writing() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rshare-perf-gate-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+
+        let mut missing_metric = complete_report_fixture();
+        missing_metric.runs[2].metrics.remove("p95_us");
+        let metric_path = directory.join("missing-metric.json");
+        assert!(write_primary_report(&metric_path, missing_metric, &schema).is_err());
+        assert!(!metric_path.exists());
+
+        let mut missing_role = complete_report_fixture();
+        missing_role.binary_sha256.clear();
+        missing_role
+            .binary_sha256
+            .insert("unrelated-role".into(), format!("{:064x}", 7));
+        let role_path = directory.join("missing-role.json");
+        assert!(write_primary_report(&role_path, missing_role, &schema).is_err());
+        assert!(!role_path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn complete_report_fixture() -> PerfReport {
+        let runs = (0..5)
+            .map(|index| report::PerfRun {
+                run_id: format!("run-{index}"),
+                batch_id: "batch-a".into(),
+                process_exit_success: true,
+                schema_valid: true,
+                scenario_config_sha256: "config".into(),
+                metrics: BTreeMap::from([
+                    ("median_us".into(), 10.0),
+                    ("p95_us".into(), 12.0),
+                    ("p99_us".into(), 14.0),
+                ]),
+                counters: report::REQUIRED_COUNTERS
+                    .into_iter()
+                    .map(|counter| (counter.into(), 0))
+                    .collect(),
+                errors: vec![],
+            })
+            .collect();
+        PerfReport::test_fixture("batch-a", "runner-a", runs)
     }
 }

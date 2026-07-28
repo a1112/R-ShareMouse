@@ -417,7 +417,9 @@ pub struct GithubApiEvidence {
     pub pull_request_number: u64,
     pub pull_request_merged: bool,
     pub pull_request_author: String,
+    pub pull_request_base_sha: String,
     pub pull_request_head_sha: String,
+    pub pr_base_manifest: String,
     pub pr_head_manifest: String,
     pub reviews: Vec<GithubReview>,
     pub changed_files: Vec<GithubChangedFile>,
@@ -520,9 +522,12 @@ pub fn validate_github_trust(
             "approval_ref is not the verified merged pull request".into(),
         ));
     }
-    if !is_commit(&evidence.pull_request_head_sha) {
+    if !is_commit(&evidence.pull_request_base_sha)
+        || !is_commit(&evidence.pull_request_head_sha)
+        || evidence.pull_request_base_sha == evidence.pull_request_head_sha
+    {
         return Err(BaselineError::GitHubVerification(
-            "pull request head commit is malformed".into(),
+            "pull request base/head commits are malformed or identical".into(),
         ));
     }
     let approved_head = evidence.reviews.iter().any(|review| {
@@ -553,6 +558,17 @@ pub fn validate_github_trust(
     {
         return Err(BaselineError::GitHubVerification(
             "approved pull request head lacks the exact manifest entry".into(),
+        ));
+    }
+    let base_manifest: BaselineManifest = toml::from_str(&evidence.pr_base_manifest)
+        .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+    if base_manifest
+        .baseline
+        .iter()
+        .any(|base_entry| base_entry == entry)
+    {
+        return Err(BaselineError::GitHubVerification(
+            "exact manifest entry already existed at the pull request base".into(),
         ));
     }
     let evidence_bytes = serde_json::to_vec(evidence)
@@ -610,6 +626,9 @@ pub fn verify_github_approval(
     let head_sha = pull["head"]["sha"].as_str().ok_or_else(|| {
         BaselineError::GitHubVerification("pull request head SHA is absent".into())
     })?;
+    let base_sha = pull["base"]["sha"].as_str().ok_or_else(|| {
+        BaselineError::GitHubVerification("pull request base SHA is absent".into())
+    })?;
     let reviews_value: serde_json::Value = serde_json::from_slice(&gh_api(
         &format!("repos/{repository}/pulls/{number}/reviews?per_page=100"),
         None,
@@ -648,6 +667,11 @@ pub fn verify_github_approval(
         Some("application/vnd.github.raw+json"),
     )?)
     .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+    let pr_base_manifest = String::from_utf8(gh_api(
+        &format!("repos/{repository}/contents/perf/baselines/manifest.toml?ref={base_sha}"),
+        Some("application/vnd.github.raw+json"),
+    )?)
+    .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
     let evidence = GithubApiEvidence {
         repository: repository.into(),
         default_branch_protected: true,
@@ -656,7 +680,9 @@ pub fn verify_github_approval(
         pull_request_number: number,
         pull_request_merged: !pull["merged_at"].is_null(),
         pull_request_author: author.into(),
+        pull_request_base_sha: base_sha.into(),
         pull_request_head_sha: head_sha.into(),
+        pr_base_manifest,
         pr_head_manifest,
         reviews,
         changed_files,
@@ -1118,6 +1144,33 @@ mod tests {
         assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
     }
 
+    #[test]
+    fn github_trust_rejects_comment_only_pr_when_base_already_has_exact_entry() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        evidence.pull_request_base_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        evidence.pr_base_manifest = evidence.pr_head_manifest.clone();
+        evidence.changed_files = vec![GithubChangedFile {
+            filename: "perf/baselines/manifest.toml".into(),
+            patch: "@@ -1 +1 @@\n-# old comment\n+# new comment".into(),
+        }];
+
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
+    }
+
+    #[test]
+    fn github_trust_accepts_exact_entry_hash_changed_from_base_to_approved_head() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        let mut old_entry = entry.clone();
+        old_entry.artifact_sha256 = hex_sha256(b"old-artifact");
+        evidence.pull_request_base_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        evidence.pr_base_manifest = toml::to_string(&BaselineManifest {
+            baseline: vec![old_entry],
+        })
+        .unwrap();
+
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_ok());
+    }
+
     fn five_runs(runner: &str, metric: &str, values: [u64; 5]) -> ReportBatch {
         let reports: Vec<_> = values
             .iter()
@@ -1235,7 +1288,9 @@ mod tests {
                 pull_request_number: 1,
                 pull_request_merged: true,
                 pull_request_author: "author".into(),
+                pull_request_base_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 pull_request_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                pr_base_manifest: toml::to_string(&BaselineManifest { baseline: vec![] }).unwrap(),
                 pr_head_manifest: manifest_text,
                 reviews: vec![GithubReview {
                     reviewer: "reviewer".into(),
