@@ -15,6 +15,7 @@ pub mod input_mode;
 pub mod ipc;
 pub mod layout;
 pub mod local_controls;
+pub mod perf;
 pub mod protocol;
 pub mod runtime;
 pub mod service;

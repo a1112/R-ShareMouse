@@ -62,6 +62,7 @@ toml = "0.8"
 uuid = { version = "1.15", features = ["v4", "serde"] }
 hostname = "0.4.2"
 cfg-if = "1.0"
+hdrhistogram = "7.5.4"
 
 # GUI - egui 0.30 有一些新特性和变更
 egui = "0.30"
