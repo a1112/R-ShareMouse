@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
+    qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent},
 };
 use rshare_core::{DeviceId, Message};
 
@@ -65,6 +66,7 @@ pub struct NetworkManager {
 
     discovery: ServiceDiscovery,
     connection: Arc<TokioMutex<ConnectionManager>>,
+    qos_registry: Arc<ConnectionRegistry>,
 
     event_tx: mpsc::Sender<NetworkEvent>,
     event_rx: Option<mpsc::Receiver<NetworkEvent>>,
@@ -163,7 +165,9 @@ impl NetworkManager {
             local_hostname.clone(),
         );
 
-        let connection = Arc::new(TokioMutex::new(ConnectionManager::new(local_device_id)));
+        let connection_manager = ConnectionManager::new(local_device_id);
+        let qos_registry = connection_manager.qos_registry();
+        let connection = Arc::new(TokioMutex::new(connection_manager));
 
         Self {
             local_device_id,
@@ -172,6 +176,7 @@ impl NetworkManager {
             config,
             discovery,
             connection,
+            qos_registry,
             event_tx,
             event_rx: Some(event_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
@@ -217,6 +222,12 @@ impl NetworkManager {
         conn.connection_infos().await
     }
 
+    /// Takes the typed terminal-release stream used by the input-plane
+    /// integration. It is intentionally separate from legacy `Message`.
+    pub async fn terminal_release_events(&self) -> Option<mpsc::Receiver<TerminalReleaseEvent>> {
+        self.connection.lock().await.terminal_release_events()
+    }
+
     /// Check if a device is connected
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let conn = self.connection.lock().await;
@@ -225,12 +236,64 @@ impl NetworkManager {
 
     /// Send a message to a device
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
+        if let Some(peer) = self.qos_registry.peer(device_id) {
+            match ClassifiedMessage::try_from(message.clone())
+                .map_err(|error| anyhow::anyhow!(error))?
+            {
+                ClassifiedMessage::Control(frame) => {
+                    return peer.transport.send_control(frame).await.map_err(Into::into);
+                }
+                ClassifiedMessage::Bulk(frame) => {
+                    return peer.transport.send_bulk(frame).await.map_err(Into::into);
+                }
+                ClassifiedMessage::Telemetry(frame) => {
+                    return peer.transport.try_send_telemetry(frame).map_err(Into::into);
+                }
+                ClassifiedMessage::Unsupported => {}
+            }
+        }
         let mut conn = self.connection.lock().await;
         conn.send_to(device_id, message).await
     }
 
     /// Broadcast a message to all connected devices
     pub async fn broadcast(&mut self, message: Message) -> Result<()> {
+        match ClassifiedMessage::try_from(message.clone())
+            .map_err(|error| anyhow::anyhow!(error))?
+        {
+            ClassifiedMessage::Control(frame) if !self.qos_registry.is_empty() => {
+                let results = self.qos_registry.broadcast_control(frame).await;
+                if let Some((id, error)) = results
+                    .into_iter()
+                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                {
+                    anyhow::bail!("QoS broadcast to {id} failed: {error}");
+                }
+                return Ok(());
+            }
+            ClassifiedMessage::Bulk(frame) if !self.qos_registry.is_empty() => {
+                let results = self.qos_registry.broadcast_bulk(frame).await;
+                if let Some((id, error)) = results
+                    .into_iter()
+                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                {
+                    anyhow::bail!("QoS broadcast to {id} failed: {error}");
+                }
+                return Ok(());
+            }
+            ClassifiedMessage::Telemetry(frame) if !self.qos_registry.is_empty() => {
+                if let Some((id, error)) = self
+                    .qos_registry
+                    .broadcast_telemetry(frame)
+                    .into_iter()
+                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                {
+                    anyhow::bail!("QoS broadcast to {id} failed: {error}");
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let mut conn = self.connection.lock().await;
         conn.broadcast(message).await
     }

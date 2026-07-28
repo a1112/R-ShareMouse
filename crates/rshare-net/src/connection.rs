@@ -11,6 +11,9 @@ use tokio::time::Instant;
 use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
+use super::qos::{
+    ClassifiedMessage, ConnectionRegistry, RegisteredPeer, TerminalReleaseEvent, TransportSendError,
+};
 use super::transport::{ConnectionPool, QuicTransport};
 
 /// Connection state
@@ -83,16 +86,44 @@ struct CanonicalConnection {
 
 type CanonicalConnections = Arc<StdRwLock<HashMap<DeviceId, CanonicalConnection>>>;
 
+fn forward_terminal_releases(
+    mut releases: mpsc::Receiver<TerminalReleaseEvent>,
+    target: mpsc::Sender<TerminalReleaseEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(release) = releases.recv().await {
+            if target.send(release).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn ensure_broadcast_success(
+    results: Vec<(DeviceId, std::result::Result<(), TransportSendError>)>,
+) -> Result<()> {
+    if let Some((device_id, error)) = results
+        .into_iter()
+        .find_map(|(device_id, result)| result.err().map(|error| (device_id, error)))
+    {
+        anyhow::bail!("QoS broadcast to {device_id} failed: {error}");
+    }
+    Ok(())
+}
+
 /// Connection manager for handling multiple device connections
 pub struct ConnectionManager {
     local_device_id: DeviceId,
     connections: CanonicalConnections,
     next_generation: Arc<AtomicU64>,
     lifecycle_lock: Arc<TokioMutex<()>>,
+    qos_registry: Arc<ConnectionRegistry>,
     transport: QuicTransport,
     pool: Arc<ConnectionPool>,
     event_tx: mpsc::Sender<ManagerEvent>,
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
+    terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
+    terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
 }
 
 fn spawn_message_reader(
@@ -104,6 +135,7 @@ fn spawn_message_reader(
     connections: CanonicalConnections,
     pool: Arc<ConnectionPool>,
     lifecycle_lock: Arc<TokioMutex<()>>,
+    qos_registry: Arc<ConnectionRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         'forwarding: {
@@ -145,6 +177,7 @@ fn spawn_message_reader(
             &event_tx,
             device_id,
             generation,
+            &qos_registry,
         )
         .await;
     })
@@ -201,13 +234,14 @@ async fn retire_generation(
     event_tx: &mpsc::Sender<ManagerEvent>,
     device_id: DeviceId,
     generation: u64,
+    qos_registry: &ConnectionRegistry,
 ) -> bool {
     if !is_current_generation(connections, device_id, generation) {
         return false;
     }
     let permit = event_tx.reserve().await.ok();
     let _lifecycle = lifecycle_lock.lock().await;
-    let removed_current = {
+    let (removed_current, connection_id) = {
         let mut canonical = connections
             .write()
             .expect("canonical connection registry poisoned");
@@ -215,14 +249,20 @@ async fn retire_generation(
             .get(&device_id)
             .is_some_and(|connection| connection.generation == generation)
         {
-            canonical.remove(&device_id);
-            true
+            let removed = canonical.remove(&device_id);
+            (
+                true,
+                removed.and_then(|connection| connection.info.control_connection_id),
+            )
         } else {
-            false
+            (false, None)
         }
     };
 
     if removed_current {
+        if let Some(connection_id) = connection_id {
+            qos_registry.remove_if_generation(device_id, connection_id);
+        }
         pool.remove_generation(&device_id, generation).await;
         if let Some(permit) = permit {
             permit.send(ManagerEvent::Disconnected(device_id));
@@ -238,6 +278,7 @@ impl ConnectionManager {
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (terminal_release_tx, terminal_release_rx) = mpsc::channel(32);
         transport.require_peer_protocol_handshake();
         let pool = Arc::new(ConnectionPool::new(local_device_id));
 
@@ -246,10 +287,13 @@ impl ConnectionManager {
             connections: Arc::new(StdRwLock::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             lifecycle_lock: Arc::new(TokioMutex::new(())),
+            qos_registry: Arc::new(ConnectionRegistry::new()),
             transport,
             pool,
             event_tx,
             event_rx: Some(event_rx),
+            terminal_release_tx,
+            terminal_release_rx: Some(terminal_release_rx),
         }
     }
 
@@ -262,6 +306,8 @@ impl ConnectionManager {
         let connections = self.connections.clone();
         let next_generation = self.next_generation.clone();
         let lifecycle_lock = self.lifecycle_lock.clone();
+        let qos_registry = self.qos_registry.clone();
+        let terminal_release_tx = self.terminal_release_tx.clone();
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -307,6 +353,17 @@ impl ConnectionManager {
                         }
 
                         let generation = allocate_generation(&next_generation);
+                        let auth = Arc::new(negotiated.auth.clone());
+                        let (qos_transport, releases) =
+                            incoming.connection.install_qos(auth.clone());
+                        qos_registry.insert(
+                            device_id,
+                            RegisteredPeer {
+                                auth,
+                                transport: qos_transport,
+                            },
+                        );
+                        forward_terminal_releases(releases, terminal_release_tx.clone());
                         let messages = incoming.connection.message_channel();
                         pool.insert_with_generation(device_id, generation, incoming.connection)
                             .await;
@@ -343,6 +400,7 @@ impl ConnectionManager {
                     connections.clone(),
                     pool.clone(),
                     lifecycle_lock.clone(),
+                    qos_registry.clone(),
                 );
 
                 if !connected_event_sent {
@@ -399,6 +457,8 @@ impl ConnectionManager {
         }
 
         conn.set_device_id(device_id);
+        let auth = Arc::new(negotiated.auth.clone());
+        let (qos_transport, releases) = conn.install_qos(auth.clone());
         let messages = conn.message_channel();
         let connected_permit = self.event_tx.reserve().await.ok();
         let generation;
@@ -409,6 +469,14 @@ impl ConnectionManager {
                 anyhow::bail!("Already connected to device {}", device_id);
             }
             generation = allocate_generation(&self.next_generation);
+            self.qos_registry.insert(
+                device_id,
+                RegisteredPeer {
+                    auth,
+                    transport: qos_transport,
+                },
+            );
+            forward_terminal_releases(releases, self.terminal_release_tx.clone());
             self.pool
                 .insert_with_generation(device_id, generation, conn)
                 .await;
@@ -434,6 +502,7 @@ impl ConnectionManager {
             self.connections.clone(),
             self.pool.clone(),
             self.lifecycle_lock.clone(),
+            self.qos_registry.clone(),
         );
         Ok(())
     }
@@ -446,8 +515,14 @@ impl ConnectionManager {
                 .connections
                 .write()
                 .expect("canonical connection registry poisoned")
-                .remove(device_id)
-                .is_some();
+                .remove(device_id);
+            if let Some(connection_id) = removed_connection_info
+                .as_ref()
+                .and_then(|connection| connection.info.control_connection_id)
+            {
+                self.qos_registry
+                    .remove_if_generation(*device_id, connection_id);
+            }
             let removed_pool_connection = self.pool.remove(device_id).await;
             (removed_connection_info, removed_pool_connection)
         };
@@ -456,7 +531,7 @@ impl ConnectionManager {
         if let Some(connection) = removed_pool_connection {
             connection.close().await;
         }
-        if removed_connection_info || removed_pool {
+        if removed_connection_info.is_some() || removed_pool {
             if let Some(permit) = disconnected_permit {
                 permit.send(ManagerEvent::Disconnected(*device_id));
             }
@@ -465,7 +540,24 @@ impl ConnectionManager {
     }
 
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
-        self.pool.send_to(device_id, &message).await?;
+        let classified =
+            ClassifiedMessage::try_from(message.clone()).map_err(|error| anyhow::anyhow!(error))?;
+        match (self.qos_registry.peer(device_id), classified) {
+            (Some(peer), ClassifiedMessage::Control(frame)) => {
+                peer.transport.send_control(frame).await?;
+            }
+            (Some(peer), ClassifiedMessage::Bulk(frame)) => {
+                peer.transport.send_bulk(frame).await?;
+            }
+            (Some(peer), ClassifiedMessage::Telemetry(frame)) => {
+                peer.transport
+                    .try_send_telemetry(frame)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            (_, ClassifiedMessage::Unsupported) | (None, _) => {
+                self.pool.send_to(device_id, &message).await?;
+            }
+        }
 
         if let Some(connection) = self
             .connections
@@ -481,11 +573,32 @@ impl ConnectionManager {
     }
 
     pub async fn broadcast(&mut self, message: Message) -> Result<()> {
-        self.pool.broadcast(&message).await
+        match ClassifiedMessage::try_from(message.clone())
+            .map_err(|error| anyhow::anyhow!(error))?
+        {
+            ClassifiedMessage::Control(frame) => {
+                ensure_broadcast_success(self.qos_registry.broadcast_control(frame).await)
+            }
+            ClassifiedMessage::Bulk(frame) => {
+                ensure_broadcast_success(self.qos_registry.broadcast_bulk(frame).await)
+            }
+            ClassifiedMessage::Telemetry(frame) => {
+                ensure_broadcast_success(self.qos_registry.broadcast_telemetry(frame))
+            }
+            ClassifiedMessage::Unsupported => self.pool.broadcast(&message).await,
+        }
     }
 
     pub fn events(&mut self) -> Option<mpsc::Receiver<ManagerEvent>> {
         self.event_rx.take()
+    }
+
+    pub fn terminal_release_events(&mut self) -> Option<mpsc::Receiver<TerminalReleaseEvent>> {
+        self.terminal_release_rx.take()
+    }
+
+    pub fn qos_registry(&self) -> Arc<ConnectionRegistry> {
+        self.qos_registry.clone()
     }
 
     pub fn get_connection(&self, device_id: &DeviceId) -> Option<ConnectionInfo> {
@@ -671,6 +784,7 @@ mod tests {
             manager.connections.clone(),
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
+            manager.qos_registry.clone(),
         );
         drop(_message_tx);
 
@@ -739,6 +853,7 @@ mod tests {
             manager.connections.clone(),
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
+            manager.qos_registry.clone(),
         );
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -802,6 +917,7 @@ mod tests {
             manager.connections.clone(),
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
+            manager.qos_registry.clone(),
         );
         drop(message_tx);
         tokio::task::yield_now().await;
@@ -907,6 +1023,7 @@ mod tests {
             manager.connections.clone(),
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
+            manager.qos_registry.clone(),
         );
 
         let new_generation = allocate_generation(&manager.next_generation);
@@ -1527,6 +1644,7 @@ mod tests {
             manager.connections.clone(),
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
+            manager.qos_registry.clone(),
         );
 
         first_remote.transport.close().await.unwrap();

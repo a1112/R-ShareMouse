@@ -17,8 +17,8 @@ use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
 use std::sync::Once;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify};
@@ -27,7 +27,9 @@ use super::codec::ControlMessageCodec;
 use super::encryption::{
     Encryption, PeerCertificateFingerprint, QuicIdentity, QuicTrustDecision, QuicTrustStore,
 };
-use rshare_core::{DeviceId, Message};
+use super::handshake::PeerAuthContext;
+use super::qos::{LaneDiscriminator, PeerTransportHandle, TerminalReleaseEvent, QOS_LANE_MAGIC};
+use rshare_core::{ControlConnectionId, DeviceId, Message, ReliableInputEvent, SessionEpoch};
 use tracing::info;
 
 const BOOTSTRAP_RELIABLE_READER_ACK: u8 = 0b01;
@@ -336,7 +338,26 @@ struct QuicConnectionInner {
     bootstrap_commit_notify: Notify,
     bootstrap_commit_acks: AtomicU8,
     bootstrap_commit_ack_notify: Notify,
+    qos_required: bool,
     datagram_reader_start_barrier: Option<Arc<Notify>>,
+    qos_receive: StdMutex<Option<QosReceiveContext>>,
+    qos_receive_notify: Notify,
+    qos_inbound: StdMutex<QosInboundState>,
+    #[cfg(test)]
+    qos_reliable_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
+}
+
+#[derive(Clone)]
+struct QosReceiveContext {
+    auth: Arc<PeerAuthContext>,
+    release_tx: mpsc::Sender<TerminalReleaseEvent>,
+}
+
+#[derive(Default)]
+struct QosInboundState {
+    active: Option<(ControlConnectionId, SessionEpoch, u64)>,
+    tombstones: std::collections::HashSet<(ControlConnectionId, SessionEpoch)>,
+    realtime_last: std::collections::HashMap<(ControlConnectionId, SessionEpoch), u64>,
 }
 
 impl Drop for QuicConnectionInner {
@@ -447,7 +468,13 @@ impl QuicConnection {
                 BOOTSTRAP_ALL_READERS_ACKED
             }),
             bootstrap_commit_ack_notify: Notify::new(),
+            qos_required: peer_protocol_handshake_required,
             datagram_reader_start_barrier,
+            qos_receive: StdMutex::new(None),
+            qos_receive_notify: Notify::new(),
+            qos_inbound: StdMutex::new(QosInboundState::default()),
+            #[cfg(test)]
+            qos_reliable_reader_start_barrier: StdMutex::new(None),
         });
         {
             let inner = inner.clone();
@@ -505,6 +532,69 @@ impl QuicConnection {
 
     pub fn set_device_id(&mut self, device_id: DeviceId) {
         self.device_id = Some(device_id);
+    }
+
+    /// Installs the authenticated QoS identity and returns the cloneable lane
+    /// handle plus the typed terminal-release receiver for this connection.
+    pub fn install_qos(
+        &self,
+        auth: Arc<PeerAuthContext>,
+    ) -> (PeerTransportHandle, mpsc::Receiver<TerminalReleaseEvent>) {
+        let (release_tx, release_rx) = mpsc::channel(8);
+        *self
+            .inner
+            .qos_receive
+            .lock()
+            .expect("qos receive context poisoned") = Some(QosReceiveContext {
+            auth: auth.clone(),
+            release_tx: release_tx.clone(),
+        });
+        self.inner.qos_receive_notify.notify_waiters();
+        let monitor_inner = self.inner.clone();
+        let monitor_auth = auth.clone();
+        let monitor_release_tx = release_tx.clone();
+        tokio::spawn(async move {
+            let _ = monitor_inner.connection.closed().await;
+            let active_epoch = {
+                let mut state = monitor_inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned");
+                match state.active {
+                    Some((generation, epoch, _))
+                        if generation == monitor_auth.control_connection_id =>
+                    {
+                        state.tombstones.insert((generation, epoch));
+                        state.realtime_last.remove(&(generation, epoch));
+                        state.active = None;
+                        Some(epoch)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(epoch) = active_epoch {
+                let _ = monitor_release_tx
+                    .send(TerminalReleaseEvent {
+                        auth: monitor_auth,
+                        epoch,
+                        reason: rshare_core::ReleaseAllReason::Timeout,
+                    })
+                    .await;
+            }
+        });
+        (
+            PeerTransportHandle::from_quinn(auth, self.inner.connection.clone(), release_tx),
+            release_rx,
+        )
+    }
+
+    #[cfg(test)]
+    fn set_qos_reliable_reader_barrier(&self, barrier: Arc<Notify>) {
+        *self
+            .inner
+            .qos_reliable_reader_start_barrier
+            .lock()
+            .expect("qos reliable reader barrier poisoned") = Some(barrier);
     }
 
     pub fn confirm_peer_identity(
@@ -1068,6 +1158,15 @@ async fn read_reliable_messages(
             return;
         }
 
+        if !bootstrap_stream {
+            let inner = inner.clone();
+            let message_tx = message_tx.clone();
+            tokio::spawn(async move {
+                read_authenticated_uni_stream(inner, stream, message_tx, max_message_size).await;
+            });
+            continue;
+        }
+
         loop {
             let mut len_buf = [0u8; 4];
             if let Err(error) = stream.read_exact(&mut len_buf).await {
@@ -1128,6 +1227,343 @@ async fn read_reliable_messages(
                 }
                 Err(error) => tracing::debug!("Failed to decode reliable message: {}", error),
             }
+        }
+    }
+}
+
+async fn read_authenticated_uni_stream(
+    inner: Arc<QuicConnectionInner>,
+    mut stream: quinn::RecvStream,
+    message_tx: mpsc::Sender<Message>,
+    max_message_size: usize,
+) {
+    let mut prefix = [0u8; 4];
+    if let Err(error) = stream.read_exact(&mut prefix).await {
+        tracing::debug!("QUIC authenticated stream prefix read stopped: {}", error);
+        return;
+    }
+    if &prefix == QOS_LANE_MAGIC {
+        let mut lane = [0u8; 1];
+        if stream.read_exact(&mut lane).await.is_err() {
+            inner
+                .connection
+                .close(0u32.into(), b"truncated qos lane preface");
+            return;
+        }
+        match lane[0] {
+            value if value == LaneDiscriminator::ReliableInput as u8 => {
+                #[cfg(test)]
+                {
+                    let barrier = inner
+                        .qos_reliable_reader_start_barrier
+                        .lock()
+                        .expect("qos reliable reader barrier poisoned")
+                        .clone();
+                    if let Some(barrier) = barrier {
+                        barrier.notified().await;
+                    }
+                }
+                read_qos_reliable_stream(inner, stream, false).await;
+            }
+            value if value == LaneDiscriminator::Emergency as u8 => {
+                read_qos_reliable_stream(inner, stream, true).await;
+            }
+            value
+                if value == LaneDiscriminator::Control as u8
+                    || value == LaneDiscriminator::Bulk as u8
+                    || value == LaneDiscriminator::Telemetry as u8 =>
+            {
+                read_qos_message_stream(inner, stream, message_tx, max_message_size, value).await;
+            }
+            _ => inner.connection.close(0u32.into(), b"unknown qos lane"),
+        }
+        return;
+    }
+    if inner.qos_required {
+        inner.connection.close(
+            0u32.into(),
+            b"authenticated stream missing qos lane preface",
+        );
+        return;
+    }
+    read_legacy_framed_stream(inner, stream, message_tx, max_message_size, Some(prefix)).await;
+}
+
+async fn read_qos_message_stream(
+    inner: Arc<QuicConnectionInner>,
+    mut stream: quinn::RecvStream,
+    message_tx: mpsc::Sender<Message>,
+    max_message_size: usize,
+    lane: u8,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > max_message_size {
+            inner
+                .connection
+                .close(0u32.into(), b"oversized qos message frame");
+            return;
+        }
+        let mut data = vec![0u8; len];
+        if stream.read_exact(&mut data).await.is_err() {
+            return;
+        }
+        let Ok(message) = ControlMessageCodec::decode(&data) else {
+            inner
+                .connection
+                .close(0u32.into(), b"invalid qos message frame");
+            return;
+        };
+        let Ok(classified) = super::qos::ClassifiedMessage::try_from(message.clone()) else {
+            inner
+                .connection
+                .close(0u32.into(), b"unclassifiable qos message");
+            return;
+        };
+        let lane_matches = match classified {
+            super::qos::ClassifiedMessage::Control(_) => lane == LaneDiscriminator::Control as u8,
+            super::qos::ClassifiedMessage::Bulk(_) => lane == LaneDiscriminator::Bulk as u8,
+            super::qos::ClassifiedMessage::Telemetry(_) => {
+                lane == LaneDiscriminator::Telemetry as u8
+            }
+            super::qos::ClassifiedMessage::Unsupported => false,
+        };
+        if !lane_matches {
+            inner
+                .connection
+                .close(0u32.into(), b"message entered wrong qos lane");
+            return;
+        }
+        if message_tx.send(message).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn read_legacy_framed_stream(
+    inner: Arc<QuicConnectionInner>,
+    mut stream: quinn::RecvStream,
+    message_tx: mpsc::Sender<Message>,
+    max_message_size: usize,
+    mut first_len: Option<[u8; 4]>,
+) {
+    loop {
+        let len_buf = if let Some(prefix) = first_len.take() {
+            prefix
+        } else {
+            let mut bytes = [0u8; 4];
+            if stream.read_exact(&mut bytes).await.is_err() {
+                return;
+            }
+            bytes
+        };
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > max_message_size {
+            inner
+                .connection
+                .close(0u32.into(), b"reliable frame exceeds active protocol limit");
+            return;
+        }
+        let mut data = vec![0u8; len];
+        if stream.read_exact(&mut data).await.is_err() {
+            return;
+        }
+        match ControlMessageCodec::decode(&data) {
+            Ok(message) => {
+                if message_tx.send(message).await.is_err() {
+                    return;
+                }
+            }
+            Err(error) => tracing::debug!("Failed to decode reliable message: {}", error),
+        }
+    }
+}
+
+async fn read_qos_reliable_stream(
+    inner: Arc<QuicConnectionInner>,
+    mut stream: quinn::RecvStream,
+    emergency: bool,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > crate::codec::MAX_RELIABLE_INPUT_FRAME + 2 {
+            inner
+                .connection
+                .close(0u32.into(), b"oversized qos input frame");
+            return;
+        }
+        let mut data = vec![0u8; len];
+        if stream.read_exact(&mut data).await.is_err() {
+            return;
+        }
+        let Ok(frame) = crate::codec::ReliableInputCodec::decode(&data) else {
+            inner
+                .connection
+                .close(0u32.into(), b"invalid qos input frame");
+            return;
+        };
+        let Some(context) = await_qos_receive_context(&inner).await else {
+            return;
+        };
+        let key = (context.auth.control_connection_id, frame.session_epoch);
+        if emergency {
+            let ReliableInputEvent::ReleaseAll { reason } = frame.event else {
+                inner
+                    .connection
+                    .close(0u32.into(), b"non-terminal emergency input frame");
+                return;
+            };
+            {
+                let mut state = inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned");
+                state.tombstones.insert(key);
+                state.realtime_last.remove(&key);
+                if state
+                    .active
+                    .is_some_and(|(generation, epoch, _)| (generation, epoch) == key)
+                {
+                    state.active = None;
+                }
+            }
+            let _ = context
+                .release_tx
+                .send(TerminalReleaseEvent {
+                    auth: context.auth,
+                    epoch: frame.session_epoch,
+                    reason,
+                })
+                .await;
+            return;
+        }
+
+        if !accept_reliable_input(&inner, &context, &frame) {
+            {
+                let mut state = inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned");
+                state.tombstones.insert(key);
+                state.active = None;
+            }
+            let _ = context
+                .release_tx
+                .send(TerminalReleaseEvent {
+                    auth: context.auth.clone(),
+                    epoch: frame.session_epoch,
+                    reason: rshare_core::ReleaseAllReason::BackendFailure,
+                })
+                .await;
+            inner
+                .connection
+                .close(0u32.into(), b"qos reliable sequence violation");
+            return;
+        }
+        if let ReliableInputEvent::ReleaseAll { reason } = frame.event {
+            let _ = context
+                .release_tx
+                .send(TerminalReleaseEvent {
+                    auth: context.auth,
+                    epoch: frame.session_epoch,
+                    reason,
+                })
+                .await;
+            return;
+        }
+    }
+}
+
+async fn await_qos_receive_context(inner: &QuicConnectionInner) -> Option<QosReceiveContext> {
+    if let Some(context) = inner
+        .qos_receive
+        .lock()
+        .expect("qos receive context poisoned")
+        .clone()
+    {
+        return Some(context);
+    }
+    let notified = inner.qos_receive_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if let Some(context) = inner
+        .qos_receive
+        .lock()
+        .expect("qos receive context poisoned")
+        .clone()
+    {
+        return Some(context);
+    }
+    if tokio::time::timeout(super::handshake::BOOTSTRAP_TIMEOUT, notified)
+        .await
+        .is_err()
+    {
+        inner
+            .connection
+            .close(0u32.into(), b"qos stream before authenticated install");
+        return None;
+    }
+    inner
+        .qos_receive
+        .lock()
+        .expect("qos receive context poisoned")
+        .clone()
+}
+
+fn accept_reliable_input(
+    inner: &QuicConnectionInner,
+    context: &QosReceiveContext,
+    frame: &rshare_core::ReliableInputFrame,
+) -> bool {
+    let connection_id = context.auth.control_connection_id;
+    let key = (connection_id, frame.session_epoch);
+    let mut state = inner
+        .qos_inbound
+        .lock()
+        .expect("qos inbound state poisoned");
+    if state.tombstones.contains(&key) {
+        return false;
+    }
+    match &frame.event {
+        ReliableInputEvent::Enter { .. } => {
+            if state.active.is_some() {
+                return false;
+            }
+            state.active = Some((connection_id, frame.session_epoch, frame.sequence));
+            true
+        }
+        ReliableInputEvent::ReleaseAll { .. } => {
+            if !state.active.is_some_and(|(generation, epoch, last)| {
+                generation == connection_id
+                    && epoch == frame.session_epoch
+                    && frame.sequence == last.saturating_add(1)
+            }) {
+                return false;
+            }
+            state.tombstones.insert(key);
+            state.active = None;
+            true
+        }
+        _ => {
+            let Some((generation, epoch, last)) = state.active.as_mut() else {
+                return false;
+            };
+            if *generation != connection_id
+                || *epoch != frame.session_epoch
+                || frame.sequence != last.saturating_add(1)
+            {
+                return false;
+            }
+            *last = frame.sequence;
+            true
         }
     }
 }
@@ -1265,21 +1701,64 @@ async fn read_realtime_datagrams(
 
     loop {
         match inner.connection.read_datagram().await {
-            Ok(datagram) => match decode_legacy_realtime_message(&datagram) {
-                Ok(message) => {
-                    inner
-                        .last_datagram_rx_us
-                        .store(current_timestamp_us(), Ordering::Relaxed);
-                    if message_tx.send(message).await.is_err() {
-                        break;
+            Ok(datagram) => {
+                if let Ok(frame) = crate::codec::RealtimeInputCodec::decode(&datagram) {
+                    let Some(context) = await_qos_receive_context(&inner).await else {
+                        return;
+                    };
+                    if accept_qos_realtime(&inner, &context, &frame) {
+                        inner
+                            .last_datagram_rx_us
+                            .store(current_timestamp_us(), Ordering::Relaxed);
                     }
+                    continue;
                 }
-                Err(error) => tracing::debug!("Failed to decode realtime datagram: {}", error),
-            },
+                match decode_legacy_realtime_message(&datagram) {
+                    Ok(message) => {
+                        inner
+                            .last_datagram_rx_us
+                            .store(current_timestamp_us(), Ordering::Relaxed);
+                        if message_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => tracing::debug!("Failed to decode realtime datagram: {}", error),
+                }
+            }
             Err(error) => {
                 tracing::debug!("QUIC datagram reader stopped: {}", error);
                 break;
             }
+        }
+    }
+}
+
+fn accept_qos_realtime(
+    inner: &QuicConnectionInner,
+    context: &QosReceiveContext,
+    frame: &rshare_core::RealtimeInputFrame,
+) -> bool {
+    let key = (context.auth.control_connection_id, frame.session_epoch);
+    let mut state = inner
+        .qos_inbound
+        .lock()
+        .expect("qos inbound state poisoned");
+    if state.tombstones.contains(&key)
+        || !state
+            .active
+            .is_some_and(|(generation, epoch, _)| (generation, epoch) == key)
+    {
+        return false;
+    }
+    match state.realtime_last.get_mut(&key) {
+        Some(last) if frame.sequence <= *last => false,
+        Some(last) => {
+            *last = frame.sequence;
+            true
+        }
+        None => {
+            state.realtime_last.insert(key, frame.sequence);
+            true
         }
     }
 }
@@ -1573,6 +2052,10 @@ impl ClientCertVerifier for OptionalBootstrapClientVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rshare_core::{
+        ClockDomainId, MonotonicStamp, RealtimeInputFrame, RealtimeInputPayload, ReleaseAllReason,
+        ReliableInputFrame, INPUT_PROTOCOL_VERSION,
+    };
     use rustls::pki_types::SubjectPublicKeyInfoDer;
     use rustls::sign::{Signer, SigningKey};
     use rustls::{SignatureAlgorithm, SignatureScheme};
@@ -1597,6 +2080,446 @@ mod tests {
 
         let reliable_bytes = ControlMessageCodec::encode(&reliable).unwrap();
         assert!(decode_legacy_realtime_message(&reliable_bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocked_quic_reliable_stream_still_delivers_emergency_release() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let reliable_reader = Arc::new(Notify::new());
+        server_connection.set_qos_reliable_reader_barrier(reliable_reader.clone());
+
+        let connection_id = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: connection_id,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut server_releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        let epoch = SessionEpoch(41);
+
+        client_qos
+            .try_send_reliable_input(ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: epoch,
+                sequence: 1,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                event: ReliableInputEvent::Enter {
+                    target_display_id: "primary".to_string(),
+                    x: 0,
+                    y: 0,
+                },
+            })
+            .unwrap();
+
+        let mut next_sequence = 2_u64;
+        let overflow_sequence = loop {
+            static TEXT: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+            let mut overflow = None;
+            for _ in 0..1024_u64 {
+                let sequence = next_sequence;
+                next_sequence += 1;
+                let result = client_qos.try_send_reliable_input(ReliableInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: epoch,
+                    sequence,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+                    event: ReliableInputEvent::TextCommit {
+                        text: TEXT.repeat(48),
+                    },
+                });
+                if result == Err(super::super::qos::TransportSendError::ReliableLaneFull) {
+                    overflow = Some(sequence);
+                    break;
+                }
+            }
+            if let Some(sequence) = overflow {
+                break sequence;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            client_qos
+                .try_send_realtime(RealtimeInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: SessionEpoch(epoch.0 + 1),
+                    sequence: 1,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                    payload: RealtimeInputPayload::RelativeMouse { dx: 1, dy: -1 },
+                })
+                .unwrap(),
+            super::super::qos::RealtimeSendOutcome::Sent,
+            "realtime must submit directly while the reliable writer is flow-control blocked"
+        );
+
+        let release = timeout(Duration::from_secs(3), server_releases.recv())
+            .await
+            .expect("emergency release must bypass blocked reliable stream")
+            .expect("terminal release callback must remain connected");
+        assert_eq!(release.epoch, epoch);
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert_eq!(release.auth.control_connection_id, connection_id);
+        assert!(overflow_sequence > 1);
+        assert_eq!(
+            client_qos.try_send_reliable_input(ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: epoch,
+                sequence: overflow_sequence + 1,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), overflow_sequence + 1,),
+                event: ReliableInputEvent::Leave,
+            }),
+            Err(super::super::qos::TransportSendError::ReliableLaneFull),
+            "the failed epoch must remain tombstoned"
+        );
+        reliable_reader.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn authenticated_qos_control_and_bulk_use_separate_framed_streams() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+
+        client_qos
+            .send_control(super::super::qos::ControlFrame::Heartbeat {
+                sequence: 7,
+                timestamp: 11,
+            })
+            .await
+            .unwrap();
+        let stream_id = uuid::Uuid::new_v4();
+        client_qos
+            .send_bulk(super::super::qos::BulkFrame::AudioStreamStop {
+                stream_id,
+                reason: "done".into(),
+            })
+            .await
+            .unwrap();
+        client_qos
+            .try_send_telemetry(super::super::qos::TelemetryFrame::LatencyProbe {
+                sequence: 13,
+                timestamp_ms: 17,
+                endpoint_switch: false,
+                origin_sequence: None,
+            })
+            .unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(
+                timeout(Duration::from_secs(1), server_connection.receive_message())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(received.iter().any(|message| matches!(
+            message,
+            Message::Heartbeat {
+                sequence: 7,
+                timestamp: 11
+            }
+        )));
+        assert!(received.iter().any(|message| matches!(
+            message,
+            Message::AudioStreamStop {
+                stream_id: received_id,
+                reason
+            } if *received_id == stream_id && reason == "done"
+        )));
+        assert!(received.iter().any(|message| matches!(
+            message,
+            Message::LatencyProbe {
+                sequence: 13,
+                timestamp_ms: 17,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn occupied_emergency_slot_closes_quic_and_releases_remote_active_epoch() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut server_releases) = server_connection.install_qos(server_auth);
+        let (client_qos, mut client_releases) = client_connection.install_qos(client_auth);
+        let epoch = SessionEpoch(73);
+        client_qos
+            .try_send_reliable_input(ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: epoch,
+                sequence: 1,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                event: ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            })
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server_connection
+                    .inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned")
+                    .active
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receiver must activate the epoch");
+
+        client_qos.occupy_emergency_slot_for_test();
+        assert_eq!(
+            client_qos.try_send_emergency(ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: epoch,
+                sequence: 2,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), 2),
+                event: ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::BackendFailure,
+                },
+            }),
+            Err(super::super::qos::TransportSendError::EmergencySlotFull)
+        );
+        let local = timeout(Duration::from_secs(1), client_releases.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.epoch, epoch);
+        let remote = timeout(Duration::from_secs(1), server_releases.recv())
+            .await
+            .expect("connection loss must release the remote active epoch")
+            .unwrap();
+        assert_eq!(remote.epoch, epoch);
+        assert_eq!(remote.reason, ReleaseAllReason::Timeout);
+    }
+
+    #[tokio::test]
+    async fn first_qos_stream_waits_for_authenticated_context_install() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        client_qos
+            .send_control(super::super::qos::ControlFrame::Heartbeat {
+                sequence: 99,
+                timestamp: 101,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server_connection.receive_message())
+                .await
+                .unwrap()
+                .unwrap(),
+            Message::Heartbeat {
+                sequence: 99,
+                timestamp: 101
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reliable_writer_fault_tombstones_and_emits_terminal_release() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let _server_connection = incoming.recv().await.unwrap().connection;
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (client_qos, mut releases) = client_connection.install_qos(client_auth);
+        client_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"force reliable writer fault");
+        let epoch = SessionEpoch(88);
+        let _ = client_qos.try_send_reliable_input(ReliableInputFrame {
+            protocol_version: INPUT_PROTOCOL_VERSION,
+            session_epoch: epoch,
+            sequence: 1,
+            captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+            event: ReliableInputEvent::Key {
+                keycode: 0x41,
+                state: rshare_core::KeyState::Pressed,
+            },
+        });
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .expect("writer fault must emit typed terminal release")
+            .unwrap();
+        assert_eq!(release.epoch, epoch);
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert!(client_qos.is_tombstoned(epoch));
+    }
+
+    #[tokio::test]
+    async fn reliable_sequence_gap_tombstones_receiver_before_release() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        let epoch = SessionEpoch(91);
+        for (sequence, event) in [
+            (
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+            (
+                3,
+                ReliableInputEvent::Key {
+                    keycode: 0x41,
+                    state: rshare_core::KeyState::Pressed,
+                },
+            ),
+        ] {
+            client_qos
+                .try_send_reliable_input(ReliableInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: epoch,
+                    sequence,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+                    event,
+                })
+                .unwrap();
+        }
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .expect("reliable gap must fail closed")
+            .unwrap();
+        assert_eq!(release.epoch, epoch);
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert!(
+            server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .expect("qos inbound state poisoned")
+                .tombstones
+                .contains(&(generation, epoch)),
+            "receiver must tombstone before invoking release"
+        );
     }
 
     #[derive(Debug)]

@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod encryption;
 pub mod handshake;
 pub mod network_manager;
+pub mod qos;
 pub mod transport;
 
 #[cfg(test)]

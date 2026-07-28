@@ -24,6 +24,7 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 if-addrs = "0.13"
+futures-util = { workspace = true }
 
 # mDNS service discovery
 mdns-sd = "0.11"

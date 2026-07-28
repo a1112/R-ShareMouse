@@ -4804,6 +4804,7 @@ dependencies = [
  "bincode",
  "bytes",
  "criterion",
+ "futures-util",
  "hostname",
  "if-addrs",
  "mdns-sd",
