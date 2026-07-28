@@ -3,10 +3,11 @@
 use crate::events::{
     GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, InputEvent,
 };
+use crate::ingress::{CapturedInputPayload, ContinuousInput, GamepadAxes};
 use crate::listener::InputEventChannel;
 use anyhow::Result;
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -114,7 +115,8 @@ fn run_gamepad_loop(
     };
 
     let mut states = HashMap::new();
-    let mut last_sent = HashMap::new();
+    let mut last_sent_at = HashMap::new();
+    let mut last_sent_states = HashMap::new();
 
     for (id, gamepad) in gilrs.gamepads() {
         let Some(gamepad_id) = stable_gamepad_id(id) else {
@@ -131,7 +133,10 @@ fn run_gamepad_loop(
 
         let state = GamepadState::neutral(gamepad_id, 0, timestamp_ms());
         states.insert(gamepad_id, state.clone());
-        let _ = channel.send(InputEvent::gamepad_state(state));
+        last_sent_states.insert(gamepad_id, state.clone());
+        let _ = channel.send_payload(CapturedInputPayload::Continuous(
+            ContinuousInput::GamepadAxes(GamepadAxes::from(&state)),
+        ));
     }
 
     while running.load(Ordering::SeqCst) {
@@ -151,11 +156,15 @@ fn run_gamepad_loop(
 
                 let state = GamepadState::neutral(gamepad_id, 0, timestamp_ms());
                 states.insert(gamepad_id, state.clone());
-                let _ = channel.send(InputEvent::gamepad_state(state));
+                last_sent_states.insert(gamepad_id, state.clone());
+                let _ = channel.send_payload(CapturedInputPayload::Continuous(
+                    ContinuousInput::GamepadAxes(GamepadAxes::from(&state)),
+                ));
             }
             EventType::Disconnected => {
                 states.remove(&gamepad_id);
-                last_sent.remove(&gamepad_id);
+                last_sent_at.remove(&gamepad_id);
+                last_sent_states.remove(&gamepad_id);
                 let _ = channel.send(InputEvent::gamepad_disconnected(gamepad_id));
             }
             EventType::ButtonPressed(button, _)
@@ -167,7 +176,14 @@ fn run_gamepad_loop(
                     .or_insert_with(|| GamepadState::neutral(gamepad_id, 0, timestamp_ms()))
                     .update_button(button, pressed)
                 {
-                    send_state(&channel, state, &mut last_sent, &config, true);
+                    send_state(
+                        &channel,
+                        state,
+                        &mut last_sent_at,
+                        &mut last_sent_states,
+                        &config,
+                        true,
+                    );
                 }
             }
             EventType::ButtonChanged(button, value, _) => {
@@ -177,7 +193,14 @@ fn run_gamepad_loop(
                     .or_insert_with(|| GamepadState::neutral(gamepad_id, 0, timestamp_ms()))
                     .update_button(button, pressed)
                 {
-                    send_state(&channel, state, &mut last_sent, &config, true);
+                    send_state(
+                        &channel,
+                        state,
+                        &mut last_sent_at,
+                        &mut last_sent_states,
+                        &config,
+                        true,
+                    );
                 }
             }
             EventType::AxisChanged(axis, value, _) => {
@@ -186,7 +209,14 @@ fn run_gamepad_loop(
                     .or_insert_with(|| GamepadState::neutral(gamepad_id, 0, timestamp_ms()))
                     .update_axis(axis, value, config.deadzone_basis_points)
                 {
-                    send_state(&channel, state, &mut last_sent, &config, false);
+                    send_state(
+                        &channel,
+                        state,
+                        &mut last_sent_at,
+                        &mut last_sent_states,
+                        &config,
+                        false,
+                    );
                 }
             }
             EventType::Dropped | EventType::ForceFeedbackEffectCompleted => {}
@@ -208,14 +238,15 @@ fn gamepad_info(gilrs: &Gilrs, id: GamepadId, gamepad_id: u8) -> Option<GamepadD
 fn send_state(
     channel: &InputEventChannel,
     state: &mut GamepadState,
-    last_sent: &mut HashMap<u8, Instant>,
+    last_sent_at: &mut HashMap<u8, Instant>,
+    last_sent_states: &mut HashMap<u8, GamepadState>,
     config: &GamepadListenerConfig,
     immediate: bool,
 ) {
     let now = Instant::now();
     let min_interval = min_update_interval(config.max_update_hz);
     if !immediate {
-        if let Some(previous) = last_sent.get(&state.gamepad_id) {
+        if let Some(previous) = last_sent_at.get(&state.gamepad_id) {
             if now.saturating_duration_since(*previous) < min_interval {
                 return;
             }
@@ -224,8 +255,94 @@ fn send_state(
 
     state.sequence = state.sequence.saturating_add(1);
     state.timestamp_ms = timestamp_ms();
-    last_sent.insert(state.gamepad_id, now);
-    let _ = channel.send(InputEvent::gamepad_state(state.clone()));
+    let previous = last_sent_states
+        .get(&state.gamepad_id)
+        .cloned()
+        .unwrap_or_else(|| GamepadState::neutral(state.gamepad_id, 0, state.timestamp_ms));
+    for payload in adapt_gamepad_snapshots(&previous, state) {
+        let _ = channel.send_payload(payload);
+    }
+    last_sent_at.insert(state.gamepad_id, now);
+    last_sent_states.insert(state.gamepad_id, state.clone());
+}
+
+/// Split full gamepad snapshots into ordered reliable button transitions and
+/// one replaceable axes snapshot.
+pub fn adapt_gamepad_snapshots(
+    previous: &GamepadState,
+    current: &GamepadState,
+) -> Vec<CapturedInputPayload> {
+    let mut outputs = Vec::new();
+    for button in ordered_gamepad_buttons(previous, current) {
+        let before = button_pressed(previous, button);
+        let after = button_pressed(current, button);
+        if before != after {
+            outputs.push(CapturedInputPayload::Discrete(InputEvent::gamepad_button(
+                current.gamepad_id,
+                button,
+                after,
+                current.clone(),
+            )));
+        }
+    }
+
+    if axes_changed(previous, current) {
+        outputs.push(CapturedInputPayload::Continuous(
+            ContinuousInput::GamepadAxes(GamepadAxes::from(current)),
+        ));
+    }
+    outputs
+}
+
+fn button_pressed(state: &GamepadState, button: GamepadButton) -> bool {
+    state
+        .buttons
+        .iter()
+        .find(|candidate| candidate.button == button)
+        .is_some_and(|candidate| candidate.pressed)
+}
+
+fn axes_changed(previous: &GamepadState, current: &GamepadState) -> bool {
+    previous.gamepad_id != current.gamepad_id
+        || previous.left_stick_x != current.left_stick_x
+        || previous.left_stick_y != current.left_stick_y
+        || previous.right_stick_x != current.right_stick_x
+        || previous.right_stick_y != current.right_stick_y
+        || previous.left_trigger != current.left_trigger
+        || previous.right_trigger != current.right_trigger
+}
+
+fn ordered_gamepad_buttons(previous: &GamepadState, current: &GamepadState) -> Vec<GamepadButton> {
+    let mut buttons = vec![
+        GamepadButton::South,
+        GamepadButton::East,
+        GamepadButton::West,
+        GamepadButton::North,
+        GamepadButton::LeftBumper,
+        GamepadButton::RightBumper,
+        GamepadButton::LeftTrigger,
+        GamepadButton::RightTrigger,
+        GamepadButton::Select,
+        GamepadButton::Start,
+        GamepadButton::Guide,
+        GamepadButton::LeftStick,
+        GamepadButton::RightStick,
+        GamepadButton::DPadUp,
+        GamepadButton::DPadDown,
+        GamepadButton::DPadLeft,
+        GamepadButton::DPadRight,
+    ];
+    let other_codes = previous
+        .buttons
+        .iter()
+        .chain(&current.buttons)
+        .filter_map(|state| match state.button {
+            GamepadButton::Other(code) => Some(code),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    buttons.extend(other_codes.into_iter().map(GamepadButton::Other));
+    buttons
 }
 
 fn min_update_interval(max_update_hz: u16) -> Duration {

@@ -216,6 +216,7 @@ impl InputEmulator for EnigoInputEmulator {
             InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
             | InputEvent::GamepadState { .. } => {
                 anyhow::bail!("Gamepad injection is not supported by this input emulator");
             }
@@ -519,6 +520,7 @@ impl InputEmulator for MacosNativeInputEmulator {
             InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
             | InputEvent::GamepadState { .. } => {
                 anyhow::bail!("Gamepad injection is not supported by this input emulator");
             }
@@ -829,6 +831,7 @@ impl InputEmulator for WindowsNativeInputEmulator {
             InputEvent::TextCommit { text } => self.commit_text(&text)?,
             InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
             | InputEvent::GamepadState { .. } => {
                 anyhow::bail!("Gamepad injection is not supported by this input emulator");
             }

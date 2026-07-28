@@ -40,6 +40,12 @@ pub enum InputEvent {
     GamepadDisconnected {
         gamepad_id: u8,
     },
+    GamepadButton {
+        gamepad_id: u8,
+        button: GamepadButton,
+        pressed: bool,
+        state_after: GamepadState,
+    },
     GamepadState {
         state: GamepadState,
     },
@@ -301,6 +307,20 @@ impl InputEvent {
         Self::GamepadDisconnected { gamepad_id }
     }
 
+    pub fn gamepad_button(
+        gamepad_id: u8,
+        button: GamepadButton,
+        pressed: bool,
+        state_after: GamepadState,
+    ) -> Self {
+        Self::GamepadButton {
+            gamepad_id,
+            button,
+            pressed,
+            state_after,
+        }
+    }
+
     pub fn gamepad_state(state: GamepadState) -> Self {
         Self::GamepadState { state }
     }
@@ -316,6 +336,7 @@ impl InputEvent {
             InputEvent::TextCommit { .. } => "TextCommit",
             InputEvent::GamepadConnected { .. } => "GamepadConnected",
             InputEvent::GamepadDisconnected { .. } => "GamepadDisconnected",
+            InputEvent::GamepadButton { .. } => "GamepadButton",
             InputEvent::GamepadState { .. } => "GamepadState",
         }
     }
@@ -332,6 +353,7 @@ impl InputEvent {
                 | InputEvent::TextCommit { .. }
                 | InputEvent::GamepadConnected { .. }
                 | InputEvent::GamepadDisconnected { .. }
+                | InputEvent::GamepadButton { .. }
                 | InputEvent::GamepadState { .. }
         )
     }

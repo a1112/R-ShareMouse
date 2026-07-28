@@ -34,7 +34,8 @@ use rshare_core::{
 };
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
-    InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend,
+    IngressEvent, InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend,
+    SemanticInputConsumer,
 };
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -1138,6 +1139,53 @@ impl DaemonState {
                     LocalInputDeviceKind::Gamepad,
                     "disconnected".to_string(),
                     format!("Gamepad disconnected: {}", gamepad_id),
+                )
+            }
+            InputEvent::GamepadButton {
+                gamepad_id,
+                button,
+                pressed,
+                state_after,
+            } => {
+                let existing = self
+                    .local_controls
+                    .gamepads
+                    .iter()
+                    .find(|gamepad| gamepad.gamepad_id == *gamepad_id);
+                let existing_name = existing.map(|gamepad| gamepad.name.clone());
+                let mut next = LocalGamepadState::from_state(state_after, existing_name, true);
+                if let Some(existing) = existing {
+                    next.event_count = existing.event_count.saturating_add(1);
+                    next.button_event_count = existing.button_event_count.saturating_add(1);
+                    next.button_press_count = existing
+                        .button_press_count
+                        .saturating_add(u64::from(*pressed));
+                    next.button_release_count = existing
+                        .button_release_count
+                        .saturating_add(u64::from(!*pressed));
+                    next.axis_event_count = existing.axis_event_count;
+                    next.trigger_event_count = existing.trigger_event_count;
+                    next.last_axis = existing.last_axis.clone();
+                } else {
+                    next.button_event_count = 1;
+                    next.button_press_count = u64::from(*pressed);
+                    next.button_release_count = u64::from(!*pressed);
+                }
+                let button_label = format!("{button:?}");
+                next.last_button = Some(button_label.clone());
+                payload.insert("gamepad_id".to_string(), gamepad_id.to_string());
+                payload.insert("button".to_string(), button_label.clone());
+                payload.insert("pressed".to_string(), pressed.to_string());
+                upsert_gamepad_state(&mut self.local_controls, next);
+                (
+                    LocalInputDeviceKind::Gamepad,
+                    "button".to_string(),
+                    format!(
+                        "Gamepad {} button {} {}",
+                        gamepad_id,
+                        button_label,
+                        if *pressed { "pressed" } else { "released" }
+                    ),
                 )
             }
             InputEvent::GamepadState { state } => {
@@ -3248,6 +3296,9 @@ fn input_event_to_raw_event(
         rshare_input::InputEvent::GamepadDisconnected { gamepad_id } => {
             Some(rshare_core::engine::RawInputEvent::GamepadDisconnected { gamepad_id })
         }
+        rshare_input::InputEvent::GamepadButton { state_after, .. } => {
+            Some(rshare_core::engine::RawInputEvent::GamepadState { state: state_after })
+        }
         rshare_input::InputEvent::GamepadState { state } => {
             Some(rshare_core::engine::RawInputEvent::GamepadState { state })
         }
@@ -3519,6 +3570,7 @@ fn is_gamepad_input_event(event: &InputEvent) -> bool {
         event,
         InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
             | InputEvent::GamepadState { .. }
     )
 }
@@ -6731,13 +6783,27 @@ fn captured_input_from_evdev_driver_event(
 }
 
 fn forward_input_events_to_captured_channel(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mut rx: SemanticInputConsumer,
     tx: tokio::sync::mpsc::UnboundedSender<CapturedInputEvent>,
 ) {
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if tx.send(CapturedInputEvent::from(event)).is_err() {
-                break;
+        while let Some(event) = rx.recv_event().await {
+            match event {
+                IngressEvent::Input(captured) => match captured.into_input_event() {
+                    Ok(event) => {
+                        if tx.send(CapturedInputEvent::from(event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("Captured input cannot enter the legacy router: {error}");
+                    }
+                },
+                IngressEvent::Fault(fault) => {
+                    // Task 12 owns suspend/ReleaseAll policy. The bounded ingress
+                    // still surfaces the fault explicitly instead of losing it.
+                    tracing::error!("Input capture ingress fault: {fault:?}");
+                }
             }
         }
     });
@@ -8400,6 +8466,8 @@ mod tests {
             addresses: vec!["127.0.0.1:27431".parse().unwrap()],
             screen_info: None,
             capabilities: advertised,
+            transport_capabilities: rshare_core::PeerTransportCapabilities::required_v3(),
+            protocol_compatibility: rshare_net::PeerProtocolCompatibility::Compatible,
             last_seen: Instant::now(),
         });
         state.mark_connected(&remote_id, true);
@@ -10531,6 +10599,8 @@ mod tests {
             addresses: vec!["192.168.1.241:27431".parse().unwrap()],
             screen_info: Some(ScreenInfo::new(0, 0, 2560, 1440)),
             capabilities: DeviceCapabilities::default(),
+            transport_capabilities: rshare_core::PeerTransportCapabilities::required_v3(),
+            protocol_compatibility: rshare_net::PeerProtocolCompatibility::Compatible,
             last_seen: Instant::now(),
         });
 
@@ -10658,6 +10728,39 @@ mod tests {
         assert!(matches!(
             raw,
             rshare_core::engine::RawInputEvent::GamepadState { .. }
+        ));
+    }
+
+    #[test]
+    fn gamepad_button_maps_its_complete_post_transition_state() {
+        let mut state_after = rshare_core::GamepadState::neutral(6, 42, 777);
+        state_after.left_stick_x = 12_345;
+        state_after.buttons.push(rshare_core::GamepadButtonState {
+            button: rshare_core::GamepadButton::South,
+            pressed: true,
+        });
+        let raw = input_event_to_raw_event(rshare_input::InputEvent::gamepad_button(
+            6,
+            rshare_core::GamepadButton::South,
+            true,
+            state_after,
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            raw,
+            rshare_core::engine::RawInputEvent::GamepadState {
+                state: rshare_core::GamepadState {
+                    gamepad_id: 6,
+                    sequence: 42,
+                    left_stick_x: 12_345,
+                    buttons,
+                    ..
+                }
+            } if buttons == vec![rshare_core::GamepadButtonState {
+                button: rshare_core::GamepadButton::South,
+                pressed: true,
+            }]
         ));
     }
 

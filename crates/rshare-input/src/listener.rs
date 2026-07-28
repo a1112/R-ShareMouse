@@ -3,10 +3,15 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton};
+use crate::ingress::{
+    CaptureOrigin, CaptureSource, CapturedInputPayload, ContinuousInput, IngressFault,
+    IngressStats, PushOutcome, SemanticInputConsumer, SemanticInputIngress, SemanticInputProducer,
+};
+
+const DEFAULT_INPUT_INGRESS_CAPACITY: usize = 128;
 
 /// Callback for input events
 pub type InputCallback = Box<dyn Fn(InputEvent) + Send>;
@@ -50,33 +55,87 @@ impl Default for ListenerConfig {
 /// Input event channel for async processing
 #[derive(Debug, Clone)]
 pub struct InputEventChannel {
-    tx: mpsc::UnboundedSender<InputEvent>,
+    producer: SemanticInputProducer,
+    origin: CaptureOrigin,
 }
 
 impl InputEventChannel {
     /// Create a new channel
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<InputEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+    pub fn new() -> (Self, SemanticInputConsumer) {
+        Self::with_capacity(DEFAULT_INPUT_INGRESS_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> (Self, SemanticInputConsumer) {
+        let (producer, consumer) = SemanticInputIngress::new(capacity);
+        (
+            Self {
+                producer,
+                origin: CaptureOrigin::default(),
+            },
+            consumer,
+        )
     }
 
     /// Send an event
     pub fn send(&self, event: InputEvent) -> Result<()> {
-        self.tx
-            .send(event)
-            .map_err(|e| anyhow::anyhow!("Failed to send event: {}", e))
+        push_outcome_to_result(self.try_send(event))
+    }
+
+    pub fn try_send(&self, event: InputEvent) -> PushOutcome {
+        self.try_send_payload(CapturedInputPayload::from_input_event(event))
+    }
+
+    pub fn send_payload(&self, payload: CapturedInputPayload) -> Result<()> {
+        push_outcome_to_result(self.try_send_payload(payload))
+    }
+
+    pub fn try_send_payload(&self, payload: CapturedInputPayload) -> PushOutcome {
+        let origin = if matches!(
+            payload,
+            CapturedInputPayload::Continuous(ContinuousInput::GamepadAxes(_))
+                | CapturedInputPayload::Discrete(InputEvent::GamepadButton { .. })
+                | CapturedInputPayload::Discrete(InputEvent::GamepadConnected { .. })
+                | CapturedInputPayload::Discrete(InputEvent::GamepadDisconnected { .. })
+        ) {
+            CaptureOrigin {
+                source: CaptureSource::Gamepad,
+                ..self.origin
+            }
+        } else {
+            self.origin
+        };
+        let item = self.producer.capture(origin, payload);
+        self.producer.try_push(item)
+    }
+
+    pub fn stats(&self) -> IngressStats {
+        self.producer.stats()
+    }
+
+    pub fn try_pop_fault(&self) -> Option<IngressFault> {
+        self.producer.try_pop_fault()
     }
 
     /// Check if channel is closed
     pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.producer.stats().closed
+    }
+}
+
+fn push_outcome_to_result(outcome: PushOutcome) -> Result<()> {
+    match outcome {
+        PushOutcome::Enqueued
+        | PushOutcome::Coalesced
+        | PushOutcome::RealtimeReplaced
+        | PushOutcome::RealtimeDropped => Ok(()),
+        PushOutcome::ReliableOverflow => Err(anyhow::anyhow!("reliable input ingress overflow")),
+        PushOutcome::Closed => Err(anyhow::anyhow!("input ingress is closed")),
     }
 }
 
 impl Default for InputEventChannel {
     fn default() -> Self {
-        let (tx, _) = mpsc::unbounded_channel();
-        Self { tx }
+        Self::new().0
     }
 }
 
@@ -85,7 +144,7 @@ pub struct RDevInputListener {
     config: ListenerConfig,
     running: Arc<Mutex<bool>>,
     channel: InputEventChannel,
-    _rx: Option<mpsc::UnboundedReceiver<InputEvent>>,
+    _rx: Option<SemanticInputConsumer>,
     last_mouse_time: Arc<Mutex<Instant>>,
     last_mouse_pos: Arc<Mutex<Option<(i32, i32)>>>,
 }
@@ -111,7 +170,7 @@ impl RDevInputListener {
     }
 
     /// Get the event receiver
-    pub fn receiver(&mut self) -> mpsc::UnboundedReceiver<InputEvent> {
+    pub fn receiver(&mut self) -> SemanticInputConsumer {
         self._rx.take().expect("Receiver already taken")
     }
 
@@ -702,8 +761,10 @@ mod tests {
         channel.send(event.clone()).unwrap();
 
         let received = rx.recv().await.unwrap();
-        match received {
-            InputEvent::MouseMove { x, y } => {
+        match received.payload {
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                crate::ingress::PointerSample::Absolute { x, y },
+            )) => {
                 assert_eq!(x, 100);
                 assert_eq!(y, 200);
             }
