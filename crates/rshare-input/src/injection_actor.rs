@@ -310,7 +310,7 @@ impl InputInjectionHandle {
         }
 
         if let Some(previous) = active.last_reliable_sequence {
-            if frame.sequence != previous.saturating_add(1) {
+            if previous.checked_add(1) != Some(frame.sequence) {
                 close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
                 self.inner.queue.changed.notify_one();
                 return Err(InjectionQueueFull::ProtocolViolation);

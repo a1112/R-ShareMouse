@@ -854,6 +854,41 @@ fn reliable_duplicate_closes_epoch_and_releases_pressed_state() {
 }
 
 #[test]
+fn reliable_max_sequence_duplicate_is_rejected_without_saturating_wraparound() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder: Arc::clone(&recorder),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::ZERO);
+    let key_down = reliable(
+        1,
+        u64::MAX,
+        ReliableInputEvent::Key {
+            keycode: 65,
+            state: KeyState::Pressed,
+        },
+    );
+
+    actor.try_submit_reliable(owner, key_down.clone()).unwrap();
+    recorder.wait_for(1);
+    assert_eq!(
+        actor.try_submit_reliable(owner, key_down),
+        Err(rshare_input::InjectionQueueFull::ProtocolViolation)
+    );
+    assert_eq!(
+        recorder.wait_for(2)[1],
+        Call::Key(
+            65,
+            ButtonState::Released,
+            "rshare-input-injection-test".into()
+        )
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
 fn backend_failure_releases_held_controls_locally() {
     let recorder = Arc::new(Recorder::default());
     let backend = RecordingBackend {
