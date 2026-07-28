@@ -940,7 +940,15 @@ async fn send_outbound_message(
             );
         }
     }
-    if let Some(datagram) = encode_legacy_realtime_message(message)? {
+    let legacy_realtime_datagram = match encode_legacy_realtime_message(message) {
+        Ok(datagram) => datagram,
+        Err(error) => {
+            inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("QUIC realtime datagram dropped during encoding: {}", error);
+            return Ok(());
+        }
+    };
+    if let Some(datagram) = legacy_realtime_datagram {
         if let Some(max_datagram_size) = inner.connection.max_datagram_size() {
             if datagram.len() <= max_datagram_size {
                 match inner.connection.send_datagram(datagram) {
@@ -2227,6 +2235,49 @@ mod tests {
             reliable_resets_before,
             "a realtime datagram failure must never touch the reliable stream"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_legacy_realtime_encoding_is_counted_and_dropped() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(local_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let server_addr = server
+            .server_endpoint
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut incoming = server.incoming();
+
+        let mut client = QuicTransport::new(remote_id);
+        let sender = client
+            .connect(&server_addr.to_string(), local_id)
+            .await
+            .unwrap();
+        let _receiver = incoming.recv().await.unwrap().connection;
+        let dropped_before = sender.datagram_tx_dropped();
+        let mut state = rshare_core::GamepadState::neutral(0, 1, 0);
+        state.buttons = vec![
+            rshare_core::GamepadButtonState {
+                button: rshare_core::GamepadButton::South,
+                pressed: true,
+            };
+            400_000
+        ];
+        let message = Message::GamepadState { state };
+        assert!(
+            encode_legacy_realtime_message(&message).is_err(),
+            "fixture must exceed the temporary legacy codec bound"
+        );
+
+        sender
+            .send_message(&message)
+            .await
+            .expect("oversized realtime encoding must be treated as a counted drop");
+
+        assert_eq!(sender.datagram_tx_dropped(), dropped_before + 1);
     }
 
     #[tokio::test]
