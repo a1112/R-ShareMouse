@@ -969,7 +969,12 @@ impl QuicConnection {
             .and_then(|receivers| receivers.peer.take())
     }
 
-    pub(crate) fn take_control_events(&self) -> Option<mpsc::Receiver<ControlFrame>> {
+    /// Takes the single-consumer authenticated control-event compatibility
+    /// mirror. Production normally leaves ownership to `ConnectionManager`;
+    /// direct typed-lane integrations such as the perf harness must drain this
+    /// mirror alongside `PeerInbound::control_rx` to avoid artificial
+    /// backpressure.
+    pub fn take_control_events(&self) -> Option<mpsc::Receiver<ControlFrame>> {
         self.inner
             .qos_receivers
             .lock()

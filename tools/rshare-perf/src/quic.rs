@@ -1,7 +1,19 @@
 use crate::report::{percentile, PerfRun, QueueSummary, VerdictStatus, REQUIRED_COUNTERS};
 use anyhow::{anyhow, Context, Result};
-use rshare_core::{AudioFormat, AudioFramePayload, DeviceId, Message};
-use rshare_net::{ConnectionPool, FanoutEnqueueFailureKind, QuicTransport};
+use rshare_core::{
+    AudioFormat, AudioFramePayload, ClockDomainId, ControlConnectionId, DeviceId, Message,
+    MonotonicStamp, RealtimeInputFrame, RealtimeInputPayload, ReliableInputEvent,
+    ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
+};
+use rshare_net::{
+    encryption::PeerCertificateFingerprint,
+    handshake::PeerAuthContext,
+    qos::{
+        ClassifiedMessage, ConnectionRegistry, PeerTransportHandle, RealtimeSendOutcome,
+        RegisteredPeer,
+    },
+    QuicTransport,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -347,17 +359,54 @@ async fn run_loopback_once_started(
         .connect(&address.to_string(), local_id)
         .await
         .context("QUIC loopback handshake failed")?;
-    let mut fast_receiver = timeout(Duration::from_secs(3), incoming.recv())
+    let fast_receiver = timeout(Duration::from_secs(3), incoming.recv())
         .await
         .context("timed out accepting QUIC loopback connection")?
         .context("QUIC loopback accept channel closed")?
         .connection;
-    let mut fast_messages = fast_receiver.message_channel();
+    let session_epoch = SessionEpoch(1);
+    let fast_sender_auth = Arc::new(PeerAuthContext {
+        peer_id: local_id,
+        certificate_fingerprint: PeerCertificateFingerprint::from_der(b"perf-server"),
+        control_connection_id: ControlConnectionId::new(),
+    });
+    let fast_receiver_auth = Arc::new(PeerAuthContext {
+        peer_id: fast_id,
+        certificate_fingerprint: PeerCertificateFingerprint::from_der(b"perf-fast"),
+        control_connection_id: ControlConnectionId::new(),
+    });
+    let (fast_transport, _fast_sender_releases) = fast_sender.install_qos(fast_sender_auth.clone());
+    let (_fast_receiver_transport, _fast_receiver_releases) =
+        fast_receiver.install_qos(fast_receiver_auth);
+    let mut fast_inbound = fast_receiver
+        .take_peer_inbound()
+        .context("fast peer did not expose typed inbound lanes")?;
+    let mut fast_control_events = fast_receiver
+        .take_control_events()
+        .context("fast peer did not expose typed control events")?;
+    fast_transport
+        .try_send_reliable_input(enter_frame(session_epoch))
+        .map_err(|error| anyhow!("failed to activate fast realtime epoch: {error}"))?;
+    timeout(
+        Duration::from_secs(1),
+        fast_inbound.reliable_input_rx.recv(),
+    )
+    .await
+    .context("timed out activating fast realtime epoch")?
+    .context("fast reliable input lane closed before epoch activation")?;
 
-    let pool = ConnectionPool::new(local_id);
-    pool.insert(fast_id, fast_sender).await;
+    let registry = Arc::new(ConnectionRegistry::new());
+    registry.insert(
+        fast_id,
+        RegisteredPeer {
+            auth: fast_sender_auth,
+            transport: fast_transport.clone(),
+        },
+    );
     let mut slow_id = None;
+    let mut slow_sender = None;
     let mut slow_receiver = None;
+    let mut _slow_inbound = None;
     if slow_fast {
         let id = DeviceId::new_v4();
         let mut slow_client = QuicTransport::new(id);
@@ -367,9 +416,40 @@ async fn run_loopback_once_started(
             .context("timed out accepting slow QUIC peer")?
             .context("slow QUIC accept channel closed")?
             .connection;
-        pool.insert(id, sender).await;
+        let slow_sender_auth = Arc::new(PeerAuthContext {
+            peer_id: local_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"perf-server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let slow_receiver_auth = Arc::new(PeerAuthContext {
+            peer_id: id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"perf-slow"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (slow_transport, _slow_sender_releases) = sender.install_qos(slow_sender_auth.clone());
+        let (_slow_receiver_transport, _slow_receiver_releases) =
+            receiver.install_qos(slow_receiver_auth);
+        let mut inbound = receiver
+            .take_peer_inbound()
+            .context("slow peer did not expose typed inbound lanes")?;
+        slow_transport
+            .try_send_reliable_input(enter_frame(session_epoch))
+            .map_err(|error| anyhow!("failed to activate slow realtime epoch: {error}"))?;
+        timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .context("timed out activating slow realtime epoch")?
+            .context("slow reliable input lane closed before epoch activation")?;
+        registry.insert(
+            id,
+            RegisteredPeer {
+                auth: slow_sender_auth,
+                transport: slow_transport,
+            },
+        );
         slow_id = Some(id);
+        slow_sender = Some(sender);
         slow_receiver = Some(receiver);
+        _slow_inbound = Some(inbound);
     }
 
     let expected_sent = ((duration.as_secs_f64() * rate_hz as f64).round() as u64).max(1);
@@ -378,6 +458,10 @@ async fn run_loopback_once_started(
     let scheduled_times = Arc::new(Mutex::new(HashMap::<u64, Instant>::new()));
     let receive_state = Arc::new(Mutex::new(ReceiveState::default()));
     let transport_send_completed = Arc::new(AtomicU64::new(0));
+    let primary_realtime_attempted = Arc::new(AtomicU64::new(0));
+    let primary_realtime_sent = Arc::new(AtomicU64::new(0));
+    let primary_realtime_dropped = Arc::new(AtomicU64::new(0));
+    let slow_realtime_dropped = Arc::new(AtomicU64::new(0));
     let production_fanout_calls = Arc::new(AtomicU64::new(0));
     let fanout_fast_enqueued = Arc::new(AtomicU64::new(0));
     let slow_enqueue_full = Arc::new(AtomicU64::new(0));
@@ -390,21 +474,36 @@ async fn run_loopback_once_started(
     let producer_started = Instant::now();
     let measurement_ended = producer_started + duration;
 
+    let mut fast_control_rx = fast_inbound.control_rx;
+    let mut fast_telemetry_rx = fast_inbound.telemetry_rx;
+    let mut fast_bulk_rx = fast_inbound.bulk_rx;
+    let background_drain = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                Some(_) = fast_control_rx.recv() => {}
+                Some(_) = fast_control_events.recv() => {}
+                Some(_) = fast_telemetry_rx.recv() => {}
+                Some(_) = fast_bulk_rx.recv() => {}
+                else => break,
+            }
+        }
+    });
+
+    let mut fast_realtime = fast_inbound.realtime_rx;
     let receiver_state = Arc::clone(&receive_state);
     let receiver_scheduled_times = Arc::clone(&scheduled_times);
     let stall_trigger_sequence = (expected_sent / 2).max(1);
     tasks.spawn(async move {
-        while let Some(message) = fast_messages.recv().await {
-            let Message::Heartbeat {
-                sequence,
-                timestamp,
-            } = message
-            else {
-                continue;
-            };
-            if timestamp != sequence {
+        while let Some(frame) = fast_realtime.recv().await {
+            if frame.protocol_version != INPUT_PROTOCOL_VERSION
+                || frame.session_epoch != session_epoch
+                || frame.captured_at.domain != ClockDomainId(1)
+                || frame.captured_at.value_us != frame.sequence
+            {
                 continue;
             }
+            let sequence = frame.sequence;
             let should_stall = {
                 let mut state = receiver_state
                     .lock()
@@ -450,7 +549,11 @@ async fn run_loopback_once_started(
             if let Some(previous) = state.last_received {
                 if sequence < previous {
                     state.out_of_order += 1;
+                } else if sequence > previous + 1 {
+                    state.realtime_overwrites += sequence - previous - 1;
                 }
+            } else if sequence > 1 {
+                state.realtime_overwrites += sequence - 1;
             }
             if let Some(stall_started) = state.stall_started {
                 if state.stall_recovery_us.is_none() {
@@ -473,12 +576,16 @@ async fn run_loopback_once_started(
     });
     task_count += 1;
 
-    let fast_pool = pool.clone();
+    let fast_registry = Arc::clone(&registry);
+    let fast_direct_transport = fast_transport.clone();
     let fast_scheduled_times = Arc::clone(&scheduled_times);
     let fast_transport_send_completed = Arc::clone(&transport_send_completed);
+    let fast_primary_realtime_attempted = Arc::clone(&primary_realtime_attempted);
+    let fast_primary_realtime_sent = Arc::clone(&primary_realtime_sent);
+    let fast_primary_realtime_dropped = Arc::clone(&primary_realtime_dropped);
+    let fast_slow_realtime_dropped = Arc::clone(&slow_realtime_dropped);
     let fast_production_fanout_calls = Arc::clone(&production_fanout_calls);
     let fast_fanout_enqueued = Arc::clone(&fanout_fast_enqueued);
-    let fast_slow_enqueue_full = Arc::clone(&slow_enqueue_full);
     let fast_slow_enqueue_closed = Arc::clone(&slow_enqueue_closed);
     let fast_errors = Arc::clone(&send_errors);
     let fast_fanout_costs = Arc::clone(&slow_send_us);
@@ -489,58 +596,70 @@ async fn run_loopback_once_started(
             if let Some(delay) = sender_delay {
                 tokio::time::sleep(delay).await;
             }
-            let message = Message::Heartbeat {
-                sequence,
-                timestamp: sequence,
-            };
+            let frame = realtime_frame(session_epoch, sequence);
+            fast_primary_realtime_attempted.fetch_add(1, Ordering::Relaxed);
             let send_started = Instant::now();
             if slow_fast {
                 fast_production_fanout_calls.fetch_add(1, Ordering::Relaxed);
-                let receipt = fast_pool.try_fanout(&message).await;
+                let outcomes = fast_registry.broadcast_realtime(frame);
                 fast_fanout_costs
                     .lock()
                     .expect("fanout cost mutex poisoned")
                     .push(send_started.elapsed().as_micros() as f64);
-                let fast_enqueued = receipt.enqueued.contains(&fast_id);
-                if fast_enqueued {
-                    fast_fanout_enqueued.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    fast_scheduled_times
-                        .lock()
-                        .expect("scheduled time mutex poisoned")
-                        .remove(&sequence);
-                }
-                for failure in receipt.failures {
-                    if Some(failure.device_id) == slow_id {
-                        match failure.kind {
-                            FanoutEnqueueFailureKind::QueueFull => {
-                                fast_slow_enqueue_full.fetch_add(1, Ordering::Relaxed);
+                for (device_id, outcome) in outcomes {
+                    if device_id == fast_id {
+                        match outcome {
+                            Ok(RealtimeSendOutcome::Sent) => {
+                                fast_fanout_enqueued.fetch_add(1, Ordering::Relaxed);
+                                fast_primary_realtime_sent.fetch_add(1, Ordering::Relaxed);
+                                if Instant::now() <= measurement_ended {
+                                    fast_transport_send_completed.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                            FanoutEnqueueFailureKind::QueueClosed => {
+                            Ok(RealtimeSendOutcome::DroppedLatest) => {
+                                fast_primary_realtime_dropped.fetch_add(1, Ordering::Relaxed);
+                                fast_scheduled_times
+                                    .lock()
+                                    .expect("scheduled time mutex poisoned")
+                                    .remove(&sequence);
+                            }
+                            Err(error) => {
+                                fast_scheduled_times
+                                    .lock()
+                                    .expect("scheduled time mutex poisoned")
+                                    .remove(&sequence);
+                                fast_errors
+                                    .lock()
+                                    .expect("send error mutex poisoned")
+                                    .push(format!("fast realtime fanout failed: {error}"));
+                            }
+                        }
+                    } else if Some(device_id) == slow_id {
+                        match outcome {
+                            Ok(RealtimeSendOutcome::Sent) => {}
+                            Ok(RealtimeSendOutcome::DroppedLatest) => {
+                                fast_slow_realtime_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
                                 fast_slow_enqueue_closed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                    } else {
-                        fast_errors
-                            .lock()
-                            .expect("send error mutex poisoned")
-                            .push(format!(
-                                "fanout enqueue failed for {}: {:?}",
-                                failure.device_id, failure.kind
-                            ));
                     }
                 }
+                tokio::task::yield_now().await;
                 continue;
             }
 
-            match fast_pool.send_to(&fast_id, &message).await {
-                Ok(()) => {
-                    fast_transport_send_completed.fetch_add(1, Ordering::Relaxed);
+            match fast_direct_transport.try_send_realtime(frame) {
+                Ok(RealtimeSendOutcome::Sent) => {
+                    if Instant::now() <= measurement_ended {
+                        fast_transport_send_completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    fast_primary_realtime_sent.fetch_add(1, Ordering::Relaxed);
                     if sequence % 100 == 0 {
                         for kind in &load_messages {
-                            if let Err(error) = fast_pool
-                                .send_to(&fast_id, &load_message(kind, sequence))
-                                .await
+                            if let Err(error) =
+                                send_background_load(&fast_direct_transport, kind, sequence).await
                             {
                                 fast_errors
                                     .lock()
@@ -549,6 +668,13 @@ async fn run_loopback_once_started(
                             }
                         }
                     }
+                }
+                Ok(RealtimeSendOutcome::DroppedLatest) => {
+                    fast_primary_realtime_dropped.fetch_add(1, Ordering::Relaxed);
+                    fast_scheduled_times
+                        .lock()
+                        .expect("scheduled time mutex poisoned")
+                        .remove(&sequence);
                 }
                 Err(error) => {
                     fast_scheduled_times
@@ -561,6 +687,7 @@ async fn run_loopback_once_started(
                         .push(error.to_string());
                 }
             }
+            tokio::task::yield_now().await;
         }
     });
     task_count += 1;
@@ -601,15 +728,8 @@ async fn run_loopback_once_started(
         }
     }
 
-    let fast_diagnostics = pool
-        .diagnostics_for(&fast_id)
-        .await
-        .context("fast QUIC transport diagnostics unavailable")?;
-    let slow_diagnostics = if let Some(id) = slow_id {
-        pool.diagnostics_for(&id).await
-    } else {
-        None
-    };
+    let fast_diagnostics = fast_sender.diagnostics();
+    let slow_diagnostics = slow_sender.as_ref().map(|sender| sender.diagnostics());
     let state = receive_state.lock().expect("receiver state mutex poisoned");
     let mut counters = BTreeMap::from(
         REQUIRED_COUNTERS
@@ -626,6 +746,19 @@ async fn run_loopback_once_started(
     counters.insert(
         "transport_send_completed".into(),
         transport_send_completed.load(Ordering::Relaxed),
+    );
+    counters.insert("primary_lane_realtime".into(), 1);
+    counters.insert(
+        "primary_realtime_attempted".into(),
+        primary_realtime_attempted.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "primary_realtime_sent".into(),
+        primary_realtime_sent.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "primary_realtime_dropped".into(),
+        primary_realtime_dropped.load(Ordering::Relaxed),
     );
     counters.insert("independent_producer".into(), 1);
     counters.insert(
@@ -667,6 +800,9 @@ async fn run_loopback_once_started(
     counters.insert(
         "overwrite".into(),
         datagram_drops
+            + primary_realtime_dropped.load(Ordering::Relaxed)
+            + slow_realtime_dropped.load(Ordering::Relaxed)
+            + state.realtime_overwrites
             + producer_dropped.load(Ordering::Relaxed)
             + slow_enqueue_full.load(Ordering::Relaxed),
     );
@@ -679,7 +815,8 @@ async fn run_loopback_once_started(
     let median = percentile(&latencies_us, 0.50);
     let p95 = percentile(&latencies_us, 0.95);
     let p99 = percentile(&latencies_us, 0.99);
-    let achieved_hz = delivered_within_window as f64 / duration.as_secs_f64();
+    let completed_within_window = transport_send_completed.load(Ordering::Relaxed);
+    let achieved_hz = completed_within_window as f64 / duration.as_secs_f64();
     let mut metrics = BTreeMap::from([
         ("median_us".into(), median),
         ("p95_us".into(), p95),
@@ -702,7 +839,7 @@ async fn run_loopback_once_started(
         .lock()
         .expect("send error mutex poisoned")
         .clone();
-    if delivered_within_window * 100 < expected_sent * 90 {
+    if completed_within_window * 100 < expected_sent * 90 {
         errors.push(format!(
             "achieved send rate {:.2} Hz is below 90% of configured {rate_hz} Hz",
             achieved_hz
@@ -721,13 +858,11 @@ async fn run_loopback_once_started(
         counters,
         errors,
     };
-    if let Some(connection) = pool.remove(&fast_id).await {
-        connection.close().await;
-    }
-    if let Some(id) = slow_id {
-        if let Some(connection) = pool.remove(&id).await {
-            connection.close().await;
-        }
+    background_drain.abort();
+    let _ = background_drain.await;
+    fast_sender.close().await;
+    if let Some(sender) = slow_sender {
+        sender.close().await;
     }
     fast_receiver.close().await;
     if let Some(receiver) = slow_receiver {
@@ -747,10 +882,56 @@ struct ReceiveState {
     last_received: Option<u64>,
     duplicate: u64,
     out_of_order: u64,
+    realtime_overwrites: u64,
     stall_started: Option<Instant>,
     stall_recovery_us: Option<f64>,
     post_stall_consecutive: u64,
     stall_recovery_consecutive_deliveries: u64,
+}
+
+fn enter_frame(epoch: SessionEpoch) -> ReliableInputFrame {
+    ReliableInputFrame {
+        protocol_version: INPUT_PROTOCOL_VERSION,
+        session_epoch: epoch,
+        sequence: 0,
+        captured_at: MonotonicStamp::new(ClockDomainId(1), 0),
+        event: ReliableInputEvent::Enter {
+            target_display_id: "perf-loopback".into(),
+            x: 0,
+            y: 0,
+        },
+    }
+}
+
+fn realtime_frame(epoch: SessionEpoch, sequence: u64) -> RealtimeInputFrame {
+    RealtimeInputFrame {
+        protocol_version: INPUT_PROTOCOL_VERSION,
+        session_epoch: epoch,
+        sequence,
+        captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+        payload: RealtimeInputPayload::RelativeMouse {
+            dx: sequence as i32,
+            dy: 0,
+        },
+    }
+}
+
+async fn send_background_load(
+    transport: &PeerTransportHandle,
+    kind: &LoadKind,
+    sequence: u64,
+) -> Result<()> {
+    match ClassifiedMessage::try_from(load_message(kind, sequence))
+        .map_err(|error| anyhow!("background load classification failed: {error}"))?
+    {
+        ClassifiedMessage::Control(frame) => transport.send_control(frame).await?,
+        ClassifiedMessage::Telemetry(frame) => transport.try_send_telemetry(frame)?,
+        ClassifiedMessage::Bulk(frame) => transport.send_bulk(frame).await?,
+        ClassifiedMessage::ReliableCompat(_) | ClassifiedMessage::Unsupported => {
+            return Err(anyhow!("background load has no typed QoS lane"));
+        }
+    }
+    Ok(())
 }
 
 fn load_message(kind: &LoadKind, sequence: u64) -> Message {
@@ -858,6 +1039,11 @@ mod tests {
         assert!(REQUIRED_COUNTERS
             .iter()
             .all(|counter| measured.run.counters.contains_key(*counter)));
+        assert_eq!(measured.run.counters["primary_lane_realtime"], 1);
+        assert!(
+            measured.run.counters["primary_realtime_sent"] > 0,
+            "rate samples must traverse typed realtime QUIC datagrams"
+        );
         assert!(
             measured.queues.is_empty(),
             "transport does not expose real queue capacity/high-watermark diagnostics"
@@ -883,7 +1069,7 @@ mod tests {
             measured.run.counters["expected_sent"]
         );
         assert!(
-            measured.run.counters["actual_sent"] * 100
+            measured.run.counters["transport_send_completed"] * 100
                 >= measured.run.counters["expected_sent"] * 90,
             "counters={:?}, errors={:?}",
             measured.run.counters,
@@ -942,6 +1128,7 @@ mod tests {
             expected - delivered
         );
         assert_eq!(measured.run.counters["actual_sent"], delivered);
+        assert!(measured.run.counters["transport_send_completed"] < expected);
         assert!(measured.run.metrics["achieved_hz"] < 125.0);
         assert!(measured.run.metrics["p99_us"] >= 20_000.0);
     }
@@ -966,6 +1153,11 @@ mod tests {
         );
         assert_eq!(measured.run.counters["slow_enqueue_full"], 0);
         assert_eq!(measured.run.counters["slow_enqueue_closed"], 0);
+        assert_eq!(measured.run.counters["primary_lane_realtime"], 1);
+        assert!(
+            measured.run.counters["primary_realtime_sent"] > 0,
+            "slow/fast fanout must broadcast typed realtime frames"
+        );
         assert!(measured.run.metrics.contains_key("fast_peer_p99_us"));
         assert!(measured.run.metrics.contains_key("slow_send_p99_us"));
         assert_eq!(
@@ -973,7 +1165,7 @@ mod tests {
             measured.run.counters["expected_sent"]
         );
         assert!(
-            measured.run.counters["actual_sent"] * 100
+            measured.run.counters["transport_send_completed"] * 100
                 >= measured.run.counters["expected_sent"] * 90,
             "counters={:?}, errors={:?}",
             measured.run.counters,
@@ -995,6 +1187,11 @@ mod tests {
         .unwrap();
 
         assert!(measured.run.metrics["stall_recovery_us"] >= 100_000.0);
+        assert_eq!(measured.run.counters["primary_lane_realtime"], 1);
+        assert!(
+            measured.run.counters["overwrite"] > 0,
+            "a 100 ms stalled latest-value consumer must observe realtime overwrites"
+        );
         assert_ne!(
             measured.run.metrics["stall_recovery_us"],
             measured.run.metrics["p99_us"]
