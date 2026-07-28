@@ -119,12 +119,17 @@ impl ConnectionView {
         self.pool.broadcast(message).await
     }
 
-    pub(crate) fn record_send_success(&self, device_id: &DeviceId) {
+    pub(crate) fn record_send_success(
+        &self,
+        device_id: &DeviceId,
+        generation: ControlConnectionId,
+    ) {
         if let Some(connection) = self
             .connections
             .write()
             .expect("canonical connection registry poisoned")
             .get_mut(device_id)
+            .filter(|connection| connection.info.control_connection_id == Some(generation))
         {
             connection.info.messages_sent += 1;
             connection.info.last_activity = Instant::now();
@@ -812,6 +817,57 @@ mod tests {
     async fn test_manager_new() {
         let manager = ConnectionManager::new(DeviceId::new_v4());
         assert_eq!(manager.connected_count().await, 0);
+    }
+
+    #[test]
+    fn stale_send_completion_does_not_increment_replacement_generation_metrics() {
+        let manager = ConnectionManager::new(DeviceId::new_v4());
+        let peer_id = DeviceId::new_v4();
+        let old_generation = ControlConnectionId::new();
+        let replacement_generation = ControlConnectionId::new();
+        insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: peer_id,
+                address: "127.0.0.1:27431".to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: Some(replacement_generation),
+            },
+        );
+
+        manager
+            .connection_view()
+            .record_send_success(&peer_id, old_generation);
+        let messages_sent = || {
+            manager
+                .connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&peer_id)
+                .expect("replacement remains canonical")
+                .info
+                .messages_sent
+        };
+        assert_eq!(
+            messages_sent(),
+            0,
+            "a late completion from the replaced generation must be ignored"
+        );
+
+        manager
+            .connection_view()
+            .record_send_success(&peer_id, replacement_generation);
+        assert_eq!(messages_sent(), 1);
     }
 
     #[tokio::test]

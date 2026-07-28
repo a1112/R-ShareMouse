@@ -13,7 +13,7 @@ use crate::{
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
     qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent, TransportSendError},
 };
-use rshare_core::{DeviceId, Message};
+use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 /// Network event
 #[derive(Debug, Clone)]
@@ -105,11 +105,15 @@ fn spawn_connection_event_forwarder(
 
 fn record_qos_broadcast_successes(
     connection_view: &ConnectionView,
-    results: &[(DeviceId, std::result::Result<(), TransportSendError>)],
+    results: &[(
+        DeviceId,
+        ControlConnectionId,
+        std::result::Result<(), TransportSendError>,
+    )],
 ) {
-    for (device_id, result) in results {
+    for (device_id, generation, result) in results {
         if result.is_ok() {
-            connection_view.record_send_success(device_id);
+            connection_view.record_send_success(device_id, *generation);
         }
     }
 }
@@ -246,27 +250,32 @@ impl NetworkManager {
     /// Send a message to a device
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
         if let Some(peer) = self.qos_registry.peer(device_id) {
+            let generation = peer.auth.control_connection_id;
             match ClassifiedMessage::try_from(message.clone())
                 .map_err(|error| anyhow::anyhow!(error))?
             {
                 ClassifiedMessage::Control(frame) => {
                     peer.transport.send_control(frame).await?;
-                    self.connection_view.record_send_success(device_id);
+                    self.connection_view
+                        .record_send_success(device_id, generation);
                     return Ok(());
                 }
                 ClassifiedMessage::Bulk(frame) => {
                     peer.transport.send_bulk(frame).await?;
-                    self.connection_view.record_send_success(device_id);
+                    self.connection_view
+                        .record_send_success(device_id, generation);
                     return Ok(());
                 }
                 ClassifiedMessage::Telemetry(frame) => {
                     peer.transport.try_send_telemetry(frame)?;
-                    self.connection_view.record_send_success(device_id);
+                    self.connection_view
+                        .record_send_success(device_id, generation);
                     return Ok(());
                 }
                 ClassifiedMessage::ReliableCompat(frame) => {
                     peer.transport.send_reliable_compat(frame).await?;
-                    self.connection_view.record_send_success(device_id);
+                    self.connection_view
+                        .record_send_success(device_id, generation);
                     return Ok(());
                 }
                 ClassifiedMessage::Unsupported => {}
@@ -281,44 +290,53 @@ impl NetworkManager {
             .map_err(|error| anyhow::anyhow!(error))?
         {
             ClassifiedMessage::Control(frame) if !self.qos_registry.is_empty() => {
-                let results = self.qos_registry.broadcast_control(frame).await;
+                let results = self
+                    .qos_registry
+                    .broadcast_control_with_generation(frame)
+                    .await;
                 record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
-                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                    .find_map(|(id, _, result)| result.err().map(|error| (id, error)))
                 {
                     anyhow::bail!("QoS broadcast to {id} failed: {error}");
                 }
                 return Ok(());
             }
             ClassifiedMessage::Bulk(frame) if !self.qos_registry.is_empty() => {
-                let results = self.qos_registry.broadcast_bulk(frame).await;
+                let results = self
+                    .qos_registry
+                    .broadcast_bulk_with_generation(frame)
+                    .await;
                 record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
-                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                    .find_map(|(id, _, result)| result.err().map(|error| (id, error)))
                 {
                     anyhow::bail!("QoS broadcast to {id} failed: {error}");
                 }
                 return Ok(());
             }
             ClassifiedMessage::Telemetry(frame) if !self.qos_registry.is_empty() => {
-                let results = self.qos_registry.broadcast_telemetry(frame);
+                let results = self.qos_registry.broadcast_telemetry_with_generation(frame);
                 record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
-                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                    .find_map(|(id, _, result)| result.err().map(|error| (id, error)))
                 {
                     anyhow::bail!("QoS broadcast to {id} failed: {error}");
                 }
                 return Ok(());
             }
             ClassifiedMessage::ReliableCompat(frame) if !self.qos_registry.is_empty() => {
-                let results = self.qos_registry.broadcast_reliable_compat(frame).await;
+                let results = self
+                    .qos_registry
+                    .broadcast_reliable_compat_with_generation(frame)
+                    .await;
                 record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
-                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                    .find_map(|(id, _, result)| result.err().map(|error| (id, error)))
                 {
                     anyhow::bail!("QoS broadcast to {id} failed: {error}");
                 }
