@@ -1,18 +1,24 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rshare_core::{KeyState, Message, MouseButton};
+use rshare_core::{
+    ClockDomainId, KeyState, Message, MonotonicStamp, MouseButton, RealtimeInputFrame,
+    RealtimeInputPayload, SessionEpoch, INPUT_PROTOCOL_VERSION,
+};
 use rshare_net::{ControlMessageCodec, RealtimeInputCodec};
 
 fn codec_benches(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("codec");
-    let mouse = Message::MouseMove { x: 101, y: -303 };
+    let mut mouse = RealtimeInputFrame {
+        protocol_version: INPUT_PROTOCOL_VERSION,
+        session_epoch: SessionEpoch(1),
+        sequence: 0,
+        captured_at: MonotonicStamp::new(ClockDomainId(1), 1_000),
+        payload: RealtimeInputPayload::RelativeMouse { dx: 101, dy: -303 },
+    };
     group.bench_function("realtime_mouse_encode_decode", |bencher| {
-        let mut sequence = 0_u32;
         bencher.iter(|| {
-            sequence = sequence.wrapping_add(1);
-            let encoded = RealtimeInputCodec::encode_message(sequence, black_box(&mouse))
-                .unwrap()
-                .unwrap();
-            black_box(RealtimeInputCodec::decode_message(&encoded).unwrap())
+            mouse.sequence = mouse.sequence.wrapping_add(1);
+            let encoded = RealtimeInputCodec::encode(black_box(&mouse)).unwrap();
+            black_box(RealtimeInputCodec::decode(&encoded).unwrap())
         })
     });
 

@@ -16,14 +16,14 @@ use rustls::{
 use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify};
 
-use super::codec::{ControlMessageCodec, RealtimeInputCodec};
+use super::codec::ControlMessageCodec;
 use super::encryption::{
     Encryption, PeerCertificateFingerprint, QuicIdentity, QuicTrustDecision, QuicTrustStore,
 };
@@ -449,22 +449,14 @@ impl QuicConnection {
             bootstrap_commit_ack_notify: Notify::new(),
             datagram_reader_start_barrier,
         });
-        let outbound_seq = Arc::new(AtomicU32::new(1));
-
         {
             let inner = inner.clone();
-            let outbound_seq = outbound_seq.clone();
             let writer_config = config.clone();
             tokio::spawn(async move {
                 while let Some(frame) = send_rx.recv().await {
-                    let result = send_outbound_message(
-                        &inner,
-                        &outbound_seq,
-                        &writer_config,
-                        &frame.message,
-                    )
-                    .await
-                    .map_err(|error| error.to_string());
+                    let result = send_outbound_message(&inner, &writer_config, &frame.message)
+                        .await
+                        .map_err(|error| error.to_string());
                     let _ = frame.ack.send(result);
                 }
             });
@@ -933,7 +925,6 @@ impl Clone for ConnectionPool {
 
 async fn send_outbound_message(
     inner: &Arc<QuicConnectionInner>,
-    outbound_seq: &Arc<AtomicU32>,
     config: &TransportConfig,
     message: &Message,
 ) -> Result<()> {
@@ -949,20 +940,24 @@ async fn send_outbound_message(
             );
         }
     }
-    let seq = outbound_seq.fetch_add(1, Ordering::Relaxed);
-
-    if let Some(datagram) = RealtimeInputCodec::encode_message(seq, message)? {
+    if let Some(datagram) = encode_legacy_realtime_message(message)? {
         if let Some(max_datagram_size) = inner.connection.max_datagram_size() {
             if datagram.len() <= max_datagram_size {
-                match inner.connection.send_datagram(Bytes::from(datagram)) {
+                match inner.connection.send_datagram(datagram) {
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!("QUIC datagram send failed, using fallback: {}", error);
+                        tracing::debug!("QUIC realtime datagram dropped: {}", error);
+                        return Ok(());
                     }
                 }
             }
         }
+        inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            "QUIC realtime datagram dropped because datagrams are unavailable or too small"
+        );
+        return Ok(());
     }
 
     let encoded = ControlMessageCodec::encode(message)?;
@@ -970,6 +965,28 @@ async fn send_outbound_message(
         anyhow::bail!("Reliable message too large: {} bytes", encoded.len());
     }
     write_reliable_frame(inner, &encoded).await
+}
+
+/// Temporary adapter for the legacy `Message` transport.
+///
+/// The epoch-scoped realtime codec remains lossless and independent. Task 9
+/// replaces this adapter when the transport accepts `RealtimeInputFrame`
+/// directly.
+pub(crate) fn encode_legacy_realtime_message(message: &Message) -> Result<Option<Bytes>> {
+    match message {
+        Message::MouseMove { .. } | Message::GamepadState { .. } => {
+            Ok(Some(Bytes::from(ControlMessageCodec::encode(message)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn decode_legacy_realtime_message(data: &[u8]) -> Result<Message> {
+    let message = ControlMessageCodec::decode(data)?;
+    match message {
+        Message::MouseMove { .. } | Message::GamepadState { .. } => Ok(message),
+        _ => anyhow::bail!("reliable message received on legacy realtime datagram adapter"),
+    }
 }
 
 async fn write_reliable_frame(inner: &Arc<QuicConnectionInner>, payload: &[u8]) -> Result<()> {
@@ -1240,7 +1257,7 @@ async fn read_realtime_datagrams(
 
     loop {
         match inner.connection.read_datagram().await {
-            Ok(datagram) => match RealtimeInputCodec::decode_message(&datagram) {
+            Ok(datagram) => match decode_legacy_realtime_message(&datagram) {
                 Ok(message) => {
                     inner
                         .last_datagram_rx_us
@@ -1553,6 +1570,27 @@ mod tests {
     use rustls::{SignatureAlgorithm, SignatureScheme};
     use tokio::time::timeout;
 
+    #[test]
+    fn legacy_realtime_adapter_is_private_and_rejects_reliable_messages() {
+        let realtime = Message::MouseMove { x: 7, y: -4 };
+        let encoded = encode_legacy_realtime_message(&realtime)
+            .unwrap()
+            .expect("mouse motion remains on the temporary datagram adapter");
+        assert!(matches!(
+            decode_legacy_realtime_message(&encoded).unwrap(),
+            Message::MouseMove { x: 7, y: -4 }
+        ));
+
+        let reliable = Message::Key {
+            keycode: 0x41,
+            state: rshare_core::KeyState::Pressed,
+        };
+        assert!(encode_legacy_realtime_message(&reliable).unwrap().is_none());
+
+        let reliable_bytes = ControlMessageCodec::encode(&reliable).unwrap();
+        assert!(decode_legacy_realtime_message(&reliable_bytes).is_err());
+    }
+
     #[derive(Debug)]
     struct CorruptSigningKey(Arc<dyn SigningKey>);
 
@@ -1773,13 +1811,13 @@ mod tests {
             .connect(&address.to_string(), server_id)
             .await
             .unwrap();
-        let datagram = RealtimeInputCodec::encode_message(1, &Message::MouseMove { x: 13, y: 17 })
+        let datagram = encode_legacy_realtime_message(&Message::MouseMove { x: 13, y: 17 })
             .unwrap()
             .unwrap();
         client_connection
             .inner
             .connection
-            .send_datagram(Bytes::from(datagram))
+            .send_datagram(datagram)
             .unwrap();
         let hello = ControlMessageCodec::encode(&rshare_core::hello_message(
             client_id,
@@ -2148,6 +2186,47 @@ mod tests {
             .unwrap();
 
         assert!(matches!(received, Message::MouseMove { x: 42, y: 24 }));
+    }
+
+    #[tokio::test]
+    async fn realtime_datagram_send_failure_is_counted_and_never_falls_back() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(local_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let server_addr = server
+            .server_endpoint
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut incoming = server.incoming();
+
+        let mut client = QuicTransport::new(remote_id);
+        let sender = client
+            .connect(&server_addr.to_string(), local_id)
+            .await
+            .unwrap();
+        let receiver = incoming.recv().await.unwrap().connection;
+        let dropped_before = sender.datagram_tx_dropped();
+        let reliable_resets_before = sender.reliable_stream_reset_count();
+
+        receiver.close().await;
+        timeout(Duration::from_secs(1), sender.inner.connection.closed())
+            .await
+            .expect("sender must observe the peer closing");
+
+        sender
+            .send_message(&Message::MouseMove { x: 1, y: 2 })
+            .await
+            .expect("realtime congestion is a counted drop, not a reliable send error");
+
+        assert_eq!(sender.datagram_tx_dropped(), dropped_before + 1);
+        assert_eq!(
+            sender.reliable_stream_reset_count(),
+            reliable_resets_before,
+            "a realtime datagram failure must never touch the reliable stream"
+        );
     }
 
     #[tokio::test]
