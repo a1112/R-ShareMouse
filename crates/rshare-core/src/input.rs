@@ -161,7 +161,21 @@ pub enum TransferError {
     },
 }
 
-#[derive(Debug, Clone)]
+/// The replay window has single ownership and cannot be cloned.
+///
+/// ```compile_fail
+/// use rshare_core::{
+///     AuthenticatedInputOwner, ControlConnectionId, DeviceId, InputOwnershipGate, SessionEpoch,
+/// };
+///
+/// let owner = AuthenticatedInputOwner {
+///     peer_id: DeviceId::nil(),
+///     control_connection_id: ControlConnectionId::new(),
+/// };
+/// let gate = InputOwnershipGate::new(owner, SessionEpoch(1));
+/// let forked_replay_window = gate.clone();
+/// ```
+#[derive(Debug)]
 pub struct InputOwnershipGate {
     owner: AuthenticatedInputOwner,
     epoch: SessionEpoch,
@@ -302,7 +316,15 @@ impl PendingReleaseBatch {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A held-state ledger has one identity and cannot be cloned.
+///
+/// ```compile_fail
+/// use rshare_core::PressedStateLedger;
+///
+/// let ledger = PressedStateLedger::new();
+/// let forked_ledger_identity = ledger.clone();
+/// ```
+#[derive(Debug)]
 pub struct PressedStateLedger {
     ledger_id: Uuid,
     next_generation: u64,
