@@ -13,6 +13,7 @@ use rshare_core::{
     MouseButton as WireMouseButton, PressedStateLedger, RealtimeInputFrame, RealtimeInputPayload,
     ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
 };
+use smallvec::{smallvec, SmallVec};
 use thiserror::Error;
 
 use crate::{ButtonState, InjectBackend, InputEvent, KeyCode, MouseButton};
@@ -21,6 +22,9 @@ static NEXT_CLOCK_DOMAIN: AtomicU64 = AtomicU64::new(1);
 const CONTROL_QUEUE_CAPACITY: usize = 4;
 const REALTIME_SEGMENT_CAPACITY: usize = 8;
 const RELATIVE_COMPONENT_CAPACITY: usize = 64;
+const TIMING_RING_CAPACITY: usize = 64;
+type RelativeComponents = SmallVec<[RelativeComponent; 8]>;
+type RelativeGroups = SmallVec<[RelativeComponents; 8]>;
 
 /// Construction settings for the injection actor.
 #[derive(Debug, Clone)]
@@ -55,6 +59,7 @@ pub enum RealtimeSubmitResult {
     WrongOwnerOrEpoch,
     EpochClosed,
     ProtocolViolation,
+    DeadlineOverflow,
     ShuttingDown,
 }
 
@@ -70,6 +75,8 @@ pub enum InjectionQueueFull {
     EpochClosed,
     #[error("the input protocol or sequence is invalid")]
     ProtocolViolation,
+    #[error("the requested lease deadline is outside the local monotonic clock range")]
+    DeadlineOverflow,
     #[error("the injection actor is shutting down")]
     ShuttingDown,
 }
@@ -103,8 +110,12 @@ pub struct InjectionTimingSample {
 /// thread and none of these submissions waits for backend I/O.
 #[derive(Clone)]
 pub struct InputInjectionHandle {
+    inner: Arc<ActorInner>,
+}
+
+struct ActorInner {
     queue: Arc<InjectionQueue>,
-    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl InputInjectionHandle {
@@ -120,7 +131,7 @@ impl InputInjectionHandle {
         let queue = Arc::new(InjectionQueue {
             state: Mutex::new(QueueState::new(config.reliable_capacity)),
             changed: Condvar::new(),
-            latest_timing: Mutex::new(None),
+            timing: Mutex::new(TimingState::new()),
             timing_changed: Condvar::new(),
             clock,
             realtime_coalesce_window: config.realtime_coalesce_window,
@@ -132,8 +143,10 @@ impl InputInjectionHandle {
             .map_err(InjectionStartError::Spawn)?;
 
         Ok(Self {
-            queue,
-            worker: Arc::new(Mutex::new(Some(worker))),
+            inner: Arc::new(ActorInner {
+                queue,
+                worker: Mutex::new(Some(worker)),
+            }),
         })
     }
 
@@ -143,7 +156,10 @@ impl InputInjectionHandle {
         epoch: SessionEpoch,
         lease_duration: Duration,
     ) -> Result<(), InjectionQueueFull> {
-        let mut state = self.queue.state.lock().unwrap();
+        let deadline = Instant::now()
+            .checked_add(lease_duration)
+            .ok_or(InjectionQueueFull::DeadlineOverflow)?;
+        let mut state = self.inner.queue.state.lock().unwrap();
         if state.shutdown {
             return Err(InjectionQueueFull::ShuttingDown);
         }
@@ -172,10 +188,10 @@ impl InputInjectionHandle {
             last_realtime_sequence: None,
             last_reliable_sequence: None,
             lease_duration,
-            deadline: Instant::now() + lease_duration,
+            deadline,
         });
         state.controls.push_back(ControlCommand::Begin { key });
-        self.queue.changed.notify_one();
+        self.inner.queue.changed.notify_one();
         Ok(())
     }
 
@@ -184,7 +200,7 @@ impl InputInjectionHandle {
         from: AuthenticatedInputOwner,
         frame: RealtimeInputFrame,
     ) -> RealtimeSubmitResult {
-        let mut state = self.queue.state.lock().unwrap();
+        let mut state = self.inner.queue.state.lock().unwrap();
         if state.shutdown {
             return RealtimeSubmitResult::ShuttingDown;
         }
@@ -203,7 +219,7 @@ impl InputInjectionHandle {
         }
         if frame.protocol_version != INPUT_PROTOCOL_VERSION {
             close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
-            self.queue.changed.notify_one();
+            self.inner.queue.changed.notify_one();
             return RealtimeSubmitResult::ProtocolViolation;
         }
         if active
@@ -213,11 +229,26 @@ impl InputInjectionHandle {
             return RealtimeSubmitResult::OutOfOrder;
         }
         active.last_realtime_sequence = Some(frame.sequence);
-        active.deadline = Instant::now() + active.lease_duration;
+        let Some(deadline) = Instant::now().checked_add(active.lease_duration) else {
+            close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
+            self.inner.queue.changed.notify_one();
+            return RealtimeSubmitResult::DeadlineOverflow;
+        };
+        active.deadline = deadline;
         state.active = Some(active);
-        let queued = QueuedRealtime::new(frame, self.queue.clock.now(), Instant::now());
+        let queued = QueuedRealtime::new(frame, self.inner.queue.clock.now(), Instant::now());
         let outcome = match state.ordinary.back_mut() {
-            Some(QueuedInput::Realtime(previous)) => merge_adjacent_realtime(previous, queued),
+            Some(QueuedInput::Realtime(previous)) => {
+                let target = if previous.followups.is_empty() {
+                    previous
+                } else {
+                    previous
+                        .followups
+                        .back_mut()
+                        .expect("non-empty followups must have a tail")
+                };
+                merge_adjacent_realtime(target, queued)
+            }
             _ => RealtimeMerge::Incompatible(queued),
         };
         let result = match outcome {
@@ -240,7 +271,7 @@ impl InputInjectionHandle {
                 }
             }
         };
-        self.queue.changed.notify_one();
+        self.inner.queue.changed.notify_one();
         result
     }
 
@@ -249,7 +280,7 @@ impl InputInjectionHandle {
         from: AuthenticatedInputOwner,
         frame: ReliableInputFrame,
     ) -> Result<(), InjectionQueueFull> {
-        let mut state = self.queue.state.lock().unwrap();
+        let mut state = self.inner.queue.state.lock().unwrap();
         if state.shutdown {
             return Err(InjectionQueueFull::ShuttingDown);
         }
@@ -268,52 +299,64 @@ impl InputInjectionHandle {
         }
         if frame.protocol_version != INPUT_PROTOCOL_VERSION {
             close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
-            self.queue.changed.notify_one();
+            self.inner.queue.changed.notify_one();
             return Err(InjectionQueueFull::ProtocolViolation);
         }
 
         if let ReliableInputEvent::ReleaseAll { reason } = frame.event {
             close_admission(&mut state, key, reason);
-            self.queue.changed.notify_one();
+            self.inner.queue.changed.notify_one();
             return Ok(());
         }
 
         if let Some(previous) = active.last_reliable_sequence {
             if frame.sequence != previous.saturating_add(1) {
                 close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
-                self.queue.changed.notify_one();
-                return Ok(());
+                self.inner.queue.changed.notify_one();
+                return Err(InjectionQueueFull::ProtocolViolation);
             }
         }
         if state.reliable_len >= state.reliable_capacity {
             return Err(InjectionQueueFull::QueueFull);
         }
         active.last_reliable_sequence = Some(frame.sequence);
-        active.deadline = Instant::now() + active.lease_duration;
+        let Some(deadline) = Instant::now().checked_add(active.lease_duration) else {
+            close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
+            self.inner.queue.changed.notify_one();
+            return Err(InjectionQueueFull::DeadlineOverflow);
+        };
+        active.deadline = deadline;
         state.active = Some(active);
         state
             .ordinary
             .push_back(QueuedInput::Reliable(QueuedReliable {
                 frame,
-                received_at: self.queue.clock.now(),
+                received_at: self.inner.queue.clock.now(),
             }));
         state.reliable_len += 1;
-        self.queue.changed.notify_one();
+        self.inner.queue.changed.notify_one();
         Ok(())
     }
 
     /// Close the active epoch locally. This is also the connection-loss entry
     /// point; it does not require the network to remain writable.
     pub fn request_release_all(&self, reason: ReleaseAllReason) {
-        let mut state = self.queue.state.lock().unwrap();
+        let mut state = self.inner.queue.state.lock().unwrap();
         if let Some(active) = state.active {
             close_admission(&mut state, active.key, reason);
-            self.queue.changed.notify_one();
+            self.inner.queue.changed.notify_one();
         }
     }
 
     pub fn latest_timing(&self) -> Option<InjectionTimingSample> {
-        *self.queue.latest_timing.lock().unwrap()
+        self.inner
+            .queue
+            .timing
+            .lock()
+            .unwrap()
+            .samples
+            .back()
+            .copied()
     }
 
     /// Wait for one exact timing sample without polling.
@@ -324,51 +367,48 @@ impl InputInjectionHandle {
     pub fn wait_for_timing(
         &self,
         epoch: SessionEpoch,
+        reliable: bool,
         sequence: u64,
         timeout: Duration,
     ) -> Option<InjectionTimingSample> {
-        let deadline = Instant::now() + timeout;
-        let mut latest = self.queue.latest_timing.lock().unwrap();
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut timing = self.inner.queue.timing.lock().unwrap();
         loop {
-            if latest
-                .as_ref()
-                .is_some_and(|sample| sample.epoch == epoch && sample.sequence == sequence)
-            {
-                return *latest;
+            if let Some(sample) = timing.samples.iter().rev().find(|sample| {
+                sample.epoch == epoch && sample.reliable == reliable && sample.sequence == sequence
+            }) {
+                return Some(*sample);
+            }
+            if timing.has_passed(epoch, reliable, sequence) {
+                return None;
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return None;
             }
-            let (next, timed_out) = self
+            let (next, _) = self
+                .inner
                 .queue
                 .timing_changed
-                .wait_timeout(latest, remaining)
+                .wait_timeout(timing, remaining)
                 .unwrap();
-            latest = next;
-            if timed_out.timed_out()
-                && !latest
-                    .as_ref()
-                    .is_some_and(|sample| sample.epoch == epoch && sample.sequence == sequence)
-            {
-                return None;
-            }
+            timing = next;
         }
     }
 
     pub fn shutdown(&self) -> Result<(), InjectionShutdownError> {
         let worker = {
-            let mut worker = self.worker.lock().unwrap();
+            let mut worker = self.inner.worker.lock().unwrap();
             worker
                 .take()
                 .ok_or(InjectionShutdownError::AlreadyShutdown)?
         };
         {
-            let mut state = self.queue.state.lock().unwrap();
+            let mut state = self.inner.queue.state.lock().unwrap();
             state.shutdown = true;
             state.clear_ordinary();
-            self.queue.changed.notify_one();
+            self.inner.queue.changed.notify_one();
         }
         worker
             .join()
@@ -376,11 +416,8 @@ impl InputInjectionHandle {
     }
 }
 
-impl Drop for InputInjectionHandle {
+impl Drop for ActorInner {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.worker) != 1 {
-            return;
-        }
         let worker = self.worker.lock().unwrap().take();
         if let Some(worker) = worker {
             {
@@ -399,10 +436,54 @@ impl Drop for InputInjectionHandle {
 struct InjectionQueue {
     state: Mutex<QueueState>,
     changed: Condvar,
-    latest_timing: Mutex<Option<InjectionTimingSample>>,
+    timing: Mutex<TimingState>,
     timing_changed: Condvar,
     clock: LocalMonotonicClock,
     realtime_coalesce_window: Duration,
+}
+
+struct TimingState {
+    samples: VecDeque<InjectionTimingSample>,
+    high_water: VecDeque<((SessionEpoch, bool), u64)>,
+    latest_epoch: [Option<SessionEpoch>; 2],
+}
+
+impl TimingState {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(TIMING_RING_CAPACITY),
+            high_water: VecDeque::with_capacity(TIMING_RING_CAPACITY),
+            latest_epoch: [None, None],
+        }
+    }
+
+    fn record_high_water(&mut self, epoch: SessionEpoch, reliable: bool, sequence: u64) {
+        let key = (epoch, reliable);
+        let high_water = self
+            .high_water
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+            .and_then(|position| self.high_water.remove(position))
+            .map_or(sequence, |(_, previous)| previous.max(sequence));
+        if self.high_water.len() == TIMING_RING_CAPACITY {
+            self.high_water.pop_front();
+        }
+        self.high_water.push_back((key, high_water));
+
+        let lane = usize::from(reliable);
+        if self.latest_epoch[lane].is_none_or(|latest| epoch.0 > latest.0) {
+            self.latest_epoch[lane] = Some(epoch);
+        }
+    }
+
+    fn has_passed(&self, epoch: SessionEpoch, reliable: bool, sequence: u64) -> bool {
+        self.high_water
+            .iter()
+            .rev()
+            .find(|(key, _)| *key == (epoch, reliable))
+            .is_some_and(|(_, high_water)| *high_water >= sequence)
+            || self.latest_epoch[usize::from(reliable)].is_some_and(|latest| latest.0 > epoch.0)
+    }
 }
 
 struct QueueState {
@@ -464,7 +545,8 @@ struct QueuedRealtime {
     frame: RealtimeInputFrame,
     received_at: MonotonicStamp,
     submitted_at: Instant,
-    relative_components: Vec<RelativeComponent>,
+    relative_components: RelativeComponents,
+    followups: VecDeque<QueuedRealtime>,
 }
 
 #[derive(Clone)]
@@ -480,7 +562,7 @@ struct RelativeComponent {
 impl QueuedRealtime {
     fn new(frame: RealtimeInputFrame, received_at: MonotonicStamp, submitted_at: Instant) -> Self {
         let relative_components = match frame.payload {
-            RealtimeInputPayload::RelativeMouse { dx, dy } => vec![RelativeComponent {
+            RealtimeInputPayload::RelativeMouse { dx, dy } => smallvec![RelativeComponent {
                 sequence: frame.sequence,
                 captured_at: frame.captured_at,
                 dx,
@@ -488,20 +570,21 @@ impl QueuedRealtime {
                 received_at,
                 submitted_at,
             }],
-            _ => Vec::new(),
+            _ => SmallVec::new(),
         };
         Self {
             frame,
             received_at,
             submitted_at,
             relative_components,
+            followups: VecDeque::new(),
         }
     }
 
     fn from_relative_components(
         protocol_version: u16,
         session_epoch: SessionEpoch,
-        components: Vec<RelativeComponent>,
+        components: RelativeComponents,
     ) -> Self {
         let first = components
             .first()
@@ -530,6 +613,7 @@ impl QueuedRealtime {
             received_at: first.received_at,
             submitted_at: last.submitted_at,
             relative_components: components,
+            followups: VecDeque::new(),
         }
     }
 }
@@ -835,7 +919,13 @@ fn next_work_item(queue: &InjectionQueue, session: Option<&WorkerSession>) -> Wo
             }
 
             match state.ordinary.pop_front().expect("front item must exist") {
-                QueuedInput::Realtime(realtime) => return WorkItem::Realtime(realtime),
+                QueuedInput::Realtime(mut realtime) => {
+                    if let Some(mut next) = realtime.followups.pop_front() {
+                        next.followups.append(&mut realtime.followups);
+                        state.ordinary.push_front(QueuedInput::Realtime(next));
+                    }
+                    return WorkItem::Realtime(realtime);
+                }
                 QueuedInput::Reliable(reliable) => {
                     state.reliable_len -= 1;
                     return WorkItem::Reliable(reliable);
@@ -898,28 +988,34 @@ fn split_front_relative_for_late_anchor(state: &mut QueueState) -> Option<Queued
         .expect("anchored reliable must follow realtime");
     let protocol_version = original.frame.protocol_version;
     let session_epoch = original.frame.session_epoch;
+    let mut original_followups = original.followups;
     let mut components = original.relative_components;
-    let suffix = components.split_off(split_index);
+    let suffix = components.drain(split_index..).collect();
     let prefix =
         QueuedRealtime::from_relative_components(protocol_version, session_epoch, components);
 
-    for group in group_representable_relative_components(suffix)
-        .into_iter()
-        .rev()
-    {
-        state.ordinary.push_front(QueuedInput::Realtime(
-            QueuedRealtime::from_relative_components(protocol_version, session_epoch, group),
-        ));
+    let mut suffix_groups = group_representable_relative_components(suffix).into_iter();
+    if let Some(group) = suffix_groups.next() {
+        let mut suffix_batch =
+            QueuedRealtime::from_relative_components(protocol_version, session_epoch, group);
+        suffix_batch.followups.extend(suffix_groups.map(|group| {
+            QueuedRealtime::from_relative_components(protocol_version, session_epoch, group)
+        }));
+        suffix_batch.followups.append(&mut original_followups);
+        state
+            .ordinary
+            .push_front(QueuedInput::Realtime(suffix_batch));
+    } else if let Some(mut first) = original_followups.pop_front() {
+        first.followups.append(&mut original_followups);
+        state.ordinary.push_front(QueuedInput::Realtime(first));
     }
     state.ordinary.push_front(reliable);
     Some(prefix)
 }
 
-fn group_representable_relative_components(
-    components: Vec<RelativeComponent>,
-) -> Vec<Vec<RelativeComponent>> {
-    let mut groups = Vec::new();
-    let mut current = Vec::new();
+fn group_representable_relative_components(components: RelativeComponents) -> RelativeGroups {
+    let mut groups = RelativeGroups::new();
+    let mut current = RelativeComponents::new();
     let mut current_dx = 0_i32;
     let mut current_dy = 0_i32;
 
@@ -1122,7 +1218,8 @@ fn record_timing(
     injection_completed: MonotonicStamp,
 ) {
     {
-        *queue.latest_timing.lock().unwrap() = Some(InjectionTimingSample {
+        let mut timing = queue.timing.lock().unwrap();
+        let sample = InjectionTimingSample {
             epoch,
             sequence,
             reliable,
@@ -1131,7 +1228,12 @@ fn record_timing(
                 injection_started: Some(injection_started),
                 injection_completed: Some(injection_completed),
             },
-        });
+        };
+        if timing.samples.len() == TIMING_RING_CAPACITY {
+            timing.samples.pop_front();
+        }
+        timing.samples.push_back(sample);
+        timing.record_high_water(epoch, reliable, sequence);
         queue.timing_changed.notify_all();
     }
 }
@@ -1178,5 +1280,141 @@ impl LocalMonotonicClock {
     fn now(self) -> MonotonicStamp {
         let micros = self.origin.elapsed().as_micros().min(u64::MAX as u128) as u64;
         MonotonicStamp::new(self.domain, micros)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relative_component(sequence: u64, dx: i32, dy: i32) -> RelativeComponent {
+        RelativeComponent {
+            sequence,
+            captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+            dx,
+            dy,
+            received_at: MonotonicStamp::new(ClockDomainId(2), sequence),
+            submitted_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn typical_relative_aggregate_and_anchor_split_stay_inline() {
+        let components: RelativeComponents = (1..=8)
+            .map(|sequence| relative_component(sequence, 1, 0))
+            .collect();
+        assert!(!components.spilled());
+
+        let aggregate = QueuedRealtime::from_relative_components(
+            INPUT_PROTOCOL_VERSION,
+            SessionEpoch(1),
+            components,
+        );
+        let anchor = QueuedReliable {
+            frame: ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: SessionEpoch(1),
+                sequence: 1,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), 8),
+                event: ReliableInputEvent::MouseButton {
+                    button: WireMouseButton::Left,
+                    state: WireButtonState::Pressed,
+                    x: 0,
+                    y: 0,
+                    realtime_anchor_sequence: 4,
+                },
+            },
+            received_at: MonotonicStamp::new(ClockDomainId(2), 8),
+        };
+        let mut state = QueueState::new(8);
+        state.ordinary.push_back(QueuedInput::Realtime(aggregate));
+        state.ordinary.push_back(QueuedInput::Reliable(anchor));
+        state.reliable_len = 1;
+
+        let prefix = split_front_relative_for_late_anchor(&mut state).unwrap();
+        assert!(!prefix.relative_components.spilled());
+        assert_eq!(prefix.relative_components.len(), 4);
+        let suffix = match state.ordinary.get(1).unwrap() {
+            QueuedInput::Realtime(suffix) => suffix,
+            QueuedInput::Reliable(_) => panic!("anchor must precede the suffix batch"),
+        };
+        assert!(!suffix.relative_components.spilled());
+        assert_eq!(suffix.relative_components.len(), 4);
+        assert!(suffix
+            .followups
+            .iter()
+            .all(|followup| !followup.relative_components.spilled()));
+    }
+
+    #[test]
+    fn timing_high_water_lane_metadata_is_bounded() {
+        let mut timing = TimingState::new();
+        for epoch in 1..=(TIMING_RING_CAPACITY as u64 + 1) {
+            timing.record_high_water(SessionEpoch(epoch), false, epoch);
+        }
+
+        assert_eq!(timing.high_water.len(), TIMING_RING_CAPACITY);
+        assert!(timing.has_passed(SessionEpoch(1), false, 1));
+        assert!(timing.has_passed(
+            SessionEpoch(TIMING_RING_CAPACITY as u64 + 1),
+            false,
+            TIMING_RING_CAPACITY as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn relative_component_spill_is_bounded_by_hard_capacity() {
+        let mut aggregate = QueuedRealtime::new(
+            RealtimeInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: SessionEpoch(1),
+                sequence: 1,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                payload: RealtimeInputPayload::RelativeMouse { dx: 1, dy: 0 },
+            },
+            MonotonicStamp::new(ClockDomainId(2), 1),
+            Instant::now(),
+        );
+        for sequence in 2..=RELATIVE_COMPONENT_CAPACITY as u64 {
+            let incoming = QueuedRealtime::new(
+                RealtimeInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: SessionEpoch(1),
+                    sequence,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+                    payload: RealtimeInputPayload::RelativeMouse { dx: 1, dy: 0 },
+                },
+                MonotonicStamp::new(ClockDomainId(2), sequence),
+                Instant::now(),
+            );
+            assert!(matches!(
+                merge_adjacent_realtime(&mut aggregate, incoming),
+                RealtimeMerge::Accumulated
+            ));
+        }
+        assert!(aggregate.relative_components.spilled());
+        assert_eq!(
+            aggregate.relative_components.len(),
+            RELATIVE_COMPONENT_CAPACITY
+        );
+
+        let overflow = QueuedRealtime::new(
+            RealtimeInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: SessionEpoch(1),
+                sequence: RELATIVE_COMPONENT_CAPACITY as u64 + 1,
+                captured_at: MonotonicStamp::new(
+                    ClockDomainId(1),
+                    RELATIVE_COMPONENT_CAPACITY as u64 + 1,
+                ),
+                payload: RealtimeInputPayload::RelativeMouse { dx: 1, dy: 0 },
+            },
+            MonotonicStamp::new(ClockDomainId(2), RELATIVE_COMPONENT_CAPACITY as u64 + 1),
+            Instant::now(),
+        );
+        assert!(matches!(
+            merge_adjacent_realtime(&mut aggregate, overflow),
+            RealtimeMerge::CapacityDropped
+        ));
     }
 }

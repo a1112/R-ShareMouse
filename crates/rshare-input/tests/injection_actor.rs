@@ -103,6 +103,7 @@ struct BlockingBackend {
     inner: RecordingBackend,
     gate: Arc<BlockingGate>,
     first: AtomicBool,
+    dropped: Option<mpsc::SyncSender<()>>,
 }
 
 impl fmt::Debug for BlockingBackend {
@@ -136,6 +137,14 @@ impl InjectBackend for BlockingBackend {
 
     fn is_active(&self) -> bool {
         true
+    }
+}
+
+impl Drop for BlockingBackend {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
     }
 }
 
@@ -656,6 +665,7 @@ fn bounded_control_pressure_keeps_release_reserved_and_purges_full_queue() {
         },
         gate: Arc::clone(&gate),
         first: AtomicBool::new(true),
+        dropped: None,
     };
     let actor = InputInjectionHandle::spawn(
         Box::new(backend),
@@ -766,8 +776,8 @@ fn reliable_gap_closes_epoch_and_releases_pressed_state() {
         )
         .unwrap();
     recorder.wait_for(1);
-    actor
-        .try_submit_reliable(
+    assert_eq!(
+        actor.try_submit_reliable(
             owner,
             reliable(
                 1,
@@ -777,8 +787,9 @@ fn reliable_gap_closes_epoch_and_releases_pressed_state() {
                     state: KeyState::Pressed,
                 },
             ),
-        )
-        .unwrap();
+        ),
+        Err(rshare_input::InjectionQueueFull::ProtocolViolation)
+    );
 
     assert_eq!(
         recorder.wait_for(2),
@@ -822,7 +833,10 @@ fn reliable_duplicate_closes_epoch_and_releases_pressed_state() {
 
     actor.try_submit_reliable(owner, key_down.clone()).unwrap();
     recorder.wait_for(1);
-    actor.try_submit_reliable(owner, key_down).unwrap();
+    assert_eq!(
+        actor.try_submit_reliable(owner, key_down),
+        Err(rshare_input::InjectionQueueFull::ProtocolViolation)
+    );
 
     assert_eq!(
         recorder.wait_for(2)[1],
@@ -979,7 +993,7 @@ fn injection_records_local_start_and_completion_stamps() {
     actor.submit_realtime(owner, realtime(1, 4, 2, 3));
     recorder.wait_for(1);
     let sample = actor
-        .wait_for_timing(SessionEpoch(1), 4, WAIT)
+        .wait_for_timing(SessionEpoch(1), false, 4, WAIT)
         .expect("missing timing sample");
 
     assert_eq!(sample.epoch, SessionEpoch(1));
@@ -1011,7 +1025,7 @@ fn timing_wait_has_no_lost_wakeup_before_or_during_wait() {
     let waiter = thread::spawn(move || {
         ready_tx.send(()).unwrap();
         waiter_actor
-            .wait_for_timing(SessionEpoch(1), 9, WAIT)
+            .wait_for_timing(SessionEpoch(1), false, 9, WAIT)
             .expect("waiter missed timing publication")
     });
     ready_rx.recv().unwrap();
@@ -1021,9 +1035,104 @@ fn timing_wait_has_no_lost_wakeup_before_or_during_wait() {
     assert_eq!(sample.sequence, 9);
 
     assert_eq!(
-        actor.wait_for_timing(SessionEpoch(1), 9, Duration::ZERO),
+        actor.wait_for_timing(SessionEpoch(1), false, 9, Duration::ZERO),
         Some(sample),
         "a publication before wait must be observed from guarded state"
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn timing_ring_retains_exact_older_sample_after_newer_publication() {
+    let backend = RecordingBackend {
+        recorder: Arc::new(Recorder::default()),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, _, owner) = fixture(backend, Duration::ZERO);
+
+    actor.submit_realtime(owner, realtime(1, 1, 1, 0));
+    actor
+        .wait_for_timing(SessionEpoch(1), false, 1, WAIT)
+        .unwrap();
+    actor.submit_realtime(owner, realtime(1, 2, 1, 0));
+    actor
+        .wait_for_timing(SessionEpoch(1), false, 2, WAIT)
+        .unwrap();
+
+    assert_eq!(
+        actor
+            .wait_for_timing(SessionEpoch(1), false, 1, Duration::ZERO)
+            .unwrap()
+            .sequence,
+        1
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn timing_ring_keys_realtime_and_reliable_lanes_separately() {
+    let backend = RecordingBackend {
+        recorder: Arc::new(Recorder::default()),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, _, owner) = fixture(backend, Duration::ZERO);
+
+    actor.submit_realtime(owner, realtime(1, 1, 1, 0));
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 65,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+
+    assert!(
+        !actor
+            .wait_for_timing(SessionEpoch(1), false, 1, WAIT)
+            .unwrap()
+            .reliable
+    );
+    assert!(
+        actor
+            .wait_for_timing(SessionEpoch(1), true, 1, WAIT)
+            .unwrap()
+            .reliable
+    );
+    actor.request_release_all(ReleaseAllReason::SessionEnded);
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn evicted_or_skipped_timing_sample_is_immediately_impossible() {
+    let backend = RecordingBackend {
+        recorder: Arc::new(Recorder::default()),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, _, owner) = fixture(backend, Duration::ZERO);
+
+    for sequence in 1..=65 {
+        actor.submit_realtime(owner, realtime(1, sequence, 1, 0));
+        actor
+            .wait_for_timing(SessionEpoch(1), false, sequence, WAIT)
+            .unwrap();
+    }
+
+    assert_eq!(
+        actor.wait_for_timing(SessionEpoch(1), false, 1, Duration::ZERO),
+        None
+    );
+    assert_eq!(
+        actor.wait_for_timing(SessionEpoch(1), false, 0, Duration::ZERO),
+        None
     );
     actor.shutdown().unwrap();
 }
@@ -1031,24 +1140,51 @@ fn timing_wait_has_no_lost_wakeup_before_or_during_wait() {
 #[tokio::test(flavor = "current_thread")]
 async fn slow_backend_does_not_block_tokio_receiver() {
     let recorder = Arc::new(Recorder::default());
-    let backend = RecordingBackend {
-        recorder,
-        delay: Duration::from_millis(150),
-        fail_relative: false,
+    let gate = Arc::new(BlockingGate::default());
+    let backend = BlockingBackend {
+        inner: RecordingBackend {
+            recorder,
+            delay: Duration::ZERO,
+            fail_relative: false,
+        },
+        gate: Arc::clone(&gate),
+        first: AtomicBool::new(true),
+        dropped: None,
     };
-    let (actor, _, owner) = fixture(backend, Duration::ZERO);
+    let actor = InputInjectionHandle::spawn(
+        Box::new(backend),
+        InjectionActorConfig {
+            reliable_capacity: 8,
+            thread_name: "rshare-input-injection-test".into(),
+            realtime_coalesce_window: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    let owner = owner();
+    actor
+        .begin_session(owner, SessionEpoch(1), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 65,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    gate.wait_until_entered();
 
-    let started = Instant::now();
     assert_eq!(
-        actor.submit_realtime(owner, realtime(1, 1, 1, 1)),
+        actor.submit_realtime(owner, realtime(1, 2, 1, 1)),
         RealtimeSubmitResult::Accepted
     );
-    assert!(
-        started.elapsed() < Duration::from_millis(25),
-        "submission blocked the async receiver for {:?}",
-        started.elapsed()
-    );
     tokio::task::yield_now().await;
+    gate.release();
     actor.shutdown().unwrap();
 }
 
@@ -1069,6 +1205,113 @@ fn dropping_last_handle_stops_actor_and_drops_backend() {
     drop(actor);
 
     dropped_rx
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(WAIT)
         .expect("last handle drop must stop the actor thread");
+}
+
+#[test]
+fn concurrent_last_clone_drops_stop_exactly_one_actor() {
+    let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+    let backend = DropSignalingBackend {
+        inner: RecordingBackend {
+            recorder: Arc::new(Recorder::default()),
+            delay: Duration::ZERO,
+            fail_relative: false,
+        },
+        dropped: dropped_tx,
+    };
+    let actor =
+        InputInjectionHandle::spawn(Box::new(backend), InjectionActorConfig::default()).unwrap();
+    let clone = actor.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let (done_tx, done_rx) = mpsc::sync_channel(2);
+    let first_barrier = Arc::clone(&barrier);
+    let first_done = done_tx.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        drop(actor);
+        first_done.send(()).unwrap();
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        drop(clone);
+        done_tx.send(()).unwrap();
+    });
+
+    barrier.wait();
+    done_rx.recv_timeout(WAIT).unwrap();
+    done_rx.recv_timeout(WAIT).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    dropped_rx
+        .recv_timeout(WAIT)
+        .expect("backend leaked after concurrent last-clone drops");
+}
+
+#[test]
+fn last_handle_drop_does_not_wait_for_inflight_slow_backend() {
+    let recorder = Arc::new(Recorder::default());
+    let gate = Arc::new(BlockingGate::default());
+    let (backend_dropped_tx, backend_dropped_rx) = mpsc::sync_channel(1);
+    let backend = BlockingBackend {
+        inner: RecordingBackend {
+            recorder,
+            delay: Duration::ZERO,
+            fail_relative: false,
+        },
+        gate: Arc::clone(&gate),
+        first: AtomicBool::new(true),
+        dropped: Some(backend_dropped_tx),
+    };
+    let actor =
+        InputInjectionHandle::spawn(Box::new(backend), InjectionActorConfig::default()).unwrap();
+    let owner = owner();
+    actor
+        .begin_session(owner, SessionEpoch(1), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 65,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    gate.wait_until_entered();
+    let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        drop(actor);
+        drop_done_tx.send(()).unwrap();
+    });
+
+    drop_done_rx
+        .recv_timeout(WAIT)
+        .expect("last handle drop blocked on the in-flight backend");
+    gate.release();
+    backend_dropped_rx
+        .recv_timeout(WAIT)
+        .expect("detached actor did not eventually release backend");
+}
+
+#[test]
+fn impossible_lease_deadline_is_rejected_explicitly() {
+    let backend = RecordingBackend {
+        recorder: Arc::new(Recorder::default()),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let actor =
+        InputInjectionHandle::spawn(Box::new(backend), InjectionActorConfig::default()).unwrap();
+
+    assert_eq!(
+        actor.begin_session(owner(), SessionEpoch(1), Duration::MAX),
+        Err(rshare_input::InjectionQueueFull::DeadlineOverflow)
+    );
+    actor.shutdown().unwrap();
 }
