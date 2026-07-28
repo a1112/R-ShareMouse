@@ -41,6 +41,12 @@ const BOOTSTRAP_DATAGRAM_READER_ACK: u8 = 0b10;
 const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum QuicServerStartError {
+    #[error("QUIC transport server is already registered; call close before starting it again")]
+    AlreadyRunning,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     pub max_idle_timeout: Duration,
@@ -244,6 +250,10 @@ impl QuicTransport {
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
+        if self.server_endpoint.is_some() || self.server_task.is_some() {
+            return Err(QuicServerStartError::AlreadyRunning.into());
+        }
+
         let bind_addr: SocketAddr = bind_addr
             .parse()
             .map_err(|_| anyhow!("Invalid bind address: {}", bind_addr))?;
@@ -5114,6 +5124,136 @@ mod tests {
                 "test trust state must stay inside the per-crate scratch tree"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_start_is_rejected_without_replacing_the_first_listener() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        let server_state = server.state_lifetime.as_ref().unwrap().state_dir.clone();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let first_addr = server.local_addr().unwrap();
+        let first_task_id = server.server_task.as_ref().unwrap().id();
+        let mut incoming = server.incoming();
+
+        let error = server
+            .start_server("127.0.0.1:0")
+            .await
+            .expect_err("a registered server must reject a second start");
+        assert!(matches!(
+            error.downcast_ref::<QuicServerStartError>(),
+            Some(QuicServerStartError::AlreadyRunning)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "QUIC transport server is already registered; call close before starting it again"
+        );
+        assert_eq!(server.local_addr(), Some(first_addr));
+        assert!(server.is_running());
+        assert_eq!(server.server_task.as_ref().unwrap().id(), first_task_id);
+
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_state = client.state_lifetime.as_ref().unwrap().state_dir.clone();
+        let mut client_connection = client
+            .connect(&first_addr.to_string(), server_id)
+            .await
+            .expect("the original listener must still complete a real QUIC handshake");
+        let mut server_connection = timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .expect("the original listener must accept within the deadline")
+            .expect("the original listener must publish its connection")
+            .connection;
+        client_connection.confirm_peer_identity(server_id).unwrap();
+        server_connection
+            .confirm_inbound_peer_identity(client_id)
+            .unwrap();
+        assert!(
+            server_state.exists(),
+            "the original listener connection must retain server state"
+        );
+        assert!(
+            client_state.exists(),
+            "the established client connection must retain client state"
+        );
+
+        client_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"repeated start lifetime test complete");
+        server_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"repeated start lifetime test complete");
+        drop(client_connection);
+        drop(server_connection);
+        server.close().await.unwrap();
+        drop(server);
+        drop(client);
+        drop(incoming);
+        timeout(Duration::from_secs(1), async {
+            while server_state.exists() || client_state.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all connection and listener owners must release isolated state");
+    }
+
+    #[tokio::test]
+    async fn finished_server_task_still_requires_explicit_close_before_restart() {
+        let mut server = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        let server_state = server.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(&server_state).unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let first_addr = server.local_addr().unwrap();
+        let first_task_id = server.server_task.as_ref().unwrap().id();
+        server
+            .server_endpoint
+            .as_ref()
+            .expect("the first endpoint must be registered")
+            .close(0u32.into(), b"finish accept loop for restart test");
+        timeout(Duration::from_secs(1), async {
+            while server.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the endpoint must finish its accept loop");
+
+        let error = server
+            .start_server("not-a-socket-address")
+            .await
+            .expect_err("registered fields must be rejected before parsing a new bind address");
+        assert!(matches!(
+            error.downcast_ref::<QuicServerStartError>(),
+            Some(QuicServerStartError::AlreadyRunning)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "QUIC transport server is already registered; call close before starting it again"
+        );
+        assert_eq!(server.local_addr(), Some(first_addr));
+        assert!(!server.is_running());
+        assert_eq!(server.server_task.as_ref().unwrap().id(), first_task_id);
+
+        server.close().await.unwrap();
+        assert_eq!(server.local_addr(), None);
+        assert!(!server.is_running());
+        server
+            .start_server("127.0.0.1:0")
+            .await
+            .expect("explicit close must permit a clean restart");
+        assert!(server.is_running());
+        server.close().await.unwrap();
+        drop(server);
+        timeout(Duration::from_secs(1), async {
+            while server_state.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit close must release the finished listener state owner");
     }
 
     #[test]
