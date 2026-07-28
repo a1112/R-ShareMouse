@@ -1538,6 +1538,9 @@ fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<Di
             width: display.width.max(1),
             height: display.height.max(1),
             primary: display.primary || (!has_primary && index == 0),
+            scale_percent: display.scale_percent,
+            dpi_x: display.dpi_x,
+            dpi_y: display.dpi_y,
         })
         .collect()
 }

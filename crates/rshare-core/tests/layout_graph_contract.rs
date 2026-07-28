@@ -3,7 +3,10 @@
 //! This test module verifies that the layout graph correctly resolves
 //! peer targets based on directional links.
 
-use rshare_core::{Direction, DisplayNode, LayoutGraph, LayoutLink, LayoutNode};
+use rshare_core::{
+    Direction, DisplayNode, LayoutGraph, LayoutLink, LayoutNode, LocalDisplayInfo,
+    LocalDisplayState, PixelRect, RouteCache, VirtualDesktopGeometry,
+};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -30,6 +33,9 @@ fn layout_graph_resolves_right_link_target() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
     graph.add_node(LayoutNode {
@@ -41,6 +47,9 @@ fn layout_graph_resolves_right_link_target() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
 
@@ -74,6 +83,9 @@ fn layout_graph_returns_none_for_disconnected_peer() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
     graph.add_node(LayoutNode {
@@ -85,6 +97,9 @@ fn layout_graph_returns_none_for_disconnected_peer() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
 
@@ -117,6 +132,9 @@ fn layout_graph_returns_none_for_missing_link() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
     graph.add_node(LayoutNode {
@@ -128,6 +146,9 @@ fn layout_graph_returns_none_for_missing_link() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
 
@@ -156,6 +177,9 @@ fn layout_graph_returns_none_for_non_local_device() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
     graph.add_node(LayoutNode {
@@ -167,6 +191,9 @@ fn layout_graph_returns_none_for_non_local_device() {
             width: 1920,
             height: 1080,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }],
     });
 
@@ -408,4 +435,133 @@ fn layout_graph_merge_uses_stable_order_for_multiple_new_devices() {
 
     assert_eq!(primary_x(&graph, first), 1920);
     assert_eq!(primary_x(&graph, second), 3840);
+}
+
+#[test]
+fn virtual_desktop_geometry_uses_active_monitor_union_with_negative_coordinates() {
+    let state = LocalDisplayState {
+        virtual_x: -1920,
+        virtual_y: -1080,
+        layout_width: 4480,
+        layout_height: 2520,
+        displays: vec![
+            LocalDisplayInfo {
+                display_id: "left".to_string(),
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                active: true,
+                ..LocalDisplayInfo::default()
+            },
+            LocalDisplayInfo {
+                display_id: "upper-right".to_string(),
+                x: 0,
+                y: -1080,
+                width: 2560,
+                height: 1440,
+                active: true,
+                ..LocalDisplayInfo::default()
+            },
+        ],
+        ..LocalDisplayState::default()
+    };
+
+    let geometry = VirtualDesktopGeometry::from(&state);
+
+    assert_eq!(geometry.bounds(), PixelRect::new(-1920, -1080, 4480, 2160));
+}
+
+#[test]
+fn display_node_deserializes_old_layouts_without_scale_or_dpi() {
+    let display: DisplayNode = serde_json::from_str(
+        r#"{
+            "display_id":"legacy",
+            "x":0,
+            "y":0,
+            "width":1920,
+            "height":1080,
+            "primary":true
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(display.scale_percent, None);
+    assert_eq!(display.dpi_x, None);
+    assert_eq!(display.dpi_y, None);
+}
+
+#[test]
+fn route_cache_indexes_four_connected_directional_targets() {
+    let local = Uuid::new_v4();
+    let targets = [
+        (Direction::Left, Direction::Right, Uuid::new_v4()),
+        (Direction::Right, Direction::Left, Uuid::new_v4()),
+        (Direction::Top, Direction::Bottom, Uuid::new_v4()),
+        (Direction::Bottom, Direction::Top, Uuid::new_v4()),
+    ];
+    let mut graph = LayoutGraph::new(local);
+    graph.add_node(LayoutNode::new(local, -1920, -1080, 3840, 2160));
+    for (index, (from_edge, target_edge, target)) in targets.iter().copied().enumerate() {
+        graph.add_node(LayoutNode {
+            device_id: target,
+            displays: vec![DisplayNode::primary((index as i32) * 100, 0, 2560, 1440)],
+        });
+        graph.add_link(LayoutLink::new(local, from_edge, target, target_edge));
+    }
+    let connected = targets
+        .iter()
+        .map(|(_, _, target)| *target)
+        .collect::<HashSet<_>>();
+
+    let cache = RouteCache::build(&graph, local, &connected, 7);
+
+    assert_eq!(cache.generation(), 7);
+    for (from_edge, target_edge, target) in targets {
+        let route = cache
+            .route(from_edge)
+            .expect("connected route must be cached");
+        assert_eq!(route.device_id, target);
+        assert_eq!(route.entry_edge, target_edge);
+        assert_eq!(
+            route.display,
+            PixelRect::new(route.display.x, 0, 2560, 1440)
+        );
+    }
+}
+
+#[test]
+fn route_cache_preserves_target_monitor_offsets_relative_to_node_bounds() {
+    let local = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let mut graph = LayoutGraph::new(local);
+    graph.add_node(LayoutNode::new(local, 0, 0, 1920, 1080));
+    graph.add_node(LayoutNode {
+        device_id: target,
+        displays: vec![
+            DisplayNode::secondary("left".to_string(), 5000, 300, 1920, 1080),
+            DisplayNode {
+                display_id: "primary".to_string(),
+                x: 6920,
+                y: 300,
+                width: 2560,
+                height: 1440,
+                primary: true,
+                scale_percent: Some(125),
+                dpi_x: Some(120),
+                dpi_y: Some(120),
+            },
+        ],
+    });
+    graph.add_link(LayoutLink::new(
+        local,
+        Direction::Right,
+        target,
+        Direction::Left,
+    ));
+
+    let cache = RouteCache::build(&graph, local, &HashSet::from([target]), 1);
+    let route = cache.route(Direction::Right).unwrap();
+
+    assert_eq!(route.display, PixelRect::new(1920, 0, 2560, 1440));
 }

@@ -1413,6 +1413,9 @@ mod tests {
             width: 2560,
             height: 1440,
             primary: false,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         });
         layout.add_node(node);
         layout

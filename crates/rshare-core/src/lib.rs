@@ -13,6 +13,7 @@ pub mod engine;
 pub mod hardware_assets;
 pub mod input;
 pub mod input_mode;
+pub mod input_router;
 pub mod ipc;
 pub mod layout;
 pub mod local_controls;
@@ -49,6 +50,9 @@ pub use input::{
     RealtimeInputPayload, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, SessionEpoch,
     SessionEpochError, TransferError, INPUT_PROTOCOL_VERSION,
 };
+
+// Re-exports from the pure single-owner input router.
+pub use input_router::{InputRouter, RouterCommand, RouterInput, RouterMetric, RouterOutput};
 
 // Re-exports from monotonic performance contracts used by input frames
 pub use perf::{ClockDomainId, MonotonicStamp};
@@ -118,7 +122,10 @@ pub use runtime::{
 };
 
 // Re-exports from layout
-pub use layout::{DisplayNode, LayoutGraph, LayoutLink, LayoutNode};
+pub use layout::{
+    DisplayNode, LayoutGraph, LayoutLink, LayoutNode, PixelRect, RouteCache, RouteTarget,
+    VirtualDesktopGeometry,
+};
 
 // Re-exports from session
 pub use session::{CaptureSessionStateMachine, TransitionError};

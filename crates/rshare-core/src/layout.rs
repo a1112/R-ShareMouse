@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::{Direction, ScreenInfo};
+use crate::{Direction, LocalDisplayState, ScreenInfo};
 
 const DEFAULT_DISPLAY_WIDTH: u32 = 1920;
 const DEFAULT_DISPLAY_HEIGHT: u32 = 1080;
@@ -28,6 +28,15 @@ pub struct DisplayNode {
     pub height: u32,
     /// Whether this is the primary display.
     pub primary: bool,
+    /// Optional UI scaling percentage reported by the target.
+    #[serde(default)]
+    pub scale_percent: Option<u32>,
+    /// Optional horizontal target DPI.
+    #[serde(default)]
+    pub dpi_x: Option<u32>,
+    /// Optional vertical target DPI.
+    #[serde(default)]
+    pub dpi_y: Option<u32>,
 }
 
 impl DisplayNode {
@@ -40,6 +49,9 @@ impl DisplayNode {
             width,
             height,
             primary: true,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }
     }
 
@@ -52,7 +64,258 @@ impl DisplayNode {
             width,
             height,
             primary: false,
+            scale_percent: None,
+            dpi_x: None,
+            dpi_y: None,
         }
+    }
+}
+
+/// Pixel-space rectangle using a signed origin and unsigned extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PixelRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub(crate) fn edge_at(self, x: i32, y: i32) -> Option<Direction> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        if x == self.x && self.contains_y(y) {
+            Some(Direction::Left)
+        } else if x == self.last_x() && self.contains_y(y) {
+            Some(Direction::Right)
+        } else if y == self.y && self.contains_x(x) {
+            Some(Direction::Top)
+        } else if y == self.last_y() && self.contains_x(x) {
+            Some(Direction::Bottom)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn project_to(self, target: Self, x: i32, y: i32) -> (i32, i32) {
+        (
+            project_axis(x, self.x, self.width, target.x, target.width),
+            project_axis(y, self.y, self.height, target.y, target.height),
+        )
+    }
+
+    pub(crate) fn last_x(self) -> i32 {
+        extent_end(self.x, self.width)
+    }
+
+    pub(crate) fn last_y(self) -> i32 {
+        extent_end(self.y, self.height)
+    }
+
+    fn contains_x(self, x: i32) -> bool {
+        x >= self.x && x <= self.last_x()
+    }
+
+    fn contains_y(self, y: i32) -> bool {
+        y >= self.y && y <= self.last_y()
+    }
+}
+
+fn extent_end(origin: i32, extent: u32) -> i32 {
+    let span = i64::from(extent.saturating_sub(1));
+    (i64::from(origin) + span).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn project_axis(
+    value: i32,
+    source_origin: i32,
+    source_extent: u32,
+    target_origin: i32,
+    target_extent: u32,
+) -> i32 {
+    let source_span = i64::from(source_extent.saturating_sub(1));
+    let target_span = i64::from(target_extent.saturating_sub(1));
+    if source_span == 0 || target_span == 0 {
+        return target_origin;
+    }
+    let offset = (i64::from(value) - i64::from(source_origin)).clamp(0, source_span);
+    let projected = (offset * target_span + source_span / 2) / source_span;
+    (i64::from(target_origin) + projected).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Immutable virtual-desktop geometry consumed by the input router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualDesktopGeometry {
+    bounds: PixelRect,
+}
+
+impl VirtualDesktopGeometry {
+    pub const fn new(bounds: PixelRect) -> Self {
+        Self { bounds }
+    }
+
+    pub const fn bounds(self) -> PixelRect {
+        self.bounds
+    }
+
+    /// Build the capture geometry from a local layout node's display union.
+    pub fn from_layout_node(node: &LayoutNode) -> Option<Self> {
+        let mut displays = node
+            .displays
+            .iter()
+            .filter(|display| display.width > 0 && display.height > 0);
+        let first = displays.next()?;
+        let mut min_x = i64::from(first.x);
+        let mut min_y = i64::from(first.y);
+        let mut max_x = i64::from(first.x) + i64::from(first.width);
+        let mut max_y = i64::from(first.y) + i64::from(first.height);
+        for display in displays {
+            min_x = min_x.min(i64::from(display.x));
+            min_y = min_y.min(i64::from(display.y));
+            max_x = max_x.max(i64::from(display.x) + i64::from(display.width));
+            max_y = max_y.max(i64::from(display.y) + i64::from(display.height));
+        }
+        Some(Self::new(PixelRect::new(
+            min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            (max_x - min_x).clamp(0, i64::from(u32::MAX)) as u32,
+            (max_y - min_y).clamp(0, i64::from(u32::MAX)) as u32,
+        )))
+    }
+}
+
+impl From<&LocalDisplayState> for VirtualDesktopGeometry {
+    fn from(state: &LocalDisplayState) -> Self {
+        let mut active = state
+            .displays
+            .iter()
+            .filter(|display| display.active && display.width > 0 && display.height > 0);
+        let bounds = if let Some(first) = active.next() {
+            let mut min_x = i64::from(first.x);
+            let mut min_y = i64::from(first.y);
+            let mut max_x = i64::from(first.x) + i64::from(first.width);
+            let mut max_y = i64::from(first.y) + i64::from(first.height);
+            for display in active {
+                min_x = min_x.min(i64::from(display.x));
+                min_y = min_y.min(i64::from(display.y));
+                max_x = max_x.max(i64::from(display.x) + i64::from(display.width));
+                max_y = max_y.max(i64::from(display.y) + i64::from(display.height));
+            }
+            PixelRect::new(
+                min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                (max_x - min_x).clamp(0, i64::from(u32::MAX)) as u32,
+                (max_y - min_y).clamp(0, i64::from(u32::MAX)) as u32,
+            )
+        } else {
+            PixelRect::new(
+                state.virtual_x,
+                state.virtual_y,
+                state.layout_width,
+                state.layout_height,
+            )
+        };
+        Self::new(bounds)
+    }
+}
+
+/// Pre-resolved target for one local desktop edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTarget {
+    pub device_id: Uuid,
+    pub entry_edge: Direction,
+    pub display_id: String,
+    pub display: PixelRect,
+}
+
+/// Four-direction route index rebuilt only after topology/connectivity changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCache {
+    generation: u64,
+    routes: [Option<RouteTarget>; 4],
+}
+
+impl RouteCache {
+    pub fn build(
+        graph: &LayoutGraph,
+        local_id: Uuid,
+        connected_peers: &HashSet<Uuid>,
+        generation: u64,
+    ) -> Self {
+        let mut routes = std::array::from_fn(|_| None);
+        for link in graph
+            .links
+            .iter()
+            .filter(|link| link.from_device == local_id)
+        {
+            if routes[direction_index(link.from_edge)].is_some()
+                || !connected_peers.contains(&link.to_device)
+            {
+                continue;
+            }
+            let Some(node) = graph.get_node(link.to_device) else {
+                continue;
+            };
+            let Some(display) = node.primary_display() else {
+                continue;
+            };
+            routes[direction_index(link.from_edge)] = Some(RouteTarget {
+                device_id: link.to_device,
+                entry_edge: link.to_edge,
+                display_id: display.display_id.clone(),
+                display: node_local_display_rect(node, display),
+            });
+        }
+        Self { generation, routes }
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn route(&self, direction: Direction) -> Option<&RouteTarget> {
+        self.routes[direction_index(direction)].as_ref()
+    }
+}
+
+fn node_local_display_rect(node: &LayoutNode, display: &DisplayNode) -> PixelRect {
+    let origin_x = node
+        .displays
+        .iter()
+        .filter(|candidate| candidate.width > 0 && candidate.height > 0)
+        .map(|candidate| candidate.x)
+        .min()
+        .unwrap_or(display.x);
+    let origin_y = node
+        .displays
+        .iter()
+        .filter(|candidate| candidate.width > 0 && candidate.height > 0)
+        .map(|candidate| candidate.y)
+        .min()
+        .unwrap_or(display.y);
+    let local_x = (i64::from(display.x) - i64::from(origin_x))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let local_y = (i64::from(display.y) - i64::from(origin_y))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    PixelRect::new(local_x, local_y, display.width, display.height)
+}
+
+const fn direction_index(direction: Direction) -> usize {
+    match direction {
+        Direction::Left => 0,
+        Direction::Right => 1,
+        Direction::Top => 2,
+        Direction::Bottom => 3,
     }
 }
 
