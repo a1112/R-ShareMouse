@@ -3,8 +3,8 @@
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rshare_core::{
-    ClockDomainId, Message, MonotonicStamp, RealtimeInputFrame, RealtimeInputPayload, SessionEpoch,
-    INPUT_PROTOCOL_VERSION,
+    ClockDomainId, Message, MonotonicStamp, RealtimeInputFrame, RealtimeInputPayload,
+    ReliableInputEvent, ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
 };
 
 /// Message frame format
@@ -22,6 +22,9 @@ const RELATIVE_MOUSE_PAYLOAD_SIZE: u16 = 8;
 const ABSOLUTE_ANCHOR_PAYLOAD_SIZE: u16 = 8;
 const GAMEPAD_AXES_PAYLOAD_SIZE: u16 = 13;
 const CURSOR_VISUAL_PAYLOAD_SIZE: u16 = 9;
+pub const MAX_RELIABLE_INPUT_FRAME: usize = 4 * 1024;
+// Reserve space for fixed frame metadata, the event tag, and the string length prefix.
+const MAX_TEXT_COMMIT_BYTES: usize = MAX_RELIABLE_INPUT_FRAME - 64;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -202,6 +205,77 @@ impl RealtimeInputCodec {
             payload,
         })
     }
+}
+
+pub struct ReliableInputCodec;
+
+impl ReliableInputCodec {
+    pub fn encode(frame: &ReliableInputFrame) -> Result<Bytes> {
+        anyhow::ensure!(
+            frame.protocol_version == INPUT_PROTOCOL_VERSION,
+            "unsupported reliable input body version: {}",
+            frame.protocol_version
+        );
+        validate_text_commit_size(frame)?;
+
+        let config = bincode::config::standard()
+            .with_big_endian()
+            .with_fixed_int_encoding()
+            .with_limit::<MAX_RELIABLE_INPUT_FRAME>();
+        let body = bincode::serde::encode_to_vec(frame, config)?;
+        anyhow::ensure!(
+            body.len() <= MAX_RELIABLE_INPUT_FRAME,
+            "reliable input body too large: {} bytes",
+            body.len()
+        );
+
+        let mut encoded = BytesMut::with_capacity(2 + body.len());
+        encoded.put_u16(INPUT_PROTOCOL_VERSION);
+        encoded.extend_from_slice(&body);
+        Ok(encoded.freeze())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<ReliableInputFrame> {
+        anyhow::ensure!(
+            (2..=MAX_RELIABLE_INPUT_FRAME + 2).contains(&data.len()),
+            "invalid reliable input frame length: {} bytes",
+            data.len()
+        );
+        let outer_version = u16::from_be_bytes(data[0..2].try_into()?);
+        anyhow::ensure!(
+            outer_version == INPUT_PROTOCOL_VERSION,
+            "unsupported reliable input outer version: {outer_version}"
+        );
+
+        let config = bincode::config::standard()
+            .with_big_endian()
+            .with_fixed_int_encoding()
+            .with_limit::<MAX_RELIABLE_INPUT_FRAME>();
+        let (frame, consumed): (ReliableInputFrame, usize) =
+            bincode::serde::decode_from_slice(&data[2..], config)?;
+        anyhow::ensure!(
+            consumed == data.len() - 2,
+            "trailing reliable input bytes: consumed {consumed}, body length {}",
+            data.len() - 2
+        );
+        anyhow::ensure!(
+            frame.protocol_version == INPUT_PROTOCOL_VERSION,
+            "reliable input prefix/body version mismatch: outer {outer_version}, body {}",
+            frame.protocol_version
+        );
+        validate_text_commit_size(&frame)?;
+        Ok(frame)
+    }
+}
+
+fn validate_text_commit_size(frame: &ReliableInputFrame) -> Result<()> {
+    if let ReliableInputEvent::TextCommit { text } = &frame.event {
+        anyhow::ensure!(
+            text.len() <= MAX_TEXT_COMMIT_BYTES,
+            "reliable TextCommit exceeds {MAX_TEXT_COMMIT_BYTES} UTF-8 bytes"
+        );
+    }
+    Ok(())
 }
 
 pub struct ControlMessageCodec;
@@ -437,10 +511,12 @@ impl Default for MessageDecoder {
 mod tests {
     use super::*;
     use rshare_core::{
-        hello_message, AcceptRealtime, AuthenticatedInputOwner, ClockDomainId, ControlConnectionId,
-        DeviceId, GamepadState, InputOwnershipGate, MonotonicStamp, RealtimeInputFrame,
-        RealtimeInputPayload, SessionEpoch, UsbDeviceClaimRequest, UsbTransferDirection,
-        UsbTransferKind, UsbTransferPayload, INPUT_PROTOCOL_VERSION,
+        hello_message, AcceptRealtime, AuthenticatedInputOwner, ButtonState, ClockDomainId,
+        ControlConnectionId, DeviceId, GamepadButton, GamepadDeviceInfo, GamepadState,
+        InputOwnershipGate, KeyState, MonotonicStamp, MouseButton, RealtimeInputFrame,
+        RealtimeInputPayload, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame,
+        SessionEpoch, UsbDeviceClaimRequest, UsbTransferDirection, UsbTransferKind,
+        UsbTransferPayload, INPUT_PROTOCOL_VERSION,
     };
 
     fn realtime_frame(sequence: u64, payload: RealtimeInputPayload) -> RealtimeInputFrame {
@@ -450,6 +526,16 @@ mod tests {
             sequence,
             captured_at: MonotonicStamp::new(ClockDomainId(7), 123_456),
             payload,
+        }
+    }
+
+    fn reliable_frame(sequence: u64, event: ReliableInputEvent) -> ReliableInputFrame {
+        ReliableInputFrame {
+            protocol_version: INPUT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(4),
+            sequence,
+            captured_at: MonotonicStamp::new(ClockDomainId(7), 123_456),
+            event,
         }
     }
 
@@ -793,5 +879,199 @@ mod tests {
             gate.accept_realtime(owner, frames[2].session_epoch, frames[2].sequence),
             AcceptRealtime::OutOfOrder
         );
+    }
+
+    #[test]
+    fn reliable_round_trip_preserves_every_event_variant() {
+        let events = vec![
+            ReliableInputEvent::Enter {
+                target_display_id: "display-main".to_string(),
+                x: -800,
+                y: 600,
+            },
+            ReliableInputEvent::Leave,
+            ReliableInputEvent::ReleaseAll {
+                reason: ReleaseAllReason::OwnershipTransfer,
+            },
+            ReliableInputEvent::Key {
+                keycode: 0x41,
+                state: KeyState::Released,
+            },
+            ReliableInputEvent::TextCommit {
+                text: "你好🙂".to_string(),
+            },
+            ReliableInputEvent::MouseButton {
+                button: MouseButton::Back,
+                state: ButtonState::Pressed,
+                x: -1920,
+                y: 1080,
+                realtime_anchor_sequence: 19,
+            },
+            ReliableInputEvent::Wheel {
+                delta_x: i32::MIN,
+                delta_y: i32::MAX,
+            },
+            ReliableInputEvent::GamepadConnected {
+                info: GamepadDeviceInfo {
+                    gamepad_id: 2,
+                    name: "test-pad".to_string(),
+                    vendor_id: Some(0x1234),
+                    product_id: Some(0x5678),
+                },
+            },
+            ReliableInputEvent::GamepadDisconnected { gamepad_id: 2 },
+            ReliableInputEvent::GamepadButton {
+                gamepad_id: 2,
+                button: GamepadButton::Other(42),
+                pressed: true,
+            },
+        ];
+
+        for (sequence, event) in events.into_iter().enumerate() {
+            let frame = reliable_frame(sequence as u64, event);
+            let encoded = ReliableInputCodec::encode(&frame).unwrap();
+            assert_eq!(ReliableInputCodec::decode(&encoded).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn mouse_button_anchor_round_trips_compactly() {
+        let frame = reliable_frame(
+            22,
+            ReliableInputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: ButtonState::Released,
+                x: 800,
+                y: 450,
+                realtime_anchor_sequence: 19,
+            },
+        );
+
+        let encoded = ReliableInputCodec::encode(&frame).unwrap();
+
+        assert_eq!(ReliableInputCodec::decode(&encoded).unwrap(), frame);
+        assert!(encoded.len() < 96);
+    }
+
+    #[test]
+    fn reliable_encoding_is_deterministic_and_bounded() {
+        let frame = reliable_frame(
+            22,
+            ReliableInputEvent::Enter {
+                target_display_id: "display-main".to_string(),
+                x: 800,
+                y: 450,
+            },
+        );
+
+        let first = ReliableInputCodec::encode(&frame).unwrap();
+        let second = ReliableInputCodec::encode(&frame).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.len() <= MAX_RELIABLE_INPUT_FRAME + 2);
+
+        let oversized = reliable_frame(
+            23,
+            ReliableInputEvent::Enter {
+                target_display_id: "x".repeat(MAX_RELIABLE_INPUT_FRAME),
+                x: 0,
+                y: 0,
+            },
+        );
+        assert!(ReliableInputCodec::encode(&oversized).is_err());
+        assert!(ReliableInputCodec::decode(&vec![0; MAX_RELIABLE_INPUT_FRAME + 3]).is_err());
+    }
+
+    #[test]
+    fn reliable_decode_rejects_unknown_outer_protocol_and_event_tag() {
+        let frame = reliable_frame(1, ReliableInputEvent::Leave);
+        let encoded = ReliableInputCodec::encode(&frame).unwrap();
+
+        let mut unknown_outer = encoded.to_vec();
+        unknown_outer[0..2].copy_from_slice(&(INPUT_PROTOCOL_VERSION + 1).to_be_bytes());
+        assert!(ReliableInputCodec::decode(&unknown_outer).is_err());
+
+        const EVENT_TAG_OFFSET: usize = 2 + 2 + 8 + 8 + 8 + 8;
+        let mut unknown_event = encoded.to_vec();
+        assert_eq!(
+            &unknown_event[EVENT_TAG_OFFSET..EVENT_TAG_OFFSET + 4],
+            &1_u32.to_be_bytes(),
+            "the test must mutate the serialized Leave event discriminant"
+        );
+        unknown_event[EVENT_TAG_OFFSET..EVENT_TAG_OFFSET + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(ReliableInputCodec::decode(&unknown_event).is_err());
+    }
+
+    #[test]
+    fn reliable_decode_rejects_truncated_invalid_and_trailing_data() {
+        assert!(ReliableInputCodec::decode(&[]).is_err());
+        assert!(ReliableInputCodec::decode(&[0]).is_err());
+
+        let frame = reliable_frame(
+            1,
+            ReliableInputEvent::Key {
+                keycode: 0x41,
+                state: KeyState::Pressed,
+            },
+        );
+        let encoded = ReliableInputCodec::encode(&frame).unwrap();
+
+        let mut truncated = encoded.to_vec();
+        truncated.pop();
+        assert!(ReliableInputCodec::decode(&truncated).is_err());
+
+        let mut invalid = encoded.to_vec();
+        *invalid.last_mut().unwrap() = u8::MAX;
+        assert!(ReliableInputCodec::decode(&invalid).is_err());
+
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(ReliableInputCodec::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn reliable_decode_rejects_outer_and_body_version_mismatch() {
+        let frame = reliable_frame(1, ReliableInputEvent::Leave);
+        let mut encoded = ReliableInputCodec::encode(&frame).unwrap().to_vec();
+        encoded[2..4].copy_from_slice(&(INPUT_PROTOCOL_VERSION + 1).to_be_bytes());
+
+        assert!(ReliableInputCodec::decode(&encoded).is_err());
+
+        let mut wrong_body = frame;
+        wrong_body.protocol_version += 1;
+        assert!(ReliableInputCodec::encode(&wrong_body).is_err());
+    }
+
+    #[test]
+    fn text_commit_enforces_utf8_byte_limit_on_encode_and_decode() {
+        let boundary_text = "🙂".repeat(MAX_TEXT_COMMIT_BYTES / 4);
+        assert_eq!(boundary_text.len(), MAX_TEXT_COMMIT_BYTES);
+        let boundary = reliable_frame(
+            1,
+            ReliableInputEvent::TextCommit {
+                text: boundary_text,
+            },
+        );
+        let encoded = ReliableInputCodec::encode(&boundary).unwrap();
+        assert!(encoded.len() <= MAX_RELIABLE_INPUT_FRAME + 2);
+        assert_eq!(ReliableInputCodec::decode(&encoded).unwrap(), boundary);
+
+        let over_limit_text = "x".repeat(MAX_TEXT_COMMIT_BYTES + 1);
+        let over_limit = reliable_frame(
+            2,
+            ReliableInputEvent::TextCommit {
+                text: over_limit_text,
+            },
+        );
+        assert!(ReliableInputCodec::encode(&over_limit).is_err());
+
+        const TEXT_LENGTH_OFFSET: usize = 2 + 2 + 8 + 8 + 8 + 8 + 4;
+        let mut over_limit_wire = encoded.to_vec();
+        over_limit_wire[TEXT_LENGTH_OFFSET..TEXT_LENGTH_OFFSET + 8]
+            .copy_from_slice(&((MAX_TEXT_COMMIT_BYTES + 1) as u64).to_be_bytes());
+        over_limit_wire.push(b'x');
+        assert!(over_limit_wire.len() <= MAX_RELIABLE_INPUT_FRAME + 2);
+        assert!(ReliableInputCodec::decode(&over_limit_wire).is_err());
     }
 }
