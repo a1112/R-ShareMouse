@@ -46,7 +46,7 @@ use rshare_input::RDevInputListener;
 use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
     connection::{ConnectionInfo, ConnectionState},
-    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig, NetworkReceivers,
+    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
 };
 use tracing_subscriber::prelude::*;
 
@@ -6894,10 +6894,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         });
 
-    let NetworkReceivers {
-        authenticated_peers: _authenticated_peers,
-        mut events,
-    } = network_manager.receivers();
+    let mut events = network_manager.events();
     let network_manager = Arc::new(Mutex::new(network_manager));
     {
         let mut manager = network_manager.lock().await;
