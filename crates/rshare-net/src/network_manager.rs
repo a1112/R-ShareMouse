@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
-    qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent},
+    qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent, TransportSendError},
 };
 use rshare_core::{DeviceId, Message};
 
@@ -101,6 +101,17 @@ fn spawn_connection_event_forwarder(
             }
         }
     });
+}
+
+fn record_qos_broadcast_successes(
+    connection_view: &ConnectionView,
+    results: &[(DeviceId, std::result::Result<(), TransportSendError>)],
+) {
+    for (device_id, result) in results {
+        if result.is_ok() {
+            connection_view.record_send_success(device_id);
+        }
+    }
 }
 
 async fn handle_discovery_event(
@@ -239,20 +250,24 @@ impl NetworkManager {
                 .map_err(|error| anyhow::anyhow!(error))?
             {
                 ClassifiedMessage::Control(frame) => {
-                    return peer.transport.send_control(frame).await.map_err(Into::into);
+                    peer.transport.send_control(frame).await?;
+                    self.connection_view.record_send_success(device_id);
+                    return Ok(());
                 }
                 ClassifiedMessage::Bulk(frame) => {
-                    return peer.transport.send_bulk(frame).await.map_err(Into::into);
+                    peer.transport.send_bulk(frame).await?;
+                    self.connection_view.record_send_success(device_id);
+                    return Ok(());
                 }
                 ClassifiedMessage::Telemetry(frame) => {
-                    return peer.transport.try_send_telemetry(frame).map_err(Into::into);
+                    peer.transport.try_send_telemetry(frame)?;
+                    self.connection_view.record_send_success(device_id);
+                    return Ok(());
                 }
                 ClassifiedMessage::ReliableCompat(frame) => {
-                    return peer
-                        .transport
-                        .send_reliable_compat(frame)
-                        .await
-                        .map_err(Into::into);
+                    peer.transport.send_reliable_compat(frame).await?;
+                    self.connection_view.record_send_success(device_id);
+                    return Ok(());
                 }
                 ClassifiedMessage::Unsupported => {}
             }
@@ -267,6 +282,7 @@ impl NetworkManager {
         {
             ClassifiedMessage::Control(frame) if !self.qos_registry.is_empty() => {
                 let results = self.qos_registry.broadcast_control(frame).await;
+                record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
                     .find_map(|(id, result)| result.err().map(|error| (id, error)))
@@ -277,6 +293,7 @@ impl NetworkManager {
             }
             ClassifiedMessage::Bulk(frame) if !self.qos_registry.is_empty() => {
                 let results = self.qos_registry.broadcast_bulk(frame).await;
+                record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
                     .find_map(|(id, result)| result.err().map(|error| (id, error)))
@@ -286,9 +303,9 @@ impl NetworkManager {
                 return Ok(());
             }
             ClassifiedMessage::Telemetry(frame) if !self.qos_registry.is_empty() => {
-                if let Some((id, error)) = self
-                    .qos_registry
-                    .broadcast_telemetry(frame)
+                let results = self.qos_registry.broadcast_telemetry(frame);
+                record_qos_broadcast_successes(&self.connection_view, &results);
+                if let Some((id, error)) = results
                     .into_iter()
                     .find_map(|(id, result)| result.err().map(|error| (id, error)))
                 {
@@ -297,10 +314,9 @@ impl NetworkManager {
                 return Ok(());
             }
             ClassifiedMessage::ReliableCompat(frame) if !self.qos_registry.is_empty() => {
-                if let Some((id, error)) = self
-                    .qos_registry
-                    .broadcast_reliable_compat(frame)
-                    .await
+                let results = self.qos_registry.broadcast_reliable_compat(frame).await;
+                record_qos_broadcast_successes(&self.connection_view, &results);
+                if let Some((id, error)) = results
                     .into_iter()
                     .find_map(|(id, result)| result.err().map(|error| (id, error)))
                 {
@@ -574,6 +590,69 @@ mod tests {
             result.is_err(),
             "missing peer must still report send failure"
         );
+    }
+
+    #[tokio::test]
+    async fn qos_direct_send_and_broadcast_update_connection_metrics() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = std::env::temp_dir()
+            .join(format!("rshare-network-metrics-{}", uuid::Uuid::new_v4()))
+            .join("trust.json");
+        let mut remote = ConnectionManager::with_transport(
+            remote_id,
+            crate::transport::QuicTransport::new(remote_id)
+                .with_trust_store_path(trust_path.clone()),
+        );
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote.transport_local_addr().unwrap();
+
+        let local_connection = ConnectionManager::with_transport(
+            local_id,
+            crate::transport::QuicTransport::new(local_id)
+                .with_trust_store_path(trust_path.clone()),
+        );
+        let mut manager =
+            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
+        manager.qos_registry = local_connection.qos_registry();
+        manager.connection_view = local_connection.connection_view();
+        manager.connection = Arc::new(TokioMutex::new(local_connection));
+        manager
+            .connect_to(remote_id, &address.to_string())
+            .await
+            .unwrap();
+
+        let snapshot = |infos: Vec<ConnectionInfo>| {
+            infos
+                .into_iter()
+                .find(|info| info.device_id == remote_id)
+                .unwrap()
+        };
+        let before = snapshot(manager.connection_infos().await);
+        manager
+            .send_to(
+                &remote_id,
+                Message::Heartbeat {
+                    sequence: 1,
+                    timestamp: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let after_send = snapshot(manager.connection_infos().await);
+        assert_eq!(after_send.messages_sent, before.messages_sent + 1);
+        assert!(after_send.last_activity >= before.last_activity);
+
+        manager
+            .broadcast(Message::Heartbeat {
+                sequence: 2,
+                timestamp: 2,
+            })
+            .await
+            .unwrap();
+        let after_broadcast = snapshot(manager.connection_infos().await);
+        assert_eq!(after_broadcast.messages_sent, after_send.messages_sent + 1);
+        assert!(after_broadcast.last_activity >= after_send.last_activity);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -7,7 +7,7 @@ use rshare_core::{
     ControlConnectionId, DeviceId, Message, RealtimeInputFrame, ReleaseAllReason,
     ReliableInputEvent, ReliableInputFrame, SessionEpoch,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use crate::handshake::PeerAuthContext;
 
@@ -133,6 +133,104 @@ pub struct TerminalReleaseEvent {
     pub reason: ReleaseAllReason,
 }
 
+#[derive(Clone)]
+pub(crate) struct TerminalReleaseEmitter {
+    inner: Arc<TerminalReleaseEmitterInner>,
+}
+
+struct TerminalReleaseEmitterInner {
+    target: mpsc::Sender<TerminalReleaseEvent>,
+    pending: Mutex<Option<TerminalReleaseEvent>>,
+    notify: Arc<Notify>,
+    in_flight: AtomicUsize,
+}
+
+impl TerminalReleaseEmitter {
+    pub(crate) fn new(target: mpsc::Sender<TerminalReleaseEvent>) -> Self {
+        let inner = Arc::new(TerminalReleaseEmitterInner {
+            target,
+            pending: Mutex::new(None),
+            notify: Arc::new(Notify::new()),
+            in_flight: AtomicUsize::new(0),
+        });
+        let weak = Arc::downgrade(&inner);
+        let notify = inner.notify.clone();
+        tokio::spawn(async move {
+            loop {
+                notify.notified().await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let event = inner
+                    .pending
+                    .lock()
+                    .expect("terminal release pending state poisoned")
+                    .take();
+                let Some(event) = event else {
+                    continue;
+                };
+                inner.in_flight.store(1, Ordering::Release);
+                let target = inner.target.clone();
+                drop(inner);
+                let _ = target.send(event).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                inner.in_flight.store(0, Ordering::Release);
+                if inner
+                    .pending
+                    .lock()
+                    .expect("terminal release pending state poisoned")
+                    .is_some()
+                {
+                    notify.notify_one();
+                }
+            }
+        });
+        Self { inner }
+    }
+
+    pub(crate) fn emit(&self, event: TerminalReleaseEvent) {
+        match self.inner.target.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let mut pending = self
+                    .inner
+                    .pending
+                    .lock()
+                    .expect("terminal release pending state poisoned");
+                if pending.is_none() {
+                    *pending = Some(event);
+                }
+                drop(pending);
+                self.inner.notify.notify_one();
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count_for_test(&self) -> usize {
+        1
+    }
+
+    #[cfg(test)]
+    fn backlog_for_test(&self) -> usize {
+        usize::from(
+            self.inner
+                .pending
+                .lock()
+                .expect("terminal release pending state poisoned")
+                .is_some(),
+        ) + self.inner.in_flight.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_for_test(&self) -> mpsc::Sender<TerminalReleaseEvent> {
+        self.inner.target.clone()
+    }
+}
+
 struct AwaitedFrame<T> {
     frame: T,
     written: oneshot::Sender<Result<(), TransportSendError>>,
@@ -175,10 +273,20 @@ struct PeerTransportInner {
     epoch_state: Mutex<SenderEpochState>,
     admission: Mutex<()>,
     reliable_cancel_tx: watch::Sender<Option<SessionEpoch>>,
-    release_tx: mpsc::Sender<TerminalReleaseEvent>,
+    release_emitter: TerminalReleaseEmitter,
     emergency_reserved: AtomicBool,
     reliable_write_started: std::sync::atomic::AtomicU64,
     reliable_write_completed: std::sync::atomic::AtomicU64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    worker_count: Arc<AtomicUsize>,
+}
+
+impl Drop for PeerTransportInner {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.realtime_connection {
+            connection.close(0u32.into(), b"qos handle dropped");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -196,11 +304,21 @@ impl QosDropProbe {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct QosWorkerProbe(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl QosWorkerProbe {
+    pub(crate) fn running(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 impl PeerTransportHandle {
-    pub fn from_quinn(
+    pub(crate) fn from_quinn(
         auth: Arc<PeerAuthContext>,
         connection: quinn::Connection,
-        release_tx: mpsc::Sender<TerminalReleaseEvent>,
+        release_emitter: TerminalReleaseEmitter,
     ) -> Self {
         let (reliable_tx, reliable_rx) = mpsc::channel(256);
         let (emergency_tx, emergency_rx) = mpsc::channel(1);
@@ -209,6 +327,7 @@ impl PeerTransportHandle {
         let (bulk_tx, bulk_rx) = mpsc::channel(8);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
         let (reliable_cancel_tx, reliable_cancel_rx) = watch::channel(None);
+        let worker_count = Arc::new(AtomicUsize::new(0));
         let inner = Arc::new(PeerTransportInner {
             auth,
             realtime_connection: Some(connection.clone()),
@@ -221,37 +340,47 @@ impl PeerTransportHandle {
             epoch_state: Mutex::new(SenderEpochState::default()),
             admission: Mutex::new(()),
             reliable_cancel_tx,
-            release_tx: release_tx.clone(),
+            release_emitter,
             emergency_reserved: AtomicBool::new(false),
             reliable_write_started: std::sync::atomic::AtomicU64::new(0),
             reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
+            worker_count: worker_count.clone(),
         });
         spawn_reliable_writer(
             Arc::downgrade(&inner),
             connection.clone(),
             reliable_rx,
             reliable_cancel_rx,
+            worker_count.clone(),
         );
-        spawn_emergency_writer(Arc::downgrade(&inner), connection.clone(), emergency_rx);
+        spawn_emergency_writer(
+            Arc::downgrade(&inner),
+            connection.clone(),
+            emergency_rx,
+            worker_count.clone(),
+        );
         spawn_awaited_writer(
             connection.clone(),
             LaneDiscriminator::ReliableCompat,
             reliable_compat_rx,
             ReliableCompatFrame::into_message,
+            worker_count.clone(),
         );
         spawn_awaited_writer(
             connection.clone(),
             LaneDiscriminator::Control,
             control_rx,
             ControlFrame::into_message,
+            worker_count.clone(),
         );
         spawn_awaited_writer(
             connection.clone(),
             LaneDiscriminator::Bulk,
             bulk_rx,
             BulkFrame::into_message,
+            worker_count.clone(),
         );
-        spawn_telemetry_writer(connection, telemetry_rx);
+        spawn_telemetry_writer(connection, telemetry_rx, worker_count);
         Self { inner }
     }
 
@@ -323,13 +452,36 @@ impl PeerTransportHandle {
                 self.fail_reliable_frame(frame)?;
                 Err(TransportSendError::ReliableLaneFull)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportSendError::LaneClosed),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let _ = self.fail_reliable_frame(frame);
+                Err(TransportSendError::LaneClosed)
+            }
         }
     }
 
     pub fn try_send_emergency(&self, frame: ReliableInputFrame) -> Result<(), TransportSendError> {
         let _admission = self.inner.admission.lock().expect("qos admission poisoned");
         if !matches!(frame.event, ReliableInputEvent::ReleaseAll { .. }) {
+            return Err(TransportSendError::UnsupportedMessage);
+        }
+        let active = self
+            .inner
+            .epoch_state
+            .lock()
+            .expect("qos epoch state poisoned")
+            .active;
+        if let Some(active) = active {
+            if active != frame.session_epoch {
+                self.fail_future_emergency_locked(active);
+                return Err(TransportSendError::UnsupportedMessage);
+            }
+        } else if self
+            .inner
+            .epoch_state
+            .lock()
+            .expect("qos epoch state poisoned")
+            .retired(frame.session_epoch)
+        {
             return Err(TransportSendError::UnsupportedMessage);
         }
         self.retire_epoch_locked(frame.session_epoch);
@@ -409,11 +561,21 @@ impl PeerTransportHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn worker_probe_for_test(&self) -> QosWorkerProbe {
+        QosWorkerProbe(self.inner.worker_count.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn reliable_write_counts_for_test(&self) -> (u64, u64) {
         (
             self.inner.reliable_write_started.load(Ordering::Acquire),
             self.inner.reliable_write_completed.load(Ordering::Acquire),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reliable_available_for_test(&self) -> usize {
+        self.inner.reliable_tx.capacity()
     }
 
     fn fail_emergency_locked(&self, frame: ReliableInputFrame) {
@@ -425,14 +587,24 @@ impl PeerTransportHandle {
             ReliableInputEvent::ReleaseAll { reason } => reason,
             _ => ReleaseAllReason::BackendFailure,
         };
-        emit_release(
-            &self.inner.release_tx,
-            TerminalReleaseEvent {
-                auth: self.inner.auth.clone(),
-                epoch: frame.session_epoch,
-                reason,
-            },
-        );
+        self.inner.release_emitter.emit(TerminalReleaseEvent {
+            auth: self.inner.auth.clone(),
+            epoch: frame.session_epoch,
+            reason,
+        });
+    }
+
+    fn fail_future_emergency_locked(&self, active: SessionEpoch) {
+        self.retire_epoch_locked(active);
+        let _ = self.inner.reliable_cancel_tx.send(Some(active));
+        if let Some(connection) = &self.inner.realtime_connection {
+            connection.close(0u32.into(), b"future emergency epoch mismatch");
+        }
+        self.inner.release_emitter.emit(TerminalReleaseEvent {
+            auth: self.inner.auth.clone(),
+            epoch: active,
+            reason: ReleaseAllReason::BackendFailure,
+        });
     }
 
     fn fail_reliable_frame(&self, frame: ReliableInputFrame) -> Result<(), TransportSendError> {
@@ -462,19 +634,6 @@ impl PeerTransportHandle {
     }
 }
 
-fn emit_release(tx: &mpsc::Sender<TerminalReleaseEvent>, event: TerminalReleaseEvent) {
-    match tx.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(event).await;
-            });
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
-    }
-}
-
 impl ControlFrame {
     pub fn heartbeat(sequence: u64, timestamp: u64) -> Self {
         Self {
@@ -498,7 +657,7 @@ impl BulkFrame {
     }
 
     #[cfg(test)]
-    fn test_payload(size: usize) -> Self {
+    pub(crate) fn test_payload(size: usize) -> Self {
         Self {
             message: Message::ClipboardData {
                 mime_type: "application/octet-stream".into(),
@@ -540,16 +699,34 @@ impl ReliableCompatFrame {
     }
 }
 
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl WorkerGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn spawn_reliable_writer(
-    inner: std::sync::Weak<PeerTransportInner>,
+    inner_weak: std::sync::Weak<PeerTransportInner>,
     connection: quinn::Connection,
     mut rx: mpsc::Receiver<ReliableInputFrame>,
     mut cancel_rx: watch::Receiver<Option<SessionEpoch>>,
+    worker_count: Arc<AtomicUsize>,
 ) {
+    let guard = WorkerGuard::new(worker_count);
     tokio::spawn(async move {
+        let _guard = guard;
         let mut stream: Option<quinn::SendStream> = None;
         while let Some(frame) = rx.recv().await {
-            let Some(inner) = inner.upgrade() else {
+            let Some(inner) = inner_weak.upgrade() else {
                 return;
             };
             cancel_rx.borrow_and_update();
@@ -561,8 +738,12 @@ fn spawn_reliable_writer(
             {
                 continue;
             }
+            drop(inner);
             if stream.is_none() {
                 let Ok(mut opened) = connection.open_uni().await else {
+                    let Some(inner) = inner_weak.upgrade() else {
+                        return;
+                    };
                     let handle = PeerTransportHandle {
                         inner: inner.clone(),
                     };
@@ -582,6 +763,9 @@ fn spawn_reliable_writer(
                     .await
                     .is_err()
                 {
+                    let Some(inner) = inner_weak.upgrade() else {
+                        return;
+                    };
                     let handle = PeerTransportHandle {
                         inner: inner.clone(),
                     };
@@ -592,6 +776,9 @@ fn spawn_reliable_writer(
                 stream = Some(opened);
             }
             let Ok(encoded) = crate::codec::ReliableInputCodec::encode(&frame) else {
+                let Some(inner) = inner_weak.upgrade() else {
+                    return;
+                };
                 let handle = PeerTransportHandle {
                     inner: inner.clone(),
                 };
@@ -603,47 +790,45 @@ fn spawn_reliable_writer(
             wire.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
             wire.extend_from_slice(&encoded);
             let active = stream.as_mut().expect("reliable stream initialized");
+            let Some(inner) = inner_weak.upgrade() else {
+                return;
+            };
             inner.reliable_write_started.fetch_add(1, Ordering::AcqRel);
-            tokio::select! {
-                result = active.write_all(&wire) => {
-                    inner
-                        .reliable_write_completed
-                        .fetch_add(1, Ordering::AcqRel);
-                    if result.is_err() {
-                        let _ = active.reset(0u32.into());
-                        let handle = PeerTransportHandle {
-                            inner: inner.clone(),
-                        };
-                        let _admission =
-                            inner.admission.lock().expect("qos admission poisoned");
-                        let _ = handle.fail_reliable_frame(frame);
-                        return;
-                    }
-                }
-                changed = cancel_rx.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    if cancel_rx.borrow().is_some() {
-                        let _ = active.reset(0u32.into());
-                        stream = None;
-                    }
-                }
+            drop(inner);
+            let result = active.write_all(&wire).await;
+            let Some(inner) = inner_weak.upgrade() else {
+                return;
+            };
+            inner
+                .reliable_write_completed
+                .fetch_add(1, Ordering::AcqRel);
+            if result.is_err() {
+                let _ = active.reset(0u32.into());
+                let handle = PeerTransportHandle {
+                    inner: inner.clone(),
+                };
+                let _admission = inner.admission.lock().expect("qos admission poisoned");
+                let _ = handle.fail_reliable_frame(frame);
+                return;
             }
         }
     });
 }
 
 fn spawn_emergency_writer(
-    inner: std::sync::Weak<PeerTransportInner>,
+    inner_weak: std::sync::Weak<PeerTransportInner>,
     connection: quinn::Connection,
     mut rx: mpsc::Receiver<ReliableInputFrame>,
+    worker_count: Arc<AtomicUsize>,
 ) {
+    let guard = WorkerGuard::new(worker_count);
     tokio::spawn(async move {
+        let _guard = guard;
         while let Some(frame) = rx.recv().await {
-            let Some(inner) = inner.upgrade() else {
+            let Some(inner) = inner_weak.upgrade() else {
                 return;
             };
+            drop(inner);
             let result = async {
                 let mut stream = connection.open_uni().await?;
                 let _ = stream.set_priority(255);
@@ -666,6 +851,9 @@ fn spawn_emergency_writer(
                 Ok::<(), quinn::WriteError>(())
             }
             .await;
+            let Some(inner) = inner_weak.upgrade() else {
+                return;
+            };
             if result.is_ok() {
                 inner.emergency_reserved.store(false, Ordering::Release);
             } else {
@@ -687,33 +875,55 @@ fn spawn_awaited_writer<T, F>(
     lane: LaneDiscriminator,
     mut rx: mpsc::Receiver<AwaitedFrame<T>>,
     convert: F,
+    worker_count: Arc<AtomicUsize>,
 ) where
     T: Send + 'static,
     F: Fn(T) -> Result<Message, TransportSendError> + Send + Sync + 'static,
 {
+    let guard = WorkerGuard::new(worker_count);
     tokio::spawn(async move {
+        let _guard = guard;
         let mut stream: Option<quinn::SendStream> = None;
-        while let Some(AwaitedFrame { frame, written }) = rx.recv().await {
+        while let Some(AwaitedFrame { frame, mut written }) = rx.recv().await {
             let result = match convert(frame) {
-                Ok(message) => write_qos_message(&connection, lane, &mut stream, &message).await,
-                Err(error) => Err(error),
+                Ok(message) => {
+                    tokio::select! {
+                        result = write_qos_message(&connection, lane, &mut stream, &message) => Some(result),
+                        _ = written.closed() => None,
+                        _ = connection.closed() => return,
+                    }
+                }
+                Err(error) => Some(Err(error)),
             };
-            let _ = written.send(result);
+            if let Some(result) = result {
+                let _ = written.send(result);
+            } else if let Some(mut abandoned) = stream.take() {
+                let _ = abandoned.reset(0u32.into());
+            }
         }
     });
 }
 
-fn spawn_telemetry_writer(connection: quinn::Connection, mut rx: mpsc::Receiver<TelemetryFrame>) {
+fn spawn_telemetry_writer(
+    connection: quinn::Connection,
+    mut rx: mpsc::Receiver<TelemetryFrame>,
+    worker_count: Arc<AtomicUsize>,
+) {
+    let guard = WorkerGuard::new(worker_count);
     tokio::spawn(async move {
+        let _guard = guard;
         let mut stream = None;
         while let Some(frame) = rx.recv().await {
-            let _ = write_qos_message(
-                &connection,
-                LaneDiscriminator::Telemetry,
-                &mut stream,
-                &frame.into_message(),
-            )
-            .await;
+            let message = frame.into_message();
+            tokio::select! {
+                _ = write_qos_message(
+                    &connection,
+                    LaneDiscriminator::Telemetry,
+                    &mut stream,
+                    &message,
+                ) => {}
+                _ = connection.closed() => return,
+            }
         }
     });
 }
@@ -955,6 +1165,7 @@ fn fixture_handle(
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
     let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
+    let release_emitter = TerminalReleaseEmitter::new(release_tx.clone());
     let worker_release_tx = release_tx.clone();
     let (reliable_cancel_tx, _reliable_cancel_rx) = watch::channel(None);
     let release_auth = auth.clone();
@@ -985,10 +1196,11 @@ fn fixture_handle(
                 epoch_state: Mutex::new(SenderEpochState::default()),
                 admission: Mutex::new(()),
                 reliable_cancel_tx,
-                release_tx: release_tx.clone(),
+                release_emitter,
                 emergency_reserved: AtomicBool::new(false),
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
                 reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
+                worker_count: Arc::new(AtomicUsize::new(0)),
             }),
         },
         QosProbe { reliable_rx },
@@ -1039,6 +1251,7 @@ fn fixture_handle_with_stalled_emergency() -> (
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
     let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
+    let release_emitter = TerminalReleaseEmitter::new(release_tx);
     let (reliable_cancel_tx, _reliable_cancel_rx) = watch::channel(None);
     (
         PeerTransportHandle {
@@ -1054,10 +1267,11 @@ fn fixture_handle_with_stalled_emergency() -> (
                 epoch_state: Mutex::new(SenderEpochState::default()),
                 admission: Mutex::new(()),
                 reliable_cancel_tx,
-                release_tx,
+                release_emitter,
                 emergency_reserved: AtomicBool::new(false),
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
                 reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
+                worker_count: Arc::new(AtomicUsize::new(0)),
             }),
         },
         emergency_rx,
@@ -1076,15 +1290,11 @@ fn fixture_registry_with_slow_and_fast_peers() -> (
     let registry = ConnectionRegistry::new();
     let slow_id = DeviceId::new_v4();
     let fast_id = DeviceId::new_v4();
-    let (slow, _slow_probe, _slow_releases) = fixture_handle(1);
+    let (mut slow, _slow_probe, _slow_releases) = fixture_handle(1);
     let (slow_control_tx, slow_control_rx) = mpsc::channel(1);
-    let slow = PeerTransportHandle {
-        inner: Arc::new(PeerTransportInner {
-            control_tx: slow_control_tx,
-            ..Arc::try_unwrap(slow.inner)
-                .unwrap_or_else(|_| panic!("fixture handle must have unique ownership"))
-        }),
-    };
+    Arc::get_mut(&mut slow.inner)
+        .expect("fixture handle must have unique ownership")
+        .control_tx = slow_control_tx;
     let (fast, fast_probe, _fast_releases) = fixture_handle(1);
     registry.insert(
         slow_id,
@@ -1112,6 +1322,7 @@ fn fixture_registry_with_slow_and_fast_peers() -> (
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use tokio::time::timeout;
 
     use rshare_core::{
         ClockDomainId, ControlConnectionId, DeviceId, KeyState, MonotonicStamp, ReliableInputEvent,
@@ -1284,13 +1495,14 @@ mod tests {
         let (handle, _stalled_emergency, mut releases) = fixture_handle_with_stalled_emergency();
         handle.try_send_emergency(reliable_release(9, 1)).unwrap();
         assert_eq!(
-            handle.try_send_emergency(reliable_release(9, 2)),
+            handle.try_send_emergency(reliable_release(10, 1)),
             Err(TransportSendError::EmergencySlotFull)
         );
         let release = releases.recv().await.unwrap();
-        assert_eq!(release.epoch, SessionEpoch(9));
+        assert_eq!(release.epoch, SessionEpoch(10));
         assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
         assert!(handle.is_tombstoned(SessionEpoch(9)));
+        assert!(handle.is_tombstoned(SessionEpoch(10)));
     }
 
     #[tokio::test]
@@ -1337,5 +1549,72 @@ mod tests {
             .try_send_reliable_input(reliable_key_down(1, 3))
             .is_err());
         assert!(handle.is_tombstoned(SessionEpoch(1)));
+    }
+
+    #[tokio::test]
+    async fn future_emergency_releases_only_current_epoch_without_retiring_future() {
+        let (handle, _probe, mut releases) = fixture_handle(8);
+        handle
+            .try_send_reliable_input(reliable_enter(1, 1))
+            .unwrap();
+
+        assert_eq!(
+            handle.try_send_emergency(reliable_release(2, 1)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+        let release = releases.recv().await.unwrap();
+        assert_eq!(release.epoch, SessionEpoch(1));
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert!(handle.is_tombstoned(SessionEpoch(1)));
+        assert!(
+            !handle.is_tombstoned(SessionEpoch(2)),
+            "untrusted future epoch must not advance the retirement high-water mark"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_reliable_channel_retires_enter_and_emits_terminal_release() {
+        let (handle, probe, mut releases) = fixture_handle(1);
+        drop(probe.reliable_rx);
+
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_enter(7, 1)),
+            Err(TransportSendError::LaneClosed)
+        );
+        assert!(handle.is_tombstoned(SessionEpoch(7)));
+        let release = releases.recv().await.unwrap();
+        assert_eq!(release.epoch, SessionEpoch(7));
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+    }
+
+    #[tokio::test]
+    async fn terminal_release_emitter_has_one_worker_and_bounded_coalesced_backlog() {
+        let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(TerminalReleaseEvent {
+            auth: auth.clone(),
+            epoch: SessionEpoch(0),
+            reason: ReleaseAllReason::SessionEnded,
+        })
+        .await
+        .unwrap();
+        let emitter = TerminalReleaseEmitter::new(tx);
+
+        for epoch in 1..=1_000 {
+            emitter.emit(TerminalReleaseEvent {
+                auth: auth.clone(),
+                epoch: SessionEpoch(epoch),
+                reason: ReleaseAllReason::BackendFailure,
+            });
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(emitter.worker_count_for_test(), 1);
+        assert!(emitter.backlog_for_test() <= 2);
+
+        assert_eq!(rx.recv().await.unwrap().epoch, SessionEpoch(0));
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("one coalesced terminal release must remain deliverable")
+            .expect("terminal release receiver must stay open");
     }
 }

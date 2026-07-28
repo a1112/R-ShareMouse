@@ -28,7 +28,10 @@ use super::encryption::{
     Encryption, PeerCertificateFingerprint, QuicIdentity, QuicTrustDecision, QuicTrustStore,
 };
 use super::handshake::PeerAuthContext;
-use super::qos::{LaneDiscriminator, PeerTransportHandle, TerminalReleaseEvent, QOS_LANE_MAGIC};
+use super::qos::{
+    LaneDiscriminator, PeerTransportHandle, TerminalReleaseEmitter, TerminalReleaseEvent,
+    QOS_LANE_MAGIC,
+};
 use rshare_core::{ControlConnectionId, DeviceId, Message, ReliableInputEvent, SessionEpoch};
 use tracing::info;
 
@@ -350,7 +353,7 @@ struct QuicConnectionInner {
 #[derive(Clone)]
 struct QosReceiveContext {
     auth: Arc<PeerAuthContext>,
-    release_tx: mpsc::Sender<TerminalReleaseEvent>,
+    release_emitter: TerminalReleaseEmitter,
 }
 
 #[derive(Default)]
@@ -547,18 +550,19 @@ impl QuicConnection {
         auth: Arc<PeerAuthContext>,
     ) -> (PeerTransportHandle, mpsc::Receiver<TerminalReleaseEvent>) {
         let (release_tx, release_rx) = mpsc::channel(8);
+        let release_emitter = TerminalReleaseEmitter::new(release_tx);
         *self
             .inner
             .qos_receive
             .lock()
             .expect("qos receive context poisoned") = Some(QosReceiveContext {
             auth: auth.clone(),
-            release_tx: release_tx.clone(),
+            release_emitter: release_emitter.clone(),
         });
         self.inner.qos_receive_notify.notify_waiters();
         let monitor_inner = self.inner.clone();
         let monitor_auth = auth.clone();
-        let monitor_release_tx = release_tx.clone();
+        let monitor_release_emitter = release_emitter.clone();
         tokio::spawn(async move {
             let _ = monitor_inner.connection.closed().await;
             let active_epoch = {
@@ -578,17 +582,15 @@ impl QuicConnection {
                 }
             };
             if let Some(epoch) = active_epoch {
-                let _ = monitor_release_tx
-                    .send(TerminalReleaseEvent {
-                        auth: monitor_auth,
-                        epoch,
-                        reason: rshare_core::ReleaseAllReason::Timeout,
-                    })
-                    .await;
+                monitor_release_emitter.emit(TerminalReleaseEvent {
+                    auth: monitor_auth,
+                    epoch,
+                    reason: rshare_core::ReleaseAllReason::Timeout,
+                });
             }
         });
         (
-            PeerTransportHandle::from_quinn(auth, self.inner.connection.clone(), release_tx),
+            PeerTransportHandle::from_quinn(auth, self.inner.connection.clone(), release_emitter),
             release_rx,
         )
     }
@@ -1294,6 +1296,9 @@ async fn read_qos_message_stream(
     loop {
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
+            inner
+                .connection
+                .close(0u32.into(), b"truncated qos message length");
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -1305,6 +1310,9 @@ async fn read_qos_message_stream(
         }
         let mut data = vec![0u8; len];
         if stream.read_exact(&mut data).await.is_err() {
+            inner
+                .connection
+                .close(0u32.into(), b"truncated qos message payload");
             return;
         }
         let Ok(message) = ControlMessageCodec::decode(&data) else {
@@ -1400,23 +1408,45 @@ async fn read_qos_reliable_stream(
         }
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
+            if let Some(context) = await_qos_receive_context(&inner).await {
+                fail_close_active_qos(&inner, &context, b"truncated qos reliable length");
+            } else {
+                inner
+                    .connection
+                    .close(0u32.into(), b"truncated qos reliable length");
+            }
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > crate::codec::MAX_RELIABLE_INPUT_FRAME + 2 {
-            inner
-                .connection
-                .close(0u32.into(), b"oversized qos input frame");
+            if let Some(context) = await_qos_receive_context(&inner).await {
+                fail_close_active_qos(&inner, &context, b"oversized qos input frame");
+            } else {
+                inner
+                    .connection
+                    .close(0u32.into(), b"oversized qos input frame");
+            }
             return;
         }
         let mut data = vec![0u8; len];
         if stream.read_exact(&mut data).await.is_err() {
+            if let Some(context) = await_qos_receive_context(&inner).await {
+                fail_close_active_qos(&inner, &context, b"truncated qos reliable payload");
+            } else {
+                inner
+                    .connection
+                    .close(0u32.into(), b"truncated qos reliable payload");
+            }
             return;
         }
         let Ok(frame) = crate::codec::ReliableInputCodec::decode(&data) else {
-            inner
-                .connection
-                .close(0u32.into(), b"invalid qos input frame");
+            if let Some(context) = await_qos_receive_context(&inner).await {
+                fail_close_active_qos(&inner, &context, b"invalid qos input frame");
+            } else {
+                inner
+                    .connection
+                    .close(0u32.into(), b"invalid qos input frame");
+            }
             return;
         };
         let Some(context) = await_qos_receive_context(&inner).await else {
@@ -1430,34 +1460,56 @@ async fn read_qos_reliable_stream(
                     .close(0u32.into(), b"non-terminal emergency input frame");
                 return;
             };
-            let should_release = {
+            enum EmergencyDisposition {
+                Ignore,
+                Release(SessionEpoch, rshare_core::ReleaseAllReason),
+                Violation(SessionEpoch),
+            }
+            let disposition = {
                 let mut state = inner
                     .qos_inbound
                     .lock()
                     .expect("qos inbound state poisoned");
                 if inbound_epoch_retired(&state, key) {
-                    false
-                } else if state
-                    .active
-                    .is_some_and(|(generation, epoch, _)| (generation, epoch) == key)
-                {
-                    retire_inbound_epoch(&mut state, key);
-                    state.active = None;
-                    true
+                    EmergencyDisposition::Ignore
                 } else {
-                    retire_inbound_epoch(&mut state, key);
-                    true
+                    match state.active {
+                        Some((generation, epoch, _)) if (generation, epoch) == key => {
+                            retire_inbound_epoch(&mut state, key);
+                            state.active = None;
+                            EmergencyDisposition::Release(epoch, reason)
+                        }
+                        Some((generation, active_epoch, _)) => {
+                            retire_inbound_epoch(&mut state, (generation, active_epoch));
+                            state.active = None;
+                            EmergencyDisposition::Violation(active_epoch)
+                        }
+                        None => {
+                            retire_inbound_epoch(&mut state, key);
+                            EmergencyDisposition::Release(frame.session_epoch, reason)
+                        }
+                    }
                 }
             };
-            if should_release {
-                emit_terminal_release(
-                    &context.release_tx,
-                    TerminalReleaseEvent {
+            match disposition {
+                EmergencyDisposition::Ignore => {}
+                EmergencyDisposition::Release(epoch, reason) => {
+                    context.release_emitter.emit(TerminalReleaseEvent {
                         auth: context.auth,
-                        epoch: frame.session_epoch,
+                        epoch,
                         reason,
-                    },
-                );
+                    })
+                }
+                EmergencyDisposition::Violation(epoch) => {
+                    inner
+                        .connection
+                        .close(0u32.into(), b"future emergency epoch mismatch");
+                    context.release_emitter.emit(TerminalReleaseEvent {
+                        auth: context.auth,
+                        epoch,
+                        reason: rshare_core::ReleaseAllReason::BackendFailure,
+                    });
+                }
             }
             return;
         }
@@ -1468,29 +1520,52 @@ async fn read_qos_reliable_stream(
                 inner
                     .connection
                     .close(0u32.into(), b"qos reliable sequence violation");
-                emit_terminal_release(
-                    &context.release_tx,
-                    TerminalReleaseEvent {
-                        auth: context.auth.clone(),
-                        epoch,
-                        reason: rshare_core::ReleaseAllReason::BackendFailure,
-                    },
-                );
+                context.release_emitter.emit(TerminalReleaseEvent {
+                    auth: context.auth.clone(),
+                    epoch,
+                    reason: rshare_core::ReleaseAllReason::BackendFailure,
+                });
                 return;
             }
             ReliableAccept::Accepted => {}
         }
         if let ReliableInputEvent::ReleaseAll { reason } = frame.event {
-            emit_terminal_release(
-                &context.release_tx,
-                TerminalReleaseEvent {
-                    auth: context.auth.clone(),
-                    epoch: frame.session_epoch,
-                    reason,
-                },
-            );
+            context.release_emitter.emit(TerminalReleaseEvent {
+                auth: context.auth.clone(),
+                epoch: frame.session_epoch,
+                reason,
+            });
             return;
         }
+    }
+}
+
+fn fail_close_active_qos(
+    inner: &QuicConnectionInner,
+    context: &QosReceiveContext,
+    close_reason: &'static [u8],
+) {
+    let active_epoch = {
+        let mut state = inner
+            .qos_inbound
+            .lock()
+            .expect("qos inbound state poisoned");
+        match state.active {
+            Some((generation, epoch, _)) if generation == context.auth.control_connection_id => {
+                retire_inbound_epoch(&mut state, (generation, epoch));
+                state.active = None;
+                Some(epoch)
+            }
+            _ => None,
+        }
+    };
+    inner.connection.close(0u32.into(), close_reason);
+    if let Some(epoch) = active_epoch {
+        context.release_emitter.emit(TerminalReleaseEvent {
+            auth: context.auth.clone(),
+            epoch,
+            reason: rshare_core::ReleaseAllReason::BackendFailure,
+        });
     }
 }
 
@@ -1638,19 +1713,6 @@ fn retire_inbound_epoch(state: &mut QosInboundState, key: (ControlConnectionId, 
         .is_some_and(|(realtime_key, _)| realtime_key.0 == key.0 && realtime_key.1 .0 <= key.1 .0)
     {
         state.realtime_last = None;
-    }
-}
-
-fn emit_terminal_release(tx: &mpsc::Sender<TerminalReleaseEvent>, event: TerminalReleaseEvent) {
-    match tx.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(event).await;
-            });
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
 
@@ -2147,6 +2209,41 @@ mod tests {
     use rustls::{SignatureAlgorithm, SignatureScheme};
     use tokio::time::timeout;
 
+    fn reliable_frame(epoch: u64, sequence: u64, event: ReliableInputEvent) -> ReliableInputFrame {
+        ReliableInputFrame {
+            protocol_version: INPUT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(epoch),
+            sequence,
+            captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+            event,
+        }
+    }
+
+    async fn write_raw_qos_input(
+        connection: &QuicConnection,
+        lane: LaneDiscriminator,
+        frame: &ReliableInputFrame,
+    ) {
+        let payload = crate::codec::ReliableInputCodec::encode(frame).unwrap();
+        let mut stream = connection.inner.connection.open_uni().await.unwrap();
+        stream
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                lane as u8,
+            ])
+            .await
+            .unwrap();
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.finish().unwrap();
+    }
+
     #[test]
     fn legacy_realtime_adapter_is_private_and_rejects_reliable_messages() {
         let realtime = Message::MouseMove { x: 7, y: -4 };
@@ -2335,6 +2432,14 @@ mod tests {
             "the failed epoch must remain tombstoned"
         );
         reliable_reader.notify_waiters();
+        timeout(Duration::from_secs(1), async {
+            while client_qos.reliable_available_for_test() == 0 {
+                reliable_reader.notify_waiters();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired reliable backlog must be purged before re-entry");
         let next_epoch = SessionEpoch(epoch.0 + 1);
         client_qos
             .try_send_reliable_input(ReliableInputFrame {
@@ -2566,7 +2671,7 @@ mod tests {
             .expect("connection loss must release the remote active epoch")
             .unwrap();
         assert_eq!(remote.epoch, epoch);
-        assert_eq!(remote.reason, ReleaseAllReason::Timeout);
+        assert_eq!(remote.reason, ReleaseAllReason::BackendFailure);
     }
 
     #[tokio::test]
@@ -2617,6 +2722,370 @@ mod tests {
         )
         .await
         .expect("wrong-lane payload must close authenticated connection");
+    }
+
+    #[tokio::test]
+    async fn truncated_authenticated_message_lane_closes_connection() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_qos, _releases) = server_connection.install_qos(auth);
+        let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+        stream
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                LaneDiscriminator::Control as u8,
+            ])
+            .await
+            .unwrap();
+        stream.write_all(&16u32.to_be_bytes()).await.unwrap();
+        stream.write_all(&[1, 2]).await.unwrap();
+        stream.finish().unwrap();
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("truncated authenticated message lane must close the connection");
+    }
+
+    #[tokio::test]
+    async fn future_emergency_closes_and_releases_only_receiver_active_epoch() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server_connection
+                    .inner
+                    .qos_inbound
+                    .lock()
+                    .unwrap()
+                    .active
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        write_raw_qos_input(
+            &client_connection,
+            LaneDiscriminator::Emergency,
+            &reliable_frame(
+                2,
+                1,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            ),
+        )
+        .await;
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("future emergency must close the authenticated connection");
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(1));
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert_eq!(
+            server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .retired_through,
+            Some((generation, SessionEpoch(1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_future_emergency_closes_and_releases_sender_active_epoch() {
+        let server_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(DeviceId::new_v4());
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let _server_connection = incoming.recv().await.unwrap().connection;
+        let auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (handle, mut releases) = client_connection.install_qos(auth);
+        handle
+            .try_send_reliable_input(reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            handle.try_send_emergency(reliable_frame(
+                2,
+                1,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            )),
+            Err(super::super::qos::TransportSendError::UnsupportedMessage)
+        );
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("sender future emergency must close the connection");
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(1));
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert!(!handle.is_tombstoned(SessionEpoch(2)));
+    }
+
+    #[tokio::test]
+    async fn truncated_reliable_frame_closes_and_releases_current_epoch() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                4,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                4,
+                2,
+                ReliableInputEvent::Key {
+                    keycode: 0x41,
+                    state: rshare_core::KeyState::Pressed,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server_connection.inner.qos_inbound.lock().unwrap().active
+                    == Some((generation, SessionEpoch(4), 2))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+        stream
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                LaneDiscriminator::ReliableInput as u8,
+            ])
+            .await
+            .unwrap();
+        stream.write_all(&16u32.to_be_bytes()).await.unwrap();
+        stream.write_all(&[1, 2]).await.unwrap();
+        stream.finish().unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("truncated reliable frame must close the connection");
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(4));
+    }
+
+    #[tokio::test]
+    async fn reliable_fin_at_frame_boundary_still_closes_when_epoch_is_active() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                5,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                5,
+                2,
+                ReliableInputEvent::Key {
+                    keycode: 0x41,
+                    state: rshare_core::KeyState::Pressed,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while server_connection.inner.qos_inbound.lock().unwrap().active
+                != Some((generation, SessionEpoch(5), 2))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+        stream
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                LaneDiscriminator::ReliableInput as u8,
+            ])
+            .await
+            .unwrap();
+        stream.finish().unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("frame-boundary FIN with active input must close the connection");
+        assert_eq!(
+            timeout(Duration::from_secs(1), releases.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            SessionEpoch(5)
+        );
     }
 
     #[tokio::test]
@@ -2751,8 +3220,8 @@ mod tests {
             .expect("qos receive context poisoned")
             .as_ref()
             .expect("qos receive context installed")
-            .release_tx
-            .clone();
+            .release_emitter
+            .target_for_test();
         for _ in 0..8 {
             release_tx.try_send(filler.clone()).unwrap();
         }
@@ -2830,12 +3299,72 @@ mod tests {
         });
         let (handle, _releases) = connection.install_qos(auth);
         let probe = handle.drop_probe_for_test();
+        let workers = handle.worker_probe_for_test();
         drop(handle);
         tokio::task::yield_now().await;
         assert!(
             probe.released(),
             "QoS workers must not keep their sender-owning state alive"
         );
+        timeout(Duration::from_secs(1), async {
+            while workers.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all QoS writers must stop when the last handle is dropped");
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocked_awaited_lane_resets_and_all_workers_stop_on_drop() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        server_connection.set_qos_reliable_reader_barrier(Arc::new(Notify::new()));
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (handle, _client_releases) = client_connection.install_qos(client_auth);
+        let workers = handle.worker_probe_for_test();
+        let blocked_handle = handle.clone();
+        let send = tokio::spawn(async move {
+            blocked_handle
+                .send_bulk(super::super::qos::BulkFrame::test_payload(512 * 1024))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !send.is_finished(),
+            "bulk write must be flow-control blocked"
+        );
+
+        send.abort();
+        let _ = send.await;
+        drop(handle);
+        timeout(Duration::from_secs(1), async {
+            while workers.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled awaited write and every QoS worker must stop on handle drop");
     }
 
     #[test]

@@ -118,6 +118,18 @@ impl ConnectionView {
     pub(crate) async fn broadcast_legacy(&self, message: &Message) -> Result<()> {
         self.pool.broadcast(message).await
     }
+
+    pub(crate) fn record_send_success(&self, device_id: &DeviceId) {
+        if let Some(connection) = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(device_id)
+        {
+            connection.info.messages_sent += 1;
+            connection.info.last_activity = Instant::now();
+        }
+    }
 }
 
 async fn collect_connection_infos(
