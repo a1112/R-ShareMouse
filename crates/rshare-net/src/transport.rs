@@ -14,7 +14,6 @@ use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme,
 };
 use std::any::Any;
-#[cfg(test)]
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -94,18 +93,46 @@ pub struct QuicTransport {
     present_client_certificate: bool,
     peer_protocol_handshake_required: bool,
     datagram_reader_start_barrier: Option<Arc<Notify>>,
+    state_lifetime: Option<Arc<StateLifetimeOwner>>,
     #[cfg(test)]
-    test_state_guard: Option<Arc<TestStateGuard>>,
+    accept_task_barrier: Option<Arc<Notify>>,
+    #[cfg(test)]
+    accept_task_waiting: Arc<AtomicBool>,
 }
 
-#[cfg(test)]
-struct TestStateGuard(PathBuf);
+#[derive(Debug)]
+struct StateLifetimeOwner {
+    state_dir: PathBuf,
+    scratch_root: PathBuf,
+}
 
-#[cfg(test)]
-impl Drop for TestStateGuard {
+impl StateLifetimeOwner {
+    #[cfg(test)]
+    fn isolated(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            scratch_root: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("rshare-state"),
+        }
+    }
+
+    fn is_safe_isolated_state_dir(&self) -> bool {
+        self.state_dir.parent() == Some(self.scratch_root.as_path())
+            && self
+                .state_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    uuid::Uuid::parse_str(name).is_ok_and(|id| id.to_string() == name)
+                })
+    }
+}
+
+impl Drop for StateLifetimeOwner {
     fn drop(&mut self) {
-        if self.0.exists() {
-            fs::remove_dir_all(&self.0).expect("failed to clean isolated QUIC test state");
+        if self.is_safe_isolated_state_dir() {
+            let _ = fs::remove_dir_all(&self.state_dir);
         }
     }
 }
@@ -145,8 +172,11 @@ impl QuicTransport {
             present_client_certificate: true,
             peer_protocol_handshake_required: false,
             datagram_reader_start_barrier: None,
+            state_lifetime: None,
             #[cfg(test)]
-            test_state_guard: None,
+            accept_task_barrier: None,
+            #[cfg(test)]
+            accept_task_waiting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -170,10 +200,10 @@ impl QuicTransport {
             .join("target")
             .join("rshare-state")
             .join(uuid::Uuid::new_v4().to_string());
-        let guard = Arc::new(TestStateGuard(state_dir.clone()));
+        let lifetime = Arc::new(StateLifetimeOwner::isolated(state_dir.clone()));
         let mut transport = Self::from_identity(local_device_id, identity)
             .with_trust_store_path(state_dir.join("quic-trust.json"));
-        transport.test_state_guard = Some(guard);
+        transport.state_lifetime = Some(lifetime);
         transport
     }
 
@@ -200,6 +230,17 @@ impl QuicTransport {
     fn with_test_datagram_reader_barrier(mut self, barrier: Arc<Notify>) -> Self {
         self.datagram_reader_start_barrier = Some(barrier);
         self
+    }
+
+    #[cfg(test)]
+    fn with_test_accept_task_barrier(mut self, barrier: Arc<Notify>) -> Self {
+        self.accept_task_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    fn accept_task_waiting_for_test(&self) -> bool {
+        self.accept_task_waiting.load(Ordering::Acquire)
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -233,17 +274,35 @@ impl QuicTransport {
         };
         let peer_protocol_handshake_required = self.peer_protocol_handshake_required;
         let datagram_reader_start_barrier = self.datagram_reader_start_barrier.clone();
+        let state_lifetime = self.state_lifetime.clone();
+        #[cfg(test)]
+        let accept_task_barrier = self.accept_task_barrier.clone();
+        #[cfg(test)]
+        let accept_task_waiting = self.accept_task_waiting.clone();
         let accept_endpoint = endpoint.clone();
 
         let server_task = tokio::spawn(async move {
+            let _state_lifetime = state_lifetime.clone();
             while let Some(connecting) = accept_endpoint.accept().await {
                 let incoming_tx = incoming_tx.clone();
                 let endpoint = accept_endpoint.clone();
                 let config = config.clone();
                 let trust_store_path = trust_store_path.clone();
                 let datagram_reader_start_barrier = datagram_reader_start_barrier.clone();
+                let state_lifetime = state_lifetime.clone();
+                #[cfg(test)]
+                let accept_task_barrier = accept_task_barrier.clone();
+                #[cfg(test)]
+                let accept_task_waiting = accept_task_waiting.clone();
 
                 tokio::spawn(async move {
+                    let _task_state_lifetime = state_lifetime.clone();
+                    #[cfg(test)]
+                    if let Some(barrier) = accept_task_barrier {
+                        accept_task_waiting.store(true, Ordering::Release);
+                        barrier.notified().await;
+                        accept_task_waiting.store(false, Ordering::Release);
+                    }
                     match connecting.await {
                         Ok(connection) => {
                             let addr = connection.remote_address();
@@ -258,6 +317,7 @@ impl QuicTransport {
                                 trust_store_path,
                                 peer_protocol_handshake_required,
                                 datagram_reader_start_barrier,
+                                state_lifetime,
                             );
 
                             let _ = incoming_tx
@@ -311,8 +371,13 @@ impl QuicTransport {
             Some(path) => path.clone(),
             None => super::encryption::trust_store_path()?,
         };
-        let pending_peer_trust =
-            inspect_outbound_peer_trust(&connection, device_id, trust_store_path.clone()).await?;
+        let pending_peer_trust = inspect_outbound_peer_trust(
+            &connection,
+            device_id,
+            trust_store_path.clone(),
+            self.state_lifetime.clone(),
+        )
+        .await?;
 
         info!("Connected to QUIC peer {}", connection.remote_address());
 
@@ -326,6 +391,7 @@ impl QuicTransport {
             trust_store_path,
             self.peer_protocol_handshake_required,
             self.datagram_reader_start_barrier.clone(),
+            self.state_lifetime.clone(),
         ))
     }
 
@@ -363,6 +429,14 @@ impl QuicTransport {
     }
 }
 
+impl Drop for QuicTransport {
+    fn drop(&mut self) {
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl Default for QuicTransport {
     fn default() -> Self {
         Self::new(DeviceId::new_v4())
@@ -372,6 +446,7 @@ impl Default for QuicTransport {
 struct QuicConnectionInner {
     _endpoint: Endpoint,
     connection: quinn::Connection,
+    _state_lifetime: Option<Arc<StateLifetimeOwner>>,
     reliable_send_stream: TokioMutex<Option<quinn::SendStream>>,
     datagram_tx_dropped: AtomicU64,
     reliable_stream_reset_count: AtomicU64,
@@ -448,6 +523,7 @@ struct PendingPeerTrust {
     fingerprint: PeerCertificateFingerprint,
     trust_store_path: PathBuf,
     decision: QuicTrustDecision,
+    _state_lifetime: Option<Arc<StateLifetimeOwner>>,
 }
 
 pub(crate) struct OutboundFrame {
@@ -515,6 +591,7 @@ impl QuicConnection {
         trust_store_path: PathBuf,
         peer_protocol_handshake_required: bool,
         datagram_reader_start_barrier: Option<Arc<Notify>>,
+        state_lifetime: Option<Arc<StateLifetimeOwner>>,
     ) -> Self {
         let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(128);
         let (message_tx, message_rx): (mpsc::Sender<Message>, _) = mpsc::channel(256);
@@ -522,6 +599,7 @@ impl QuicConnection {
         let inner = Arc::new(QuicConnectionInner {
             _endpoint: endpoint,
             connection,
+            _state_lifetime: state_lifetime.clone(),
             reliable_send_stream: TokioMutex::new(None),
             datagram_tx_dropped: AtomicU64::new(0),
             reliable_stream_reset_count: AtomicU64::new(0),
@@ -2405,6 +2483,7 @@ async fn inspect_outbound_peer_trust(
     connection: &quinn::Connection,
     device_id: DeviceId,
     trust_store_path: PathBuf,
+    state_lifetime: Option<Arc<StateLifetimeOwner>>,
 ) -> Result<PendingPeerTrust> {
     let fingerprint = match peer_certificate_fingerprint(connection) {
         Some(fingerprint) => fingerprint,
@@ -2439,6 +2518,7 @@ async fn inspect_outbound_peer_trust(
         fingerprint,
         trust_store_path,
         decision,
+        _state_lifetime: state_lifetime,
     })
 }
 
@@ -5084,8 +5164,227 @@ mod tests {
         drop(isolated);
         assert!(
             state_dirs.iter().all(|state_dir| !state_dir.exists()),
-            "each transport guard must clean only its own test state"
+            "each lifetime owner must clean only its own test state"
         );
+    }
+
+    #[tokio::test]
+    async fn established_connections_keep_isolated_state_after_transports_drop() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        let server_state = server.state_lifetime.as_ref().unwrap().state_dir.clone();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_state = client.state_lifetime.as_ref().unwrap().state_dir.clone();
+        let mut client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        fs::create_dir_all(&server_state).unwrap();
+        fs::create_dir_all(&client_state).unwrap();
+
+        drop(server);
+        drop(client);
+        assert!(server_state.exists());
+        assert!(client_state.exists());
+        client_connection.confirm_peer_identity(server_id).unwrap();
+        server_connection
+            .confirm_inbound_peer_identity(client_id)
+            .unwrap();
+
+        client_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"lifetime test complete");
+        server_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"lifetime test complete");
+        drop(client_connection);
+        drop(server_connection);
+        timeout(Duration::from_secs(1), async {
+            while server_state.exists() || client_state.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the final connection/task owner must clean both state directories");
+    }
+
+    #[tokio::test]
+    async fn pending_peer_trust_keeps_state_until_confirmed_after_transport_drop() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_state = client.state_lifetime.as_ref().unwrap().state_dir.clone();
+        let mut pending = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let remote = incoming.recv().await.unwrap().connection;
+        fs::create_dir_all(&client_state).unwrap();
+
+        drop(client);
+        assert!(client_state.exists());
+        pending.confirm_peer_identity(server_id).unwrap();
+        assert!(
+            pending.trust_store_path.exists(),
+            "confirmation after transport drop must still persist trust"
+        );
+
+        pending
+            .inner
+            .connection
+            .close(0u32.into(), b"pending trust lifetime test complete");
+        remote
+            .inner
+            .connection
+            .close(0u32.into(), b"pending trust lifetime test complete");
+        drop(pending);
+        drop(remote);
+        server.close().await.unwrap();
+        drop(server);
+        timeout(Duration::from_secs(1), async {
+            while client_state.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the confirmed pending trust owner must clean its state");
+    }
+
+    #[tokio::test]
+    async fn detached_accept_task_keeps_state_until_it_finishes_after_transport_drop() {
+        let server_id = DeviceId::new_v4();
+        let barrier = Arc::new(Notify::new());
+        let mut server = QuicTransport::isolated_for_test(server_id)
+            .with_test_accept_task_barrier(barrier.clone());
+        let server_state = server.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(&server_state).unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let connect = tokio::spawn(async move {
+            let mut client = QuicTransport::isolated_for_test(DeviceId::new_v4());
+            client.connect(&address.to_string(), server_id).await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !server.accept_task_waiting_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached accept task must reach its barrier");
+
+        drop(server);
+        assert!(
+            server_state.exists(),
+            "the detached accept task must retain isolated state"
+        );
+        barrier.notify_one();
+        let client_connection = connect
+            .await
+            .expect("client connect task panicked")
+            .expect("the per-handshake task must finish the accepted connection");
+        let server_connection = incoming
+            .recv()
+            .await
+            .expect("the accepted connection must be published")
+            .connection;
+        client_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"accept task lifetime test complete");
+        server_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"accept task lifetime test complete");
+        drop(client_connection);
+        drop(server_connection);
+        drop(incoming);
+        timeout(Duration::from_secs(1), async {
+            while server_state.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("state must be cleaned after the detached accept task exits");
+    }
+
+    #[test]
+    fn isolated_state_drop_is_best_effort_when_external_state_changes() {
+        let deleted = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        let deleted_state = deleted.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(&deleted_state).unwrap();
+        fs::remove_dir_all(&deleted_state).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(deleted))).is_ok());
+
+        let replaced = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        let replaced_state = replaced.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(
+            replaced_state
+                .parent()
+                .expect("isolated state must have a scratch parent"),
+        )
+        .unwrap();
+        fs::write(&replaced_state, b"external replacement").unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(replaced))).is_ok(),
+            "cleanup failure during unwinding must never panic"
+        );
+        fs::remove_file(replaced_state).unwrap();
+
+        let unwinding = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        let unwinding_state = unwinding.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(unwinding_state.parent().unwrap()).unwrap();
+        fs::write(&unwinding_state, b"external replacement during unwind").unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _transport = unwinding;
+            panic!("simulated test panic");
+        }));
+        assert!(unwind.is_err(), "the simulated panic must be caught");
+        fs::remove_file(unwinding_state).unwrap();
+
+        let unsafe_state = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("outside-rshare-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&unsafe_state).unwrap();
+        let unsafe_owner = StateLifetimeOwner {
+            state_dir: unsafe_state.clone(),
+            scratch_root: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("rshare-state"),
+        };
+        drop(unsafe_owner);
+        assert!(
+            unsafe_state.exists(),
+            "cleanup must reject paths outside the isolated scratch root"
+        );
+        fs::remove_dir_all(unsafe_state).unwrap();
+
+        let scratch_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rshare-state");
+        let non_isolated_state = scratch_root.join("not-an-isolated-uuid");
+        fs::create_dir_all(&non_isolated_state).unwrap();
+        drop(StateLifetimeOwner {
+            state_dir: non_isolated_state.clone(),
+            scratch_root,
+        });
+        assert!(
+            non_isolated_state.exists(),
+            "cleanup must reject non-UUID paths inside the scratch root"
+        );
+        fs::remove_dir_all(non_isolated_state).unwrap();
     }
 
     #[test]
