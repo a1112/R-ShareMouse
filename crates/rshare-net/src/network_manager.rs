@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::{
-    connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
+    connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
     qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent},
 };
@@ -66,6 +66,7 @@ pub struct NetworkManager {
 
     discovery: ServiceDiscovery,
     connection: Arc<TokioMutex<ConnectionManager>>,
+    connection_view: ConnectionView,
     qos_registry: Arc<ConnectionRegistry>,
 
     event_tx: mpsc::Sender<NetworkEvent>,
@@ -107,7 +108,7 @@ async fn handle_discovery_event(
     config: &NetworkManagerConfig,
     discovered_devices: &Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
     discovery_tx: &mpsc::Sender<NetworkEvent>,
-    connection: &Arc<TokioMutex<ConnectionManager>>,
+    connection_view: &ConnectionView,
 ) {
     if config.auto_connect
         && matches!(
@@ -135,10 +136,7 @@ async fn handle_discovery_event(
                 devices.remove(&id);
             }
 
-            let transport_connected = {
-                let manager = connection.lock().await;
-                manager.is_connected(&id).await
-            };
+            let transport_connected = connection_view.is_connected(&id).await;
             if let Some(event) = discovery_lost_network_event(id, transport_connected) {
                 let _ = discovery_tx.try_send(event);
             }
@@ -167,6 +165,7 @@ impl NetworkManager {
 
         let connection_manager = ConnectionManager::new(local_device_id);
         let qos_registry = connection_manager.qos_registry();
+        let connection_view = connection_manager.connection_view();
         let connection = Arc::new(TokioMutex::new(connection_manager));
 
         Self {
@@ -176,6 +175,7 @@ impl NetworkManager {
             config,
             discovery,
             connection,
+            connection_view,
             qos_registry,
             event_tx,
             event_rx: Some(event_rx),
@@ -218,8 +218,7 @@ impl NetworkManager {
 
     /// Get current connection information snapshots.
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
-        let conn = self.connection.lock().await;
-        conn.connection_infos().await
+        self.connection_view.connection_infos().await
     }
 
     /// Takes the typed terminal-release stream used by the input-plane
@@ -230,8 +229,7 @@ impl NetworkManager {
 
     /// Check if a device is connected
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
-        let conn = self.connection.lock().await;
-        conn.is_connected(device_id).await
+        self.connection_view.is_connected(device_id).await
     }
 
     /// Send a message to a device
@@ -249,11 +247,17 @@ impl NetworkManager {
                 ClassifiedMessage::Telemetry(frame) => {
                     return peer.transport.try_send_telemetry(frame).map_err(Into::into);
                 }
+                ClassifiedMessage::ReliableCompat(frame) => {
+                    return peer
+                        .transport
+                        .send_reliable_compat(frame)
+                        .await
+                        .map_err(Into::into);
+                }
                 ClassifiedMessage::Unsupported => {}
             }
         }
-        let mut conn = self.connection.lock().await;
-        conn.send_to(device_id, message).await
+        self.connection_view.send_legacy(device_id, &message).await
     }
 
     /// Broadcast a message to all connected devices
@@ -292,10 +296,21 @@ impl NetworkManager {
                 }
                 return Ok(());
             }
+            ClassifiedMessage::ReliableCompat(frame) if !self.qos_registry.is_empty() => {
+                if let Some((id, error)) = self
+                    .qos_registry
+                    .broadcast_reliable_compat(frame)
+                    .await
+                    .into_iter()
+                    .find_map(|(id, result)| result.err().map(|error| (id, error)))
+                {
+                    anyhow::bail!("QoS broadcast to {id} failed: {error}");
+                }
+                return Ok(());
+            }
             _ => {}
         }
-        let mut conn = self.connection.lock().await;
-        conn.broadcast(message).await
+        self.connection_view.broadcast_legacy(&message).await
     }
 
     /// Start the network manager
@@ -320,7 +335,7 @@ impl NetworkManager {
         // Start discovery with event channel
         let discovery_tx = self.event_tx.clone();
         let discovered_devices = self.discovered_devices.clone();
-        let discovery_lost_connection = self.connection.clone();
+        let discovery_lost_connection = self.connection_view.clone();
         let discovery_event_config = self.config.clone();
 
         let mut discovery = ServiceDiscovery::new(
@@ -526,6 +541,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_query_does_not_wait_for_outer_connection_manager_lock() {
+        let manager = NetworkManager::new(
+            DeviceId::new_v4(),
+            "Test".to_string(),
+            "test-host".to_string(),
+        );
+        let _held = manager.connection.lock().await;
+
+        tokio::time::timeout(Duration::from_millis(50), manager.connection_infos())
+            .await
+            .expect("status query must bypass the lifecycle manager lock");
+    }
+
+    #[tokio::test]
+    async fn legacy_realtime_send_does_not_wait_for_outer_connection_manager_lock() {
+        let mut manager = NetworkManager::new(
+            DeviceId::new_v4(),
+            "Test".to_string(),
+            "test-host".to_string(),
+        );
+        let connection = manager.connection.clone();
+        let _held = connection.lock().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            manager.send_to(&DeviceId::new_v4(), Message::MouseMove { x: 10, y: 20 }),
+        )
+        .await
+        .expect("legacy realtime send must bypass the lifecycle manager lock");
+        assert!(
+            result.is_err(),
+            "missing peer must still report send failure"
+        );
+    }
+
+    #[tokio::test]
     async fn known_incompatible_discovery_fails_before_quic_connect() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
@@ -571,7 +622,7 @@ mod tests {
             &manager.config,
             &manager.discovered_devices,
             &manager.event_tx,
-            &manager.connection,
+            &manager.connection_view,
         )
         .await;
         let mut updated = found;
@@ -581,7 +632,7 @@ mod tests {
             &manager.config,
             &manager.discovered_devices,
             &manager.event_tx,
-            &manager.connection,
+            &manager.connection_view,
         )
         .await;
 

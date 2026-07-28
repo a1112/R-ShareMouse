@@ -86,6 +86,83 @@ struct CanonicalConnection {
 
 type CanonicalConnections = Arc<StdRwLock<HashMap<DeviceId, CanonicalConnection>>>;
 
+#[derive(Clone)]
+pub(crate) struct ConnectionView {
+    connections: CanonicalConnections,
+    pool: Arc<ConnectionPool>,
+}
+
+impl ConnectionView {
+    pub(crate) async fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        collect_connection_infos(&self.connections, &self.pool).await
+    }
+
+    pub(crate) async fn is_connected(&self, device_id: &DeviceId) -> bool {
+        self.pool.diagnostics_for(device_id).await.is_some()
+    }
+
+    pub(crate) async fn send_legacy(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
+        self.pool.send_to(device_id, message).await?;
+        if let Some(connection) = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(device_id)
+        {
+            connection.info.messages_sent += 1;
+            connection.info.last_activity = Instant::now();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn broadcast_legacy(&self, message: &Message) -> Result<()> {
+        self.pool.broadcast(message).await
+    }
+}
+
+async fn collect_connection_infos(
+    connections: &CanonicalConnections,
+    pool: &ConnectionPool,
+) -> Vec<ConnectionInfo> {
+    let mut infos_by_id: HashMap<_, _> = connections
+        .read()
+        .expect("canonical connection registry poisoned")
+        .iter()
+        .map(|(device_id, connection)| (*device_id, connection.info.clone()))
+        .collect();
+    let active_diagnostics = pool.diagnostics_all().await;
+    let active_device_ids: std::collections::HashSet<_> = active_diagnostics
+        .iter()
+        .map(|(device_id, _)| *device_id)
+        .collect();
+
+    for (device_id, info) in &mut infos_by_id {
+        if info.state == ConnectionState::Connected && !active_device_ids.contains(device_id) {
+            info.state = ConnectionState::Disconnected;
+            info.datagram_available = false;
+            info.rtt_ms = None;
+            info.last_datagram_rx_ms = None;
+            info.cert_trust_state = None;
+        }
+    }
+
+    for (device_id, diagnostics) in active_diagnostics {
+        let info = infos_by_id
+            .entry(device_id)
+            .or_insert_with(|| ConnectionInfo::new(device_id, diagnostics.address.clone()));
+        info.state = ConnectionState::Connected;
+        info.address = diagnostics.address;
+        info.transport = diagnostics.transport.to_string();
+        info.datagram_available = diagnostics.datagram_available;
+        info.rtt_ms = diagnostics.rtt_ms;
+        info.last_datagram_rx_ms = diagnostics.last_datagram_rx_ms;
+        info.datagram_tx_dropped = diagnostics.datagram_tx_dropped;
+        info.reliable_stream_reset_count = diagnostics.reliable_stream_reset_count;
+        info.cert_trust_state = diagnostics.cert_trust_state;
+    }
+    infos_by_id.into_values().collect()
+}
+
 fn forward_terminal_releases(
     mut releases: mpsc::Receiver<TerminalReleaseEvent>,
     target: mpsc::Sender<TerminalReleaseEvent>,
@@ -554,6 +631,9 @@ impl ConnectionManager {
                     .try_send_telemetry(frame)
                     .map_err(|error| anyhow::anyhow!(error))?;
             }
+            (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
+                peer.transport.send_reliable_compat(frame).await?;
+            }
             (_, ClassifiedMessage::Unsupported) | (None, _) => {
                 self.pool.send_to(device_id, &message).await?;
             }
@@ -585,6 +665,9 @@ impl ConnectionManager {
             ClassifiedMessage::Telemetry(frame) => {
                 ensure_broadcast_success(self.qos_registry.broadcast_telemetry(frame))
             }
+            ClassifiedMessage::ReliableCompat(frame) => {
+                ensure_broadcast_success(self.qos_registry.broadcast_reliable_compat(frame).await)
+            }
             ClassifiedMessage::Unsupported => self.pool.broadcast(&message).await,
         }
     }
@@ -599,6 +682,13 @@ impl ConnectionManager {
 
     pub fn qos_registry(&self) -> Arc<ConnectionRegistry> {
         self.qos_registry.clone()
+    }
+
+    pub(crate) fn connection_view(&self) -> ConnectionView {
+        ConnectionView {
+            connections: self.connections.clone(),
+            pool: self.pool.clone(),
+        }
     }
 
     pub fn get_connection(&self, device_id: &DeviceId) -> Option<ConnectionInfo> {
@@ -620,44 +710,7 @@ impl ConnectionManager {
 
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        let mut infos_by_id: HashMap<_, _> = self
-            .connections
-            .read()
-            .expect("canonical connection registry poisoned")
-            .iter()
-            .map(|(device_id, connection)| (*device_id, connection.info.clone()))
-            .collect();
-        let active_diagnostics = self.pool.diagnostics_all().await;
-        let active_device_ids: std::collections::HashSet<_> = active_diagnostics
-            .iter()
-            .map(|(device_id, _)| *device_id)
-            .collect();
-
-        for (device_id, info) in &mut infos_by_id {
-            if info.state == ConnectionState::Connected && !active_device_ids.contains(device_id) {
-                info.state = ConnectionState::Disconnected;
-                info.datagram_available = false;
-                info.rtt_ms = None;
-                info.last_datagram_rx_ms = None;
-                info.cert_trust_state = None;
-            }
-        }
-
-        for (device_id, diagnostics) in active_diagnostics {
-            let info = infos_by_id
-                .entry(device_id)
-                .or_insert_with(|| ConnectionInfo::new(device_id, diagnostics.address.clone()));
-            info.state = ConnectionState::Connected;
-            info.address = diagnostics.address;
-            info.transport = diagnostics.transport.to_string();
-            info.datagram_available = diagnostics.datagram_available;
-            info.rtt_ms = diagnostics.rtt_ms;
-            info.last_datagram_rx_ms = diagnostics.last_datagram_rx_ms;
-            info.datagram_tx_dropped = diagnostics.datagram_tx_dropped;
-            info.reliable_stream_reset_count = diagnostics.reliable_stream_reset_count;
-            info.cert_trust_state = diagnostics.cert_trust_state;
-        }
-        infos_by_id.into_values().collect()
+        collect_connection_infos(&self.connections, &self.pool).await
     }
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
