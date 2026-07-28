@@ -636,31 +636,53 @@ impl ConnectionManager {
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
         let classified =
             ClassifiedMessage::try_from(message.clone()).map_err(|error| anyhow::anyhow!(error))?;
-        match (self.qos_registry.peer(device_id), classified) {
-            (Some(peer), ClassifiedMessage::Control(frame)) => {
-                peer.transport.send_control(frame).await?;
-            }
-            (Some(peer), ClassifiedMessage::Bulk(frame)) => {
-                peer.transport.send_bulk(frame).await?;
-            }
-            (Some(peer), ClassifiedMessage::Telemetry(frame)) => {
-                peer.transport
-                    .try_send_telemetry(frame)
-                    .map_err(|error| anyhow::anyhow!(error))?;
-            }
-            (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
-                peer.transport.send_reliable_compat(frame).await?;
-            }
-            (_, ClassifiedMessage::Unsupported) | (None, _) => {
-                self.pool.send_to(device_id, &message).await?;
-            }
-        }
+        let (send_result, qos_generation): (Result<()>, Option<ControlConnectionId>) =
+            match (self.qos_registry.peer(device_id), classified) {
+                (Some(peer), ClassifiedMessage::Control(frame)) => {
+                    let generation = peer.auth.control_connection_id;
+                    (
+                        peer.transport.send_control(frame).await.map_err(Into::into),
+                        Some(generation),
+                    )
+                }
+                (Some(peer), ClassifiedMessage::Bulk(frame)) => {
+                    let generation = peer.auth.control_connection_id;
+                    (
+                        peer.transport.send_bulk(frame).await.map_err(Into::into),
+                        Some(generation),
+                    )
+                }
+                (Some(peer), ClassifiedMessage::Telemetry(frame)) => {
+                    let generation = peer.auth.control_connection_id;
+                    (
+                        peer.transport.try_send_telemetry(frame).map_err(Into::into),
+                        Some(generation),
+                    )
+                }
+                (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
+                    let generation = peer.auth.control_connection_id;
+                    (
+                        peer.transport
+                            .send_reliable_compat(frame)
+                            .await
+                            .map_err(Into::into),
+                        Some(generation),
+                    )
+                }
+                (_, ClassifiedMessage::Unsupported) | (None, _) => {
+                    (self.pool.send_to(device_id, &message).await, None)
+                }
+            };
+        send_result?;
 
         if let Some(connection) = self
             .connections
             .write()
             .expect("canonical connection registry poisoned")
             .get_mut(device_id)
+            .filter(|connection| {
+                qos_generation.is_none() || connection.info.control_connection_id == qos_generation
+            })
         {
             connection.info.messages_sent += 1;
             connection.info.last_activity = Instant::now();
@@ -868,6 +890,125 @@ mod tests {
             .connection_view()
             .record_send_success(&peer_id, replacement_generation);
         assert_eq!(messages_sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_to_completion_from_replaced_generation_does_not_mutate_replacement_metrics() {
+        let local_id = DeviceId::new_v4();
+        let peer_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(peer_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(local_id);
+        let client_connection = client.connect(&address.to_string(), peer_id).await.unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let bulk_reader_barrier = Arc::new(tokio::sync::Notify::new());
+        server_connection.set_qos_bulk_reader_barrier(bulk_reader_barrier.clone());
+        let old_generation = ControlConnectionId::new();
+        let server_auth = Arc::new(crate::handshake::PeerAuthContext {
+            peer_id: local_id,
+            certificate_fingerprint: crate::encryption::PeerCertificateFingerprint::from_der(
+                b"client",
+            ),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(crate::handshake::PeerAuthContext {
+            peer_id,
+            certificate_fingerprint: crate::encryption::PeerCertificateFingerprint::from_der(
+                b"server",
+            ),
+            control_connection_id: old_generation,
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (old_transport, _client_releases) = client_connection.install_qos(client_auth.clone());
+
+        let mut manager = ConnectionManager::new(local_id);
+        manager.qos_registry.insert(
+            peer_id,
+            RegisteredPeer {
+                auth: client_auth,
+                transport: old_transport.clone(),
+            },
+        );
+        insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: peer_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: Some(old_generation),
+            },
+        );
+        let connections = manager.connections.clone();
+        let registry = manager.qos_registry.clone();
+        let send = tokio::spawn(async move {
+            manager
+                .send_to(
+                    &peer_id,
+                    Message::ClipboardData {
+                        mime_type: "application/octet-stream".into(),
+                        data: vec![0xA5; 512 * 1024],
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (started, completed, _, _) = old_transport.awaited_write_counts_for_test();
+                if started > completed && server_connection.qos_bulk_reader_waiting_for_test() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send_to must be awaiting a real blocked old-generation write");
+
+        let replacement_generation = ControlConnectionId::new();
+        connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(&peer_id)
+            .expect("canonical peer remains present")
+            .info
+            .control_connection_id = Some(replacement_generation);
+        registry.insert(
+            peer_id,
+            RegisteredPeer {
+                auth: Arc::new(crate::handshake::PeerAuthContext {
+                    peer_id,
+                    certificate_fingerprint:
+                        crate::encryption::PeerCertificateFingerprint::from_der(b"server-new"),
+                    control_connection_id: replacement_generation,
+                }),
+                transport: old_transport,
+            },
+        );
+        bulk_reader_barrier.notify_waiters();
+        send.await.unwrap().unwrap();
+
+        assert_eq!(
+            connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&peer_id)
+                .expect("replacement remains canonical")
+                .info
+                .messages_sent,
+            0,
+            "late send_to success must not increment replacement metrics"
+        );
     }
 
     #[tokio::test]

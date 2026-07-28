@@ -13,6 +13,7 @@ use crate::handshake::PeerAuthContext;
 
 pub const QOS_LANE_MAGIC: &[u8; 4] = b"RSQ3";
 pub(crate) const TERMINAL_CANCEL_RESET_CODE: u32 = 0x525351;
+pub(crate) const AWAITED_CANCEL_RESET_CODE: u32 = 0x525352;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -246,6 +247,12 @@ struct AwaitedWriteProbes {
     completed: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     cancelled: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    reset_succeeded: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    preface_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(test)]
+    preface_barrier_waiting: AtomicBool,
 }
 
 #[derive(Default)]
@@ -284,7 +291,7 @@ struct PeerTransportInner {
     telemetry_tx: mpsc::Sender<TelemetryFrame>,
     epoch_state: Mutex<SenderEpochState>,
     admission: Mutex<()>,
-    reliable_cancel_tx: watch::Sender<Option<SessionEpoch>>,
+    reliable_cancelled_through_tx: watch::Sender<Option<SessionEpoch>>,
     release_emitter: TerminalReleaseEmitter,
     emergency_reserved: AtomicBool,
     reliable_write_started: std::sync::atomic::AtomicU64,
@@ -340,7 +347,7 @@ impl PeerTransportHandle {
         let (reliable_compat_tx, reliable_compat_rx) = mpsc::channel(128);
         let (bulk_tx, bulk_rx) = mpsc::channel(8);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
-        let (reliable_cancel_tx, reliable_cancel_rx) = watch::channel(None);
+        let (reliable_cancelled_through_tx, reliable_cancelled_through_rx) = watch::channel(None);
         let worker_count = Arc::new(AtomicUsize::new(0));
         let awaited_write_probes = Arc::new(AwaitedWriteProbes::default());
         let inner = Arc::new(PeerTransportInner {
@@ -354,7 +361,7 @@ impl PeerTransportHandle {
             telemetry_tx,
             epoch_state: Mutex::new(SenderEpochState::default()),
             admission: Mutex::new(()),
-            reliable_cancel_tx,
+            reliable_cancelled_through_tx,
             release_emitter,
             emergency_reserved: AtomicBool::new(false),
             reliable_write_started: std::sync::atomic::AtomicU64::new(0),
@@ -367,7 +374,7 @@ impl PeerTransportHandle {
             Arc::downgrade(&inner),
             connection.clone(),
             reliable_rx,
-            reliable_cancel_rx,
+            reliable_cancelled_through_rx,
             worker_count.clone(),
         );
         spawn_emergency_writer(
@@ -451,10 +458,7 @@ impl PeerTransportHandle {
                     }
                     state.retire(frame.session_epoch);
                     drop(state);
-                    let _ = self
-                        .inner
-                        .reliable_cancel_tx
-                        .send(Some(frame.session_epoch));
+                    self.cancel_reliable_through_locked(frame.session_epoch);
                     return self.enqueue_emergency_locked(frame);
                 }
                 _ => {
@@ -501,10 +505,7 @@ impl PeerTransportHandle {
             }
         }
         self.retire_epoch_locked(frame.session_epoch);
-        let _ = self
-            .inner
-            .reliable_cancel_tx
-            .send(Some(frame.session_epoch));
+        self.cancel_reliable_through_locked(frame.session_epoch);
         self.enqueue_emergency_locked(frame)
     }
 
@@ -595,7 +596,7 @@ impl PeerTransportHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn awaited_write_counts_for_test(&self) -> (u64, u64, u64) {
+    pub(crate) fn awaited_write_counts_for_test(&self) -> (u64, u64, u64, u64) {
         (
             self.inner
                 .awaited_write_probes
@@ -609,7 +610,36 @@ impl PeerTransportHandle {
                 .awaited_write_probes
                 .cancelled
                 .load(Ordering::Acquire),
+            self.inner
+                .awaited_write_probes
+                .reset_succeeded
+                .load(Ordering::Acquire),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_cancel_for_test(&self, epoch: SessionEpoch) {
+        let _admission = self.inner.admission.lock().expect("qos admission poisoned");
+        self.retire_epoch_locked(epoch);
+        self.cancel_reliable_through_locked(epoch);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_awaited_preface_barrier_for_test(&self, barrier: Arc<tokio::sync::Notify>) {
+        *self
+            .inner
+            .awaited_write_probes
+            .preface_barrier
+            .lock()
+            .expect("awaited preface barrier poisoned") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awaited_preface_waiting_for_test(&self) -> bool {
+        self.inner
+            .awaited_write_probes
+            .preface_barrier_waiting
+            .load(Ordering::Acquire)
     }
 
     fn fail_emergency_locked(&self, frame: ReliableInputFrame) {
@@ -630,7 +660,7 @@ impl PeerTransportHandle {
 
     fn fail_future_emergency_locked(&self, active: SessionEpoch) {
         self.retire_epoch_locked(active);
-        let _ = self.inner.reliable_cancel_tx.send(Some(active));
+        self.cancel_reliable_through_locked(active);
         if let Some(connection) = &self.inner.realtime_connection {
             connection.close(0u32.into(), b"future emergency epoch mismatch");
         }
@@ -643,10 +673,7 @@ impl PeerTransportHandle {
 
     fn fail_reliable_frame(&self, frame: ReliableInputFrame) -> Result<(), TransportSendError> {
         self.retire_epoch_locked(frame.session_epoch);
-        let _ = self
-            .inner
-            .reliable_cancel_tx
-            .send(Some(frame.session_epoch));
+        self.cancel_reliable_through_locked(frame.session_epoch);
         let terminal = ReliableInputFrame {
             protocol_version: frame.protocol_version,
             session_epoch: frame.session_epoch,
@@ -665,6 +692,15 @@ impl PeerTransportHandle {
             .lock()
             .expect("qos epoch state poisoned")
             .retire(epoch);
+    }
+
+    fn cancel_reliable_through_locked(&self, epoch: SessionEpoch) {
+        let current = *self.inner.reliable_cancelled_through_tx.borrow();
+        if current.is_none_or(|cancelled| epoch.0 > cancelled.0) {
+            self.inner
+                .reliable_cancelled_through_tx
+                .send_replace(Some(epoch));
+        }
     }
 }
 
@@ -752,7 +788,7 @@ fn spawn_reliable_writer(
     inner_weak: std::sync::Weak<PeerTransportInner>,
     connection: quinn::Connection,
     mut rx: mpsc::Receiver<ReliableInputFrame>,
-    mut cancel_rx: watch::Receiver<Option<SessionEpoch>>,
+    mut cancelled_through_rx: watch::Receiver<Option<SessionEpoch>>,
     worker_count: Arc<AtomicUsize>,
 ) {
     let guard = WorkerGuard::new(worker_count);
@@ -763,7 +799,10 @@ fn spawn_reliable_writer(
             let Some(inner) = inner_weak.upgrade() else {
                 return;
             };
-            cancel_rx.borrow_and_update();
+            let cancelled_through = *cancelled_through_rx.borrow_and_update();
+            if cancelled_through.is_some_and(|cancelled| cancelled.0 >= frame.session_epoch.0) {
+                continue;
+            }
             if inner
                 .epoch_state
                 .lock()
@@ -835,11 +874,15 @@ fn spawn_reliable_writer(
                 loop {
                     tokio::select! {
                         result = &mut write => break Some(result),
-                        changed = cancel_rx.changed() => {
+                        changed = cancelled_through_rx.changed() => {
                             if changed.is_err() {
                                 return;
                             }
-                            if *cancel_rx.borrow_and_update() == Some(frame.session_epoch) {
+                            let cancelled_through =
+                                *cancelled_through_rx.borrow_and_update();
+                            if cancelled_through.is_some_and(|cancelled| {
+                                cancelled.0 >= frame.session_epoch.0
+                            }) {
                                 break None;
                             }
                         }
@@ -953,7 +996,13 @@ fn spawn_awaited_writer<T, F>(
                     #[cfg(test)]
                     _probes.started.fetch_add(1, Ordering::AcqRel);
                     tokio::select! {
-                        result = write_qos_message(&connection, lane, &mut stream, &message) => {
+                        result = write_qos_message(
+                            &connection,
+                            lane,
+                            &mut stream,
+                            &message,
+                            Some(&_probes),
+                        ) => {
                             #[cfg(test)]
                             _probes.completed.fetch_add(1, Ordering::AcqRel);
                             Some(result)
@@ -971,7 +1020,10 @@ fn spawn_awaited_writer<T, F>(
             if let Some(result) = result {
                 let _ = written.send(result);
             } else if let Some(mut abandoned) = stream.take() {
-                let _ = abandoned.reset(0u32.into());
+                if abandoned.reset(AWAITED_CANCEL_RESET_CODE.into()).is_ok() {
+                    #[cfg(test)]
+                    _probes.reset_succeeded.fetch_add(1, Ordering::AcqRel);
+                }
             }
         }
     });
@@ -994,6 +1046,7 @@ fn spawn_telemetry_writer(
                     LaneDiscriminator::Telemetry,
                     &mut stream,
                     &message,
+                    None,
                 ) => {}
                 _ = connection.closed() => return,
             }
@@ -1006,12 +1059,15 @@ async fn write_qos_message(
     lane: LaneDiscriminator,
     stream: &mut Option<quinn::SendStream>,
     message: &Message,
+    _probes: Option<&AwaitedWriteProbes>,
 ) -> Result<(), TransportSendError> {
     if stream.is_none() {
-        let mut opened = connection
+        let opened = connection
             .open_uni()
             .await
             .map_err(|_| TransportSendError::LaneClosed)?;
+        *stream = Some(opened);
+        let opened = stream.as_mut().expect("qos stream was just initialized");
         let _ = opened.set_priority(match lane {
             LaneDiscriminator::Control => 80,
             LaneDiscriminator::Bulk => -10,
@@ -1025,11 +1081,27 @@ async fn write_qos_message(
             QOS_LANE_MAGIC[3],
             lane as u8,
         ];
-        opened
-            .write_all(&preface)
-            .await
-            .map_err(|_| TransportSendError::LaneClosed)?;
-        *stream = Some(opened);
+        #[cfg(test)]
+        if let Some(probes) = _probes {
+            let barrier = probes
+                .preface_barrier
+                .lock()
+                .expect("awaited preface barrier poisoned")
+                .take();
+            if let Some(barrier) = barrier {
+                probes
+                    .preface_barrier_waiting
+                    .store(true, Ordering::Release);
+                barrier.notified().await;
+                probes
+                    .preface_barrier_waiting
+                    .store(false, Ordering::Release);
+            }
+        }
+        if opened.write_all(&preface).await.is_err() {
+            *stream = None;
+            return Err(TransportSendError::LaneClosed);
+        }
     }
     let payload = crate::codec::ControlMessageCodec::encode(message)
         .map_err(|_| TransportSendError::UnsupportedMessage)?;
@@ -1338,7 +1410,7 @@ fn fixture_handle(
     let (release_tx, release_rx) = mpsc::channel(4);
     let release_emitter = TerminalReleaseEmitter::new(release_tx.clone());
     let worker_release_tx = release_tx.clone();
-    let (reliable_cancel_tx, _reliable_cancel_rx) = watch::channel(None);
+    let (reliable_cancelled_through_tx, _reliable_cancelled_through_rx) = watch::channel(None);
     let release_auth = auth.clone();
     tokio::spawn(async move {
         while let Some(frame) = emergency_rx.recv().await {
@@ -1366,7 +1438,7 @@ fn fixture_handle(
                 telemetry_tx,
                 epoch_state: Mutex::new(SenderEpochState::default()),
                 admission: Mutex::new(()),
-                reliable_cancel_tx,
+                reliable_cancelled_through_tx,
                 release_emitter,
                 emergency_reserved: AtomicBool::new(false),
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
@@ -1425,7 +1497,7 @@ fn fixture_handle_with_stalled_emergency() -> (
     let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
     let release_emitter = TerminalReleaseEmitter::new(release_tx);
-    let (reliable_cancel_tx, _reliable_cancel_rx) = watch::channel(None);
+    let (reliable_cancelled_through_tx, _reliable_cancelled_through_rx) = watch::channel(None);
     (
         PeerTransportHandle {
             inner: Arc::new(PeerTransportInner {
@@ -1439,7 +1511,7 @@ fn fixture_handle_with_stalled_emergency() -> (
                 telemetry_tx,
                 epoch_state: Mutex::new(SenderEpochState::default()),
                 admission: Mutex::new(()),
-                reliable_cancel_tx,
+                reliable_cancelled_through_tx,
                 release_emitter,
                 emergency_reserved: AtomicBool::new(false),
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
@@ -1791,6 +1863,25 @@ mod tests {
                 },
             })
             .expect("the current epoch must remain active");
+    }
+
+    #[tokio::test]
+    async fn cancelled_through_starts_empty_never_decreases_and_accepts_max_epoch() {
+        let (handle, _probe, _releases) = fixture_handle(8);
+        assert_eq!(*handle.inner.reliable_cancelled_through_tx.borrow(), None);
+
+        handle.publish_cancel_for_test(SessionEpoch(u64::MAX));
+        handle.publish_cancel_for_test(SessionEpoch(u64::MAX - 1));
+
+        assert_eq!(
+            *handle.inner.reliable_cancelled_through_tx.borrow(),
+            Some(SessionEpoch(u64::MAX))
+        );
+        assert!(handle.is_tombstoned(SessionEpoch(u64::MAX)));
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_enter(u64::MAX, 1)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
     }
 
     #[tokio::test]

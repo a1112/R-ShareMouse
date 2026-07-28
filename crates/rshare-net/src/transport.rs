@@ -30,7 +30,7 @@ use super::encryption::{
 use super::handshake::PeerAuthContext;
 use super::qos::{
     LaneDiscriminator, PeerTransportHandle, TerminalReleaseEmitter, TerminalReleaseEvent,
-    QOS_LANE_MAGIC, TERMINAL_CANCEL_RESET_CODE,
+    AWAITED_CANCEL_RESET_CODE, QOS_LANE_MAGIC, TERMINAL_CANCEL_RESET_CODE,
 };
 use rshare_core::{ControlConnectionId, DeviceId, Message, ReliableInputEvent, SessionEpoch};
 use tracing::info;
@@ -350,6 +350,12 @@ struct QuicConnectionInner {
     qos_reliable_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
     #[cfg(test)]
     qos_bulk_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
+    #[cfg(test)]
+    qos_bulk_reader_barrier_waiting: AtomicBool,
+    #[cfg(test)]
+    qos_reliable_faults_handled: AtomicU64,
+    #[cfg(test)]
+    qos_awaited_cancel_resets_observed: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -489,6 +495,12 @@ impl QuicConnection {
             qos_reliable_reader_start_barrier: StdMutex::new(None),
             #[cfg(test)]
             qos_bulk_reader_start_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            qos_bulk_reader_barrier_waiting: AtomicBool::new(false),
+            #[cfg(test)]
+            qos_reliable_faults_handled: AtomicU64::new(0),
+            #[cfg(test)]
+            qos_awaited_cancel_resets_observed: AtomicU64::new(0),
         });
         {
             let inner = inner.clone();
@@ -610,12 +622,19 @@ impl QuicConnection {
     }
 
     #[cfg(test)]
-    fn set_qos_bulk_reader_barrier(&self, barrier: Arc<Notify>) {
+    pub(crate) fn set_qos_bulk_reader_barrier(&self, barrier: Arc<Notify>) {
         *self
             .inner
             .qos_bulk_reader_start_barrier
             .lock()
             .expect("qos bulk reader barrier poisoned") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qos_bulk_reader_waiting_for_test(&self) -> bool {
+        self.inner
+            .qos_bulk_reader_barrier_waiting
+            .load(Ordering::Acquire)
     }
 
     pub fn confirm_peer_identity(
@@ -1260,12 +1279,25 @@ async fn read_authenticated_uni_stream(
 ) {
     let mut prefix = [0u8; 4];
     if let Err(error) = stream.read_exact(&mut prefix).await {
+        #[cfg(test)]
+        if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
+            inner
+                .qos_awaited_cancel_resets_observed
+                .fetch_add(1, Ordering::AcqRel);
+        }
         tracing::debug!("QUIC authenticated stream prefix read stopped: {}", error);
         return;
     }
     if &prefix == QOS_LANE_MAGIC {
         let mut lane = [0u8; 1];
-        if stream.read_exact(&mut lane).await.is_err() {
+        if let Err(error) = stream.read_exact(&mut lane).await {
+            if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
+                #[cfg(test)]
+                inner
+                    .qos_awaited_cancel_resets_observed
+                    .fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             inner
                 .connection
                 .close(0u32.into(), b"truncated qos lane preface");
@@ -1315,12 +1347,25 @@ async fn read_qos_message_stream(
             .expect("qos bulk reader barrier poisoned")
             .clone();
         if let Some(barrier) = barrier {
+            inner
+                .qos_bulk_reader_barrier_waiting
+                .store(true, Ordering::Release);
             barrier.notified().await;
+            inner
+                .qos_bulk_reader_barrier_waiting
+                .store(false, Ordering::Release);
         }
     }
     loop {
         let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
+        if let Err(error) = stream.read_exact(&mut len_buf).await {
+            if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
+                #[cfg(test)]
+                inner
+                    .qos_awaited_cancel_resets_observed
+                    .fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             inner
                 .connection
                 .close(0u32.into(), b"truncated qos message length");
@@ -1334,7 +1379,14 @@ async fn read_qos_message_stream(
             return;
         }
         let mut data = vec![0u8; len];
-        if stream.read_exact(&mut data).await.is_err() {
+        if let Err(error) = stream.read_exact(&mut data).await {
+            if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
+                #[cfg(test)]
+                inner
+                    .qos_awaited_cancel_resets_observed
+                    .fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             inner
                 .connection
                 .close(0u32.into(), b"truncated qos message payload");
@@ -1435,22 +1487,25 @@ async fn read_qos_reliable_stream(
         let mut len_buf = [0u8; 4];
         if let Err(error) = stream.read_exact(&mut len_buf).await {
             if let Some(context) = await_qos_receive_context(&inner).await {
-                if is_terminal_cancel_reset(&error)
-                    && handle_terminal_cancel_reset(&inner, &context, stream_epoch)
+                if !(is_terminal_cancel_reset(&error)
+                    && handle_terminal_cancel_reset(&inner, &context, stream_epoch))
                 {
-                    return;
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"truncated qos reliable length",
+                    );
                 }
-                fail_close_active_qos(
-                    &inner,
-                    &context,
-                    stream_epoch,
-                    b"truncated qos reliable length",
-                );
             } else {
                 inner
                     .connection
                     .close(0u32.into(), b"truncated qos reliable length");
             }
+            #[cfg(test)]
+            inner
+                .qos_reliable_faults_handled
+                .fetch_add(1, Ordering::AcqRel);
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -1467,22 +1522,25 @@ async fn read_qos_reliable_stream(
         let mut data = vec![0u8; len];
         if let Err(error) = stream.read_exact(&mut data).await {
             if let Some(context) = await_qos_receive_context(&inner).await {
-                if is_terminal_cancel_reset(&error)
-                    && handle_terminal_cancel_reset(&inner, &context, stream_epoch)
+                if !(is_terminal_cancel_reset(&error)
+                    && handle_terminal_cancel_reset(&inner, &context, stream_epoch))
                 {
-                    return;
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"truncated qos reliable payload",
+                    );
                 }
-                fail_close_active_qos(
-                    &inner,
-                    &context,
-                    stream_epoch,
-                    b"truncated qos reliable payload",
-                );
             } else {
                 inner
                     .connection
                     .close(0u32.into(), b"truncated qos reliable payload");
             }
+            #[cfg(test)]
+            inner
+                .qos_reliable_faults_handled
+                .fetch_add(1, Ordering::AcqRel);
             return;
         }
         let Ok(frame) = crate::codec::ReliableInputCodec::decode(&data) else {
@@ -1597,10 +1655,14 @@ async fn read_qos_reliable_stream(
 }
 
 fn is_terminal_cancel_reset(error: &quinn::ReadExactError) -> bool {
+    is_stream_reset(error, TERMINAL_CANCEL_RESET_CODE)
+}
+
+fn is_stream_reset(error: &quinn::ReadExactError, expected_code: u32) -> bool {
     matches!(
         error,
         quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code))
-            if *code == quinn::VarInt::from_u32(TERMINAL_CANCEL_RESET_CODE)
+            if *code == quinn::VarInt::from_u32(expected_code)
     )
 }
 
@@ -1654,6 +1716,15 @@ fn fail_close_active_qos(
             .qos_inbound
             .lock()
             .expect("qos inbound state poisoned");
+        if let Some(stream_epoch) = stream_epoch {
+            let stream_key = (context.auth.control_connection_id, stream_epoch);
+            let matches_active = state
+                .active
+                .is_some_and(|(generation, epoch, _)| (generation, epoch) == stream_key);
+            if !matches_active && inbound_epoch_retired(&state, stream_key) {
+                return;
+            }
+        }
         match state.active {
             Some((generation, epoch, _))
                 if generation == context.auth.control_connection_id
@@ -2369,6 +2440,93 @@ mod tests {
         stream
     }
 
+    struct TwoEpochReliableFixture {
+        client_connection: QuicConnection,
+        server_connection: QuicConnection,
+        releases: mpsc::Receiver<TerminalReleaseEvent>,
+        old_stream: quinn::SendStream,
+        new_stream: quinn::SendStream,
+        generation: ControlConnectionId,
+        _server_qos: PeerTransportHandle,
+    }
+
+    async fn two_epoch_reliable_fixture() -> TwoEpochReliableFixture {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let (server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let old_stream = open_raw_qos_input_stream(
+            &client_connection,
+            LaneDiscriminator::ReliableInput,
+            &reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "old".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+        )
+        .await;
+        timeout(Duration::from_secs(1), async {
+            while server_connection.inner.qos_inbound.lock().unwrap().active
+                != Some((generation, SessionEpoch(1), 1))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first epoch must become active");
+        let new_stream = open_raw_qos_input_stream(
+            &client_connection,
+            LaneDiscriminator::ReliableInput,
+            &reliable_frame(
+                2,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "new".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+        )
+        .await;
+        let displaced = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .expect("the larger Enter must release the old epoch")
+            .unwrap();
+        assert_eq!(displaced.epoch, SessionEpoch(1));
+        assert_eq!(
+            server_connection.inner.qos_inbound.lock().unwrap().active,
+            Some((generation, SessionEpoch(2), 1))
+        );
+        TwoEpochReliableFixture {
+            client_connection,
+            server_connection,
+            releases,
+            old_stream,
+            new_stream,
+            generation,
+            _server_qos: server_qos,
+        }
+    }
+
     #[test]
     fn legacy_realtime_adapter_is_private_and_rejects_reliable_messages() {
         let realtime = Message::MouseMove { x: 7, y: -4 };
@@ -2594,6 +2752,107 @@ mod tests {
         })
         .await
         .expect("stale cancellation must not consume the next epoch Enter");
+        reliable_reader.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn overwritten_cancel_still_resets_blocked_old_epoch_and_allows_new_enter() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let reliable_reader = Arc::new(Notify::new());
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        let blocked_epoch = SessionEpoch(50);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                blocked_epoch.0,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "blocked".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while server_connection.inner.qos_inbound.lock().unwrap().active
+                != Some((generation, blocked_epoch, 1))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the blocked epoch must first become active");
+        server_connection.set_qos_reliable_reader_barrier(reliable_reader.clone());
+
+        let mut sequence = 2;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                client_qos
+                    .try_send_reliable_input(reliable_frame(
+                        blocked_epoch.0,
+                        sequence,
+                        ReliableInputEvent::TextCommit {
+                            text: "x".repeat(3_072),
+                        },
+                    ))
+                    .unwrap();
+                sequence += 1;
+                tokio::task::yield_now().await;
+                let (started, completed) = client_qos.reliable_write_counts_for_test();
+                if started > completed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a real reliable write must be flow-control blocked");
+
+        client_qos.publish_cancel_for_test(blocked_epoch);
+        client_qos.publish_cancel_for_test(SessionEpoch(blocked_epoch.0 + 1));
+        let replacement_epoch = SessionEpoch(blocked_epoch.0 + 2);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                replacement_epoch.0,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "replacement".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            while server_connection.inner.qos_inbound.lock().unwrap().active
+                != Some((generation, replacement_epoch, 1))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled-through must not lose the blocked epoch cancellation");
         reliable_reader.notify_waiters();
     }
 
@@ -3143,6 +3402,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_old_stream_fin_does_not_close_or_release_active_replacement() {
+        let mut fixture = two_epoch_reliable_fixture().await;
+        fixture.old_stream.finish().unwrap();
+        timeout(Duration::from_secs(1), async {
+            while fixture
+                .server_connection
+                .inner
+                .qos_reliable_faults_handled
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old stream FIN must be observed by its reader");
+
+        let close_reason = fixture.server_connection.inner.connection.close_reason();
+        assert!(
+            close_reason.is_none(),
+            "an old retired stream FIN must not close the connection: {close_reason:?}"
+        );
+        assert_eq!(
+            fixture
+                .server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .active,
+            Some((fixture.generation, SessionEpoch(2), 1))
+        );
+        assert!(fixture.releases.try_recv().is_err());
+        let _ = fixture.new_stream;
+        let _ = fixture.client_connection;
+    }
+
+    #[tokio::test]
+    async fn retired_old_stream_nonterminal_reset_does_not_close_active_replacement() {
+        let mut fixture = two_epoch_reliable_fixture().await;
+        fixture
+            .old_stream
+            .reset(quinn::VarInt::from_u32(77))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while fixture
+                .server_connection
+                .inner
+                .qos_reliable_faults_handled
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old stream reset must be observed by its reader");
+
+        let close_reason = fixture.server_connection.inner.connection.close_reason();
+        assert!(
+            close_reason.is_none(),
+            "an old retired stream reset must not close the connection: {close_reason:?}"
+        );
+        assert_eq!(
+            fixture
+                .server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .active,
+            Some((fixture.generation, SessionEpoch(2), 1))
+        );
+        assert!(fixture.releases.try_recv().is_err());
+        let _ = fixture.new_stream;
+        let _ = fixture.client_connection;
+    }
+
+    #[tokio::test]
+    async fn active_stream_nonterminal_reset_still_fails_closed() {
+        let mut fixture = two_epoch_reliable_fixture().await;
+        fixture
+            .new_stream
+            .reset(quinn::VarInt::from_u32(78))
+            .unwrap();
+        timeout(
+            Duration::from_secs(1),
+            fixture.client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("a nonterminal reset of the active stream must close the connection");
+        let release = timeout(Duration::from_secs(1), fixture.releases.recv())
+            .await
+            .expect("the active reset must release active input")
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(2));
+        let _ = fixture.old_stream;
+    }
+
+    #[tokio::test]
     async fn truncated_reliable_frame_closes_and_releases_current_epoch() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
@@ -3546,6 +3905,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_awaited_lane_during_preface_resets_without_closing_connection() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (handle, _client_releases) = client_connection.install_qos(client_auth);
+        handle.set_awaited_preface_barrier_for_test(Arc::new(Notify::new()));
+        let blocked_handle = handle.clone();
+        let send = tokio::spawn(async move {
+            blocked_handle
+                .send_bulk(super::super::qos::BulkFrame::test_payload(8))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !handle.awaited_preface_waiting_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the awaited writer must open a stream and block before writing its preface");
+
+        send.abort();
+        let _ = send.await;
+        timeout(Duration::from_secs(1), async {
+            while handle.awaited_write_counts_for_test().3 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preface cancellation must reset the already-open stream with the dedicated code");
+        timeout(Duration::from_secs(1), async {
+            while server_connection
+                .inner
+                .qos_awaited_cancel_resets_observed
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the peer must observe the dedicated preface cancellation reset");
+        assert!(
+            server_connection.inner.connection.close_reason().is_none(),
+            "preface cancellation must not close the connection"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_blocked_awaited_lane_resets_and_all_workers_stop_on_drop() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
@@ -3582,8 +4009,8 @@ mod tests {
         });
         timeout(Duration::from_secs(1), async {
             loop {
-                let (started, completed, _) = handle.awaited_write_counts_for_test();
-                if started > completed {
+                let (started, completed, _, _) = handle.awaited_write_counts_for_test();
+                if started > completed && server_connection.qos_bulk_reader_waiting_for_test() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -3607,9 +4034,32 @@ mod tests {
             }
         })
         .await
-        .expect("dropping the caller must cancel and reset the in-flight bulk stream");
-        drop(handle);
+        .expect("dropping the caller must cancel the in-flight bulk write");
+        timeout(Duration::from_secs(1), async {
+            while handle.awaited_write_counts_for_test().3 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled writer must successfully reset its stream");
         bulk_reader_barrier.notify_waiters();
+        timeout(Duration::from_secs(1), async {
+            while server_connection
+                .inner
+                .qos_awaited_cancel_resets_observed
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the peer must observe the dedicated awaited-lane cancel reset");
+        assert!(
+            server_connection.inner.connection.close_reason().is_none(),
+            "an awaited-lane caller cancellation must not close the connection"
+        );
+        drop(handle);
         timeout(Duration::from_secs(1), async {
             while workers.running() != 0 {
                 tokio::task::yield_now().await;
