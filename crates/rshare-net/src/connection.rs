@@ -104,7 +104,7 @@ fn spawn_message_reader(
     connections: CanonicalConnections,
     pool: Arc<ConnectionPool>,
     lifecycle_lock: Arc<TokioMutex<()>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         'forwarding: {
             if let Some(message) = first_message {
@@ -147,7 +147,7 @@ fn spawn_message_reader(
             generation,
         )
         .await;
-    });
+    })
 }
 
 fn allocate_generation(next_generation: &AtomicU64) -> u64 {
@@ -334,7 +334,7 @@ impl ConnectionManager {
                     continue;
                 };
 
-                spawn_message_reader(
+                let _reader_task = spawn_message_reader(
                     device_id,
                     generation,
                     messages,
@@ -425,7 +425,7 @@ impl ConnectionManager {
             }
         }
 
-        spawn_message_reader(
+        let _reader_task = spawn_message_reader(
             device_id,
             generation,
             messages,
@@ -662,7 +662,7 @@ mod tests {
         let (_message_tx, message_rx) = mpsc::channel(1);
         let mut event_rx = manager.events().unwrap();
 
-        spawn_message_reader(
+        let _reader_task = spawn_message_reader(
             device_id,
             generation,
             message_rx,
@@ -730,7 +730,7 @@ mod tests {
             .insert_with_generation(remote_id, generation, connection)
             .await;
 
-        spawn_message_reader(
+        let _reader_task = spawn_message_reader(
             remote_id,
             generation,
             messages,
@@ -793,7 +793,7 @@ mod tests {
 
         let lifecycle = manager.lifecycle_lock.lock().await;
         let (message_tx, message_rx) = mpsc::channel(1);
-        spawn_message_reader(
+        let _reader_task = spawn_message_reader(
             device_id,
             generation,
             message_rx,
@@ -839,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_generation_retirement_after_replacement_preserves_control_connection_id() {
+    async fn reconnect_old_disconnect_cannot_remove_new_generation() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let old_control_id = ControlConnectionId::new();
@@ -897,37 +897,17 @@ mod tests {
             .insert_with_generation(remote_id, old_generation, old_connection)
             .await;
 
-        let connected_permit = manager.event_tx.reserve().await.unwrap();
-        let lifecycle = manager.lifecycle_lock.lock().await;
-        let retire_task = tokio::spawn({
-            let connections = manager.connections.clone();
-            let pool = manager.pool.clone();
-            let lifecycle_lock = manager.lifecycle_lock.clone();
-            let event_tx = manager.event_tx.clone();
-            async move {
-                retire_generation(
-                    &connections,
-                    &pool,
-                    &lifecycle_lock,
-                    &event_tx,
-                    remote_id,
-                    old_generation,
-                )
-                .await
-            }
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if manager.event_tx.capacity() == 98 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the old retirement should reserve capacity before waiting on lifecycle");
-        assert!(!retire_task.is_finished());
+        let (old_message_tx, old_message_rx) = mpsc::channel(1);
+        let old_reader_task = spawn_message_reader(
+            remote_id,
+            old_generation,
+            old_message_rx,
+            None,
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.pool.clone(),
+            manager.lifecycle_lock.clone(),
+        );
 
         let new_generation = allocate_generation(&manager.next_generation);
         manager
@@ -960,18 +940,28 @@ mod tests {
                     },
                 },
             );
-        connected_permit.send(ManagerEvent::Connected(remote_id));
-        drop(lifecycle);
-
-        assert!(!retire_task.await.unwrap());
+        manager
+            .event_tx
+            .send(ManagerEvent::Connected(remote_id))
+            .await
+            .unwrap();
         assert!(matches!(
             events.recv().await,
             Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
         ));
+
+        drop(old_message_tx);
+        tokio::time::timeout(Duration::from_secs(1), old_reader_task)
+            .await
+            .expect("the old reader must complete its late retirement attempt")
+            .expect("the old reader task must not panic");
+
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), events.recv())
-                .await
-                .is_err()
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the old reader must not emit Disconnected for the replacement generation"
         );
         assert!(is_current_generation(
             &manager.connections,
@@ -979,6 +969,10 @@ mod tests {
             new_generation
         ));
         assert!(manager.pool.diagnostics_for(&remote_id).await.is_some());
+        assert_eq!(
+            manager.pool.generation_for(&remote_id).await,
+            Some(new_generation)
+        );
         assert_eq!(
             manager
                 .connections
@@ -1524,7 +1518,7 @@ mod tests {
             .expect("the first connection should be canonical")
             .generation;
         let (late_old_reader_tx, late_old_reader_rx) = mpsc::channel(1);
-        spawn_message_reader(
+        let _reader_task = spawn_message_reader(
             remote_id,
             first_generation,
             late_old_reader_rx,

@@ -174,7 +174,7 @@ fn discovery_surfaces_old_peer_as_incompatible_without_connecting() {
 }
 
 #[tokio::test]
-async fn reconnect_old_disconnect_cannot_remove_new_generation() {
+async fn sequential_reconnect_assigns_new_control_connection_id() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let mut server = ConnectionManager::new(server_id);
@@ -190,6 +190,12 @@ async fn reconnect_old_disconnect_cannot_remove_new_generation() {
         .expect("first negotiated connection id");
 
     server.disconnect(&client_id).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), events.recv()).await,
+        Ok(Some(ManagerEvent::Disconnected(id))) if id == client_id
+    ));
+    assert!(server.connections().is_empty());
+
     let mut second = ConnectionManager::new(client_id);
     second.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
@@ -198,9 +204,6 @@ async fn reconnect_old_disconnect_cannot_remove_new_generation() {
         .expect("replacement negotiated connection id");
     assert_ne!(old_control_id, replacement_control_id);
 
-    first.disconnect(&server_id).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(350)).await;
     let replacement = server
         .connections()
         .into_iter()
@@ -210,4 +213,5 @@ async fn reconnect_old_disconnect_cannot_remove_new_generation() {
         replacement.control_connection_id,
         Some(replacement_control_id)
     );
+    assert_eq!(server.connected_count().await, 1);
 }

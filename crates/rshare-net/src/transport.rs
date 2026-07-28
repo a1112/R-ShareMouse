@@ -823,6 +823,15 @@ impl ConnectionPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn generation_for(&self, device_id: &DeviceId) -> Option<u64> {
+        self.connections
+            .lock()
+            .await
+            .get(device_id)
+            .map(|entry| entry.generation)
+    }
+
     pub fn count(&self) -> usize {
         let conns = self.connections.blocking_lock();
         conns.len()
