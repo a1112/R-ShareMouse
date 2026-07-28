@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    ButtonState, CaptureSessionStateMachine, ControlSessionState, DeviceId, Direction, KeyState,
-    LayoutGraph, MonotonicStamp, MouseButton, PendingReleaseBatch, PressedStateLedger,
-    RealtimeInputFrame, RealtimeInputPayload, ReleaseAllReason, ReliableInputEvent,
-    ReliableInputFrame, RouteCache, SessionEpoch, VirtualDesktopGeometry, INPUT_PROTOCOL_VERSION,
+    ButtonState, CaptureSessionStateMachine, ControlSessionState, DeviceId, Direction,
+    GamepadButton, GamepadDeviceInfo, KeyState, LayoutGraph, MonotonicStamp, MouseButton,
+    PendingReleaseBatch, PressedStateLedger, RealtimeInputFrame, RealtimeInputPayload,
+    ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, RouteCache, SessionEpoch,
+    VirtualDesktopGeometry, INPUT_PROTOCOL_VERSION,
 };
 
 /// Semantic input accepted by the pure router.
@@ -37,6 +38,34 @@ pub enum RouterInput {
     Wheel {
         delta_x: i32,
         delta_y: i32,
+        captured_at: MonotonicStamp,
+    },
+    TextCommit {
+        text: String,
+        captured_at: MonotonicStamp,
+    },
+    GamepadConnected {
+        info: GamepadDeviceInfo,
+        captured_at: MonotonicStamp,
+    },
+    GamepadDisconnected {
+        gamepad_id: u8,
+        captured_at: MonotonicStamp,
+    },
+    GamepadButton {
+        gamepad_id: u8,
+        button: GamepadButton,
+        pressed: bool,
+        captured_at: MonotonicStamp,
+    },
+    GamepadAxes {
+        gamepad_id: u8,
+        left_stick_x: i16,
+        left_stick_y: i16,
+        right_stick_x: i16,
+        right_stick_y: i16,
+        left_trigger: u16,
+        right_trigger: u16,
         captured_at: MonotonicStamp,
     },
 }
@@ -86,13 +115,73 @@ impl RouterInput {
         }
     }
 
+    pub fn text_commit(text: impl Into<String>, captured_at: MonotonicStamp) -> Self {
+        Self::TextCommit {
+            text: text.into(),
+            captured_at,
+        }
+    }
+
+    pub const fn gamepad_connected(info: GamepadDeviceInfo, captured_at: MonotonicStamp) -> Self {
+        Self::GamepadConnected { info, captured_at }
+    }
+
+    pub const fn gamepad_disconnected(gamepad_id: u8, captured_at: MonotonicStamp) -> Self {
+        Self::GamepadDisconnected {
+            gamepad_id,
+            captured_at,
+        }
+    }
+
+    pub const fn gamepad_button(
+        gamepad_id: u8,
+        button: GamepadButton,
+        pressed: bool,
+        captured_at: MonotonicStamp,
+    ) -> Self {
+        Self::GamepadButton {
+            gamepad_id,
+            button,
+            pressed,
+            captured_at,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub const fn gamepad_axes(
+        gamepad_id: u8,
+        left_stick_x: i16,
+        left_stick_y: i16,
+        right_stick_x: i16,
+        right_stick_y: i16,
+        left_trigger: u16,
+        right_trigger: u16,
+        captured_at: MonotonicStamp,
+    ) -> Self {
+        Self::GamepadAxes {
+            gamepad_id,
+            left_stick_x,
+            left_stick_y,
+            right_stick_x,
+            right_stick_y,
+            left_trigger,
+            right_trigger,
+            captured_at,
+        }
+    }
+
     fn captured_at(&self) -> MonotonicStamp {
         match self {
             Self::AbsoluteMove { captured_at, .. }
             | Self::RelativeMove { captured_at, .. }
             | Self::Key { captured_at, .. }
             | Self::MouseButton { captured_at, .. }
-            | Self::Wheel { captured_at, .. } => *captured_at,
+            | Self::Wheel { captured_at, .. }
+            | Self::TextCommit { captured_at, .. }
+            | Self::GamepadConnected { captured_at, .. }
+            | Self::GamepadDisconnected { captured_at, .. }
+            | Self::GamepadButton { captured_at, .. }
+            | Self::GamepadAxes { captured_at, .. } => *captured_at,
         }
     }
 }
@@ -107,6 +196,7 @@ pub enum RouterCommand {
     BackendDegraded,
     LeaseExpired,
     Shutdown,
+    ReleaseAllCompleted { token: u64, success: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +220,7 @@ pub enum RouterOutput {
     EmergencyReleaseAll {
         target: DeviceId,
         frame: ReliableInputFrame,
+        release_token: Option<u64>,
     },
     LocalSessionChanged(ControlSessionState),
     SuppressLocalShortcuts(bool),
@@ -153,6 +244,11 @@ pub struct InputRouter {
     pending_release: Option<PendingReleaseBatch>,
     last_captured_at: MonotonicStamp,
     last_absolute: Option<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EmergencyReleaseStatus {
+    ledger_fault: bool,
 }
 
 impl InputRouter {
@@ -197,6 +293,9 @@ impl InputRouter {
             RouterCommand::BackendDegraded => self.handle_backend_degraded(),
             RouterCommand::LeaseExpired => self.return_to_local(ReleaseAllReason::Timeout),
             RouterCommand::Shutdown => self.return_to_local(ReleaseAllReason::SessionEnded),
+            RouterCommand::ReleaseAllCompleted { token, success } => {
+                self.handle_release_all_completed(token, success)
+            }
         }
     }
 
@@ -288,6 +387,81 @@ impl InputRouter {
                     ReliableInputEvent::Wheel { delta_x, delta_y },
                 )
             }
+            RouterInput::TextCommit { text, captured_at } => {
+                let Some(target) = self.session.active_target() else {
+                    return SmallVec::new();
+                };
+                self.send_reliable(target, captured_at, ReliableInputEvent::TextCommit { text })
+            }
+            RouterInput::GamepadConnected { info, captured_at } => {
+                let Some(target) = self.session.active_target() else {
+                    return SmallVec::new();
+                };
+                self.send_reliable(
+                    target,
+                    captured_at,
+                    ReliableInputEvent::GamepadConnected { info },
+                )
+            }
+            RouterInput::GamepadDisconnected {
+                gamepad_id,
+                captured_at,
+            } => {
+                let Some(target) = self.session.active_target() else {
+                    return SmallVec::new();
+                };
+                self.send_reliable(
+                    target,
+                    captured_at,
+                    ReliableInputEvent::GamepadDisconnected { gamepad_id },
+                )
+            }
+            RouterInput::GamepadButton {
+                gamepad_id,
+                button,
+                pressed,
+                captured_at,
+            } => {
+                let Some(target) = self.session.active_target() else {
+                    return SmallVec::new();
+                };
+                self.send_reliable(
+                    target,
+                    captured_at,
+                    ReliableInputEvent::GamepadButton {
+                        gamepad_id,
+                        button,
+                        pressed,
+                    },
+                )
+            }
+            RouterInput::GamepadAxes {
+                gamepad_id,
+                left_stick_x,
+                left_stick_y,
+                right_stick_x,
+                right_stick_y,
+                left_trigger,
+                right_trigger,
+                captured_at,
+            } => {
+                let Some(target) = self.session.active_target() else {
+                    return SmallVec::new();
+                };
+                self.send_realtime(
+                    target,
+                    captured_at,
+                    RealtimeInputPayload::GamepadAxes {
+                        gamepad_id,
+                        left_stick_x,
+                        left_stick_y,
+                        right_stick_x,
+                        right_stick_y,
+                        left_trigger,
+                        right_trigger,
+                    },
+                )
+            }
         }
     }
 
@@ -309,6 +483,9 @@ impl InputRouter {
         }
         self.last_absolute = Some((x, y));
         if !self.session.is_local_ready() {
+            return SmallVec::new();
+        }
+        if self.pending_release.is_some() {
             return SmallVec::new();
         }
         let source = self.geometry.bounds();
@@ -397,6 +574,19 @@ impl InputRouter {
         let Some(target) = self.session.active_target() else {
             return SmallVec::new();
         };
+        self.send_realtime(
+            target,
+            captured_at,
+            RealtimeInputPayload::RelativeMouse { dx, dy },
+        )
+    }
+
+    fn send_realtime(
+        &mut self,
+        target: DeviceId,
+        captured_at: MonotonicStamp,
+        payload: RealtimeInputPayload,
+    ) -> SmallVec<[RouterOutput; 4]> {
         let Some(sequence) = self.take_realtime_sequence() else {
             return self.handle_counter_exhausted(target);
         };
@@ -407,7 +597,7 @@ impl InputRouter {
                 session_epoch: self.epoch,
                 sequence,
                 captured_at,
-                payload: RealtimeInputPayload::RelativeMouse { dx, dy },
+                payload,
             },
         }]
     }
@@ -437,6 +627,13 @@ impl InputRouter {
         if self.layout == layout {
             return SmallVec::new();
         }
+        let active_route = match self.session.state() {
+            ControlSessionState::RemoteActive {
+                target,
+                entered_via,
+            } => Some((target, entered_via)),
+            _ => None,
+        };
         if let Some(geometry) = layout
             .get_node(self.local_id)
             .and_then(VirtualDesktopGeometry::from_layout_node)
@@ -444,7 +641,30 @@ impl InputRouter {
             self.geometry = geometry;
         }
         self.layout = layout;
-        self.rebuild_routes()
+        let rebuilt = self.rebuild_routes();
+        let Some((target, entered_via)) = active_route else {
+            return rebuilt;
+        };
+        if self
+            .routes
+            .route(entered_via)
+            .is_some_and(|route| route.device_id == target)
+        {
+            return rebuilt;
+        }
+
+        let mut outputs = SmallVec::new();
+        let release =
+            self.push_emergency_release(&mut outputs, target, ReleaseAllReason::Suspended);
+        self.session.on_target_disconnect(target);
+        outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
+        outputs.push(RouterOutput::SuppressLocalShortcuts(false));
+        if release.ledger_fault {
+            outputs.push(RouterOutput::Metric(RouterMetric::PressedStateLedgerFault));
+        } else {
+            outputs.extend(rebuilt);
+        }
+        outputs
     }
 
     fn handle_connectivity_changed(
@@ -465,8 +685,9 @@ impl InputRouter {
         let mut outputs = SmallVec::new();
         let mut ledger_fault = false;
         if !connected && active_target == Some(peer) {
-            ledger_fault =
-                self.push_emergency_release(&mut outputs, peer, ReleaseAllReason::Suspended);
+            ledger_fault = self
+                .push_emergency_release(&mut outputs, peer, ReleaseAllReason::Suspended)
+                .ledger_fault;
             self.session.on_target_disconnect(peer);
             outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
             outputs.push(RouterOutput::SuppressLocalShortcuts(false));
@@ -485,8 +706,9 @@ impl InputRouter {
         let mut outputs = SmallVec::new();
         let mut ledger_fault = false;
         if let Some(target) = active_target {
-            ledger_fault =
-                self.push_emergency_release(&mut outputs, target, ReleaseAllReason::BackendFailure);
+            ledger_fault = self
+                .push_emergency_release(&mut outputs, target, ReleaseAllReason::BackendFailure)
+                .ledger_fault;
         }
         self.session.on_backend_degraded();
         outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
@@ -506,12 +728,17 @@ impl InputRouter {
             _ => return SmallVec::new(),
         };
         let mut outputs = SmallVec::new();
-        let ledger_fault = self.push_emergency_release(&mut outputs, target, reason);
-        if self.session.on_return_edge_hit(return_edge).is_ok() {
+        let release = self.push_emergency_release(&mut outputs, target, reason);
+        if release.ledger_fault {
+            self.session.on_backend_degraded();
+        } else {
+            let _ = self.session.on_return_edge_hit(return_edge);
+        }
+        if !self.session.is_remote_active() {
             outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
             outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         }
-        if ledger_fault {
+        if release.ledger_fault {
             outputs.push(RouterOutput::Metric(RouterMetric::PressedStateLedgerFault));
         }
         outputs
@@ -522,17 +749,24 @@ impl InputRouter {
         outputs: &mut SmallVec<[RouterOutput; 4]>,
         target: DeviceId,
         reason: ReleaseAllReason,
-    ) -> bool {
+    ) -> EmergencyReleaseStatus {
         let Some(sequence) = self.take_emergency_reliable_sequence() else {
             outputs.push(RouterOutput::Metric(RouterMetric::CounterExhausted));
-            return false;
+            return EmergencyReleaseStatus {
+                ledger_fault: false,
+            };
         };
-        let ledger_fault = match self.pressed.release_all_events(reason) {
-            Ok(batch) => {
-                self.pending_release = Some(batch);
-                false
+        let (release_token, ledger_fault) = if let Some(batch) = &self.pending_release {
+            (Some(batch.token()), false)
+        } else {
+            match self.pressed.release_all_events(reason) {
+                Ok(batch) => {
+                    let token = batch.token();
+                    self.pending_release = Some(batch);
+                    (Some(token), false)
+                }
+                Err(_) => (None, true),
             }
-            Err(_) => true,
         };
         outputs.push(RouterOutput::EmergencyReleaseAll {
             target,
@@ -543,8 +777,9 @@ impl InputRouter {
                 captured_at: self.last_captured_at,
                 event: ReliableInputEvent::ReleaseAll { reason },
             },
+            release_token,
         });
-        ledger_fault
+        EmergencyReleaseStatus { ledger_fault }
     }
 
     fn handle_pressed_ledger_fault(&mut self, target: DeviceId) -> SmallVec<[RouterOutput; 4]> {
@@ -555,6 +790,25 @@ impl InputRouter {
         outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         outputs.push(RouterOutput::Metric(RouterMetric::PressedStateLedgerFault));
         outputs
+    }
+
+    fn handle_release_all_completed(
+        &mut self,
+        token: u64,
+        success: bool,
+    ) -> SmallVec<[RouterOutput; 4]> {
+        if !success
+            || self
+                .pending_release
+                .as_ref()
+                .is_none_or(|pending| pending.token() != token)
+        {
+            return SmallVec::new();
+        }
+        if let Some(batch) = self.pending_release.take() {
+            self.pressed.confirm_release_all(&batch);
+        }
+        SmallVec::new()
     }
 
     fn handle_counter_exhausted(&mut self, target: DeviceId) -> SmallVec<[RouterOutput; 4]> {
@@ -569,6 +823,7 @@ impl InputRouter {
 
     fn rebuild_routes(&mut self) -> SmallVec<[RouterOutput; 4]> {
         let Some(generation) = self.routes.generation().checked_add(1) else {
+            self.routes = RouteCache::empty(self.routes.generation());
             return smallvec![RouterOutput::Metric(RouterMetric::CounterExhausted)];
         };
         self.routes = RouteCache::build(
@@ -612,9 +867,10 @@ impl InputRouter {
 mod tests {
     use super::*;
     use crate::{
-        ButtonState, ClockDomainId, Direction, DisplayNode, KeyState, LayoutGraph, LayoutLink,
-        LayoutNode, MonotonicStamp, MouseButton, PixelRect, RealtimeInputFrame,
-        RealtimeInputPayload, ReliableInputEvent, ReliableInputFrame, SessionEpoch,
+        ButtonState, ClockDomainId, Direction, DisplayNode, GamepadButton, GamepadDeviceInfo,
+        KeyState, LayoutGraph, LayoutLink, LayoutNode, MonotonicStamp, MouseButton, PixelRect,
+        RealtimeInputFrame, RealtimeInputPayload, ReliableInputEvent, ReliableInputFrame,
+        SessionEpoch,
     };
 
     fn stamp(value_us: u64) -> MonotonicStamp {
@@ -657,6 +913,16 @@ mod tests {
             local,
             target,
         )
+    }
+
+    fn emergency_release_token(outputs: &[RouterOutput]) -> u64 {
+        match outputs.first() {
+            Some(RouterOutput::EmergencyReleaseAll {
+                release_token: Some(token),
+                ..
+            }) => *token,
+            other => panic!("expected emergency release token, got {other:?}"),
+        }
     }
 
     #[test]
@@ -879,10 +1145,12 @@ mod tests {
                         event: ReliableInputEvent::ReleaseAll { .. },
                         ..
                     },
+                    release_token: Some(token),
                 },
                 RouterOutput::LocalSessionChanged(crate::ControlSessionState::LocalReady),
                 RouterOutput::SuppressLocalShortcuts(false),
             ] if *actual_target == target
+                && router.pending_release_token() == Some(*token)
         ));
         assert_eq!(router.held_key_count(), 1);
         assert!(router.pending_release_token().is_some());
@@ -916,6 +1184,7 @@ mod tests {
                     event: ReliableInputEvent::ReleaseAll { .. },
                     ..
                 },
+                ..
             }) if *actual_target == target
         ));
         assert!(matches!(
@@ -1035,7 +1304,116 @@ mod tests {
     }
 
     #[test]
-    fn conservative_ledger_does_not_block_reliable_input_after_reentry() {
+    fn layout_change_invalidates_active_route_before_suspending_for_missing_parts() {
+        for missing_part in ["link", "node", "primary-display"] {
+            let (mut router, local, target) = linked_router(
+                PixelRect::new(0, 0, 1920, 1080),
+                Direction::Right,
+                Direction::Left,
+                PixelRect::new(1920, 0, 1920, 1080),
+            );
+            let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                500,
+                stamp(1),
+            )));
+            let mut changed = LayoutGraph::new(local);
+            changed.add_node(LayoutNode::new(local, 0, 0, 1920, 1080));
+            if missing_part != "node" {
+                if missing_part == "primary-display" {
+                    changed.add_node(LayoutNode {
+                        device_id: target,
+                        displays: vec![DisplayNode::secondary(
+                            "secondary".to_string(),
+                            1920,
+                            0,
+                            1920,
+                            1080,
+                        )],
+                    });
+                } else {
+                    changed.add_node(LayoutNode::new(target, 1920, 0, 1920, 1080));
+                }
+            }
+            if missing_part != "link" {
+                changed.add_link(LayoutLink::new(
+                    local,
+                    Direction::Right,
+                    target,
+                    Direction::Left,
+                ));
+            }
+
+            let outputs = router.handle(RouterCommand::LayoutChanged(changed));
+
+            assert!(
+                matches!(
+                    outputs.first(),
+                    Some(RouterOutput::EmergencyReleaseAll {
+                        target: actual_target,
+                        ..
+                    }) if *actual_target == target
+                ),
+                "missing {missing_part}"
+            );
+            assert!(matches!(
+                outputs.get(1),
+                Some(RouterOutput::LocalSessionChanged(
+                    crate::ControlSessionState::Suspended { .. }
+                ))
+            ));
+            assert!(matches!(
+                outputs.get(2),
+                Some(RouterOutput::SuppressLocalShortcuts(false))
+            ));
+        }
+    }
+
+    #[test]
+    fn unrelated_layout_change_keeps_active_route_and_session() {
+        let (mut router, local, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(1920, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let unrelated = crate::DeviceId::new_v4();
+        let mut changed = router.layout.clone();
+        changed.add_node(LayoutNode::new(unrelated, -1280, 0, 1280, 720));
+        changed.add_link(LayoutLink::new(
+            local,
+            Direction::Left,
+            unrelated,
+            Direction::Right,
+        ));
+
+        let outputs = router.handle(RouterCommand::LayoutChanged(changed));
+        let moved = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            4,
+            -2,
+            stamp(2),
+        )));
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [RouterOutput::Metric(RouterMetric::RouteCacheRebuilt { .. })]
+        ));
+        assert!(matches!(
+            moved.as_slice(),
+            [RouterOutput::SendRealtime {
+                target: actual_target,
+                ..
+            }] if *actual_target == target
+        ));
+    }
+
+    #[test]
+    fn pending_release_blocks_reentry_until_matching_success() {
         let (mut router, _, target) = linked_router(
             PixelRect::new(0, 0, 1920, 1080),
             Direction::Right,
@@ -1052,7 +1430,142 @@ mod tests {
             KeyState::Pressed,
             stamp(2),
         )));
-        let _ = router.handle(RouterCommand::QuickReturn);
+        let released = router.handle(RouterCommand::QuickReturn);
+        let token = emergency_release_token(&released);
+
+        let blocked = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(3),
+        )));
+        assert!(blocked.is_empty());
+        assert_eq!(router.epoch, SessionEpoch(1));
+
+        assert!(router
+            .handle(RouterCommand::ReleaseAllCompleted {
+                token,
+                success: false,
+            })
+            .is_empty());
+        assert!(router
+            .handle(RouterCommand::ReleaseAllCompleted {
+                token: token + 1,
+                success: true,
+            })
+            .is_empty());
+        assert_eq!(router.pending_release_token(), Some(token));
+        assert_eq!(router.held_key_count(), 1);
+        assert!(router
+            .handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                500,
+                stamp(4),
+            )))
+            .is_empty());
+
+        assert!(router
+            .handle(RouterCommand::ReleaseAllCompleted {
+                token,
+                success: true,
+            })
+            .is_empty());
+        assert_eq!(router.pending_release_token(), None);
+        assert_eq!(router.held_key_count(), 0);
+        let entered = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(5),
+        )));
+
+        assert!(matches!(
+            entered.first(),
+            Some(
+                RouterOutput::SendReliable {
+                    target: actual_target,
+                    frame: ReliableInputFrame {
+                        session_epoch: SessionEpoch(2),
+                        event: ReliableInputEvent::Enter { .. },
+                        ..
+                    },
+                }
+            ) if *actual_target == target
+        ));
+    }
+
+    #[test]
+    fn late_release_completion_token_cannot_clear_a_new_batch() {
+        let (mut router, _, _) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::key(
+            0x41,
+            KeyState::Pressed,
+            stamp(2),
+        )));
+        let first_token = emergency_release_token(&router.handle(RouterCommand::QuickReturn));
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token: first_token,
+            success: true,
+        });
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(3),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::key(
+            0x42,
+            KeyState::Pressed,
+            stamp(4),
+        )));
+        let second_token = emergency_release_token(&router.handle(RouterCommand::QuickReturn));
+
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token: first_token,
+            success: true,
+        });
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(router.pending_release_token(), Some(second_token));
+        assert_eq!(router.held_key_count(), 1);
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token: second_token,
+            success: true,
+        });
+        assert_eq!(router.pending_release_token(), None);
+        assert_eq!(router.held_key_count(), 0);
+    }
+
+    #[test]
+    fn reliable_input_after_confirmed_reentry_is_not_blocked_by_old_ledger_state() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::key(
+            0x41,
+            KeyState::Pressed,
+            stamp(2),
+        )));
+        let token = emergency_release_token(&router.handle(RouterCommand::QuickReturn));
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
         let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
             1919,
             500,
@@ -1159,6 +1672,7 @@ mod tests {
             PixelRect::new(0, 0, 1920, 1080),
         );
 
+        let mut previous_token = None;
         for round in 0..32 {
             let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
                 1919,
@@ -1166,16 +1680,25 @@ mod tests {
                 stamp(round * 3 + 1),
             )));
             let _ = router.handle(RouterCommand::Input(RouterInput::key(
-                0x41,
+                0x100 + round as u32,
                 KeyState::Pressed,
                 stamp(round * 3 + 2),
             )));
-            let _ = router.handle(RouterCommand::QuickReturn);
+            let released = router.handle(RouterCommand::QuickReturn);
+            let token = emergency_release_token(&released);
+            assert!(previous_token.is_none_or(|previous| token > previous));
+            assert_eq!(usize::from(router.pending_release.is_some()), 1);
+            assert_eq!(router.held_key_count(), 1);
+            let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+                token,
+                success: true,
+            });
+            assert_eq!(router.pending_release_token(), None);
+            assert_eq!(router.held_key_count(), 0);
+            previous_token = Some(token);
         }
 
-        assert_eq!(usize::from(router.pending_release.is_some()), 1);
-        assert_eq!(router.held_key_count(), 1);
-        assert!(router.pending_release_token().is_some());
+        assert_eq!(usize::from(router.pending_release.is_some()), 0);
     }
 
     #[test]
@@ -1268,5 +1791,286 @@ mod tests {
                 RouterOutput::Metric(RouterMetric::PressedStateLedgerFault),
             ] if *actual_target == target
         ));
+    }
+
+    #[test]
+    fn task4_reliable_inputs_share_active_target_epoch_and_reliable_sequence() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let info = GamepadDeviceInfo {
+            gamepad_id: 2,
+            name: "Pad".to_string(),
+            vendor_id: Some(0x1234),
+            product_id: Some(0x5678),
+        };
+        let commands = [
+            (
+                RouterInput::TextCommit {
+                    text: "你好".to_string(),
+                    captured_at: stamp(2),
+                },
+                ReliableInputEvent::TextCommit {
+                    text: "你好".to_string(),
+                },
+            ),
+            (
+                RouterInput::GamepadConnected {
+                    info: info.clone(),
+                    captured_at: stamp(3),
+                },
+                ReliableInputEvent::GamepadConnected { info: info.clone() },
+            ),
+            (
+                RouterInput::GamepadDisconnected {
+                    gamepad_id: 2,
+                    captured_at: stamp(4),
+                },
+                ReliableInputEvent::GamepadDisconnected { gamepad_id: 2 },
+            ),
+            (
+                RouterInput::GamepadButton {
+                    gamepad_id: 2,
+                    button: GamepadButton::South,
+                    pressed: true,
+                    captured_at: stamp(5),
+                },
+                ReliableInputEvent::GamepadButton {
+                    gamepad_id: 2,
+                    button: GamepadButton::South,
+                    pressed: true,
+                },
+            ),
+        ];
+
+        for (index, (input, expected_event)) in commands.into_iter().enumerate() {
+            let outputs = router.handle(RouterCommand::Input(input));
+            assert!(matches!(
+                outputs.as_slice(),
+                [RouterOutput::SendReliable {
+                    target: actual_target,
+                    frame: ReliableInputFrame {
+                        session_epoch: SessionEpoch(1),
+                        sequence,
+                        event,
+                        ..
+                    },
+                }] if *actual_target == target
+                    && *sequence == index as u64 + 1
+                    && *event == expected_event
+            ));
+        }
+    }
+
+    #[test]
+    fn task4_extended_input_constructors_preserve_semantic_payloads() {
+        let info = GamepadDeviceInfo {
+            gamepad_id: 4,
+            name: "Constructor Pad".to_string(),
+            vendor_id: Some(1),
+            product_id: Some(2),
+        };
+        assert!(matches!(
+            RouterInput::text_commit("hello", stamp(1)),
+            RouterInput::TextCommit { text, .. } if text == "hello"
+        ));
+        assert!(matches!(
+            RouterInput::gamepad_connected(info.clone(), stamp(2)),
+            RouterInput::GamepadConnected {
+                info: actual_info,
+                ..
+            } if actual_info == info
+        ));
+        assert!(matches!(
+            RouterInput::gamepad_disconnected(4, stamp(3)),
+            RouterInput::GamepadDisconnected { gamepad_id: 4, .. }
+        ));
+        assert!(matches!(
+            RouterInput::gamepad_button(4, GamepadButton::Guide, true, stamp(4)),
+            RouterInput::GamepadButton {
+                gamepad_id: 4,
+                button: GamepadButton::Guide,
+                pressed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            RouterInput::gamepad_axes(4, -1, 2, -3, 4, 5, 6, stamp(5)),
+            RouterInput::GamepadAxes {
+                gamepad_id: 4,
+                left_stick_x: -1,
+                left_stick_y: 2,
+                right_stick_x: -3,
+                right_stick_y: 4,
+                left_trigger: 5,
+                right_trigger: 6,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exhausted_route_cache_rebuild_clears_stale_routes_and_suspends_active_session() {
+        let (mut active, local, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(1920, 0, 1920, 1080),
+        );
+        let _ = active.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        active.routes = RouteCache::build(&active.layout, local, &active.connected_peers, u64::MAX);
+        let mut without_route = LayoutGraph::new(local);
+        without_route.add_node(LayoutNode::new(local, 0, 0, 1920, 1080));
+        without_route.add_node(LayoutNode::new(target, 1920, 0, 1920, 1080));
+
+        let outputs = active.handle(RouterCommand::LayoutChanged(without_route.clone()));
+
+        assert!(matches!(
+            outputs.first(),
+            Some(RouterOutput::EmergencyReleaseAll {
+                target: actual_target,
+                ..
+            }) if *actual_target == target
+        ));
+        assert!(matches!(
+            outputs.get(1),
+            Some(RouterOutput::LocalSessionChanged(
+                crate::ControlSessionState::Suspended { .. }
+            ))
+        ));
+        assert!(active.routes.route(Direction::Right).is_none());
+
+        let (mut local_only, local, _) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(1920, 0, 1920, 1080),
+        );
+        local_only.routes = RouteCache::build(
+            &local_only.layout,
+            local,
+            &local_only.connected_peers,
+            u64::MAX,
+        );
+        let _ = local_only.handle(RouterCommand::LayoutChanged(without_route));
+        assert!(local_only
+            .handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                500,
+                stamp(2),
+            )))
+            .is_empty());
+    }
+
+    #[test]
+    fn gamepad_axes_use_realtime_sequence_independent_from_reliable_input() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::TextCommit {
+            text: "a".to_string(),
+            captured_at: stamp(2),
+        }));
+
+        let outputs = router.handle(RouterCommand::Input(RouterInput::GamepadAxes {
+            gamepad_id: 3,
+            left_stick_x: -100,
+            left_stick_y: 200,
+            right_stick_x: -300,
+            right_stick_y: 400,
+            left_trigger: 500,
+            right_trigger: 600,
+            captured_at: stamp(3),
+        }));
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [RouterOutput::SendRealtime {
+                target: actual_target,
+                frame: RealtimeInputFrame {
+                    session_epoch: SessionEpoch(1),
+                    sequence: 1,
+                    payload: RealtimeInputPayload::GamepadAxes {
+                        gamepad_id: 3,
+                        left_stick_x: -100,
+                        left_stick_y: 200,
+                        right_stick_x: -300,
+                        right_stick_y: 400,
+                        left_trigger: 500,
+                        right_trigger: 600,
+                    },
+                    ..
+                },
+            }] if *actual_target == target
+        ));
+    }
+
+    #[test]
+    fn inactive_router_drops_all_task4_extended_inputs() {
+        let (mut router, _, _) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let inputs = vec![
+            RouterInput::TextCommit {
+                text: "local".to_string(),
+                captured_at: stamp(1),
+            },
+            RouterInput::GamepadConnected {
+                info: GamepadDeviceInfo {
+                    gamepad_id: 1,
+                    name: "Pad".to_string(),
+                    vendor_id: None,
+                    product_id: None,
+                },
+                captured_at: stamp(2),
+            },
+            RouterInput::GamepadDisconnected {
+                gamepad_id: 1,
+                captured_at: stamp(3),
+            },
+            RouterInput::GamepadButton {
+                gamepad_id: 1,
+                button: GamepadButton::East,
+                pressed: false,
+                captured_at: stamp(4),
+            },
+            RouterInput::GamepadAxes {
+                gamepad_id: 1,
+                left_stick_x: 0,
+                left_stick_y: 0,
+                right_stick_x: 0,
+                right_stick_y: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                captured_at: stamp(5),
+            },
+        ];
+
+        for input in inputs {
+            assert!(router.handle(RouterCommand::Input(input)).is_empty());
+        }
     }
 }

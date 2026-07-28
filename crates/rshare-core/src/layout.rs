@@ -143,14 +143,14 @@ fn project_axis(
     target_origin: i32,
     target_extent: u32,
 ) -> i32 {
-    let source_span = i64::from(source_extent.saturating_sub(1));
-    let target_span = i64::from(target_extent.saturating_sub(1));
+    let source_span = i128::from(source_extent.saturating_sub(1));
+    let target_span = i128::from(target_extent.saturating_sub(1));
     if source_span == 0 || target_span == 0 {
         return target_origin;
     }
-    let offset = (i64::from(value) - i64::from(source_origin)).clamp(0, source_span);
+    let offset = (i128::from(value) - i128::from(source_origin)).clamp(0, source_span);
     let projected = (offset * target_span + source_span / 2) / source_span;
-    (i64::from(target_origin) + projected).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    (i128::from(target_origin) + projected).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
 }
 
 /// Immutable virtual-desktop geometry consumed by the input router.
@@ -246,13 +246,20 @@ pub struct RouteCache {
 }
 
 impl RouteCache {
+    pub fn empty(generation: u64) -> Self {
+        Self {
+            generation,
+            routes: std::array::from_fn(|_| None),
+        }
+    }
+
     pub fn build(
         graph: &LayoutGraph,
         local_id: Uuid,
         connected_peers: &HashSet<Uuid>,
         generation: u64,
     ) -> Self {
-        let mut routes = std::array::from_fn(|_| None);
+        let mut routes = Self::empty(generation).routes;
         for link in graph
             .links
             .iter()
@@ -877,5 +884,17 @@ mod tests {
         assert_eq!(primary.width, 3840);
         assert_eq!(primary.height, 2160);
         assert_eq!(primary.x, 2560);
+    }
+
+    #[test]
+    fn project_axis_handles_maximum_extents_and_negative_origins_without_overflow() {
+        assert_eq!(
+            project_axis(i32::MAX, i32::MIN, u32::MAX, i32::MIN, u32::MAX,),
+            i32::MAX - 1
+        );
+        assert_eq!(
+            project_axis(i32::MAX, i32::MIN, u32::MAX, -100, u32::MAX),
+            i32::MAX
+        );
     }
 }
