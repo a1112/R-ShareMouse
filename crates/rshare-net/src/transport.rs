@@ -328,6 +328,26 @@ impl OutboundSender {
             .map_err(|_| anyhow!("Write confirmation channel closed"))?
             .map_err(|error| anyhow!("Write failed: {error}"))
     }
+
+    fn try_send_message(
+        &self,
+        message: &Message,
+    ) -> std::result::Result<(), FanoutEnqueueFailureKind> {
+        let (ack, written) = oneshot::channel();
+        let frame = OutboundFrame {
+            message: message.clone(),
+            ack,
+        };
+        let result = self
+            .send_channel
+            .try_send(frame)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => FanoutEnqueueFailureKind::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => FanoutEnqueueFailureKind::QueueClosed,
+            });
+        drop(written);
+        result
+    }
 }
 
 impl QuicConnection {
@@ -560,6 +580,24 @@ struct PooledConnection {
     connection: QuicConnection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutEnqueueFailureKind {
+    QueueFull,
+    QueueClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanoutEnqueueFailure {
+    pub device_id: DeviceId,
+    pub kind: FanoutEnqueueFailureKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanoutEnqueueReceipt {
+    pub enqueued: Vec<DeviceId>,
+    pub failures: Vec<FanoutEnqueueFailure>,
+}
+
 impl ConnectionPool {
     pub fn new(local_device_id: DeviceId) -> Self {
         Self {
@@ -694,6 +732,31 @@ impl ConnectionPool {
             ));
         }
         Ok(())
+    }
+
+    pub async fn try_fanout(&self, message: &Message) -> FanoutEnqueueReceipt {
+        let mut peers: Vec<_> = self
+            .connections
+            .lock()
+            .await
+            .iter()
+            .map(|(device_id, entry)| (*device_id, entry.outbound.clone()))
+            .collect();
+        peers.sort_by_key(|(device_id, _)| device_id.to_string());
+
+        let mut receipt = FanoutEnqueueReceipt {
+            enqueued: Vec::with_capacity(peers.len()),
+            failures: Vec::new(),
+        };
+        for (device_id, outbound) in peers {
+            match outbound.try_send_message(message) {
+                Ok(()) => receipt.enqueued.push(device_id),
+                Err(kind) => receipt
+                    .failures
+                    .push(FanoutEnqueueFailure { device_id, kind }),
+            }
+        }
+        receipt
     }
 
     pub async fn cleanup(&self) {
@@ -1188,6 +1251,88 @@ mod tests {
         assert!(error.contains(&slow_id.to_string()));
         assert!(error.contains("simulated slow-peer backpressure failure"));
 
+        drop(slow_receiver);
+        fast_receiver.close().await;
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonblocking_fanout_keeps_fast_peer_moving_when_slow_queue_fills() {
+        let server_id = DeviceId::new_v4();
+        let fast_id = DeviceId::new_v4();
+        let slow_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut fast_client = QuicTransport::new(fast_id);
+        let fast_sender = fast_client
+            .connect(&server_addr.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut fast_receiver = incoming.recv().await.unwrap().connection;
+        let mut fast_messages = fast_receiver.message_channel();
+
+        let mut slow_client = QuicTransport::new(slow_id);
+        let slow_sender = slow_client
+            .connect(&server_addr.to_string(), server_id)
+            .await
+            .unwrap();
+        let slow_receiver = incoming.recv().await.unwrap().connection;
+
+        let pool = ConnectionPool::new(server_id);
+        pool.insert(fast_id, fast_sender).await;
+        pool.insert(slow_id, slow_sender).await;
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        {
+            let mut connections = pool.connections.lock().await;
+            connections.get_mut(&slow_id).unwrap().outbound = OutboundSender {
+                send_channel: blocked_tx,
+            };
+        }
+
+        let first = pool.try_fanout(&Message::MouseMove { x: 1, y: 0 }).await;
+        assert!(first.failures.is_empty());
+        let mut expected_order = vec![fast_id, slow_id];
+        expected_order.sort_by_key(DeviceId::to_string);
+        assert_eq!(first.enqueued, expected_order);
+        let blocked_first = blocked_rx
+            .recv()
+            .await
+            .expect("slow peer must retain the first frame without acknowledging it");
+
+        let second = pool.try_fanout(&Message::MouseMove { x: 2, y: 0 }).await;
+        assert!(second.failures.is_empty());
+        assert_eq!(second.enqueued, expected_order);
+        for expected_x in [1, 2] {
+            assert!(matches!(
+                timeout(Duration::from_millis(100), fast_messages.recv())
+                    .await
+                    .expect("fast peer must receive consecutive fanout frames"),
+                Some(Message::MouseMove { x, y: 0 }) if x == expected_x
+            ));
+        }
+        assert!(
+            timeout(Duration::from_millis(50), pool.connections.lock())
+                .await
+                .is_ok(),
+            "nonblocking fanout must release the pool lock before peer queue work"
+        );
+
+        let third = pool.try_fanout(&Message::MouseMove { x: 3, y: 0 }).await;
+        assert_eq!(third.enqueued, vec![fast_id]);
+        assert_eq!(third.failures.len(), 1);
+        assert_eq!(third.failures[0].device_id, slow_id);
+        assert_eq!(third.failures[0].kind, FanoutEnqueueFailureKind::QueueFull);
+        assert!(matches!(
+            timeout(Duration::from_millis(100), fast_messages.recv())
+                .await
+                .expect("fast peer must continue after only the slow queue overflows"),
+            Some(Message::MouseMove { x: 3, y: 0 })
+        ));
+
+        drop(blocked_first);
         drop(slow_receiver);
         fast_receiver.close().await;
         server.close().await.unwrap();

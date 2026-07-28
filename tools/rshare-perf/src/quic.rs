@@ -1,7 +1,7 @@
 use crate::report::{percentile, PerfRun, QueueSummary, VerdictStatus, REQUIRED_COUNTERS};
 use anyhow::{anyhow, Context, Result};
 use rshare_core::{AudioFormat, AudioFramePayload, DeviceId, Message};
-use rshare_net::{ConnectionPool, QuicTransport};
+use rshare_net::{ConnectionPool, FanoutEnqueueFailureKind, QuicTransport};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -379,6 +379,9 @@ async fn run_loopback_once_started(
     let receive_state = Arc::new(Mutex::new(ReceiveState::default()));
     let transport_send_completed = Arc::new(AtomicU64::new(0));
     let production_fanout_calls = Arc::new(AtomicU64::new(0));
+    let fanout_fast_enqueued = Arc::new(AtomicU64::new(0));
+    let slow_enqueue_full = Arc::new(AtomicU64::new(0));
+    let slow_enqueue_closed = Arc::new(AtomicU64::new(0));
     let producer_dropped = Arc::new(AtomicU64::new(0));
     let send_errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let slow_send_us = Arc::new(Mutex::new(Vec::<f64>::new()));
@@ -468,6 +471,9 @@ async fn run_loopback_once_started(
     let fast_scheduled_times = Arc::clone(&scheduled_times);
     let fast_transport_send_completed = Arc::clone(&transport_send_completed);
     let fast_production_fanout_calls = Arc::clone(&production_fanout_calls);
+    let fast_fanout_enqueued = Arc::clone(&fanout_fast_enqueued);
+    let fast_slow_enqueue_full = Arc::clone(&slow_enqueue_full);
+    let fast_slow_enqueue_closed = Arc::clone(&slow_enqueue_closed);
     let fast_errors = Arc::clone(&send_errors);
     let fast_fanout_costs = Arc::clone(&slow_send_us);
     let load_messages = load.to_vec();
@@ -482,23 +488,48 @@ async fn run_loopback_once_started(
                 y: sequence.wrapping_neg() as i32,
             };
             let send_started = Instant::now();
-            let send_result = if slow_fast {
-                fast_pool.broadcast(&message).await
-            } else {
-                fast_pool.send_to(&fast_id, &message).await
-            };
             if slow_fast {
+                fast_production_fanout_calls.fetch_add(1, Ordering::Relaxed);
+                let receipt = fast_pool.try_fanout(&message).await;
                 fast_fanout_costs
                     .lock()
                     .expect("fanout cost mutex poisoned")
                     .push(send_started.elapsed().as_micros() as f64);
+                let fast_enqueued = receipt.enqueued.contains(&fast_id);
+                if fast_enqueued {
+                    fast_fanout_enqueued.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    fast_scheduled_times
+                        .lock()
+                        .expect("scheduled time mutex poisoned")
+                        .remove(&sequence);
+                }
+                for failure in receipt.failures {
+                    if Some(failure.device_id) == slow_id {
+                        match failure.kind {
+                            FanoutEnqueueFailureKind::QueueFull => {
+                                fast_slow_enqueue_full.fetch_add(1, Ordering::Relaxed);
+                            }
+                            FanoutEnqueueFailureKind::QueueClosed => {
+                                fast_slow_enqueue_closed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        fast_errors
+                            .lock()
+                            .expect("send error mutex poisoned")
+                            .push(format!(
+                                "fanout enqueue failed for {}: {:?}",
+                                failure.device_id, failure.kind
+                            ));
+                    }
+                }
+                continue;
             }
-            match send_result {
+
+            match fast_pool.send_to(&fast_id, &message).await {
                 Ok(()) => {
                     fast_transport_send_completed.fetch_add(1, Ordering::Relaxed);
-                    if slow_fast {
-                        fast_production_fanout_calls.fetch_add(1, Ordering::Relaxed);
-                    }
                     if sequence % 100 == 0 {
                         for kind in &load_messages {
                             if let Err(error) = fast_pool
@@ -599,6 +630,18 @@ async fn run_loopback_once_started(
     counters.insert("production_fanout_calls".into(), fanout_calls);
     counters.insert("shared_pool_fanout".into(), u64::from(fanout_calls > 0));
     counters.insert(
+        "fanout_fast_enqueued".into(),
+        fanout_fast_enqueued.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "slow_enqueue_full".into(),
+        slow_enqueue_full.load(Ordering::Relaxed),
+    );
+    counters.insert(
+        "slow_enqueue_closed".into(),
+        slow_enqueue_closed.load(Ordering::Relaxed),
+    );
+    counters.insert(
         "stall_recovery_consecutive_deliveries".into(),
         state.stall_recovery_consecutive_deliveries,
     );
@@ -617,7 +660,9 @@ async fn run_loopback_once_started(
             .unwrap_or(0);
     counters.insert(
         "overwrite".into(),
-        datagram_drops + producer_dropped.load(Ordering::Relaxed),
+        datagram_drops
+            + producer_dropped.load(Ordering::Relaxed)
+            + slow_enqueue_full.load(Ordering::Relaxed),
     );
     counters.insert("reliable_overflow".into(), reliable_resets);
 
@@ -833,7 +878,10 @@ mod tests {
         );
         assert!(
             measured.run.counters["actual_sent"] * 100
-                >= measured.run.counters["expected_sent"] * 90
+                >= measured.run.counters["expected_sent"] * 90,
+            "counters={:?}, errors={:?}",
+            measured.run.counters,
+            measured.run.errors
         );
         assert!(measured.run.metrics["achieved_hz"] >= 900.0);
         assert_eq!(measured.run.counters["independent_producer"], 1);
@@ -871,7 +919,7 @@ mod tests {
     async fn slow_fast_isolation_uses_shared_pool_fanout_and_measures_slow_cost() {
         let measured = run_loopback_once(
             &QuicScenario::SlowFastPeerIsolation,
-            LoopbackRunOptions::test(Duration::from_millis(120)),
+            LoopbackRunOptions::test(Duration::from_millis(500)),
         )
         .await
         .unwrap();
@@ -881,6 +929,12 @@ mod tests {
             measured.run.counters["production_fanout_calls"],
             measured.run.counters["expected_sent"]
         );
+        assert_eq!(
+            measured.run.counters["fanout_fast_enqueued"],
+            measured.run.counters["expected_sent"]
+        );
+        assert_eq!(measured.run.counters["slow_enqueue_full"], 0);
+        assert_eq!(measured.run.counters["slow_enqueue_closed"], 0);
         assert!(measured.run.metrics.contains_key("fast_peer_p99_us"));
         assert!(measured.run.metrics.contains_key("slow_send_p99_us"));
         assert_eq!(
@@ -889,7 +943,10 @@ mod tests {
         );
         assert!(
             measured.run.counters["actual_sent"] * 100
-                >= measured.run.counters["expected_sent"] * 90
+                >= measured.run.counters["expected_sent"] * 90,
+            "counters={:?}, errors={:?}",
+            measured.run.counters,
+            measured.run.errors
         );
         assert!(
             measured.run.counters["actual_sent"]

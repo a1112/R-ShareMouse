@@ -756,7 +756,7 @@ mod tests {
             output: output.clone(),
         };
 
-        let _result = run_quic_with_duration(args, Some(Duration::from_millis(40)));
+        let _result = run_quic_with_duration(args, Some(Duration::from_millis(200)));
 
         let bytes = fs::read(&output).expect("CLI must write its primary artifact");
         let schema: serde_json::Value =
@@ -767,7 +767,7 @@ mod tests {
         assert!(report.runs.iter().all(|run| run.process_exit_success));
         assert_eq!(
             report.scenario_parameters["measurement_duration_ms"],
-            serde_json::json!(40)
+            serde_json::json!(200)
         );
         assert_eq!(
             report.scenario_config_sha256,
