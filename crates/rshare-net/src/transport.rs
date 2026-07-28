@@ -651,9 +651,47 @@ impl ConnectionPool {
     }
 
     pub async fn broadcast(&self, message: &Message) -> Result<()> {
-        let conns = self.connections.lock().await;
-        for (_id, entry) in conns.iter() {
-            let _ = entry.connection.send_message(message).await;
+        let peers: Vec<_> = self
+            .connections
+            .lock()
+            .await
+            .iter()
+            .map(|(device_id, entry)| (*device_id, entry.outbound.clone()))
+            .collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for (device_id, outbound) in peers {
+            let message = message.clone();
+            tasks.spawn(async move {
+                (
+                    device_id,
+                    outbound
+                        .send_message(&message)
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            });
+        }
+
+        let mut failures = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((_device_id, Ok(()))) => {}
+                Ok((device_id, Err(error))) => {
+                    failures.push((device_id.to_string(), error));
+                }
+                Err(error) => failures.push(("join".into(), error.to_string())),
+            }
+        }
+        if !failures.is_empty() {
+            failures.sort();
+            return Err(anyhow!(
+                "broadcast failed: {}",
+                failures
+                    .into_iter()
+                    .map(|(peer, error)| format!("{peer}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         Ok(())
     }
@@ -1071,6 +1109,87 @@ mod tests {
         drop(blocked_frame);
         assert!(send_task.await.unwrap().is_err());
         drop(receiver);
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_slow_peer_does_not_delay_fast_peer_or_hold_pool_lock() {
+        let server_id = DeviceId::new_v4();
+        let fast_id = DeviceId::new_v4();
+        let slow_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut fast_client = QuicTransport::new(fast_id);
+        let fast_sender = fast_client
+            .connect(&server_addr.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut fast_receiver = incoming.recv().await.unwrap().connection;
+        let mut fast_messages = fast_receiver.message_channel();
+
+        let mut slow_client = QuicTransport::new(slow_id);
+        let slow_sender = slow_client
+            .connect(&server_addr.to_string(), server_id)
+            .await
+            .unwrap();
+        let slow_receiver = incoming.recv().await.unwrap().connection;
+
+        let pool = ConnectionPool::new(server_id);
+        pool.insert(fast_id, fast_sender).await;
+        pool.insert(slow_id, slow_sender).await;
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        {
+            let mut connections = pool.connections.lock().await;
+            connections.get_mut(&slow_id).unwrap().outbound = OutboundSender {
+                send_channel: blocked_tx,
+            };
+        }
+
+        let broadcast_pool = pool.clone();
+        let broadcast_task = tokio::spawn(async move {
+            broadcast_pool
+                .broadcast(&Message::MouseMove { x: 7, y: 11 })
+                .await
+        });
+        let blocked_frame = timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .expect("slow peer must enter the production outbound path")
+            .expect("slow peer outbound channel must remain open");
+
+        assert!(
+            matches!(
+                timeout(Duration::from_millis(100), fast_messages.recv())
+                    .await
+                    .expect("fast peer must receive while the slow peer is blocked"),
+                Some(Message::MouseMove { x: 7, y: 11 })
+            ),
+            "fast peer must receive the broadcast payload"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), pool.connections.lock())
+                .await
+                .is_ok(),
+            "broadcast must release the pool-wide mutex before awaiting peer sends"
+        );
+
+        blocked_frame
+            .ack
+            .send(Err("simulated slow-peer backpressure failure".into()))
+            .unwrap();
+        let error = timeout(Duration::from_secs(1), broadcast_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&slow_id.to_string()));
+        assert!(error.contains("simulated slow-peer backpressure failure"));
+
+        drop(slow_receiver);
+        fast_receiver.close().await;
         server.close().await.unwrap();
     }
 

@@ -4,7 +4,7 @@ use rshare_core::{AudioFormat, AudioFramePayload, DeviceId, Message};
 use rshare_net::{ConnectionPool, QuicTransport};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -129,6 +129,7 @@ pub struct LoopbackRunOptions {
     pub bind_addr: Option<String>,
     pub batch_id: String,
     pub run_index: usize,
+    sender_delay: Option<Duration>,
 }
 
 impl LoopbackRunOptions {
@@ -139,6 +140,7 @@ impl LoopbackRunOptions {
             bind_addr: None,
             batch_id,
             run_index,
+            sender_delay: None,
         }
     }
 
@@ -150,7 +152,15 @@ impl LoopbackRunOptions {
             bind_addr: None,
             batch_id: "test-batch".into(),
             run_index: 0,
+            sender_delay: None,
         }
+    }
+
+    #[cfg(test)]
+    fn test_with_sender_delay(duration: Duration, sender_delay: Duration) -> Self {
+        let mut options = Self::test(duration);
+        options.sender_delay = Some(sender_delay);
+        options
     }
 }
 
@@ -365,18 +375,20 @@ async fn run_loopback_once_started(
     let expected_sent = ((duration.as_secs_f64() * rate_hz as f64).round() as u64).max(1);
     let channel_capacity = usize::try_from(expected_sent.min(4_096)).unwrap_or(4_096);
     let (fast_tx, mut fast_rx) = mpsc::channel::<u64>(channel_capacity);
-    let (slow_tx, mut slow_rx) = mpsc::channel::<u64>(channel_capacity);
-    let sent_times = Arc::new(Mutex::new(HashMap::<u64, Instant>::new()));
+    let scheduled_times = Arc::new(Mutex::new(HashMap::<u64, Instant>::new()));
     let receive_state = Arc::new(Mutex::new(ReceiveState::default()));
-    let actual_sent = Arc::new(AtomicU64::new(0));
+    let transport_send_completed = Arc::new(AtomicU64::new(0));
+    let production_fanout_calls = Arc::new(AtomicU64::new(0));
     let producer_dropped = Arc::new(AtomicU64::new(0));
     let send_errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let slow_send_us = Arc::new(Mutex::new(Vec::<f64>::new()));
     let mut tasks = JoinSet::new();
     let mut task_count = 0_usize;
+    let producer_started = Instant::now();
+    let measurement_ended = producer_started + duration;
 
     let receiver_state = Arc::clone(&receive_state);
-    let receiver_sent_times = Arc::clone(&sent_times);
+    let receiver_scheduled_times = Arc::clone(&scheduled_times);
     let stall_trigger_sequence = (expected_sent / 2).max(1);
     tasks.spawn(async move {
         while let Some(message) = fast_messages.recv().await {
@@ -403,28 +415,32 @@ async fn run_loopback_once_started(
             }
 
             let received_at = Instant::now();
-            let sent_at = receiver_sent_times
+            let scheduled_at = receiver_scheduled_times
                 .lock()
-                .expect("sent time mutex poisoned")
+                .expect("scheduled time mutex poisoned")
                 .remove(&sequence);
             let mut state = receiver_state
                 .lock()
                 .expect("receiver state mutex poisoned");
-            if let Some(sent_at) = sent_at {
-                state
-                    .latencies_us
-                    .push(received_at.duration_since(sent_at).as_micros() as f64);
+            if received_at > measurement_ended {
+                break;
+            }
+            let unique_delivery = state.received_sequences.insert(sequence);
+            if unique_delivery {
+                if let Some(scheduled_at) = scheduled_at {
+                    state
+                        .latencies_us
+                        .push(received_at.duration_since(scheduled_at).as_micros() as f64);
+                }
+            } else {
+                state.duplicate += 1;
             }
             let consecutive = state
                 .last_received
                 .is_some_and(|previous| sequence == previous + 1);
             if let Some(previous) = state.last_received {
-                if sequence == previous {
-                    state.duplicate += 1;
-                } else if sequence < previous {
+                if sequence < previous {
                     state.out_of_order += 1;
-                } else if sequence > previous + 1 {
-                    state.gap += sequence - previous - 1;
                 }
             }
             if let Some(stall_started) = state.stall_started {
@@ -449,23 +465,40 @@ async fn run_loopback_once_started(
     task_count += 1;
 
     let fast_pool = pool.clone();
-    let fast_sent_times = Arc::clone(&sent_times);
-    let fast_actual_sent = Arc::clone(&actual_sent);
+    let fast_scheduled_times = Arc::clone(&scheduled_times);
+    let fast_transport_send_completed = Arc::clone(&transport_send_completed);
+    let fast_production_fanout_calls = Arc::clone(&production_fanout_calls);
     let fast_errors = Arc::clone(&send_errors);
+    let fast_fanout_costs = Arc::clone(&slow_send_us);
     let load_messages = load.to_vec();
+    let sender_delay = options.sender_delay;
     tasks.spawn(async move {
         while let Some(sequence) = fast_rx.recv().await {
-            fast_sent_times
-                .lock()
-                .expect("sent time mutex poisoned")
-                .insert(sequence, Instant::now());
+            if let Some(delay) = sender_delay {
+                tokio::time::sleep(delay).await;
+            }
             let message = Message::MouseMove {
                 x: sequence as i32,
                 y: sequence.wrapping_neg() as i32,
             };
-            match fast_pool.send_to(&fast_id, &message).await {
+            let send_started = Instant::now();
+            let send_result = if slow_fast {
+                fast_pool.broadcast(&message).await
+            } else {
+                fast_pool.send_to(&fast_id, &message).await
+            };
+            if slow_fast {
+                fast_fanout_costs
+                    .lock()
+                    .expect("fanout cost mutex poisoned")
+                    .push(send_started.elapsed().as_micros() as f64);
+            }
+            match send_result {
                 Ok(()) => {
-                    fast_actual_sent.fetch_add(1, Ordering::Relaxed);
+                    fast_transport_send_completed.fetch_add(1, Ordering::Relaxed);
+                    if slow_fast {
+                        fast_production_fanout_calls.fetch_add(1, Ordering::Relaxed);
+                    }
                     if sequence % 100 == 0 {
                         for kind in &load_messages {
                             if let Err(error) = fast_pool
@@ -481,9 +514,9 @@ async fn run_loopback_once_started(
                     }
                 }
                 Err(error) => {
-                    fast_sent_times
+                    fast_scheduled_times
                         .lock()
-                        .expect("sent time mutex poisoned")
+                        .expect("scheduled time mutex poisoned")
                         .remove(&sequence);
                     fast_errors
                         .lock()
@@ -495,51 +528,23 @@ async fn run_loopback_once_started(
     });
     task_count += 1;
 
-    if let Some(id) = slow_id {
-        let slow_pool = pool.clone();
-        let slow_costs = Arc::clone(&slow_send_us);
-        let slow_errors = Arc::clone(&send_errors);
-        tasks.spawn(async move {
-            while let Some(sequence) = slow_rx.recv().await {
-                let started = Instant::now();
-                if let Err(error) = slow_pool
-                    .send_to(
-                        &id,
-                        &Message::MouseMove {
-                            x: sequence as i32,
-                            y: -1,
-                        },
-                    )
-                    .await
-                {
-                    slow_errors
-                        .lock()
-                        .expect("send error mutex poisoned")
-                        .push(error.to_string());
-                }
-                slow_costs
-                    .lock()
-                    .expect("slow send mutex poisoned")
-                    .push(started.elapsed().as_micros() as f64);
-            }
-        });
-        task_count += 1;
-    }
-
-    let producer_started = Instant::now();
     let period = Duration::from_secs_f64(1.0 / rate_hz as f64);
     for sequence in 1..=expected_sent {
         let deadline = producer_started + period.mul_f64((sequence - 1) as f64);
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        scheduled_times
+            .lock()
+            .expect("scheduled time mutex poisoned")
+            .insert(sequence, deadline);
         if fast_tx.try_send(sequence).is_err() {
             producer_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        if slow_fast && slow_tx.try_send(sequence).is_err() {
-            producer_dropped.fetch_add(1, Ordering::Relaxed);
+            scheduled_times
+                .lock()
+                .expect("scheduled time mutex poisoned")
+                .remove(&sequence);
         }
     }
     drop(fast_tx);
-    drop(slow_tx);
     for _ in 0..task_count {
         match timeout(Duration::from_secs(2), tasks.join_next()).await {
             Ok(Some(Ok(()))) => {}
@@ -575,19 +580,29 @@ async fn run_loopback_once_started(
             .map(|counter| (counter.to_string(), 0_u64))
             .collect::<BTreeMap<_, _>>(),
     );
+    let delivered_within_window = state.received_sequences.len() as u64;
+    let end_window_backlog = expected_sent.saturating_sub(delivered_within_window);
     counters.insert("expected_sent".into(), expected_sent);
-    counters.insert("actual_sent".into(), actual_sent.load(Ordering::Relaxed));
+    counters.insert("actual_sent".into(), delivered_within_window);
+    counters.insert("delivered_within_window".into(), delivered_within_window);
+    counters.insert("end_window_backlog".into(), end_window_backlog);
+    counters.insert(
+        "transport_send_completed".into(),
+        transport_send_completed.load(Ordering::Relaxed),
+    );
     counters.insert("independent_producer".into(), 1);
     counters.insert(
         "producer_queue_dropped".into(),
         producer_dropped.load(Ordering::Relaxed),
     );
-    counters.insert("shared_pool_fanout".into(), u64::from(slow_fast));
+    let fanout_calls = production_fanout_calls.load(Ordering::Relaxed);
+    counters.insert("production_fanout_calls".into(), fanout_calls);
+    counters.insert("shared_pool_fanout".into(), u64::from(fanout_calls > 0));
     counters.insert(
         "stall_recovery_consecutive_deliveries".into(),
         state.stall_recovery_consecutive_deliveries,
     );
-    counters.insert("gap".into(), state.gap);
+    counters.insert("gap".into(), end_window_backlog);
     counters.insert("duplicate".into(), state.duplicate);
     counters.insert("out_of_order".into(), state.out_of_order);
     let datagram_drops = fast_diagnostics.datagram_tx_dropped
@@ -600,7 +615,10 @@ async fn run_loopback_once_started(
             .as_ref()
             .map(|diagnostics| diagnostics.reliable_stream_reset_count)
             .unwrap_or(0);
-    counters.insert("overwrite".into(), datagram_drops);
+    counters.insert(
+        "overwrite".into(),
+        datagram_drops + producer_dropped.load(Ordering::Relaxed),
+    );
     counters.insert("reliable_overflow".into(), reliable_resets);
 
     let mut latencies_us = state.latencies_us.clone();
@@ -610,7 +628,7 @@ async fn run_loopback_once_started(
     let median = percentile(&latencies_us, 0.50);
     let p95 = percentile(&latencies_us, 0.95);
     let p99 = percentile(&latencies_us, 0.99);
-    let achieved_hz = actual_sent.load(Ordering::Relaxed) as f64 / duration.as_secs_f64();
+    let achieved_hz = delivered_within_window as f64 / duration.as_secs_f64();
     let mut metrics = BTreeMap::from([
         ("median_us".into(), median),
         ("p95_us".into(), p95),
@@ -633,7 +651,7 @@ async fn run_loopback_once_started(
         .lock()
         .expect("send error mutex poisoned")
         .clone();
-    if actual_sent.load(Ordering::Relaxed) * 100 < expected_sent * 90 {
+    if delivered_within_window * 100 < expected_sent * 90 {
         errors.push(format!(
             "achieved send rate {:.2} Hz is below 90% of configured {rate_hz} Hz",
             achieved_hz
@@ -674,8 +692,8 @@ async fn run_loopback_once_started(
 #[derive(Default)]
 struct ReceiveState {
     latencies_us: Vec<f64>,
+    received_sequences: HashSet<u64>,
     last_received: Option<u64>,
-    gap: u64,
     duplicate: u64,
     out_of_order: u64,
     stall_started: Option<Instant>,
@@ -810,11 +828,43 @@ mod tests {
 
         assert_eq!(measured.run.counters["expected_sent"], 120);
         assert_eq!(
-            measured.run.counters["actual_sent"],
+            measured.run.counters["actual_sent"] + measured.run.counters["end_window_backlog"],
             measured.run.counters["expected_sent"]
+        );
+        assert!(
+            measured.run.counters["actual_sent"] * 100
+                >= measured.run.counters["expected_sent"] * 90
         );
         assert!(measured.run.metrics["achieved_hz"] >= 900.0);
         assert_eq!(measured.run.counters["independent_producer"], 1);
+    }
+
+    #[tokio::test]
+    async fn slow_sender_backlog_cannot_inflate_window_rate_and_latency_includes_queueing() {
+        let measured = run_loopback_once(
+            &QuicScenario::Rate {
+                rate_hz: 125,
+                duration_secs: 10,
+                load: vec![],
+            },
+            LoopbackRunOptions::test_with_sender_delay(
+                Duration::from_millis(80),
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let expected = measured.run.counters["expected_sent"];
+        let delivered = measured.run.counters["delivered_within_window"];
+        assert!(delivered < expected);
+        assert_eq!(
+            measured.run.counters["end_window_backlog"],
+            expected - delivered
+        );
+        assert_eq!(measured.run.counters["actual_sent"], delivered);
+        assert!(measured.run.metrics["achieved_hz"] < 125.0);
+        assert!(measured.run.metrics["p99_us"] >= 20_000.0);
     }
 
     #[tokio::test]
@@ -827,11 +877,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(measured.run.counters["shared_pool_fanout"], 1);
+        assert_eq!(
+            measured.run.counters["production_fanout_calls"],
+            measured.run.counters["expected_sent"]
+        );
         assert!(measured.run.metrics.contains_key("fast_peer_p99_us"));
         assert!(measured.run.metrics.contains_key("slow_send_p99_us"));
         assert_eq!(
-            measured.run.counters["actual_sent"],
+            measured.run.counters["actual_sent"] + measured.run.counters["end_window_backlog"],
             measured.run.counters["expected_sent"]
+        );
+        assert!(
+            measured.run.counters["actual_sent"] * 100
+                >= measured.run.counters["expected_sent"] * 90
+        );
+        assert!(
+            measured.run.counters["actual_sent"]
+                <= measured.run.counters["production_fanout_calls"]
         );
     }
 

@@ -151,32 +151,62 @@ pub enum VerdictStatus {
     NotRun,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricDirection {
+    LowerIsBetter,
+    HigherIsBetter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioContract {
     pub metrics: Vec<String>,
+    pub metric_directions: BTreeMap<String, MetricDirection>,
     pub counters: Vec<String>,
     pub binary_roles: Vec<String>,
 }
 
 impl ScenarioContract {
     pub fn for_scenario(scenario: &str) -> Result<Self, ReportError> {
-        let (metrics, binary_roles) = match scenario {
+        let (metric_specs, binary_roles) = match scenario {
             "quic-control-v3" => (
-                vec!["median_us", "p95_us", "p99_us", "achieved_hz"],
+                vec![
+                    ("median_us", MetricDirection::LowerIsBetter),
+                    ("p95_us", MetricDirection::LowerIsBetter),
+                    ("p99_us", MetricDirection::LowerIsBetter),
+                    ("achieved_hz", MetricDirection::HigherIsBetter),
+                ],
                 vec!["rshare-perf"],
             ),
             "daemon-control" => (
-                vec!["median_us", "p95_us", "p99_us"],
+                vec![
+                    ("median_us", MetricDirection::LowerIsBetter),
+                    ("p95_us", MetricDirection::LowerIsBetter),
+                    ("p99_us", MetricDirection::LowerIsBetter),
+                ],
                 vec!["rshare-daemon", "rshare-perf"],
             ),
             "desktop-control" | "windows-media" => (
-                vec!["median_us", "p95_us", "p99_us"],
+                vec![
+                    ("median_us", MetricDirection::LowerIsBetter),
+                    ("p95_us", MetricDirection::LowerIsBetter),
+                    ("p99_us", MetricDirection::LowerIsBetter),
+                ],
                 vec!["rshare-daemon", "rshare-desktop", "rshare-perf"],
             ),
             other => return Err(ReportError::UnknownScenario(other.into())),
         };
+        let metrics = metric_specs
+            .iter()
+            .map(|(metric, _)| (*metric).to_string())
+            .collect();
+        let metric_directions = metric_specs
+            .into_iter()
+            .map(|(metric, direction)| (metric.to_string(), direction))
+            .collect();
         Ok(Self {
-            metrics: metrics.into_iter().map(str::to_string).collect(),
+            metrics,
+            metric_directions,
             counters: REQUIRED_COUNTERS
                 .iter()
                 .map(|counter| counter.to_string())
@@ -193,10 +223,21 @@ impl ScenarioContract {
                 .get("kind")
                 .and_then(Value::as_str)
             {
-                Some("stall_recovery") => contract.metrics.push("stall_recovery_us".into()),
+                Some("stall_recovery") => {
+                    contract.metrics.push("stall_recovery_us".into());
+                    contract
+                        .metric_directions
+                        .insert("stall_recovery_us".into(), MetricDirection::LowerIsBetter);
+                }
                 Some("slow_fast_peer_isolation") => {
                     contract.metrics.push("fast_peer_p99_us".into());
                     contract.metrics.push("slow_send_p99_us".into());
+                    contract
+                        .metric_directions
+                        .insert("fast_peer_p99_us".into(), MetricDirection::LowerIsBetter);
+                    contract
+                        .metric_directions
+                        .insert("slow_send_p99_us".into(), MetricDirection::LowerIsBetter);
                 }
                 _ => {}
             }
@@ -696,6 +737,14 @@ mod tests {
             loopback.metrics,
             vec!["median_us", "p95_us", "p99_us", "achieved_hz"]
         );
+        assert_eq!(
+            loopback.metric_directions["median_us"],
+            MetricDirection::LowerIsBetter
+        );
+        assert_eq!(
+            loopback.metric_directions["achieved_hz"],
+            MetricDirection::HigherIsBetter
+        );
         assert_eq!(loopback.binary_roles, vec!["rshare-perf"]);
 
         let mut slow_fast = valid_report();
@@ -797,6 +846,10 @@ mod tests {
     fn required_contract() -> ScenarioContract {
         ScenarioContract {
             metrics: vec!["latency_us".into()],
+            metric_directions: BTreeMap::from([(
+                "latency_us".into(),
+                MetricDirection::LowerIsBetter,
+            )]),
             counters: REQUIRED_COUNTERS
                 .iter()
                 .map(|value| value.to_string())

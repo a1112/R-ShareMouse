@@ -1,6 +1,6 @@
 use crate::report::{
-    parse_and_validate_report, Availability, PerfReport, PerfRun, VerdictStatus,
-    PERF_SCHEMA_VERSION, REQUIRED_COUNTERS,
+    parse_and_validate_report, Availability, MetricDirection, PerfReport, PerfRun,
+    ScenarioContract, VerdictStatus, PERF_SCHEMA_VERSION, REQUIRED_COUNTERS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -71,6 +71,7 @@ pub struct BuildArtifactHashes {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Regression {
     pub metric: String,
+    pub direction: MetricDirection,
     pub baseline_median: f64,
     pub candidate_median: f64,
     pub regression: f64,
@@ -80,6 +81,7 @@ pub struct Regression {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ComparedMetric {
     pub metric: String,
+    pub direction: MetricDirection,
     pub baseline_median: f64,
     pub candidate_median: f64,
     pub candidate_cv: f64,
@@ -107,6 +109,8 @@ pub enum CompareError {
     MissingCounter { run_id: String, counter: String },
     #[error("run id {run_id} appears more than once in a strict batch")]
     DuplicateRunId { run_id: String },
+    #[error("scenario contract has no direction for metric {metric}")]
+    MissingMetricDirection { metric: String },
     #[error("report is unavailable: {reason}")]
     Unavailable { reason: String },
 }
@@ -146,6 +150,11 @@ pub fn compare(
     let mut comparisons = Vec::new();
     let mut regressions = Vec::new();
     let mut unstable = false;
+    let contract = ScenarioContract::for_report(&baseline.reports[0]).map_err(|_| {
+        CompareError::ScenarioConfigMismatch {
+            details: "baseline scenario has no comparison contract".into(),
+        }
+    })?;
     for metric in baseline_metrics {
         let baseline_values: Vec<_> = baseline
             .runs
@@ -161,22 +170,45 @@ pub fn compare(
         let candidate_median = median(&candidate_values);
         let candidate_cv = coefficient_of_variation(&candidate_values);
         unstable |= candidate_cv > policy.cv_limit;
+        let direction = contract
+            .metric_directions
+            .get(&metric)
+            .copied()
+            .ok_or_else(|| CompareError::MissingMetricDirection {
+                metric: metric.clone(),
+            })?;
         let allowed = if metric.contains("p95") || metric.contains("p99") {
             policy.tail_regression_limit
         } else {
             policy.median_regression_limit
         };
-        let regression = if baseline_median == 0.0 {
-            if candidate_median == 0.0 {
-                0.0
-            } else {
-                f64::INFINITY
+        let regression = match direction {
+            MetricDirection::LowerIsBetter => {
+                if baseline_median == 0.0 {
+                    if candidate_median == 0.0 {
+                        0.0
+                    } else {
+                        f64::INFINITY
+                    }
+                } else {
+                    candidate_median / baseline_median - 1.0
+                }
             }
-        } else {
-            candidate_median / baseline_median - 1.0
+            MetricDirection::HigherIsBetter => {
+                if candidate_median == 0.0 {
+                    if baseline_median == 0.0 {
+                        0.0
+                    } else {
+                        f64::INFINITY
+                    }
+                } else {
+                    baseline_median / candidate_median - 1.0
+                }
+            }
         };
         comparisons.push(ComparedMetric {
             metric: metric.clone(),
+            direction,
             baseline_median,
             candidate_median,
             candidate_cv,
@@ -184,6 +216,7 @@ pub fn compare(
         if regression > allowed {
             regressions.push(Regression {
                 metric,
+                direction,
                 baseline_median,
                 candidate_median,
                 regression,
@@ -1019,6 +1052,29 @@ mod tests {
         let candidate = five_runs("runner-a", "median_us", [111; 5]);
         let verdict = compare(&baseline, &candidate, ComparisonPolicy::strict()).unwrap();
         assert_eq!(verdict.status, VerdictStatus::Fail);
+    }
+
+    #[test]
+    fn achieved_rate_decrease_fails_but_increase_does_not() {
+        let thousand = five_runs("runner-a", "achieved_hz", [1_000; 5]);
+        let nine_hundred = five_runs("runner-a", "achieved_hz", [900; 5]);
+
+        let regression = compare(&thousand, &nine_hundred, ComparisonPolicy::strict()).unwrap();
+        assert_eq!(regression.status, VerdictStatus::Fail);
+        assert_eq!(
+            regression.regressions[0].direction,
+            MetricDirection::HigherIsBetter
+        );
+        assert_eq!(
+            regression.metrics[0].direction,
+            MetricDirection::HigherIsBetter
+        );
+        assert_eq!(
+            compare(&nine_hundred, &thousand, ComparisonPolicy::strict())
+                .unwrap()
+                .status,
+            VerdictStatus::Pass
+        );
     }
 
     #[test]
