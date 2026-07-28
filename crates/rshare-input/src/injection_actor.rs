@@ -445,7 +445,7 @@ struct InjectionQueue {
 struct TimingState {
     samples: VecDeque<InjectionTimingSample>,
     high_water: VecDeque<((SessionEpoch, bool), u64)>,
-    latest_epoch: [Option<SessionEpoch>; 2],
+    latest_epoch: Option<SessionEpoch>,
 }
 
 impl TimingState {
@@ -453,8 +453,16 @@ impl TimingState {
         Self {
             samples: VecDeque::with_capacity(TIMING_RING_CAPACITY),
             high_water: VecDeque::with_capacity(TIMING_RING_CAPACITY),
-            latest_epoch: [None, None],
+            latest_epoch: None,
         }
+    }
+
+    fn record_sample(&mut self, sample: InjectionTimingSample) {
+        if self.samples.len() == TIMING_RING_CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+        self.record_high_water(sample.epoch, sample.reliable, sample.sequence);
     }
 
     fn record_high_water(&mut self, epoch: SessionEpoch, reliable: bool, sequence: u64) {
@@ -470,9 +478,8 @@ impl TimingState {
         }
         self.high_water.push_back((key, high_water));
 
-        let lane = usize::from(reliable);
-        if self.latest_epoch[lane].is_none_or(|latest| epoch.0 > latest.0) {
-            self.latest_epoch[lane] = Some(epoch);
+        if self.latest_epoch.is_none_or(|latest| epoch.0 > latest.0) {
+            self.latest_epoch = Some(epoch);
         }
     }
 
@@ -482,7 +489,7 @@ impl TimingState {
             .rev()
             .find(|(key, _)| *key == (epoch, reliable))
             .is_some_and(|(_, high_water)| *high_water >= sequence)
-            || self.latest_epoch[usize::from(reliable)].is_some_and(|latest| latest.0 > epoch.0)
+            || self.latest_epoch.is_some_and(|latest| latest.0 > epoch.0)
     }
 }
 
@@ -1229,11 +1236,7 @@ fn record_timing(
                 injection_completed: Some(injection_completed),
             },
         };
-        if timing.samples.len() == TIMING_RING_CAPACITY {
-            timing.samples.pop_front();
-        }
-        timing.samples.push_back(sample);
-        timing.record_high_water(epoch, reliable, sequence);
+        timing.record_sample(sample);
         queue.timing_changed.notify_all();
     }
 }
@@ -1295,6 +1298,19 @@ mod tests {
             dy,
             received_at: MonotonicStamp::new(ClockDomainId(2), sequence),
             submitted_at: Instant::now(),
+        }
+    }
+
+    fn timing_sample(epoch: u64, reliable: bool, sequence: u64) -> InjectionTimingSample {
+        InjectionTimingSample {
+            epoch: SessionEpoch(epoch),
+            sequence,
+            reliable,
+            stamps: ReceiverStageStamps {
+                received: MonotonicStamp::new(ClockDomainId(3), sequence),
+                injection_started: None,
+                injection_completed: None,
+            },
         }
     }
 
@@ -1360,6 +1376,27 @@ mod tests {
             false,
             TIMING_RING_CAPACITY as u64 + 1
         ));
+    }
+
+    #[test]
+    fn newer_reliable_epochs_make_evicted_realtime_epoch_impossible() {
+        let mut timing = TimingState::new();
+        timing.record_sample(timing_sample(1, false, 1));
+        for epoch in 2..=(TIMING_RING_CAPACITY as u64 + 1) {
+            timing.record_sample(timing_sample(epoch, true, 1));
+        }
+
+        assert_eq!(timing.samples.len(), TIMING_RING_CAPACITY);
+        assert_eq!(timing.high_water.len(), TIMING_RING_CAPACITY);
+        assert!(!timing
+            .samples
+            .iter()
+            .any(|sample| sample.epoch == SessionEpoch(1) && !sample.reliable));
+        assert!(!timing
+            .high_water
+            .iter()
+            .any(|(key, _)| *key == (SessionEpoch(1), false)));
+        assert!(timing.has_passed(SessionEpoch(1), false, 1));
     }
 
     #[test]
