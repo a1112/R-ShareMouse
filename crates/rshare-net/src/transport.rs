@@ -651,6 +651,7 @@ struct QosInboundState {
     active: Option<(ControlConnectionId, SessionEpoch, u64)>,
     retired_through: Option<(ControlConnectionId, SessionEpoch)>,
     realtime_last: Option<((ControlConnectionId, SessionEpoch), u64)>,
+    terminal_generation: Option<ControlConnectionId>,
 }
 
 enum ReliableAccept {
@@ -935,16 +936,7 @@ impl QuicConnection {
                     .qos_inbound
                     .lock()
                     .expect("qos inbound state poisoned");
-                match state.active {
-                    Some((generation, epoch, _))
-                        if generation == monitor_auth.control_connection_id =>
-                    {
-                        retire_inbound_epoch(&mut state, (generation, epoch));
-                        state.active = None;
-                        Some(epoch)
-                    }
-                    _ => None,
-                }
+                terminalize_qos_generation(&mut state, monitor_auth.control_connection_id).1
             };
             if let Some(epoch) = active_epoch {
                 monitor_release_emitter.emit(TerminalReleaseEvent {
@@ -1987,16 +1979,12 @@ async fn read_qos_message_stream(
                     .fetch_add(1, Ordering::AcqRel);
                 return;
             }
-            inner
-                .connection
-                .close(0u32.into(), b"truncated qos message length");
+            fail_close_current_qos_generation(&inner, &context, b"truncated qos message length");
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > max_message_size {
-            inner
-                .connection
-                .close(0u32.into(), b"oversized qos message frame");
+            fail_close_current_qos_generation(&inner, &context, b"oversized qos message frame");
             return;
         }
         let mut data = vec![0u8; len];
@@ -2008,21 +1996,15 @@ async fn read_qos_message_stream(
                     .fetch_add(1, Ordering::AcqRel);
                 return;
             }
-            inner
-                .connection
-                .close(0u32.into(), b"truncated qos message payload");
+            fail_close_current_qos_generation(&inner, &context, b"truncated qos message payload");
             return;
         }
         let Ok(message) = ControlMessageCodec::decode(&data) else {
-            inner
-                .connection
-                .close(0u32.into(), b"invalid qos message frame");
+            fail_close_current_qos_generation(&inner, &context, b"invalid qos message frame");
             return;
         };
         let Ok(classified) = super::qos::ClassifiedMessage::try_from(message.clone()) else {
-            inner
-                .connection
-                .close(0u32.into(), b"unclassifiable qos message");
+            fail_close_current_qos_generation(&inner, &context, b"unclassifiable qos message");
             return;
         };
         let lane_matches = matches!(
@@ -2078,9 +2060,11 @@ async fn read_qos_message_stream(
                     &context,
                     "reliable compatibility input lacks authenticated epoch metadata".into(),
                 );
-                inner
-                    .connection
-                    .close(0u32.into(), b"rejected reliable compatibility input");
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"rejected reliable compatibility input",
+                );
                 return;
             }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
@@ -2220,9 +2204,11 @@ async fn read_qos_reliable_stream(
         let key = (context.auth.control_connection_id, frame.session_epoch);
         if emergency {
             let ReliableInputEvent::ReleaseAll { reason } = &frame.event else {
-                inner
-                    .connection
-                    .close(0u32.into(), b"non-terminal emergency input frame");
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"non-terminal emergency input frame",
+                );
                 return;
             };
             let reason = *reason;
@@ -2236,12 +2222,15 @@ async fn read_qos_reliable_stream(
                     .qos_inbound
                     .lock()
                     .expect("qos inbound state poisoned");
-                if inbound_epoch_retired(&state, key) {
+                if state.terminal_generation == Some(key.0) {
+                    EmergencyDisposition::Ignore
+                } else if inbound_epoch_retired(&state, key) {
                     if state.active.is_some_and(|(generation, active_epoch, _)| {
                         generation == key.0 && active_epoch.0 > key.1 .0
                     }) {
                         EmergencyDisposition::Ignore
                     } else {
+                        terminalize_qos_generation(&mut state, key.0);
                         EmergencyDisposition::Violation(frame.session_epoch)
                     }
                 } else {
@@ -2252,8 +2241,7 @@ async fn read_qos_reliable_stream(
                             EmergencyDisposition::Release(epoch, reason)
                         }
                         Some((generation, active_epoch, _)) => {
-                            retire_inbound_epoch(&mut state, (generation, active_epoch));
-                            state.active = None;
+                            terminalize_qos_generation(&mut state, generation);
                             EmergencyDisposition::Violation(active_epoch)
                         }
                         None => {
@@ -2356,24 +2344,27 @@ fn fail_close_reliable_delivery(
     epoch: SessionEpoch,
     close_reason: &'static [u8],
 ) {
-    {
+    let release_epoch = {
         let mut state = inner
             .qos_inbound
             .lock()
             .expect("qos inbound state poisoned");
-        retire_inbound_epoch(&mut state, (context.auth.control_connection_id, epoch));
-        if state.active.is_some_and(|(generation, active_epoch, _)| {
-            generation == context.auth.control_connection_id && active_epoch == epoch
-        }) {
-            state.active = None;
+        let (newly_terminal, active_epoch) =
+            terminalize_qos_generation(&mut state, context.auth.control_connection_id);
+        if newly_terminal {
+            active_epoch.or(Some(epoch))
+        } else {
+            None
         }
-    }
+    };
     inner.connection.close(0u32.into(), close_reason);
-    context.release_emitter.emit(TerminalReleaseEvent {
-        auth: context.auth.clone(),
-        epoch,
-        reason: rshare_core::ReleaseAllReason::BackendFailure,
-    });
+    if let Some(epoch) = release_epoch {
+        context.release_emitter.emit(TerminalReleaseEvent {
+            auth: context.auth.clone(),
+            epoch,
+            reason: rshare_core::ReleaseAllReason::BackendFailure,
+        });
+    }
 }
 
 fn is_terminal_cancel_reset(error: &quinn::ReadExactError) -> bool {
@@ -2447,17 +2438,7 @@ fn fail_close_active_qos(
                 return;
             }
         }
-        match state.active {
-            Some((generation, epoch, _))
-                if generation == context.auth.control_connection_id
-                    && stream_epoch == Some(epoch) =>
-            {
-                retire_inbound_epoch(&mut state, (generation, epoch));
-                state.active = None;
-                Some(epoch)
-            }
-            _ => None,
-        }
+        terminalize_qos_generation(&mut state, context.auth.control_connection_id).1
     };
     inner.connection.close(0u32.into(), close_reason);
     if let Some(epoch) = active_epoch {
@@ -2488,14 +2469,7 @@ fn fail_close_current_qos_generation_with_code(
             .qos_inbound
             .lock()
             .expect("qos inbound state poisoned");
-        match state.active {
-            Some((generation, epoch, _)) if generation == context.auth.control_connection_id => {
-                retire_inbound_epoch(&mut state, (generation, epoch));
-                state.active = None;
-                Some(epoch)
-            }
-            _ => None,
-        }
+        terminalize_qos_generation(&mut state, context.auth.control_connection_id).1
     };
     inner.connection.close(close_code, close_reason);
     if let Some(epoch) = active_epoch {
@@ -2562,12 +2536,16 @@ fn accept_reliable_state(
     frame: &rshare_core::ReliableInputFrame,
 ) -> ReliableAccept {
     let key = (connection_id, frame.session_epoch);
+    if state.terminal_generation == Some(connection_id) {
+        return ReliableAccept::RetiredEpoch;
+    }
     if inbound_epoch_retired(state, key) {
         if state.active.is_some_and(|(generation, active_epoch, _)| {
             generation == connection_id && active_epoch.0 > frame.session_epoch.0
         }) {
             return ReliableAccept::RetiredEpoch;
         }
+        terminalize_qos_generation(state, connection_id);
         return ReliableAccept::CurrentViolation {
             epoch: frame.session_epoch,
         };
@@ -2593,7 +2571,7 @@ fn accept_reliable_state(
                     .map(|(_, epoch, _)| epoch)
                     .unwrap_or(frame.session_epoch);
                 retire_inbound_epoch(state, (connection_id, epoch));
-                state.active = None;
+                terminalize_qos_generation(state, connection_id);
                 return ReliableAccept::CurrentViolation { epoch };
             }
             state.active = Some((connection_id, frame.session_epoch, frame.sequence));
@@ -2613,7 +2591,7 @@ fn accept_reliable_state(
                     .map(|(_, epoch, _)| epoch)
                     .unwrap_or(frame.session_epoch);
                 retire_inbound_epoch(state, (connection_id, epoch));
-                state.active = None;
+                terminalize_qos_generation(state, connection_id);
                 return ReliableAccept::CurrentViolation { epoch };
             }
             retire_inbound_epoch(state, key);
@@ -2623,6 +2601,7 @@ fn accept_reliable_state(
         _ => {
             let Some((generation, epoch, last)) = state.active.as_mut() else {
                 retire_inbound_epoch(state, key);
+                terminalize_qos_generation(state, connection_id);
                 return ReliableAccept::CurrentViolation {
                     epoch: frame.session_epoch,
                 };
@@ -2635,7 +2614,7 @@ fn accept_reliable_state(
             {
                 let active_epoch = *epoch;
                 retire_inbound_epoch(state, (connection_id, active_epoch));
-                state.active = None;
+                terminalize_qos_generation(state, connection_id);
                 return ReliableAccept::CurrentViolation {
                     epoch: active_epoch,
                 };
@@ -2668,6 +2647,31 @@ fn retire_inbound_epoch(state: &mut QosInboundState, key: (ControlConnectionId, 
     {
         state.realtime_last = None;
     }
+}
+
+fn terminalize_qos_generation(
+    state: &mut QosInboundState,
+    generation: ControlConnectionId,
+) -> (bool, Option<SessionEpoch>) {
+    if state.terminal_generation == Some(generation) {
+        return (false, None);
+    }
+    state.terminal_generation = Some(generation);
+    let active_epoch = match state.active {
+        Some((active_generation, epoch, _)) if active_generation == generation => {
+            retire_inbound_epoch(state, (generation, epoch));
+            state.active = None;
+            Some(epoch)
+        }
+        _ => None,
+    };
+    if state
+        .realtime_last
+        .is_some_and(|((realtime_generation, _), _)| realtime_generation == generation)
+    {
+        state.realtime_last = None;
+    }
+    (true, active_epoch)
 }
 
 async fn enforce_bootstrap_stream_eof(
@@ -2828,12 +2832,21 @@ fn accept_qos_realtime(
     context: &QosReceiveContext,
     frame: &rshare_core::RealtimeInputFrame,
 ) -> bool {
-    let key = (context.auth.control_connection_id, frame.session_epoch);
     let mut state = inner
         .qos_inbound
         .lock()
         .expect("qos inbound state poisoned");
-    if inbound_epoch_retired(&state, key)
+    accept_realtime_state(&mut state, context.auth.control_connection_id, frame)
+}
+
+fn accept_realtime_state(
+    state: &mut QosInboundState,
+    generation: ControlConnectionId,
+    frame: &rshare_core::RealtimeInputFrame,
+) -> bool {
+    let key = (generation, frame.session_epoch);
+    if state.terminal_generation == Some(generation)
+        || inbound_epoch_retired(state, key)
         || !state
             .active
             .is_some_and(|(generation, epoch, _)| (generation, epoch) == key)
@@ -6126,6 +6139,50 @@ mod tests {
             ReliableAccept::RetiredEpoch
         ));
         assert_eq!(superseded.active, Some((generation, SessionEpoch(2), 1)));
+    }
+
+    #[test]
+    fn connection_terminal_state_releases_original_epoch_once_and_rejects_later_input_before_close()
+    {
+        let generation = ControlConnectionId::new();
+        let mut state = QosInboundState::default();
+        let enter = |epoch| ReliableInputFrame {
+            protocol_version: INPUT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(epoch),
+            sequence: 1,
+            captured_at: MonotonicStamp::new(ClockDomainId(1), epoch),
+            event: ReliableInputEvent::Enter {
+                target_display_id: format!("display-{epoch}"),
+                x: 0,
+                y: 0,
+            },
+        };
+
+        assert!(matches!(
+            accept_reliable_state(&mut state, generation, &enter(1)),
+            ReliableAccept::Accepted
+        ));
+
+        // This happens under the inbound-state lock before connection.close().
+        assert_eq!(
+            terminalize_qos_generation(&mut state, generation),
+            (true, Some(SessionEpoch(1)))
+        );
+
+        assert!(matches!(
+            accept_reliable_state(&mut state, generation, &enter(2)),
+            ReliableAccept::RetiredEpoch
+        ));
+        assert!(!accept_realtime_state(
+            &mut state,
+            generation,
+            &realtime_frame(2, 1)
+        ));
+        assert_eq!(
+            terminalize_qos_generation(&mut state, generation),
+            (false, None)
+        );
+        assert_eq!(state.active, None);
     }
 
     #[derive(Debug)]
