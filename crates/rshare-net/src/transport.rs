@@ -4848,7 +4848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_duplicate_enter_after_terminal_epoch_fails_closed_and_requests_release() {
+    async fn late_duplicate_enter_after_terminal_epoch_fails_closed_without_duplicate_release() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
         let mut server = QuicTransport::isolated_for_test(server_id);
@@ -4921,12 +4921,6 @@ mod tests {
         )
         .await
         .expect("a late frame for the terminal epoch must fail closed");
-        let fail_closed = timeout(Duration::from_secs(1), releases.recv())
-            .await
-            .expect("fail-close must request the idempotent local release path")
-            .unwrap();
-        assert_eq!(fail_closed.epoch, SessionEpoch(1));
-        assert_eq!(fail_closed.reason, ReleaseAllReason::BackendFailure);
         assert_eq!(
             server_connection
                 .inner
@@ -4935,6 +4929,12 @@ mod tests {
                 .unwrap()
                 .retired_through,
             Some((generation, SessionEpoch(1)))
+        );
+        assert!(
+            timeout(Duration::from_millis(50), releases.recv())
+                .await
+                .is_err(),
+            "the generation-wide high-water must coalesce a duplicate terminal epoch"
         );
     }
 

@@ -153,11 +153,19 @@ impl TerminalReleaseEvent {
 pub(crate) struct TerminalReleaseEmitter {
     target: mpsc::Sender<TerminalReleaseEvent>,
     latest_tx: watch::Sender<Option<TerminalReleaseEvent>>,
+    state: Arc<Mutex<TerminalReleaseEmissionState>>,
     pending: Arc<AtomicBool>,
     #[cfg(test)]
     in_flight: Arc<AtomicUsize>,
     #[cfg(test)]
     workers: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct TerminalReleaseEmissionState {
+    auth: Option<Arc<PeerAuthContext>>,
+    highest: Option<SessionEpoch>,
+    coalescing: bool,
 }
 
 impl TerminalReleaseEmitter {
@@ -213,6 +221,7 @@ impl TerminalReleaseEmitter {
         Self {
             target,
             latest_tx,
+            state: Arc::new(Mutex::new(TerminalReleaseEmissionState::default())),
             pending,
             #[cfg(test)]
             in_flight,
@@ -222,9 +231,28 @@ impl TerminalReleaseEmitter {
     }
 
     pub(crate) fn emit(&self, event: TerminalReleaseEvent) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("terminal release emission state poisoned");
+        let auth = state.auth.get_or_insert_with(|| event.auth.clone());
+        if auth.as_ref() != event.auth.as_ref()
+            || state
+                .highest
+                .is_some_and(|highest| event.epoch.0 <= highest.0)
+        {
+            return;
+        }
+        state.highest = Some(event.epoch);
+        if state.coalescing {
+            self.pending.store(true, Ordering::Release);
+            self.latest_tx.send_replace(Some(event));
+            return;
+        }
         match self.target.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
+                state.coalescing = true;
                 self.pending.store(true, Ordering::Release);
                 self.latest_tx.send_replace(Some(event));
             }
@@ -2348,6 +2376,106 @@ mod tests {
         assert_eq!(release.events().len(), 2);
         assert_eq!(ledger.confirm_release_all(&release), 2);
         assert!(ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_release_emitter_rejects_epoch_regression() {
+        let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
+        let (tx, mut rx) = mpsc::channel(2);
+        let emitter = TerminalReleaseEmitter::new(tx);
+
+        emitter.emit(TerminalReleaseEvent {
+            auth: auth.clone(),
+            epoch: SessionEpoch(9),
+            reason: ReleaseAllReason::BackendFailure,
+        });
+        emitter.emit(TerminalReleaseEvent {
+            auth,
+            epoch: SessionEpoch(3),
+            reason: ReleaseAllReason::SessionEnded,
+        });
+
+        assert_eq!(rx.recv().await.unwrap().retired_through(), SessionEpoch(9));
+        assert!(
+            rx.try_recv().is_err(),
+            "a cumulative release publisher must reject an older epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_releases_publish_a_monotonic_high_water() {
+        let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
+        let epochs = [
+            SessionEpoch(3),
+            SessionEpoch(1),
+            SessionEpoch(8),
+            SessionEpoch(5),
+            SessionEpoch(13),
+            SessionEpoch(2),
+        ];
+        let (tx, mut rx) = mpsc::channel(epochs.len());
+        let emitter = TerminalReleaseEmitter::new(tx);
+        let turn = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for (index, epoch) in epochs.into_iter().enumerate() {
+                let emitter = emitter.clone();
+                let auth = auth.clone();
+                let turn = turn.clone();
+                scope.spawn(move || {
+                    while turn.load(Ordering::Acquire) != index {
+                        std::thread::yield_now();
+                    }
+                    emitter.emit(TerminalReleaseEvent {
+                        auth,
+                        epoch,
+                        reason: ReleaseAllReason::BackendFailure,
+                    });
+                    turn.fetch_add(1, Ordering::Release);
+                });
+            }
+        });
+
+        let mut published = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            published.push(event.retired_through());
+        }
+        assert!(
+            published.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "concurrent release output must remain strictly monotonic: {published:?}"
+        );
+        assert_eq!(published.last(), Some(&SessionEpoch(13)));
+    }
+
+    #[tokio::test]
+    async fn terminal_release_emitter_is_scoped_to_one_authenticated_generation() {
+        let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
+        let other_auth = fixture_auth(auth.peer_id, ControlConnectionId::new());
+        let (tx, mut rx) = mpsc::channel(2);
+        let emitter = TerminalReleaseEmitter::new(tx);
+
+        emitter.emit(TerminalReleaseEvent {
+            auth: auth.clone(),
+            epoch: SessionEpoch(4),
+            reason: ReleaseAllReason::SessionEnded,
+        });
+        emitter.emit(TerminalReleaseEvent {
+            auth: other_auth,
+            epoch: SessionEpoch(9),
+            reason: ReleaseAllReason::BackendFailure,
+        });
+        emitter.emit(TerminalReleaseEvent {
+            auth,
+            epoch: SessionEpoch(5),
+            reason: ReleaseAllReason::BackendFailure,
+        });
+
+        assert_eq!(rx.recv().await.unwrap().retired_through(), SessionEpoch(4));
+        assert_eq!(rx.recv().await.unwrap().retired_through(), SessionEpoch(5));
+        assert!(
+            rx.try_recv().is_err(),
+            "one emitter must never publish another authenticated generation"
+        );
     }
 
     #[tokio::test]
