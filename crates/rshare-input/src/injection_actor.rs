@@ -121,6 +121,7 @@ impl InputInjectionHandle {
             state: Mutex::new(QueueState::new(config.reliable_capacity)),
             changed: Condvar::new(),
             latest_timing: Mutex::new(None),
+            timing_changed: Condvar::new(),
             clock,
             realtime_coalesce_window: config.realtime_coalesce_window,
         });
@@ -315,6 +316,47 @@ impl InputInjectionHandle {
         *self.queue.latest_timing.lock().unwrap()
     }
 
+    /// Wait for one exact timing sample without polling.
+    ///
+    /// The predicate is checked while holding the same mutex used by the
+    /// publisher, so a publication that happens before this call cannot lose
+    /// its wakeup.
+    pub fn wait_for_timing(
+        &self,
+        epoch: SessionEpoch,
+        sequence: u64,
+        timeout: Duration,
+    ) -> Option<InjectionTimingSample> {
+        let deadline = Instant::now() + timeout;
+        let mut latest = self.queue.latest_timing.lock().unwrap();
+        loop {
+            if latest
+                .as_ref()
+                .is_some_and(|sample| sample.epoch == epoch && sample.sequence == sequence)
+            {
+                return *latest;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, timed_out) = self
+                .queue
+                .timing_changed
+                .wait_timeout(latest, remaining)
+                .unwrap();
+            latest = next;
+            if timed_out.timed_out()
+                && !latest
+                    .as_ref()
+                    .is_some_and(|sample| sample.epoch == epoch && sample.sequence == sequence)
+            {
+                return None;
+            }
+        }
+    }
+
     pub fn shutdown(&self) -> Result<(), InjectionShutdownError> {
         let worker = {
             let mut worker = self.worker.lock().unwrap();
@@ -358,6 +400,7 @@ struct InjectionQueue {
     state: Mutex<QueueState>,
     changed: Condvar,
     latest_timing: Mutex<Option<InjectionTimingSample>>,
+    timing_changed: Condvar,
     clock: LocalMonotonicClock,
     realtime_coalesce_window: Duration,
 }
@@ -1078,16 +1121,19 @@ fn record_timing(
     injection_started: MonotonicStamp,
     injection_completed: MonotonicStamp,
 ) {
-    *queue.latest_timing.lock().unwrap() = Some(InjectionTimingSample {
-        epoch,
-        sequence,
-        reliable,
-        stamps: ReceiverStageStamps {
-            received,
-            injection_started: Some(injection_started),
-            injection_completed: Some(injection_completed),
-        },
-    });
+    {
+        *queue.latest_timing.lock().unwrap() = Some(InjectionTimingSample {
+            epoch,
+            sequence,
+            reliable,
+            stamps: ReceiverStageStamps {
+                received,
+                injection_started: Some(injection_started),
+                injection_completed: Some(injection_completed),
+            },
+        });
+        queue.timing_changed.notify_all();
+    }
 }
 
 fn map_key_state(state: KeyState) -> ButtonState {

@@ -978,7 +978,9 @@ fn injection_records_local_start_and_completion_stamps() {
 
     actor.submit_realtime(owner, realtime(1, 4, 2, 3));
     recorder.wait_for(1);
-    let sample = actor.latest_timing().expect("missing timing sample");
+    let sample = actor
+        .wait_for_timing(SessionEpoch(1), 4, WAIT)
+        .expect("missing timing sample");
 
     assert_eq!(sample.epoch, SessionEpoch(1));
     assert_eq!(sample.sequence, 4);
@@ -991,6 +993,37 @@ fn injection_records_local_start_and_completion_stamps() {
     assert!(
         sample.stamps.injection_started.unwrap().value_us
             <= sample.stamps.injection_completed.unwrap().value_us
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn timing_wait_has_no_lost_wakeup_before_or_during_wait() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder,
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, _, owner) = fixture(backend, Duration::ZERO);
+    let waiter_actor = actor.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let waiter = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        waiter_actor
+            .wait_for_timing(SessionEpoch(1), 9, WAIT)
+            .expect("waiter missed timing publication")
+    });
+    ready_rx.recv().unwrap();
+
+    actor.submit_realtime(owner, realtime(1, 9, 2, 3));
+    let sample = waiter.join().unwrap();
+    assert_eq!(sample.sequence, 9);
+
+    assert_eq!(
+        actor.wait_for_timing(SessionEpoch(1), 9, Duration::ZERO),
+        Some(sample),
+        "a publication before wait must be observed from guarded state"
     );
     actor.shutdown().unwrap();
 }
