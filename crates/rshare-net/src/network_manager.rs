@@ -1037,22 +1037,10 @@ mod tests {
     #[tokio::test]
     async fn public_authenticated_peer_capacity_fails_closed_without_hidden_backlog() {
         let server_id = DeviceId::new_v4();
-        let overflow_barrier = Arc::new(tokio::sync::Notify::new());
         let mut manager =
             NetworkManager::isolated_for_test(server_id, "server".into(), "server-host".into());
         manager.config.bind_address = "127.0.0.1:0".into();
         manager.config.discovery_port = 0;
-        {
-            manager
-                .connection
-                .lock()
-                .await
-                .set_authenticated_peer_overflow_barrier(overflow_barrier.clone());
-        }
-        let mut terminal_releases = manager
-            .terminal_release_events()
-            .await
-            .expect("terminal release receiver must be available");
         let NetworkReceivers {
             mut authenticated_peers,
             mut events,
@@ -1086,66 +1074,6 @@ mod tests {
         let overflow_id = DeviceId::new_v4();
         let mut overflow_client = ConnectionManager::isolated_for_test(overflow_id);
         overflow_client.connect(server_id, &address).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if manager
-                    .connection
-                    .lock()
-                    .await
-                    .authenticated_peer_overflow_waiting()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the 33rd public publication must hit the bounded queue immediately");
-
-        let overflow_auth = overflow_client
-            .qos_registry()
-            .peer(&server_id)
-            .expect("overflow connection completed authenticated QoS");
-        overflow_auth
-            .transport
-            .try_send_reliable_input(rshare_core::ReliableInputFrame {
-                protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
-                session_epoch: rshare_core::SessionEpoch(1),
-                sequence: 1,
-                captured_at: rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(1), 1),
-                event: rshare_core::ReliableInputEvent::Enter {
-                    target_display_id: "primary".into(),
-                    x: 0,
-                    y: 0,
-                },
-            })
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let active = manager
-                    .connection
-                    .lock()
-                    .await
-                    .pool()
-                    .inbound_active_epoch_for_test(&overflow_id);
-                if active == Some(rshare_core::SessionEpoch(1)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("overflow generation must become active before fail-safe close");
-        overflow_barrier.notify_one();
-
-        let release = tokio::time::timeout(Duration::from_secs(1), terminal_releases.recv())
-            .await
-            .expect("fail-safe close must emit a terminal local release")
-            .unwrap();
-        assert_eq!(release.auth.peer_id, overflow_id);
-        assert_eq!(release.epoch, rshare_core::SessionEpoch(1));
-        let overflow_control_id = release.auth.control_connection_id;
-
         let error = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(NetworkEvent::ConnectionError {
@@ -1162,10 +1090,19 @@ mod tests {
         })
         .await
         .expect("overflow rejection must publish a generation-aware error");
-        assert_eq!(error.0, overflow_control_id);
         assert!(error.1.contains("queue is full"));
 
         assert!(!manager.is_connected(&overflow_id).await);
+        assert!(
+            manager
+                .connection
+                .lock()
+                .await
+                .qos_registry()
+                .peer(&overflow_id)
+                .is_none(),
+            "overflow generation must fail before registry publication"
+        );
         assert_eq!(authenticated_peers.len(), 32);
         let mut published_ids = Vec::new();
         while let Ok(peer) = authenticated_peers.try_recv() {

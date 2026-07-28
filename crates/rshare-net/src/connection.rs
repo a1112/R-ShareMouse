@@ -290,9 +290,9 @@ pub struct ConnectionManager {
     authenticated_peer_tx: mpsc::Sender<PeerInbound>,
     authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
     #[cfg(test)]
-    authenticated_peer_overflow_barrier: Option<Arc<tokio::sync::Notify>>,
+    authenticated_publication_barrier: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
-    authenticated_peer_overflow_waiting: Arc<AtomicBool>,
+    authenticated_publication_waiting: Arc<AtomicBool>,
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
 }
@@ -515,54 +515,6 @@ async fn retire_generation(
     removed_current
 }
 
-async fn fail_authenticated_publication(
-    connections: &CanonicalConnections,
-    pool: &ConnectionPool,
-    lifecycle_lock: &TokioMutex<()>,
-    event_tx: &mpsc::Sender<ManagerEvent>,
-    auth: &super::handshake::PeerAuthContext,
-    lifecycle_generation: u64,
-    qos_registry: &ConnectionRegistry,
-    reason: &'static str,
-) -> bool {
-    let removed_connection = {
-        let _lifecycle = lifecycle_lock.lock().await;
-        let removed_current = connections
-            .read()
-            .expect("canonical connection registry poisoned")
-            .get(&auth.peer_id)
-            .is_some_and(|connection| {
-                connection.generation == lifecycle_generation
-                    && connection.info.control_connection_id == Some(auth.control_connection_id)
-            });
-        if !removed_current {
-            None
-        } else {
-            connections
-                .write()
-                .expect("canonical connection registry poisoned")
-                .remove(&auth.peer_id);
-            qos_registry.remove_if_generation(auth.peer_id, auth.control_connection_id);
-            Some(pool.remove_generation_now(&auth.peer_id, lifecycle_generation))
-        }
-    };
-
-    let Some(connection) = removed_connection else {
-        return false;
-    };
-    if let Some(connection) = connection {
-        connection.close().await;
-    }
-    let _ = event_tx
-        .send(ManagerEvent::Error {
-            peer_id: Some(auth.peer_id),
-            control_connection_id: Some(auth.control_connection_id),
-            error: reason.to_string(),
-        })
-        .await;
-    true
-}
-
 impl ConnectionManager {
     pub fn new(local_device_id: DeviceId) -> Self {
         Self::with_transport(local_device_id, QuicTransport::new(local_device_id))
@@ -596,9 +548,9 @@ impl ConnectionManager {
             authenticated_peer_tx,
             authenticated_peer_rx: Some(authenticated_peer_rx),
             #[cfg(test)]
-            authenticated_peer_overflow_barrier: None,
+            authenticated_publication_barrier: None,
             #[cfg(test)]
-            authenticated_peer_overflow_waiting: Arc::new(AtomicBool::new(false)),
+            authenticated_publication_waiting: Arc::new(AtomicBool::new(false)),
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
         }
@@ -617,9 +569,9 @@ impl ConnectionManager {
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
         #[cfg(test)]
-        let authenticated_peer_overflow_barrier = self.authenticated_peer_overflow_barrier.clone();
+        let authenticated_publication_barrier = self.authenticated_publication_barrier.clone();
         #[cfg(test)]
-        let authenticated_peer_overflow_waiting = self.authenticated_peer_overflow_waiting.clone();
+        let authenticated_publication_waiting = self.authenticated_publication_waiting.clone();
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -668,9 +620,49 @@ impl ConnectionManager {
                     .expect("incoming connection candidate must be present")
                     .message_channel();
 
+                let authenticated_peer_permit = match authenticated_peer_tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let reason = match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                "authenticated peer receiver queue is full"
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                "authenticated peer receiver queue is closed"
+                            }
+                        };
+                        candidate_connection
+                            .take()
+                            .expect("rejected incoming connection candidate must be present")
+                            .close()
+                            .await;
+                        let _ = event_tx
+                            .send(ManagerEvent::Error {
+                                peer_id: Some(auth.peer_id),
+                                control_connection_id: Some(auth.control_connection_id),
+                                error: reason.to_string(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+                let Some(mut event_permits) = event_tx.reserve_many(2).await.ok() else {
+                    candidate_connection
+                        .take()
+                        .expect("unpublished incoming connection candidate must be present")
+                        .close()
+                        .await;
+                    break;
+                };
+
                 let installed = {
                     let _lifecycle = lifecycle_lock.lock().await;
-                    if pool.diagnostics_for_now(&device_id).is_some() {
+                    if pool.diagnostics_for_now(&device_id).is_some()
+                        || !candidate_connection
+                            .as_ref()
+                            .expect("incoming connection candidate must be present")
+                            .is_connected()
+                    {
                         None
                     } else {
                         let removed_canonical = connections
@@ -696,7 +688,6 @@ impl ConnectionManager {
                                 transport: qos_transport,
                             },
                         );
-                        forward_terminal_releases(releases, terminal_release_tx.clone());
                         pool.insert_with_generation_now(
                             device_id,
                             generation,
@@ -712,11 +703,25 @@ impl ConnectionManager {
                             .write()
                             .expect("canonical connection registry poisoned")
                             .insert(device_id, CanonicalConnection { generation, info });
-                        Some((generation, stale_control_connection_id))
+                        if let Some(control_connection_id) = stale_control_connection_id {
+                            event_permits
+                                .next()
+                                .expect("two event permits were reserved")
+                                .send(ManagerEvent::Disconnected {
+                                    peer_id: device_id,
+                                    control_connection_id,
+                                });
+                        }
+                        authenticated_peer_permit.send(peer_inbound);
+                        event_permits
+                            .next()
+                            .expect("a connected event permit was reserved")
+                            .send(ManagerEvent::Connected(negotiated.auth.clone()));
+                        Some((generation, releases))
                     }
                 };
 
-                let Some((generation, stale_control_connection_id)) = installed else {
+                let Some((generation, releases)) = installed else {
                     candidate_connection
                         .take()
                         .expect("duplicate incoming connection candidate must be present")
@@ -725,37 +730,14 @@ impl ConnectionManager {
                     continue;
                 };
 
-                if let Err(error) = authenticated_peer_tx.try_send(peer_inbound) {
-                    #[cfg(test)]
-                    if matches!(&error, mpsc::error::TrySendError::Full(_)) {
-                        if let Some(barrier) = authenticated_peer_overflow_barrier.as_ref() {
-                            authenticated_peer_overflow_waiting.store(true, Ordering::Release);
-                            barrier.notified().await;
-                            authenticated_peer_overflow_waiting.store(false, Ordering::Release);
-                        }
-                    }
-                    let reason = match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            "authenticated peer receiver queue is full"
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            "authenticated peer receiver queue is closed"
-                        }
-                    };
-                    fail_authenticated_publication(
-                        &connections,
-                        &pool,
-                        &lifecycle_lock,
-                        &event_tx,
-                        &auth,
-                        generation,
-                        &qos_registry,
-                        reason,
-                    )
-                    .await;
-                    continue;
+                #[cfg(test)]
+                if let Some(barrier) = authenticated_publication_barrier.as_ref() {
+                    authenticated_publication_waiting.store(true, Ordering::Release);
+                    barrier.notified().await;
+                    authenticated_publication_waiting.store(false, Ordering::Release);
                 }
 
+                forward_terminal_releases(releases, terminal_release_tx.clone());
                 spawn_control_event_reader(
                     auth.clone(),
                     generation,
@@ -782,28 +764,6 @@ impl ConnectionManager {
                     lifecycle_lock.clone(),
                     qos_registry.clone(),
                 );
-
-                let mut event_permits = event_tx.reserve_many(2).await.ok();
-                if let Some(control_connection_id) = stale_control_connection_id {
-                    if let Some(permit) = event_permits.as_mut().and_then(|permits| permits.next())
-                    {
-                        permit.send(ManagerEvent::Disconnected {
-                            peer_id: device_id,
-                            control_connection_id,
-                        });
-                    }
-                }
-                let connected_event_sent = if let Some(permit) =
-                    event_permits.as_mut().and_then(|permits| permits.next())
-                {
-                    permit.send(ManagerEvent::Connected(negotiated.auth.clone()));
-                    true
-                } else {
-                    false
-                };
-                if !connected_event_sent {
-                    break;
-                }
             }
         });
 
@@ -870,9 +830,52 @@ impl ConnectionManager {
             .expect("authenticated QoS install must expose protocol errors");
         let messages = conn.message_channel();
         let mut candidate_connection = Some(conn);
+        let authenticated_peer_permit = match self.authenticated_peer_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                let reason = match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        "authenticated peer receiver queue is full"
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        "authenticated peer receiver queue is closed"
+                    }
+                };
+                candidate_connection
+                    .take()
+                    .expect("rejected outbound connection candidate must be present")
+                    .close()
+                    .await;
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        peer_id: Some(auth.peer_id),
+                        control_connection_id: Some(auth.control_connection_id),
+                        error: reason.to_string(),
+                    })
+                    .await;
+                anyhow::bail!("{reason}");
+            }
+        };
+        let connected_event_permit = match self.event_tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                candidate_connection
+                    .take()
+                    .expect("unpublished outbound connection candidate must be present")
+                    .close()
+                    .await;
+                anyhow::bail!("manager event receiver is closed");
+            }
+        };
         let installation = {
             let _lifecycle = self.lifecycle_lock.lock().await;
-            if self.pool.diagnostics_for_now(&device_id).is_some() {
+            if self.pool.diagnostics_for_now(&device_id).is_some()
+                || !candidate_connection
+                    .as_ref()
+                    .expect("outbound connection candidate must be present")
+                    .is_connected()
+            {
                 Err(candidate_connection
                     .take()
                     .expect("outbound connection candidate must be present"))
@@ -885,7 +888,6 @@ impl ConnectionManager {
                         transport: qos_transport,
                     },
                 );
-                forward_terminal_releases(releases, self.terminal_release_tx.clone());
                 self.pool.insert_with_generation_now(
                     device_id,
                     generation,
@@ -901,38 +903,20 @@ impl ConnectionManager {
                     .write()
                     .expect("canonical connection registry poisoned")
                     .insert(device_id, CanonicalConnection { generation, info });
-                Ok(generation)
+                authenticated_peer_permit.send(peer_inbound);
+                connected_event_permit.send(ManagerEvent::Connected(negotiated.auth.clone()));
+                Ok((generation, releases))
             }
         };
-        let generation = match installation {
-            Ok(generation) => generation,
+        let (generation, releases) = match installation {
+            Ok(installed) => installed,
             Err(connection) => {
                 connection.close().await;
                 anyhow::bail!("Already connected to device {}", device_id);
             }
         };
 
-        if let Err(error) = self.authenticated_peer_tx.try_send(peer_inbound) {
-            let reason = match error {
-                mpsc::error::TrySendError::Full(_) => "authenticated peer receiver queue is full",
-                mpsc::error::TrySendError::Closed(_) => {
-                    "authenticated peer receiver queue is closed"
-                }
-            };
-            fail_authenticated_publication(
-                &self.connections,
-                &self.pool,
-                &self.lifecycle_lock,
-                &self.event_tx,
-                &auth,
-                generation,
-                &self.qos_registry,
-                reason,
-            )
-            .await;
-            anyhow::bail!("{reason}");
-        }
-
+        forward_terminal_releases(releases, self.terminal_release_tx.clone());
         spawn_control_event_reader(
             auth.clone(),
             generation,
@@ -959,9 +943,6 @@ impl ConnectionManager {
             self.lifecycle_lock.clone(),
             self.qos_registry.clone(),
         );
-        if let Some(permit) = self.event_tx.reserve().await.ok() {
-            permit.send(ManagerEvent::Connected(negotiated.auth.clone()));
-        }
         Ok(())
     }
 
@@ -1159,16 +1140,16 @@ impl ConnectionManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_authenticated_peer_overflow_barrier(
+    pub(crate) fn set_authenticated_publication_barrier(
         &mut self,
         barrier: Arc<tokio::sync::Notify>,
     ) {
-        self.authenticated_peer_overflow_barrier = Some(barrier);
+        self.authenticated_publication_barrier = Some(barrier);
     }
 
     #[cfg(test)]
-    pub(crate) fn authenticated_peer_overflow_waiting(&self) -> bool {
-        self.authenticated_peer_overflow_waiting
+    pub(crate) fn authenticated_publication_waiting(&self) -> bool {
+        self.authenticated_publication_waiting
             .load(Ordering::Acquire)
     }
 }
@@ -2337,7 +2318,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_qos_is_installed_before_general_event_capacity_is_available() {
+    async fn authenticated_publication_is_atomic_with_disconnect() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let publication_barrier = Arc::new(tokio::sync::Notify::new());
+        let mut server = ConnectionManager::isolated_for_test(server_id);
+        server.set_authenticated_publication_barrier(publication_barrier.clone());
+        let mut events = server.events().unwrap();
+        let mut authenticated = server.authenticated_peers().unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.transport_local_addr().unwrap();
+
+        let mut client = ConnectionManager::isolated_for_test(client_id);
+        client
+            .connect(server_id, &address.to_string())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !server.authenticated_publication_waiting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incoming generation must reach the publication barrier");
+
+        server.disconnect(&client_id).await.unwrap();
+        publication_barrier.notify_one();
+
+        let peer = tokio::time::timeout(Duration::from_secs(1), authenticated.recv())
+            .await
+            .expect("the committed generation must publish its typed inbound set")
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let control_connection_id = peer.auth.control_connection_id;
+        assert!(matches!(
+            first,
+            ManagerEvent::Connected(auth)
+                if auth.peer_id == client_id
+                    && auth.control_connection_id == control_connection_id
+        ));
+        assert!(matches!(
+            second,
+            ManagerEvent::Disconnected {
+                peer_id,
+                control_connection_id: disconnected_id,
+            } if peer_id == client_id && disconnected_id == control_connection_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_generation_waits_for_atomic_event_capacity_before_publication() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
         let mut server = ConnectionManager::isolated_for_test(server_id);
@@ -2362,22 +2401,17 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while server.qos_registry.peer(&client_id).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("authenticated QoS context must be installed before event capacity is awaited");
-        let mut peer = tokio::time::timeout(Duration::from_millis(100), authenticated.recv())
-            .await
-            .expect("typed inbound must publish independently of the general event FIFO")
-            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), authenticated.recv())
+                .await
+                .is_err(),
+            "typed inbound must not publish without matching connected-event capacity"
+        );
+        assert!(
+            server.qos_registry.peer(&client_id).is_none(),
+            "QoS registry must not expose a half-published generation"
+        );
 
-        client
-            .send_to(&server_id, Message::MouseMove { x: 7, y: 9 })
-            .await
-            .unwrap();
         let client_peer = client.qos_registry.peer(&server_id).unwrap();
         client_peer
             .transport
@@ -2393,9 +2427,15 @@ mod tests {
                 },
             })
             .unwrap();
+        events.recv().await.unwrap();
+        events.recv().await.unwrap();
+        let mut peer = tokio::time::timeout(Duration::from_secs(1), authenticated.recv())
+            .await
+            .expect("freeing event capacity must atomically publish typed inbound")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), peer.reliable_input_rx.recv())
             .await
-            .expect("typed reliable input must drain while the general event FIFO is full")
+            .expect("queued typed reliable input must drain after atomic publication")
             .unwrap();
         client_peer
             .transport
@@ -2410,13 +2450,12 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), peer.realtime_rx.recv())
                 .await
-                .expect("typed realtime input must drain while the general event FIFO is full")
+                .expect("queued typed realtime input must drain after atomic publication")
                 .unwrap()
                 .sequence,
             1
         );
 
-        while events.try_recv().is_ok() {}
         let connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match events.recv().await.unwrap() {
@@ -2429,7 +2468,7 @@ mod tests {
             }
         })
         .await
-        .expect("freeing event capacity must publish the connected event");
+        .expect("freeing event capacity must publish the matching connected event");
         assert_eq!(connected.peer_id, client_id);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), async {
@@ -2444,68 +2483,6 @@ mod tests {
             .await
             .is_err(),
             "legacy realtime must never enter the general ManagerEvent FIFO"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_authenticated_publication_failure_cannot_close_replacement_generation() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut remote = ConnectionManager::isolated_for_test(remote_id);
-        remote.start_server("127.0.0.1:0").await.unwrap();
-        let address = remote.transport_local_addr().unwrap().to_string();
-
-        let mut manager = ConnectionManager::isolated_for_test(local_id);
-        let mut events = manager.events().unwrap();
-        manager.connect(remote_id, &address).await.unwrap();
-        let replacement = manager
-            .qos_registry
-            .peer(&remote_id)
-            .expect("replacement generation must be registered");
-        let replacement_lifecycle_generation = manager
-            .pool
-            .generation_for(&remote_id)
-            .await
-            .expect("replacement generation must be pooled");
-        let stale_auth = crate::handshake::PeerAuthContext {
-            peer_id: remote_id,
-            certificate_fingerprint: replacement.auth.certificate_fingerprint.clone(),
-            control_connection_id: ControlConnectionId::new(),
-        };
-
-        assert!(
-            !fail_authenticated_publication(
-                &manager.connections,
-                &manager.pool,
-                &manager.lifecycle_lock,
-                &manager.event_tx,
-                &stale_auth,
-                replacement_lifecycle_generation
-                    .checked_add(1)
-                    .expect("test generation must advance"),
-                &manager.qos_registry,
-                "stale authenticated peer publication failed",
-            )
-            .await,
-            "stale publication failure must not remove a replacement generation"
-        );
-        assert!(manager.is_connected(&remote_id).await);
-        assert_eq!(
-            manager
-                .qos_registry
-                .peer(&remote_id)
-                .unwrap()
-                .auth
-                .control_connection_id,
-            replacement.auth.control_connection_id
-        );
-        assert!(
-            events.try_recv().is_ok(),
-            "the replacement connected event remains observable"
-        );
-        assert!(
-            events.try_recv().is_err(),
-            "stale publication failure must not emit an error for the replacement"
         );
     }
 

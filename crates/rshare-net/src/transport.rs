@@ -1363,27 +1363,6 @@ impl ConnectionPool {
             .map(|entry| entry.generation)
     }
 
-    #[cfg(test)]
-    pub(crate) fn inbound_active_epoch_for_test(
-        &self,
-        device_id: &DeviceId,
-    ) -> Option<SessionEpoch> {
-        self.connections
-            .lock()
-            .expect("connection pool poisoned")
-            .get(device_id)
-            .and_then(|entry| {
-                entry
-                    .connection
-                    .inner
-                    .qos_inbound
-                    .lock()
-                    .expect("qos inbound state poisoned")
-                    .active
-                    .map(|(_, epoch, _)| epoch)
-            })
-    }
-
     pub fn count(&self) -> usize {
         let conns = self.connections.lock().expect("connection pool poisoned");
         conns.len()
