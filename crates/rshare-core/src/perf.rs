@@ -68,16 +68,16 @@ impl SenderStageStamps {
         }
     }
 
-    pub fn capture_to_route_us(&self) -> Option<u64> {
+    pub fn capture_to_route_us(&self) -> Result<Option<u64>, MonotonicTimeError> {
         self.router_dequeued
             .checked_duration_since(self.captured)
-            .ok()
+            .map(Some)
     }
 
-    pub fn capture_to_transport_us(&self) -> Option<u64> {
-        self.transport_enqueued?
-            .checked_duration_since(self.captured)
-            .ok()
+    pub fn capture_to_transport_us(&self) -> Result<Option<u64>, MonotonicTimeError> {
+        self.transport_enqueued
+            .map(|transport_enqueued| transport_enqueued.checked_duration_since(self.captured))
+            .transpose()
     }
 }
 
@@ -103,10 +103,10 @@ impl ReceiverStageStamps {
         }
     }
 
-    pub fn receive_to_inject_us(&self) -> Option<u64> {
-        self.injection_completed?
-            .checked_duration_since(self.received)
-            .ok()
+    pub fn receive_to_inject_us(&self) -> Result<Option<u64>, MonotonicTimeError> {
+        self.injection_completed
+            .map(|injection_completed| injection_completed.checked_duration_since(self.received))
+            .transpose()
     }
 }
 
@@ -215,16 +215,113 @@ mod tests {
     fn sender_and_receiver_stages_report_only_local_durations() {
         let sender = SenderStageStamps::fixture(ClockDomainId(1), 100, 120, 150, 180);
         let receiver = ReceiverStageStamps::fixture(ClockDomainId(2), 20, 30, 45);
-        assert_eq!(sender.capture_to_route_us(), Some(50));
-        assert_eq!(sender.capture_to_transport_us(), Some(80));
-        assert_eq!(receiver.receive_to_inject_us(), Some(25));
+        assert_eq!(sender.capture_to_route_us(), Ok(Some(50)));
+        assert_eq!(sender.capture_to_transport_us(), Ok(Some(80)));
+        assert_eq!(receiver.receive_to_inject_us(), Ok(Some(25)));
+    }
+
+    #[test]
+    fn sender_stages_preserve_clock_errors() {
+        let cross_domain = SenderStageStamps {
+            captured: MonotonicStamp::new(ClockDomainId(1), 100),
+            ingress_enqueued: MonotonicStamp::new(ClockDomainId(1), 120),
+            router_dequeued: MonotonicStamp::new(ClockDomainId(2), 150),
+            transport_enqueued: Some(MonotonicStamp::new(ClockDomainId(2), 180)),
+        };
+        assert_eq!(
+            cross_domain.capture_to_route_us(),
+            Err(MonotonicTimeError::ClockDomainMismatch {
+                earlier: ClockDomainId(1),
+                later: ClockDomainId(2),
+            })
+        );
+        assert_eq!(
+            cross_domain.capture_to_transport_us(),
+            Err(MonotonicTimeError::ClockDomainMismatch {
+                earlier: ClockDomainId(1),
+                later: ClockDomainId(2),
+            })
+        );
+
+        let regression = SenderStageStamps {
+            captured: MonotonicStamp::new(ClockDomainId(1), 100),
+            ingress_enqueued: MonotonicStamp::new(ClockDomainId(1), 90),
+            router_dequeued: MonotonicStamp::new(ClockDomainId(1), 80),
+            transport_enqueued: Some(MonotonicStamp::new(ClockDomainId(1), 70)),
+        };
+        assert_eq!(
+            regression.capture_to_route_us(),
+            Err(MonotonicTimeError::ClockRegression {
+                earlier_us: 100,
+                later_us: 80,
+            })
+        );
+        assert_eq!(
+            regression.capture_to_transport_us(),
+            Err(MonotonicTimeError::ClockRegression {
+                earlier_us: 100,
+                later_us: 70,
+            })
+        );
+    }
+
+    #[test]
+    fn receiver_stage_preserves_clock_errors() {
+        let cross_domain = ReceiverStageStamps {
+            received: MonotonicStamp::new(ClockDomainId(1), 20),
+            injection_started: Some(MonotonicStamp::new(ClockDomainId(1), 30)),
+            injection_completed: Some(MonotonicStamp::new(ClockDomainId(2), 45)),
+        };
+        assert_eq!(
+            cross_domain.receive_to_inject_us(),
+            Err(MonotonicTimeError::ClockDomainMismatch {
+                earlier: ClockDomainId(1),
+                later: ClockDomainId(2),
+            })
+        );
+
+        let regression = ReceiverStageStamps {
+            received: MonotonicStamp::new(ClockDomainId(1), 45),
+            injection_started: Some(MonotonicStamp::new(ClockDomainId(1), 30)),
+            injection_completed: Some(MonotonicStamp::new(ClockDomainId(1), 20)),
+        };
+        assert_eq!(
+            regression.receive_to_inject_us(),
+            Err(MonotonicTimeError::ClockRegression {
+                earlier_us: 45,
+                later_us: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn unobserved_optional_stage_is_ok_none() {
+        let sender = SenderStageStamps {
+            captured: MonotonicStamp::new(ClockDomainId(1), 100),
+            ingress_enqueued: MonotonicStamp::new(ClockDomainId(1), 120),
+            router_dequeued: MonotonicStamp::new(ClockDomainId(1), 150),
+            transport_enqueued: None,
+        };
+        let receiver = ReceiverStageStamps {
+            received: MonotonicStamp::new(ClockDomainId(2), 20),
+            injection_started: None,
+            injection_completed: None,
+        };
+        assert_eq!(sender.capture_to_transport_us(), Ok(None));
+        assert_eq!(receiver.receive_to_inject_us(), Ok(None));
     }
 
     #[test]
     fn histogram_overflow_is_counted_not_silently_dropped() {
         let mut histogram = RollingLatencyHistogram::new(100).unwrap();
         histogram.record(101);
-        assert_eq!(histogram.report().overflow, 1);
+        let report = histogram.report();
+        assert_eq!(report.samples, 0);
+        assert_eq!(report.p50_us, None);
+        assert_eq!(report.p95_us, None);
+        assert_eq!(report.p99_us, None);
+        assert_eq!(report.max_us, None);
+        assert_eq!(report.overflow, 1);
     }
 
     #[test]
