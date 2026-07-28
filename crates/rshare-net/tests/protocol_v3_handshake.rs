@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rshare_core::{
@@ -6,11 +7,46 @@ use rshare_core::{
 };
 use rshare_net::{
     connection::{ConnectionManager, ManagerEvent},
+    encryption::{Encryption, QuicIdentity},
     handshake::{is_bootstrap_message, BOOTSTRAP_MAX_MESSAGE_SIZE},
     QuicTransport,
 };
 use tokio::time::timeout;
 use uuid::Uuid;
+
+struct TestNetwork {
+    state_dir: PathBuf,
+}
+
+impl TestNetwork {
+    fn new(name: &str) -> Self {
+        Self {
+            state_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("rshare-state")
+                .join(format!("{name}-{}", Uuid::new_v4())),
+        }
+    }
+
+    fn transport(&self, device_id: Uuid, role: &str) -> QuicTransport {
+        let (cert_der, key_der) = Encryption::generate_cert().unwrap();
+        QuicTransport::with_identity(device_id, QuicIdentity { cert_der, key_der })
+            .with_trust_store_path(self.state_dir.join(role).join("quic-trust.json"))
+    }
+
+    fn manager(&self, device_id: Uuid, role: &str) -> ConnectionManager {
+        ConnectionManager::with_transport(device_id, self.transport(device_id, role))
+    }
+}
+
+impl Drop for TestNetwork {
+    fn drop(&mut self) {
+        if self.state_dir.exists() {
+            std::fs::remove_dir_all(&self.state_dir)
+                .expect("failed to clean isolated protocol test state");
+        }
+    }
+}
 
 fn v2_hello(device_id: Uuid) -> Message {
     Message::Hello {
@@ -45,11 +81,14 @@ async fn inbound_v2_hello_is_rejected_before_registration() {
 async fn assert_v2_rejected_after_tls() {
     let local_id = Uuid::new_v4();
     let remote_id = Uuid::new_v4();
-    let mut manager = ConnectionManager::new(local_id);
+    let network = TestNetwork::new("v2-rejection");
+    let mut manager = network.manager(local_id, "manager");
     let mut events = manager.events().unwrap();
     manager.start_server("127.0.0.1:0").await.unwrap();
 
-    let mut old = QuicTransport::new(remote_id).without_client_certificate();
+    let mut old = network
+        .transport(remote_id, "old-peer")
+        .without_client_certificate();
     let mut connection = old
         .connect(
             &manager.transport_local_addr().unwrap().to_string(),
@@ -77,11 +116,12 @@ async fn assert_v2_rejected_after_tls() {
 async fn timed_out_hello_never_emits_connected() {
     let local_id = Uuid::new_v4();
     let remote_id = Uuid::new_v4();
-    let mut manager = ConnectionManager::new(local_id);
+    let network = TestNetwork::new("hello-timeout");
+    let mut manager = network.manager(local_id, "manager");
     let mut events = manager.events().unwrap();
     manager.start_server("127.0.0.1:0").await.unwrap();
 
-    let mut silent = QuicTransport::new(remote_id);
+    let mut silent = network.transport(remote_id, "silent-peer");
     let _connection = silent
         .connect(
             &manager.transport_local_addr().unwrap().to_string(),
@@ -98,11 +138,12 @@ async fn timed_out_hello_never_emits_connected() {
 async fn non_hello_first_message_never_enters_registry() {
     let local_id = Uuid::new_v4();
     let remote_id = Uuid::new_v4();
-    let mut manager = ConnectionManager::new(local_id);
+    let network = TestNetwork::new("non-hello-first");
+    let mut manager = network.manager(local_id, "manager");
     let mut events = manager.events().unwrap();
     manager.start_server("127.0.0.1:0").await.unwrap();
 
-    let mut peer = QuicTransport::new(remote_id);
+    let mut peer = network.transport(remote_id, "peer");
     let connection = peer
         .connect(
             &manager.transport_local_addr().unwrap().to_string(),
@@ -126,7 +167,8 @@ async fn non_hello_first_message_never_enters_registry() {
 async fn outbound_surfaces_peer_rejection_reason() {
     let client_id = Uuid::new_v4();
     let server_id = Uuid::new_v4();
-    let mut server = QuicTransport::new(server_id);
+    let network = TestNetwork::new("outbound-rejection");
+    let mut server = network.transport(server_id, "server");
     server.start_server("127.0.0.1:0").await.unwrap();
     let address = server.local_addr().unwrap();
     let mut incoming = server.incoming();
@@ -146,7 +188,7 @@ async fn outbound_surfaces_peer_rejection_reason() {
             .unwrap();
     });
 
-    let mut manager = ConnectionManager::new(client_id);
+    let mut manager = network.manager(client_id, "client");
     let error = manager
         .connect(server_id, &address.to_string())
         .await

@@ -169,6 +169,34 @@ impl NetworkManager {
         local_device_name: String,
         local_hostname: String,
     ) -> Self {
+        Self::with_connection_manager(
+            local_device_id,
+            local_device_name,
+            local_hostname,
+            ConnectionManager::new(local_device_id),
+        )
+    }
+
+    #[cfg(test)]
+    fn isolated_for_test(
+        local_device_id: DeviceId,
+        local_device_name: String,
+        local_hostname: String,
+    ) -> Self {
+        Self::with_connection_manager(
+            local_device_id,
+            local_device_name,
+            local_hostname,
+            ConnectionManager::isolated_for_test(local_device_id),
+        )
+    }
+
+    fn with_connection_manager(
+        local_device_id: DeviceId,
+        local_device_name: String,
+        local_hostname: String,
+        connection_manager: ConnectionManager,
+    ) -> Self {
         let config = NetworkManagerConfig::default();
         let (event_tx, event_rx) = mpsc::channel(100);
 
@@ -178,7 +206,6 @@ impl NetworkManager {
             local_hostname.clone(),
         );
 
-        let connection_manager = ConnectionManager::new(local_device_id);
         let qos_registry = connection_manager.qos_registry();
         let connection_view = connection_manager.connection_view();
         let connection = Arc::new(TokioMutex::new(connection_manager));
@@ -533,21 +560,19 @@ mod tests {
     ) -> (NetworkManager, ConnectionManager, DeviceId, String) {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let trust_path = std::env::temp_dir()
-            .join(format!("rshare-network-fallback-{}", uuid::Uuid::new_v4()))
-            .join("trust.json");
         let mut remote = ConnectionManager::with_transport(
             remote_id,
-            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone()),
+            QuicTransport::isolated_for_test(remote_id),
         );
         remote.start_server("127.0.0.1:0").await.unwrap();
         let address = remote.transport_local_addr().unwrap().to_string();
-        let local_connection = ConnectionManager::with_transport(
+        let local_connection =
+            ConnectionManager::with_transport(local_id, QuicTransport::isolated_for_test(local_id));
+        let mut manager = NetworkManager::isolated_for_test(
             local_id,
-            QuicTransport::new(local_id).with_trust_store_path(trust_path),
+            "local".to_string(),
+            "local-host".to_string(),
         );
-        let mut manager =
-            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
         manager.qos_registry = local_connection.qos_registry();
         manager.connection_view = local_connection.connection_view();
         manager.connection = Arc::new(TokioMutex::new(local_connection));
@@ -650,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_network_manager_new() {
-        let manager = NetworkManager::new(
+        let manager = NetworkManager::isolated_for_test(
             DeviceId::new_v4(),
             "Test".to_string(),
             "test-host".to_string(),
@@ -660,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_query_does_not_wait_for_outer_connection_manager_lock() {
-        let manager = NetworkManager::new(
+        let manager = NetworkManager::isolated_for_test(
             DeviceId::new_v4(),
             "Test".to_string(),
             "test-host".to_string(),
@@ -674,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_realtime_send_does_not_wait_for_outer_connection_manager_lock() {
-        let mut manager = NetworkManager::new(
+        let mut manager = NetworkManager::isolated_for_test(
             DeviceId::new_v4(),
             "Test".to_string(),
             "test-host".to_string(),
@@ -732,24 +757,22 @@ mod tests {
     async fn qos_direct_send_and_broadcast_update_connection_metrics() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let trust_path = std::env::temp_dir()
-            .join(format!("rshare-network-metrics-{}", uuid::Uuid::new_v4()))
-            .join("trust.json");
         let mut remote = ConnectionManager::with_transport(
             remote_id,
-            crate::transport::QuicTransport::new(remote_id)
-                .with_trust_store_path(trust_path.clone()),
+            crate::transport::QuicTransport::isolated_for_test(remote_id),
         );
         remote.start_server("127.0.0.1:0").await.unwrap();
         let address = remote.transport_local_addr().unwrap();
 
         let local_connection = ConnectionManager::with_transport(
             local_id,
-            crate::transport::QuicTransport::new(local_id)
-                .with_trust_store_path(trust_path.clone()),
+            crate::transport::QuicTransport::isolated_for_test(local_id),
         );
-        let mut manager =
-            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
+        let mut manager = NetworkManager::isolated_for_test(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+        );
         manager.qos_registry = local_connection.qos_registry();
         manager.connection_view = local_connection.connection_view();
         manager.connection = Arc::new(TokioMutex::new(local_connection));
@@ -795,8 +818,11 @@ mod tests {
     async fn known_incompatible_discovery_fails_before_quic_connect() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut manager =
-            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
+        let mut manager = NetworkManager::isolated_for_test(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+        );
         let mut incompatible = discovered_device(remote_id, "127.0.0.1:1".parse().unwrap(), "old");
         incompatible.protocol_compatibility = PeerProtocolCompatibility::Incompatible {
             local: rshare_core::PROTOCOL_VERSION,
@@ -826,9 +852,12 @@ mod tests {
             auto_connect: true,
             ..NetworkManagerConfig::default()
         };
-        let mut manager =
-            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string())
-                .with_config(config);
+        let mut manager = NetworkManager::isolated_for_test(
+            local_id,
+            "local".to_string(),
+            "local-host".to_string(),
+        )
+        .with_config(config);
         let mut events = manager.events();
 
         let found = discovered_device(remote_id, probe.local_addr().unwrap(), "first");

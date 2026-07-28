@@ -14,6 +14,8 @@ use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme,
 };
 use std::any::Any;
+#[cfg(test)]
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -92,6 +94,20 @@ pub struct QuicTransport {
     present_client_certificate: bool,
     peer_protocol_handshake_required: bool,
     datagram_reader_start_barrier: Option<Arc<Notify>>,
+    #[cfg(test)]
+    test_state_guard: Option<Arc<TestStateGuard>>,
+}
+
+#[cfg(test)]
+struct TestStateGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for TestStateGuard {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            fs::remove_dir_all(&self.0).expect("failed to clean isolated QUIC test state");
+        }
+    }
 }
 
 pub struct IncomingConnection {
@@ -102,7 +118,6 @@ pub struct IncomingConnection {
 
 impl QuicTransport {
     pub fn new(local_device_id: DeviceId) -> Self {
-        let (incoming_tx, incoming_rx) = mpsc::channel(10);
         let identity = Encryption::load_or_generate_default_identity().unwrap_or_else(|error| {
             tracing::warn!(
                 "Failed to load persistent QUIC identity, using ephemeral certificate: {}",
@@ -113,6 +128,11 @@ impl QuicTransport {
             QuicIdentity { cert_der, key_der }
         });
 
+        Self::from_identity(local_device_id, identity)
+    }
+
+    fn from_identity(local_device_id: DeviceId, identity: QuicIdentity) -> Self {
+        let (incoming_tx, incoming_rx) = mpsc::channel(10);
         Self {
             server_endpoint: None,
             server_task: None,
@@ -125,12 +145,35 @@ impl QuicTransport {
             present_client_certificate: true,
             peer_protocol_handshake_required: false,
             datagram_reader_start_barrier: None,
+            #[cfg(test)]
+            test_state_guard: None,
         }
     }
 
     pub fn with_identity(local_device_id: DeviceId, identity: QuicIdentity) -> Self {
-        let mut transport = Self::new(local_device_id);
-        transport.identity = identity;
+        Self::from_identity(local_device_id, identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test(local_device_id: DeviceId) -> Self {
+        let (cert_der, key_der) =
+            Encryption::generate_cert().expect("test QUIC certificate generation failed");
+        Self::isolated_with_identity_for_test(local_device_id, QuicIdentity { cert_der, key_der })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_with_identity_for_test(
+        local_device_id: DeviceId,
+        identity: QuicIdentity,
+    ) -> Self {
+        let state_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rshare-state")
+            .join(uuid::Uuid::new_v4().to_string());
+        let guard = Arc::new(TestStateGuard(state_dir.clone()));
+        let mut transport = Self::from_identity(local_device_id, identity)
+            .with_trust_store_path(state_dir.join("quic-trust.json"));
+        transport.test_state_guard = Some(guard);
         transport
     }
 
@@ -2608,11 +2651,11 @@ mod tests {
     async fn two_epoch_reliable_fixture() -> TwoEpochReliableFixture {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -2707,12 +2750,12 @@ mod tests {
     async fn blocked_quic_reliable_stream_still_delivers_emergency_release() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -2914,11 +2957,11 @@ mod tests {
     async fn connection_close_while_reliable_payload_is_flow_control_blocked_fails_frame() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3045,11 +3088,11 @@ mod tests {
     async fn overwritten_cancel_still_resets_blocked_old_epoch_and_allows_new_enter() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3146,11 +3189,11 @@ mod tests {
     async fn reliable_preface_cancel_resets_unbound_stream_and_allows_next_epoch_enter() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3240,11 +3283,11 @@ mod tests {
     async fn authenticated_qos_control_and_bulk_use_separate_framed_streams() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3355,11 +3398,11 @@ mod tests {
     async fn occupied_emergency_slot_closes_quic_and_releases_remote_active_epoch() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3439,11 +3482,11 @@ mod tests {
     async fn authenticated_wrong_lane_message_is_rejected() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3489,11 +3532,11 @@ mod tests {
     async fn truncated_authenticated_message_lane_closes_connection() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3531,11 +3574,11 @@ mod tests {
     async fn future_emergency_closes_and_releases_only_receiver_active_epoch() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3621,11 +3664,11 @@ mod tests {
     #[tokio::test]
     async fn sender_future_emergency_closes_and_releases_sender_active_epoch() {
         let server_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(DeviceId::new_v4());
+        let mut client = QuicTransport::isolated_for_test(DeviceId::new_v4());
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -3677,11 +3720,11 @@ mod tests {
     async fn larger_enter_retires_old_epoch_and_ignores_delayed_old_terminal_signals() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4002,11 +4045,11 @@ mod tests {
     async fn truncated_reliable_frame_closes_and_releases_current_epoch() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4091,11 +4134,11 @@ mod tests {
     async fn reliable_fin_at_frame_boundary_still_closes_when_epoch_is_active() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4178,11 +4221,11 @@ mod tests {
     async fn first_qos_stream_waits_for_authenticated_context_install() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4221,11 +4264,11 @@ mod tests {
     async fn reliable_writer_fault_tombstones_and_emits_terminal_release() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4266,11 +4309,11 @@ mod tests {
     async fn reliable_sequence_gap_closes_before_full_callback_and_does_not_drop_release() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4368,11 +4411,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_last_qos_handle_releases_worker_state() {
         let server_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(DeviceId::new_v4());
+        let mut client = QuicTransport::isolated_for_test(DeviceId::new_v4());
         let connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4405,11 +4448,11 @@ mod tests {
     async fn cancelled_awaited_lane_during_preface_resets_without_closing_connection() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4473,11 +4516,11 @@ mod tests {
     async fn cancelled_blocked_awaited_lane_resets_and_all_workers_stop_on_drop() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4700,7 +4743,7 @@ mod tests {
     async fn optional_client_verifier_rejects_invalid_certificate_verify_signature() {
         ensure_rustls_crypto_provider();
         let server_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
 
@@ -4759,13 +4802,13 @@ mod tests {
     async fn raw_bootstrap_stream_with_prequeued_input_is_closed() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.require_peer_protocol_handshake();
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4813,12 +4856,12 @@ mod tests {
     async fn raw_second_stream_prequeued_before_auth_never_reaches_manager() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut manager = crate::connection::ConnectionManager::new(server_id);
+        let mut manager = crate::connection::ConnectionManager::isolated_for_test(server_id);
         let mut events = manager.events().unwrap();
         manager.start_server("127.0.0.1:0").await.unwrap();
         let address = manager.transport_local_addr().unwrap();
 
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4867,15 +4910,15 @@ mod tests {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
         let reader_barrier = Arc::new(Notify::new());
-        let server_transport =
-            QuicTransport::new(server_id).with_test_datagram_reader_barrier(reader_barrier.clone());
+        let server_transport = QuicTransport::isolated_for_test(server_id)
+            .with_test_datagram_reader_barrier(reader_barrier.clone());
         let mut manager =
             crate::connection::ConnectionManager::with_transport(server_id, server_transport);
         let mut events = manager.events().unwrap();
         manager.start_server("127.0.0.1:0").await.unwrap();
         let address = manager.transport_local_addr().unwrap();
 
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let mut client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4937,13 +4980,13 @@ mod tests {
     async fn raw_oversized_bootstrap_length_is_closed_before_payload_read() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.require_peer_protocol_handshake();
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(client_id);
+        let mut client = QuicTransport::isolated_for_test(client_id);
         let client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -4973,13 +5016,89 @@ mod tests {
 
     #[test]
     fn test_transport_new() {
-        let transport = QuicTransport::new(DeviceId::new_v4());
-        assert!(!transport.is_running());
+        Encryption::reset_default_identity_loads_for_test();
+        let first = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        let second = QuicTransport::isolated_for_test(DeviceId::new_v4());
+        assert!(!first.is_running());
+        assert_eq!(Encryption::default_identity_loads_for_test(), 0);
+        assert_ne!(first.identity.cert_der, second.identity.cert_der);
+        assert_ne!(first.trust_store_path, second.trust_store_path);
+        for path in [&first.trust_store_path, &second.trust_store_path] {
+            let path = path.as_ref().expect("test trust path must be explicit");
+            assert!(
+                path.starts_with(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("target")
+                        .join("rshare-state")
+                ),
+                "test trust state must stay inside the per-crate scratch tree"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_isolated_transports_never_share_state_and_cleanup() {
+        let workers = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let transport = QuicTransport::isolated_for_test(DeviceId::new_v4());
+                    let trust_path = transport
+                        .trust_store_path
+                        .clone()
+                        .expect("isolated transport must have an explicit trust path");
+                    let state_dir = trust_path
+                        .parent()
+                        .expect("trust path must have a state directory")
+                        .to_path_buf();
+                    fs::create_dir_all(&state_dir).unwrap();
+                    fs::write(
+                        state_dir.join("owner"),
+                        transport.identity.cert_der.as_slice(),
+                    )
+                    .unwrap();
+                    (transport, trust_path, state_dir)
+                })
+            })
+            .collect::<Vec<_>>();
+        let isolated = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("isolated transport worker panicked"))
+            .collect::<Vec<_>>();
+
+        let trust_paths = isolated
+            .iter()
+            .map(|(_, trust_path, _)| trust_path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let identities = isolated
+            .iter()
+            .map(|(transport, _, _)| transport.identity.cert_der.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(trust_paths.len(), isolated.len());
+        assert_eq!(identities.len(), isolated.len());
+        assert!(isolated.iter().all(|(_, _, state_dir)| state_dir.exists()));
+
+        let state_dirs = isolated
+            .iter()
+            .map(|(_, _, state_dir)| state_dir.clone())
+            .collect::<Vec<_>>();
+        drop(isolated);
+        assert!(
+            state_dirs.iter().all(|state_dir| !state_dir.exists()),
+            "each transport guard must clean only its own test state"
+        );
+    }
+
+    #[test]
+    fn explicit_identity_constructor_does_not_load_default_state() {
+        Encryption::reset_default_identity_loads_for_test();
+        let _transport =
+            QuicTransport::with_identity(DeviceId::new_v4(), generated_test_identity());
+        assert_eq!(Encryption::default_identity_loads_for_test(), 0);
     }
 
     #[tokio::test]
     async fn start_server_marks_transport_running() {
-        let mut transport = QuicTransport::new(DeviceId::new_v4());
+        let mut transport = QuicTransport::isolated_for_test(DeviceId::new_v4());
 
         transport.start_server("127.0.0.1:0").await.unwrap();
 
@@ -5015,11 +5134,11 @@ mod tests {
     async fn connection_pool_does_not_hold_global_lock_while_target_send_waits() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(local_id);
+        let mut server = QuicTransport::isolated_for_test(local_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let mut incoming = server.incoming();
-        let mut client = QuicTransport::new(remote_id);
+        let mut client = QuicTransport::isolated_for_test(remote_id);
         let sender = client
             .connect(&server_addr.to_string(), local_id)
             .await
@@ -5064,12 +5183,12 @@ mod tests {
         let server_id = DeviceId::new_v4();
         let fast_id = DeviceId::new_v4();
         let slow_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let mut incoming = server.incoming();
 
-        let mut fast_client = QuicTransport::new(fast_id);
+        let mut fast_client = QuicTransport::isolated_for_test(fast_id);
         let fast_sender = fast_client
             .connect(&server_addr.to_string(), server_id)
             .await
@@ -5077,7 +5196,7 @@ mod tests {
         let mut fast_receiver = incoming.recv().await.unwrap().connection;
         let mut fast_messages = fast_receiver.message_channel();
 
-        let mut slow_client = QuicTransport::new(slow_id);
+        let mut slow_client = QuicTransport::isolated_for_test(slow_id);
         let slow_sender = slow_client
             .connect(&server_addr.to_string(), server_id)
             .await
@@ -5145,12 +5264,12 @@ mod tests {
         let server_id = DeviceId::new_v4();
         let fast_id = DeviceId::new_v4();
         let slow_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(server_id);
+        let mut server = QuicTransport::isolated_for_test(server_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let mut incoming = server.incoming();
 
-        let mut fast_client = QuicTransport::new(fast_id);
+        let mut fast_client = QuicTransport::isolated_for_test(fast_id);
         let fast_sender = fast_client
             .connect(&server_addr.to_string(), server_id)
             .await
@@ -5158,7 +5277,7 @@ mod tests {
         let mut fast_receiver = incoming.recv().await.unwrap().connection;
         let mut fast_messages = fast_receiver.message_channel();
 
-        let mut slow_client = QuicTransport::new(slow_id);
+        let mut slow_client = QuicTransport::isolated_for_test(slow_id);
         let slow_sender = slow_client
             .connect(&server_addr.to_string(), server_id)
             .await
@@ -5226,7 +5345,7 @@ mod tests {
     async fn quinn_loopback_sends_mouse_move_datagram() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(local_id);
+        let mut server = QuicTransport::isolated_for_test(local_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server
             .server_endpoint
@@ -5236,7 +5355,7 @@ mod tests {
             .unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(remote_id);
+        let mut client = QuicTransport::isolated_for_test(remote_id);
         let sender = client
             .connect(&server_addr.to_string(), local_id)
             .await
@@ -5261,7 +5380,7 @@ mod tests {
     async fn realtime_datagram_send_failure_is_counted_and_never_falls_back() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(local_id);
+        let mut server = QuicTransport::isolated_for_test(local_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server
             .server_endpoint
@@ -5271,7 +5390,7 @@ mod tests {
             .unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(remote_id);
+        let mut client = QuicTransport::isolated_for_test(remote_id);
         let sender = client
             .connect(&server_addr.to_string(), local_id)
             .await
@@ -5302,7 +5421,7 @@ mod tests {
     async fn oversized_legacy_realtime_encoding_is_counted_and_dropped() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(local_id);
+        let mut server = QuicTransport::isolated_for_test(local_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server
             .server_endpoint
@@ -5312,7 +5431,7 @@ mod tests {
             .unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(remote_id);
+        let mut client = QuicTransport::isolated_for_test(remote_id);
         let sender = client
             .connect(&server_addr.to_string(), local_id)
             .await
@@ -5345,7 +5464,7 @@ mod tests {
     async fn quinn_loopback_sends_key_over_reliable_stream() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::new(local_id);
+        let mut server = QuicTransport::isolated_for_test(local_id);
         server.start_server("127.0.0.1:0").await.unwrap();
         let server_addr = server
             .server_endpoint
@@ -5355,7 +5474,7 @@ mod tests {
             .unwrap();
         let mut incoming = server.incoming();
 
-        let mut client = QuicTransport::new(remote_id);
+        let mut client = QuicTransport::isolated_for_test(remote_id);
         let sender = client
             .connect(&server_addr.to_string(), local_id)
             .await

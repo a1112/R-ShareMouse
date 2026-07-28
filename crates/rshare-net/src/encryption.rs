@@ -19,6 +19,8 @@ const QUIC_TRUST_FILE: &str = "quic-trust.json";
 static IDENTITY_LOCK: Mutex<()> = Mutex::new(());
 static TRUST_STORE_LOCK: Mutex<()> = Mutex::new(());
 static TRUST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static DEFAULT_IDENTITY_LOADS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct QuicIdentity {
@@ -181,11 +183,23 @@ impl Encryption {
     }
 
     pub fn load_or_generate_default_identity() -> Result<QuicIdentity> {
+        #[cfg(test)]
+        DEFAULT_IDENTITY_LOADS.fetch_add(1, Ordering::AcqRel);
         let _guard = IDENTITY_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("QUIC identity lock poisoned"))?;
         let state_dir = rshare_core::service::state_dir()?;
         Self::load_or_generate_identity_in(&state_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_default_identity_loads_for_test() {
+        DEFAULT_IDENTITY_LOADS.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn default_identity_loads_for_test() -> u64 {
+        DEFAULT_IDENTITY_LOADS.load(Ordering::Acquire)
     }
 
     pub fn regenerate_default_identity() -> Result<QuicIdentity> {
@@ -372,14 +386,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("rshare-{name}-{suffix}"))
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rshare-state")
+            .join(format!("rshare-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]

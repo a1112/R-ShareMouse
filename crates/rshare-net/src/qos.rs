@@ -305,6 +305,10 @@ struct PeerTransportInner {
     #[cfg(test)]
     reliable_payload_poll_paused: AtomicBool,
     #[cfg(test)]
+    reliable_fail_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(test)]
+    reliable_fail_barrier_waiting: AtomicBool,
+    #[cfg(test)]
     awaited_write_probes: Arc<AwaitedWriteProbes>,
     #[cfg_attr(not(test), allow(dead_code))]
     worker_count: Arc<AtomicUsize>,
@@ -382,6 +386,10 @@ impl PeerTransportHandle {
             reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             reliable_payload_poll_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            reliable_fail_barrier: Mutex::new(None),
+            #[cfg(test)]
+            reliable_fail_barrier_waiting: AtomicBool::new(false),
             #[cfg(test)]
             awaited_write_probes: awaited_write_probes.clone(),
             worker_count: worker_count.clone(),
@@ -642,6 +650,22 @@ impl PeerTransportHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_reliable_fail_barrier_for_test(&self, barrier: Arc<tokio::sync::Notify>) {
+        *self
+            .inner
+            .reliable_fail_barrier
+            .lock()
+            .expect("reliable fail barrier poisoned") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reliable_fail_waiting_for_test(&self) -> bool {
+        self.inner
+            .reliable_fail_barrier_waiting
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn awaited_write_counts_for_test(&self) -> (u64, u64, u64, u64) {
         (
             self.inner
@@ -859,17 +883,41 @@ fn reset_cancelled_reliable_stream(
     *stream = None;
 }
 
-fn fail_reliable_writer_frame(
+async fn fail_reliable_writer_frame(
     inner_weak: &std::sync::Weak<PeerTransportInner>,
     frame: ReliableInputFrame,
 ) {
     let Some(inner) = inner_weak.upgrade() else {
         return;
     };
+    #[cfg(test)]
+    {
+        let barrier = inner
+            .reliable_fail_barrier
+            .lock()
+            .expect("reliable fail barrier poisoned")
+            .take();
+        if let Some(barrier) = barrier {
+            inner
+                .reliable_fail_barrier_waiting
+                .store(true, Ordering::Release);
+            barrier.notified().await;
+            inner
+                .reliable_fail_barrier_waiting
+                .store(false, Ordering::Release);
+        }
+    }
     let handle = PeerTransportHandle {
         inner: inner.clone(),
     };
     let _admission = inner.admission.lock().expect("qos admission poisoned");
+    let epoch_still_active = {
+        let state = inner.epoch_state.lock().expect("qos epoch state poisoned");
+        state.active == Some(frame.session_epoch) && !state.retired(frame.session_epoch)
+    };
+    if !epoch_still_active {
+        return;
+    }
     let _ = handle.fail_reliable_frame(frame);
 }
 
@@ -931,7 +979,7 @@ fn spawn_reliable_writer(
                         continue;
                     }
                     Err(_) => {
-                        fail_reliable_writer_frame(&inner_weak, frame);
+                        fail_reliable_writer_frame(&inner_weak, frame).await;
                         return;
                     }
                 };
@@ -1009,12 +1057,12 @@ fn spawn_reliable_writer(
                         .as_mut()
                         .expect("failed reliable stream remains initialized")
                         .reset(0u32.into());
-                    fail_reliable_writer_frame(&inner_weak, frame);
+                    fail_reliable_writer_frame(&inner_weak, frame).await;
                     return;
                 }
             }
             let Ok(encoded) = crate::codec::ReliableInputCodec::encode(&frame) else {
-                fail_reliable_writer_frame(&inner_weak, frame);
+                fail_reliable_writer_frame(&inner_weak, frame).await;
                 return;
             };
             let mut wire = Vec::with_capacity(4 + encoded.len());
@@ -1055,7 +1103,7 @@ fn spawn_reliable_writer(
                         }
                         result = &mut write => break Some(result),
                         _ = connection.closed() => {
-                            fail_reliable_writer_frame(&inner_weak, frame);
+                            fail_reliable_writer_frame(&inner_weak, frame).await;
                             return;
                         },
                     }
@@ -1080,7 +1128,7 @@ fn spawn_reliable_writer(
                     .expect("failed reliable stream remains initialized")
                     .reset(0u32.into());
                 drop(inner);
-                fail_reliable_writer_frame(&inner_weak, frame);
+                fail_reliable_writer_frame(&inner_weak, frame).await;
                 return;
             }
         }
@@ -1619,6 +1667,10 @@ fn fixture_handle(
                 #[cfg(test)]
                 reliable_payload_poll_paused: AtomicBool::new(false),
                 #[cfg(test)]
+                reliable_fail_barrier: Mutex::new(None),
+                #[cfg(test)]
+                reliable_fail_barrier_waiting: AtomicBool::new(false),
+                #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1660,11 +1712,12 @@ fn registered_peer_fixture(
 #[cfg(test)]
 fn fixture_handle_with_stalled_emergency() -> (
     PeerTransportHandle,
+    QosProbe,
     mpsc::Receiver<ReliableInputFrame>,
     mpsc::Receiver<TerminalReleaseEvent>,
 ) {
     let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
-    let (reliable_tx, _reliable_rx) = mpsc::channel(1);
+    let (reliable_tx, reliable_rx) = mpsc::channel(1);
     let (emergency_tx, emergency_rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
     let (reliable_compat_tx, _reliable_compat_rx) = mpsc::channel(1);
@@ -1700,10 +1753,15 @@ fn fixture_handle_with_stalled_emergency() -> (
                 #[cfg(test)]
                 reliable_payload_poll_paused: AtomicBool::new(false),
                 #[cfg(test)]
+                reliable_fail_barrier: Mutex::new(None),
+                #[cfg(test)]
+                reliable_fail_barrier_waiting: AtomicBool::new(false),
+                #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
         },
+        QosProbe { reliable_rx },
         emergency_rx,
         release_rx,
     )
@@ -1798,6 +1856,93 @@ mod tests {
                 reason: ReleaseAllReason::BackendFailure,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn normal_release_wins_when_writer_failure_was_waiting_for_admission() {
+        let (handle, _reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        let epoch = SessionEpoch(71);
+        handle
+            .try_send_reliable_input(reliable_enter(epoch.0, 1))
+            .unwrap();
+
+        let barrier = Arc::new(tokio::sync::Notify::new());
+        handle.set_reliable_fail_barrier_for_test(barrier.clone());
+        let weak = Arc::downgrade(&handle.inner);
+        let fault_frame = reliable_key_down(epoch.0, 2);
+        let fault = tokio::spawn(async move {
+            fail_reliable_writer_frame(&weak, fault_frame).await;
+        });
+        timeout(Duration::from_secs(1), async {
+            while !handle.reliable_fail_waiting_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer failure helper must reach the admission barrier");
+
+        let mut normal_release = reliable_release(epoch.0, 3);
+        normal_release.event = ReliableInputEvent::ReleaseAll {
+            reason: ReleaseAllReason::SessionEnded,
+        };
+        handle
+            .try_send_reliable_input(normal_release)
+            .expect("the first normal release must retire the active epoch");
+        let terminal = emergency_rx
+            .recv()
+            .await
+            .expect("normal release must occupy the sole terminal output");
+        assert!(matches!(
+            terminal.event,
+            ReliableInputEvent::ReleaseAll {
+                reason: ReleaseAllReason::SessionEnded
+            }
+        ));
+
+        barrier.notify_one();
+        fault.await.expect("writer failure task must finish");
+        assert!(handle.is_tombstoned(epoch));
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(
+            local_releases.try_recv().is_err(),
+            "the stale writer failure must not emit a second BackendFailure release"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_failure_wins_when_it_retires_epoch_before_normal_release() {
+        let (handle, _reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        let epoch = SessionEpoch(72);
+        handle
+            .try_send_reliable_input(reliable_enter(epoch.0, 1))
+            .unwrap();
+
+        let weak = Arc::downgrade(&handle.inner);
+        fail_reliable_writer_frame(&weak, reliable_key_down(epoch.0, 2)).await;
+        let terminal = emergency_rx
+            .recv()
+            .await
+            .expect("writer failure must produce one terminal output");
+        assert!(matches!(
+            terminal.event,
+            ReliableInputEvent::ReleaseAll {
+                reason: ReleaseAllReason::BackendFailure
+            }
+        ));
+
+        let mut normal_release = reliable_release(epoch.0, 3);
+        normal_release.event = ReliableInputEvent::ReleaseAll {
+            reason: ReleaseAllReason::SessionEnded,
+        };
+        assert_eq!(
+            handle.try_send_reliable_input(normal_release),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+        assert!(handle.is_tombstoned(epoch));
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(local_releases.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1922,7 +2067,8 @@ mod tests {
 
     #[tokio::test]
     async fn occupied_emergency_slot_fails_closed_with_typed_release() {
-        let (handle, _stalled_emergency, mut releases) = fixture_handle_with_stalled_emergency();
+        let (handle, _reliable, _stalled_emergency, mut releases) =
+            fixture_handle_with_stalled_emergency();
         handle.try_send_emergency(reliable_release(9, 1)).unwrap();
         assert_eq!(
             handle.try_send_emergency(reliable_release(10, 1)),
