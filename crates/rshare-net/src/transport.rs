@@ -24,7 +24,7 @@ use std::sync::Once;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify, Semaphore};
 
 use super::codec::ControlMessageCodec;
 use super::encryption::{
@@ -46,6 +46,7 @@ const BOOTSTRAP_RELIABLE_READER_ACK: u8 = 0b01;
 const BOOTSTRAP_DATAGRAM_READER_ACK: u8 = 0b10;
 const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
+const AUTHENTICATED_UNI_STREAM_TASK_BUDGET: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuicServerStartError {
@@ -575,6 +576,7 @@ struct QuicConnectionInner {
     qos_receivers: StdMutex<Option<InstalledInboundReceivers>>,
     qos_receive_notify: Notify,
     qos_inbound: StdMutex<QosInboundState>,
+    authenticated_uni_stream_tasks: Arc<Semaphore>,
     #[cfg(test)]
     qos_reliable_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
     #[cfg(test)]
@@ -587,6 +589,47 @@ struct QuicConnectionInner {
     qos_awaited_cancel_resets_observed: AtomicU64,
     #[cfg(test)]
     qos_terminal_cancel_resets_observed: AtomicU64,
+    #[cfg(test)]
+    authenticated_uni_streams_accepted: AtomicUsize,
+    #[cfg(test)]
+    authenticated_uni_stream_tasks_active: AtomicUsize,
+    #[cfg(test)]
+    authenticated_uni_stream_tasks_peak: AtomicUsize,
+    #[cfg(test)]
+    authenticated_uni_streams_rejected: AtomicUsize,
+    #[cfg(test)]
+    authenticated_uni_stream_tasks_completed: AtomicUsize,
+}
+
+#[cfg(test)]
+struct AuthenticatedUniStreamTaskProbe {
+    inner: Arc<QuicConnectionInner>,
+}
+
+#[cfg(test)]
+impl AuthenticatedUniStreamTaskProbe {
+    fn start(inner: Arc<QuicConnectionInner>) -> Self {
+        let active = inner
+            .authenticated_uni_stream_tasks_active
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        inner
+            .authenticated_uni_stream_tasks_peak
+            .fetch_max(active, Ordering::AcqRel);
+        Self { inner }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AuthenticatedUniStreamTaskProbe {
+    fn drop(&mut self) {
+        self.inner
+            .authenticated_uni_stream_tasks_active
+            .fetch_sub(1, Ordering::AcqRel);
+        self.inner
+            .authenticated_uni_stream_tasks_completed
+            .fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -740,6 +783,9 @@ impl QuicConnection {
             qos_receivers: StdMutex::new(None),
             qos_receive_notify: Notify::new(),
             qos_inbound: StdMutex::new(QosInboundState::default()),
+            authenticated_uni_stream_tasks: Arc::new(Semaphore::new(
+                AUTHENTICATED_UNI_STREAM_TASK_BUDGET,
+            )),
             #[cfg(test)]
             qos_reliable_reader_start_barrier: StdMutex::new(None),
             #[cfg(test)]
@@ -752,6 +798,16 @@ impl QuicConnection {
             qos_awaited_cancel_resets_observed: AtomicU64::new(0),
             #[cfg(test)]
             qos_terminal_cancel_resets_observed: AtomicU64::new(0),
+            #[cfg(test)]
+            authenticated_uni_streams_accepted: AtomicUsize::new(0),
+            #[cfg(test)]
+            authenticated_uni_stream_tasks_active: AtomicUsize::new(0),
+            #[cfg(test)]
+            authenticated_uni_stream_tasks_peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            authenticated_uni_streams_rejected: AtomicUsize::new(0),
+            #[cfg(test)]
+            authenticated_uni_stream_tasks_completed: AtomicUsize::new(0),
         });
         {
             let inner = inner.clone();
@@ -954,6 +1010,27 @@ impl QuicConnection {
         self.inner
             .qos_bulk_reader_barrier_waiting
             .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn authenticated_uni_stream_task_counts_for_test(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.inner
+                .authenticated_uni_streams_accepted
+                .load(Ordering::Acquire),
+            self.inner
+                .authenticated_uni_stream_tasks_active
+                .load(Ordering::Acquire),
+            self.inner
+                .authenticated_uni_stream_tasks_peak
+                .load(Ordering::Acquire),
+            self.inner
+                .authenticated_uni_streams_rejected
+                .load(Ordering::Acquire),
+            self.inner
+                .authenticated_uni_stream_tasks_completed
+                .load(Ordering::Acquire),
+        )
     }
 
     pub fn confirm_peer_identity(
@@ -1600,9 +1677,35 @@ async fn read_reliable_messages(
         }
 
         if !bootstrap_stream {
+            #[cfg(test)]
+            inner
+                .authenticated_uni_streams_accepted
+                .fetch_add(1, Ordering::AcqRel);
+            let task_permit = match inner
+                .authenticated_uni_stream_tasks
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = stream.stop(VarInt::from_u32(0x525350));
+                    #[cfg(test)]
+                    inner
+                        .authenticated_uni_streams_rejected
+                        .fetch_add(1, Ordering::AcqRel);
+                    try_report_current_protocol_error(
+                        &inner,
+                        "authenticated uni stream task budget exhausted".into(),
+                    );
+                    continue;
+                }
+            };
             let inner = inner.clone();
             let message_tx = message_tx.clone();
             tokio::spawn(async move {
+                let _task_permit = task_permit;
+                #[cfg(test)]
+                let _probe = AuthenticatedUniStreamTaskProbe::start(inner.clone());
                 read_authenticated_uni_stream(inner, stream, message_tx, max_message_size).await;
             });
             continue;
@@ -1802,14 +1905,26 @@ async fn reject_unrecognized_qos_stream(
 ) {
     let _ = stream.stop(VarInt::from_u32(0x525350));
     if let Some(context) = await_qos_receive_context(inner).await {
-        let _ = context
-            .protocol_error_tx
-            .send(TransportProtocolError {
-                auth: context.auth,
-                error,
-            })
-            .await;
+        try_report_protocol_error(&context, error);
     }
+}
+
+fn try_report_current_protocol_error(inner: &QuicConnectionInner, error: String) {
+    let context = inner
+        .qos_receive
+        .lock()
+        .expect("qos receive context poisoned")
+        .clone();
+    if let Some(context) = context {
+        try_report_protocol_error(&context, error);
+    }
+}
+
+fn try_report_protocol_error(context: &QosReceiveContext, error: String) {
+    let _ = context.protocol_error_tx.try_send(TransportProtocolError {
+        auth: context.auth.clone(),
+        error,
+    });
 }
 
 async fn read_qos_message_stream(
@@ -1913,13 +2028,7 @@ async fn read_qos_message_stream(
         );
         if !lane_matches {
             let _ = stream.stop(VarInt::from_u32(0x525350));
-            let _ = context
-                .protocol_error_tx
-                .send(TransportProtocolError {
-                    auth: context.auth.clone(),
-                    error: "message entered wrong qos lane".into(),
-                })
-                .await;
+            try_report_protocol_error(&context, "message entered wrong qos lane".into());
             return;
         }
         match classified {
@@ -1941,10 +2050,10 @@ async fn read_qos_message_stream(
             }
             super::qos::ClassifiedMessage::ReliableCompat(_) => {
                 let _ = stream.stop(VarInt::from_u32(0x525350));
-                let _ = context.protocol_error_tx.try_send(TransportProtocolError {
-                    auth: context.auth.clone(),
-                    error: "reliable compatibility input lacks authenticated epoch metadata".into(),
-                });
+                try_report_protocol_error(
+                    &context,
+                    "reliable compatibility input lacks authenticated epoch metadata".into(),
+                );
                 inner
                     .connection
                     .close(0u32.into(), b"rejected reliable compatibility input");
@@ -4191,6 +4300,147 @@ mod tests {
             server_connection.inner.connection.close_reason().is_none(),
             "malformed lane must only close its own stream"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_stream_flood_has_a_strict_task_budget_and_cannot_block_realtime() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _releases) = server_connection.install_qos(server_auth);
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let protocol_errors = server_connection.take_protocol_errors().unwrap();
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("reliable enter must activate the realtime epoch")
+            .unwrap();
+
+        for _ in 0..32 {
+            let mut malformed = client_connection.inner.connection.open_uni().await.unwrap();
+            malformed
+                .write_all(&[
+                    QOS_LANE_MAGIC[0],
+                    QOS_LANE_MAGIC[1],
+                    QOS_LANE_MAGIC[2],
+                    QOS_LANE_MAGIC[3],
+                    0xff,
+                ])
+                .await
+                .unwrap();
+            malformed.finish().unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            while protocol_errors.len() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("malformed diagnostics FIFO must become full");
+
+        let counts_before_blocked_diagnostic =
+            server_connection.authenticated_uni_stream_task_counts_for_test();
+        let mut blocked_diagnostic = client_connection.inner.connection.open_uni().await.unwrap();
+        blocked_diagnostic
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                0xff,
+            ])
+            .await
+            .unwrap();
+        blocked_diagnostic.finish().unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = server_connection.authenticated_uni_stream_task_counts_for_test();
+                if counts.0 > counts_before_blocked_diagnostic.0
+                    && counts.4 > counts_before_blocked_diagnostic.4
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full diagnostics FIFO must not park an unknown-lane handler");
+
+        let extra_streams = 16;
+        let accepted_before_flood = server_connection
+            .authenticated_uni_stream_task_counts_for_test()
+            .0;
+        let mut parked = Vec::new();
+        for _ in 0..AUTHENTICATED_UNI_STREAM_TASK_BUDGET + extra_streams {
+            let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+            stream.write_all(&QOS_LANE_MAGIC[..1]).await.unwrap();
+            parked.push(stream);
+        }
+        let expected_accepts =
+            accepted_before_flood + AUTHENTICATED_UNI_STREAM_TASK_BUDGET + extra_streams;
+        timeout(Duration::from_secs(1), async {
+            while server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .0
+                < expected_accepts
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all flood streams must be accepted even while diagnostics are blocked");
+
+        let (_accepted, active, peak, rejected, _completed) =
+            server_connection.authenticated_uni_stream_task_counts_for_test();
+        assert!(active <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
+        assert!(peak <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
+        assert!(rejected >= extra_streams);
+
+        client_qos.try_send_realtime(realtime_frame(1, 1)).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), inbound.realtime_rx.recv())
+                .await
+                .expect("realtime datagram must bypass blocked malformed diagnostics")
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert!(server_connection.inner.connection.close_reason().is_none());
+        assert!(client_connection.inner.connection.close_reason().is_none());
+
+        drop(protocol_errors);
+        drop(parked);
     }
 
     #[tokio::test]
