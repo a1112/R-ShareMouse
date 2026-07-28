@@ -440,15 +440,23 @@ impl ConnectionManager {
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
         let disconnected_permit = self.event_tx.reserve().await.ok();
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        let removed_connection_info = self
-            .connections
-            .write()
-            .expect("canonical connection registry poisoned")
-            .remove(device_id)
-            .is_some();
-        let removed_pool_connection = self.pool.remove(device_id).await.is_some();
-        if removed_connection_info || removed_pool_connection {
+        let (removed_connection_info, removed_pool_connection) = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            let removed_connection_info = self
+                .connections
+                .write()
+                .expect("canonical connection registry poisoned")
+                .remove(device_id)
+                .is_some();
+            let removed_pool_connection = self.pool.remove(device_id).await;
+            (removed_connection_info, removed_pool_connection)
+        };
+
+        let removed_pool = removed_pool_connection.is_some();
+        if let Some(connection) = removed_pool_connection {
+            connection.close().await;
+        }
+        if removed_connection_info || removed_pool {
             if let Some(permit) = disconnected_permit {
                 permit.send(ManagerEvent::Disconnected(*device_id));
             }
@@ -831,9 +839,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_old_retirement_cannot_disconnect_new_generation() {
+    async fn old_generation_retirement_after_replacement_preserves_control_connection_id() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
+        let old_control_id = ControlConnectionId::new();
+        let replacement_control_id = ControlConnectionId::new();
         let trust_path = temp_trust_store_path("reserved-retirement-race");
 
         let mut server = QuicTransport::new(remote_id);
@@ -879,7 +889,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: Some("trusted".to_string()),
-                control_connection_id: None,
+                control_connection_id: Some(old_control_id),
             },
         );
         manager
@@ -946,7 +956,7 @@ mod tests {
                         datagram_tx_dropped: 0,
                         reliable_stream_reset_count: 0,
                         cert_trust_state: Some("trusted".to_string()),
-                        control_connection_id: None,
+                        control_connection_id: Some(replacement_control_id),
                     },
                 },
             );
@@ -969,6 +979,18 @@ mod tests {
             new_generation
         ));
         assert!(manager.pool.diagnostics_for(&remote_id).await.is_some());
+        assert_eq!(
+            manager
+                .connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&remote_id)
+                .expect("replacement generation should remain canonical")
+                .info
+                .control_connection_id,
+            Some(replacement_control_id)
+        );
+        assert_ne!(old_control_id, replacement_control_id);
 
         server.close().await.unwrap();
         if let Some(parent) = trust_path.parent() {
@@ -1034,6 +1056,61 @@ mod tests {
             .unwrap();
 
         assert!(matches!(event, ManagerEvent::Disconnected(id) if id == remote_id));
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_closes_quic_and_retires_remote_reader() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = temp_trust_store_path("explicit-disconnect-close");
+        let mut remote = ConnectionManager::with_transport(
+            remote_id,
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone()),
+        );
+        let mut remote_events = remote.events().unwrap();
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote.transport_local_addr().unwrap();
+
+        let mut local = ConnectionManager::with_transport(
+            local_id,
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone()),
+        );
+        local
+            .connect(remote_id, &address.to_string())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    remote_events.recv().await,
+                    Some(ManagerEvent::Connected(id)) if id == local_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        local.disconnect(&remote_id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    remote_events.recv().await,
+                    Some(ManagerEvent::Disconnected(id)) if id == local_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("explicit disconnect must close QUIC and retire the remote reader");
+        assert!(!remote.is_connected(&local_id).await);
+
+        if let Some(parent) = trust_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[tokio::test]
@@ -1291,9 +1368,10 @@ mod tests {
         manager.start_server("127.0.0.1:0").await.unwrap();
         let address = manager.transport_local_addr().unwrap();
 
-        let mut first_peer = ConnectionManager::new(remote_id);
-        first_peer.transport =
-            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone());
+        let mut first_peer = ConnectionManager::with_transport(
+            remote_id,
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone()),
+        );
         first_peer
             .connect(local_id, &address.to_string())
             .await
@@ -1318,9 +1396,10 @@ mod tests {
             .expect("the first inbound connection should be present")
             .generation;
 
-        let mut duplicate_peer = ConnectionManager::new(remote_id);
-        duplicate_peer.transport =
-            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone());
+        let mut duplicate_peer = ConnectionManager::with_transport(
+            remote_id,
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone()),
+        );
         duplicate_peer
             .connect(local_id, &address.to_string())
             .await
@@ -1423,8 +1502,10 @@ mod tests {
         first_remote.start_server("127.0.0.1:0").await.unwrap();
         let first_address = first_remote.transport_local_addr().unwrap();
 
-        let mut manager = ConnectionManager::new(local_id);
-        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut manager = ConnectionManager::with_transport(
+            local_id,
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone()),
+        );
         let mut events = manager.events().unwrap();
         manager
             .connect(remote_id, &first_address.to_string())
@@ -1560,8 +1641,10 @@ mod tests {
                 .unwrap();
         });
 
-        let mut manager = ConnectionManager::new(local_id);
-        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut manager = ConnectionManager::with_transport(
+            local_id,
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone()),
+        );
         let error = manager
             .connect(expected_id, &address.to_string())
             .await
@@ -1604,8 +1687,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
         });
 
-        let mut manager = ConnectionManager::new(local_id);
-        manager.transport = QuicTransport::new(local_id).with_trust_store_path(trust_path.clone());
+        let mut manager = ConnectionManager::with_transport(
+            local_id,
+            QuicTransport::new(local_id).with_trust_store_path(trust_path.clone()),
+        );
         let error = manager
             .connect(expected_id, &address.to_string())
             .await

@@ -16,7 +16,7 @@ use rustls::{
 use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
@@ -29,6 +29,11 @@ use super::encryption::{
 };
 use rshare_core::{DeviceId, Message};
 use tracing::info;
+
+const BOOTSTRAP_RELIABLE_READER_ACK: u8 = 0b01;
+const BOOTSTRAP_DATAGRAM_READER_ACK: u8 = 0b10;
+const BOOTSTRAP_ALL_READERS_ACKED: u8 =
+    BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -81,6 +86,7 @@ pub struct QuicTransport {
     trust_store_path: Option<PathBuf>,
     present_client_certificate: bool,
     peer_protocol_handshake_required: bool,
+    datagram_reader_start_barrier: Option<Arc<Notify>>,
 }
 
 pub struct IncomingConnection {
@@ -113,6 +119,7 @@ impl QuicTransport {
             trust_store_path: None,
             present_client_certificate: true,
             peer_protocol_handshake_required: false,
+            datagram_reader_start_barrier: None,
         }
     }
 
@@ -139,6 +146,12 @@ impl QuicTransport {
 
     pub(crate) fn require_peer_protocol_handshake(&mut self) {
         self.peer_protocol_handshake_required = true;
+    }
+
+    #[cfg(test)]
+    fn with_test_datagram_reader_barrier(mut self, barrier: Arc<Notify>) -> Self {
+        self.datagram_reader_start_barrier = Some(barrier);
+        self
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -171,6 +184,7 @@ impl QuicTransport {
             None => super::encryption::trust_store_path()?,
         };
         let peer_protocol_handshake_required = self.peer_protocol_handshake_required;
+        let datagram_reader_start_barrier = self.datagram_reader_start_barrier.clone();
         let accept_endpoint = endpoint.clone();
 
         let server_task = tokio::spawn(async move {
@@ -179,6 +193,7 @@ impl QuicTransport {
                 let endpoint = accept_endpoint.clone();
                 let config = config.clone();
                 let trust_store_path = trust_store_path.clone();
+                let datagram_reader_start_barrier = datagram_reader_start_barrier.clone();
 
                 tokio::spawn(async move {
                     match connecting.await {
@@ -194,6 +209,7 @@ impl QuicTransport {
                                 None,
                                 trust_store_path,
                                 peer_protocol_handshake_required,
+                                datagram_reader_start_barrier,
                             );
 
                             let _ = incoming_tx
@@ -261,6 +277,7 @@ impl QuicTransport {
             Some(pending_peer_trust),
             trust_store_path,
             self.peer_protocol_handshake_required,
+            self.datagram_reader_start_barrier.clone(),
         ))
     }
 
@@ -313,6 +330,13 @@ struct QuicConnectionInner {
     last_datagram_rx_us: AtomicU64,
     bootstrap_complete: AtomicBool,
     bootstrap_notify: Notify,
+    bootstrap_stream_verified: AtomicBool,
+    bootstrap_stream_notify: Notify,
+    bootstrap_commit_requested: AtomicBool,
+    bootstrap_commit_notify: Notify,
+    bootstrap_commit_acks: AtomicU8,
+    bootstrap_commit_ack_notify: Notify,
+    datagram_reader_start_barrier: Option<Arc<Notify>>,
 }
 
 impl Drop for QuicConnectionInner {
@@ -399,6 +423,7 @@ impl QuicConnection {
         pending_peer_trust: Option<PendingPeerTrust>,
         trust_store_path: PathBuf,
         peer_protocol_handshake_required: bool,
+        datagram_reader_start_barrier: Option<Arc<Notify>>,
     ) -> Self {
         let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(128);
         let (message_tx, message_rx): (mpsc::Sender<Message>, _) = mpsc::channel(256);
@@ -412,6 +437,17 @@ impl QuicConnection {
             last_datagram_rx_us: AtomicU64::new(0),
             bootstrap_complete: AtomicBool::new(!peer_protocol_handshake_required),
             bootstrap_notify: Notify::new(),
+            bootstrap_stream_verified: AtomicBool::new(!peer_protocol_handshake_required),
+            bootstrap_stream_notify: Notify::new(),
+            bootstrap_commit_requested: AtomicBool::new(false),
+            bootstrap_commit_notify: Notify::new(),
+            bootstrap_commit_acks: AtomicU8::new(if peer_protocol_handshake_required {
+                0
+            } else {
+                BOOTSTRAP_ALL_READERS_ACKED
+            }),
+            bootstrap_commit_ack_notify: Notify::new(),
+            datagram_reader_start_barrier,
         });
         let outbound_seq = Arc::new(AtomicU32::new(1));
 
@@ -562,10 +598,24 @@ impl QuicConnection {
     }
 
     pub(crate) async fn complete_peer_protocol_handshake(&self) -> Result<()> {
+        if self.inner.bootstrap_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if let Some(mut bootstrap_stream) = self.inner.reliable_send_stream.lock().await.take() {
             bootstrap_stream
                 .finish()
                 .context("Failed to finish compatibility bootstrap stream")?;
+        }
+
+        wait_for_bootstrap_stream_verification(&self.inner).await?;
+        self.inner
+            .bootstrap_commit_requested
+            .store(true, Ordering::Release);
+        self.inner.bootstrap_commit_notify.notify_waiters();
+        wait_for_bootstrap_reader_acks(&self.inner).await?;
+
+        if let Some(reason) = self.inner.connection.close_reason() {
+            anyhow::bail!("peer closed during compatibility bootstrap: {reason}");
         }
         self.inner.bootstrap_complete.store(true, Ordering::Release);
         self.inner.bootstrap_notify.notify_waiters();
@@ -958,7 +1008,15 @@ async fn read_reliable_messages(
     message_tx: mpsc::Sender<Message>,
     max_message_size: usize,
 ) {
+    let mut bootstrap_stream_seen = inner.bootstrap_complete.load(Ordering::Acquire);
     loop {
+        if bootstrap_stream_seen
+            && !inner.bootstrap_complete.load(Ordering::Acquire)
+            && !await_reliable_bootstrap_commit(&inner).await
+        {
+            return;
+        }
+
         let mut stream = match inner.connection.accept_uni().await {
             Ok(stream) => stream,
             Err(error) => {
@@ -966,6 +1024,15 @@ async fn read_reliable_messages(
                 break;
             }
         };
+        let bootstrap_stream =
+            !bootstrap_stream_seen && !inner.bootstrap_complete.load(Ordering::Acquire);
+        if !bootstrap_stream && !inner.bootstrap_complete.load(Ordering::Acquire) {
+            tracing::warn!("Closing peer that opened a second stream before authentication");
+            inner
+                .connection
+                .close(0u32.into(), b"stream opened before peer authentication");
+            return;
+        }
 
         loop {
             let mut len_buf = [0u8; 4];
@@ -978,8 +1045,7 @@ async fn read_reliable_messages(
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
-            let bootstrap_pending = !inner.bootstrap_complete.load(Ordering::Acquire);
-            let frame_limit = if bootstrap_pending {
+            let frame_limit = if bootstrap_stream {
                 max_message_size.min(super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE)
             } else {
                 max_message_size
@@ -1003,7 +1069,7 @@ async fn read_reliable_messages(
 
             match ControlMessageCodec::decode(&data) {
                 Ok(msg) => {
-                    if bootstrap_pending && !super::handshake::is_bootstrap_message(&msg) {
+                    if bootstrap_stream && !super::handshake::is_bootstrap_message(&msg) {
                         tracing::warn!(
                             "Closing peer that sent non-bootstrap message before authentication"
                         );
@@ -1015,11 +1081,14 @@ async fn read_reliable_messages(
                     if message_tx.send(msg).await.is_err() {
                         return;
                     }
-                    if bootstrap_pending {
+                    if bootstrap_stream {
                         // The compatibility stream is permanently bootstrap-only.
                         // Normal traffic must arrive on a newly opened stream after
                         // both peers have completed authentication.
-                        enforce_bootstrap_stream_eof(&inner, &mut stream).await;
+                        bootstrap_stream_seen = true;
+                        if !enforce_bootstrap_stream_eof(&inner, &mut stream).await {
+                            return;
+                        }
                         break;
                     }
                 }
@@ -1032,18 +1101,7 @@ async fn read_reliable_messages(
 async fn enforce_bootstrap_stream_eof(
     inner: &Arc<QuicConnectionInner>,
     stream: &mut quinn::RecvStream,
-) {
-    while !inner.bootstrap_complete.load(Ordering::Acquire) {
-        let notified = inner.bootstrap_notify.notified();
-        if inner.bootstrap_complete.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::select! {
-            _ = notified => {}
-            _ = inner.connection.closed() => return,
-        }
-    }
-
+) -> bool {
     let mut trailing = [0u8; 1];
     match tokio::time::timeout(
         super::handshake::BOOTSTRAP_TIMEOUT,
@@ -1051,25 +1109,75 @@ async fn enforce_bootstrap_stream_eof(
     )
     .await
     {
-        Ok(Ok(None)) => {}
+        Ok(Ok(None)) => {
+            inner
+                .bootstrap_stream_verified
+                .store(true, Ordering::Release);
+            inner.bootstrap_stream_notify.notify_waiters();
+            true
+        }
         Ok(Ok(Some(_))) => {
             tracing::warn!("Closing peer that appended data to the bootstrap-only stream");
             inner
                 .connection
                 .close(0u32.into(), b"bootstrap stream carried trailing data");
+            false
         }
         Ok(Err(error)) => {
             tracing::debug!("Bootstrap stream close check failed: {}", error);
             inner
                 .connection
                 .close(0u32.into(), b"bootstrap stream close check failed");
+            false
         }
         Err(_) => {
             tracing::warn!("Closing peer that did not finish the bootstrap-only stream");
             inner
                 .connection
                 .close(0u32.into(), b"bootstrap stream did not finish");
+            false
         }
+    }
+}
+
+async fn await_reliable_bootstrap_commit(inner: &Arc<QuicConnectionInner>) -> bool {
+    let commit_notified = inner.bootstrap_commit_notify.notified();
+    tokio::pin!(commit_notified);
+    commit_notified.as_mut().enable();
+    if inner.bootstrap_commit_requested.load(Ordering::Acquire) {
+        return guard_reliable_until_authenticated(inner).await;
+    }
+    tokio::select! {
+        biased;
+        stream = inner.connection.accept_uni() => {
+            if stream.is_ok() {
+                tracing::warn!("Closing peer that prequeued a second stream before authentication");
+                inner.connection.close(0u32.into(), b"pre-authentication stream");
+            }
+            false
+        }
+        _ = commit_notified => {
+            guard_reliable_until_authenticated(inner).await
+        }
+    }
+}
+
+async fn guard_reliable_until_authenticated(inner: &Arc<QuicConnectionInner>) -> bool {
+    let authenticated = inner.bootstrap_notify.notified();
+    tokio::pin!(authenticated);
+    authenticated.as_mut().enable();
+    mark_bootstrap_reader_ack(inner, BOOTSTRAP_RELIABLE_READER_ACK);
+    tokio::select! {
+        biased;
+        stream = inner.connection.accept_uni() => {
+            if stream.is_ok() {
+                tracing::warn!("Closing peer that opened a stream during bootstrap commit");
+                inner.connection.close(0u32.into(), b"stream during bootstrap commit");
+            }
+            false
+        }
+        _ = authenticated => true,
+        _ = inner.connection.closed() => false,
     }
 }
 
@@ -1077,23 +1185,47 @@ async fn read_realtime_datagrams(
     inner: Arc<QuicConnectionInner>,
     message_tx: mpsc::Sender<Message>,
 ) {
-    while !inner.bootstrap_complete.load(Ordering::Acquire) {
-        let notified = inner.bootstrap_notify.notified();
+    if let Some(barrier) = &inner.datagram_reader_start_barrier {
+        barrier.notified().await;
+    }
+    if !inner.bootstrap_complete.load(Ordering::Acquire) {
+        let commit_notified = inner.bootstrap_commit_notify.notified();
+        tokio::pin!(commit_notified);
+        commit_notified.as_mut().enable();
+        if !inner.bootstrap_commit_requested.load(Ordering::Acquire) {
+            tokio::select! {
+                biased;
+                datagram = inner.connection.read_datagram() => {
+                    match datagram {
+                        Ok(_) => {
+                            tracing::warn!("Closing peer that prequeued a datagram before authentication");
+                            inner.connection.close(0u32.into(), b"datagram before peer authentication");
+                        }
+                        Err(error) => {
+                            tracing::debug!("QUIC datagram reader stopped during bootstrap: {}", error);
+                        }
+                    }
+                    return;
+                }
+                _ = commit_notified => {}
+            }
+        }
+
+        let authenticated = inner.bootstrap_notify.notified();
+        tokio::pin!(authenticated);
+        authenticated.as_mut().enable();
+        mark_bootstrap_reader_ack(&inner, BOOTSTRAP_DATAGRAM_READER_ACK);
         tokio::select! {
             biased;
             datagram = inner.connection.read_datagram() => {
-                match datagram {
-                    Ok(_) => {
-                        tracing::warn!("Closing peer that prequeued a datagram before authentication");
-                        inner.connection.close(0u32.into(), b"datagram before peer authentication");
-                    }
-                    Err(error) => {
-                        tracing::debug!("QUIC datagram reader stopped during bootstrap: {}", error);
-                    }
+                if datagram.is_ok() {
+                    tracing::warn!("Closing peer that queued a datagram during bootstrap commit");
+                    inner.connection.close(0u32.into(), b"datagram during bootstrap commit");
                 }
                 return;
             }
-            _ = notified => {}
+            _ = authenticated => {}
+            _ = inner.connection.closed() => return,
         }
     }
 
@@ -1116,6 +1248,53 @@ async fn read_realtime_datagrams(
             }
         }
     }
+}
+
+fn mark_bootstrap_reader_ack(inner: &QuicConnectionInner, ack: u8) {
+    inner.bootstrap_commit_acks.fetch_or(ack, Ordering::AcqRel);
+    inner.bootstrap_commit_ack_notify.notify_waiters();
+}
+
+async fn wait_for_bootstrap_stream_verification(inner: &Arc<QuicConnectionInner>) -> Result<()> {
+    tokio::time::timeout(super::handshake::BOOTSTRAP_TIMEOUT, async {
+        loop {
+            let verified = inner.bootstrap_stream_notify.notified();
+            tokio::pin!(verified);
+            verified.as_mut().enable();
+            if inner.bootstrap_stream_verified.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = verified => {}
+                reason = inner.connection.closed() => {
+                    anyhow::bail!("peer closed before bootstrap stream verification: {reason}");
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("bootstrap stream verification timed out"))?
+}
+
+async fn wait_for_bootstrap_reader_acks(inner: &Arc<QuicConnectionInner>) -> Result<()> {
+    tokio::time::timeout(super::handshake::BOOTSTRAP_TIMEOUT, async {
+        loop {
+            let acknowledged = inner.bootstrap_commit_ack_notify.notified();
+            tokio::pin!(acknowledged);
+            acknowledged.as_mut().enable();
+            if inner.bootstrap_commit_acks.load(Ordering::Acquire) == BOOTSTRAP_ALL_READERS_ACKED {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = acknowledged => {}
+                reason = inner.connection.closed() => {
+                    anyhow::bail!("peer closed during bootstrap reader commit: {reason}");
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("bootstrap reader commit timed out"))?
 }
 
 fn make_server_config(
@@ -1489,10 +1668,13 @@ mod tests {
             server_connection.receive_message().await.unwrap(),
             Message::Hello { .. }
         ));
-        server_connection
-            .complete_peer_protocol_handshake()
-            .await
-            .unwrap();
+        assert!(
+            server_connection
+                .complete_peer_protocol_handshake()
+                .await
+                .is_err(),
+            "bootstrap completion must fail when the bootstrap stream carries trailing input"
+        );
 
         timeout(
             Duration::from_secs(1),
@@ -1509,6 +1691,130 @@ mod tests {
             .is_ok_and(|message| message.is_err()),
             "prequeued input must never enter the decoded message channel"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_second_stream_prequeued_before_auth_never_reaches_manager() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut manager = crate::connection::ConnectionManager::new(server_id);
+        let mut events = manager.events().unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
+
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let hello = ControlMessageCodec::encode(&rshare_core::hello_message(
+            client_id,
+            "client".into(),
+            "host".into(),
+        ))
+        .unwrap();
+        let input = ControlMessageCodec::encode(&Message::MouseMove { x: 7, y: 9 }).unwrap();
+
+        write_raw_reliable_payloads(&client_connection, &[hello]).await;
+        write_raw_reliable_payloads(&client_connection, &[input]).await;
+
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("pre-authentication second stream must close the QUIC connection");
+        while let Ok(Some(event)) = timeout(Duration::from_millis(50), events.recv()).await {
+            assert!(
+                !matches!(
+                    event,
+                    crate::connection::ManagerEvent::Connected(id) if id == client_id
+                ),
+                "pre-authentication second stream must prevent registration"
+            );
+            assert!(
+                !matches!(
+                    event,
+                    crate::connection::ManagerEvent::MessageReceived {
+                        from,
+                        message: Message::MouseMove { .. }
+                    } if from == client_id
+                ),
+                "pre-authentication second stream leaked into ManagerEvent"
+            );
+        }
+        assert!(manager.connections().is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_datagram_prequeued_before_auth_never_reaches_manager() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let reader_barrier = Arc::new(Notify::new());
+        let server_transport =
+            QuicTransport::new(server_id).with_test_datagram_reader_barrier(reader_barrier.clone());
+        let mut manager =
+            crate::connection::ConnectionManager::with_transport(server_id, server_transport);
+        let mut events = manager.events().unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
+
+        let mut client = QuicTransport::new(client_id);
+        let mut client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let datagram = RealtimeInputCodec::encode_message(1, &Message::MouseMove { x: 13, y: 17 })
+            .unwrap()
+            .unwrap();
+        client_connection
+            .inner
+            .connection
+            .send_datagram(Bytes::from(datagram))
+            .unwrap();
+        let hello = ControlMessageCodec::encode(&rshare_core::hello_message(
+            client_id,
+            "client".into(),
+            "host".into(),
+        ))
+        .unwrap();
+        write_raw_reliable_payloads(&client_connection, &[hello]).await;
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), client_connection.receive_message())
+                .await
+                .unwrap()
+                .unwrap(),
+            Message::HelloBack { .. }
+        ));
+        reader_barrier.notify_one();
+
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("pre-authentication datagram must close the QUIC connection");
+        while let Ok(Some(event)) = timeout(Duration::from_millis(50), events.recv()).await {
+            assert!(
+                !matches!(
+                    event,
+                    crate::connection::ManagerEvent::Connected(id) if id == client_id
+                ),
+                "pre-authentication datagram must prevent registration"
+            );
+            assert!(
+                !matches!(
+                    event,
+                    crate::connection::ManagerEvent::MessageReceived {
+                        from,
+                        message: Message::MouseMove { .. }
+                    } if from == client_id
+                ),
+                "pre-authentication datagram leaked into ManagerEvent"
+            );
+        }
+        assert!(manager.connections().is_empty());
     }
 
     #[tokio::test]
