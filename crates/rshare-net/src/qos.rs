@@ -128,13 +128,27 @@ pub enum RealtimeSendOutcome {
     DroppedLatest,
 }
 
+/// A generation-scoped cumulative release high-water notification.
+///
+/// Consumers must first match `auth` to the current owner/generation, then
+/// release all held state through `epoch`; they must not wait for one exact
+/// notification per epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalReleaseEvent {
     pub auth: Arc<PeerAuthContext>,
+    /// Inclusive cumulative high-water for the authenticated generation.
     pub epoch: SessionEpoch,
     pub reason: ReleaseAllReason,
 }
 
+impl TerminalReleaseEvent {
+    /// Returns the inclusive cumulative epoch high-water.
+    pub fn retired_through(&self) -> SessionEpoch {
+        self.epoch
+    }
+}
+
+/// A bounded latest-wins publisher for cumulative terminal-release events.
 #[derive(Clone)]
 pub(crate) struct TerminalReleaseEmitter {
     target: mpsc::Sender<TerminalReleaseEvent>,
@@ -1813,8 +1827,9 @@ mod tests {
     use tokio::time::timeout;
 
     use rshare_core::{
-        ClockDomainId, ControlConnectionId, DeviceId, KeyState, MonotonicStamp, ReliableInputEvent,
-        ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
+        ButtonState, ClockDomainId, ControlConnectionId, DeviceId, KeyState, MonotonicStamp,
+        MouseButton, PressedStateLedger, ReliableInputEvent, ReliableInputFrame, SessionEpoch,
+        INPUT_PROTOCOL_VERSION,
     };
 
     use super::*;
@@ -2292,6 +2307,47 @@ mod tests {
         })
         .await
         .expect("dropping the emitter must stop its idle worker");
+    }
+
+    #[tokio::test]
+    async fn latest_terminal_release_is_a_generation_wide_cumulative_high_water() {
+        let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(TerminalReleaseEvent {
+            auth: auth.clone(),
+            epoch: SessionEpoch(0),
+            reason: ReleaseAllReason::SessionEnded,
+        })
+        .await
+        .unwrap();
+        let emitter = TerminalReleaseEmitter::new(tx);
+        for epoch in 1..=1_000 {
+            emitter.emit(TerminalReleaseEvent {
+                auth: auth.clone(),
+                epoch: SessionEpoch(epoch),
+                reason: ReleaseAllReason::BackendFailure,
+            });
+        }
+        assert_eq!(rx.recv().await.unwrap().epoch, SessionEpoch(0));
+        let mut latest = rx.recv().await.unwrap();
+        while latest.retired_through().0 < 1_000 {
+            latest = rx.recv().await.unwrap();
+        }
+        assert_eq!(
+            latest.auth.control_connection_id,
+            auth.control_connection_id
+        );
+        assert_eq!(latest.retired_through(), SessionEpoch(1_000));
+        let mut ledger = PressedStateLedger::new();
+        ledger.record_key(0x41, KeyState::Pressed).unwrap();
+        ledger
+            .record_mouse_button(MouseButton::Left, ButtonState::Pressed, 10, 20, 1)
+            .unwrap();
+
+        let release = ledger.release_all_events(latest.reason).unwrap();
+        assert_eq!(release.events().len(), 2);
+        assert_eq!(ledger.confirm_release_all(&release), 2);
+        assert!(ledger.is_empty());
     }
 
     #[tokio::test]
