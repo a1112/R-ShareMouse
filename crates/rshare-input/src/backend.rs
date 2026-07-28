@@ -53,6 +53,11 @@ pub trait InjectBackend: Debug + Send + Sync {
     /// Inject an input event.
     fn inject(&mut self, event: InputEvent) -> Result<()>;
 
+    /// Inject a relative pointer delta without querying the current cursor.
+    fn inject_relative_pointer(&mut self, _dx: i32, _dy: i32) -> Result<()> {
+        anyhow::bail!("relative pointer injection is not supported by this backend")
+    }
+
     /// Check if currently active.
     fn is_active(&self) -> bool;
 
@@ -306,6 +311,10 @@ impl InjectBackend for PortableInjectBackend {
         self.emulator.emulate(event)
     }
 
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.emulator.move_mouse_relative(dx, dy)
+    }
+
     fn is_active(&self) -> bool {
         self.emulator.is_active()
     }
@@ -370,6 +379,10 @@ impl InjectBackend for WindowsNativeInjectBackend {
         }
 
         InputEmulator::emulate(&mut self.emulator, event)
+    }
+
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
+        InputEmulator::move_mouse_relative(&mut self.emulator, dx, dy)
     }
 
     fn is_active(&self) -> bool {
@@ -636,6 +649,10 @@ impl InjectBackend for VirtualHidInjectBackend {
                 event.event_type()
             ),
         }
+    }
+
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.client.inject_mouse_move(dx, dy)
     }
 
     fn is_active(&self) -> bool {
@@ -1207,6 +1224,13 @@ impl InjectBackend for UInputInjectBackend {
             _ => anyhow::bail!("UInput injection does not support {}", event.event_type()),
         }
         Ok(())
+    }
+
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
+        if !self.injector.is_active() {
+            anyhow::bail!("UInput inject backend is not active");
+        }
+        self.injector.send_mouse_move(dx, dy)
     }
 
     fn is_active(&self) -> bool {

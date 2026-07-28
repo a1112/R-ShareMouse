@@ -71,17 +71,24 @@ pub struct EmulatorConfig {
     pub event_delay: Duration,
     /// Scale factor for mouse coordinates
     pub mouse_scale: f64,
-    /// Whether to emulate input immediately or queue
-    pub immediate: bool,
 }
 
 impl Default for EmulatorConfig {
     fn default() -> Self {
         Self {
-            event_delay: Duration::from_millis(1),
+            event_delay: Duration::ZERO,
             mouse_scale: 1.0,
-            immediate: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod realtime_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn emulator_config_defaults_to_zero_event_delay() {
+        assert_eq!(EmulatorConfig::default().event_delay, Duration::ZERO);
     }
 }
 
@@ -850,8 +857,8 @@ impl InputEmulator for WindowsNativeInputEmulator {
         self.inner.send_mouse_move(x, y)
     }
 
-    fn move_mouse_relative(&mut self, _dx: i32, _dy: i32) -> Result<()> {
-        anyhow::bail!("Relative mouse movement is not supported by the Windows native emulator")
+    fn move_mouse_relative(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.inner.send_mouse_move_relative(dx, dy)
     }
 
     fn press_button(&mut self, button: MouseButton) -> Result<()> {
@@ -1042,7 +1049,7 @@ mod tests {
     fn test_emulator_config_default() {
         let config = EmulatorConfig::default();
         assert_eq!(config.mouse_scale, 1.0);
-        assert!(config.immediate);
+        assert_eq!(config.event_delay, Duration::ZERO);
     }
 
     #[test]
@@ -1062,7 +1069,6 @@ mod tests {
         let config = EmulatorConfig {
             event_delay: Duration::from_millis(10),
             mouse_scale: 1.5,
-            immediate: false,
         };
 
         let emulator = match EnigoInputEmulator::new() {
@@ -1071,7 +1077,7 @@ mod tests {
         };
 
         assert_eq!(emulator.config.mouse_scale, 1.5);
-        assert!(!emulator.config.immediate);
+        assert_eq!(emulator.config.event_delay, Duration::from_millis(10));
     }
 
     #[test]

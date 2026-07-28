@@ -10,6 +10,7 @@ pub mod emulator;
 pub mod events;
 pub mod gamepad;
 pub mod ingress;
+pub mod injection_actor;
 pub mod listener;
 pub mod privilege;
 pub mod selection;
@@ -20,6 +21,7 @@ pub use emulator::*;
 pub use events::*;
 pub use gamepad::*;
 pub use ingress::*;
+pub use injection_actor::*;
 pub use listener::*;
 
 // Backend re-exports

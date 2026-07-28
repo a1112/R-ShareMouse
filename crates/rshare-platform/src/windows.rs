@@ -1472,6 +1472,19 @@ mod windows_impl {
             Ok(())
         }
 
+        /// Send a relative mouse delta without reading the current cursor.
+        pub fn send_mouse_move_relative(&mut self, dx: i32, dy: i32) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+
+            tracing::trace!("Windows: relative mouse move by ({}, {})", dx, dy);
+            unsafe {
+                send_mouse_move_relative_input(dx, dy)?;
+            }
+            Ok(())
+        }
+
         /// Send mouse button event
         pub fn send_button(&mut self, button: u8, down: bool) -> Result<()> {
             if !self.active {
@@ -2687,6 +2700,28 @@ mod windows_impl {
         };
 
         send_input(&input, "mouse move")
+    }
+
+    unsafe fn send_mouse_move_relative_input(dx: i32, dy: i32) -> Result<()> {
+        let input = Input {
+            kind: INPUT_MOUSE,
+            payload: InputPayload {
+                mouse: mouse_input_for_relative_move(dx, dy),
+            },
+        };
+
+        send_input(&input, "relative mouse move")
+    }
+
+    fn mouse_input_for_relative_move(dx: i32, dy: i32) -> MouseInput {
+        MouseInput {
+            dx,
+            dy,
+            mouse_data: 0,
+            flags: MOUSEEVENTF_MOVE,
+            time: 0,
+            extra_info: 0,
+        }
     }
 
     fn mouse_input_for_absolute_move(dx: i32, dy: i32) -> MouseInput {
@@ -4711,6 +4746,15 @@ mod windows_impl {
                 input.flags,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
             );
+        }
+
+        #[test]
+        fn windows_relative_mouse_uses_move_only_without_absolute_coordinates() {
+            let input = mouse_input_for_relative_move(-17, 23);
+
+            assert_eq!(input.dx, -17);
+            assert_eq!(input.dy, 23);
+            assert_eq!(input.flags, MOUSEEVENTF_MOVE);
         }
 
         #[test]
