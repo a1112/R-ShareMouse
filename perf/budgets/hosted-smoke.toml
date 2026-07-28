@@ -1,0 +1,9 @@
+runs = 5
+median_regression_percent = 10.0
+p95_p99_regression_percent = 15.0
+coefficient_of_variation_percent = 10.0
+require_reviewed_baseline = true
+unstable_complete_batch_retries = 1
+preserve_all_batches = true
+runner_class = "hosted-smoke"
+enforced = false

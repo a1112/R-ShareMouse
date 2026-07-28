@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rsharemouse.dev/schemas/perf-report-v1.json",
+  "title": "R-ShareMouse reproducible performance report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario",
+    "scenario_parameters",
+    "scenario_config_sha256",
+    "random_seed",
+    "commit",
+    "dirty",
+    "binary_sha256",
+    "cargo_lock_sha256",
+    "build_profile",
+    "cargo_features",
+    "rustflags",
+    "runner_id",
+    "runner_fingerprint",
+    "availability",
+    "toolchain",
+    "hardware",
+    "warmup",
+    "runs",
+    "metrics",
+    "queues",
+    "errors",
+    "rss",
+    "measurement_provenance",
+    "verdict"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "scenario": { "type": "string", "minLength": 1 },
+    "scenario_parameters": { "type": "object" },
+    "scenario_config_sha256": { "$ref": "#/$defs/sha256" },
+    "random_seed": { "type": "integer", "minimum": 0 },
+    "commit": { "type": "string", "minLength": 1 },
+    "dirty": { "type": "boolean" },
+    "binary_sha256": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/sha256" }
+    },
+    "cargo_lock_sha256": { "$ref": "#/$defs/sha256" },
+    "build_profile": { "type": "string", "minLength": 1 },
+    "cargo_features": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string" }
+    },
+    "rustflags": { "type": "string" },
+    "runner_id": { "type": "string", "minLength": 1 },
+    "runner_fingerprint": { "$ref": "#/$defs/sha256" },
+    "availability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "available" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": { "enum": ["unsupported", "not_run"] },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustc", "cargo", "target"],
+      "properties": {
+        "rustc": { "type": "string" },
+        "cargo": { "type": "string" },
+        "target": { "type": "string" }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "cpu", "logical_cores", "memory_bytes"],
+      "properties": {
+        "os": { "type": "string" },
+        "cpu": { "type": "string" },
+        "logical_cores": { "type": "integer", "minimum": 0 },
+        "memory_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "warmup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["millis"],
+      "properties": { "millis": { "type": "integer", "minimum": 0 } }
+    },
+    "runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    },
+    "queues": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/queue" }
+    },
+    "errors": { "type": "array", "items": { "type": "string" } },
+    "rss": {
+      "oneOf": [{ "$ref": "#/$defs/rss" }, { "type": "null" }]
+    },
+    "measurement_provenance": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/provenance" }
+    },
+    "verdict": {
+      "enum": ["pass", "fail", "unstable", "unsupported", "not_run"]
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "batch_id",
+        "process_exit_success",
+        "schema_valid",
+        "scenario_config_sha256",
+        "metrics",
+        "counters",
+        "errors"
+      ],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "batch_id": { "type": "string", "minLength": 1 },
+        "process_exit_success": { "const": true },
+        "schema_valid": { "const": true },
+        "scenario_config_sha256": { "$ref": "#/$defs/sha256" },
+        "metrics": { "type": "object", "minProperties": 1 },
+        "counters": {
+          "type": "object",
+          "required": [
+            "overwrite",
+            "gap",
+            "duplicate",
+            "out_of_order",
+            "reliable_overflow"
+          ],
+          "properties": {
+            "overwrite": { "type": "integer", "minimum": 0 },
+            "gap": { "type": "integer", "minimum": 0 },
+            "duplicate": { "type": "integer", "minimum": 0 },
+            "out_of_order": { "type": "integer", "minimum": 0 },
+            "reliable_overflow": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "uncertainty_us",
+        "evidence_path",
+        "evidence_sha256",
+        "estimate_only"
+      ],
+      "properties": {
+        "method": { "type": "string", "minLength": 1 },
+        "uncertainty_us": { "type": ["integer", "null"], "minimum": 0 },
+        "evidence_path": { "type": ["string", "null"] },
+        "evidence_sha256": {
+          "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        },
+        "estimate_only": { "type": "boolean" }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "samples",
+        "median",
+        "p95",
+        "p99",
+        "max",
+        "coefficient_of_variation"
+      ],
+      "properties": {
+        "unit": { "type": "string", "minLength": 1 },
+        "samples": { "type": "integer", "minimum": 0 },
+        "median": { "type": "number", "minimum": 0 },
+        "p95": { "type": "number", "minimum": 0 },
+        "p99": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 },
+        "coefficient_of_variation": { "type": "number", "minimum": 0 }
+      }
+    },
+    "queue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capacity", "high_watermark", "overwrites", "overflows"],
+      "properties": {
+        "capacity": { "type": "integer", "minimum": 0 },
+        "high_watermark": { "type": "integer", "minimum": 0 },
+        "overwrites": { "type": "integer", "minimum": 0 },
+        "overflows": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "rss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peak_bytes", "method"],
+      "properties": {
+        "peak_bytes": { "type": "integer", "minimum": 0 },
+        "method": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

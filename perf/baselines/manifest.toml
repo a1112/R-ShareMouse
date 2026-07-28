@@ -1,0 +1,4 @@
+# This file is authority only when read from the protected default branch.
+# No baseline is approved during Task 2. A real entry is added by the reviewed
+# bootstrap procedure in README.md; placeholders are intentionally not entries.
+baseline = []

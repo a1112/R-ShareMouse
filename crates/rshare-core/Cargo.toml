@@ -35,7 +35,12 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 dhat = "0.3.3"
+criterion = { workspace = true }
 
 [[bench]]
 name = "perf_record_alloc"
+harness = false
+
+[[bench]]
+name = "control_hot_path"
 harness = false
