@@ -91,7 +91,6 @@ pub struct NetworkManager {
 
     event_tx: mpsc::Sender<NetworkEvent>,
     event_rx: Option<mpsc::Receiver<NetworkEvent>>,
-    authenticated_peer_tx: mpsc::Sender<PeerInbound>,
     authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
 
     discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
@@ -139,19 +138,6 @@ fn spawn_connection_event_forwarder(
 
             if network_tx.send(network_event).await.is_err() {
                 break;
-            }
-        }
-    });
-}
-
-fn spawn_authenticated_peer_forwarder(
-    mut peers: mpsc::Receiver<PeerInbound>,
-    target: mpsc::Sender<PeerInbound>,
-) {
-    tokio::spawn(async move {
-        while let Some(peer) = peers.recv().await {
-            if target.send(peer).await.is_err() {
-                return;
             }
         }
     });
@@ -249,11 +235,13 @@ impl NetworkManager {
         local_device_id: DeviceId,
         local_device_name: String,
         local_hostname: String,
-        connection_manager: ConnectionManager,
+        mut connection_manager: ConnectionManager,
     ) -> Self {
         let config = NetworkManagerConfig::default();
         let (event_tx, event_rx) = mpsc::channel(100);
-        let (authenticated_peer_tx, authenticated_peer_rx) = mpsc::channel(32);
+        let authenticated_peer_rx = connection_manager
+            .authenticated_peers()
+            .expect("new connection manager must expose its authenticated peer receiver");
 
         let discovery = ServiceDiscovery::new(
             local_device_id,
@@ -276,7 +264,6 @@ impl NetworkManager {
             qos_registry,
             event_tx,
             event_rx: Some(event_rx),
-            authenticated_peer_tx,
             authenticated_peer_rx: Some(authenticated_peer_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             running: false,
@@ -450,20 +437,14 @@ impl NetworkManager {
         self.running = true;
 
         // Start connection manager (server)
-        let (connection_events, authenticated_peers) = {
+        let connection_events = {
             let mut conn = self.connection.lock().await;
             conn.start_server(&self.config.bind_address).await?;
-            (conn.events(), conn.authenticated_peers())
+            conn.events()
         };
 
         if let Some(connection_events) = connection_events {
             spawn_connection_event_forwarder(connection_events, self.event_tx.clone());
-        }
-        if let Some(authenticated_peers) = authenticated_peers {
-            spawn_authenticated_peer_forwarder(
-                authenticated_peers,
-                self.authenticated_peer_tx.clone(),
-            );
         }
 
         // Start discovery with event channel
@@ -1051,5 +1032,151 @@ mod tests {
         } = manager.receivers();
         assert!(!authenticated_peers.is_closed());
         assert!(!events.is_closed());
+    }
+
+    #[tokio::test]
+    async fn public_authenticated_peer_capacity_fails_closed_without_hidden_backlog() {
+        let server_id = DeviceId::new_v4();
+        let overflow_barrier = Arc::new(tokio::sync::Notify::new());
+        let mut manager =
+            NetworkManager::isolated_for_test(server_id, "server".into(), "server-host".into());
+        manager.config.bind_address = "127.0.0.1:0".into();
+        manager.config.discovery_port = 0;
+        {
+            manager
+                .connection
+                .lock()
+                .await
+                .set_authenticated_peer_overflow_barrier(overflow_barrier.clone());
+        }
+        let mut terminal_releases = manager
+            .terminal_release_events()
+            .await
+            .expect("terminal release receiver must be available");
+        let NetworkReceivers {
+            mut authenticated_peers,
+            mut events,
+        } = manager.receivers();
+        manager.start().await.unwrap();
+        let address = manager
+            .connection
+            .lock()
+            .await
+            .transport_local_addr()
+            .unwrap()
+            .to_string();
+
+        let mut retained_clients = Vec::new();
+        let mut retained_ids = Vec::new();
+        for _ in 0..32 {
+            let client_id = DeviceId::new_v4();
+            let mut client = ConnectionManager::isolated_for_test(client_id);
+            client.connect(server_id, &address).await.unwrap();
+            retained_ids.push(client_id);
+            retained_clients.push(client);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while authenticated_peers.len() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the public authenticated peer queue must contain exactly its 32 entries");
+
+        let overflow_id = DeviceId::new_v4();
+        let mut overflow_client = ConnectionManager::isolated_for_test(overflow_id);
+        overflow_client.connect(server_id, &address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .connection
+                    .lock()
+                    .await
+                    .authenticated_peer_overflow_waiting()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the 33rd public publication must hit the bounded queue immediately");
+
+        let overflow_auth = overflow_client
+            .qos_registry()
+            .peer(&server_id)
+            .expect("overflow connection completed authenticated QoS");
+        overflow_auth
+            .transport
+            .try_send_reliable_input(rshare_core::ReliableInputFrame {
+                protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+                session_epoch: rshare_core::SessionEpoch(1),
+                sequence: 1,
+                captured_at: rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(1), 1),
+                event: rshare_core::ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = manager
+                    .connection
+                    .lock()
+                    .await
+                    .pool()
+                    .inbound_active_epoch_for_test(&overflow_id);
+                if active == Some(rshare_core::SessionEpoch(1)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("overflow generation must become active before fail-safe close");
+        overflow_barrier.notify_one();
+
+        let release = tokio::time::timeout(Duration::from_secs(1), terminal_releases.recv())
+            .await
+            .expect("fail-safe close must emit a terminal local release")
+            .unwrap();
+        assert_eq!(release.auth.peer_id, overflow_id);
+        assert_eq!(release.epoch, rshare_core::SessionEpoch(1));
+        let overflow_control_id = release.auth.control_connection_id;
+
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(NetworkEvent::ConnectionError {
+                    peer_id: Some(peer_id),
+                    control_connection_id: Some(control_connection_id),
+                    error,
+                }) = events.recv().await
+                {
+                    if peer_id == overflow_id {
+                        break (control_connection_id, error);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("overflow rejection must publish a generation-aware error");
+        assert_eq!(error.0, overflow_control_id);
+        assert!(error.1.contains("queue is full"));
+
+        assert!(!manager.is_connected(&overflow_id).await);
+        assert_eq!(authenticated_peers.len(), 32);
+        let mut published_ids = Vec::new();
+        while let Ok(peer) = authenticated_peers.try_recv() {
+            published_ids.push(peer.auth.peer_id);
+        }
+        assert_eq!(published_ids.len(), 32);
+        assert!(!published_ids.contains(&overflow_id));
+        for retained_id in retained_ids {
+            assert!(published_ids.contains(&retained_id));
+            assert!(manager.is_connected(&retained_id).await);
+        }
+        drop(retained_clients);
     }
 }

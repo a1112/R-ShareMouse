@@ -778,7 +778,7 @@ impl QuicConnection {
         {
             let inner = inner.clone();
             tokio::spawn(async move {
-                read_realtime_datagrams(inner, message_tx).await;
+                read_realtime_datagrams(inner).await;
             });
         }
 
@@ -1363,6 +1363,27 @@ impl ConnectionPool {
             .map(|entry| entry.generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn inbound_active_epoch_for_test(
+        &self,
+        device_id: &DeviceId,
+    ) -> Option<SessionEpoch> {
+        self.connections
+            .lock()
+            .expect("connection pool poisoned")
+            .get(device_id)
+            .and_then(|entry| {
+                entry
+                    .connection
+                    .inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned")
+                    .active
+                    .map(|(_, epoch, _)| epoch)
+            })
+    }
+
     pub fn count(&self) -> usize {
         let conns = self.connections.lock().expect("connection pool poisoned");
         conns.len()
@@ -1525,14 +1546,6 @@ pub(crate) fn encode_legacy_realtime_message(message: &Message) -> Result<Option
             Ok(Some(Bytes::from(ControlMessageCodec::encode(message)?)))
         }
         _ => Ok(None),
-    }
-}
-
-pub(crate) fn decode_legacy_realtime_message(data: &[u8]) -> Result<Message> {
-    let message = ControlMessageCodec::decode(data)?;
-    match message {
-        Message::MouseMove { .. } | Message::GamepadState { .. } => Ok(message),
-        _ => anyhow::bail!("reliable message received on legacy realtime datagram adapter"),
     }
 }
 
@@ -2619,10 +2632,7 @@ async fn guard_reliable_until_authenticated(inner: &Arc<QuicConnectionInner>) ->
     }
 }
 
-async fn read_realtime_datagrams(
-    inner: Arc<QuicConnectionInner>,
-    message_tx: mpsc::Sender<Message>,
-) {
+async fn read_realtime_datagrams(inner: Arc<QuicConnectionInner>) {
     if let Some(barrier) = &inner.datagram_reader_start_barrier {
         barrier.notified().await;
     }
@@ -2682,28 +2692,7 @@ async fn read_realtime_datagrams(
                     }
                     continue;
                 }
-                if inner
-                    .qos_receive
-                    .lock()
-                    .expect("qos receive context poisoned")
-                    .is_some()
-                {
-                    tracing::debug!(
-                        "Rejected legacy realtime datagram on authenticated QoS connection"
-                    );
-                    continue;
-                }
-                match decode_legacy_realtime_message(&datagram) {
-                    Ok(message) => {
-                        inner
-                            .last_datagram_rx_us
-                            .store(current_timestamp_us(), Ordering::Relaxed);
-                        if message_tx.send(message).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => tracing::debug!("Failed to decode realtime datagram: {}", error),
-                }
+                tracing::debug!("Rejected non-v3 realtime datagram");
             }
             Err(error) => {
                 tracing::debug!("QUIC datagram reader stopped: {}", error);
@@ -3200,24 +3189,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_realtime_adapter_is_private_and_rejects_reliable_messages() {
+    fn legacy_realtime_encoder_is_private_and_rejects_reliable_messages() {
         let realtime = Message::MouseMove { x: 7, y: -4 };
-        let encoded = encode_legacy_realtime_message(&realtime)
-            .unwrap()
-            .expect("mouse motion remains on the temporary datagram adapter");
-        assert!(matches!(
-            decode_legacy_realtime_message(&encoded).unwrap(),
-            Message::MouseMove { x: 7, y: -4 }
-        ));
+        assert!(encode_legacy_realtime_message(&realtime).unwrap().is_some());
 
         let reliable = Message::Key {
             keycode: 0x41,
             state: rshare_core::KeyState::Pressed,
         };
         assert!(encode_legacy_realtime_message(&reliable).unwrap().is_none());
-
-        let reliable_bytes = ControlMessageCodec::encode(&reliable).unwrap();
-        assert!(decode_legacy_realtime_message(&reliable_bytes).is_err());
     }
 
     #[tokio::test]
@@ -6636,7 +6616,10 @@ mod tests {
         let broadcast_pool = pool.clone();
         let broadcast_task = tokio::spawn(async move {
             broadcast_pool
-                .broadcast(&Message::MouseMove { x: 7, y: 11 })
+                .broadcast(&Message::Heartbeat {
+                    sequence: 7,
+                    timestamp: 11,
+                })
                 .await
         });
         let blocked_frame = timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -6649,7 +6632,10 @@ mod tests {
                 timeout(Duration::from_millis(100), fast_messages.recv())
                     .await
                     .expect("fast peer must receive while the slow peer is blocked"),
-                Some(Message::MouseMove { x: 7, y: 11 })
+                Some(Message::Heartbeat {
+                    sequence: 7,
+                    timestamp: 11
+                })
             ),
             "fast peer must receive the broadcast payload"
         );
@@ -6712,7 +6698,12 @@ mod tests {
             };
         }
 
-        let first = pool.try_fanout(&Message::MouseMove { x: 1, y: 0 }).await;
+        let first = pool
+            .try_fanout(&Message::Heartbeat {
+                sequence: 1,
+                timestamp: 0,
+            })
+            .await;
         assert!(first.failures.is_empty());
         let mut expected_order = vec![fast_id, slow_id];
         expected_order.sort_by_key(DeviceId::to_string);
@@ -6722,15 +6713,23 @@ mod tests {
             .await
             .expect("slow peer must retain the first frame without acknowledging it");
 
-        let second = pool.try_fanout(&Message::MouseMove { x: 2, y: 0 }).await;
+        let second = pool
+            .try_fanout(&Message::Heartbeat {
+                sequence: 2,
+                timestamp: 0,
+            })
+            .await;
         assert!(second.failures.is_empty());
         assert_eq!(second.enqueued, expected_order);
-        for expected_x in [1, 2] {
+        for expected_sequence in [1, 2] {
             assert!(matches!(
                 timeout(Duration::from_millis(100), fast_messages.recv())
                     .await
                     .expect("fast peer must receive consecutive fanout frames"),
-                Some(Message::MouseMove { x, y: 0 }) if x == expected_x
+                Some(Message::Heartbeat {
+                    sequence,
+                    timestamp: 0
+                }) if sequence == expected_sequence
             ));
         }
         assert!(
@@ -6738,7 +6737,12 @@ mod tests {
             "nonblocking fanout must release the pool lock before peer queue work"
         );
 
-        let third = pool.try_fanout(&Message::MouseMove { x: 3, y: 0 }).await;
+        let third = pool
+            .try_fanout(&Message::Heartbeat {
+                sequence: 3,
+                timestamp: 0,
+            })
+            .await;
         assert_eq!(third.enqueued, vec![fast_id]);
         assert_eq!(third.failures.len(), 1);
         assert_eq!(third.failures[0].device_id, slow_id);
@@ -6747,7 +6751,10 @@ mod tests {
             timeout(Duration::from_millis(100), fast_messages.recv())
                 .await
                 .expect("fast peer must continue after only the slow queue overflows"),
-            Some(Message::MouseMove { x: 3, y: 0 })
+            Some(Message::Heartbeat {
+                sequence: 3,
+                timestamp: 0
+            })
         ));
 
         drop(blocked_first);
@@ -6757,7 +6764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quinn_loopback_sends_mouse_move_datagram() {
+    async fn legacy_realtime_datagram_never_enters_message_fifo_without_qos_context() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut server = QuicTransport::isolated_for_test(local_id);
@@ -6783,12 +6790,12 @@ mod tests {
             .await
             .unwrap();
 
-        let received = tokio::time::timeout(Duration::from_secs(1), messages.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(received, Message::MouseMove { x: 42, y: 24 }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), messages.recv())
+                .await
+                .is_err(),
+            "legacy realtime input must never enter the general Message FIFO"
+        );
     }
 
     #[tokio::test]

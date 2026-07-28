@@ -395,10 +395,16 @@ async fn run_loopback_once_started(
     let stall_trigger_sequence = (expected_sent / 2).max(1);
     tasks.spawn(async move {
         while let Some(message) = fast_messages.recv().await {
-            let Message::MouseMove { x, .. } = message else {
+            let Message::Heartbeat {
+                sequence,
+                timestamp,
+            } = message
+            else {
                 continue;
             };
-            let sequence = x as u64;
+            if timestamp != sequence {
+                continue;
+            }
             let should_stall = {
                 let mut state = receiver_state
                     .lock()
@@ -483,9 +489,9 @@ async fn run_loopback_once_started(
             if let Some(delay) = sender_delay {
                 tokio::time::sleep(delay).await;
             }
-            let message = Message::MouseMove {
-                x: sequence as i32,
-                y: sequence.wrapping_neg() as i32,
+            let message = Message::Heartbeat {
+                sequence,
+                timestamp: sequence,
             };
             let send_started = Instant::now();
             if slow_fast {
@@ -885,6 +891,31 @@ mod tests {
         );
         assert!(measured.run.metrics["achieved_hz"] >= 900.0);
         assert_eq!(measured.run.counters["independent_producer"], 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_status_load_does_not_count_background_heartbeat_as_sample() {
+        let measured = run_loopback_once(
+            &QuicScenario::Rate {
+                rate_hz: 1_000,
+                duration_secs: 60,
+                load: vec![
+                    LoadKind::Diagnostics,
+                    LoadKind::Status,
+                    LoadKind::Audio,
+                    LoadKind::Bulk,
+                ],
+            },
+            LoopbackRunOptions::test(Duration::from_millis(120)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(measured.run.counters["duplicate"], 0);
+        assert!(
+            measured.run.counters["actual_sent"] <= measured.run.counters["expected_sent"],
+            "background load must not inflate primary sample delivery"
+        );
     }
 
     #[tokio::test]
