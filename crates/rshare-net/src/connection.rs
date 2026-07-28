@@ -102,12 +102,17 @@ impl ConnectionView {
     }
 
     pub(crate) async fn send_legacy(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
-        self.pool.send_to(device_id, message).await?;
+        let selected_identity = self.pool.send_to_with_identity(device_id, message).await?;
         if let Some(connection) = self
             .connections
             .write()
             .expect("canonical connection registry poisoned")
             .get_mut(device_id)
+            .filter(|connection| {
+                connection.generation == selected_identity.lifecycle_generation
+                    && connection.info.control_connection_id
+                        == selected_identity.control_connection_id
+            })
         {
             connection.info.messages_sent += 1;
             connection.info.last_activity = Instant::now();
@@ -134,6 +139,51 @@ impl ConnectionView {
             connection.info.messages_sent += 1;
             connection.info.last_activity = Instant::now();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pool_generation_for_test(&self, device_id: &DeviceId) -> u64 {
+        self.pool
+            .generation_for(device_id)
+            .await
+            .expect("test peer must have a pooled lifecycle generation")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_pool_generation_and_outbound_for_test(
+        &self,
+        device_id: DeviceId,
+        lifecycle_generation: u64,
+        control_connection_id: Option<ControlConnectionId>,
+        send_channel: mpsc::Sender<crate::transport::OutboundFrame>,
+    ) {
+        self.pool
+            .replace_generation_and_outbound_for_test(
+                device_id,
+                lifecycle_generation,
+                control_connection_id,
+                send_channel,
+            )
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_canonical_identity_for_test(
+        &self,
+        device_id: DeviceId,
+        lifecycle_generation: u64,
+        control_connection_id: Option<ControlConnectionId>,
+    ) {
+        let mut connections = self
+            .connections
+            .write()
+            .expect("canonical connection registry poisoned");
+        let connection = connections
+            .get_mut(&device_id)
+            .expect("test peer must have canonical connection state");
+        connection.generation = lifecycle_generation;
+        connection.info.control_connection_id = control_connection_id;
+        connection.info.messages_sent = 0;
     }
 }
 

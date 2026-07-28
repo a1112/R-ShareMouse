@@ -303,6 +303,8 @@ struct PeerTransportInner {
     #[cfg(test)]
     reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    reliable_payload_poll_paused: AtomicBool,
+    #[cfg(test)]
     awaited_write_probes: Arc<AwaitedWriteProbes>,
     #[cfg_attr(not(test), allow(dead_code))]
     worker_count: Arc<AtomicUsize>,
@@ -378,6 +380,8 @@ impl PeerTransportHandle {
             reliable_preface_barrier_waiting: AtomicBool::new(false),
             #[cfg(test)]
             reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            reliable_payload_poll_paused: AtomicBool::new(false),
             #[cfg(test)]
             awaited_write_probes: awaited_write_probes.clone(),
             worker_count: worker_count.clone(),
@@ -631,6 +635,13 @@ impl PeerTransportHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_reliable_payload_poll_for_test(&self) {
+        self.inner
+            .reliable_payload_poll_paused
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(crate) fn awaited_write_counts_for_test(&self) -> (u64, u64, u64, u64) {
         (
             self.inner
@@ -848,6 +859,20 @@ fn reset_cancelled_reliable_stream(
     *stream = None;
 }
 
+fn fail_reliable_writer_frame(
+    inner_weak: &std::sync::Weak<PeerTransportInner>,
+    frame: ReliableInputFrame,
+) {
+    let Some(inner) = inner_weak.upgrade() else {
+        return;
+    };
+    let handle = PeerTransportHandle {
+        inner: inner.clone(),
+    };
+    let _admission = inner.admission.lock().expect("qos admission poisoned");
+    let _ = handle.fail_reliable_frame(frame);
+}
+
 fn spawn_reliable_writer(
     inner_weak: std::sync::Weak<PeerTransportInner>,
     connection: quinn::Connection,
@@ -906,14 +931,7 @@ fn spawn_reliable_writer(
                         continue;
                     }
                     Err(_) => {
-                        let Some(inner) = inner_weak.upgrade() else {
-                            return;
-                        };
-                        let handle = PeerTransportHandle {
-                            inner: inner.clone(),
-                        };
-                        let _admission = inner.admission.lock().expect("qos admission poisoned");
-                        let _ = handle.fail_reliable_frame(frame);
+                        fail_reliable_writer_frame(&inner_weak, frame);
                         return;
                     }
                 };
@@ -991,26 +1009,12 @@ fn spawn_reliable_writer(
                         .as_mut()
                         .expect("failed reliable stream remains initialized")
                         .reset(0u32.into());
-                    let Some(inner) = inner_weak.upgrade() else {
-                        return;
-                    };
-                    let handle = PeerTransportHandle {
-                        inner: inner.clone(),
-                    };
-                    let _admission = inner.admission.lock().expect("qos admission poisoned");
-                    let _ = handle.fail_reliable_frame(frame);
+                    fail_reliable_writer_frame(&inner_weak, frame);
                     return;
                 }
             }
             let Ok(encoded) = crate::codec::ReliableInputCodec::encode(&frame) else {
-                let Some(inner) = inner_weak.upgrade() else {
-                    return;
-                };
-                let handle = PeerTransportHandle {
-                    inner: inner.clone(),
-                };
-                let _admission = inner.admission.lock().expect("qos admission poisoned");
-                let _ = handle.fail_reliable_frame(frame);
+                fail_reliable_writer_frame(&inner_weak, frame);
                 return;
             };
             let mut wire = Vec::with_capacity(4 + encoded.len());
@@ -1023,7 +1027,17 @@ fn spawn_reliable_writer(
             drop(inner);
             let result = {
                 let active = stream.as_mut().expect("reliable stream initialized");
-                let write = active.write_all(&wire);
+                let write_all = active.write_all(&wire);
+                tokio::pin!(write_all);
+                let write = std::future::poll_fn(|cx| {
+                    #[cfg(test)]
+                    if inner_weak.upgrade().is_some_and(|inner| {
+                        inner.reliable_payload_poll_paused.load(Ordering::Acquire)
+                    }) {
+                        return std::task::Poll::Pending;
+                    }
+                    std::future::Future::poll(write_all.as_mut(), cx)
+                });
                 tokio::pin!(write);
                 loop {
                     tokio::select! {
@@ -1040,7 +1054,10 @@ fn spawn_reliable_writer(
                             }
                         }
                         result = &mut write => break Some(result),
-                        _ = connection.closed() => return,
+                        _ = connection.closed() => {
+                            fail_reliable_writer_frame(&inner_weak, frame);
+                            return;
+                        },
                     }
                 }
             };
@@ -1062,11 +1079,8 @@ fn spawn_reliable_writer(
                     .as_mut()
                     .expect("failed reliable stream remains initialized")
                     .reset(0u32.into());
-                let handle = PeerTransportHandle {
-                    inner: inner.clone(),
-                };
-                let _admission = inner.admission.lock().expect("qos admission poisoned");
-                let _ = handle.fail_reliable_frame(frame);
+                drop(inner);
+                fail_reliable_writer_frame(&inner_weak, frame);
                 return;
             }
         }
@@ -1603,6 +1617,8 @@ fn fixture_handle(
                 #[cfg(test)]
                 reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
+                reliable_payload_poll_paused: AtomicBool::new(false),
+                #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1681,6 +1697,8 @@ fn fixture_handle_with_stalled_emergency() -> (
                 reliable_preface_barrier_waiting: AtomicBool::new(false),
                 #[cfg(test)]
                 reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                reliable_payload_poll_paused: AtomicBool::new(false),
                 #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),

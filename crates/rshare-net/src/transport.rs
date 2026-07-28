@@ -970,6 +970,26 @@ impl ConnectionPool {
             .expect("test peer must be present");
     }
 
+    #[cfg(test)]
+    pub(crate) async fn replace_generation_and_outbound_for_test(
+        &self,
+        device_id: DeviceId,
+        lifecycle_generation: u64,
+        control_connection_id: Option<ControlConnectionId>,
+        send_channel: mpsc::Sender<OutboundFrame>,
+    ) {
+        self.connections
+            .lock()
+            .await
+            .get_mut(&device_id)
+            .map(|entry| {
+                entry.generation = lifecycle_generation;
+                entry.control_connection_id = control_connection_id;
+                entry.outbound = OutboundSender { send_channel };
+            })
+            .expect("test peer must be present");
+    }
+
     pub async fn diagnostics_for(
         &self,
         device_id: &DeviceId,
@@ -2888,6 +2908,137 @@ mod tests {
         .await
         .expect("stale cancellation must not consume the next epoch Enter");
         reliable_reader.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn connection_close_while_reliable_payload_is_flow_control_blocked_fails_frame() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let reliable_reader = Arc::new(Notify::new());
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let (client_qos, mut client_releases) = client_connection.install_qos(client_auth);
+        let worker_probe = client_qos.worker_probe_for_test();
+        let epoch = SessionEpoch(42);
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                epoch.0,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server_connection
+                    .inner
+                    .qos_inbound
+                    .lock()
+                    .expect("qos inbound state poisoned")
+                    .active
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Enter must activate before blocking the payload reader");
+        server_connection.set_qos_reliable_reader_barrier(reliable_reader);
+
+        let mut sequence = 2_u64;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let (started_before, _) = client_qos.reliable_write_counts_for_test();
+                client_qos
+                    .try_send_reliable_input(reliable_frame(
+                        epoch.0,
+                        sequence,
+                        ReliableInputEvent::TextCommit {
+                            text: "x".repeat(3_072),
+                        },
+                    ))
+                    .unwrap();
+                sequence += 1;
+                while client_qos.reliable_write_counts_for_test().0 == started_before {
+                    tokio::task::yield_now().await;
+                }
+                let started = client_qos.reliable_write_counts_for_test().0;
+                if timeout(Duration::from_millis(10), async {
+                    while client_qos.reliable_write_counts_for_test().1 < started {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a real QUIC payload write must become flow-control blocked");
+        let (started, completed) = client_qos.reliable_write_counts_for_test();
+        assert!(
+            started > completed,
+            "the payload write must still be pending"
+        );
+
+        client_qos.pause_reliable_payload_poll_for_test();
+        client_connection
+            .inner
+            .connection
+            .close(0u32.into(), b"close blocked reliable payload");
+        let release = timeout(Duration::from_secs(1), client_releases.recv())
+            .await
+            .expect("connection close must fail the blocked payload frame")
+            .expect("typed terminal release stream must remain connected");
+        assert_eq!(release.epoch, epoch);
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert!(client_qos.is_tombstoned(epoch));
+        assert_eq!(
+            client_qos.try_send_reliable_input(reliable_frame(
+                epoch.0,
+                sequence,
+                ReliableInputEvent::Key {
+                    keycode: 0x41,
+                    state: rshare_core::KeyState::Pressed,
+                },
+            )),
+            Err(super::super::qos::TransportSendError::UnsupportedMessage)
+        );
+
+        drop(client_qos);
+        timeout(Duration::from_secs(1), async {
+            while worker_probe.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all QoS workers must exit after the closed transport is dropped");
     }
 
     #[tokio::test]

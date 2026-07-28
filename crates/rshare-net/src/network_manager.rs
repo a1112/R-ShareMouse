@@ -513,6 +513,7 @@ fn discovery_lost_network_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::QuicTransport;
 
     fn discovered_device(device_id: DeviceId, address: SocketAddr, name: &str) -> DiscoveredDevice {
         DiscoveredDevice {
@@ -526,6 +527,89 @@ mod tests {
             protocol_compatibility: PeerProtocolCompatibility::Compatible,
             last_seen: tokio::time::Instant::now(),
         }
+    }
+
+    async fn connected_network_manager_for_fallback_test(
+    ) -> (NetworkManager, ConnectionManager, DeviceId, String) {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let trust_path = std::env::temp_dir()
+            .join(format!("rshare-network-fallback-{}", uuid::Uuid::new_v4()))
+            .join("trust.json");
+        let mut remote = ConnectionManager::with_transport(
+            remote_id,
+            QuicTransport::new(remote_id).with_trust_store_path(trust_path.clone()),
+        );
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote.transport_local_addr().unwrap().to_string();
+        let local_connection = ConnectionManager::with_transport(
+            local_id,
+            QuicTransport::new(local_id).with_trust_store_path(trust_path),
+        );
+        let mut manager =
+            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
+        manager.qos_registry = local_connection.qos_registry();
+        manager.connection_view = local_connection.connection_view();
+        manager.connection = Arc::new(TokioMutex::new(local_connection));
+        manager.connect_to(remote_id, &address).await.unwrap();
+        (manager, remote, remote_id, address)
+    }
+
+    async fn run_network_fallback_replacement_race(
+        old_control_id: Option<ControlConnectionId>,
+        replacement_control_id: Option<ControlConnectionId>,
+        completion: std::result::Result<(), String>,
+    ) -> (Result<()>, u64) {
+        let (mut manager, _remote, remote_id, _address) =
+            connected_network_manager_for_fallback_test().await;
+        let view = manager.connection_view.clone();
+        let old_generation = view.pool_generation_for_test(&remote_id).await;
+        view.replace_canonical_identity_for_test(remote_id, old_generation, old_control_id);
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        view.replace_pool_generation_and_outbound_for_test(
+            remote_id,
+            old_generation,
+            old_control_id,
+            blocked_tx,
+        )
+        .await;
+
+        let send = tokio::spawn(async move {
+            manager
+                .send_to(&remote_id, Message::MouseMove { x: 29, y: 31 })
+                .await
+        });
+        let old_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .expect("NetworkManager fallback must select the delayed old sender")
+            .expect("old delayed sender must remain connected");
+
+        let replacement_generation = old_generation
+            .checked_add(1)
+            .expect("test lifecycle generation must advance");
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        view.replace_pool_generation_and_outbound_for_test(
+            remote_id,
+            replacement_generation,
+            replacement_control_id,
+            replacement_tx,
+        )
+        .await;
+        view.replace_canonical_identity_for_test(
+            remote_id,
+            replacement_generation,
+            replacement_control_id,
+        );
+        old_frame.complete_for_test(completion);
+        let result = send.await.unwrap();
+        let messages_sent = view
+            .connection_infos()
+            .await
+            .into_iter()
+            .find(|info| info.device_id == remote_id)
+            .expect("replacement must remain visible")
+            .messages_sent;
+        (result, messages_sent)
     }
 
     #[test]
@@ -608,6 +692,40 @@ mod tests {
             result.is_err(),
             "missing peer must still report send failure"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_old_sender_with_absent_control_ids_cannot_increment_replacement_metrics() {
+        let (result, messages_sent) =
+            run_network_fallback_replacement_race(None, None, Ok(())).await;
+
+        result.expect("the already selected old fallback sender completes successfully");
+        assert_eq!(
+            messages_sent, 0,
+            "NetworkManager must match the selected lifecycle generation even when both control IDs are absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_old_sender_with_control_ids_cannot_increment_replacement_metrics() {
+        let (result, messages_sent) = run_network_fallback_replacement_race(
+            Some(ControlConnectionId::new()),
+            Some(ControlConnectionId::new()),
+            Ok(()),
+        )
+        .await;
+
+        result.expect("the already selected old fallback sender completes successfully");
+        assert_eq!(messages_sent, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_old_sender_never_increments_replacement_metrics() {
+        let (result, messages_sent) =
+            run_network_fallback_replacement_race(None, None, Err("injected failure".into())).await;
+
+        assert!(result.is_err());
+        assert_eq!(messages_sent, 0);
     }
 
     #[tokio::test]
