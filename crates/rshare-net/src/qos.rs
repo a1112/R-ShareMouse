@@ -297,6 +297,12 @@ struct PeerTransportInner {
     reliable_write_started: std::sync::atomic::AtomicU64,
     reliable_write_completed: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    reliable_preface_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(test)]
+    reliable_preface_barrier_waiting: AtomicBool,
+    #[cfg(test)]
+    reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     awaited_write_probes: Arc<AwaitedWriteProbes>,
     #[cfg_attr(not(test), allow(dead_code))]
     worker_count: Arc<AtomicUsize>,
@@ -366,6 +372,12 @@ impl PeerTransportHandle {
             emergency_reserved: AtomicBool::new(false),
             reliable_write_started: std::sync::atomic::AtomicU64::new(0),
             reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            reliable_preface_barrier: Mutex::new(None),
+            #[cfg(test)]
+            reliable_preface_barrier_waiting: AtomicBool::new(false),
+            #[cfg(test)]
+            reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             awaited_write_probes: awaited_write_probes.clone(),
             worker_count: worker_count.clone(),
@@ -596,6 +608,29 @@ impl PeerTransportHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_reliable_preface_barrier_for_test(&self, barrier: Arc<tokio::sync::Notify>) {
+        *self
+            .inner
+            .reliable_preface_barrier
+            .lock()
+            .expect("reliable preface barrier poisoned") = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reliable_preface_waiting_for_test(&self) -> bool {
+        self.inner
+            .reliable_preface_barrier_waiting
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reliable_cancel_reset_succeeded_for_test(&self) -> u64 {
+        self.inner
+            .reliable_cancel_reset_succeeded
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn awaited_write_counts_for_test(&self) -> (u64, u64, u64, u64) {
         (
             self.inner
@@ -784,6 +819,35 @@ impl Drop for WorkerGuard {
     }
 }
 
+fn reliable_frame_cancelled(
+    cancelled_through_rx: &mut watch::Receiver<Option<SessionEpoch>>,
+    epoch: SessionEpoch,
+) -> bool {
+    cancelled_through_rx
+        .borrow_and_update()
+        .is_some_and(|cancelled| cancelled.0 >= epoch.0)
+}
+
+fn reset_cancelled_reliable_stream(
+    stream: &mut Option<quinn::SendStream>,
+    _inner_weak: &std::sync::Weak<PeerTransportInner>,
+) {
+    let reset_succeeded = stream
+        .as_mut()
+        .is_some_and(|active| active.reset(TERMINAL_CANCEL_RESET_CODE.into()).is_ok());
+    #[cfg(test)]
+    if reset_succeeded {
+        if let Some(inner) = _inner_weak.upgrade() {
+            inner
+                .reliable_cancel_reset_succeeded
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = reset_succeeded;
+    *stream = None;
+}
+
 fn spawn_reliable_writer(
     inner_weak: std::sync::Weak<PeerTransportInner>,
     connection: quinn::Connection,
@@ -795,12 +859,11 @@ fn spawn_reliable_writer(
     tokio::spawn(async move {
         let _guard = guard;
         let mut stream: Option<quinn::SendStream> = None;
-        while let Some(frame) = rx.recv().await {
+        'frames: while let Some(frame) = rx.recv().await {
             let Some(inner) = inner_weak.upgrade() else {
                 return;
             };
-            let cancelled_through = *cancelled_through_rx.borrow_and_update();
-            if cancelled_through.is_some_and(|cancelled| cancelled.0 >= frame.session_epoch.0) {
+            if reliable_frame_cancelled(&mut cancelled_through_rx, frame.session_epoch) {
                 continue;
             }
             if inner
@@ -813,29 +876,121 @@ fn spawn_reliable_writer(
             }
             drop(inner);
             if stream.is_none() {
-                let Ok(mut opened) = connection.open_uni().await else {
-                    let Some(inner) = inner_weak.upgrade() else {
-                        return;
-                    };
-                    let handle = PeerTransportHandle {
-                        inner: inner.clone(),
-                    };
-                    let _admission = inner.admission.lock().expect("qos admission poisoned");
-                    let _ = handle.fail_reliable_frame(frame);
-                    return;
+                let open = connection.open_uni();
+                tokio::pin!(open);
+                let opened = loop {
+                    tokio::select! {
+                        biased;
+                        changed = cancelled_through_rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            if reliable_frame_cancelled(
+                                &mut cancelled_through_rx,
+                                frame.session_epoch,
+                            ) {
+                                continue 'frames;
+                            }
+                        }
+                        result = &mut open => break result,
+                    }
                 };
-                let _ = opened.set_priority(100);
-                if opened
-                    .write_all(&[
-                        QOS_LANE_MAGIC[0],
-                        QOS_LANE_MAGIC[1],
-                        QOS_LANE_MAGIC[2],
-                        QOS_LANE_MAGIC[3],
-                        LaneDiscriminator::ReliableInput as u8,
-                    ])
-                    .await
-                    .is_err()
+                let opened = match opened {
+                    Ok(opened) => opened,
+                    Err(_)
+                        if reliable_frame_cancelled(
+                            &mut cancelled_through_rx,
+                            frame.session_epoch,
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => {
+                        let Some(inner) = inner_weak.upgrade() else {
+                            return;
+                        };
+                        let handle = PeerTransportHandle {
+                            inner: inner.clone(),
+                        };
+                        let _admission = inner.admission.lock().expect("qos admission poisoned");
+                        let _ = handle.fail_reliable_frame(frame);
+                        return;
+                    }
+                };
+                stream = Some(opened);
+                if reliable_frame_cancelled(&mut cancelled_through_rx, frame.session_epoch) {
+                    reset_cancelled_reliable_stream(&mut stream, &inner_weak);
+                    continue;
+                }
+                let preface_result = {
+                    let opened = stream
+                        .as_mut()
+                        .expect("reliable stream was just initialized");
+                    let _ = opened.set_priority(100);
+                    let preface = async {
+                        #[cfg(test)]
+                        {
+                            let barrier = inner_weak.upgrade().and_then(|inner| {
+                                inner
+                                    .reliable_preface_barrier
+                                    .lock()
+                                    .expect("reliable preface barrier poisoned")
+                                    .take()
+                            });
+                            if let Some(barrier) = barrier {
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    inner
+                                        .reliable_preface_barrier_waiting
+                                        .store(true, Ordering::Release);
+                                }
+                                barrier.notified().await;
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    inner
+                                        .reliable_preface_barrier_waiting
+                                        .store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                        opened
+                            .write_all(&[
+                                QOS_LANE_MAGIC[0],
+                                QOS_LANE_MAGIC[1],
+                                QOS_LANE_MAGIC[2],
+                                QOS_LANE_MAGIC[3],
+                                LaneDiscriminator::ReliableInput as u8,
+                            ])
+                            .await
+                    };
+                    tokio::pin!(preface);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            changed = cancelled_through_rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                if reliable_frame_cancelled(
+                                    &mut cancelled_through_rx,
+                                    frame.session_epoch,
+                                ) {
+                                    break None;
+                                }
+                            }
+                            result = &mut preface => break Some(result),
+                        }
+                    }
+                };
+                if preface_result.is_none()
+                    || reliable_frame_cancelled(&mut cancelled_through_rx, frame.session_epoch)
                 {
+                    reset_cancelled_reliable_stream(&mut stream, &inner_weak);
+                    continue;
+                }
+                if preface_result.is_some_and(|result| result.is_err()) {
+                    let _ = stream
+                        .as_mut()
+                        .expect("failed reliable stream remains initialized")
+                        .reset(0u32.into());
                     let Some(inner) = inner_weak.upgrade() else {
                         return;
                     };
@@ -846,7 +1001,6 @@ fn spawn_reliable_writer(
                     let _ = handle.fail_reliable_frame(frame);
                     return;
                 }
-                stream = Some(opened);
             }
             let Ok(encoded) = crate::codec::ReliableInputCodec::encode(&frame) else {
                 let Some(inner) = inner_weak.upgrade() else {
@@ -873,31 +1027,30 @@ fn spawn_reliable_writer(
                 tokio::pin!(write);
                 loop {
                     tokio::select! {
-                        result = &mut write => break Some(result),
+                        biased;
                         changed = cancelled_through_rx.changed() => {
                             if changed.is_err() {
                                 return;
                             }
-                            let cancelled_through =
-                                *cancelled_through_rx.borrow_and_update();
-                            if cancelled_through.is_some_and(|cancelled| {
-                                cancelled.0 >= frame.session_epoch.0
-                            }) {
+                            if reliable_frame_cancelled(
+                                &mut cancelled_through_rx,
+                                frame.session_epoch,
+                            ) {
                                 break None;
                             }
                         }
+                        result = &mut write => break Some(result),
                         _ = connection.closed() => return,
                     }
                 }
             };
-            let Some(result) = result else {
-                let _ = stream
-                    .as_mut()
-                    .expect("cancelled reliable stream remains initialized")
-                    .reset(TERMINAL_CANCEL_RESET_CODE.into());
-                stream = None;
+            if result.is_none()
+                || reliable_frame_cancelled(&mut cancelled_through_rx, frame.session_epoch)
+            {
+                reset_cancelled_reliable_stream(&mut stream, &inner_weak);
                 continue;
-            };
+            }
+            let result = result.expect("non-cancelled reliable write has a result");
             let Some(inner) = inner_weak.upgrade() else {
                 return;
             };
@@ -1444,6 +1597,12 @@ fn fixture_handle(
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
                 reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
+                reliable_preface_barrier: Mutex::new(None),
+                #[cfg(test)]
+                reliable_preface_barrier_waiting: AtomicBool::new(false),
+                #[cfg(test)]
+                reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
@@ -1516,6 +1675,12 @@ fn fixture_handle_with_stalled_emergency() -> (
                 emergency_reserved: AtomicBool::new(false),
                 reliable_write_started: std::sync::atomic::AtomicU64::new(0),
                 reliable_write_completed: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                reliable_preface_barrier: Mutex::new(None),
+                #[cfg(test)]
+                reliable_preface_barrier_waiting: AtomicBool::new(false),
+                #[cfg(test)]
+                reliable_cancel_reset_succeeded: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
@@ -1881,6 +2046,20 @@ mod tests {
         assert_eq!(
             handle.try_send_reliable_input(reliable_enter(u64::MAX, 1)),
             Err(TransportSendError::UnsupportedMessage)
+        );
+    }
+
+    #[test]
+    fn reliable_cancel_watermark_is_rechecked_after_stage_completion() {
+        let (tx, mut rx) = watch::channel(None);
+        let epoch = SessionEpoch(41);
+        assert!(!reliable_frame_cancelled(&mut rx, epoch));
+
+        tx.send_replace(Some(epoch));
+
+        assert!(
+            reliable_frame_cancelled(&mut rx, epoch),
+            "a stage completion must not hide a concurrently published cumulative cancellation"
         );
     }
 

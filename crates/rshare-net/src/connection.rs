@@ -634,54 +634,48 @@ impl ConnectionManager {
     }
 
     pub async fn send_to(&mut self, device_id: &DeviceId, message: Message) -> Result<()> {
+        enum SelectedSendIdentity {
+            Control(ControlConnectionId),
+            Pool(crate::transport::PooledSendIdentity),
+        }
+
         let classified =
             ClassifiedMessage::try_from(message.clone()).map_err(|error| anyhow::anyhow!(error))?;
-        let (send_result, qos_generation): (Result<()>, Option<ControlConnectionId>) =
-            match (self.qos_registry.peer(device_id), classified) {
-                (Some(peer), ClassifiedMessage::Control(frame)) => {
-                    let generation = peer.auth.control_connection_id;
-                    (
-                        peer.transport.send_control(frame).await.map_err(Into::into),
-                        Some(generation),
-                    )
-                }
-                (Some(peer), ClassifiedMessage::Bulk(frame)) => {
-                    let generation = peer.auth.control_connection_id;
-                    (
-                        peer.transport.send_bulk(frame).await.map_err(Into::into),
-                        Some(generation),
-                    )
-                }
-                (Some(peer), ClassifiedMessage::Telemetry(frame)) => {
-                    let generation = peer.auth.control_connection_id;
-                    (
-                        peer.transport.try_send_telemetry(frame).map_err(Into::into),
-                        Some(generation),
-                    )
-                }
-                (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
-                    let generation = peer.auth.control_connection_id;
-                    (
-                        peer.transport
-                            .send_reliable_compat(frame)
-                            .await
-                            .map_err(Into::into),
-                        Some(generation),
-                    )
-                }
-                (_, ClassifiedMessage::Unsupported) | (None, _) => {
-                    (self.pool.send_to(device_id, &message).await, None)
-                }
-            };
-        send_result?;
+        let selected_identity = match (self.qos_registry.peer(device_id), classified) {
+            (Some(peer), ClassifiedMessage::Control(frame)) => {
+                peer.transport.send_control(frame).await?;
+                SelectedSendIdentity::Control(peer.auth.control_connection_id)
+            }
+            (Some(peer), ClassifiedMessage::Bulk(frame)) => {
+                peer.transport.send_bulk(frame).await?;
+                SelectedSendIdentity::Control(peer.auth.control_connection_id)
+            }
+            (Some(peer), ClassifiedMessage::Telemetry(frame)) => {
+                peer.transport.try_send_telemetry(frame)?;
+                SelectedSendIdentity::Control(peer.auth.control_connection_id)
+            }
+            (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
+                peer.transport.send_reliable_compat(frame).await?;
+                SelectedSendIdentity::Control(peer.auth.control_connection_id)
+            }
+            (_, ClassifiedMessage::Unsupported) | (None, _) => SelectedSendIdentity::Pool(
+                self.pool.send_to_with_identity(device_id, &message).await?,
+            ),
+        };
 
         if let Some(connection) = self
             .connections
             .write()
             .expect("canonical connection registry poisoned")
             .get_mut(device_id)
-            .filter(|connection| {
-                qos_generation.is_none() || connection.info.control_connection_id == qos_generation
+            .filter(|connection| match selected_identity {
+                SelectedSendIdentity::Control(control_connection_id) => {
+                    connection.info.control_connection_id == Some(control_connection_id)
+                }
+                SelectedSendIdentity::Pool(identity) => {
+                    connection.generation == identity.lifecycle_generation
+                        && connection.info.control_connection_id == identity.control_connection_id
+                }
             })
         {
             connection.info.messages_sent += 1;
@@ -1008,6 +1002,243 @@ mod tests {
                 .messages_sent,
             0,
             "late send_to success must not increment replacement metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_send_to_completion_from_replaced_generation_does_not_mutate_metrics() {
+        let local_id = DeviceId::new_v4();
+        let peer_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(peer_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(local_id);
+        let client_connection = client.connect(&address.to_string(), peer_id).await.unwrap();
+        let _server_connection = incoming.recv().await.unwrap().connection;
+        let old_control_id = ControlConnectionId::new();
+        let replacement_control_id = ControlConnectionId::new();
+        let mut manager = ConnectionManager::new(local_id);
+        let lifecycle_generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: peer_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: Some(old_control_id),
+            },
+        );
+        manager
+            .pool
+            .insert_with_generation(peer_id, lifecycle_generation, client_connection)
+            .await;
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        manager
+            .pool
+            .replace_outbound_for_test(peer_id, Some(old_control_id), blocked_tx)
+            .await;
+        let connections = manager.connections.clone();
+        let send = tokio::spawn(async move {
+            manager
+                .send_to(&peer_id, Message::MouseMove { x: 9, y: 11 })
+                .await
+        });
+        let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .expect("fallback send must select the delayed outbound sender")
+            .expect("delayed outbound sender must remain connected");
+
+        connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .get_mut(&peer_id)
+            .expect("canonical peer remains present")
+            .info
+            .control_connection_id = Some(replacement_control_id);
+        blocked_frame.complete_for_test(Ok(()));
+        send.await.unwrap().unwrap();
+
+        assert_eq!(
+            connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&peer_id)
+                .expect("replacement remains canonical")
+                .info
+                .messages_sent,
+            0,
+            "late fallback success must not increment replacement metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_send_to_does_not_increment_metrics() {
+        let local_id = DeviceId::new_v4();
+        let peer_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(peer_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(local_id);
+        let client_connection = client.connect(&address.to_string(), peer_id).await.unwrap();
+        let _server_connection = incoming.recv().await.unwrap().connection;
+        let control_id = ControlConnectionId::new();
+        let mut manager = ConnectionManager::new(local_id);
+        let lifecycle_generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: peer_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: Some(control_id),
+            },
+        );
+        manager
+            .pool
+            .insert_with_generation(peer_id, lifecycle_generation, client_connection)
+            .await;
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        manager
+            .pool
+            .replace_outbound_for_test(peer_id, Some(control_id), blocked_tx)
+            .await;
+        let connections = manager.connections.clone();
+        let send = tokio::spawn(async move {
+            manager
+                .send_to(&peer_id, Message::MouseMove { x: 13, y: 17 })
+                .await
+        });
+        let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .expect("fallback send must select the delayed outbound sender")
+            .expect("delayed outbound sender must remain connected");
+        blocked_frame.complete_for_test(Err("injected write failure".into()));
+
+        assert!(send.await.unwrap().is_err());
+        assert_eq!(
+            connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&peer_id)
+                .expect("canonical peer remains present")
+                .info
+                .messages_sent,
+            0,
+            "failed fallback sends must never increment metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_send_to_with_no_control_id_still_matches_lifecycle_generation() {
+        let local_id = DeviceId::new_v4();
+        let peer_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(peer_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::new(local_id);
+        let client_connection = client.connect(&address.to_string(), peer_id).await.unwrap();
+        let _server_connection = incoming.recv().await.unwrap().connection;
+        let mut manager = ConnectionManager::new(local_id);
+        let old_lifecycle_generation = insert_test_canonical(
+            &manager,
+            ConnectionInfo {
+                device_id: peer_id,
+                address: address.to_string(),
+                state: ConnectionState::Connected,
+                last_activity: Instant::now(),
+                messages_sent: 0,
+                messages_received: 0,
+                transport: "quic".to_string(),
+                datagram_available: true,
+                rtt_ms: Some(1),
+                last_datagram_rx_ms: Some(1),
+                datagram_tx_dropped: 0,
+                reliable_stream_reset_count: 0,
+                cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: None,
+            },
+        );
+        manager
+            .pool
+            .insert_with_generation(peer_id, old_lifecycle_generation, client_connection)
+            .await;
+        let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
+        manager
+            .pool
+            .replace_outbound_for_test(peer_id, None, blocked_tx)
+            .await;
+        let connections = manager.connections.clone();
+        let next_generation = manager.next_generation.clone();
+        let send = tokio::spawn(async move {
+            manager
+                .send_to(&peer_id, Message::MouseMove { x: 19, y: 23 })
+                .await
+        });
+        let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
+            .await
+            .expect("fallback send must select the delayed outbound sender")
+            .expect("delayed outbound sender must remain connected");
+
+        let replacement_generation = allocate_generation(&next_generation);
+        connections
+            .write()
+            .expect("canonical connection registry poisoned")
+            .insert(
+                peer_id,
+                CanonicalConnection {
+                    generation: replacement_generation,
+                    info: ConnectionInfo {
+                        device_id: peer_id,
+                        address: address.to_string(),
+                        state: ConnectionState::Connected,
+                        last_activity: Instant::now(),
+                        messages_sent: 0,
+                        messages_received: 0,
+                        transport: "quic".to_string(),
+                        datagram_available: true,
+                        rtt_ms: Some(1),
+                        last_datagram_rx_ms: Some(1),
+                        datagram_tx_dropped: 0,
+                        reliable_stream_reset_count: 0,
+                        cert_trust_state: Some("trusted".to_string()),
+                        control_connection_id: None,
+                    },
+                },
+            );
+        blocked_frame.complete_for_test(Ok(()));
+        send.await.unwrap().unwrap();
+
+        assert_eq!(
+            connections
+                .read()
+                .expect("canonical connection registry poisoned")
+                .get(&peer_id)
+                .expect("replacement remains canonical")
+                .info
+                .messages_sent,
+            0,
+            "late fallback success must not match a replacement solely because both control IDs are absent"
         );
     }
 
