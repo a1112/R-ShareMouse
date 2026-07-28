@@ -47,6 +47,7 @@ const BOOTSTRAP_DATAGRAM_READER_ACK: u8 = 0b10;
 const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 const AUTHENTICATED_UNI_STREAM_TASK_BUDGET: usize = 32;
+const AUTHENTICATED_UNI_STREAM_BUDGET_EXHAUSTED_CODE: u32 = 0x525342;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuicServerStartError {
@@ -1702,7 +1703,25 @@ async fn read_reliable_messages(
                         &inner,
                         "authenticated uni stream task budget exhausted".into(),
                     );
-                    continue;
+                    if let Some(context) = inner
+                        .qos_receive
+                        .lock()
+                        .expect("qos receive context poisoned")
+                        .clone()
+                    {
+                        fail_close_current_qos_generation_with_code(
+                            &inner,
+                            &context,
+                            VarInt::from_u32(AUTHENTICATED_UNI_STREAM_BUDGET_EXHAUSTED_CODE),
+                            b"authenticated uni stream task budget exhausted",
+                        );
+                    } else {
+                        inner.connection.close(
+                            VarInt::from_u32(AUTHENTICATED_UNI_STREAM_BUDGET_EXHAUSTED_CODE),
+                            b"authenticated uni stream task budget exhausted",
+                        );
+                    }
+                    return;
                 }
             };
             let inner = inner.clone();
@@ -2455,6 +2474,15 @@ fn fail_close_current_qos_generation(
     context: &QosReceiveContext,
     close_reason: &'static [u8],
 ) {
+    fail_close_current_qos_generation_with_code(inner, context, VarInt::from_u32(0), close_reason);
+}
+
+fn fail_close_current_qos_generation_with_code(
+    inner: &QuicConnectionInner,
+    context: &QosReceiveContext,
+    close_code: VarInt,
+    close_reason: &'static [u8],
+) {
     let active_epoch = {
         let mut state = inner
             .qos_inbound
@@ -2469,7 +2497,7 @@ fn fail_close_current_qos_generation(
             _ => None,
         }
     };
-    inner.connection.close(0u32.into(), close_reason);
+    inner.connection.close(close_code, close_reason);
     if let Some(epoch) = active_epoch {
         context.release_emitter.emit(TerminalReleaseEvent {
             auth: context.auth.clone(),
@@ -4308,7 +4336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_stream_flood_has_a_strict_task_budget_and_cannot_block_realtime() {
+    async fn completed_malformed_stream_flood_cannot_block_realtime() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
         let mut server = QuicTransport::isolated_for_test(server_id);
@@ -4353,6 +4381,9 @@ mod tests {
             .unwrap();
 
         for _ in 0..32 {
+            let completed_before = server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .4;
             let mut malformed = client_connection.inner.connection.open_uni().await.unwrap();
             malformed
                 .write_all(&[
@@ -4365,6 +4396,17 @@ mod tests {
                 .await
                 .unwrap();
             malformed.finish().unwrap();
+            timeout(Duration::from_secs(1), async {
+                while server_connection
+                    .authenticated_uni_stream_task_counts_for_test()
+                    .4
+                    == completed_before
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("each completed malformed stream must release its reader permit");
         }
         timeout(Duration::from_secs(1), async {
             while protocol_errors.len() != 32 {
@@ -4373,6 +4415,17 @@ mod tests {
         })
         .await
         .expect("malformed diagnostics FIFO must become full");
+        timeout(Duration::from_secs(1), async {
+            while server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .1
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed malformed streams must release all reader permits");
 
         let counts_before_blocked_diagnostic =
             server_connection.authenticated_uni_stream_task_counts_for_test();
@@ -4402,35 +4455,11 @@ mod tests {
         .await
         .expect("full diagnostics FIFO must not park an unknown-lane handler");
 
-        let extra_streams = 16;
-        let accepted_before_flood = server_connection
-            .authenticated_uni_stream_task_counts_for_test()
-            .0;
-        let mut parked = Vec::new();
-        for _ in 0..AUTHENTICATED_UNI_STREAM_TASK_BUDGET + extra_streams {
-            let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
-            stream.write_all(&QOS_LANE_MAGIC[..1]).await.unwrap();
-            parked.push(stream);
-        }
-        let expected_accepts =
-            accepted_before_flood + AUTHENTICATED_UNI_STREAM_TASK_BUDGET + extra_streams;
-        timeout(Duration::from_secs(1), async {
-            while server_connection
-                .authenticated_uni_stream_task_counts_for_test()
-                .0
-                < expected_accepts
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all flood streams must be accepted even while diagnostics are blocked");
-
         let (_accepted, active, peak, rejected, _completed) =
             server_connection.authenticated_uni_stream_task_counts_for_test();
         assert!(active <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
         assert!(peak <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
-        assert!(rejected >= extra_streams);
+        assert_eq!(rejected, 0);
 
         client_qos.try_send_realtime(realtime_frame(1, 1)).unwrap();
         assert_eq!(
@@ -4445,7 +4474,120 @@ mod tests {
         assert!(client_connection.inner.connection.close_reason().is_none());
 
         drop(protocol_errors);
-        drop(parked);
+    }
+
+    #[tokio::test]
+    async fn partial_stream_budget_exhaustion_fails_closed_and_releases_active_epoch() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let generation = ControlConnectionId::new();
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: generation,
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, mut releases) = server_connection.install_qos(server_auth);
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        let epoch = SessionEpoch(7);
+
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                epoch.0,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("reliable enter must activate the epoch")
+            .unwrap();
+        assert_eq!(enter.session_epoch, epoch);
+
+        let active_reliable_streams = server_connection
+            .authenticated_uni_stream_task_counts_for_test()
+            .1;
+        assert_eq!(active_reliable_streams, 1);
+        let mut partial_streams = Vec::new();
+        for _ in active_reliable_streams..AUTHENTICATED_UNI_STREAM_TASK_BUDGET {
+            let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+            stream.write_all(&QOS_LANE_MAGIC[..1]).await.unwrap();
+            partial_streams.push(stream);
+        }
+        timeout(Duration::from_secs(1), async {
+            while server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .1
+                != AUTHENTICATED_UNI_STREAM_TASK_BUDGET
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the active reliable stream plus partial streams must occupy the reader budget");
+
+        let mut emergency = open_raw_qos_input_stream(
+            &client_connection,
+            LaneDiscriminator::Emergency,
+            &reliable_frame(
+                epoch.0,
+                2,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            ),
+        )
+        .await;
+        let _ = emergency.finish();
+
+        timeout(
+            Duration::from_secs(1),
+            client_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("reader budget exhaustion must fail-close the authenticated connection");
+        let release = timeout(Duration::from_secs(1), releases.recv())
+            .await
+            .expect("connection close must release the active input epoch")
+            .unwrap();
+        assert_eq!(release.auth.control_connection_id, generation);
+        assert_eq!(release.epoch, epoch);
+        assert_eq!(release.reason, ReleaseAllReason::BackendFailure);
+        assert_eq!(
+            server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .retired_through,
+            Some((generation, epoch))
+        );
+
+        let (_accepted, active, peak, rejected, _completed) =
+            server_connection.authenticated_uni_stream_task_counts_for_test();
+        assert!(active <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
+        assert!(peak <= AUTHENTICATED_UNI_STREAM_TASK_BUDGET);
+        assert_eq!(rejected, 1);
+        drop(partial_streams);
     }
 
     #[tokio::test]
