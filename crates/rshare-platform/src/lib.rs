@@ -192,6 +192,24 @@ mod platform_source_contract_tests {
         assert!(send_text.contains("event.set_string(text);"));
         assert!(send_text.contains("event.post(CGEventTapLocation::HID);"));
     }
+
+    #[test]
+    fn macos_relative_mouse_uses_current_point_plus_delta() {
+        let source = include_str!("macos.rs");
+        let start = source
+            .find("pub fn send_mouse_move_relative")
+            .expect("missing macOS relative mouse implementation");
+        let end = source[start..]
+            .find("pub fn send_button")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS relative mouse implementation");
+        let relative = &source[start..end];
+
+        assert!(relative.contains("current_mouse_position()?"));
+        assert!(relative.contains("position.x + dx as f64"));
+        assert!(relative.contains("position.y + dy as f64"));
+        assert!(relative.contains("CGEventType::MouseMoved"));
+    }
 }
 
 /// Platform-specific clipboard listener type alias

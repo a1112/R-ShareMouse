@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -61,6 +62,81 @@ struct RecordingBackend {
 struct DropSignalingBackend {
     inner: RecordingBackend,
     dropped: mpsc::SyncSender<()>,
+}
+
+#[derive(Default)]
+struct BlockingGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl BlockingGate {
+    fn enter_and_wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + WAIT;
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "backend never entered blocking call");
+            let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(!timeout.timed_out() || state.0);
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct BlockingBackend {
+    inner: RecordingBackend,
+    gate: Arc<BlockingGate>,
+    first: AtomicBool,
+}
+
+impl fmt::Debug for BlockingBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockingBackend").finish_non_exhaustive()
+    }
+}
+
+impl InjectBackend for BlockingBackend {
+    fn kind(&self) -> BackendKind {
+        self.inner.kind()
+    }
+
+    fn health(&self) -> BackendHealth {
+        self.inner.health()
+    }
+
+    fn inject(&mut self, event: InputEvent) -> Result<()> {
+        if self.first.swap(false, Ordering::AcqRel) {
+            self.gate.enter_and_wait();
+        }
+        self.inner.inject(event)
+    }
+
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
+        if self.first.swap(false, Ordering::AcqRel) {
+            self.gate.enter_and_wait();
+        }
+        self.inner.inject_relative_pointer(dx, dy)
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
 }
 
 impl fmt::Debug for DropSignalingBackend {
@@ -166,6 +242,16 @@ fn realtime(epoch: u64, sequence: u64, dx: i32, dy: i32) -> RealtimeInputFrame {
         sequence,
         captured_at: stamp(),
         payload: RealtimeInputPayload::RelativeMouse { dx, dy },
+    }
+}
+
+fn absolute(epoch: u64, sequence: u64, x: i32, y: i32) -> RealtimeInputFrame {
+    RealtimeInputFrame {
+        protocol_version: INPUT_PROTOCOL_VERSION,
+        session_epoch: SessionEpoch(epoch),
+        sequence,
+        captured_at: stamp(),
+        payload: RealtimeInputPayload::AbsoluteAnchor { x, y },
     }
 }
 
@@ -285,6 +371,81 @@ fn realtime_latest_wins_without_regressing_sequence() {
 }
 
 #[test]
+fn adjacent_relative_realtime_accumulates_without_losing_motion() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder: Arc::clone(&recorder),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::from_millis(25));
+
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(1, 10, 5, -2)),
+        RealtimeSubmitResult::Accepted
+    );
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(1, 11, 7, 3)),
+        RealtimeSubmitResult::Accumulated
+    );
+
+    assert_eq!(
+        recorder.wait_for(1)[0],
+        Call::Relative(12, 1, "rshare-input-injection-test".into())
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn relative_accumulation_overflow_is_explicit_and_preserves_queued_delta() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder: Arc::clone(&recorder),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::from_millis(25));
+
+    actor.submit_realtime(owner, realtime(1, 10, i32::MAX, 9));
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(1, 11, 1, 4)),
+        RealtimeSubmitResult::OverflowDropped
+    );
+
+    assert_eq!(
+        recorder.wait_for(1)[0],
+        Call::Relative(i32::MAX, 9, "rshare-input-injection-test".into())
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn changing_realtime_payload_class_does_not_swallow_pending_state() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder: Arc::clone(&recorder),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::from_millis(25));
+
+    actor.submit_realtime(owner, realtime(1, 10, 5, 6));
+    assert_eq!(
+        actor.submit_realtime(owner, absolute(1, 11, 100, 200)),
+        RealtimeSubmitResult::Accepted
+    );
+
+    assert_eq!(
+        recorder.wait_for(2),
+        vec![
+            Call::Relative(5, 6, "rshare-input-injection-test".into()),
+            Call::Absolute(100, 200, "rshare-input-injection-test".into()),
+        ]
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
 fn missing_motion_anchor_repairs_pointer_before_click() {
     let recorder = Arc::new(Recorder::default());
     let backend = RecordingBackend {
@@ -340,6 +501,44 @@ fn future_realtime_waits_behind_earlier_reliable_anchor() {
                 "rshare-input-injection-test".into()
             ),
             Call::Relative(300, 200, "rshare-input-injection-test".into()),
+        ]
+    );
+    actor.shutdown().unwrap();
+}
+
+#[test]
+fn late_reliable_anchor_splits_accumulated_relative_components_at_sequence_boundary() {
+    let recorder = Arc::new(Recorder::default());
+    let backend = RecordingBackend {
+        recorder: Arc::clone(&recorder),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::from_millis(25));
+
+    actor.submit_realtime(owner, realtime(1, 10, 5, 0));
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(1, 11, 7, 0)),
+        RealtimeSubmitResult::Accumulated
+    );
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(1, 12, 3, 0)),
+        RealtimeSubmitResult::Accumulated
+    );
+    actor
+        .try_submit_reliable(owner, button(1, 1, 10, 240, 180))
+        .unwrap();
+
+    assert_eq!(
+        recorder.wait_for(3),
+        vec![
+            Call::Relative(5, 0, "rshare-input-injection-test".into()),
+            Call::Button(
+                InjectMouseButton::Left,
+                ButtonState::Pressed,
+                "rshare-input-injection-test".into()
+            ),
+            Call::Relative(10, 0, "rshare-input-injection-test".into()),
         ]
     );
     actor.shutdown().unwrap();
@@ -443,6 +642,104 @@ fn terminal_release_purges_queue_and_rejects_late_same_epoch() {
     );
     actor.shutdown().unwrap();
     assert!(recorder.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn bounded_control_pressure_keeps_release_reserved_and_purges_full_queue() {
+    let recorder = Arc::new(Recorder::default());
+    let gate = Arc::new(BlockingGate::default());
+    let backend = BlockingBackend {
+        inner: RecordingBackend {
+            recorder: Arc::clone(&recorder),
+            delay: Duration::ZERO,
+            fail_relative: false,
+        },
+        gate: Arc::clone(&gate),
+        first: AtomicBool::new(true),
+    };
+    let actor = InputInjectionHandle::spawn(
+        Box::new(backend),
+        InjectionActorConfig {
+            reliable_capacity: 1,
+            thread_name: "rshare-input-injection-test".into(),
+            realtime_coalesce_window: Duration::ZERO,
+        },
+    )
+    .unwrap();
+    let owner = owner();
+    actor
+        .begin_session(owner, SessionEpoch(1), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 65,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    gate.wait_until_entered();
+
+    actor
+        .begin_session(owner, SessionEpoch(2), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .begin_session(owner, SessionEpoch(3), Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        actor.begin_session(owner, SessionEpoch(4), Duration::from_secs(30)),
+        Err(rshare_input::InjectionQueueFull::QueueFull)
+    );
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                3,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 66,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        actor.try_submit_reliable(
+            owner,
+            reliable(
+                3,
+                2,
+                ReliableInputEvent::Key {
+                    keycode: 67,
+                    state: KeyState::Pressed,
+                },
+            ),
+        ),
+        Err(rshare_input::InjectionQueueFull::QueueFull)
+    );
+
+    actor.request_release_all(ReleaseAllReason::SessionEnded);
+    assert_eq!(
+        actor.submit_realtime(owner, realtime(3, 1, 1, 1)),
+        RealtimeSubmitResult::EpochClosed
+    );
+    gate.release();
+    recorder.wait_for(2);
+    actor.shutdown().unwrap();
+    assert!(
+        recorder
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| !matches!(call, Call::Key(66 | 67, ButtonState::Pressed, _))),
+        "terminal release must purge queued key-downs"
+    );
 }
 
 #[test]

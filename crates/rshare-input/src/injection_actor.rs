@@ -19,6 +19,8 @@ use crate::{ButtonState, InjectBackend, InputEvent, KeyCode, MouseButton};
 
 static NEXT_CLOCK_DOMAIN: AtomicU64 = AtomicU64::new(1);
 const CONTROL_QUEUE_CAPACITY: usize = 4;
+const REALTIME_SEGMENT_CAPACITY: usize = 8;
+const RELATIVE_COMPONENT_CAPACITY: usize = 64;
 
 /// Construction settings for the injection actor.
 #[derive(Debug, Clone)]
@@ -46,6 +48,9 @@ impl Default for InjectionActorConfig {
 pub enum RealtimeSubmitResult {
     Accepted,
     Replaced,
+    Accumulated,
+    OverflowDropped,
+    CapacityDropped,
     OutOfOrder,
     WrongOwnerOrEpoch,
     EpochClosed,
@@ -209,27 +214,33 @@ impl InputInjectionHandle {
         active.last_realtime_sequence = Some(frame.sequence);
         active.deadline = Instant::now() + active.lease_duration;
         state.active = Some(active);
-        let queued = QueuedRealtime {
-            frame,
-            received_at: self.queue.clock.now(),
-            submitted_at: Instant::now(),
+        let queued = QueuedRealtime::new(frame, self.queue.clock.now(), Instant::now());
+        let outcome = match state.ordinary.back_mut() {
+            Some(QueuedInput::Realtime(previous)) => merge_adjacent_realtime(previous, queued),
+            _ => RealtimeMerge::Incompatible(queued),
         };
-        let replaced = match state.ordinary.back_mut() {
-            Some(QueuedInput::Realtime(previous)) => {
-                *previous = queued;
-                true
-            }
-            _ => {
-                state.ordinary.push_back(QueuedInput::Realtime(queued));
-                false
+        let result = match outcome {
+            RealtimeMerge::Replaced => RealtimeSubmitResult::Replaced,
+            RealtimeMerge::Accumulated => RealtimeSubmitResult::Accumulated,
+            RealtimeMerge::OverflowDropped => RealtimeSubmitResult::OverflowDropped,
+            RealtimeMerge::CapacityDropped => RealtimeSubmitResult::CapacityDropped,
+            RealtimeMerge::Incompatible(queued) => {
+                let segment_len = state
+                    .ordinary
+                    .iter()
+                    .rev()
+                    .take_while(|item| matches!(item, QueuedInput::Realtime(_)))
+                    .count();
+                if segment_len >= REALTIME_SEGMENT_CAPACITY {
+                    RealtimeSubmitResult::CapacityDropped
+                } else {
+                    state.ordinary.push_back(QueuedInput::Realtime(queued));
+                    RealtimeSubmitResult::Accepted
+                }
             }
         };
         self.queue.changed.notify_one();
-        if replaced {
-            RealtimeSubmitResult::Replaced
-        } else {
-            RealtimeSubmitResult::Accepted
-        }
+        result
     }
 
     pub fn try_submit_reliable(
@@ -410,6 +421,74 @@ struct QueuedRealtime {
     frame: RealtimeInputFrame,
     received_at: MonotonicStamp,
     submitted_at: Instant,
+    relative_components: Vec<RelativeComponent>,
+}
+
+#[derive(Clone)]
+struct RelativeComponent {
+    sequence: u64,
+    captured_at: MonotonicStamp,
+    dx: i32,
+    dy: i32,
+    received_at: MonotonicStamp,
+    submitted_at: Instant,
+}
+
+impl QueuedRealtime {
+    fn new(frame: RealtimeInputFrame, received_at: MonotonicStamp, submitted_at: Instant) -> Self {
+        let relative_components = match frame.payload {
+            RealtimeInputPayload::RelativeMouse { dx, dy } => vec![RelativeComponent {
+                sequence: frame.sequence,
+                captured_at: frame.captured_at,
+                dx,
+                dy,
+                received_at,
+                submitted_at,
+            }],
+            _ => Vec::new(),
+        };
+        Self {
+            frame,
+            received_at,
+            submitted_at,
+            relative_components,
+        }
+    }
+
+    fn from_relative_components(
+        protocol_version: u16,
+        session_epoch: SessionEpoch,
+        components: Vec<RelativeComponent>,
+    ) -> Self {
+        let first = components
+            .first()
+            .expect("relative component group must not be empty");
+        let last = components
+            .last()
+            .expect("relative component group must not be empty");
+        let mut dx = 0_i32;
+        let mut dy = 0_i32;
+        for component in &components {
+            dx = dx
+                .checked_add(component.dx)
+                .expect("previously admitted relative x components must remain representable");
+            dy = dy
+                .checked_add(component.dy)
+                .expect("previously admitted relative y components must remain representable");
+        }
+        Self {
+            frame: RealtimeInputFrame {
+                protocol_version,
+                session_epoch,
+                sequence: last.sequence,
+                captured_at: last.captured_at,
+                payload: RealtimeInputPayload::RelativeMouse { dx, dy },
+            },
+            received_at: first.received_at,
+            submitted_at: last.submitted_at,
+            relative_components: components,
+        }
+    }
 }
 
 struct QueuedReliable {
@@ -420,6 +499,67 @@ struct QueuedReliable {
 enum QueuedInput {
     Realtime(QueuedRealtime),
     Reliable(QueuedReliable),
+}
+
+enum RealtimeMerge {
+    Replaced,
+    Accumulated,
+    OverflowDropped,
+    CapacityDropped,
+    Incompatible(QueuedRealtime),
+}
+
+fn merge_adjacent_realtime(
+    previous: &mut QueuedRealtime,
+    incoming: QueuedRealtime,
+) -> RealtimeMerge {
+    match (&mut previous.frame.payload, &incoming.frame.payload) {
+        (
+            RealtimeInputPayload::RelativeMouse { dx, dy },
+            RealtimeInputPayload::RelativeMouse {
+                dx: incoming_dx,
+                dy: incoming_dy,
+            },
+        ) => {
+            if previous.relative_components.len() >= RELATIVE_COMPONENT_CAPACITY {
+                return RealtimeMerge::CapacityDropped;
+            }
+            let Some(merged_dx) = dx.checked_add(*incoming_dx) else {
+                return RealtimeMerge::OverflowDropped;
+            };
+            let Some(merged_dy) = dy.checked_add(*incoming_dy) else {
+                return RealtimeMerge::OverflowDropped;
+            };
+            *dx = merged_dx;
+            *dy = merged_dy;
+            previous.frame.sequence = incoming.frame.sequence;
+            previous.frame.captured_at = incoming.frame.captured_at;
+            previous.submitted_at = incoming.submitted_at;
+            previous
+                .relative_components
+                .extend(incoming.relative_components);
+            RealtimeMerge::Accumulated
+        }
+        (
+            RealtimeInputPayload::AbsoluteAnchor { .. },
+            RealtimeInputPayload::AbsoluteAnchor { .. },
+        )
+        | (RealtimeInputPayload::CursorVisual { .. }, RealtimeInputPayload::CursorVisual { .. }) => {
+            *previous = incoming;
+            RealtimeMerge::Replaced
+        }
+        (
+            RealtimeInputPayload::GamepadAxes { gamepad_id, .. },
+            RealtimeInputPayload::GamepadAxes {
+                gamepad_id: incoming_id,
+                ..
+            },
+        ) if gamepad_id == incoming_id => {
+            *previous = incoming;
+            RealtimeMerge::Replaced
+        }
+        _ => RealtimeMerge::Incompatible(incoming),
+    }
 }
 
 fn close_admission(state: &mut QueueState, key: SessionKey, reason: ReleaseAllReason) {
@@ -573,7 +713,6 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
                     fail_worker_session(&queue, current.key, &mut *backend, &mut ledger);
                     session = None;
                     gamepads.clear();
-                } else {
                 }
             }
         }
@@ -605,6 +744,10 @@ fn next_work_item(queue: &InjectionQueue, session: Option<&WorkerSession>) -> Wo
                 }
                 return WorkItem::LeaseExpired(current.key);
             }
+        }
+
+        if let Some(prefix) = split_front_relative_for_late_anchor(&mut state) {
+            return WorkItem::Realtime(prefix);
         }
 
         if let Some(front) = state.ordinary.front() {
@@ -673,6 +816,91 @@ fn next_work_item(queue: &InjectionQueue, session: Option<&WorkerSession>) -> Wo
             state = queue.changed.wait(state).unwrap();
         }
     }
+}
+
+fn split_front_relative_for_late_anchor(state: &mut QueueState) -> Option<QueuedRealtime> {
+    let anchor = match state.ordinary.get(1) {
+        Some(QueuedInput::Reliable(QueuedReliable {
+            frame:
+                ReliableInputFrame {
+                    event:
+                        ReliableInputEvent::MouseButton {
+                            realtime_anchor_sequence,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        })) => *realtime_anchor_sequence,
+        _ => return None,
+    };
+    let split_index = match state.ordinary.front() {
+        Some(QueuedInput::Realtime(realtime)) => realtime
+            .relative_components
+            .iter()
+            .position(|component| component.sequence > anchor)?,
+        _ => return None,
+    };
+    if split_index == 0 {
+        return None;
+    }
+
+    let original = match state.ordinary.pop_front().expect("front must exist") {
+        QueuedInput::Realtime(realtime) => realtime,
+        QueuedInput::Reliable(_) => unreachable!(),
+    };
+    let reliable = state
+        .ordinary
+        .pop_front()
+        .expect("anchored reliable must follow realtime");
+    let protocol_version = original.frame.protocol_version;
+    let session_epoch = original.frame.session_epoch;
+    let mut components = original.relative_components;
+    let suffix = components.split_off(split_index);
+    let prefix =
+        QueuedRealtime::from_relative_components(protocol_version, session_epoch, components);
+
+    for group in group_representable_relative_components(suffix)
+        .into_iter()
+        .rev()
+    {
+        state.ordinary.push_front(QueuedInput::Realtime(
+            QueuedRealtime::from_relative_components(protocol_version, session_epoch, group),
+        ));
+    }
+    state.ordinary.push_front(reliable);
+    Some(prefix)
+}
+
+fn group_representable_relative_components(
+    components: Vec<RelativeComponent>,
+) -> Vec<Vec<RelativeComponent>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_dx = 0_i32;
+    let mut current_dy = 0_i32;
+
+    for component in components {
+        let merged = current_dx
+            .checked_add(component.dx)
+            .zip(current_dy.checked_add(component.dy));
+        if !current.is_empty() && merged.is_none() {
+            groups.push(std::mem::take(&mut current));
+            current_dx = 0;
+            current_dy = 0;
+        }
+        current_dx = current_dx
+            .checked_add(component.dx)
+            .expect("one relative component always fits in i32");
+        current_dy = current_dy
+            .checked_add(component.dy)
+            .expect("one relative component always fits in i32");
+        current.push(component);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
 }
 
 fn inject_realtime(

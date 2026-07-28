@@ -53,7 +53,7 @@ pub trait InjectBackend: Debug + Send + Sync {
     /// Inject an input event.
     fn inject(&mut self, event: InputEvent) -> Result<()>;
 
-    /// Inject a relative pointer delta without querying the current cursor.
+    /// Inject a pointer delta using relative-movement semantics.
     fn inject_relative_pointer(&mut self, _dx: i32, _dy: i32) -> Result<()> {
         anyhow::bail!("relative pointer injection is not supported by this backend")
     }

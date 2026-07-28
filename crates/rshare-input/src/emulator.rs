@@ -546,8 +546,8 @@ impl InputEmulator for MacosNativeInputEmulator {
         self.inner.send_mouse_move(x, y)
     }
 
-    fn move_mouse_relative(&mut self, _dx: i32, _dy: i32) -> Result<()> {
-        anyhow::bail!("Relative mouse movement is not supported by the macOS native emulator")
+    fn move_mouse_relative(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.inner.send_mouse_move_relative(dx, dy)
     }
 
     fn press_button(&mut self, button: MouseButton) -> Result<()> {
@@ -697,6 +697,10 @@ impl crate::backend::InjectBackend for WindowsNativeInputEmulator {
 
     fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
         self.emulate(event)
+    }
+
+    fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> anyhow::Result<()> {
+        self.move_mouse_relative(dx, dy)
     }
 
     fn is_active(&self) -> bool {
@@ -1144,6 +1148,31 @@ mod tests {
         assert!(macos_impl.contains("InputEvent::TextCommit { text } => self.commit_text(&text)?"));
         assert!(macos_impl.contains("fn commit_text(&mut self, text: &str) -> Result<()>"));
         assert!(macos_impl.contains("self.inner.send_text(text)"));
+    }
+
+    #[test]
+    fn production_native_emulators_forward_relative_pointer_to_platform() {
+        let source = include_str!("emulator.rs");
+        let macos_start = source
+            .find("impl InputEmulator for MacosNativeInputEmulator")
+            .expect("missing macOS native emulator");
+        let macos_end = source[macos_start..]
+            .find("impl MacosNativeInputEmulator")
+            .map(|offset| macos_start + offset)
+            .expect("missing end of macOS native emulator trait implementation");
+        let macos_impl = &source[macos_start..macos_end];
+        assert!(macos_impl.contains("self.inner.send_mouse_move_relative(dx, dy)"));
+
+        let windows_backend_start = source
+            .find("impl crate::backend::InjectBackend for WindowsNativeInputEmulator")
+            .expect("missing Windows native backend");
+        let windows_backend_end = source[windows_backend_start..]
+            .find("impl WindowsNativeInputEmulator")
+            .map(|offset| windows_backend_start + offset)
+            .expect("missing end of Windows native backend");
+        let windows_backend = &source[windows_backend_start..windows_backend_end];
+        assert!(windows_backend.contains("fn inject_relative_pointer"));
+        assert!(windows_backend.contains("self.move_mouse_relative(dx, dy)"));
     }
 
     #[cfg(target_os = "windows")]

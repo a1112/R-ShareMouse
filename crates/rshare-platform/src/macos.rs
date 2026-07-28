@@ -259,6 +259,23 @@ mod macos_impl {
             Ok(())
         }
 
+        pub fn send_mouse_move_relative(&mut self, dx: i32, dy: i32) -> Result<()> {
+            if !self.active {
+                return Ok(());
+            }
+
+            let position = current_mouse_position()?;
+            let event = CGEvent::new_mouse_event(
+                new_event_source()?,
+                CGEventType::MouseMoved,
+                CGPoint::new(position.x + dx as f64, position.y + dy as f64),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow!("Failed to create macOS relative mouse move event"))?;
+            event.post(CGEventTapLocation::HID);
+            Ok(())
+        }
+
         pub fn send_button(&mut self, button: u8, down: bool) -> Result<()> {
             if !self.active {
                 return Ok(());
