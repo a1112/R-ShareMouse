@@ -11,6 +11,7 @@ pub mod device;
 pub mod endpoint_events;
 pub mod engine;
 pub mod hardware_assets;
+pub mod input;
 pub mod input_mode;
 pub mod ipc;
 pub mod layout;
@@ -40,6 +41,17 @@ pub use device::{Device, DevicePosition, DeviceRegistry, DeviceStatus, ScreenLay
 // Re-exports from config
 pub use config::Config;
 pub use config::{FeatureConfig, GamepadConfig, GamepadRoutingMode};
+
+// Re-exports from epoch-scoped input contracts
+pub use input::{
+    AcceptRealtime, AcceptReliable, AuthenticatedInputOwner, InputOwnershipGate,
+    PendingReleaseBatch, PressedStateLedger, PressedStateLedgerError, RealtimeInputFrame,
+    RealtimeInputPayload, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, SessionEpoch,
+    SessionEpochError, TransferError, INPUT_PROTOCOL_VERSION,
+};
+
+// Re-exports from monotonic performance contracts used by input frames
+pub use perf::{ClockDomainId, MonotonicStamp};
 
 // Re-exports from hardware asset packs
 pub use hardware_assets::{
