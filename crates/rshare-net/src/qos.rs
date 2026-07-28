@@ -419,7 +419,7 @@ impl PeerTransportHandle {
             connection.clone(),
             LaneDiscriminator::Control,
             control_rx,
-            ControlFrame::into_message,
+            |frame| Ok(frame.into_message()),
             worker_count.clone(),
             awaited_write_probes.clone(),
         );
@@ -784,8 +784,8 @@ impl ControlFrame {
         }
     }
 
-    fn into_message(self) -> Result<Message, TransportSendError> {
-        Ok(self.message)
+    pub fn into_message(self) -> Message {
+        self.message
     }
 }
 

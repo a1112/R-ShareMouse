@@ -11,7 +11,12 @@ use tokio::task::JoinHandle;
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
-    qos::{ClassifiedMessage, ConnectionRegistry, TerminalReleaseEvent, TransportSendError},
+    handshake::PeerAuthContext,
+    qos::{
+        ClassifiedMessage, ConnectionRegistry, ControlFrame, TerminalReleaseEvent,
+        TransportSendError,
+    },
+    transport::PeerInbound,
 };
 use rshare_core::{ControlConnectionId, DeviceId, Message};
 
@@ -21,13 +26,28 @@ pub enum NetworkEvent {
     /// Device discovered
     DeviceFound(DiscoveredDevice),
     /// Device connected
-    DeviceConnected(DeviceId),
+    DeviceConnected(PeerAuthContext),
     /// Device disconnected
-    DeviceDisconnected(DeviceId),
-    /// Message received from device
-    MessageReceived { from: DeviceId, message: Message },
+    DeviceDisconnected {
+        peer_id: DeviceId,
+        control_connection_id: ControlConnectionId,
+    },
+    ControlReceived {
+        auth: Arc<PeerAuthContext>,
+        frame: ControlFrame,
+    },
     /// Connection error
-    ConnectionError { device_id: DeviceId, error: String },
+    ConnectionError {
+        peer_id: Option<DeviceId>,
+        control_connection_id: Option<ControlConnectionId>,
+        error: String,
+    },
+}
+
+pub struct NetworkReceivers {
+    /// Yields one isolated receiver set per authenticated connection generation.
+    pub authenticated_peers: mpsc::Receiver<PeerInbound>,
+    pub events: mpsc::Receiver<NetworkEvent>,
 }
 
 /// Network manager configuration
@@ -71,6 +91,8 @@ pub struct NetworkManager {
 
     event_tx: mpsc::Sender<NetworkEvent>,
     event_rx: Option<mpsc::Receiver<NetworkEvent>>,
+    authenticated_peer_tx: mpsc::Sender<PeerInbound>,
+    authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
 
     discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
     running: bool,
@@ -84,20 +106,52 @@ fn spawn_connection_event_forwarder(
     tokio::spawn(async move {
         while let Some(event) = manager_events.recv().await {
             let network_event = match event {
-                ManagerEvent::Connected(device_id) => NetworkEvent::DeviceConnected(device_id),
-                ManagerEvent::Disconnected(device_id) => {
-                    NetworkEvent::DeviceDisconnected(device_id)
+                ManagerEvent::Connected(auth) => NetworkEvent::DeviceConnected(auth),
+                ManagerEvent::Disconnected {
+                    peer_id,
+                    control_connection_id,
+                } => NetworkEvent::DeviceDisconnected {
+                    peer_id,
+                    control_connection_id,
+                },
+                ManagerEvent::ControlReceived { auth, frame } => {
+                    NetworkEvent::ControlReceived { auth, frame }
                 }
-                ManagerEvent::MessageReceived { from, message } => {
-                    NetworkEvent::MessageReceived { from, message }
-                }
-                ManagerEvent::Error { device_id, error } => {
-                    NetworkEvent::ConnectionError { device_id, error }
+                ManagerEvent::ProtocolError { auth, error } => NetworkEvent::ConnectionError {
+                    peer_id: Some(auth.peer_id),
+                    control_connection_id: Some(auth.control_connection_id),
+                    error,
+                },
+                ManagerEvent::Error {
+                    peer_id,
+                    control_connection_id,
+                    error,
+                } => NetworkEvent::ConnectionError {
+                    peer_id,
+                    control_connection_id,
+                    error,
+                },
+                ManagerEvent::MessageReceived { message, .. } => {
+                    let _ = ClassifiedMessage::try_from(message);
+                    continue;
                 }
             };
 
             if network_tx.send(network_event).await.is_err() {
                 break;
+            }
+        }
+    });
+}
+
+fn spawn_authenticated_peer_forwarder(
+    mut peers: mpsc::Receiver<PeerInbound>,
+    target: mpsc::Sender<PeerInbound>,
+) {
+    tokio::spawn(async move {
+        while let Some(peer) = peers.recv().await {
+            if target.send(peer).await.is_err() {
+                return;
             }
         }
     });
@@ -199,6 +253,7 @@ impl NetworkManager {
     ) -> Self {
         let config = NetworkManagerConfig::default();
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (authenticated_peer_tx, authenticated_peer_rx) = mpsc::channel(32);
 
         let discovery = ServiceDiscovery::new(
             local_device_id,
@@ -221,6 +276,8 @@ impl NetworkManager {
             qos_registry,
             event_tx,
             event_rx: Some(event_rx),
+            authenticated_peer_tx,
+            authenticated_peer_rx: Some(authenticated_peer_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             running: false,
             discovery_task: None,
@@ -236,6 +293,16 @@ impl NetworkManager {
     /// Get the event receiver
     pub fn events(&mut self) -> mpsc::Receiver<NetworkEvent> {
         self.event_rx.take().expect("Event receiver already taken")
+    }
+
+    pub fn receivers(&mut self) -> NetworkReceivers {
+        NetworkReceivers {
+            authenticated_peers: self
+                .authenticated_peer_rx
+                .take()
+                .expect("Authenticated peer receiver already taken"),
+            events: self.event_rx.take().expect("Event receiver already taken"),
+        }
     }
 
     /// Get all discovered devices
@@ -383,14 +450,20 @@ impl NetworkManager {
         self.running = true;
 
         // Start connection manager (server)
-        let connection_events = {
+        let (connection_events, authenticated_peers) = {
             let mut conn = self.connection.lock().await;
             conn.start_server(&self.config.bind_address).await?;
-            conn.events()
+            (conn.events(), conn.authenticated_peers())
         };
 
         if let Some(connection_events) = connection_events {
             spawn_connection_event_forwarder(connection_events, self.event_tx.clone());
+        }
+        if let Some(authenticated_peers) = authenticated_peers {
+            spawn_authenticated_peer_forwarder(
+                authenticated_peers,
+                self.authenticated_peer_tx.clone(),
+            );
         }
 
         // Start discovery with event channel
@@ -524,14 +597,12 @@ fn normalize_discovered_connection_address(
 }
 
 fn discovery_lost_network_event(
-    device_id: DeviceId,
-    transport_connected: bool,
+    _device_id: DeviceId,
+    _transport_connected: bool,
 ) -> Option<NetworkEvent> {
-    if transport_connected {
-        None
-    } else {
-        Some(NetworkEvent::DeviceDisconnected(device_id))
-    }
+    // Discovery expiry is not an authenticated transport generation and must
+    // not synthesize a generation-less disconnect event.
+    None
 }
 
 // Note: NetworkManager intentionally doesn't implement Clone
@@ -664,13 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn discovery_lost_emits_disconnect_when_transport_is_not_connected() {
+    fn discovery_lost_does_not_synthesize_generationless_disconnect() {
         let device_id = DeviceId::new_v4();
 
-        assert!(matches!(
-            discovery_lost_network_event(device_id, false),
-            Some(NetworkEvent::DeviceDisconnected(id)) if id == device_id
-        ));
+        assert!(discovery_lost_network_event(device_id, false).is_none());
     }
 
     #[test]
@@ -908,16 +976,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_connection_message_events_to_network_events() {
+    async fn forwards_typed_control_and_protocol_errors_with_authenticated_generation() {
         let device_id = DeviceId::new_v4();
+        let auth = Arc::new(crate::handshake::PeerAuthContext {
+            peer_id: device_id,
+            certificate_fingerprint: crate::encryption::PeerCertificateFingerprint::from_der(
+                b"peer",
+            ),
+            control_connection_id: ControlConnectionId::new(),
+        });
         let (manager_tx, manager_rx) = mpsc::channel(4);
         let (network_tx, mut network_rx) = mpsc::channel(4);
 
         spawn_connection_event_forwarder(manager_rx, network_tx);
         manager_tx
-            .send(crate::connection::ManagerEvent::MessageReceived {
-                from: device_id,
-                message: Message::MouseMove { x: 1, y: 2 },
+            .send(crate::connection::ManagerEvent::ControlReceived {
+                auth: auth.clone(),
+                frame: crate::qos::ControlFrame::heartbeat(1, 2),
             })
             .await
             .unwrap();
@@ -928,11 +1003,53 @@ mod tests {
             .unwrap();
 
         match event {
-            NetworkEvent::MessageReceived { from, message } => {
-                assert_eq!(from, device_id);
-                assert!(matches!(message, Message::MouseMove { x: 1, y: 2 }));
+            NetworkEvent::ControlReceived {
+                auth: received,
+                frame,
+            } => {
+                assert_eq!(received.control_connection_id, auth.control_connection_id);
+                assert!(matches!(
+                    frame.into_message(),
+                    Message::Heartbeat {
+                        sequence: 1,
+                        timestamp: 2
+                    }
+                ));
             }
             _ => panic!("Wrong network event"),
         }
+
+        manager_tx
+            .send(crate::connection::ManagerEvent::ProtocolError {
+                auth: auth.clone(),
+                error: "unknown qos lane discriminator 255".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            NetworkEvent::ConnectionError {
+                peer_id: Some(id),
+                control_connection_id: Some(generation),
+                error,
+            } if id == device_id
+                && generation == auth.control_connection_id
+                && error.contains("unknown qos lane")
+        ));
+    }
+
+    #[test]
+    fn receivers_are_taken_as_one_typed_set() {
+        let mut manager =
+            NetworkManager::isolated_for_test(DeviceId::new_v4(), "local".into(), "host".into());
+        let NetworkReceivers {
+            authenticated_peers,
+            events,
+        } = manager.receivers();
+        assert!(!authenticated_peers.is_closed());
+        assert!(!events.is_closed());
     }
 }

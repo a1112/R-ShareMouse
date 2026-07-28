@@ -46,7 +46,7 @@ use rshare_input::RDevInputListener;
 use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
     connection::{ConnectionInfo, ConnectionState},
-    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
+    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig, NetworkReceivers,
 };
 use tracing_subscriber::prelude::*;
 
@@ -6894,7 +6894,10 @@ async fn main() -> Result<()> {
             ..Default::default()
         });
 
-    let mut events = network_manager.events();
+    let NetworkReceivers {
+        authenticated_peers: _authenticated_peers,
+        mut events,
+    } = network_manager.receivers();
     let network_manager = Arc::new(Mutex::new(network_manager));
     {
         let mut manager = network_manager.lock().await;
@@ -7162,7 +7165,8 @@ async fn main() -> Result<()> {
                             tracing::warn!("Failed to persist auto-updated layout: {}", err);
                         }
                     }
-                    NetworkEvent::DeviceConnected(id) => {
+                    NetworkEvent::DeviceConnected(auth) => {
+                        let id = auth.peer_id;
                         let (should_advertise_usb, layout_to_save) = {
                             let mut state = state.write().await;
                             let layout_changed = state.mark_connected(&id, true);
@@ -7185,7 +7189,10 @@ async fn main() -> Result<()> {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
                     }
-                    NetworkEvent::DeviceDisconnected(id) => {
+                    NetworkEvent::DeviceDisconnected {
+                        peer_id: id,
+                        control_connection_id: _,
+                    } => {
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
                         state.session.on_target_disconnect(id);
@@ -7197,7 +7204,7 @@ async fn main() -> Result<()> {
                         state.remove_device(&id);
                         sync_local_shortcut_suppression(&state);
                     }
-                    NetworkEvent::MessageReceived { from, message } => {
+                    NetworkEvent::ControlReceived { auth, frame } => {
                         handle_network_message(
                             &state,
                             &network_manager,
@@ -7206,22 +7213,33 @@ async fn main() -> Result<()> {
                             &usb_runtime,
                             &local_events_tx,
                             &endpoint_events_tx,
-                            from,
-                            message,
+                            auth.peer_id,
+                            frame.into_message(),
                         )
                         .await;
                     }
-                    NetworkEvent::ConnectionError { device_id, error } => {
-                        tracing::warn!("Connection error to {}: {}", device_id, error);
-                        let mut state = state.write().await;
-                        state.session.on_target_disconnect(device_id);
-                        fail_pending_usb_for_device(
-                            &mut state,
-                            device_id,
-                            "USB probe target connection failed.",
+                    NetworkEvent::ConnectionError {
+                        peer_id,
+                        control_connection_id,
+                        error,
+                    } => {
+                        tracing::warn!(
+                            "Connection error to {:?} generation {:?}: {}",
+                            peer_id,
+                            control_connection_id,
+                            error
                         );
-                        state.mark_connected(&device_id, false);
-                        sync_local_shortcut_suppression(&state);
+                        if let Some(device_id) = peer_id {
+                            let mut state = state.write().await;
+                            state.session.on_target_disconnect(device_id);
+                            fail_pending_usb_for_device(
+                                &mut state,
+                                device_id,
+                                "USB probe target connection failed.",
+                            );
+                            state.mark_connected(&device_id, false);
+                            sync_local_shortcut_suppression(&state);
+                        }
                     }
                 }
             }

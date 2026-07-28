@@ -55,7 +55,7 @@ async fn event_until_connected(
     timeout(Duration::from_secs(2), async {
         loop {
             match events.recv().await? {
-                ManagerEvent::Connected(id) => return Some(id),
+                ManagerEvent::Connected(auth) => return Some(auth.peer_id),
                 _ => {}
             }
         }
@@ -153,7 +153,7 @@ async fn changed_fingerprint_never_enters_registry() {
     let no_connected = timeout(Duration::from_millis(350), async {
         while let Some(event) = events.recv().await {
             assert!(
-                !matches!(event, ManagerEvent::Connected(id) if id == claimed_id),
+                !matches!(event, ManagerEvent::Connected(auth) if auth.peer_id == claimed_id),
                 "changed fingerprint entered the canonical registry"
             );
         }
@@ -209,7 +209,7 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     server.disconnect(&client_id).await.unwrap();
     assert!(matches!(
         timeout(Duration::from_secs(1), events.recv()).await,
-        Ok(Some(ManagerEvent::Disconnected(id))) if id == client_id
+        Ok(Some(ManagerEvent::Disconnected { peer_id, .. })) if peer_id == client_id
     ));
     assert!(server.connections().is_empty());
 

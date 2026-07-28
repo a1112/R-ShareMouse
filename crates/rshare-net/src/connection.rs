@@ -12,9 +12,10 @@ use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
 use super::qos::{
-    ClassifiedMessage, ConnectionRegistry, RegisteredPeer, TerminalReleaseEvent, TransportSendError,
+    ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TerminalReleaseEvent,
+    TransportSendError,
 };
-use super::transport::{ConnectionPool, QuicTransport};
+use super::transport::{ConnectionPool, PeerInbound, QuicTransport, TransportProtocolError};
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,10 +73,28 @@ impl ConnectionInfo {
 /// Connection manager event
 #[derive(Debug, Clone)]
 pub enum ManagerEvent {
-    Connected(DeviceId),
-    Disconnected(DeviceId),
-    MessageReceived { from: DeviceId, message: Message },
-    Error { device_id: DeviceId, error: String },
+    Connected(super::handshake::PeerAuthContext),
+    Disconnected {
+        peer_id: DeviceId,
+        control_connection_id: ControlConnectionId,
+    },
+    MessageReceived {
+        from: DeviceId,
+        message: Message,
+    },
+    ControlReceived {
+        auth: Arc<super::handshake::PeerAuthContext>,
+        frame: ControlFrame,
+    },
+    ProtocolError {
+        auth: Arc<super::handshake::PeerAuthContext>,
+        error: String,
+    },
+    Error {
+        peer_id: Option<DeviceId>,
+        control_connection_id: Option<ControlConnectionId>,
+        error: String,
+    },
 }
 
 #[derive(Clone)]
@@ -94,11 +113,11 @@ pub(crate) struct ConnectionView {
 
 impl ConnectionView {
     pub(crate) async fn connection_infos(&self) -> Vec<ConnectionInfo> {
-        collect_connection_infos(&self.connections, &self.pool).await
+        collect_connection_infos(&self.connections, &self.pool)
     }
 
     pub(crate) async fn is_connected(&self, device_id: &DeviceId) -> bool {
-        self.pool.diagnostics_for(device_id).await.is_some()
+        self.pool.diagnostics_for_now(device_id).is_some()
     }
 
     pub(crate) async fn send_legacy(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
@@ -187,7 +206,7 @@ impl ConnectionView {
     }
 }
 
-async fn collect_connection_infos(
+fn collect_connection_infos(
     connections: &CanonicalConnections,
     pool: &ConnectionPool,
 ) -> Vec<ConnectionInfo> {
@@ -197,7 +216,7 @@ async fn collect_connection_infos(
         .iter()
         .map(|(device_id, connection)| (*device_id, connection.info.clone()))
         .collect();
-    let active_diagnostics = pool.diagnostics_all().await;
+    let active_diagnostics = pool.diagnostics_all_now();
     let active_device_ids: std::collections::HashSet<_> = active_diagnostics
         .iter()
         .map(|(device_id, _)| *device_id)
@@ -266,8 +285,78 @@ pub struct ConnectionManager {
     pool: Arc<ConnectionPool>,
     event_tx: mpsc::Sender<ManagerEvent>,
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
+    authenticated_peer_tx: mpsc::Sender<PeerInbound>,
+    authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
+}
+
+fn spawn_control_event_reader(
+    auth: Arc<super::handshake::PeerAuthContext>,
+    generation: u64,
+    mut controls: mpsc::Receiver<ControlFrame>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    connections: CanonicalConnections,
+    lifecycle_lock: Arc<TokioMutex<()>>,
+) {
+    tokio::spawn(async move {
+        while let Some(frame) = controls.recv().await {
+            let permit = event_tx.reserve().await.ok();
+            let _lifecycle = lifecycle_lock.lock().await;
+            if !is_current_generation(&connections, auth.peer_id, generation)
+                || !connections
+                    .read()
+                    .expect("canonical connection registry poisoned")
+                    .get(&auth.peer_id)
+                    .is_some_and(|connection| {
+                        connection.info.control_connection_id == Some(auth.control_connection_id)
+                    })
+            {
+                return;
+            }
+            let Some(permit) = permit else {
+                return;
+            };
+            permit.send(ManagerEvent::ControlReceived {
+                auth: auth.clone(),
+                frame,
+            });
+        }
+    });
+}
+
+fn spawn_protocol_error_reader(
+    generation: u64,
+    mut errors: mpsc::Receiver<TransportProtocolError>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    connections: CanonicalConnections,
+    lifecycle_lock: Arc<TokioMutex<()>>,
+) {
+    tokio::spawn(async move {
+        while let Some(error) = errors.recv().await {
+            let permit = event_tx.reserve().await.ok();
+            let _lifecycle = lifecycle_lock.lock().await;
+            if !is_current_generation(&connections, error.auth.peer_id, generation)
+                || !connections
+                    .read()
+                    .expect("canonical connection registry poisoned")
+                    .get(&error.auth.peer_id)
+                    .is_some_and(|connection| {
+                        connection.info.control_connection_id
+                            == Some(error.auth.control_connection_id)
+                    })
+            {
+                return;
+            }
+            let Some(permit) = permit else {
+                return;
+            };
+            permit.send(ManagerEvent::ProtocolError {
+                auth: error.auth,
+                error: error.error,
+            });
+        }
+    });
 }
 
 fn spawn_message_reader(
@@ -407,9 +496,14 @@ async fn retire_generation(
         if let Some(connection_id) = connection_id {
             qos_registry.remove_if_generation(device_id, connection_id);
         }
-        pool.remove_generation(&device_id, generation).await;
+        pool.remove_generation_now(&device_id, generation);
         if let Some(permit) = permit {
-            permit.send(ManagerEvent::Disconnected(device_id));
+            if let Some(control_connection_id) = connection_id {
+                permit.send(ManagerEvent::Disconnected {
+                    peer_id: device_id,
+                    control_connection_id,
+                });
+            }
         }
     }
     removed_current
@@ -430,6 +524,7 @@ impl ConnectionManager {
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (authenticated_peer_tx, authenticated_peer_rx) = mpsc::channel(32);
         let (terminal_release_tx, terminal_release_rx) = mpsc::channel(32);
         transport.require_peer_protocol_handshake();
         let pool = Arc::new(ConnectionPool::new(local_device_id));
@@ -444,6 +539,8 @@ impl ConnectionManager {
             pool,
             event_tx,
             event_rx: Some(event_rx),
+            authenticated_peer_tx,
+            authenticated_peer_rx: Some(authenticated_peer_rx),
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
         }
@@ -460,6 +557,7 @@ impl ConnectionManager {
         let lifecycle_lock = self.lifecycle_lock.clone();
         let qos_registry = self.qos_registry.clone();
         let terminal_release_tx = self.terminal_release_tx.clone();
+        let authenticated_peer_tx = self.authenticated_peer_tx.clone();
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -482,43 +580,74 @@ impl ConnectionManager {
                 let device_id = negotiated.auth.peer_id;
                 let address = incoming.address.to_string();
                 incoming.connection.set_device_id(device_id);
+                let mut candidate_connection = Some(incoming.connection);
                 let mut event_permits = event_tx.reserve_many(2).await.ok();
+                let peer_permit = match authenticated_peer_tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        candidate_connection
+                            .take()
+                            .expect("incoming connection candidate must be present")
+                            .close()
+                            .await;
+                        continue;
+                    }
+                };
 
                 let installed = {
                     let _lifecycle = lifecycle_lock.lock().await;
-                    if pool.diagnostics_for(&device_id).await.is_some() {
-                        incoming.connection.close().await;
+                    if pool.diagnostics_for_now(&device_id).is_some() {
                         None
                     } else {
                         let removed_canonical = connections
                             .write()
                             .expect("canonical connection registry poisoned")
-                            .remove(&device_id)
-                            .is_some();
-                        let removed_pool = pool.remove(&device_id).await.is_some();
-                        if removed_canonical || removed_pool {
+                            .remove(&device_id);
+                        let removed_pool = pool.remove_now(&device_id).is_some();
+                        if let Some(control_connection_id) = removed_canonical
+                            .as_ref()
+                            .and_then(|connection| connection.info.control_connection_id)
+                        {
                             if let Some(permit) =
                                 event_permits.as_mut().and_then(|permits| permits.next())
                             {
-                                permit.send(ManagerEvent::Disconnected(device_id));
+                                permit.send(ManagerEvent::Disconnected {
+                                    peer_id: device_id,
+                                    control_connection_id,
+                                });
                             }
+                        } else if removed_pool {
+                            tracing::debug!(
+                                "Removed stale pool entry without authenticated generation for {}",
+                                device_id
+                            );
                         }
 
                         let generation = allocate_generation(&next_generation);
                         let auth = Arc::new(negotiated.auth.clone());
-                        let (qos_transport, releases) =
-                            incoming.connection.install_qos(auth.clone());
+                        let mut connection = candidate_connection
+                            .take()
+                            .expect("incoming connection candidate must be present");
+                        let (qos_transport, releases) = connection.install_qos(auth.clone());
+                        let peer_inbound = connection
+                            .take_peer_inbound()
+                            .expect("authenticated QoS install must expose peer inbound");
+                        let control_events = connection
+                            .take_control_events()
+                            .expect("authenticated QoS install must expose control events");
+                        let protocol_errors = connection
+                            .take_protocol_errors()
+                            .expect("authenticated QoS install must expose protocol errors");
                         qos_registry.insert(
                             device_id,
                             RegisteredPeer {
-                                auth,
+                                auth: auth.clone(),
                                 transport: qos_transport,
                             },
                         );
                         forward_terminal_releases(releases, terminal_release_tx.clone());
-                        let messages = incoming.connection.message_channel();
-                        pool.insert_with_generation(device_id, generation, incoming.connection)
-                            .await;
+                        let messages = connection.message_channel();
+                        pool.insert_with_generation_now(device_id, generation, connection);
                         let mut info = ConnectionInfo::new(device_id, address);
                         info.state = ConnectionState::Connected;
                         info.cert_trust_state = Some("trusted".to_string());
@@ -530,19 +659,55 @@ impl ConnectionManager {
                         let connected_event_sent = if let Some(permit) =
                             event_permits.as_mut().and_then(|permits| permits.next())
                         {
-                            permit.send(ManagerEvent::Connected(device_id));
+                            permit.send(ManagerEvent::Connected(negotiated.auth.clone()));
                             true
                         } else {
                             false
                         };
-                        Some((generation, messages, connected_event_sent))
+                        peer_permit.send(peer_inbound);
+                        Some((
+                            generation,
+                            auth,
+                            messages,
+                            control_events,
+                            protocol_errors,
+                            connected_event_sent,
+                        ))
                     }
                 };
 
-                let Some((generation, messages, connected_event_sent)) = installed else {
+                let Some((
+                    generation,
+                    auth,
+                    messages,
+                    control_events,
+                    protocol_errors,
+                    connected_event_sent,
+                )) = installed
+                else {
+                    candidate_connection
+                        .take()
+                        .expect("duplicate incoming connection candidate must be present")
+                        .close()
+                        .await;
                     continue;
                 };
 
+                spawn_control_event_reader(
+                    auth,
+                    generation,
+                    control_events,
+                    event_tx.clone(),
+                    connections.clone(),
+                    lifecycle_lock.clone(),
+                );
+                spawn_protocol_error_reader(
+                    generation,
+                    protocol_errors,
+                    event_tx.clone(),
+                    connections.clone(),
+                    lifecycle_lock.clone(),
+                );
                 let _reader_task = spawn_message_reader(
                     device_id,
                     generation,
@@ -567,7 +732,7 @@ impl ConnectionManager {
     pub async fn connect(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
         {
             let _lifecycle = self.lifecycle_lock.lock().await;
-            if self.pool.diagnostics_for(&device_id).await.is_some() {
+            if self.pool.diagnostics_for_now(&device_id).is_some() {
                 anyhow::bail!("Already connected to device {}", device_id);
             }
         }
@@ -578,7 +743,8 @@ impl ConnectionManager {
                 let _ = self
                     .event_tx
                     .send(ManagerEvent::Error {
-                        device_id,
+                        peer_id: Some(device_id),
+                        control_connection_id: None,
                         error: error.to_string(),
                     })
                     .await;
@@ -592,7 +758,8 @@ impl ConnectionManager {
                 let _ = self
                     .event_tx
                     .send(ManagerEvent::Error {
-                        device_id,
+                        peer_id: Some(device_id),
+                        control_connection_id: None,
                         error: error.to_string(),
                     })
                     .await;
@@ -609,42 +776,88 @@ impl ConnectionManager {
         }
 
         conn.set_device_id(device_id);
+        let peer_permit = match self.authenticated_peer_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                conn.close().await;
+                anyhow::bail!("Authenticated peer receiver queue is unavailable");
+            }
+        };
         let auth = Arc::new(negotiated.auth.clone());
         let (qos_transport, releases) = conn.install_qos(auth.clone());
+        let peer_inbound = conn
+            .take_peer_inbound()
+            .expect("authenticated QoS install must expose peer inbound");
+        let control_events = conn
+            .take_control_events()
+            .expect("authenticated QoS install must expose control events");
+        let protocol_errors = conn
+            .take_protocol_errors()
+            .expect("authenticated QoS install must expose protocol errors");
         let messages = conn.message_channel();
         let connected_permit = self.event_tx.reserve().await.ok();
-        let generation;
-        {
+        let mut candidate_connection = Some(conn);
+        let installation = {
             let _lifecycle = self.lifecycle_lock.lock().await;
-            if self.pool.diagnostics_for(&device_id).await.is_some() {
-                conn.close().await;
+            if self.pool.diagnostics_for_now(&device_id).is_some() {
+                Err(candidate_connection
+                    .take()
+                    .expect("outbound connection candidate must be present"))
+            } else {
+                let generation = allocate_generation(&self.next_generation);
+                self.qos_registry.insert(
+                    device_id,
+                    RegisteredPeer {
+                        auth: auth.clone(),
+                        transport: qos_transport,
+                    },
+                );
+                forward_terminal_releases(releases, self.terminal_release_tx.clone());
+                self.pool.insert_with_generation_now(
+                    device_id,
+                    generation,
+                    candidate_connection
+                        .take()
+                        .expect("outbound connection candidate must be present"),
+                );
+                let mut info = ConnectionInfo::new(device_id, address.to_string());
+                info.state = ConnectionState::Connected;
+                info.cert_trust_state = Some("trusted".to_string());
+                info.control_connection_id = Some(negotiated.auth.control_connection_id);
+                self.connections
+                    .write()
+                    .expect("canonical connection registry poisoned")
+                    .insert(device_id, CanonicalConnection { generation, info });
+                if let Some(permit) = connected_permit {
+                    permit.send(ManagerEvent::Connected(negotiated.auth.clone()));
+                }
+                peer_permit.send(peer_inbound);
+                Ok(generation)
+            }
+        };
+        let generation = match installation {
+            Ok(generation) => generation,
+            Err(connection) => {
+                connection.close().await;
                 anyhow::bail!("Already connected to device {}", device_id);
             }
-            generation = allocate_generation(&self.next_generation);
-            self.qos_registry.insert(
-                device_id,
-                RegisteredPeer {
-                    auth,
-                    transport: qos_transport,
-                },
-            );
-            forward_terminal_releases(releases, self.terminal_release_tx.clone());
-            self.pool
-                .insert_with_generation(device_id, generation, conn)
-                .await;
-            let mut info = ConnectionInfo::new(device_id, address.to_string());
-            info.state = ConnectionState::Connected;
-            info.cert_trust_state = Some("trusted".to_string());
-            info.control_connection_id = Some(negotiated.auth.control_connection_id);
-            self.connections
-                .write()
-                .expect("canonical connection registry poisoned")
-                .insert(device_id, CanonicalConnection { generation, info });
-            if let Some(permit) = connected_permit {
-                permit.send(ManagerEvent::Connected(device_id));
-            }
-        }
+        };
 
+        spawn_control_event_reader(
+            auth,
+            generation,
+            control_events,
+            self.event_tx.clone(),
+            self.connections.clone(),
+            self.lifecycle_lock.clone(),
+        );
+        spawn_protocol_error_reader(
+            generation,
+            protocol_errors,
+            self.event_tx.clone(),
+            self.connections.clone(),
+            self.lifecycle_lock.clone(),
+        );
         let _reader_task = spawn_message_reader(
             device_id,
             generation,
@@ -675,7 +888,7 @@ impl ConnectionManager {
                 self.qos_registry
                     .remove_if_generation(*device_id, connection_id);
             }
-            let removed_pool_connection = self.pool.remove(device_id).await;
+            let removed_pool_connection = self.pool.remove_now(device_id);
             (removed_connection_info, removed_pool_connection)
         };
 
@@ -684,8 +897,16 @@ impl ConnectionManager {
             connection.close().await;
         }
         if removed_connection_info.is_some() || removed_pool {
-            if let Some(permit) = disconnected_permit {
-                permit.send(ManagerEvent::Disconnected(*device_id));
+            if let (Some(permit), Some(control_connection_id)) = (
+                disconnected_permit,
+                removed_connection_info
+                    .as_ref()
+                    .and_then(|connection| connection.info.control_connection_id),
+            ) {
+                permit.send(ManagerEvent::Disconnected {
+                    peer_id: *device_id,
+                    control_connection_id,
+                });
             }
         }
         Ok(())
@@ -767,6 +988,10 @@ impl ConnectionManager {
         self.event_rx.take()
     }
 
+    pub fn authenticated_peers(&mut self) -> Option<mpsc::Receiver<PeerInbound>> {
+        self.authenticated_peer_rx.take()
+    }
+
     pub fn terminal_release_events(&mut self) -> Option<mpsc::Receiver<TerminalReleaseEvent>> {
         self.terminal_release_rx.take()
     }
@@ -801,17 +1026,17 @@ impl ConnectionManager {
 
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        collect_connection_infos(&self.connections, &self.pool).await
+        collect_connection_infos(&self.connections, &self.pool)
     }
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        self.pool.diagnostics_for(device_id).await.is_some()
+        self.pool.diagnostics_for_now(device_id).is_some()
     }
 
     pub async fn connected_count(&self) -> usize {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        self.pool.diagnostics_all().await.len()
+        self.pool.diagnostics_all_now().len()
     }
 
     pub async fn cleanup_stale(&mut self, timeout: Duration) -> Vec<DeviceId> {
@@ -1236,7 +1461,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: Some("trusted".to_string()),
-                control_connection_id: None,
+                control_connection_id: Some(ControlConnectionId::new()),
             },
         );
         manager
@@ -1305,6 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn message_reader_emits_disconnected_when_channel_closes() {
         let device_id = DeviceId::new_v4();
+        let control_connection_id = ControlConnectionId::new();
         let mut manager = ConnectionManager::isolated_for_test(DeviceId::new_v4());
         let generation = insert_test_canonical(
             &manager,
@@ -1322,7 +1548,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
-                control_connection_id: None,
+                control_connection_id: Some(control_connection_id),
             },
         );
         let (_message_tx, message_rx) = mpsc::channel(1);
@@ -1346,7 +1572,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(matches!(event, ManagerEvent::Disconnected(id) if id == device_id));
+        assert!(matches!(
+            event,
+            ManagerEvent::Disconnected { peer_id, .. } if peer_id == device_id
+        ));
     }
 
     #[tokio::test]
@@ -1427,6 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn retirement_waiting_for_event_capacity_does_not_hold_lifecycle() {
         let device_id = DeviceId::new_v4();
+        let control_connection_id = ControlConnectionId::new();
         let mut manager = ConnectionManager::isolated_for_test(DeviceId::new_v4());
         let generation = insert_test_canonical(
             &manager,
@@ -1444,13 +1674,17 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
-                control_connection_id: None,
+                control_connection_id: Some(control_connection_id),
             },
         );
         let mut events = manager.events().unwrap();
         while manager
             .event_tx
-            .try_send(ManagerEvent::Connected(DeviceId::new_v4()))
+            .try_send(ManagerEvent::Error {
+                peer_id: None,
+                control_connection_id: None,
+                error: "fill".into(),
+            })
             .is_ok()
         {}
         assert_eq!(manager.event_tx.capacity(), 0);
@@ -1488,7 +1722,8 @@ mod tests {
             loop {
                 if matches!(
                     events.recv().await,
-                    Some(ManagerEvent::Disconnected(disconnected)) if disconnected == device_id
+                    Some(ManagerEvent::Disconnected { peer_id: disconnected, .. })
+                        if disconnected == device_id
                 ) {
                     break;
                 }
@@ -1605,12 +1840,19 @@ mod tests {
             );
         manager
             .event_tx
-            .send(ManagerEvent::Connected(remote_id))
+            .send(ManagerEvent::Error {
+                peer_id: Some(remote_id),
+                control_connection_id: Some(replacement_control_id),
+                error: "replacement-installed".into(),
+            })
             .await
             .unwrap();
         assert!(matches!(
             events.recv().await,
-            Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+            Some(ManagerEvent::Error {
+                peer_id: Some(device_id),
+                ..
+            }) if device_id == remote_id
         ));
 
         drop(old_message_tx);
@@ -1670,8 +1912,9 @@ mod tests {
         assert!(matches!(
             event,
             ManagerEvent::Error {
-                device_id,
-                error: _
+                peer_id: Some(device_id),
+                error: _,
+                ..
             } if device_id == remote_id
         ));
     }
@@ -1680,6 +1923,7 @@ mod tests {
     async fn explicit_disconnect_emits_disconnected_event() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
+        let control_connection_id = ControlConnectionId::new();
         let mut manager = ConnectionManager::isolated_for_test(local_id);
         insert_test_canonical(
             &manager,
@@ -1697,7 +1941,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
-                control_connection_id: None,
+                control_connection_id: Some(control_connection_id),
             },
         );
         let mut events = manager.events().unwrap();
@@ -1709,7 +1953,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(matches!(event, ManagerEvent::Disconnected(id) if id == remote_id));
+        assert!(matches!(
+            event,
+            ManagerEvent::Disconnected { peer_id, .. } if peer_id == remote_id
+        ));
     }
 
     #[tokio::test]
@@ -1730,7 +1977,7 @@ mod tests {
             loop {
                 if matches!(
                     remote_events.recv().await,
-                    Some(ManagerEvent::Connected(id)) if id == local_id
+                    Some(ManagerEvent::Connected(auth)) if auth.peer_id == local_id
                 ) {
                     break;
                 }
@@ -1745,7 +1992,7 @@ mod tests {
             loop {
                 if matches!(
                     remote_events.recv().await,
-                    Some(ManagerEvent::Disconnected(id)) if id == local_id
+                    Some(ManagerEvent::Disconnected { peer_id: id, .. }) if id == local_id
                 ) {
                     break;
                 }
@@ -1869,7 +2116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_emits_message_received_for_connected_device() {
+    async fn manager_emits_control_received_for_connected_device() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut remote_manager = ConnectionManager::isolated_for_test(remote_id);
@@ -1886,8 +2133,8 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let ManagerEvent::Connected(device_id) = remote_events.recv().await.unwrap() {
-                    assert_eq!(device_id, local_id);
+                if let ManagerEvent::Connected(auth) = remote_events.recv().await.unwrap() {
+                    assert_eq!(auth.peer_id, local_id);
                     break;
                 }
             }
@@ -1896,15 +2143,21 @@ mod tests {
         .unwrap();
 
         remote_manager
-            .send_to(&local_id, Message::MouseMove { x: 7, y: 9 })
+            .send_to(
+                &local_id,
+                Message::Heartbeat {
+                    sequence: 7,
+                    timestamp: 9,
+                },
+            )
             .await
             .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match events.recv().await.unwrap() {
-                    ManagerEvent::MessageReceived { from, message } => {
-                        break (from, message);
+                    ManagerEvent::ControlReceived { auth, frame } => {
+                        break (auth.peer_id, frame.into_message());
                     }
                     _ => {}
                 }
@@ -1914,11 +2167,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(received.0, remote_id);
-        assert!(matches!(received.1, Message::MouseMove { x: 7, y: 9 }));
+        assert!(matches!(
+            received.1,
+            Message::Heartbeat {
+                sequence: 7,
+                timestamp: 9
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn manager_emits_message_received_for_incoming_connection() {
+    async fn manager_publishes_one_typed_inbound_set_and_generation_aware_control_event() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = ConnectionManager::isolated_for_test(server_id);
+        let mut events = server.events().unwrap();
+        let mut authenticated = server.authenticated_peers().unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.transport_local_addr().unwrap();
+
+        let mut client = ConnectionManager::isolated_for_test(client_id);
+        client
+            .connect(server_id, &address.to_string())
+            .await
+            .unwrap();
+
+        let peer = tokio::time::timeout(Duration::from_secs(1), authenticated.recv())
+            .await
+            .expect("authenticated connection must publish its typed inbound set")
+            .unwrap();
+        assert_eq!(peer.auth.peer_id, client_id);
+        assert!(
+            authenticated.try_recv().is_err(),
+            "one connection generation must publish exactly one receiver set"
+        );
+
+        client
+            .send_to(
+                &server_id,
+                Message::Heartbeat {
+                    sequence: 41,
+                    timestamp: 43,
+                },
+            )
+            .await
+            .unwrap();
+        let (auth, _frame) = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ManagerEvent::ControlReceived { auth, frame } = events.recv().await.unwrap()
+                {
+                    break (auth, frame);
+                }
+            }
+        })
+        .await
+        .expect("control compatibility event must be forwarded");
+        assert_eq!(auth.peer_id, client_id);
+        assert_eq!(
+            auth.control_connection_id, peer.auth.control_connection_id,
+            "control event must retain the authenticated generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_emits_control_received_for_incoming_connection() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
 
@@ -1933,15 +2245,21 @@ mod tests {
             .await
             .unwrap();
         remote_manager
-            .send_to(&local_id, Message::MouseMove { x: 11, y: 13 })
+            .send_to(
+                &local_id,
+                Message::Heartbeat {
+                    sequence: 11,
+                    timestamp: 13,
+                },
+            )
             .await
             .unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match events.recv().await.unwrap() {
-                    ManagerEvent::MessageReceived { from, message } => {
-                        break (from, message);
+                    ManagerEvent::ControlReceived { auth, frame } => {
+                        break (auth.peer_id, frame.into_message());
                     }
                     _ => {}
                 }
@@ -1950,7 +2268,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(received.1, Message::MouseMove { x: 11, y: 13 }));
+        assert!(matches!(
+            received.1,
+            Message::Heartbeat {
+                sequence: 11,
+                timestamp: 13
+            }
+        ));
 
         let connection_infos = manager.connection_infos().await;
         assert!(connection_infos.iter().any(|info| {
@@ -1984,8 +2308,8 @@ mod tests {
 
         let connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let ManagerEvent::Connected(device_id) = events.recv().await.unwrap() {
-                    break device_id;
+                if let ManagerEvent::Connected(auth) = events.recv().await.unwrap() {
+                    break auth.peer_id;
                 }
             }
         })
@@ -2018,7 +2342,7 @@ mod tests {
             loop {
                 if matches!(
                     events.recv().await,
-                    Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+                    Some(ManagerEvent::Connected(auth)) if auth.peer_id == remote_id
                 ) {
                     break;
                 }
@@ -2047,7 +2371,7 @@ mod tests {
             loop {
                 if matches!(
                     events.recv().await,
-                    Some(ManagerEvent::Connected(device_id)) if device_id == remote_id
+                    Some(ManagerEvent::Connected(auth)) if auth.peer_id == remote_id
                 ) {
                     break;
                 }
@@ -2070,20 +2394,32 @@ mod tests {
         );
 
         first_peer
-            .send_to(&local_id, Message::MouseMove { x: 31, y: 37 })
+            .send_to(
+                &local_id,
+                Message::Heartbeat {
+                    sequence: 31,
+                    timestamp: 37,
+                },
+            )
             .await
             .unwrap();
         let received = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(ManagerEvent::MessageReceived { from, message }) = events.recv().await {
-                    break (from, message);
+                if let Some(ManagerEvent::ControlReceived { auth, frame }) = events.recv().await {
+                    break (auth.peer_id, frame.into_message());
                 }
             }
         })
         .await
         .expect("the original inbound connection should remain usable");
         assert_eq!(received.0, remote_id);
-        assert!(matches!(received.1, Message::MouseMove { x: 31, y: 37 }));
+        assert!(matches!(
+            received.1,
+            Message::Heartbeat {
+                sequence: 31,
+                timestamp: 37
+            }
+        ));
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -2114,8 +2450,8 @@ mod tests {
 
         let connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let ManagerEvent::Connected(device_id) = events.recv().await.unwrap() {
-                    break device_id;
+                if let ManagerEvent::Connected(auth) = events.recv().await.unwrap() {
+                    break auth.peer_id;
                 }
             }
         })
@@ -2175,7 +2511,8 @@ mod tests {
             loop {
                 if matches!(
                     events.recv().await,
-                    Some(ManagerEvent::Disconnected(device_id)) if device_id == remote_id
+                    Some(ManagerEvent::Disconnected { peer_id: device_id, .. })
+                        if device_id == remote_id
                 ) {
                     break;
                 }
@@ -2205,9 +2542,9 @@ mod tests {
 
         let replacement_connected = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(ManagerEvent::Connected(device_id)) = events.recv().await {
-                    if device_id == remote_id {
-                        break device_id;
+                if let Some(ManagerEvent::Connected(auth)) = events.recv().await {
+                    if auth.peer_id == remote_id {
+                        break auth.peer_id;
                     }
                 }
             }
@@ -2220,7 +2557,9 @@ mod tests {
         let stale_disconnect = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 match events.recv().await {
-                    Some(ManagerEvent::Disconnected(device_id)) if device_id == remote_id => {
+                    Some(ManagerEvent::Disconnected {
+                        peer_id: device_id, ..
+                    }) if device_id == remote_id => {
                         break Some(device_id);
                     }
                     Some(_) => {}
