@@ -3,23 +3,25 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use quinn::{
-    crypto::rustls::QuicClientConfig, ClientConfig, Endpoint, IdleTimeout,
-    ServerConfig as QuinnServerConfig, TransportConfig as QuinnTransportConfig, VarInt,
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    ClientConfig, Endpoint, IdleTimeout, ServerConfig as QuinnServerConfig,
+    TransportConfig as QuinnTransportConfig, VarInt,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-    DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    server::danger::{ClientCertVerified, ClientCertVerifier},
+    DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme,
 };
 use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify};
 
 use super::codec::{ControlMessageCodec, RealtimeInputCodec};
 use super::encryption::{
@@ -77,6 +79,8 @@ pub struct QuicTransport {
     incoming_tx: mpsc::Sender<IncomingConnection>,
     incoming_rx: Option<mpsc::Receiver<IncomingConnection>>,
     trust_store_path: Option<PathBuf>,
+    present_client_certificate: bool,
+    peer_protocol_handshake_required: bool,
 }
 
 pub struct IncomingConnection {
@@ -107,7 +111,15 @@ impl QuicTransport {
             incoming_tx,
             incoming_rx: Some(incoming_rx),
             trust_store_path: None,
+            present_client_certificate: true,
+            peer_protocol_handshake_required: false,
         }
+    }
+
+    pub fn with_identity(local_device_id: DeviceId, identity: QuicIdentity) -> Self {
+        let mut transport = Self::new(local_device_id);
+        transport.identity = identity;
+        transport
     }
 
     pub fn with_config(mut self, config: TransportConfig) -> Self {
@@ -118,6 +130,15 @@ impl QuicTransport {
     pub fn with_trust_store_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.trust_store_path = Some(path.into());
         self
+    }
+
+    pub fn without_client_certificate(mut self) -> Self {
+        self.present_client_certificate = false;
+        self
+    }
+
+    pub(crate) fn require_peer_protocol_handshake(&mut self) {
+        self.peer_protocol_handshake_required = true;
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -145,6 +166,11 @@ impl QuicTransport {
         let incoming_tx = self.incoming_tx.clone();
         let local_device_id = self.local_device_id;
         let config = self.config.clone();
+        let trust_store_path = match &self.trust_store_path {
+            Some(path) => path.clone(),
+            None => super::encryption::trust_store_path()?,
+        };
+        let peer_protocol_handshake_required = self.peer_protocol_handshake_required;
         let accept_endpoint = endpoint.clone();
 
         let server_task = tokio::spawn(async move {
@@ -152,6 +178,7 @@ impl QuicTransport {
                 let incoming_tx = incoming_tx.clone();
                 let endpoint = accept_endpoint.clone();
                 let config = config.clone();
+                let trust_store_path = trust_store_path.clone();
 
                 tokio::spawn(async move {
                     match connecting.await {
@@ -165,6 +192,8 @@ impl QuicTransport {
                                 addr,
                                 config,
                                 None,
+                                trust_store_path,
+                                peer_protocol_handshake_required,
                             );
 
                             let _ = incoming_tx
@@ -202,7 +231,11 @@ impl QuicTransport {
         ensure_rustls_crypto_provider();
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .context("Failed to create QUIC client endpoint")?;
-        endpoint.set_default_client_config(make_client_config(&self.config)?);
+        endpoint.set_default_client_config(make_client_config(
+            &self.identity,
+            &self.config,
+            self.present_client_certificate,
+        )?);
 
         let connection = endpoint
             .connect(remote_addr, "rshare.local")
@@ -215,7 +248,7 @@ impl QuicTransport {
             None => super::encryption::trust_store_path()?,
         };
         let pending_peer_trust =
-            inspect_outbound_peer_trust(&connection, device_id, trust_store_path).await?;
+            inspect_outbound_peer_trust(&connection, device_id, trust_store_path.clone()).await?;
 
         info!("Connected to QUIC peer {}", connection.remote_address());
 
@@ -226,6 +259,8 @@ impl QuicTransport {
             remote_addr,
             self.config.clone(),
             Some(pending_peer_trust),
+            trust_store_path,
+            self.peer_protocol_handshake_required,
         ))
     }
 
@@ -276,6 +311,8 @@ struct QuicConnectionInner {
     datagram_tx_dropped: AtomicU64,
     reliable_stream_reset_count: AtomicU64,
     last_datagram_rx_us: AtomicU64,
+    bootstrap_complete: AtomicBool,
+    bootstrap_notify: Notify,
 }
 
 impl Drop for QuicConnectionInner {
@@ -293,6 +330,8 @@ pub struct QuicConnection {
     inner: Arc<QuicConnectionInner>,
     cert_trust_state: Option<String>,
     pending_peer_trust: Option<PendingPeerTrust>,
+    peer_fingerprint: Option<PeerCertificateFingerprint>,
+    trust_store_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -358,9 +397,12 @@ impl QuicConnection {
         remote_addr: SocketAddr,
         config: TransportConfig,
         pending_peer_trust: Option<PendingPeerTrust>,
+        trust_store_path: PathBuf,
+        peer_protocol_handshake_required: bool,
     ) -> Self {
         let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(128);
         let (message_tx, message_rx): (mpsc::Sender<Message>, _) = mpsc::channel(256);
+        let peer_fingerprint = peer_certificate_fingerprint(&connection);
         let inner = Arc::new(QuicConnectionInner {
             _endpoint: endpoint,
             connection,
@@ -368,6 +410,8 @@ impl QuicConnection {
             datagram_tx_dropped: AtomicU64::new(0),
             reliable_stream_reset_count: AtomicU64::new(0),
             last_datagram_rx_us: AtomicU64::new(0),
+            bootstrap_complete: AtomicBool::new(!peer_protocol_handshake_required),
+            bootstrap_notify: Notify::new(),
         });
         let outbound_seq = Arc::new(AtomicU32::new(1));
 
@@ -422,6 +466,8 @@ impl QuicConnection {
             inner,
             cert_trust_state,
             pending_peer_trust,
+            peer_fingerprint,
+            trust_store_path,
         }
     }
 
@@ -433,7 +479,10 @@ impl QuicConnection {
         self.device_id = Some(device_id);
     }
 
-    pub fn confirm_peer_identity(&mut self, actual_device_id: DeviceId) -> Result<()> {
+    pub fn confirm_peer_identity(
+        &mut self,
+        actual_device_id: DeviceId,
+    ) -> Result<PeerCertificateFingerprint> {
         let pending = self
             .pending_peer_trust
             .take()
@@ -449,6 +498,7 @@ impl QuicConnection {
             );
         }
 
+        let fingerprint = pending.fingerprint.clone();
         let decision = match pending.decision {
             QuicTrustDecision::FirstSeen => QuicTrustStore::trust_first_seen_at(
                 &pending.trust_store_path,
@@ -460,7 +510,7 @@ impl QuicConnection {
         match decision {
             Ok(QuicTrustDecision::FirstSeen) | Ok(QuicTrustDecision::Trusted) => {
                 self.cert_trust_state = Some("trusted".to_string());
-                Ok(())
+                Ok(fingerprint)
             }
             Ok(QuicTrustDecision::Rejected { expected, actual }) => {
                 self.inner
@@ -480,6 +530,46 @@ impl QuicConnection {
                 Err(error)
             }
         }
+    }
+
+    pub fn confirm_inbound_peer_identity(
+        &mut self,
+        actual_device_id: DeviceId,
+    ) -> Result<PeerCertificateFingerprint> {
+        let fingerprint = self
+            .peer_fingerprint
+            .clone()
+            .ok_or_else(|| anyhow!("peer certificate unavailable"))?;
+        let decision = QuicTrustStore::trust_first_seen_at(
+            &self.trust_store_path,
+            actual_device_id,
+            fingerprint.clone(),
+        )?;
+        match decision {
+            QuicTrustDecision::FirstSeen | QuicTrustDecision::Trusted => {
+                self.cert_trust_state = Some("trusted".to_string());
+                Ok(fingerprint)
+            }
+            QuicTrustDecision::Rejected { expected, actual } => {
+                anyhow::bail!(
+                    "QUIC certificate fingerprint changed for {}: expected {}, got {}",
+                    actual_device_id,
+                    expected,
+                    actual
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn complete_peer_protocol_handshake(&self) -> Result<()> {
+        if let Some(mut bootstrap_stream) = self.inner.reliable_send_stream.lock().await.take() {
+            bootstrap_stream
+                .finish()
+                .context("Failed to finish compatibility bootstrap stream")?;
+        }
+        self.inner.bootstrap_complete.store(true, Ordering::Release);
+        self.inner.bootstrap_notify.notify_waiters();
+        Ok(())
     }
 
     pub fn reject_pending_peer_identity(&mut self) {
@@ -788,6 +878,18 @@ async fn send_outbound_message(
     config: &TransportConfig,
     message: &Message,
 ) -> Result<()> {
+    if !inner.bootstrap_complete.load(Ordering::Acquire) {
+        if !super::handshake::is_bootstrap_message(message) {
+            anyhow::bail!("non-bootstrap message sent before peer authentication");
+        }
+        let bootstrap_size = serde_json::to_vec(message)?.len();
+        if bootstrap_size > super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE {
+            anyhow::bail!(
+                "compatibility bootstrap message exceeds {} bytes",
+                super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE
+            );
+        }
+    }
     let seq = outbound_seq.fetch_add(1, Ordering::Relaxed);
 
     if let Some(datagram) = RealtimeInputCodec::encode_message(seq, message)? {
@@ -876,8 +978,17 @@ async fn read_reliable_messages(
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
-            if len > max_message_size {
+            let bootstrap_pending = !inner.bootstrap_complete.load(Ordering::Acquire);
+            let frame_limit = if bootstrap_pending {
+                max_message_size.min(super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE)
+            } else {
+                max_message_size
+            };
+            if len > frame_limit {
                 tracing::warn!("Dropping oversized QUIC reliable frame: {} bytes", len);
+                inner
+                    .connection
+                    .close(0u32.into(), b"reliable frame exceeds active protocol limit");
                 break;
             }
 
@@ -892,8 +1003,24 @@ async fn read_reliable_messages(
 
             match ControlMessageCodec::decode(&data) {
                 Ok(msg) => {
+                    if bootstrap_pending && !super::handshake::is_bootstrap_message(&msg) {
+                        tracing::warn!(
+                            "Closing peer that sent non-bootstrap message before authentication"
+                        );
+                        inner
+                            .connection
+                            .close(0u32.into(), b"illegal compatibility bootstrap message");
+                        return;
+                    }
                     if message_tx.send(msg).await.is_err() {
                         return;
+                    }
+                    if bootstrap_pending {
+                        // The compatibility stream is permanently bootstrap-only.
+                        // Normal traffic must arrive on a newly opened stream after
+                        // both peers have completed authentication.
+                        enforce_bootstrap_stream_eof(&inner, &mut stream).await;
+                        break;
                     }
                 }
                 Err(error) => tracing::debug!("Failed to decode reliable message: {}", error),
@@ -902,10 +1029,74 @@ async fn read_reliable_messages(
     }
 }
 
+async fn enforce_bootstrap_stream_eof(
+    inner: &Arc<QuicConnectionInner>,
+    stream: &mut quinn::RecvStream,
+) {
+    while !inner.bootstrap_complete.load(Ordering::Acquire) {
+        let notified = inner.bootstrap_notify.notified();
+        if inner.bootstrap_complete.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = inner.connection.closed() => return,
+        }
+    }
+
+    let mut trailing = [0u8; 1];
+    match tokio::time::timeout(
+        super::handshake::BOOTSTRAP_TIMEOUT,
+        stream.read(&mut trailing),
+    )
+    .await
+    {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some(_))) => {
+            tracing::warn!("Closing peer that appended data to the bootstrap-only stream");
+            inner
+                .connection
+                .close(0u32.into(), b"bootstrap stream carried trailing data");
+        }
+        Ok(Err(error)) => {
+            tracing::debug!("Bootstrap stream close check failed: {}", error);
+            inner
+                .connection
+                .close(0u32.into(), b"bootstrap stream close check failed");
+        }
+        Err(_) => {
+            tracing::warn!("Closing peer that did not finish the bootstrap-only stream");
+            inner
+                .connection
+                .close(0u32.into(), b"bootstrap stream did not finish");
+        }
+    }
+}
+
 async fn read_realtime_datagrams(
     inner: Arc<QuicConnectionInner>,
     message_tx: mpsc::Sender<Message>,
 ) {
+    while !inner.bootstrap_complete.load(Ordering::Acquire) {
+        let notified = inner.bootstrap_notify.notified();
+        tokio::select! {
+            biased;
+            datagram = inner.connection.read_datagram() => {
+                match datagram {
+                    Ok(_) => {
+                        tracing::warn!("Closing peer that prequeued a datagram before authentication");
+                        inner.connection.close(0u32.into(), b"datagram before peer authentication");
+                    }
+                    Err(error) => {
+                        tracing::debug!("QUIC datagram reader stopped during bootstrap: {}", error);
+                    }
+                }
+                return;
+            }
+            _ = notified => {}
+        }
+    }
+
     loop {
         match inner.connection.read_datagram().await {
             Ok(datagram) => match RealtimeInputCodec::decode_message(&datagram) {
@@ -934,19 +1125,39 @@ fn make_server_config(
     ensure_rustls_crypto_provider();
     let cert = CertificateDer::from(identity.cert_der.clone());
     let key = PrivatePkcs8KeyDer::from(identity.key_der.clone());
-    let mut server_config =
-        QuinnServerConfig::with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))
-            .context("Failed to build QUIC server config")?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let rustls_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("Failed to select TLS 1.3 for QUIC")?
+        .with_client_cert_verifier(Arc::new(OptionalBootstrapClientVerifier(provider)))
+        .with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))
+        .context("Failed to build QUIC server identity")?;
+    let crypto = QuicServerConfig::try_from(rustls_config)
+        .map_err(|error| anyhow!("Failed to build QUIC server crypto: {error}"))?;
+    let mut server_config = QuinnServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(make_quinn_transport_config(config)?));
     Ok(server_config)
 }
 
-fn make_client_config(config: &TransportConfig) -> Result<ClientConfig> {
+fn make_client_config(
+    identity: &QuicIdentity,
+    config: &TransportConfig,
+    present_client_certificate: bool,
+) -> Result<ClientConfig> {
     ensure_rustls_crypto_provider();
-    let rustls_config = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuServerVerifier))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(Arc::new(TofuServerVerifier::new()));
+    let rustls_config = if present_client_certificate {
+        builder
+            .with_client_auth_cert(
+                vec![CertificateDer::from(identity.cert_der.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone())),
+            )
+            .context("Failed to build QUIC client identity")?
+    } else {
+        builder.with_no_client_auth()
+    };
     let crypto = QuicClientConfig::try_from(rustls_config)
         .map_err(|error| anyhow!("Failed to build QUIC client crypto: {error}"))?;
     let mut client_config = ClientConfig::new(Arc::new(crypto));
@@ -1037,7 +1248,13 @@ fn current_timestamp_us() -> u64 {
 }
 
 #[derive(Debug)]
-struct TofuServerVerifier;
+struct TofuServerVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+impl TofuServerVerifier {
+    fn new() -> Self {
+        Self(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+    }
+}
 
 impl ServerCertVerifier for TofuServerVerifier {
     fn verify_server_cert(
@@ -1053,39 +1270,284 @@ impl ServerCertVerifier for TofuServerVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-        ]
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct OptionalBootstrapClientVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+impl ClientCertVerifier for OptionalBootstrapClientVerifier {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        // Self-signed identities are authorized only after the claimed DeviceId
+        // is checked against TOFU during the application bootstrap.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::SubjectPublicKeyInfoDer;
+    use rustls::sign::{Signer, SigningKey};
+    use rustls::{SignatureAlgorithm, SignatureScheme};
     use tokio::time::timeout;
+
+    #[derive(Debug)]
+    struct CorruptSigningKey(Arc<dyn SigningKey>);
+
+    impl SigningKey for CorruptSigningKey {
+        fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            self.0
+                .choose_scheme(offered)
+                .map(|signer| Box::new(CorruptSigner(signer)) as Box<dyn Signer>)
+        }
+
+        fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+            self.0.public_key()
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            self.0.algorithm()
+        }
+    }
+
+    #[derive(Debug)]
+    struct CorruptSigner(Box<dyn Signer>);
+
+    impl Signer for CorruptSigner {
+        fn sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, RustlsError> {
+            let mut signature = self.0.sign(message)?;
+            if let Some(byte) = signature.first_mut() {
+                *byte ^= 0x80;
+            }
+            Ok(signature)
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            self.0.scheme()
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_client_verifier_rejects_invalid_certificate_verify_signature() {
+        ensure_rustls_crypto_provider();
+        let server_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+
+        let identity = generated_test_identity();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let signing_key = provider
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                identity.key_der,
+            )))
+            .unwrap();
+        let certified_key = rustls::sign::CertifiedKey::new(
+            vec![CertificateDer::from(identity.cert_der)],
+            Arc::new(CorruptSigningKey(signing_key)),
+        );
+        let rustls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TofuServerVerifier::new()))
+            .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                certified_key,
+            )));
+        let crypto = QuicClientConfig::try_from(rustls_config).unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+
+        let connection = endpoint
+            .connect(address, "rshare.local")
+            .unwrap()
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(1), connection.closed()).await;
+        assert!(
+            result.is_ok(),
+            "invalid CertificateVerify signature must close the TLS connection"
+        );
+    }
+
+    fn generated_test_identity() -> QuicIdentity {
+        let (cert_der, key_der) = Encryption::generate_cert().unwrap();
+        QuicIdentity { cert_der, key_der }
+    }
+
+    async fn write_raw_reliable_payloads(connection: &QuicConnection, payloads: &[Vec<u8>]) {
+        let mut stream = connection.inner.connection.open_uni().await.unwrap();
+        for payload in payloads {
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(payload).await.unwrap();
+        }
+        stream.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_bootstrap_stream_with_prequeued_input_is_closed() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let hello = ControlMessageCodec::encode(&rshare_core::hello_message(
+            client_id,
+            "client".into(),
+            "host".into(),
+        ))
+        .unwrap();
+        let input = ControlMessageCodec::encode(&Message::MouseMove { x: 99, y: 101 }).unwrap();
+
+        write_raw_reliable_payloads(&client_connection, &[hello, input]).await;
+        assert!(matches!(
+            server_connection.receive_message().await.unwrap(),
+            Message::Hello { .. }
+        ));
+        server_connection
+            .complete_peer_protocol_handshake()
+            .await
+            .unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("receiver must close a bootstrap stream with trailing input");
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                server_connection.receive_message()
+            )
+            .await
+            .is_ok_and(|message| message.is_err()),
+            "prequeued input must never enter the decoded message channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_oversized_bootstrap_length_is_closed_before_payload_read() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::new(server_id);
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+
+        let mut client = QuicTransport::new(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+        let oversized = (super::super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE as u32) + 1;
+        stream.write_all(&oversized.to_be_bytes()).await.unwrap();
+        stream.finish().unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("receiver must close on an oversized bootstrap length prefix");
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                server_connection.receive_message()
+            )
+            .await
+            .is_ok_and(|message| message.is_err()),
+            "oversized bootstrap must never allocate and publish a decoded message"
+        );
+    }
 
     #[test]
     fn test_transport_new() {

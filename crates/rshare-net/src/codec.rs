@@ -391,6 +391,7 @@ impl MessageCodec {
             Message::Hello { .. } => 0,
             Message::HelloBack { .. } => 1,
             Message::Goodbye { .. } => 2,
+            Message::HelloRejected { .. } => 3,
 
             // Input events (10-19)
             Message::MouseMove { .. } => 10,
@@ -623,8 +624,17 @@ mod tests {
                 hostname: String::new(),
                 protocol_version: 1,
                 capabilities: Default::default(),
+                transport_capabilities: Default::default(),
             }),
             0
+        );
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::HelloRejected {
+                app_id: rshare_core::DISCOVERY_APP_ID.to_string(),
+                device_id: DeviceId::new_v4(),
+                reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
+            }),
+            3
         );
 
         assert_eq!(
@@ -673,6 +683,31 @@ mod tests {
             }),
             55
         );
+    }
+
+    #[test]
+    fn hello_rejected_uses_reserved_tag_and_round_trips() {
+        let message = Message::HelloRejected {
+            app_id: rshare_core::DISCOVERY_APP_ID.to_string(),
+            device_id: DeviceId::new_v4(),
+            reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                required: rshare_core::PROTOCOL_VERSION,
+                received: 2,
+            },
+        };
+
+        assert_eq!(MessageCodec::message_type_tag(&message), 3);
+        let encoded = MessageCodec::encode(&message).unwrap();
+        assert!(matches!(
+            MessageCodec::decode(&encoded).unwrap(),
+            Message::HelloRejected {
+                reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                    required: 3,
+                    received: 2
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

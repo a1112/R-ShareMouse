@@ -13,11 +13,13 @@ use crate::{
     local_controls::LocalInputDiagnosticEvent,
 };
 
+pub mod handshake;
+pub use handshake::{
+    ControlConnectionId, HandshakeRejectReason, PeerTransportCapabilities, PROTOCOL_VERSION,
+};
+
 /// Device identifier
 pub type DeviceId = Uuid;
-
-/// Protocol version
-pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Application namespace for LAN discovery and handshake packets.
 pub const DISCOVERY_APP_ID: &str = "rsharemouse";
@@ -639,6 +641,8 @@ pub enum Message {
         hostname: String,
         protocol_version: u32,
         capabilities: DeviceCapabilities,
+        #[serde(default)]
+        transport_capabilities: PeerTransportCapabilities,
     },
     /// Response to Hello message
     HelloBack {
@@ -649,7 +653,15 @@ pub enum Message {
         hostname: String,
         protocol_version: u32,
         capabilities: DeviceCapabilities,
+        #[serde(default)]
+        transport_capabilities: PeerTransportCapabilities,
         screen_info: ScreenInfo,
+    },
+    /// Explicit compatibility-bootstrap rejection.
+    HelloRejected {
+        app_id: String,
+        device_id: DeviceId,
+        reason: HandshakeRejectReason,
     },
     /// Device is leaving
     Goodbye { device_id: DeviceId, reason: String },
@@ -822,6 +834,7 @@ impl Message {
             // Critical: connection management
             Message::Hello { .. }
             | Message::HelloBack { .. }
+            | Message::HelloRejected { .. }
             | Message::Goodbye { .. }
             | Message::ScreenEnter { .. }
             | Message::ScreenLeave { .. } => Priority::Critical,
@@ -878,6 +891,7 @@ impl Message {
             self,
             Message::Hello { .. }
                 | Message::HelloBack { .. }
+                | Message::HelloRejected { .. }
                 | Message::ScreenEnter { .. }
                 | Message::ScreenLeave { .. }
                 | Message::ScreenUpdate { .. }
@@ -896,6 +910,25 @@ impl Message {
                 | Message::UsbFlowControl { .. }
         )
     }
+
+    pub fn transport_capabilities(&self) -> Option<&PeerTransportCapabilities> {
+        match self {
+            Message::Hello {
+                transport_capabilities,
+                ..
+            }
+            | Message::HelloBack {
+                transport_capabilities,
+                ..
+            } => Some(transport_capabilities),
+            _ => None,
+        }
+    }
+
+    pub fn advertises_required_v3_transport_capabilities(&self) -> bool {
+        self.transport_capabilities()
+            .is_some_and(PeerTransportCapabilities::advertises_required_v3_transport_capabilities)
+    }
 }
 
 /// Helper to create a Hello message
@@ -907,6 +940,7 @@ pub fn hello_message(device_id: DeviceId, device_name: String, hostname: String)
         hostname,
         protocol_version: PROTOCOL_VERSION,
         capabilities: DeviceCapabilities::default(),
+        transport_capabilities: PeerTransportCapabilities::required_v3(),
     }
 }
 
@@ -924,6 +958,7 @@ pub fn hello_back_message(
         hostname,
         protocol_version: PROTOCOL_VERSION,
         capabilities: DeviceCapabilities::default(),
+        transport_capabilities: PeerTransportCapabilities::required_v3(),
         screen_info,
     }
 }
@@ -1013,6 +1048,7 @@ mod tests {
             hostname: "test".to_string(),
             protocol_version: 1,
             capabilities: DeviceCapabilities::default(),
+            transport_capabilities: PeerTransportCapabilities::default(),
         };
         assert_eq!(critical.priority(), Priority::Critical);
 

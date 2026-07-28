@@ -24,13 +24,14 @@ pub mod session;
 // Re-exports from protocol
 pub use protocol::{
     heartbeat_message, hello_back_message, hello_message, timestamp_ms, AudioFormat,
-    AudioFramePayload, AudioSampleFormat, ButtonState, DeviceCapabilities, DeviceId, Direction,
-    GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, KeyState, Message,
-    MouseButton, Priority, ScreenInfo, UsbConfigurationDescriptor, UsbControlSetupPacket,
-    UsbDeviceClaimRequest, UsbDeviceClaimResponse, UsbDeviceDescriptor, UsbDeviceResetKind,
-    UsbDeviceSpeed, UsbEndpointDescriptor, UsbFlowControl, UsbForwardingCapabilities,
-    UsbInterfaceDescriptor, UsbIsoPacketDescriptor, UsbTransferDirection, UsbTransferFlag,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, DISCOVERY_APP_ID,
+    AudioFramePayload, AudioSampleFormat, ButtonState, ControlConnectionId, DeviceCapabilities,
+    DeviceId, Direction, GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState,
+    HandshakeRejectReason, KeyState, Message, MouseButton, PeerTransportCapabilities, Priority,
+    ScreenInfo, UsbConfigurationDescriptor, UsbControlSetupPacket, UsbDeviceClaimRequest,
+    UsbDeviceClaimResponse, UsbDeviceDescriptor, UsbDeviceResetKind, UsbDeviceSpeed,
+    UsbEndpointDescriptor, UsbFlowControl, UsbForwardingCapabilities, UsbInterfaceDescriptor,
+    UsbIsoPacketDescriptor, UsbTransferDirection, UsbTransferFlag, UsbTransferKind,
+    UsbTransferPayload, UsbTransferStatus, DISCOVERY_APP_ID, PROTOCOL_VERSION,
 };
 
 // Re-exports from device

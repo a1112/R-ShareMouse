@@ -11,9 +11,15 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant};
 
 use rshare_core::{
-    hello_back_message, hello_message, DeviceCapabilities, DeviceId, Message, ScreenInfo,
-    DISCOVERY_APP_ID,
+    hello_back_message, hello_message, DeviceCapabilities, DeviceId, Message,
+    PeerTransportCapabilities, ScreenInfo, DISCOVERY_APP_ID, PROTOCOL_VERSION,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerProtocolCompatibility {
+    Compatible,
+    Incompatible { local: u32, remote: u32 },
+}
 
 /// Discovery configuration
 #[derive(Debug, Clone)]
@@ -54,11 +60,13 @@ pub struct DiscoveredDevice {
     pub addresses: Vec<SocketAddr>,
     pub screen_info: Option<ScreenInfo>,
     pub capabilities: DeviceCapabilities,
+    pub transport_capabilities: PeerTransportCapabilities,
+    pub protocol_compatibility: PeerProtocolCompatibility,
     pub last_seen: Instant,
 }
 
 impl DiscoveredDevice {
-    fn from_message(addr: SocketAddr, msg: &Message) -> Option<Self> {
+    pub fn from_announcement(addr: SocketAddr, msg: &Message) -> Option<Self> {
         match msg {
             Message::Hello {
                 app_id,
@@ -66,6 +74,8 @@ impl DiscoveredDevice {
                 device_name,
                 hostname,
                 capabilities,
+                protocol_version,
+                transport_capabilities,
                 ..
             } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
@@ -74,6 +84,8 @@ impl DiscoveredDevice {
                 addresses: vec![addr],
                 screen_info: None,
                 capabilities: capabilities.clone(),
+                transport_capabilities: transport_capabilities.clone(),
+                protocol_compatibility: protocol_compatibility(*protocol_version),
                 last_seen: Instant::now(),
             }),
             Message::HelloBack {
@@ -83,6 +95,8 @@ impl DiscoveredDevice {
                 hostname,
                 screen_info,
                 capabilities,
+                protocol_version,
+                transport_capabilities,
                 ..
             } if is_rshare_discovery_app(app_id) => Some(Self {
                 id: *device_id,
@@ -91,15 +105,32 @@ impl DiscoveredDevice {
                 addresses: vec![addr],
                 screen_info: Some(screen_info.clone()),
                 capabilities: capabilities.clone(),
+                transport_capabilities: transport_capabilities.clone(),
+                protocol_compatibility: protocol_compatibility(*protocol_version),
                 last_seen: Instant::now(),
             }),
             _ => None,
         }
     }
 
+    fn from_message(addr: SocketAddr, msg: &Message) -> Option<Self> {
+        Self::from_announcement(addr, msg)
+    }
+
     /// Check if this device is stale (not seen recently)
     fn is_stale(&self, timeout: Duration) -> bool {
         self.last_seen.elapsed() > timeout
+    }
+}
+
+fn protocol_compatibility(remote: u32) -> PeerProtocolCompatibility {
+    if remote == PROTOCOL_VERSION {
+        PeerProtocolCompatibility::Compatible
+    } else {
+        PeerProtocolCompatibility::Incompatible {
+            local: PROTOCOL_VERSION,
+            remote,
+        }
     }
 }
 
@@ -714,6 +745,8 @@ mod tests {
             addresses: vec![],
             screen_info: None,
             capabilities: DeviceCapabilities::default(),
+            transport_capabilities: PeerTransportCapabilities::required_v3(),
+            protocol_compatibility: PeerProtocolCompatibility::Compatible,
             last_seen: Instant::now(),
         };
 
@@ -738,6 +771,8 @@ mod tests {
                 addresses: vec!["127.0.0.1:27432".parse().unwrap()],
                 screen_info: None,
                 capabilities: DeviceCapabilities::default(),
+                transport_capabilities: PeerTransportCapabilities::required_v3(),
+                protocol_compatibility: PeerProtocolCompatibility::Compatible,
                 last_seen: Instant::now(),
             },
         );
@@ -776,6 +811,7 @@ mod tests {
             hostname: "remote-host".to_string(),
             protocol_version: 1,
             capabilities: Default::default(),
+            transport_capabilities: Default::default(),
         };
         let bytes = serialize_message(&hello).unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();

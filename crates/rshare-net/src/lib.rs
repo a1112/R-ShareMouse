@@ -8,6 +8,7 @@ pub mod codec;
 pub mod connection;
 pub mod discovery;
 pub mod encryption;
+pub mod handshake;
 pub mod network_manager;
 pub mod transport;
 

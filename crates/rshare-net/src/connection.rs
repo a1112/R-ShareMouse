@@ -8,10 +8,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::time::Instant;
 
-use rshare_core::{
-    hello_back_message, hello_message, protocol::PROTOCOL_VERSION, DeviceId, Message, ScreenInfo,
-};
+use rshare_core::{ControlConnectionId, DeviceId, Message};
 
+use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
 use super::transport::{ConnectionPool, QuicTransport};
 
 /// Connection state
@@ -39,6 +38,7 @@ pub struct ConnectionInfo {
     pub datagram_tx_dropped: u64,
     pub reliable_stream_reset_count: u64,
     pub cert_trust_state: Option<String>,
+    pub control_connection_id: Option<ControlConnectionId>,
 }
 
 impl ConnectionInfo {
@@ -57,6 +57,7 @@ impl ConnectionInfo {
             datagram_tx_dropped: 0,
             reliable_stream_reset_count: 0,
             cert_trust_state: None,
+            control_connection_id: None,
         }
     }
 
@@ -232,8 +233,12 @@ async fn retire_generation(
 
 impl ConnectionManager {
     pub fn new(local_device_id: DeviceId) -> Self {
+        Self::with_transport(local_device_id, QuicTransport::new(local_device_id))
+    }
+
+    pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let transport = QuicTransport::new(local_device_id);
+        transport.require_peer_protocol_handshake();
         let pool = Arc::new(ConnectionPool::new(local_device_id));
 
         Self {
@@ -261,22 +266,22 @@ impl ConnectionManager {
 
         tokio::spawn(async move {
             while let Some(mut incoming) = incoming.recv().await {
-                let (device_id, first_message) =
+                let negotiated =
                     match receive_incoming_handshake(&mut incoming.connection, local_device_id)
                         .await
                     {
-                        Ok((device_id, first_message)) => (device_id, first_message),
+                        Ok(negotiated) => negotiated,
                         Err(error) => {
-                            let device_id = incoming.device_id.unwrap_or_else(DeviceId::new_v4);
-                            let _ = event_tx
-                                .send(ManagerEvent::Error {
-                                    device_id,
-                                    error: error.to_string(),
-                                })
-                                .await;
-                            (device_id, None)
+                            tracing::warn!(
+                                "Rejecting unauthenticated incoming connection from {}: {}",
+                                incoming.address,
+                                error
+                            );
+                            incoming.connection.close().await;
+                            continue;
                         }
                     };
+                let device_id = negotiated.auth.peer_id;
                 let address = incoming.address.to_string();
                 incoming.connection.set_device_id(device_id);
                 let mut event_permits = event_tx.reserve_many(2).await.ok();
@@ -307,6 +312,8 @@ impl ConnectionManager {
                             .await;
                         let mut info = ConnectionInfo::new(device_id, address);
                         info.state = ConnectionState::Connected;
+                        info.cert_trust_state = Some("trusted".to_string());
+                        info.control_connection_id = Some(negotiated.auth.control_connection_id);
                         connections
                             .write()
                             .expect("canonical connection registry poisoned")
@@ -331,7 +338,7 @@ impl ConnectionManager {
                     device_id,
                     generation,
                     messages,
-                    first_message,
+                    None,
                     event_tx.clone(),
                     connections.clone(),
                     pool.clone(),
@@ -348,122 +355,87 @@ impl ConnectionManager {
     }
 
     pub async fn connect(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
-        let mut stale_permit = self.event_tx.reserve().await.ok();
-        let generation = {
+        {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.pool.diagnostics_for(&device_id).await.is_some() {
                 anyhow::bail!("Already connected to device {}", device_id);
             }
+        }
 
-            let removed_canonical = self
-                .connections
-                .write()
-                .expect("canonical connection registry poisoned")
-                .remove(&device_id)
-                .is_some();
-            let removed_pool = self.pool.remove(&device_id).await.is_some();
-            if removed_canonical || removed_pool {
-                if let Some(permit) = stale_permit.take() {
-                    permit.send(ManagerEvent::Disconnected(device_id));
-                }
+        let mut conn = match self.transport.connect(address, device_id).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        device_id,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
             }
+        };
+        let negotiated = match perform_outbound_handshake(&mut conn, self.local_device_id).await {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                conn.reject_pending_peer_identity();
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        device_id,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+        };
+        if negotiated.auth.peer_id != device_id {
+            conn.reject_pending_peer_identity();
+            anyhow::bail!(
+                "QUIC peer identity mismatch: expected {}, got {}",
+                device_id,
+                negotiated.auth.peer_id
+            );
+        }
 
-            let generation = allocate_generation(&self.next_generation);
+        conn.set_device_id(device_id);
+        let messages = conn.message_channel();
+        let connected_permit = self.event_tx.reserve().await.ok();
+        let generation;
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.pool.diagnostics_for(&device_id).await.is_some() {
+                conn.close().await;
+                anyhow::bail!("Already connected to device {}", device_id);
+            }
+            generation = allocate_generation(&self.next_generation);
+            self.pool
+                .insert_with_generation(device_id, generation, conn)
+                .await;
+            let mut info = ConnectionInfo::new(device_id, address.to_string());
+            info.state = ConnectionState::Connected;
+            info.cert_trust_state = Some("trusted".to_string());
+            info.control_connection_id = Some(negotiated.auth.control_connection_id);
             self.connections
                 .write()
                 .expect("canonical connection registry poisoned")
-                .insert(
-                    device_id,
-                    CanonicalConnection {
-                        generation,
-                        info: ConnectionInfo::new(device_id, address.to_string()),
-                    },
-                );
-            generation
-        };
-        drop(stale_permit);
-
-        let connection_result = match self.transport.connect(address, device_id).await {
-            Ok(mut conn) => match perform_outbound_handshake(&mut conn, self.local_device_id).await
-            {
-                Ok(remote_id) => match conn.confirm_peer_identity(remote_id) {
-                    Ok(()) => Ok(conn),
-                    Err(error) => Err(error),
-                },
-                Err(error) => {
-                    conn.reject_pending_peer_identity();
-                    Err(error)
-                }
-            },
-            Err(error) => Err(error),
-        };
-
-        match connection_result {
-            Ok(mut conn) => {
-                conn.set_device_id(device_id);
-                let messages = conn.message_channel();
-                let connected_permit = self.event_tx.reserve().await.ok();
-
-                let installed = {
-                    let _lifecycle = self.lifecycle_lock.lock().await;
-                    if !is_current_generation(&self.connections, device_id, generation) {
-                        false
-                    } else {
-                        self.pool
-                            .insert_with_generation(device_id, generation, conn)
-                            .await;
-                        self.update_connection_state(
-                            device_id,
-                            generation,
-                            ConnectionState::Connected,
-                        );
-                        if let Some(permit) = connected_permit {
-                            permit.send(ManagerEvent::Connected(device_id));
-                        }
-                        true
-                    }
-                };
-
-                if !installed {
-                    anyhow::bail!(
-                        "Connection to device {} was superseded by a newer generation",
-                        device_id
-                    );
-                }
-
-                spawn_message_reader(
-                    device_id,
-                    generation,
-                    messages,
-                    None,
-                    self.event_tx.clone(),
-                    self.connections.clone(),
-                    self.pool.clone(),
-                    self.lifecycle_lock.clone(),
-                );
-
-                Ok(())
-            }
-            Err(e) => {
-                let error_permit = self.event_tx.reserve().await.ok();
-                let _lifecycle = self.lifecycle_lock.lock().await;
-                if is_current_generation(&self.connections, device_id, generation) {
-                    self.update_connection_state(device_id, generation, ConnectionState::Error);
-                    self.connections
-                        .write()
-                        .expect("canonical connection registry poisoned")
-                        .remove(&device_id);
-                    self.pool.remove_generation(&device_id, generation).await;
-                    if let Some(permit) = error_permit {
-                        permit.send(ManagerEvent::Error {
-                            device_id,
-                            error: e.to_string(),
-                        });
-                    }
-                }
-                Err(e)
+                .insert(device_id, CanonicalConnection { generation, info });
+            if let Some(permit) = connected_permit {
+                permit.send(ManagerEvent::Connected(device_id));
             }
         }
+
+        spawn_message_reader(
+            device_id,
+            generation,
+            messages,
+            None,
+            self.event_tx.clone(),
+            self.connections.clone(),
+            self.pool.clone(),
+            self.lifecycle_lock.clone(),
+        );
+        Ok(())
     }
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
@@ -577,25 +549,6 @@ impl ConnectionManager {
         self.pool.diagnostics_all().await.len()
     }
 
-    fn update_connection_state(
-        &self,
-        device_id: DeviceId,
-        generation: u64,
-        state: ConnectionState,
-    ) {
-        if let Some(connection) = self
-            .connections
-            .write()
-            .expect("canonical connection registry poisoned")
-            .get_mut(&device_id)
-        {
-            if connection.generation == generation {
-                connection.info.state = state;
-                connection.info.last_activity = Instant::now();
-            }
-        }
-    }
-
     pub async fn cleanup_stale(&mut self, timeout: Duration) -> Vec<DeviceId> {
         let stale: Vec<DeviceId> = self
             .connections
@@ -623,70 +576,6 @@ impl ConnectionManager {
     }
 }
 
-async fn receive_incoming_handshake(
-    conn: &mut super::transport::QuicConnection,
-    local_device_id: DeviceId,
-) -> Result<(DeviceId, Option<Message>)> {
-    match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
-        Ok(Ok(Message::Hello {
-            app_id,
-            device_id,
-            device_name: _,
-            hostname: _,
-            protocol_version,
-            ..
-        })) if protocol_version == PROTOCOL_VERSION
-            && app_id.eq_ignore_ascii_case(rshare_core::DISCOVERY_APP_ID) =>
-        {
-            conn.send_message(&hello_back_message(
-                local_device_id,
-                "R-ShareMouse".to_string(),
-                hostname::get()
-                    .unwrap_or_else(|_| "unknown".into())
-                    .to_string_lossy()
-                    .to_string(),
-                ScreenInfo::primary(),
-            ))
-            .await?;
-            Ok((device_id, None))
-        }
-        Ok(Ok(message)) => Ok((DeviceId::new_v4(), Some(message))),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok((DeviceId::new_v4(), None)),
-    }
-}
-
-async fn perform_outbound_handshake(
-    conn: &mut super::transport::QuicConnection,
-    local_device_id: DeviceId,
-) -> Result<DeviceId> {
-    conn.send_message(&hello_message(
-        local_device_id,
-        "R-ShareMouse".to_string(),
-        hostname::get()
-            .unwrap_or_else(|_| "unknown".into())
-            .to_string_lossy()
-            .to_string(),
-    ))
-    .await?;
-
-    match tokio::time::timeout(Duration::from_millis(250), conn.receive_message()).await {
-        Ok(Ok(Message::HelloBack {
-            app_id,
-            device_id,
-            protocol_version,
-            ..
-        })) if protocol_version == PROTOCOL_VERSION
-            && app_id.eq_ignore_ascii_case(rshare_core::DISCOVERY_APP_ID) =>
-        {
-            Ok(device_id)
-        }
-        Ok(Ok(_)) => anyhow::bail!("QUIC peer did not return a valid HelloBack identity"),
-        Ok(Err(error)) => Err(error),
-        Err(_) => anyhow::bail!("QUIC peer identity handshake timed out"),
-    }
-}
-
 pub type SharedConnectionManager = Arc<RwLock<ConnectionManager>>;
 
 pub fn create_shared_manager(local_device_id: DeviceId) -> SharedConnectionManager {
@@ -697,6 +586,7 @@ pub fn create_shared_manager(local_device_id: DeviceId) -> SharedConnectionManag
 mod tests {
     use super::*;
     use crate::encryption::QuicTrustStore;
+    use rshare_core::{hello_back_message, ScreenInfo};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_trust_store_path(name: &str) -> std::path::PathBuf {
@@ -758,6 +648,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
+                control_connection_id: None,
             },
         );
         let (_message_tx, message_rx) = mpsc::channel(1);
@@ -823,6 +714,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: None,
             },
         );
         manager
@@ -880,6 +772,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
+                control_connection_id: None,
             },
         );
         let mut events = manager.events().unwrap();
@@ -986,6 +879,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: Some("trusted".to_string()),
+                control_connection_id: None,
             },
         );
         manager
@@ -1052,6 +946,7 @@ mod tests {
                         datagram_tx_dropped: 0,
                         reliable_stream_reset_count: 0,
                         cert_trust_state: Some("trusted".to_string()),
+                        control_connection_id: None,
                     },
                 },
             );
@@ -1126,6 +1021,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
+                control_connection_id: None,
             },
         );
         let mut events = manager.events().unwrap();
@@ -1161,6 +1057,7 @@ mod tests {
                 datagram_tx_dropped: 0,
                 reliable_stream_reset_count: 0,
                 cert_trust_state: None,
+                control_connection_id: None,
             },
         );
 
@@ -1226,6 +1123,7 @@ mod tests {
                         datagram_tx_dropped: 0,
                         reliable_stream_reset_count: 0,
                         cert_trust_state: Some("trusted".to_string()),
+                        control_connection_id: None,
                     },
                 },
             );

@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ManagerEvent},
-    discovery::{DiscoveredDevice, DiscoveryEvent, ServiceDiscovery},
+    discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
 };
 use rshare_core::{DeviceId, Message};
 
@@ -333,6 +333,17 @@ impl NetworkManager {
 
     /// Connect to a specific device
     pub async fn connect_to(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
+        if let Some(device) = self.discovered_devices.read().await.get(&device_id) {
+            if let PeerProtocolCompatibility::Incompatible { local, remote } =
+                device.protocol_compatibility
+            {
+                anyhow::bail!(
+                    "Peer protocol is incompatible: local version {}, remote version {}",
+                    local,
+                    remote
+                );
+            }
+        }
         let address = normalize_discovered_connection_address(
             address,
             self.config.discovery_port,
@@ -399,6 +410,8 @@ mod tests {
             addresses: vec![address],
             screen_info: None,
             capabilities: rshare_core::DeviceCapabilities::default(),
+            transport_capabilities: rshare_core::PeerTransportCapabilities::required_v3(),
+            protocol_compatibility: PeerProtocolCompatibility::Compatible,
             last_seen: tokio::time::Instant::now(),
         }
     }
@@ -447,6 +460,31 @@ mod tests {
             "test-host".to_string(),
         );
         assert!(!manager.running);
+    }
+
+    #[tokio::test]
+    async fn known_incompatible_discovery_fails_before_quic_connect() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut manager =
+            NetworkManager::new(local_id, "local".to_string(), "local-host".to_string());
+        let mut incompatible = discovered_device(remote_id, "127.0.0.1:1".parse().unwrap(), "old");
+        incompatible.protocol_compatibility = PeerProtocolCompatibility::Incompatible {
+            local: rshare_core::PROTOCOL_VERSION,
+            remote: 2,
+        };
+        manager
+            .discovered_devices
+            .write()
+            .await
+            .insert(remote_id, incompatible);
+
+        let error = manager
+            .connect_to(remote_id, "not-even-a-socket-address")
+            .await
+            .expect_err("known incompatible peer must fail before address or QUIC work");
+        assert!(error.to_string().contains("remote version 2"));
+        assert!(manager.connection_infos().await.is_empty());
     }
 
     #[tokio::test]
