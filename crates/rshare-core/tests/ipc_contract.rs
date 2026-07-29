@@ -22,8 +22,108 @@ use rshare_core::{
 };
 use std::collections::BTreeMap;
 use std::future::Future;
-use tokio::io::duplex;
+use std::time::Duration;
+use tokio::io::{duplex, AsyncWriteExt};
+use tokio::time::timeout;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn ui_state_envelopes_round_trip_over_typed_frames() {
+    let (mut writer, mut reader) = duplex(4096);
+    let envelope = rshare_core::UiEnvelope::Heartbeat {
+        boot_id: Uuid::from_u128(1),
+        revision: 7,
+        sent_at_ms: 99,
+    };
+
+    rshare_core::write_ui_state_frame(&mut writer, &envelope)
+        .await
+        .unwrap();
+    let decoded = rshare_core::read_ui_state_frame(&mut reader).await.unwrap();
+
+    assert_eq!(decoded, envelope);
+}
+
+#[tokio::test]
+async fn ui_state_reader_rejects_binary_header_before_waiting_for_body() {
+    let (mut writer, mut reader) = duplex(64);
+    let declared_length = 16 * 1024 * 1024_u32;
+    let mut header = [0_u8; rshare_core::IPC_FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(&declared_length.to_be_bytes());
+    header[4] = rshare_core::IpcEnvelopeKind::Binary as u8;
+    writer.write_all(&header).await.unwrap();
+
+    let error = timeout(
+        Duration::from_millis(100),
+        rshare_core::read_ui_state_frame(&mut reader),
+    )
+    .await
+    .expect("reader waited for a disallowed Binary body")
+    .unwrap_err();
+
+    let io_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .expect("error chain should retain the InvalidData framing error");
+    assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn ui_state_header_rejects_heartbeat_body() {
+    let (mut writer, mut reader) = duplex(4096);
+    let envelope = rshare_core::UiEnvelope::Heartbeat {
+        boot_id: Uuid::from_u128(1),
+        revision: 7,
+        sent_at_ms: 99,
+    };
+    let payload = serde_json::to_vec(&envelope).unwrap();
+    rshare_core::IpcFrameCodec::default()
+        .write_frame(&mut writer, rshare_core::IpcEnvelopeKind::UiState, &payload)
+        .await
+        .unwrap();
+
+    let error = rshare_core::read_ui_state_frame(&mut reader)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("does not match its envelope"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_header_rejects_delta_body() {
+    let (mut writer, mut reader) = duplex(4096);
+    let envelope = rshare_core::UiEnvelope::Delta(rshare_core::UiDelta {
+        boot_id: Uuid::from_u128(1),
+        revision: 1,
+        change: rshare_core::UiChange::Pointer(rshare_core::UiPointerState {
+            x: 1,
+            y: 2,
+            display_id: None,
+            observed_at_ms: 3,
+        }),
+    });
+    let payload = serde_json::to_vec(&envelope).unwrap();
+    rshare_core::IpcFrameCodec::default()
+        .write_frame(
+            &mut writer,
+            rshare_core::IpcEnvelopeKind::Heartbeat,
+            &payload,
+        )
+        .await
+        .unwrap();
+
+    let error = rshare_core::read_ui_state_frame(&mut reader)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("does not match its envelope"),
+        "unexpected error: {error:#}"
+    );
+}
 
 #[tokio::test]
 async fn daemon_requests_round_trip_over_json_frames() {

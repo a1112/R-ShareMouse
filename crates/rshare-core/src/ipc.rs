@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::UiEnvelope;
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode,
     CapabilityRegistrySnapshot, ControlSessionState, DeviceId, DisplayCaptureRequest,
@@ -565,5 +566,56 @@ where
         .write_frame(writer, IpcEnvelopeKind::Json, &payload)
         .await
         .context("Failed to write IPC JSON frame")?;
+    Ok(())
+}
+
+/// Read a single typed UI-state or heartbeat frame from a stream.
+pub async fn read_ui_state_frame<R>(reader: &mut R) -> Result<UiEnvelope>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = IpcFrameCodec::default()
+        .read_frame_for_kinds(
+            reader,
+            &[IpcEnvelopeKind::UiState, IpcEnvelopeKind::Heartbeat],
+        )
+        .await
+        .context("Failed to read IPC UI-state frame")?
+        .context("IPC stream closed before receiving a UI-state frame")?;
+
+    let envelope: UiEnvelope =
+        serde_json::from_slice(&frame.payload).context("Failed to decode IPC UI-state frame")?;
+    let kind_matches = matches!(
+        (&envelope, frame.kind),
+        (UiEnvelope::Heartbeat { .. }, IpcEnvelopeKind::Heartbeat)
+            | (
+                UiEnvelope::Snapshot(_) | UiEnvelope::Delta(_) | UiEnvelope::ResyncRequired { .. },
+                IpcEnvelopeKind::UiState
+            )
+    );
+    if !kind_matches {
+        anyhow::bail!(
+            "IPC UI-state frame kind {:?} does not match its envelope",
+            frame.kind
+        );
+    }
+    Ok(envelope)
+}
+
+/// Write one typed UI-state envelope, using the dedicated heartbeat frame kind.
+pub async fn write_ui_state_frame<W>(writer: &mut W, envelope: &UiEnvelope) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let kind = if matches!(envelope, UiEnvelope::Heartbeat { .. }) {
+        IpcEnvelopeKind::Heartbeat
+    } else {
+        IpcEnvelopeKind::UiState
+    };
+    let payload = serde_json::to_vec(envelope).context("Failed to encode IPC UI-state frame")?;
+    IpcFrameCodec::default()
+        .write_frame(writer, kind, &payload)
+        .await
+        .context("Failed to write IPC UI-state frame")?;
     Ok(())
 }

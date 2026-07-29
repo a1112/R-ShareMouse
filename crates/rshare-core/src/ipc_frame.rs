@@ -81,7 +81,7 @@ impl IpcFrameCodec {
     where
         R: AsyncRead + Unpin,
     {
-        self.read_frame_inner(reader, None).await
+        self.read_frame_inner(reader, None, None).await
     }
 
     pub async fn read_frame_for_kind<R>(
@@ -92,13 +92,31 @@ impl IpcFrameCodec {
     where
         R: AsyncRead + Unpin,
     {
-        self.read_frame_inner(reader, Some(expected_kind)).await
+        self.read_frame_inner(reader, Some(expected_kind), None)
+            .await
+    }
+
+    /// Read one frame whose kind must be in `allowed_kinds`.
+    ///
+    /// The kind is rejected from the fixed-size header before the declared
+    /// body is allocated or read.
+    pub async fn read_frame_for_kinds<R>(
+        &self,
+        reader: &mut R,
+        allowed_kinds: &[IpcEnvelopeKind],
+    ) -> io::Result<Option<IpcFrame>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.read_frame_inner(reader, None, Some(allowed_kinds))
+            .await
     }
 
     async fn read_frame_inner<R>(
         &self,
         reader: &mut R,
         expected_kind: Option<IpcEnvelopeKind>,
+        allowed_kinds: Option<&[IpcEnvelopeKind]>,
     ) -> io::Result<Option<IpcFrame>>
     where
         R: AsyncRead + Unpin,
@@ -121,6 +139,12 @@ impl IpcFrameCodec {
                     "expected IPC {:?} envelope, received {kind:?}",
                     expected_kind.expect("checked expected kind")
                 ),
+            ));
+        }
+        if allowed_kinds.is_some_and(|allowed| !allowed.contains(&kind)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("IPC {kind:?} envelope is not allowed on this stream"),
             ));
         }
         let limit = self.limits.for_kind(kind);

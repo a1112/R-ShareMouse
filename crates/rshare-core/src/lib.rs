@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod runtime;
 pub mod service;
 pub mod session;
+pub mod ui_state;
 
 // Re-exports from protocol
 pub use protocol::{
@@ -78,11 +79,11 @@ pub use capabilities::{
 // Re-exports from local daemon IPC
 pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
-    default_mobile_gateway_addr, read_json_frame, write_json_frame, DaemonDeviceSnapshot,
-    DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot,
-    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    default_mobile_gateway_addr, read_json_frame, read_ui_state_frame, write_json_frame,
+    write_ui_state_frame, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
+    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LocalInputFeedback, MobileAccessSnapshot,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    ServiceStatusSnapshot, TransportFeedback, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
 pub use ipc_frame::{
     IpcEnvelopeKind, IpcFrame, IpcFrameCodec, IpcFrameLimits, DEFAULT_MAX_BINARY_FRAME_BYTES,
@@ -134,3 +135,11 @@ pub use layout::{
 
 // Re-exports from session
 pub use session::{CaptureSessionStateMachine, TransitionError};
+
+// Re-exports from the versioned daemon UI state stream.
+pub use ui_state::{
+    UiActiveSessions, UiApplyError, UiChange, UiCursor, UiDelta, UiDiscreteInputState,
+    UiDynamicState, UiEnvelope, UiMediaSession, UiMediaSessionState, UiPointerState,
+    UiPressedGamepadButton, UiResyncReason, UiRevisionError, UiRevisionSequencer, UiSnapshot,
+    UiView, UI_STATE_PROTOCOL_VERSION,
+};
