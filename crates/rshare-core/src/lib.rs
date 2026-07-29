@@ -79,11 +79,12 @@ pub use capabilities::{
 // Re-exports from local daemon IPC
 pub use ipc::{
     default_ipc_addr, default_local_controls_ws_addr, default_local_controls_ws_url,
-    default_mobile_gateway_addr, read_json_frame, read_ui_state_frame, write_json_frame,
-    write_ui_state_frame, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
-    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LocalInputFeedback, MobileAccessSnapshot,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    ServiceStatusSnapshot, TransportFeedback, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    default_mobile_gateway_addr, read_json_frame, read_optional_ui_state_frame,
+    read_ui_state_frame, write_json_frame, write_ui_state_frame, DaemonDeviceSnapshot,
+    DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
+    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
+    UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
 pub use ipc_frame::{
     IpcEnvelopeKind, IpcFrame, IpcFrameCodec, IpcFrameLimits, DEFAULT_MAX_BINARY_FRAME_BYTES,

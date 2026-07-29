@@ -44,6 +44,18 @@ async fn ui_state_envelopes_round_trip_over_typed_frames() {
     assert_eq!(decoded, envelope);
 }
 
+#[test]
+fn ui_state_subscription_request_round_trips_with_cursor() {
+    let request = DaemonRequest::SubscribeUiState {
+        cursor: Some(rshare_core::UiCursor::new(Uuid::from_u128(9), 41)),
+    };
+
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let decoded: DaemonRequest = serde_json::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded, request);
+}
+
 #[tokio::test]
 async fn ui_state_reader_rejects_binary_header_before_waiting_for_body() {
     let (mut writer, mut reader) = duplex(64);

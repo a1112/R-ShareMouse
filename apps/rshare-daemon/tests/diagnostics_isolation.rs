@@ -78,6 +78,29 @@ async fn no_subscribers_skip_formatting_and_publication_for_one_hundred_thousand
 }
 
 #[tokio::test]
+async fn latest_metrics_watch_only_wakes_for_semantic_changes() {
+    let metrics = Arc::new(ControlMetrics::default());
+    let mut runtime = DiagnosticsRuntime::new(metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
+    let mut latest = runtime.latest_receiver();
+
+    assert!(runtime.sample_at(DIAGNOSTICS_SAMPLE_PERIOD));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), latest.changed())
+            .await
+            .is_err(),
+        "an unchanged sample must not wake the UI projection"
+    );
+
+    metrics.record_captured();
+    assert!(runtime.sample_at(DIAGNOSTICS_SAMPLE_PERIOD * 2));
+    tokio::time::timeout(Duration::from_millis(100), latest.changed())
+        .await
+        .expect("changed metrics must wake the UI projection")
+        .expect("diagnostics metrics sender must remain open");
+    assert_eq!(latest.borrow().captured, 1);
+}
+
+#[tokio::test]
 async fn one_subscriber_receives_twenty_hertz_samples_not_per_input_updates() {
     let metrics = Arc::new(ControlMetrics::default());
     let mut runtime = DiagnosticsRuntime::new(metrics.clone(), 8);

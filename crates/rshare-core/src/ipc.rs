@@ -5,7 +5,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::UiEnvelope;
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode,
     CapabilityRegistrySnapshot, ControlSessionState, DeviceId, DisplayCaptureRequest,
@@ -19,6 +18,7 @@ use crate::{
     VirtualDisplaySnapshot,
 };
 use crate::{IpcEnvelopeKind, IpcFrameCodec};
+use crate::{UiCursor, UiEnvelope};
 
 /// Default TCP port for localhost daemon IPC.
 pub const DEFAULT_IPC_PORT: u16 = 27435;
@@ -431,6 +431,10 @@ pub enum DaemonRequest {
     ListUsbDevices,
     LocalControls,
     SubscribeLocalControls,
+    SubscribeUiState {
+        #[serde(default)]
+        cursor: Option<UiCursor>,
+    },
     EndpointEvents {
         #[serde(default)]
         filter: EndpointEventFilter,
@@ -574,14 +578,26 @@ pub async fn read_ui_state_frame<R>(reader: &mut R) -> Result<UiEnvelope>
 where
     R: AsyncRead + Unpin,
 {
+    read_optional_ui_state_frame(reader)
+        .await?
+        .context("IPC stream closed before receiving a UI-state frame")
+}
+
+/// Read one typed UI-state frame, returning `None` only for clean frame-boundary EOF.
+pub async fn read_optional_ui_state_frame<R>(reader: &mut R) -> Result<Option<UiEnvelope>>
+where
+    R: AsyncRead + Unpin,
+{
     let frame = IpcFrameCodec::default()
         .read_frame_for_kinds(
             reader,
             &[IpcEnvelopeKind::UiState, IpcEnvelopeKind::Heartbeat],
         )
         .await
-        .context("Failed to read IPC UI-state frame")?
-        .context("IPC stream closed before receiving a UI-state frame")?;
+        .context("Failed to read IPC UI-state frame")?;
+    let Some(frame) = frame else {
+        return Ok(None);
+    };
 
     let envelope: UiEnvelope =
         serde_json::from_slice(&frame.payload).context("Failed to decode IPC UI-state frame")?;
@@ -599,7 +615,7 @@ where
             frame.kind
         );
     }
-    Ok(envelope)
+    Ok(Some(envelope))
 }
 
 /// Write one typed UI-state envelope, using the dedicated heartbeat frame kind.

@@ -4,15 +4,18 @@ use std::time::Duration;
 
 use rshare_core::{
     BackendHealth, BackendKind, ClockDomainId, ControlConnectionId, ControlSessionState, DeviceId,
-    Direction, InputRouter, KeyState, LayoutGraph, LayoutLink, LayoutNode, MonotonicStamp,
-    PixelRect, RealtimeInputFrame, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame,
-    RouterCommand, SessionEpoch, VirtualDesktopGeometry,
+    Direction, GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, InputRouter,
+    KeyState, LayoutGraph, LayoutLink, LayoutNode, LocalDisplayState, MonotonicStamp, PixelRect,
+    RealtimeInputFrame, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, RouterCommand,
+    ServiceStatusSnapshot, SessionEpoch, UiActiveSessions, UiChange, UiDynamicState, UiEnvelope,
+    UiSnapshot, VirtualDesktopGeometry, UI_STATE_PROTOCOL_VERSION,
 };
 use rshare_daemon::input_runtime::{
     dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch, InputRuntime,
     InputTransport,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetrics, InputStateFeeds};
+use rshare_daemon::state_aggregator::StateAggregator;
 use rshare_input::{
     ButtonState as CaptureButtonState, CaptureOrigin, CaptureSource, CapturedInputPayload,
     ContinuousInput, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle,
@@ -310,6 +313,32 @@ fn linked_router() -> (DeviceId, DeviceId, InputRouter) {
     (local, remote, router)
 }
 
+fn ui_snapshot(local_id: DeviceId) -> UiSnapshot {
+    UiSnapshot {
+        protocol_version: UI_STATE_PROTOCOL_VERSION,
+        boot_id: DeviceId::nil(),
+        revision: 0,
+        status: ServiceStatusSnapshot::new(
+            local_id,
+            "local".into(),
+            "host".into(),
+            "127.0.0.1:0".into(),
+            27432,
+            1,
+        ),
+        devices: Vec::new(),
+        layout: LayoutGraph::new(local_id),
+        capabilities: rshare_core::CapabilityRegistrySnapshot {
+            local_device_id: local_id,
+            generated_at_ms: 0,
+            devices: Vec::new(),
+        },
+        display_inventory: LocalDisplayState::default(),
+        dynamic_state: UiDynamicState::default(),
+        active_sessions: UiActiveSessions::default(),
+    }
+}
+
 fn runtime(
     capacity: usize,
 ) -> (
@@ -375,6 +404,136 @@ async fn enter_remote<T: InputTransport>(
         PushOutcome::Enqueued
     );
     assert!(runtime.process_next().await);
+}
+
+#[tokio::test]
+async fn input_runtime_gamepad_capture_reaches_aggregator_latest_stream() {
+    let (local, _, router) = linked_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(RecordingTransport::default());
+    let (input_state, feeds) = input_state_channel(8);
+    let aggregator = StateAggregator::with_input(ui_snapshot(local), 8, feeds);
+    let metrics = Arc::new(ControlMetrics::default());
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let mut runtime =
+        InputRuntime::new(consumer, router, transport, input_state, metrics, injection);
+    let mut subscriber = aggregator.subscribe(None).await.unwrap();
+    assert!(matches!(
+        subscriber.recv().await.unwrap(),
+        UiEnvelope::Snapshot(_)
+    ));
+
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::Gamepad),
+            InputEvent::gamepad_connected(GamepadDeviceInfo {
+                gamepad_id: 2,
+                name: "Production Pad".into(),
+                vendor_id: None,
+                product_id: None,
+            }),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let UiEnvelope::Delta(connected) = subscriber.recv().await.unwrap() else {
+        panic!("connect must update the latest gamepad projection");
+    };
+    let UiChange::Gamepads(gamepads) = connected.change else {
+        panic!("connect must emit the typed gamepad projection");
+    };
+    assert!(gamepads[0].connected);
+    assert_eq!(gamepads[0].name, "Production Pad");
+
+    let mut pressed = GamepadState::neutral(2, 9, 1234);
+    pressed.buttons.push(GamepadButtonState {
+        button: GamepadButton::South,
+        pressed: true,
+    });
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::Gamepad),
+            InputEvent::gamepad_button(2, GamepadButton::South, true, pressed.clone()),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let UiEnvelope::Delta(button) = subscriber.recv().await.unwrap() else {
+        panic!("gamepad button must emit reliable typed truth");
+    };
+    assert!(matches!(
+        button.change,
+        UiChange::KeyButton(rshare_core::UiDiscreteInputState::GamepadButton {
+            gamepad_id: 2,
+            button: GamepadButton::South,
+            state: rshare_core::ButtonState::Pressed,
+            ..
+        })
+    ));
+    let UiEnvelope::Delta(button_view) = subscriber.recv().await.unwrap() else {
+        panic!("gamepad button must also update the latest full gamepad view");
+    };
+    let UiChange::Gamepads(gamepads) = button_view.change else {
+        panic!("button view must be a typed gamepad projection");
+    };
+    assert_eq!(gamepads[0].pressed_buttons, vec!["South"]);
+    assert_eq!(aggregator.reliable_history_len(), 1);
+
+    let mut axes = pressed;
+    axes.sequence = 10;
+    axes.timestamp_ms = 1240;
+    axes.left_stick_x = 12_345;
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::Gamepad),
+            InputEvent::gamepad_state(axes),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let UiEnvelope::Delta(axes_view) = subscriber.recv().await.unwrap() else {
+        panic!("axes state must update the latest gamepad view");
+    };
+    let UiChange::Gamepads(gamepads) = axes_view.change else {
+        panic!("axes state must remain latest-only");
+    };
+    assert_eq!(gamepads.len(), 1);
+    assert_eq!(gamepads[0].gamepad_id, 2);
+    assert_eq!(gamepads[0].left_stick_x, 12_345);
+    assert_eq!(gamepads[0].pressed_buttons, vec!["South"]);
+    assert_eq!(aggregator.reliable_history_len(), 1);
+
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::Gamepad),
+            InputEvent::gamepad_disconnected(2),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let UiEnvelope::Delta(release) = subscriber.recv().await.unwrap() else {
+        panic!("disconnect must release typed button truth");
+    };
+    assert!(matches!(
+        release.change,
+        UiChange::KeyButton(rshare_core::UiDiscreteInputState::GamepadButton {
+            gamepad_id: 2,
+            button: GamepadButton::South,
+            state: rshare_core::ButtonState::Released,
+            ..
+        })
+    ));
+    let UiEnvelope::Delta(disconnected) = subscriber.recv().await.unwrap() else {
+        panic!("disconnect must update the latest gamepad view");
+    };
+    let UiChange::Gamepads(gamepads) = disconnected.change else {
+        panic!("disconnect view must be a typed gamepad projection");
+    };
+    assert!(!gamepads[0].connected);
+    assert!(gamepads[0].pressed_buttons.is_empty());
+    assert_eq!(aggregator.reliable_history_len(), 2);
 }
 
 #[tokio::test]

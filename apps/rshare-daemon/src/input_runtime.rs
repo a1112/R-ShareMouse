@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rshare_core::{
     AuthenticatedInputOwner, ButtonState, ControlConnectionId, DeviceId, InputRouter, KeyState,
-    MouseButton, RealtimeInputFrame, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame,
-    RouterCommand, RouterOutput, SessionEpoch,
+    LocalGamepadState, MouseButton, RealtimeInputFrame, ReleaseAllReason, ReliableInputEvent,
+    ReliableInputFrame, RouterCommand, RouterOutput, SessionEpoch,
 };
 use rshare_input::{
     CapturedInput, CapturedInputPayload, ContinuousInput, IngressEvent, IngressFault,
@@ -69,6 +69,7 @@ pub struct InputRuntime<T: InputTransport = ConnectionRegistry> {
     injection: InputInjectionHandle,
     pressed_keys: BTreeSet<u32>,
     pressed_buttons: BTreeSet<u8>,
+    gamepads: BTreeMap<u8, LocalGamepadState>,
     current_epoch: SessionEpoch,
     last_replaced: u64,
     last_dropped: u64,
@@ -94,6 +95,7 @@ impl<T: InputTransport> InputRuntime<T> {
             injection,
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
+            gamepads: BTreeMap::new(),
             current_epoch: SessionEpoch(0),
             last_replaced: 0,
             last_dropped: 0,
@@ -248,6 +250,7 @@ impl<T: InputTransport> InputRuntime<T> {
     fn process_captured(&mut self, input: CapturedInput) {
         self.metrics.record_captured();
         let pointer = input.pointer;
+        self.observe_gamepad_projection(&input.payload);
         let Some(router_input) = captured_to_router_input(input) else {
             return;
         };
@@ -260,6 +263,106 @@ impl<T: InputTransport> InputRuntime<T> {
                 y: pointer.y,
             });
         }
+    }
+
+    fn observe_gamepad_projection(&mut self, payload: &CapturedInputPayload) {
+        match payload {
+            CapturedInputPayload::Continuous(ContinuousInput::GamepadAxes(axes)) => {
+                self.update_gamepad_state(rshare_core::GamepadState::from(axes.clone()));
+            }
+            CapturedInputPayload::Discrete(InputEvent::GamepadConnected { info }) => {
+                let gamepad = self.gamepads.entry(info.gamepad_id).or_insert_with(|| {
+                    let mut gamepad = LocalGamepadState::from_state(
+                        &rshare_core::GamepadState::neutral(info.gamepad_id, 0, 0),
+                        Some(info.name.clone()),
+                        true,
+                    );
+                    gamepad.event_count = 0;
+                    gamepad
+                });
+                gamepad.name = info.name.clone();
+                gamepad.connected = true;
+                gamepad.event_count = gamepad.event_count.saturating_add(1);
+                self.publish_gamepad_projection();
+            }
+            CapturedInputPayload::Discrete(InputEvent::GamepadDisconnected { gamepad_id }) => {
+                let gamepad = self.gamepads.entry(*gamepad_id).or_insert_with(|| {
+                    let mut gamepad = LocalGamepadState::from_state(
+                        &rshare_core::GamepadState::neutral(*gamepad_id, 0, 0),
+                        None,
+                        false,
+                    );
+                    gamepad.event_count = 0;
+                    gamepad
+                });
+                gamepad.connected = false;
+                for button in &mut gamepad.buttons {
+                    button.pressed = false;
+                }
+                gamepad.pressed_buttons.clear();
+                gamepad.event_count = gamepad.event_count.saturating_add(1);
+                self.publish_gamepad_projection();
+            }
+            CapturedInputPayload::Discrete(InputEvent::GamepadButton { state_after, .. })
+            | CapturedInputPayload::Discrete(InputEvent::GamepadState { state: state_after }) => {
+                self.update_gamepad_state(state_after.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn update_gamepad_state(&mut self, state: rshare_core::GamepadState) {
+        let previous = self.gamepads.get(&state.gamepad_id);
+        let name = previous.map(|gamepad| gamepad.name.clone());
+        let mut next = LocalGamepadState::from_state(&state, name, true);
+        if let Some(previous) = previous {
+            next.event_count = previous.event_count.saturating_add(1);
+            next.button_event_count = previous.button_event_count;
+            next.button_press_count = previous.button_press_count;
+            next.button_release_count = previous.button_release_count;
+            next.axis_event_count = previous.axis_event_count;
+            next.trigger_event_count = previous.trigger_event_count;
+            next.last_button = previous.last_button.clone();
+            next.last_axis = previous.last_axis.clone();
+
+            for button in &state.buttons {
+                let was_pressed = previous
+                    .buttons
+                    .iter()
+                    .find(|old| old.button == button.button)
+                    .is_some_and(|old| old.pressed);
+                if was_pressed != button.pressed {
+                    next.button_event_count = next.button_event_count.saturating_add(1);
+                    if button.pressed {
+                        next.button_press_count = next.button_press_count.saturating_add(1);
+                    } else {
+                        next.button_release_count = next.button_release_count.saturating_add(1);
+                    }
+                    next.last_button = Some(format!("{:?}", button.button));
+                }
+            }
+            if previous.left_stick_x != state.left_stick_x
+                || previous.left_stick_y != state.left_stick_y
+                || previous.right_stick_x != state.right_stick_x
+                || previous.right_stick_y != state.right_stick_y
+            {
+                next.axis_event_count = next.axis_event_count.saturating_add(1);
+                next.last_axis = Some("stick".into());
+            }
+            if previous.left_trigger != state.left_trigger
+                || previous.right_trigger != state.right_trigger
+            {
+                next.trigger_event_count = next.trigger_event_count.saturating_add(1);
+                next.last_axis = Some("trigger".into());
+            }
+        }
+        self.gamepads.insert(state.gamepad_id, next);
+        self.publish_gamepad_projection();
+    }
+
+    fn publish_gamepad_projection(&self) {
+        self.state
+            .publish_gamepads(self.gamepads.values().cloned().collect());
     }
 
     fn dispatch_outputs(&mut self, outputs: impl IntoIterator<Item = RouterOutput>) {

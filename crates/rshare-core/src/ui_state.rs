@@ -332,7 +332,12 @@ impl UiView {
         }
 
         match delta.change {
-            UiChange::Status(status) => self.snapshot.status = status,
+            UiChange::Status(status) => {
+                self.snapshot.status = status;
+                self.snapshot.dynamic_state.diagnostics =
+                    self.snapshot.status.latency_feedback.clone();
+                synchronize_status_session(&mut self.snapshot, false);
+            }
             UiChange::Capabilities(capabilities) => self.snapshot.capabilities = capabilities,
             UiChange::DeviceUpsert(device) => {
                 if let Some(existing) = self
@@ -367,9 +372,11 @@ impl UiView {
                     return Err(error);
                 }
                 self.snapshot.active_sessions = active_sessions;
+                synchronize_status_session(&mut self.snapshot, true);
             }
             UiChange::Diagnostics(diagnostics) => {
-                self.snapshot.dynamic_state.diagnostics = diagnostics;
+                self.snapshot.dynamic_state.diagnostics = diagnostics.clone();
+                self.snapshot.status.latency_feedback = diagnostics;
             }
             UiChange::MediaSessionUpsert(media_session) => {
                 if let Some(existing) = self
@@ -412,7 +419,27 @@ fn prepare_snapshot(mut snapshot: UiSnapshot) -> Result<UiSnapshot, UiApplyError
     validate_protocol(snapshot.protocol_version)?;
     validate_unique_identities(&snapshot)?;
     canonicalize_pressed_truth(&mut snapshot.dynamic_state);
+    synchronize_status_session(&mut snapshot, false);
+    snapshot.dynamic_state.diagnostics = snapshot.status.latency_feedback.clone();
     Ok(snapshot)
+}
+
+fn synchronize_status_session(snapshot: &mut UiSnapshot, clear_when_none: bool) {
+    let Some(session) = snapshot.active_sessions.control.clone() else {
+        if clear_when_none {
+            snapshot.status.session_state = None;
+            snapshot.status.active_target = None;
+        }
+        return;
+    };
+    snapshot.status.active_target = match &session {
+        ControlSessionState::TransitioningToRemote { target, .. }
+        | ControlSessionState::RemoteActive { target, .. } => Some(*target),
+        ControlSessionState::LocalReady
+        | ControlSessionState::ReturningLocal { .. }
+        | ControlSessionState::Suspended { .. } => None,
+    };
+    snapshot.status.session_state = Some(session);
 }
 
 fn validate_unique_identities(snapshot: &UiSnapshot) -> Result<(), UiApplyError> {

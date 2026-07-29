@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -11,15 +12,15 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    default_ipc_addr, default_local_controls_ws_url, read_json_frame, write_json_frame,
-    CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
-    DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
-    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, MobileAccessSnapshot,
-    ServiceStatusSnapshot, UsbDescriptorProbeResult, UsbDeviceDescriptor,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot,
+    default_ipc_addr, default_local_controls_ws_url, read_json_frame, read_optional_ui_state_frame,
+    write_json_frame, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest,
+    DaemonResponse, DeviceId, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
+    DisplayIdentifyResult, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
+    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestRequest,
+    LocalInputTestResult, MobileAccessSnapshot, ServiceStatusSnapshot, UiCursor, UiEnvelope,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -360,6 +361,31 @@ pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<Tc
     Ok(stream)
 }
 
+pub struct UiStateSubscription {
+    stream: TcpStream,
+}
+
+impl UiStateSubscription {
+    pub async fn recv(&mut self) -> Result<Option<UiEnvelope>> {
+        read_optional_ui_state_frame(&mut self.stream).await
+    }
+}
+
+pub async fn subscribe_ui_state(cursor: Option<UiCursor>) -> Result<UiStateSubscription> {
+    subscribe_ui_state_at(default_ipc_addr(), cursor).await
+}
+
+pub async fn subscribe_ui_state_at(
+    address: SocketAddr,
+    cursor: Option<UiCursor>,
+) -> Result<UiStateSubscription> {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+    write_json_frame(&mut stream, &DaemonRequest::SubscribeUiState { cursor }).await?;
+    Ok(UiStateSubscription { stream })
+}
+
 pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonResponse> {
     let response: DaemonResponse = read_json_frame(stream).await?;
     match response {
@@ -410,8 +436,10 @@ pub async fn read_local_control_ws_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write_ui_state_frame;
     use std::fs::{self, File};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::TcpListener;
 
     fn temp_root(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -463,5 +491,54 @@ mod tests {
         assert_eq!(found, daemon);
 
         fs::remove_dir_all(root).expect("remove temp tree");
+    }
+
+    #[tokio::test]
+    async fn ui_state_subscription_uses_one_framed_connection_until_clean_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cursor = UiCursor::new(DeviceId::from_u128(1), 7);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: DaemonRequest = read_json_frame(&mut stream).await.unwrap();
+            assert_eq!(
+                request,
+                DaemonRequest::SubscribeUiState {
+                    cursor: Some(cursor)
+                }
+            );
+            write_ui_state_frame(
+                &mut stream,
+                &UiEnvelope::Heartbeat {
+                    boot_id: cursor.boot_id,
+                    revision: cursor.revision,
+                    sent_at_ms: 10,
+                },
+            )
+            .await
+            .unwrap();
+            write_ui_state_frame(
+                &mut stream,
+                &UiEnvelope::Heartbeat {
+                    boot_id: cursor.boot_id,
+                    revision: cursor.revision,
+                    sent_at_ms: 20,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut subscription = subscribe_ui_state_at(address, Some(cursor)).await.unwrap();
+        assert!(matches!(
+            subscription.recv().await.unwrap(),
+            Some(UiEnvelope::Heartbeat { sent_at_ms: 10, .. })
+        ));
+        assert!(matches!(
+            subscription.recv().await.unwrap(),
+            Some(UiEnvelope::Heartbeat { sent_at_ms: 20, .. })
+        ));
+        assert_eq!(subscription.recv().await.unwrap(), None);
+        server.await.unwrap();
     }
 }

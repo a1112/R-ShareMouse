@@ -3,8 +3,12 @@
 use std::future::Future;
 
 use anyhow::{Context, Result};
-use rshare_core::{DaemonRequest, DaemonResponse, IpcEnvelopeKind, IpcFrameCodec};
+use rshare_core::{
+    write_ui_state_frame, DaemonRequest, DaemonResponse, IpcEnvelopeKind, IpcFrameCodec,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::state_aggregator::{StateAggregatorHandle, StateSubscriber};
 
 pub async fn read_json_request<S>(stream: &mut S) -> Result<Option<DaemonRequest>>
 where
@@ -33,6 +37,29 @@ where
         .context("failed to write daemon IPC response")
 }
 
+pub async fn stream_ui_state<S>(stream: &mut S, mut subscriber: StateSubscriber) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    loop {
+        let envelope = subscriber
+            .recv()
+            .await
+            .context("UI state subscription ended")?;
+        write_ui_state_frame(stream, &envelope).await?;
+    }
+}
+
+pub async fn ui_state_subscriber_for_request(
+    request: &DaemonRequest,
+    state: &StateAggregatorHandle,
+) -> Result<Option<StateSubscriber>> {
+    let DaemonRequest::SubscribeUiState { cursor } = request else {
+        return Ok(None);
+    };
+    Ok(Some(state.subscribe(*cursor).await?))
+}
+
 pub async fn handle_persistent_json_connection<S, H, F>(mut stream: S, handler: H) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -59,7 +86,9 @@ where
     while let Some(request) = next_request {
         if matches!(
             request,
-            DaemonRequest::SubscribeLocalControls | DaemonRequest::SubscribeEndpointEvents { .. }
+            DaemonRequest::SubscribeLocalControls
+                | DaemonRequest::SubscribeEndpointEvents { .. }
+                | DaemonRequest::SubscribeUiState { .. }
         ) {
             write_json_response(
                 &mut stream,
@@ -154,7 +183,8 @@ mod tests {
                 match request {
                     DaemonRequest::Status => Ok(DaemonResponse::Ack),
                     DaemonRequest::SubscribeLocalControls
-                    | DaemonRequest::SubscribeEndpointEvents { .. } => {
+                    | DaemonRequest::SubscribeEndpointEvents { .. }
+                    | DaemonRequest::SubscribeUiState { .. } => {
                         panic!("streaming request reached ordinary dispatcher")
                     }
                     _ => Ok(DaemonResponse::Error("unexpected request".to_string())),

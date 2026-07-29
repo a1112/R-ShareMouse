@@ -425,7 +425,10 @@ impl DiagnosticsRuntime {
     fn sample(&mut self) {
         self.counters.samples.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.metrics.snapshot();
-        self.latest_tx.send_replace(snapshot);
+        let latest_changed = *self.latest.borrow() != snapshot;
+        if latest_changed {
+            self.latest_tx.send_replace(snapshot);
+        }
 
         let mut payloads = vec![DiagnosticPayload::Metrics(snapshot)];
         if self.last_metric != Some(snapshot) {

@@ -92,6 +92,28 @@ pub struct TransportConnectionDiagnostics {
     pub cert_trust_state: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct TransportDiagnosticsNotifier {
+    revision: Arc<AtomicU64>,
+    tx: watch::Sender<u64>,
+}
+
+impl TransportDiagnosticsNotifier {
+    pub(crate) fn new(revision: Arc<AtomicU64>, tx: watch::Sender<u64>) -> Self {
+        Self { revision, tx }
+    }
+
+    fn notify(&self) {
+        let previous = self
+            .revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                Some(revision.saturating_add(1))
+            })
+            .expect("transport diagnostic revision update cannot fail");
+        self.tx.send_replace(previous.saturating_add(1));
+    }
+}
+
 pub type PeerTransportConnection = QuicConnection;
 
 /// Isolated inbound lanes for one authenticated peer connection generation.
@@ -201,6 +223,7 @@ pub struct QuicTransport {
     present_client_certificate: bool,
     peer_protocol_handshake_required: bool,
     datagram_reader_start_barrier: Option<Arc<Notify>>,
+    diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
     state_lifetime: Option<Arc<StateLifetimeOwner>>,
     #[cfg(test)]
     accept_task_barrier: Option<Arc<Notify>>,
@@ -280,6 +303,7 @@ impl QuicTransport {
             present_client_certificate: true,
             peer_protocol_handshake_required: false,
             datagram_reader_start_barrier: None,
+            diagnostics_notifier: None,
             state_lifetime: None,
             #[cfg(test)]
             accept_task_barrier: None,
@@ -334,6 +358,10 @@ impl QuicTransport {
         self.peer_protocol_handshake_required = true;
     }
 
+    pub(crate) fn set_diagnostics_notifier(&mut self, notifier: TransportDiagnosticsNotifier) {
+        self.diagnostics_notifier = Some(notifier);
+    }
+
     #[cfg(test)]
     fn with_test_datagram_reader_barrier(mut self, barrier: Arc<Notify>) -> Self {
         self.datagram_reader_start_barrier = Some(barrier);
@@ -386,6 +414,7 @@ impl QuicTransport {
         };
         let peer_protocol_handshake_required = self.peer_protocol_handshake_required;
         let datagram_reader_start_barrier = self.datagram_reader_start_barrier.clone();
+        let diagnostics_notifier = self.diagnostics_notifier.clone();
         let state_lifetime = self.state_lifetime.clone();
         #[cfg(test)]
         let accept_task_barrier = self.accept_task_barrier.clone();
@@ -401,6 +430,7 @@ impl QuicTransport {
                 let config = config.clone();
                 let trust_store_path = trust_store_path.clone();
                 let datagram_reader_start_barrier = datagram_reader_start_barrier.clone();
+                let diagnostics_notifier = diagnostics_notifier.clone();
                 let state_lifetime = state_lifetime.clone();
                 #[cfg(test)]
                 let accept_task_barrier = accept_task_barrier.clone();
@@ -429,6 +459,7 @@ impl QuicTransport {
                                 trust_store_path,
                                 peer_protocol_handshake_required,
                                 datagram_reader_start_barrier,
+                                diagnostics_notifier,
                                 state_lifetime,
                             );
 
@@ -503,6 +534,7 @@ impl QuicTransport {
             trust_store_path,
             self.peer_protocol_handshake_required,
             self.datagram_reader_start_barrier.clone(),
+            self.diagnostics_notifier.clone(),
             self.state_lifetime.clone(),
         ))
     }
@@ -563,6 +595,7 @@ struct QuicConnectionInner {
     datagram_tx_dropped: AtomicU64,
     reliable_stream_reset_count: AtomicU64,
     last_datagram_rx_us: AtomicU64,
+    diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
     bootstrap_complete: AtomicBool,
     bootstrap_notify: Notify,
     bootstrap_stream_verified: AtomicBool,
@@ -756,6 +789,7 @@ impl QuicConnection {
         trust_store_path: PathBuf,
         peer_protocol_handshake_required: bool,
         datagram_reader_start_barrier: Option<Arc<Notify>>,
+        diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
         state_lifetime: Option<Arc<StateLifetimeOwner>>,
     ) -> Self {
         let (send_channel, mut send_rx): (mpsc::Sender<OutboundFrame>, _) = mpsc::channel(128);
@@ -769,6 +803,7 @@ impl QuicConnection {
             datagram_tx_dropped: AtomicU64::new(0),
             reliable_stream_reset_count: AtomicU64::new(0),
             last_datagram_rx_us: AtomicU64::new(0),
+            diagnostics_notifier,
             bootstrap_complete: AtomicBool::new(!peer_protocol_handshake_required),
             bootstrap_notify: Notify::new(),
             bootstrap_stream_verified: AtomicBool::new(!peer_protocol_handshake_required),
@@ -2819,6 +2854,9 @@ async fn read_realtime_datagrams(inner: Arc<QuicConnectionInner>) {
                         inner
                             .last_datagram_rx_us
                             .store(current_timestamp_us(), Ordering::Relaxed);
+                        if let Some(notifier) = &inner.diagnostics_notifier {
+                            notifier.notify();
+                        }
                         context.realtime.emit(frame);
                     }
                     continue;

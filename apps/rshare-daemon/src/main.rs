@@ -6,11 +6,9 @@ mod audio_runtime;
 mod endpoint_runtime;
 mod mobile_gateway;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
-use futures_util::SinkExt;
-#[cfg(test)]
-use rshare_core::Direction;
+use futures_util::{future::BoxFuture, SinkExt};
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
     local_capability_snapshots, remote_capability_snapshots, AudioFormat, BackendFailureReason,
@@ -28,13 +26,16 @@ use rshare_core::{
     LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
     LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
     RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
-    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
-    VirtualDesktopGeometry, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
-    VirtualDisplayStatus,
+    ServiceStatusSnapshot, TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState,
+    UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    UI_STATE_PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use rshare_core::{Direction, UiChange, UiEnvelope};
 use rshare_daemon::diagnostics_runtime::{
     DiagnosticPayload, DiagnosticPublicationItem, DiagnosticSubscriberId, DiagnosticsHandle,
     DiagnosticsRuntime, DiagnosticsSubscription, DIAGNOSTICS_HISTORY_CAPACITY,
@@ -42,10 +43,12 @@ use rshare_daemon::diagnostics_runtime::{
 use rshare_daemon::input_runtime::{
     dispatch_system_safety_event, run_authenticated_input_peers, InputRuntime,
 };
-use rshare_daemon::input_state::{input_state_channel, ControlMetrics};
+use rshare_daemon::input_state::{input_state_channel, ControlMetricSnapshot, ControlMetrics};
 use rshare_daemon::ipc_server::{
-    handle_persistent_json_connection_with_first, read_json_request, write_json_response,
+    handle_persistent_json_connection_with_first, read_json_request, stream_ui_state,
+    ui_state_subscriber_for_request, write_json_response,
 };
+use rshare_daemon::state_aggregator::{StateAggregator, StateAggregatorHandle, UiProjectionSource};
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
@@ -58,7 +61,7 @@ use rshare_input::RDevInputListener;
 #[cfg(windows)]
 use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
-    connection::{ConnectionInfo, ConnectionState},
+    connection::{ConnectionInfo, ConnectionSnapshotReader, ConnectionState},
     qos::{ClassifiedMessage, ConnectionRegistry, TransportSendError},
     DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig, TelemetryFrame,
 };
@@ -74,7 +77,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -546,7 +549,9 @@ impl DaemonState {
     ) -> ServiceStatusSnapshot {
         let network = network_snapshot_from_connections(connection_infos);
         let transport = transport_feedback_from_connections(&network, connection_infos);
-        self.status_snapshot_with_network_and_transport(&network, transport)
+        let mut snapshot = self.status_snapshot_with_network_and_transport(&network, transport);
+        snapshot.connected_devices = connected_connection_count(connection_infos);
+        snapshot
     }
 
     fn device_snapshots(&self) -> Vec<DaemonDeviceSnapshot> {
@@ -666,6 +671,46 @@ impl DaemonState {
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
         self.local_controls.clone()
+    }
+
+    fn ui_snapshot(&self) -> UiSnapshot {
+        let status = self.status_snapshot();
+        let diagnostics = status.latency_feedback.clone();
+        let capabilities = self.capability_registry_snapshot(&status.network, None);
+        UiSnapshot {
+            protocol_version: UI_STATE_PROTOCOL_VERSION,
+            boot_id: DeviceId::nil(),
+            revision: 0,
+            status,
+            devices: self.device_snapshots(),
+            layout: self.layout.clone(),
+            capabilities,
+            display_inventory: self.local_controls.display.clone(),
+            dynamic_state: UiDynamicState {
+                pointer: Some(UiPointerState {
+                    x: self.local_controls.mouse.x,
+                    y: self.local_controls.mouse.y,
+                    display_id: self.local_controls.mouse.current_display_id.clone(),
+                    observed_at_ms: timestamp_ms_now(),
+                }),
+                gamepads: self.local_controls.gamepads.clone(),
+                diagnostics,
+                ..UiDynamicState::default()
+            },
+            active_sessions: UiActiveSessions {
+                control: Some(self.session.state()),
+                media_sessions: Vec::new(),
+            },
+        }
+    }
+
+    fn ui_snapshot_for_connections(&self, connection_infos: &[ConnectionInfo]) -> UiSnapshot {
+        let mut snapshot = self.ui_snapshot();
+        let status = self.status_snapshot_for_connections(connection_infos);
+        snapshot.capabilities = self.capability_registry_snapshot(&status.network, None);
+        snapshot.dynamic_state.diagnostics = status.latency_feedback.clone();
+        snapshot.status = status;
+        snapshot
     }
 
     fn local_input_feedback(&self) -> LocalInputFeedback {
@@ -1270,6 +1315,54 @@ impl DaemonState {
         push_recent_local_event(&mut self.local_controls, event.clone());
         event
     }
+}
+
+#[derive(Clone)]
+struct DaemonUiProjectionSource {
+    state: Arc<RwLock<DaemonState>>,
+    network: Arc<dyn DaemonNetworkProjection>,
+    diagnostics: Option<watch::Receiver<ControlMetricSnapshot>>,
+}
+
+trait DaemonNetworkProjection: Send + Sync {
+    fn connection_infos(&self) -> Vec<ConnectionInfo>;
+}
+
+impl DaemonNetworkProjection for ConnectionSnapshotReader {
+    fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        ConnectionSnapshotReader::connection_infos(self)
+    }
+}
+
+impl UiProjectionSource for DaemonUiProjectionSource {
+    fn project(&self) -> BoxFuture<'_, Result<UiSnapshot>> {
+        let connection_infos = self.network.connection_infos();
+        let diagnostics = self
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| *diagnostics.borrow());
+        Box::pin(async move {
+            let state = self.state.read().await;
+            let mut snapshot = state.ui_snapshot_for_connections(&connection_infos);
+            if let Some(diagnostics) = diagnostics {
+                overlay_sampled_control_metrics(&mut snapshot, diagnostics);
+            }
+            Ok(snapshot)
+        })
+    }
+}
+
+fn overlay_sampled_control_metrics(snapshot: &mut UiSnapshot, metrics: ControlMetricSnapshot) {
+    let local = &mut snapshot.status.latency_feedback.local_input;
+    local.event_count = metrics.captured;
+    local.status = if metrics.reliable_overflow > 0 || metrics.realtime_dropped > 0 {
+        LatencyFeedbackStatus::Degraded
+    } else if metrics.captured > 0 {
+        LatencyFeedbackStatus::Healthy
+    } else {
+        local.status
+    };
+    snapshot.dynamic_state.diagnostics = snapshot.status.latency_feedback.clone();
 }
 
 fn local_gamepad_event_count(snapshot: &LocalControlDeviceSnapshot) -> u64 {
@@ -5690,39 +5783,6 @@ async fn run_audio_test(state: &Arc<RwLock<DaemonState>>) -> LocalAudioTestResul
     }
 }
 
-async fn apply_legacy_input_projection(
-    state: &Arc<RwLock<DaemonState>>,
-    projection: &rshare_daemon::input_state::InputReliableUiProjection,
-) {
-    let mut state = state.write().await;
-    state.local_controls.keyboard.pressed_keys = projection
-        .discrete
-        .pressed_keys
-        .iter()
-        .map(|keycode| format!("{:?}", rshare_input::KeyCode::Raw(*keycode)))
-        .collect();
-    state.local_controls.mouse.pressed_buttons = projection
-        .discrete
-        .pressed_buttons
-        .iter()
-        .map(|button| format!("{button:?}"))
-        .collect();
-    match &projection.session {
-        ControlSessionState::RemoteActive {
-            target,
-            entered_via,
-        } => {
-            state.session.reset();
-            let _ = state.session.on_edge_hit(*entered_via, Some(*target));
-        }
-        ControlSessionState::Suspended { .. } => state.session.on_backend_degraded(),
-        ControlSessionState::LocalReady
-        | ControlSessionState::TransitioningToRemote { .. }
-        | ControlSessionState::ReturningLocal { .. } => state.session.reset(),
-    }
-    sync_local_shortcut_suppression(&state);
-}
-
 #[cfg(windows)]
 fn input_event_from_windows_driver_event(
     event: &rshare_platform::windows::WindowsDriverInputEvent,
@@ -6374,6 +6434,7 @@ async fn main() -> Result<()> {
     let mut events = receivers.events;
     let authenticated_peers = receivers.authenticated_peers;
     let input_registry = network_manager.input_registry();
+    let ui_network_projection = network_manager.connection_snapshot_reader();
     let mut terminal_releases = network_manager
         .terminal_release_events()
         .await
@@ -6575,9 +6636,36 @@ async fn main() -> Result<()> {
 
     let layout_path = Arc::new(layout_path);
     let (input_command_tx, input_command_rx) = tokio::sync::mpsc::channel(64);
+    let (input_state, input_feeds) = input_state_channel(32);
+    let input_metrics = Arc::new(ControlMetrics::default());
+    let diagnostics_runtime =
+        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
+    let diagnostics_samples = diagnostics_runtime.latest_receiver();
+    let diagnostics = diagnostics_runtime.handle();
+    let (diagnostics_shutdown_tx, diagnostics_shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let _diagnostics_task = tokio::spawn(diagnostics_runtime.run(diagnostics_shutdown_rx));
+    let ui_network_changes = ui_network_projection.changes();
+    let initial_ui_snapshot = {
+        let connection_infos = ui_network_projection.connection_infos();
+        let state = state.read().await;
+        state.ui_snapshot_for_connections(&connection_infos)
+    };
+    let ui_state = StateAggregator::try_with_projection_and_diagnostics(
+        initial_ui_snapshot,
+        256,
+        input_feeds,
+        Arc::new(DaemonUiProjectionSource {
+            state: state.clone(),
+            network: Arc::new(ui_network_projection),
+            diagnostics: Some(diagnostics_samples.clone()),
+        }),
+        diagnostics_samples,
+        ui_network_changes,
+    )?;
 
     let ipc_task = tokio::spawn(run_ipc_server(
         ipc_listener,
+        ui_state.clone(),
         state.clone(),
         network_manager.clone(),
         input_command_tx.clone(),
@@ -6591,6 +6679,7 @@ async fn main() -> Result<()> {
     ));
     let local_controls_ws_task = tokio::spawn(run_local_controls_ws_server(
         state.clone(),
+        ui_state.clone(),
         local_events_tx.clone(),
         shutdown_tx.subscribe(),
     ));
@@ -6638,13 +6727,6 @@ async fn main() -> Result<()> {
         )
     };
     let input_router = InputRouter::new(device_id, router_layout, router_geometry, connected_peers);
-    let (input_state, mut input_feeds) = input_state_channel(32);
-    let input_metrics = Arc::new(ControlMetrics::default());
-    let diagnostics_runtime =
-        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
-    let diagnostics = diagnostics_runtime.handle();
-    let (diagnostics_shutdown_tx, diagnostics_shutdown_rx) = tokio::sync::mpsc::channel(1);
-    let _diagnostics_task = tokio::spawn(diagnostics_runtime.run(diagnostics_shutdown_rx));
     if !input_backend_healthy {
         enqueue_router_command(&input_command_tx, RouterCommand::BackendDegraded).await?;
     }
@@ -6672,38 +6754,6 @@ async fn main() -> Result<()> {
         Duration::from_secs(2),
         shutdown_tx.subscribe(),
     ));
-    let legacy_input_state = state.clone();
-    let mut legacy_input_shutdown = shutdown_tx.subscribe();
-    let _legacy_input_adapter_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                mutation = input_feeds.reliable_rx.recv() => {
-                    let Some(_mutation) = mutation else { break; };
-                    let projection = input_feeds.authoritative_rx.borrow().clone();
-                    apply_legacy_input_projection(&legacy_input_state, &projection).await;
-                }
-                changed = input_feeds.pointer_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    let pointer = *input_feeds.pointer_rx.borrow_and_update();
-                    if let Some(pointer) = pointer {
-                        let mut state = legacy_input_state.write().await;
-                        state.local_controls.mouse.x = pointer.x;
-                        state.local_controls.mouse.y = pointer.y;
-                    }
-                }
-                _ = input_feeds.dirty.notified() => {
-                    if input_feeds.dirty.take() {
-                        let projection = input_feeds.authoritative_rx.borrow().clone();
-                        apply_legacy_input_projection(&legacy_input_state, &projection).await;
-                    }
-                }
-                _ = legacy_input_shutdown.recv() => break,
-            }
-        }
-    });
-
     let current_generations = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let terminal_generation_view = current_generations.clone();
     let terminal_injection = injection.clone();
@@ -6729,6 +6779,7 @@ async fn main() -> Result<()> {
 
     let event_task = {
         let state = state.clone();
+        let ui_state = ui_state.clone();
         let inject_backend = inject_backend.clone();
         let network_manager = network_manager.clone();
         let audio_runtime = audio_runtime.clone();
@@ -6745,6 +6796,7 @@ async fn main() -> Result<()> {
             while let Some(event) = events.recv().await {
                 let event = match into_authenticated_network_message(event) {
                     Ok((from, control_connection_id, message)) => {
+                        let reconcile = network_message_may_mutate_ui(&message);
                         handle_network_message(
                             &state,
                             &network_manager,
@@ -6760,6 +6812,12 @@ async fn main() -> Result<()> {
                             message,
                         )
                         .await;
+                        if let Err(error) = reconcile_ui_state_if(&ui_state, reconcile).await {
+                            tracing::error!(
+                                "Failed to reconcile UI state after peer message: {error:#}"
+                            );
+                            break;
+                        }
                         continue;
                     }
                     Err(event) => event,
@@ -6962,6 +7020,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                if let Err(error) = ui_state.reconcile_from_projection().await {
+                    tracing::error!("Failed to reconcile UI state after network event: {error:#}");
+                    break;
+                }
             }
             tracing::debug!("Event task: events channel closed");
         })
@@ -7046,6 +7108,7 @@ async fn main() -> Result<()> {
 
 async fn run_ipc_server(
     listener: TcpListener,
+    ui_state: StateAggregatorHandle,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
     input_command_tx: tokio::sync::mpsc::Sender<RouterCommand>,
@@ -7059,6 +7122,7 @@ async fn run_ipc_server(
 ) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
+        let ui_state = ui_state.clone();
         let state = state.clone();
         let network_manager = network_manager.clone();
         let input_command_tx = input_command_tx.clone();
@@ -7073,6 +7137,7 @@ async fn run_ipc_server(
         tokio::spawn(async move {
             if let Err(err) = handle_ipc_client(
                 stream,
+                ui_state,
                 state,
                 network_manager,
                 input_command_tx,
@@ -7094,6 +7159,7 @@ async fn run_ipc_server(
 
 async fn run_local_controls_ws_server(
     state: Arc<RwLock<DaemonState>>,
+    ui_state: StateAggregatorHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -7108,9 +7174,10 @@ async fn run_local_controls_ws_server(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let state = state.clone();
+                let ui_state = ui_state.clone();
                 let local_events_tx = local_events_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_local_controls_ws_client(stream, state, local_events_tx).await {
+                    if let Err(error) = handle_local_controls_ws_client(stream, state, ui_state, local_events_tx).await {
                         tracing::debug!("Local controls websocket client error: {}", error);
                     }
                 });
@@ -7125,18 +7192,14 @@ async fn run_local_controls_ws_server(
 async fn handle_local_controls_ws_client(
     stream: TcpStream,
     state: Arc<RwLock<DaemonState>>,
+    ui_state: StateAggregatorHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
 ) -> Result<()> {
     let mut websocket = accept_async(stream).await?;
-    let snapshot = {
-        let mut state = state.write().await;
-        state.refresh_local_controls_platform();
-        state.local_control_snapshot()
-    };
+    let response =
+        DaemonResponse::LocalControls(local_controls_fallback_snapshot(&state, &ui_state).await?);
     websocket
-        .send(WsMessage::Text(serde_json::to_string(
-            &DaemonResponse::LocalControls(snapshot),
-        )?))
+        .send(WsMessage::Text(serde_json::to_string(&response)?))
         .await?;
 
     let mut events = local_events_tx.subscribe();
@@ -7152,6 +7215,7 @@ async fn handle_local_controls_ws_client(
 
 async fn handle_ipc_client(
     mut stream: TcpStream,
+    ui_state: StateAggregatorHandle,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
     input_command_tx: tokio::sync::mpsc::Sender<RouterCommand>,
@@ -7167,12 +7231,12 @@ async fn handle_ipc_client(
         return Ok(());
     };
 
+    if let Some(subscriber) = ui_state_subscriber_for_request(&request, &ui_state).await? {
+        return stream_ui_state(&mut stream, subscriber).await;
+    }
+
     if matches!(request, DaemonRequest::SubscribeLocalControls) {
-        let snapshot = {
-            let state = state.read().await;
-            state.local_control_snapshot()
-        };
-        write_json_response(&mut stream, &DaemonResponse::LocalControls(snapshot)).await?;
+        write_local_controls_fallback_snapshot(&mut stream, &state, &ui_state).await?;
         let mut events = local_events_tx.subscribe();
         loop {
             match events.recv().await {
@@ -7238,6 +7302,7 @@ async fn handle_ipc_client(
     }
 
     handle_persistent_json_connection_with_first(stream, request, move |request| {
+        let ui_state = ui_state.clone();
         let state = Arc::clone(&state);
         let network_manager = Arc::clone(&network_manager);
         let input_command_tx = input_command_tx.clone();
@@ -7248,7 +7313,8 @@ async fn handle_ipc_client(
         let layout_path = Arc::clone(&layout_path);
         let shutdown_tx = shutdown_tx.clone();
         async move {
-            dispatch_ipc_request(
+            let reconcile = request_may_mutate_ui(&request);
+            let response = dispatch_ipc_request(
                 request,
                 state,
                 network_manager,
@@ -7260,10 +7326,174 @@ async fn handle_ipc_client(
                 layout_path,
                 shutdown_tx,
             )
-            .await
+            .await?;
+            if reconcile {
+                ui_state
+                    .reconcile_from_projection()
+                    .await
+                    .context("failed to reconcile UI state after daemon command")?;
+            }
+            Ok(overlay_stream_truth_onto_fallback_response(
+                response,
+                ui_state.latest_snapshot().as_ref(),
+            ))
         }
     })
     .await
+}
+
+fn network_message_may_mutate_ui(message: &Message) -> bool {
+    match message {
+        Message::Hello { .. }
+        | Message::HelloBack { .. }
+        | Message::HelloRejected { .. }
+        | Message::Goodbye { .. }
+        | Message::EndpointEventSnapshot { .. }
+        | Message::EndpointEventDelta { .. }
+        | Message::EndpointInjectResult { .. }
+        | Message::LatencyProbeAck { .. }
+        | Message::AudioStreamStart { .. }
+        | Message::AudioStreamStop { .. }
+        | Message::AudioStreamError { .. }
+        | Message::UsbDeviceAttached { .. }
+        | Message::UsbDeviceDetached { .. }
+        | Message::UsbForwardingError { .. }
+        | Message::UsbDeviceClaimRequest { .. }
+        | Message::UsbDeviceClaimResponse { .. }
+        | Message::UsbDeviceRelease { .. }
+        | Message::UsbDeviceReset { .. }
+        | Message::UsbTransferCancel { .. }
+        | Message::ScreenUpdate { .. } => true,
+        Message::InputDiagnostic { .. }
+        | Message::EndpointEventSubscribe { .. }
+        | Message::EndpointInjectRequest { .. }
+        | Message::LatencyProbe { .. }
+        | Message::AudioFrame { .. }
+        | Message::UsbTransfer { .. }
+        | Message::UsbTransferComplete { .. }
+        | Message::UsbFlowControl { .. }
+        | Message::ClipboardData { .. }
+        | Message::ClipboardRequest
+        | Message::ClipboardResponse { .. }
+        | Message::Heartbeat { .. }
+        | Message::Ack { .. }
+        | Message::Error { .. } => false,
+    }
+}
+
+async fn reconcile_ui_state_if(state: &StateAggregatorHandle, required: bool) -> Result<()> {
+    if required {
+        state.reconcile_from_projection().await?;
+    }
+    Ok(())
+}
+
+async fn write_local_controls_fallback_snapshot<S>(
+    stream: &mut S,
+    state: &Arc<RwLock<DaemonState>>,
+    ui_state: &StateAggregatorHandle,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let local_controls = local_controls_fallback_snapshot(state, ui_state).await?;
+    write_json_response(stream, &DaemonResponse::LocalControls(local_controls)).await
+}
+
+async fn local_controls_fallback_snapshot(
+    state: &Arc<RwLock<DaemonState>>,
+    ui_state: &StateAggregatorHandle,
+) -> Result<LocalControlDeviceSnapshot> {
+    let local_controls = {
+        let mut state = state.write().await;
+        state.refresh_local_controls_platform();
+        state.local_control_snapshot()
+    };
+    ui_state
+        .reconcile_from_projection()
+        .await
+        .context("failed to reconcile UI state for local-controls fallback")?;
+    let response = overlay_stream_truth_onto_fallback_response(
+        DaemonResponse::LocalControls(local_controls),
+        ui_state.latest_snapshot().as_ref(),
+    );
+    match response {
+        DaemonResponse::LocalControls(snapshot) => Ok(snapshot),
+        _ => unreachable!("local-controls overlay preserves the response variant"),
+    }
+}
+
+fn overlay_stream_truth_onto_fallback_response(
+    response: DaemonResponse,
+    snapshot: &UiSnapshot,
+) -> DaemonResponse {
+    match response {
+        DaemonResponse::Status(mut status) => {
+            status.session_state = snapshot.active_sessions.control.clone();
+            status.active_target = snapshot
+                .active_sessions
+                .control
+                .as_ref()
+                .and_then(|session| match session {
+                    ControlSessionState::TransitioningToRemote { target, .. }
+                    | ControlSessionState::RemoteActive { target, .. } => Some(*target),
+                    ControlSessionState::LocalReady
+                    | ControlSessionState::ReturningLocal { .. }
+                    | ControlSessionState::Suspended { .. } => None,
+                });
+            DaemonResponse::Status(status)
+        }
+        DaemonResponse::LocalControls(mut controls) => {
+            if let Some(pointer) = &snapshot.dynamic_state.pointer {
+                controls.mouse.x = pointer.x;
+                controls.mouse.y = pointer.y;
+                controls.mouse.current_display_id = pointer.display_id.clone();
+            }
+            controls.keyboard.pressed_keys = snapshot
+                .dynamic_state
+                .pressed_keys
+                .iter()
+                .map(|keycode| format!("{:?}", rshare_input::KeyCode::Raw(*keycode)))
+                .collect();
+            controls.mouse.pressed_buttons = snapshot
+                .dynamic_state
+                .pressed_mouse_buttons
+                .iter()
+                .map(|button| format!("{button:?}"))
+                .collect();
+            controls.gamepads = snapshot.dynamic_state.gamepads.clone();
+            controls.display = snapshot.display_inventory.clone();
+            DaemonResponse::LocalControls(controls)
+        }
+        other => other,
+    }
+}
+
+fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
+    matches!(
+        request,
+        DaemonRequest::Capabilities { .. }
+            | DaemonRequest::LocalControls
+            | DaemonRequest::Connect { .. }
+            | DaemonRequest::Disconnect { .. }
+            | DaemonRequest::SetLayout { .. }
+            | DaemonRequest::InjectEndpointEvent { .. }
+            | DaemonRequest::RunLocalInputTest { .. }
+            | DaemonRequest::RunRemoteLatencyTest { .. }
+            | DaemonRequest::RunRemoteUsbDescriptorProbe { .. }
+            | DaemonRequest::SetAudioDefaultOutput { .. }
+            | DaemonRequest::SetAudioOutputVolume { .. }
+            | DaemonRequest::SetAudioOutputMute { .. }
+            | DaemonRequest::StartAudioCapture { .. }
+            | DaemonRequest::StopAudioCapture
+            | DaemonRequest::StartAudioForwarding { .. }
+            | DaemonRequest::StopAudioForwarding
+            | DaemonRequest::RunAudioTest { .. }
+            | DaemonRequest::UpdateDisplaySettings(_)
+            | DaemonRequest::ListVirtualDisplays
+            | DaemonRequest::CreateVirtualDisplay(_)
+            | DaemonRequest::RemoveVirtualDisplay(_)
+    )
 }
 
 async fn dispatch_ipc_request(
@@ -7566,12 +7796,12 @@ async fn dispatch_ipc_request(
             state.refresh_local_controls_platform();
             DaemonResponse::VirtualDisplayOperation(result)
         }
-        DaemonRequest::SubscribeLocalControls | DaemonRequest::SubscribeEndpointEvents { .. } => {
-            DaemonResponse::Error(
-                "streaming subscriptions must be the first request on a dedicated connection"
-                    .to_string(),
-            )
-        }
+        DaemonRequest::SubscribeLocalControls
+        | DaemonRequest::SubscribeEndpointEvents { .. }
+        | DaemonRequest::SubscribeUiState { .. } => DaemonResponse::Error(
+            "streaming subscriptions must be the first request on a dedicated connection"
+                .to_string(),
+        ),
         DaemonRequest::Shutdown => {
             let _ = shutdown_tx.send(());
             DaemonResponse::Ack
@@ -7775,6 +8005,76 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountingUiProjection {
+        calls: Arc<AtomicUsize>,
+        snapshot: UiSnapshot,
+    }
+
+    impl UiProjectionSource for CountingUiProjection {
+        fn project(&self) -> BoxFuture<'_, Result<UiSnapshot>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let snapshot = self.snapshot.clone();
+            Box::pin(async move { Ok(snapshot) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedDaemonNetworkProjection {
+        connections: Vec<ConnectionInfo>,
+    }
+
+    impl DaemonNetworkProjection for FixedDaemonNetworkProjection {
+        fn connection_infos(&self) -> Vec<ConnectionInfo> {
+            self.connections.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct MutableDaemonNetworkProjection {
+        connections: Arc<std::sync::RwLock<Vec<ConnectionInfo>>>,
+        revision: Arc<AtomicUsize>,
+        changed: watch::Sender<u64>,
+    }
+
+    impl MutableDaemonNetworkProjection {
+        fn new(connections: Vec<ConnectionInfo>) -> Self {
+            let (changed, _) = watch::channel(0);
+            Self {
+                connections: Arc::new(std::sync::RwLock::new(connections)),
+                revision: Arc::new(AtomicUsize::new(0)),
+                changed,
+            }
+        }
+
+        fn changes(&self) -> watch::Receiver<u64> {
+            self.changed.subscribe()
+        }
+
+        fn replace(&self, connections: Vec<ConnectionInfo>) {
+            *self.connections.write().unwrap() = connections;
+            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.changed.send_replace(revision as u64);
+        }
+    }
+
+    impl DaemonNetworkProjection for MutableDaemonNetworkProjection {
+        fn connection_infos(&self) -> Vec<ConnectionInfo> {
+            self.connections.read().unwrap().clone()
+        }
+    }
+
+    fn zero_control_metrics() -> ControlMetricSnapshot {
+        ControlMetricSnapshot {
+            captured: 0,
+            routed: 0,
+            realtime_replaced: 0,
+            realtime_dropped: 0,
+            reliable_overflow: 0,
+        }
+    }
 
     fn test_daemon_state() -> DaemonState {
         DaemonState::new(ServiceStatusSnapshot::new(
@@ -7791,57 +8091,168 @@ mod tests {
         InputInjectionHandle::spawn(Box::new(backend), InjectionActorConfig::default()).unwrap()
     }
 
-    #[tokio::test]
-    async fn legacy_projection_applies_key_button_and_dirty_authoritative_truth() {
-        let state = Arc::new(RwLock::new(test_daemon_state()));
-        let target = DeviceId::new_v4();
-        let projection = rshare_daemon::input_state::InputReliableUiProjection {
-            discrete: rshare_daemon::input_state::InputDiscreteProjection {
-                session_epoch: rshare_core::SessionEpoch(9),
-                pressed_keys: vec![0x41],
-                pressed_buttons: vec![rshare_core::MouseButton::Left],
+    #[test]
+    fn hot_input_messages_bypass_full_projection_reconcile() {
+        let input = Message::InputDiagnostic {
+            device_id: DeviceId::from_u128(7),
+            event: LocalInputDiagnosticEvent {
+                sequence: 1,
+                timestamp_ms: 2,
+                device_kind: LocalInputDeviceKind::Mouse,
+                event_kind: "move".into(),
+                summary: "pointer".into(),
+                device_id: None,
+                device_instance_id: None,
+                capture_path: None,
+                source: LocalInputEventSource::Hardware,
+                payload: BTreeMap::new(),
             },
-            session: ControlSessionState::RemoteActive {
+        };
+        assert!(!network_message_may_mutate_ui(&input));
+        assert!(network_message_may_mutate_ui(&Message::ScreenUpdate {
+            screen_info: ScreenInfo::new(0, 0, 1920, 1080),
+        }));
+        assert!(request_may_mutate_ui(&DaemonRequest::Capabilities {
+            device_id: None,
+        }));
+        assert!(request_may_mutate_ui(&DaemonRequest::LocalControls));
+        assert!(request_may_mutate_ui(&DaemonRequest::ListVirtualDisplays));
+    }
+
+    #[tokio::test]
+    async fn hot_input_classification_does_not_call_projection_but_low_frequency_change_does() {
+        let snapshot = test_daemon_state().ui_snapshot();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let projection = Arc::new(CountingUiProjection {
+            calls: calls.clone(),
+            snapshot: snapshot.clone(),
+        });
+        let (_input, feeds) = input_state_channel(4);
+        let aggregator = StateAggregator::with_projection(snapshot, 8, feeds, projection);
+        let input = Message::InputDiagnostic {
+            device_id: DeviceId::from_u128(7),
+            event: LocalInputDiagnosticEvent {
+                sequence: 1,
+                timestamp_ms: 2,
+                device_kind: LocalInputDeviceKind::Mouse,
+                event_kind: "move".into(),
+                summary: "pointer".into(),
+                device_id: None,
+                device_instance_id: None,
+                capture_path: None,
+                source: LocalInputEventSource::Hardware,
+                payload: BTreeMap::new(),
+            },
+        };
+        reconcile_ui_state_if(&aggregator, network_message_may_mutate_ui(&input))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let display = Message::ScreenUpdate {
+            screen_info: ScreenInfo::new(0, 0, 1920, 1080),
+        };
+        reconcile_ui_state_if(&aggregator, network_message_may_mutate_ui(&display))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_status_and_local_controls_overlay_latest_input_stream_truth() {
+        let state = test_daemon_state();
+        let initial = state.ui_snapshot();
+        let (input, feeds) = input_state_channel(8);
+        let aggregator = StateAggregator::with_input(initial, 8, feeds);
+        let target = DeviceId::from_u128(55);
+
+        input.publish_pointer(rshare_daemon::input_state::InputPointerProjection {
+            session_epoch: rshare_core::SessionEpoch(1),
+            x: 321,
+            y: -42,
+        });
+        input.publish_discrete(rshare_daemon::input_state::InputDiscreteProjection {
+            session_epoch: rshare_core::SessionEpoch(1),
+            pressed_keys: vec![0x41],
+            pressed_buttons: vec![rshare_core::MouseButton::Left],
+        });
+        input.publish_session(ControlSessionState::RemoteActive {
+            target,
+            entered_via: Direction::Right,
+        });
+        let latest = tokio::time::timeout(Duration::from_secs(1), aggregator.wait_for_revision(4))
+            .await
+            .expect("input projection did not reach fallback view")
+            .unwrap();
+
+        let DaemonResponse::LocalControls(controls) = overlay_stream_truth_onto_fallback_response(
+            DaemonResponse::LocalControls(state.local_control_snapshot()),
+            latest.as_ref(),
+        ) else {
+            panic!("expected fallback local-controls response");
+        };
+        assert_eq!((controls.mouse.x, controls.mouse.y), (321, -42));
+        assert_eq!(controls.keyboard.pressed_keys, vec!["Raw(65)"]);
+        assert_eq!(controls.mouse.pressed_buttons, vec!["Left"]);
+
+        let DaemonResponse::Status(status) = overlay_stream_truth_onto_fallback_response(
+            DaemonResponse::Status(state.status_snapshot()),
+            latest.as_ref(),
+        ) else {
+            panic!("expected fallback status response");
+        };
+        assert_eq!(
+            status.session_state,
+            Some(ControlSessionState::RemoteActive {
                 target,
                 entered_via: Direction::Right,
-            },
-        };
+            })
+        );
+        assert_eq!(status.active_target, Some(target));
+    }
 
-        apply_legacy_input_projection(&state, &projection).await;
-        {
-            let current = state.read().await;
-            assert_eq!(
-                current.local_controls.keyboard.pressed_keys,
-                vec!["Raw(65)"]
-            );
-            assert_eq!(current.local_controls.mouse.pressed_buttons, vec!["Left"]);
-            assert!(matches!(
-                current.session.state(),
-                ControlSessionState::RemoteActive {
-                    target: actual_target,
-                    ..
-                } if actual_target == target
-            ));
-        }
+    #[tokio::test]
+    async fn dedicated_local_controls_subscription_writes_latest_input_truth_first() {
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let initial = state.read().await.ui_snapshot();
+        let (input, feeds) = input_state_channel(8);
+        let aggregator = StateAggregator::with_projection(
+            initial,
+            8,
+            feeds,
+            Arc::new(DaemonUiProjectionSource {
+                state: state.clone(),
+                network: Arc::new(FixedDaemonNetworkProjection {
+                    connections: Vec::new(),
+                }),
+                diagnostics: None,
+            }),
+        );
+        input.publish_pointer(rshare_daemon::input_state::InputPointerProjection {
+            session_epoch: rshare_core::SessionEpoch(1),
+            x: 88,
+            y: 99,
+        });
+        input.publish_discrete(rshare_daemon::input_state::InputDiscreteProjection {
+            session_epoch: rshare_core::SessionEpoch(1),
+            pressed_keys: vec![0x42],
+            pressed_buttons: Vec::new(),
+        });
+        tokio::time::timeout(Duration::from_secs(1), aggregator.wait_for_revision(2))
+            .await
+            .expect("input projection did not reach dedicated fallback")
+            .unwrap();
 
-        let cleared = rshare_daemon::input_state::InputReliableUiProjection {
-            discrete: rshare_daemon::input_state::InputDiscreteProjection {
-                session_epoch: rshare_core::SessionEpoch(10),
-                pressed_keys: Vec::new(),
-                pressed_buttons: Vec::new(),
-            },
-            session: ControlSessionState::Suspended {
-                reason: rshare_core::SuspendReason::BackendDegraded,
-            },
+        let (mut server, mut client) = tokio::io::duplex(64 * 1024);
+        write_local_controls_fallback_snapshot(&mut server, &state, &aggregator)
+            .await
+            .unwrap();
+        let response: DaemonResponse = rshare_core::read_json_frame(&mut client).await.unwrap();
+        let DaemonResponse::LocalControls(controls) = response else {
+            panic!("dedicated subscription must begin with local controls");
         };
-        apply_legacy_input_projection(&state, &cleared).await;
-        let current = state.read().await;
-        assert!(current.local_controls.keyboard.pressed_keys.is_empty());
-        assert!(current.local_controls.mouse.pressed_buttons.is_empty());
-        assert!(matches!(
-            current.session.state(),
-            ControlSessionState::Suspended { .. }
-        ));
+        assert_eq!((controls.mouse.x, controls.mouse.y), (88, 99));
+        assert_eq!(controls.keyboard.pressed_keys, vec!["Raw(66)"]);
     }
 
     #[test]
@@ -10961,6 +11372,141 @@ mod tests {
             LatencyFeedbackStatus::Healthy
         );
         assert_eq!(snapshot.latency_feedback.transport.rtt_ms, Some(12));
+    }
+
+    #[tokio::test]
+    async fn daemon_ui_projection_uses_live_network_truth_for_status_and_capabilities() {
+        let connection = connected_connection_info(DeviceId::new_v4(), Some(12));
+        let source = DaemonUiProjectionSource {
+            state: Arc::new(RwLock::new(test_daemon_state())),
+            network: Arc::new(FixedDaemonNetworkProjection {
+                connections: vec![connection],
+            }),
+            diagnostics: None,
+        };
+
+        let snapshot = source.project().await.unwrap();
+
+        assert_eq!(snapshot.status.connected_devices, 1);
+        assert_eq!(snapshot.status.network.rtt_ms, Some(12));
+        assert_eq!(
+            snapshot.status.latency_feedback.transport.status,
+            LatencyFeedbackStatus::Healthy
+        );
+        let local = snapshot
+            .capabilities
+            .devices
+            .iter()
+            .find(|device| device.device_id == snapshot.capabilities.local_device_id)
+            .unwrap();
+        let diagnostics = local
+            .capabilities
+            .iter()
+            .find(|capability| capability.kind == rshare_core::EndpointCapabilityKind::Diagnostics)
+            .unwrap();
+        assert_eq!(diagnostics.latency_ms, Some(12));
+        assert_eq!(diagnostics.transport_state.as_deref(), Some("healthy"));
+        assert_eq!(
+            diagnostics
+                .details
+                .get("datagram_available")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn sampled_control_metrics_wake_live_ui_stream_without_interval_refresh() {
+        let (diagnostics_tx, diagnostics_rx) = watch::channel(zero_control_metrics());
+        let (_network_tx, network_rx) = watch::channel(0_u64);
+        let source = Arc::new(DaemonUiProjectionSource {
+            state: Arc::new(RwLock::new(test_daemon_state())),
+            network: Arc::new(FixedDaemonNetworkProjection {
+                connections: Vec::new(),
+            }),
+            diagnostics: Some(diagnostics_rx.clone()),
+        });
+        let initial = source.project().await.unwrap();
+        let (_input, feeds) = input_state_channel(4);
+        let aggregator = StateAggregator::try_with_projection_and_diagnostics(
+            initial,
+            8,
+            feeds,
+            source,
+            diagnostics_rx,
+            network_rx,
+        )
+        .unwrap();
+        let mut subscriber = aggregator.subscribe(None).await.unwrap();
+        let _ = subscriber.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), subscriber.recv())
+                .await
+                .is_err(),
+            "live UI must not refresh on an interval without a sampled change"
+        );
+
+        diagnostics_tx.send_replace(ControlMetricSnapshot {
+            captured: 7,
+            routed: 5,
+            realtime_replaced: 2,
+            realtime_dropped: 1,
+            reliable_overflow: 0,
+        });
+        let UiEnvelope::Delta(delta) = subscriber.recv().await.unwrap() else {
+            panic!("sampled diagnostics must wake the live UI stream");
+        };
+        assert!(matches!(delta.change, UiChange::Status(_)));
+        let snapshot = aggregator.latest_snapshot();
+        assert_eq!(snapshot.status.latency_feedback.local_input.event_count, 7);
+        assert_eq!(
+            snapshot.status.latency_feedback.local_input.status,
+            LatencyFeedbackStatus::Degraded
+        );
+        assert_eq!(
+            snapshot.dynamic_state.diagnostics,
+            snapshot.status.latency_feedback
+        );
+    }
+
+    #[tokio::test]
+    async fn network_projection_notification_updates_live_ui_rtt() {
+        let network = MutableDaemonNetworkProjection::new(Vec::new());
+        let network_rx = network.changes();
+        let (diagnostics_tx, diagnostics_rx) = watch::channel(zero_control_metrics());
+        let source = Arc::new(DaemonUiProjectionSource {
+            state: Arc::new(RwLock::new(test_daemon_state())),
+            network: Arc::new(network.clone()),
+            diagnostics: Some(diagnostics_rx.clone()),
+        });
+        let initial = source.project().await.unwrap();
+        let (_input, feeds) = input_state_channel(4);
+        let aggregator = StateAggregator::try_with_projection_and_diagnostics(
+            initial,
+            8,
+            feeds,
+            source,
+            diagnostics_rx,
+            network_rx,
+        )
+        .unwrap();
+        let mut subscriber = aggregator.subscribe(None).await.unwrap();
+        let _ = subscriber.recv().await.unwrap();
+
+        network.replace(vec![connected_connection_info(
+            DeviceId::new_v4(),
+            Some(23),
+        )]);
+        let UiEnvelope::Delta(delta) = subscriber.recv().await.unwrap() else {
+            panic!("network actor notification must wake the live UI stream");
+        };
+        let UiChange::Status(status) = delta.change else {
+            panic!("network notification must first emit the changed status");
+        };
+        assert_eq!(status.connected_devices, 1);
+        assert_eq!(status.network.rtt_ms, Some(23));
+        assert_eq!(status.latency_feedback.transport.rtt_ms, Some(23));
+        drop(diagnostics_tx);
     }
 
     #[test]

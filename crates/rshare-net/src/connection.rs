@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex as TokioMutex, Notify, RwLock};
+use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify, RwLock};
 use tokio::time::Instant;
 
 use rshare_core::{ControlConnectionId, DeviceId, Message};
@@ -15,7 +15,10 @@ use super::qos::{
     ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
     TerminalReleaseEvent, TransportSendError,
 };
-use super::transport::{ConnectionPool, PeerInbound, QuicTransport, TransportProtocolError};
+use super::transport::{
+    ConnectionPool, PeerInbound, QuicTransport, TransportDiagnosticsNotifier,
+    TransportProtocolError,
+};
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,9 +175,44 @@ impl GenerationPublication {
 pub(crate) struct ConnectionView {
     connections: CanonicalConnections,
     pool: Arc<ConnectionPool>,
+    projection_revision: Arc<AtomicU64>,
+    projection_tx: watch::Sender<u64>,
+}
+
+/// Cloneable, read-only projection of canonical connection state.
+///
+/// Snapshot collection is synchronous and never requires callers to hold the
+/// outer `NetworkManager` mutex across an await.
+#[derive(Clone)]
+pub struct ConnectionSnapshotReader {
+    view: ConnectionView,
+}
+
+impl ConnectionSnapshotReader {
+    pub fn connection_infos(&self) -> Vec<ConnectionInfo> {
+        collect_connection_infos(&self.view.connections, &self.view.pool)
+    }
+
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.view.projection_tx.subscribe()
+    }
+}
+
+impl From<ConnectionView> for ConnectionSnapshotReader {
+    fn from(view: ConnectionView) -> Self {
+        Self { view }
+    }
 }
 
 impl ConnectionView {
+    fn notify_projection_changed(&self) {
+        let revision = self
+            .projection_revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.projection_tx.send_replace(revision);
+    }
+
     pub(crate) async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         collect_connection_infos(&self.connections, &self.pool)
     }
@@ -185,19 +223,25 @@ impl ConnectionView {
 
     pub(crate) async fn send_legacy(&self, device_id: &DeviceId, message: &Message) -> Result<()> {
         let selected_identity = self.pool.send_to_with_identity(device_id, message).await?;
-        if let Some(connection) = self
-            .connections
-            .write()
-            .expect("canonical connection registry poisoned")
-            .get_mut(device_id)
-            .filter(|connection| {
+        let updated = {
+            let mut connections = self
+                .connections
+                .write()
+                .expect("canonical connection registry poisoned");
+            if let Some(connection) = connections.get_mut(device_id).filter(|connection| {
                 connection.generation == selected_identity.lifecycle_generation
                     && connection.info.control_connection_id
                         == selected_identity.control_connection_id
-            })
-        {
-            connection.info.messages_sent += 1;
-            connection.info.last_activity = Instant::now();
+            }) {
+                connection.info.messages_sent += 1;
+                connection.info.last_activity = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.notify_projection_changed();
         }
         Ok(())
     }
@@ -211,15 +255,24 @@ impl ConnectionView {
         device_id: &DeviceId,
         generation: ControlConnectionId,
     ) {
-        if let Some(connection) = self
-            .connections
-            .write()
-            .expect("canonical connection registry poisoned")
-            .get_mut(device_id)
-            .filter(|connection| connection.info.control_connection_id == Some(generation))
-        {
-            connection.info.messages_sent += 1;
-            connection.info.last_activity = Instant::now();
+        let updated = {
+            let mut connections = self
+                .connections
+                .write()
+                .expect("canonical connection registry poisoned");
+            if let Some(connection) = connections
+                .get_mut(device_id)
+                .filter(|connection| connection.info.control_connection_id == Some(generation))
+            {
+                connection.info.messages_sent += 1;
+                connection.info.last_activity = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.notify_projection_changed();
         }
     }
 
@@ -346,6 +399,8 @@ pub struct ConnectionManager {
     qos_registry: Arc<ConnectionRegistry>,
     transport: QuicTransport,
     pool: Arc<ConnectionPool>,
+    projection_revision: Arc<AtomicU64>,
+    projection_tx: watch::Sender<u64>,
     event_tx: mpsc::Sender<ManagerEvent>,
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
     authenticated_peer_tx: mpsc::Sender<PeerInbound>,
@@ -696,6 +751,12 @@ impl ConnectionManager {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (authenticated_peer_tx, authenticated_peer_rx) = mpsc::channel(32);
         let (terminal_release_tx, terminal_release_rx) = mpsc::channel(32);
+        let projection_revision = Arc::new(AtomicU64::new(0));
+        let (projection_tx, _) = watch::channel(0);
+        transport.set_diagnostics_notifier(TransportDiagnosticsNotifier::new(
+            projection_revision.clone(),
+            projection_tx.clone(),
+        ));
         transport.require_peer_protocol_handshake();
         let pool = Arc::new(ConnectionPool::new(local_device_id));
 
@@ -707,6 +768,8 @@ impl ConnectionManager {
             qos_registry: Arc::new(ConnectionRegistry::new()),
             transport,
             pool,
+            projection_revision,
+            projection_tx,
             event_tx,
             event_rx: Some(event_rx),
             authenticated_peer_tx,
@@ -1257,6 +1320,8 @@ impl ConnectionManager {
         ConnectionView {
             connections: self.connections.clone(),
             pool: self.pool.clone(),
+            projection_revision: self.projection_revision.clone(),
+            projection_tx: self.projection_tx.clone(),
         }
     }
 
@@ -1372,6 +1437,101 @@ mod tests {
     async fn test_manager_new() {
         let manager = ConnectionManager::isolated_for_test(DeviceId::new_v4());
         assert_eq!(manager.connected_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_projection_notifies_after_live_transport_activity() {
+        let manager = ConnectionManager::isolated_for_test(DeviceId::new_v4());
+        let peer_id = DeviceId::new_v4();
+        let control_connection_id = ControlConnectionId::new();
+        let mut info = ConnectionInfo::new(peer_id, "127.0.0.1:27431".into());
+        info.state = ConnectionState::Connected;
+        info.control_connection_id = Some(control_connection_id);
+        insert_test_canonical(&manager, info);
+        let view = manager.connection_view();
+        let reader: ConnectionSnapshotReader = view.clone().into();
+        let mut changes = reader.changes();
+
+        view.record_send_success(&peer_id, control_connection_id);
+
+        tokio::time::timeout(Duration::from_millis(50), changes.changed())
+            .await
+            .expect("transport activity must notify UI projection consumers")
+            .unwrap();
+        assert_eq!(reader.connection_infos()[0].messages_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn connection_projection_notifies_for_real_inbound_datagram_diagnostics() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut manager = ConnectionManager::isolated_for_test(local_id);
+        let reader: ConnectionSnapshotReader = manager.connection_view().into();
+        let mut changes = reader.changes();
+        let mut peers = manager.authenticated_peers().unwrap();
+        manager.start_server("127.0.0.1:0").await.unwrap();
+        let address = manager.transport_local_addr().unwrap();
+
+        let mut remote_manager = ConnectionManager::isolated_for_test(remote_id);
+        remote_manager
+            .connect(local_id, &address.to_string())
+            .await
+            .unwrap();
+        let mut inbound = tokio::time::timeout(Duration::from_secs(1), peers.recv())
+            .await
+            .expect("server must publish the authenticated peer")
+            .expect("authenticated peer lane must remain open");
+        let peer = remote_manager
+            .qos_registry
+            .peer(&local_id)
+            .expect("client must retain the authenticated transport");
+        let captured_at = rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(1), 1);
+        peer.transport
+            .try_send_reliable_input(rshare_core::ReliableInputFrame {
+                protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+                session_epoch: rshare_core::SessionEpoch(1),
+                sequence: 1,
+                captured_at,
+                event: rshare_core::ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("reliable enter must establish the input epoch")
+            .expect("reliable lane must remain open");
+
+        peer.transport
+            .try_send_realtime(rshare_core::RealtimeInputFrame {
+                protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+                session_epoch: rshare_core::SessionEpoch(1),
+                sequence: 1,
+                captured_at,
+                payload: rshare_core::RealtimeInputPayload::RelativeMouse { dx: 1, dy: 0 },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), inbound.realtime_rx.recv())
+            .await
+            .expect("server must receive the real QUIC datagram")
+            .expect("realtime lane must remain open");
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .expect("inbound datagram diagnostics must wake UI projection consumers")
+            .expect("connection projection sender must remain open");
+
+        let info = reader
+            .connection_infos()
+            .into_iter()
+            .find(|info| info.device_id == remote_id)
+            .expect("canonical inbound connection must remain visible");
+        assert!(
+            info.last_datagram_rx_ms.is_some(),
+            "the wake must expose the newly visible datagram age"
+        );
+        assert!(info.rtt_ms.is_some());
     }
 
     #[test]

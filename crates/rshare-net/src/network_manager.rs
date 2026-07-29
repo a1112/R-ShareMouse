@@ -304,6 +304,11 @@ impl NetworkManager {
         self.qos_registry.clone()
     }
 
+    /// Read-only canonical connection projection for status/UI consumers.
+    pub fn connection_snapshot_reader(&self) -> crate::connection::ConnectionSnapshotReader {
+        self.connection_view.clone().into()
+    }
+
     /// Get all discovered devices
     pub async fn discovered_devices(&self) -> Vec<DiscoveredDevice> {
         self.discovered_devices
