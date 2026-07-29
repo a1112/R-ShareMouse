@@ -9,8 +9,8 @@ param(
     [switch]$EnableInputClassFilters,
     [switch]$RestartInputDeviceStacks,
     [switch]$SkipManualHardwareCapture,
-    [uint32]$MinFilterMinorVersion = 3,
-    [uint32]$ExpectedFilterStatsBytes = 64,
+    [uint32]$MinFilterMinorVersion = 4,
+    [uint32]$ExpectedFilterStatsBytes = 80,
     [uint32]$HardwareCaptureTimeoutSeconds = 20
 )
 
@@ -89,6 +89,9 @@ function Assert-FilterDriverStats($Output) {
 
     $keyboardConnect = Get-FilterStatsValue $text "keyboard_connect"
     $mouseConnect = Get-FilterStatsValue $text "mouse_connect"
+    $null = Get-FilterStatsValue $text "coalesced_realtime"
+    $null = Get-FilterStatsValue $text "dropped_realtime"
+    $null = Get-FilterStatsValue $text "reliable_overflow"
     if ($keyboardConnect -eq 0) {
         throw "The filter driver has not attached to a keyboard class stack. Reboot Windows after enabling input class filters, then re-run with -SkipBuild -SkipInstall."
     }

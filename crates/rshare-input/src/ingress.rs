@@ -526,6 +526,25 @@ impl SemanticInputProducer {
         PushOutcome::Enqueued
     }
 
+    pub fn report_fault(&self, fault: IngressFault) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("input ingress state poisoned");
+        if state.closed {
+            return;
+        }
+        match fault {
+            IngressFault::ReliableOverflow => {
+                state.reliable_overflow = checked_increment(state.reliable_overflow);
+                state.reliable_overflow_latched = true;
+            }
+        }
+        drop(state);
+        self.shared.ready.notify_one();
+    }
+
     pub fn try_pop_fault(&self) -> Option<IngressFault> {
         self.shared
             .state

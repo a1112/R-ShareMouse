@@ -12,11 +12,11 @@ use rshare_daemon::input_runtime::{
     dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch, InputRuntime,
     InputTransport,
 };
-use rshare_daemon::input_state::{input_state_channel, ControlMetrics};
+use rshare_daemon::input_state::{input_state_channel, ControlMetrics, InputStateFeeds};
 use rshare_input::{
     ButtonState as CaptureButtonState, CaptureOrigin, CaptureSource, CapturedInputPayload,
     ContinuousInput, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle,
-    KeyCode, PointerSample, PushOutcome, SemanticInputIngress,
+    KeyCode, MouseButton as CaptureMouseButton, PointerSample, PushOutcome, SemanticInputIngress,
 };
 use rshare_net::{encryption::PeerCertificateFingerprint, handshake::PeerAuthContext, PeerInbound};
 use rshare_platform::SystemSafetyEvent;
@@ -317,10 +317,22 @@ fn runtime(
     InputRuntime<RecordingTransport>,
     Arc<RecordingTransport>,
 ) {
+    let (producer, runtime, transport, _feeds) = runtime_with_feeds(capacity);
+    (producer, runtime, transport)
+}
+
+fn runtime_with_feeds(
+    capacity: usize,
+) -> (
+    rshare_input::SemanticInputProducer,
+    InputRuntime<RecordingTransport>,
+    Arc<RecordingTransport>,
+    InputStateFeeds,
+) {
     let (_, _, router) = linked_router();
     let (producer, consumer) = SemanticInputIngress::new(capacity);
     let transport = Arc::new(RecordingTransport::default());
-    let (state, _feeds) = input_state_channel(1);
+    let (state, feeds) = input_state_channel(8);
     let metrics = Arc::new(ControlMetrics::default());
     let injection =
         InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
@@ -336,6 +348,7 @@ fn runtime(
             injection,
         ),
         transport,
+        feeds,
     )
 }
 
@@ -594,6 +607,96 @@ async fn reliable_overflow_suspends_and_emits_emergency_release() {
         InputDispatch::Reliable { frame, .. }
             if matches!(frame.event, ReliableInputEvent::ReleaseAll { reason: ReleaseAllReason::BackendFailure })
     )));
+}
+
+#[tokio::test]
+async fn windows_filter_overflow_status_maps_to_suspension_epoch_and_targeted_release() {
+    let (producer, mut runtime, transport, feeds) = runtime_with_feeds(8);
+    enter_remote(&producer, &mut runtime).await;
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::WindowsFilter),
+            InputEvent::key(KeyCode::Raw(0x41), CaptureButtonState::Pressed),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::WindowsFilter),
+            InputEvent::mouse_button(CaptureMouseButton::Left, CaptureButtonState::Pressed,),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let pressed_projection = feeds.authoritative_rx.borrow().clone();
+    assert!(pressed_projection.discrete.pressed_keys.contains(&0x41));
+    assert!(pressed_projection
+        .discrete
+        .pressed_buttons
+        .contains(&rshare_core::MouseButton::Left));
+    let before = transport.events.lock().unwrap().clone();
+    let (target, enter_epoch) = before
+        .iter()
+        .find_map(|event| match event {
+            InputDispatch::Reliable { target, frame }
+                if matches!(frame.event, ReliableInputEvent::Enter { .. }) =>
+            {
+                Some((*target, frame.session_epoch))
+            }
+            _ => None,
+        })
+        .expect("remote session must publish Enter");
+
+    let rshare_input::backend::WindowsFilterCaptureOutput::Fault(fault) =
+        rshare_input::backend::adapt_windows_filter_capture_event(
+            rshare_platform::windows::WindowsDriverCaptureEvent::Status(
+                rshare_platform::windows::RawCaptureStatus::ReliableOverflow,
+            ),
+        )
+    else {
+        panic!("overflow status must map to an ingress fault");
+    };
+    producer.report_fault(fault);
+    assert!(runtime.process_next().await);
+    let advanced_epoch = runtime.session_epoch();
+    let recovered_projection = feeds.authoritative_rx.borrow().clone();
+    assert!(matches!(
+        recovered_projection.session,
+        ControlSessionState::Suspended { .. }
+    ));
+    assert_eq!(recovered_projection.discrete.session_epoch, advanced_epoch);
+    assert!(recovered_projection.discrete.pressed_keys.is_empty());
+    assert!(recovered_projection.discrete.pressed_buttons.is_empty());
+
+    let events = transport.events.lock().unwrap();
+    let release = events
+        .iter()
+        .find_map(|event| match event {
+            InputDispatch::Reliable {
+                target: release_target,
+                frame,
+            } if matches!(
+                frame.event,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::BackendFailure
+                }
+            ) =>
+            {
+                Some((*release_target, frame.session_epoch))
+            }
+            _ => None,
+        })
+        .expect("overflow must publish targeted emergency ReleaseAll");
+    assert_eq!(release.0, target);
+    assert_eq!(
+        release.1, enter_epoch,
+        "targeted release must use the remote-owned epoch"
+    );
+    assert!(
+        advanced_epoch.0 > enter_epoch.0,
+        "overflow must advance session epoch"
+    );
 }
 
 #[tokio::test]

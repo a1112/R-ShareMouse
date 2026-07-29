@@ -5959,8 +5959,16 @@ impl WindowsDriverCapture {
                     return;
                 }
                 while worker_running.load(std::sync::atomic::Ordering::Acquire) {
-                    match client.read_event() {
-                        Ok(event) => publish_windows_driver_event(&producer, event),
+                    match client
+                        .read_event()
+                        .map(rshare_input::backend::adapt_windows_filter_capture_event)
+                    {
+                        Ok(rshare_input::backend::WindowsFilterCaptureOutput::Input(event)) => {
+                            publish_windows_driver_event(&producer, event)
+                        }
+                        Ok(rshare_input::backend::WindowsFilterCaptureOutput::Fault(fault)) => {
+                            producer.report_fault(fault);
+                        }
                         Err(error)
                             if rshare_platform::windows::is_driver_event_queue_empty(&error) =>
                         {

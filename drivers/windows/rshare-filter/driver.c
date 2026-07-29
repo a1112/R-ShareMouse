@@ -6,8 +6,7 @@
 #include <kbdmou.h>
 
 #include "..\rshare-common\rshare_ioctls.h"
-
-#define RSHARE_EVENT_QUEUE_CAPACITY 128u
+#include "event_queue.h"
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD RShareFilterEvtDeviceAdd;
@@ -17,13 +16,8 @@ EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL RShareFilterEvtIoInternalDeviceContr
 
 typedef struct _RSHARE_CONTROL_CONTEXT {
     WDFQUEUE Queue;
-    RSHARE_DRIVER_EVENT Events[RSHARE_EVENT_QUEUE_CAPACITY];
-    ULONG Head;
-    ULONG Tail;
-    ULONG Count;
+    RSHARE_EVENT_QUEUE EventQueue;
     KSPIN_LOCK Lock;
-    volatile LONG64 QueuedEventCount;
-    volatile LONG64 DroppedEventCount;
     volatile LONG64 KeyboardConnectCount;
     volatile LONG64 MouseConnectCount;
     volatile LONG64 KeyboardEventCount;
@@ -76,29 +70,67 @@ static VOID RShareRecordConnect(ULONG deviceKind)
 static VOID RShareSnapshotStats(PRSHARE_CONTROL_CONTEXT context, PRSHARE_DRIVER_STATS stats)
 {
     KIRQL oldIrql;
-    ULONG queueDepth;
+    RSHARE_EVENT_QUEUE_STATS queueStats;
 
     KeAcquireSpinLock(&context->Lock, &oldIrql);
-    queueDepth = context->Count;
+    RShareEventQueueGetStats(&context->EventQueue, &queueStats);
+    stats->QueueDepth = context->EventQueue.Count;
     KeReleaseSpinLock(&context->Lock, oldIrql);
 
-    RtlZeroMemory(stats, sizeof(*stats));
     stats->Abi = RSHARE_DRIVER_ABI;
+    stats->Reserved0 = 0;
     stats->QueueCapacity = RSHARE_EVENT_QUEUE_CAPACITY;
-    stats->QueueDepth = queueDepth;
-    stats->QueuedEventCount = (ULONGLONG)RShareReadStatsCounter(&context->QueuedEventCount);
-    stats->DroppedEventCount = (ULONGLONG)RShareReadStatsCounter(&context->DroppedEventCount);
+    stats->QueuedEventCount = queueStats.QueuedEventCount;
+    stats->DroppedEventCount =
+        queueStats.RealtimeDroppedCount + queueStats.ReliableOverflowCount;
     stats->KeyboardConnectCount = (ULONGLONG)RShareReadStatsCounter(&context->KeyboardConnectCount);
     stats->MouseConnectCount = (ULONGLONG)RShareReadStatsCounter(&context->MouseConnectCount);
     stats->KeyboardEventCount = (ULONGLONG)RShareReadStatsCounter(&context->KeyboardEventCount);
     stats->MouseEventCount = (ULONGLONG)RShareReadStatsCounter(&context->MouseEventCount);
 }
 
+static VOID RShareSnapshotFilterStatsV2(
+    PRSHARE_CONTROL_CONTEXT context,
+    PRSHARE_FILTER_STATS_V2 stats)
+{
+    KIRQL oldIrql;
+    RSHARE_EVENT_QUEUE_STATS queueStats;
+
+    KeAcquireSpinLock(&context->Lock, &oldIrql);
+    RShareEventQueueGetStats(&context->EventQueue, &queueStats);
+    stats->QueueDepth = context->EventQueue.Count;
+    KeReleaseSpinLock(&context->Lock, oldIrql);
+
+    stats->Abi = RSHARE_DRIVER_ABI;
+    stats->Version = RSHARE_FILTER_STATS_VERSION;
+    stats->StructSize = sizeof(*stats);
+    stats->QueueCapacity = RSHARE_EVENT_QUEUE_CAPACITY;
+    stats->QueuedEventCount = queueStats.QueuedEventCount;
+    stats->RealtimeCoalescedCount = queueStats.RealtimeCoalescedCount;
+    stats->RealtimeDroppedCount = queueStats.RealtimeDroppedCount;
+    stats->ReliableOverflowCount = queueStats.ReliableOverflowCount;
+    stats->KeyboardConnectCount =
+        (ULONGLONG)RShareReadStatsCounter(&context->KeyboardConnectCount);
+    stats->MouseConnectCount =
+        (ULONGLONG)RShareReadStatsCounter(&context->MouseConnectCount);
+    stats->KeyboardEventCount =
+        (ULONGLONG)RShareReadStatsCounter(&context->KeyboardEventCount);
+    stats->MouseEventCount =
+        (ULONGLONG)RShareReadStatsCounter(&context->MouseEventCount);
+}
+
 static ULONGLONG RShareTimestampUs(void)
 {
-    LARGE_INTEGER now;
-    KeQuerySystemTimePrecise(&now);
-    return (ULONGLONG)(now.QuadPart / 10);
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter = KeQueryPerformanceCounter(&frequency);
+    ULONGLONG ticks = (ULONGLONG)counter.QuadPart;
+    ULONGLONG ticksPerSecond = (ULONGLONG)frequency.QuadPart;
+
+    if (ticksPerSecond == 0u) {
+        return ticks;
+    }
+    return (ticks / ticksPerSecond) * 1000000ull
+        + ((ticks % ticksPerSecond) * 1000000ull) / ticksPerSecond;
 }
 
 static ULONGLONG RShareDeviceToken(PDEVICE_OBJECT deviceObject, ULONG unitId)
@@ -117,16 +149,7 @@ static VOID RShareQueueEvent(const RSHARE_DRIVER_EVENT* event)
     }
 
     KeAcquireSpinLock(&context->Lock, &oldIrql);
-    if (context->Count == RSHARE_EVENT_QUEUE_CAPACITY) {
-        context->Tail = (context->Tail + 1u) % RSHARE_EVENT_QUEUE_CAPACITY;
-        context->Count--;
-        RShareIncrementStatsCounter(&context->DroppedEventCount);
-    }
-
-    context->Events[context->Head] = *event;
-    context->Head = (context->Head + 1u) % RSHARE_EVENT_QUEUE_CAPACITY;
-    context->Count++;
-    RShareIncrementStatsCounter(&context->QueuedEventCount);
+    (VOID)RShareEventQueuePush(&context->EventQueue, event);
     if (event->DeviceKind == RSHARE_DEVICE_KEYBOARD) {
         RShareIncrementStatsCounter(&context->KeyboardEventCount);
     } else if (event->DeviceKind == RSHARE_DEVICE_MOUSE) {
@@ -141,12 +164,7 @@ static BOOLEAN RSharePopEvent(PRSHARE_CONTROL_CONTEXT context, PRSHARE_DRIVER_EV
     KIRQL oldIrql;
 
     KeAcquireSpinLock(&context->Lock, &oldIrql);
-    if (context->Count > 0u) {
-        *event = context->Events[context->Tail];
-        context->Tail = (context->Tail + 1u) % RSHARE_EVENT_QUEUE_CAPACITY;
-        context->Count--;
-        hasEvent = TRUE;
-    }
+    hasEvent = RShareEventQueuePop(&context->EventQueue, event);
     KeReleaseSpinLock(&context->Lock, oldIrql);
 
     return hasEvent;
@@ -353,9 +371,7 @@ static NTSTATUS RShareCreateControlDevice(WDFDRIVER driver, PWDFDEVICE_INIT devi
 
     context = RShareControlGetContext(device);
     KeInitializeSpinLock(&context->Lock);
-    context->Head = 0;
-    context->Tail = 0;
-    context->Count = 0;
+    RtlZeroMemory(&context->EventQueue, sizeof(context->EventQueue));
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = RShareFilterEvtIoDeviceControl;
@@ -513,7 +529,7 @@ VOID RShareFilterEvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*version), (PVOID*)&version, NULL);
         if (NT_SUCCESS(status)) {
             version->Major = 0;
-            version->Minor = 3;
+            version->Minor = 4;
             version->Patch = 0;
             version->Abi = RSHARE_DRIVER_ABI;
             bytes = sizeof(*version);
@@ -525,9 +541,10 @@ VOID RShareFilterEvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*capabilities), (PVOID*)&capabilities, NULL);
         if (NT_SUCCESS(status)) {
             capabilities->Abi = RSHARE_DRIVER_ABI;
-            capabilities->Flags = RSHARE_CAP_FILTER_EVENTS;
+            capabilities->Flags =
+                RSHARE_CAP_FILTER_EVENTS | RSHARE_CAP_FILTER_SEMANTIC_QUEUE;
             capabilities->MaxEventSize = sizeof(RSHARE_DRIVER_EVENT);
-            capabilities->Reserved = 0;
+            capabilities->Reserved = RSHARE_FILTER_EVENT_FORMAT_VERSION;
             bytes = sizeof(*capabilities);
         }
         break;
@@ -545,6 +562,19 @@ VOID RShareFilterEvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*stats), (PVOID*)&stats, NULL);
         if (NT_SUCCESS(status)) {
             RShareSnapshotStats(context, stats);
+            bytes = sizeof(*stats);
+        }
+        break;
+    }
+    case IOCTL_RSHARE_QUERY_FILTER_STATS_V2: {
+        PRSHARE_FILTER_STATS_V2 stats;
+        status = WdfRequestRetrieveOutputBuffer(
+            Request,
+            sizeof(*stats),
+            (PVOID*)&stats,
+            NULL);
+        if (NT_SUCCESS(status)) {
+            RShareSnapshotFilterStatsV2(context, stats);
             bytes = sizeof(*stats);
         }
         break;

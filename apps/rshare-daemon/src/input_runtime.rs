@@ -8,8 +8,8 @@ use rshare_core::{
     RouterCommand, RouterOutput, SessionEpoch,
 };
 use rshare_input::{
-    CapturedInput, CapturedInputPayload, ContinuousInput, IngressEvent, InjectionQueueFull,
-    InputEvent, InputInjectionHandle, PointerSample, SemanticInputConsumer,
+    CapturedInput, CapturedInputPayload, ContinuousInput, IngressEvent, IngressFault,
+    InjectionQueueFull, InputEvent, InputInjectionHandle, PointerSample, SemanticInputConsumer,
 };
 use rshare_net::qos::{ConnectionRegistry, RegisteredPeer};
 use rshare_net::PeerInbound;
@@ -104,6 +104,10 @@ impl<T: InputTransport> InputRuntime<T> {
 
     pub fn route_cache_generation(&self) -> u64 {
         self.router.route_cache_generation()
+    }
+
+    pub fn session_epoch(&self) -> SessionEpoch {
+        self.current_epoch
     }
 
     pub async fn process_next(&mut self) -> bool {
@@ -221,11 +225,21 @@ impl<T: InputTransport> InputRuntime<T> {
     fn process_ingress_event(&mut self, event: IngressEvent) {
         self.observe_ingress_stats();
         match event {
-            IngressEvent::Fault(_) => {
+            IngressEvent::Fault(IngressFault::ReliableOverflow) => {
                 self.injection
                     .request_release_all(ReleaseAllReason::BackendFailure);
                 let outputs = self.router.handle(RouterCommand::BackendDegraded);
                 self.dispatch_outputs(outputs);
+                if let Ok(next_epoch) = self.current_epoch.next() {
+                    self.current_epoch = next_epoch;
+                    self.pressed_keys.clear();
+                    self.pressed_buttons.clear();
+                    self.state.publish_discrete(InputDiscreteProjection {
+                        session_epoch: next_epoch,
+                        pressed_keys: Vec::new(),
+                        pressed_buttons: Vec::new(),
+                    });
+                }
             }
             IngressEvent::Input(input) => self.process_captured(input),
         }

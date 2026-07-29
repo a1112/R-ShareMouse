@@ -576,7 +576,7 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(ioctls.contains("DroppedEventCount"));
 
     assert!(filter.contains("IOCTL_INTERNAL_KEYBOARD_CONNECT"));
-    assert!(filter.contains("version->Minor = 3"));
+    assert!(filter.contains("version->Minor = 4"));
     assert!(filter.contains("IOCTL_INTERNAL_MOUSE_CONNECT"));
     assert!(filter.contains("RShareFilterKeyboardServiceCallback"));
     assert!(filter.contains("RShareFilterMouseServiceCallback"));
@@ -584,8 +584,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(filter.contains("RShareIncrementStatsCounter(&context->MouseConnectCount)"));
     assert!(filter.contains("RShareSnapshotStats"));
     assert!(filter.contains("RSHARE_EVENT_QUEUE_CAPACITY"));
-    assert!(filter.contains("context->Tail = (context->Tail + 1u) % RSHARE_EVENT_QUEUE_CAPACITY"));
-    assert!(filter.contains("RShareIncrementStatsCounter(&context->DroppedEventCount)"));
+    assert!(filter.contains("RShareEventQueuePush(&context->EventQueue, event)"));
+    assert!(filter.contains("RShareEventQueuePop(&context->EventQueue, event)"));
     assert!(filter.contains("RSHARE_EVENT_MOUSE_WHEEL"));
 
     assert!(vhid.contains("g_RShareKeyboardModifiers"));
@@ -609,8 +609,8 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
 
     assert!(probe.contains("rshare-driver-probe filter status"));
     assert!(probe.contains("rshare-driver-probe filter stats"));
-    assert!(probe.contains("stats_bytes=%zu"));
-    assert!(probe.contains("sizeof(*stats)"));
+    assert!(probe.contains("stats_bytes=%lu"));
+    assert!(probe.contains("stats->StructSize"));
     assert!(probe.contains("rshare-driver-probe filter test"));
     assert!(probe.contains("rshare-driver-probe filter watch [timeout_seconds]"));
     assert!(probe.contains("rshare-driver-probe filter drain [quiet_ms] [timeout_seconds]"));
@@ -768,6 +768,47 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(driver_readme.contains("does not unload an older loaded filter driver"));
     assert!(driver_readme.contains("register-hid-post-reboot-validation.ps1"));
     assert!(driver_readme.contains("RShareMouse-HidPostRebootValidation"));
+}
+
+#[test]
+fn windows_driver_abi_keeps_shared_v1_and_versions_filter_queue_independently() {
+    let ioctls = read_repo_file("drivers/windows/rshare-common/rshare_ioctls.h");
+    let filter = read_repo_file("drivers/windows/rshare-filter/driver.c");
+    let filter_inf = read_repo_file("drivers/windows/rshare-filter/rshare-filter.inf");
+    let queue = read_repo_file("drivers/windows/rshare-filter/event_queue.c");
+    let project = read_repo_file("drivers/windows/rshare-filter/rshare-filter.vcxproj");
+    let queue_script = read_repo_file("scripts/driver/test-filter-queue.ps1");
+    let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
+    let validation = read_repo_file("scripts/driver/validate-hid.ps1");
+
+    assert!(ioctls.contains("#define RSHARE_DRIVER_ABI 1"));
+    assert!(ioctls.contains("#define RSHARE_FILTER_EVENT_FORMAT_VERSION 2"));
+    assert!(ioctls.contains("RSHARE_CAP_FILTER_SEMANTIC_QUEUE"));
+    assert!(ioctls.contains("RSHARE_EVENT_RELIABLE_OVERFLOW"));
+    assert!(ioctls.contains("IOCTL_RSHARE_QUERY_FILTER_STATS_V2"));
+    assert!(ioctls.contains("RSHARE_FILTER_STATS_V2"));
+    assert!(ioctls.contains("RSHARE_FILTER_STATS_V2_SIZE"));
+    assert!(ioctls.contains("sizeof(RSHARE_FILTER_STATS_V2) == RSHARE_FILTER_STATS_V2_SIZE"));
+
+    assert!(filter.contains("version->Minor = 4"));
+    assert!(filter.contains("version->Patch = 0"));
+    assert!(filter_inf.contains("DriverVer=05/02/2026,0.4.0.0"));
+    assert!(filter.contains("KeQueryPerformanceCounter"));
+    assert!(filter.contains("RShareEventQueuePush"));
+    assert!(filter.contains("RShareEventQueuePop"));
+    assert!(filter.contains("IOCTL_RSHARE_QUERY_FILTER_STATS_V2"));
+    assert!(filter.contains("RSHARE_CAP_FILTER_SEMANTIC_QUEUE"));
+    assert!(filter.contains("capabilities->Reserved = RSHARE_FILTER_EVENT_FORMAT_VERSION"));
+    assert!(queue.contains("RShareReliableOverflowLatched"));
+    assert!(project.contains("<ClCompile Include=\"event_queue.c\" />"));
+    assert!(queue_script.contains("event_queue_tests.c"));
+    assert!(probe.contains("IOCTL_RSHARE_QUERY_FILTER_STATS_V2"));
+    assert!(probe.contains("coalesced_realtime="));
+    assert!(probe.contains("dropped_realtime="));
+    assert!(probe.contains("reliable_overflow="));
+    assert!(validation.contains("[uint32]$MinFilterMinorVersion = 4"));
+    assert!(validation.contains("[uint32]$ExpectedFilterStatsBytes = 80"));
+    assert!(validation.contains("\"reliable_overflow\""));
 }
 
 #[test]

@@ -35,6 +35,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="event_queue.c" />
     <Inf Include="rshare-filter.inf" />
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>

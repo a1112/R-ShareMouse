@@ -1,5 +1,12 @@
 //! Windows platform-specific implementations
 
+/// Platform-neutral status reported by a raw input capture source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawCaptureStatus {
+    /// At least one reliable input transition could not be retained.
+    ReliableOverflow,
+}
+
 cfg_if::cfg_if! {
     if #[cfg(windows)] {
         pub use windows_impl::*;
@@ -8,6 +15,7 @@ cfg_if::cfg_if! {
 
 #[cfg(windows)]
 mod windows_impl {
+    use super::RawCaptureStatus;
     use crate::display::{clamp_identify_duration_ms, fit_thumbnail_size};
     use anyhow::{Context, Result};
     use rshare_core::{
@@ -556,6 +564,7 @@ mod windows_impl {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct WindowsDriverCapabilities {
         pub filter_events: bool,
+        pub filter_semantic_queue: bool,
         pub virtual_keyboard: bool,
         pub virtual_mouse: bool,
         pub virtual_gamepad_scaffold: bool,
@@ -574,6 +583,9 @@ mod windows_impl {
         pub queue_depth: u32,
         pub queued_events: u64,
         pub dropped_events: u64,
+        pub coalesced_realtime_events: u64,
+        pub dropped_realtime_events: u64,
+        pub reliable_overflows: u64,
         pub keyboard_connects: u64,
         pub mouse_connects: u64,
         pub keyboard_events: u64,
@@ -622,6 +634,12 @@ mod windows_impl {
         pub value2: i32,
         pub flags: u32,
         pub timestamp_us: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum WindowsDriverCaptureEvent {
+        Input(WindowsDriverInputEvent),
+        Status(RawCaptureStatus),
     }
 
     pub struct WindowsDriverClient {
@@ -721,7 +739,7 @@ mod windows_impl {
             raw.try_into()
         }
 
-        pub fn read_event(&self) -> Result<WindowsDriverInputEvent> {
+        pub fn read_event(&self) -> Result<WindowsDriverCaptureEvent> {
             let mut raw = RShareDriverEventRaw::default();
             unsafe {
                 device_io_control(
@@ -737,15 +755,15 @@ mod windows_impl {
         }
 
         pub fn query_stats(&self) -> Result<WindowsDriverStats> {
-            let mut raw = RShareDriverStatsRaw::default();
+            let mut raw = RShareFilterStatsV2Raw::default();
             unsafe {
                 device_io_control(
                     self.handle,
-                    IOCTL_RSHARE_QUERY_STATS,
+                    IOCTL_RSHARE_QUERY_FILTER_STATS_V2,
                     std::ptr::null_mut(),
                     0,
-                    (&mut raw as *mut RShareDriverStatsRaw).cast(),
-                    size_of::<RShareDriverStatsRaw>() as u32,
+                    (&mut raw as *mut RShareFilterStatsV2Raw).cast(),
+                    size_of::<RShareFilterStatsV2Raw>() as u32,
                 )?;
             }
             raw.try_into()
@@ -1620,10 +1638,13 @@ mod windows_impl {
     // Windows API constants
 
     pub const RSHARE_DRIVER_ABI: u16 = 1;
+    const RSHARE_FILTER_EVENT_FORMAT_VERSION: u32 = 2;
+    const RSHARE_FILTER_STATS_VERSION: u16 = 2;
     const RSHARE_CAP_FILTER_EVENTS: u32 = 0x0000_0001;
     const RSHARE_CAP_VIRTUAL_KEYBOARD: u32 = 0x0000_0002;
     const RSHARE_CAP_VIRTUAL_MOUSE: u32 = 0x0000_0004;
     const RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD: u32 = 0x0000_0008;
+    const RSHARE_CAP_FILTER_SEMANTIC_QUEUE: u32 = 0x0000_0020;
 
     const RSHARE_SOURCE_HARDWARE: u16 = 1;
     const RSHARE_SOURCE_INJECTED_LOOPBACK: u16 = 2;
@@ -1639,6 +1660,7 @@ mod windows_impl {
     const RSHARE_EVENT_MOUSE_BUTTON: u32 = 3;
     const RSHARE_EVENT_MOUSE_WHEEL: u32 = 4;
     const RSHARE_EVENT_SYNTHETIC: u32 = 5;
+    const RSHARE_EVENT_RELIABLE_OVERFLOW: u32 = 6;
 
     const RSHARE_REPORT_KEYBOARD: u32 = 1;
     const RSHARE_REPORT_MOUSE_MOVE: u32 = 2;
@@ -1661,8 +1683,11 @@ mod windows_impl {
         ctl_code(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_DATA);
     const IOCTL_RSHARE_EMIT_TEST_PACKET: u32 =
         ctl_code(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA);
+    #[cfg(test)]
     const IOCTL_RSHARE_QUERY_STATS: u32 =
         ctl_code(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA);
+    const IOCTL_RSHARE_QUERY_FILTER_STATS_V2: u32 =
+        ctl_code(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_DATA);
     const ERROR_NO_MORE_ITEMS: i32 = 259;
 
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -2146,6 +2171,24 @@ mod windows_impl {
         mouse_events: u64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RShareFilterStatsV2Raw {
+        abi: u16,
+        version: u16,
+        struct_size: u32,
+        queue_capacity: u32,
+        queue_depth: u32,
+        queued_events: u64,
+        coalesced_realtime_events: u64,
+        dropped_realtime_events: u64,
+        reliable_overflows: u64,
+        keyboard_connects: u64,
+        mouse_connects: u64,
+        keyboard_events: u64,
+        mouse_events: u64,
+    }
+
     impl TryFrom<RShareDriverCapabilitiesRaw> for WindowsDriverCapabilities {
         type Error = anyhow::Error;
 
@@ -2153,9 +2196,18 @@ mod windows_impl {
             if raw.abi != RSHARE_DRIVER_ABI {
                 anyhow::bail!("Unsupported RShare driver capabilities ABI {}", raw.abi);
             }
+            if raw.flags & RSHARE_CAP_FILTER_SEMANTIC_QUEUE != 0
+                && raw.reserved != RSHARE_FILTER_EVENT_FORMAT_VERSION
+            {
+                anyhow::bail!(
+                    "Unsupported RShare filter event format version {}",
+                    raw.reserved
+                );
+            }
 
             Ok(Self {
                 filter_events: raw.flags & RSHARE_CAP_FILTER_EVENTS != 0,
+                filter_semantic_queue: raw.flags & RSHARE_CAP_FILTER_SEMANTIC_QUEUE != 0,
                 virtual_keyboard: raw.flags & RSHARE_CAP_VIRTUAL_KEYBOARD != 0,
                 virtual_mouse: raw.flags & RSHARE_CAP_VIRTUAL_MOUSE != 0,
                 virtual_gamepad_scaffold: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD != 0,
@@ -2177,6 +2229,41 @@ mod windows_impl {
                 queue_depth: raw.queue_depth,
                 queued_events: raw.queued_events,
                 dropped_events: raw.dropped_events,
+                coalesced_realtime_events: 0,
+                dropped_realtime_events: raw.dropped_events,
+                reliable_overflows: 0,
+                keyboard_connects: raw.keyboard_connects,
+                mouse_connects: raw.mouse_connects,
+                keyboard_events: raw.keyboard_events,
+                mouse_events: raw.mouse_events,
+            })
+        }
+    }
+
+    impl TryFrom<RShareFilterStatsV2Raw> for WindowsDriverStats {
+        type Error = anyhow::Error;
+
+        fn try_from(raw: RShareFilterStatsV2Raw) -> Result<Self> {
+            if raw.abi != RSHARE_DRIVER_ABI {
+                anyhow::bail!("Unsupported RShare driver stats ABI {}", raw.abi);
+            }
+            if raw.version != RSHARE_FILTER_STATS_VERSION {
+                anyhow::bail!("Unsupported RShare filter stats version {}", raw.version);
+            }
+            if raw.struct_size as usize != size_of::<RShareFilterStatsV2Raw>() {
+                anyhow::bail!("Unsupported RShare filter stats size {}", raw.struct_size);
+            }
+
+            Ok(Self {
+                queue_capacity: raw.queue_capacity,
+                queue_depth: raw.queue_depth,
+                queued_events: raw.queued_events,
+                dropped_events: raw
+                    .dropped_realtime_events
+                    .saturating_add(raw.reliable_overflows),
+                coalesced_realtime_events: raw.coalesced_realtime_events,
+                dropped_realtime_events: raw.dropped_realtime_events,
+                reliable_overflows: raw.reliable_overflows,
                 keyboard_connects: raw.keyboard_connects,
                 mouse_connects: raw.mouse_connects,
                 keyboard_events: raw.keyboard_events,
@@ -2721,6 +2808,20 @@ mod windows_impl {
             flags: MOUSEEVENTF_MOVE,
             time: 0,
             extra_info: 0,
+        }
+    }
+
+    impl TryFrom<RShareDriverEventRaw> for WindowsDriverCaptureEvent {
+        type Error = anyhow::Error;
+
+        fn try_from(raw: RShareDriverEventRaw) -> Result<Self> {
+            if raw.abi != RSHARE_DRIVER_ABI {
+                anyhow::bail!("Unsupported RShare driver event ABI {}", raw.abi);
+            }
+            if raw.event_kind == RSHARE_EVENT_RELIABLE_OVERFLOW {
+                return Ok(Self::Status(RawCaptureStatus::ReliableOverflow));
+            }
+            Ok(Self::Input(raw.try_into()?))
         }
     }
 
@@ -4787,9 +4888,11 @@ mod windows_impl {
             assert_eq!(size_of::<RShareTestPacketRaw>(), 20);
             assert_eq!(size_of::<RShareDriverEventRaw>(), 56);
             assert_eq!(size_of::<RShareDriverStatsRaw>(), 64);
+            assert_eq!(size_of::<RShareFilterStatsV2Raw>(), 80);
             assert_eq!(IOCTL_RSHARE_QUERY_VERSION, 0x0022_2004);
             assert_eq!(IOCTL_RSHARE_READ_EVENT, 0x0022_600c);
             assert_eq!(IOCTL_RSHARE_QUERY_STATS, 0x0022_6018);
+            assert_eq!(IOCTL_RSHARE_QUERY_FILTER_STATS_V2, 0x0022_601c);
         }
 
         #[test]
@@ -4831,6 +4934,23 @@ mod windows_impl {
             assert_eq!(event.source, WindowsDriverEventSource::DriverTest);
             assert_eq!(event.device_id, "rshare-driver:0000000000001234");
             assert_eq!(event.device_instance_id, "hash:0000000000005678");
+        }
+
+        #[test]
+        fn reliable_overflow_event_converts_to_platform_neutral_capture_status() {
+            let raw = RShareDriverEventRaw {
+                abi: RSHARE_DRIVER_ABI,
+                source: RSHARE_SOURCE_HARDWARE,
+                device_kind: RSHARE_DEVICE_KEYBOARD,
+                event_kind: RSHARE_EVENT_RELIABLE_OVERFLOW,
+                timestamp_us: 101,
+                ..RShareDriverEventRaw::default()
+            };
+
+            assert_eq!(
+                WindowsDriverCaptureEvent::try_from(raw).unwrap(),
+                WindowsDriverCaptureEvent::Status(RawCaptureStatus::ReliableOverflow)
+            );
         }
 
         #[test]
@@ -4917,6 +5037,9 @@ mod windows_impl {
                 queue_depth: 0,
                 queued_events: 0,
                 dropped_events: 0,
+                coalesced_realtime_events: 0,
+                dropped_realtime_events: 0,
+                reliable_overflows: 0,
                 keyboard_connects: 1,
                 mouse_connects: 0,
                 keyboard_events: 0,

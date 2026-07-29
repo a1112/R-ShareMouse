@@ -9,6 +9,37 @@ use crate::listener::RDevInputListener;
 use anyhow::Result;
 use std::fmt::{self, Debug};
 
+pub fn ingress_fault_from_raw_capture_status(
+    status: rshare_platform::windows::RawCaptureStatus,
+) -> crate::IngressFault {
+    match status {
+        rshare_platform::windows::RawCaptureStatus::ReliableOverflow => {
+            crate::IngressFault::ReliableOverflow
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsFilterCaptureOutput {
+    Input(rshare_platform::windows::WindowsDriverInputEvent),
+    Fault(crate::IngressFault),
+}
+
+#[cfg(target_os = "windows")]
+pub fn adapt_windows_filter_capture_event(
+    event: rshare_platform::windows::WindowsDriverCaptureEvent,
+) -> WindowsFilterCaptureOutput {
+    match event {
+        rshare_platform::windows::WindowsDriverCaptureEvent::Input(event) => {
+            WindowsFilterCaptureOutput::Input(event)
+        }
+        rshare_platform::windows::WindowsDriverCaptureEvent::Status(status) => {
+            WindowsFilterCaptureOutput::Fault(ingress_fault_from_raw_capture_status(status))
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 type PortableInputEmulator = crate::emulator::MacosNativeInputEmulator;
 
@@ -601,7 +632,7 @@ fn virtual_hid_inject_capabilities_health(
 fn windows_filter_driver_version_health(
     version: &rshare_platform::windows::WindowsDriverVersion,
 ) -> BackendHealth {
-    const MIN_FILTER_MINOR_VERSION: u16 = 3;
+    const MIN_FILTER_MINOR_VERSION: u16 = 4;
 
     if version.abi != rshare_platform::windows::RSHARE_DRIVER_ABI
         || (version.major == 0 && version.minor < MIN_FILTER_MINOR_VERSION)
@@ -744,13 +775,17 @@ impl VirtualHidCaptureBackend {
         }
 
         match client.query_capabilities() {
-            Ok(capabilities) if capabilities.filter_events => match client.query_stats() {
-                Ok(stats) if stats.filter_capture_ready() => BackendHealth::Healthy,
-                Ok(_) => BackendHealth::Degraded {
-                    reason: BackendFailureReason::Unavailable,
-                },
-                Err(error) => driver_error_health(&error.to_string()),
-            },
+            Ok(capabilities)
+                if capabilities.filter_events && capabilities.filter_semantic_queue =>
+            {
+                match client.query_stats() {
+                    Ok(stats) if stats.filter_capture_ready() => BackendHealth::Healthy,
+                    Ok(_) => BackendHealth::Degraded {
+                        reason: BackendFailureReason::Unavailable,
+                    },
+                    Err(error) => driver_error_health(&error.to_string()),
+                }
+            }
             Ok(_) => BackendHealth::Degraded {
                 reason: BackendFailureReason::Unavailable,
             },
@@ -914,8 +949,8 @@ impl VirtualHidCaptureDriver {
         };
 
         while running.load(std::sync::atomic::Ordering::Acquire) {
-            match client.read_event() {
-                Ok(event) => {
+            match client.read_event().map(adapt_windows_filter_capture_event) {
+                Ok(WindowsFilterCaptureOutput::Input(event)) => {
                     // Only forward hardware events (ignore injected loopback)
                     if matches!(
                         event.source,
@@ -927,6 +962,10 @@ impl VirtualHidCaptureDriver {
                             }
                         }
                     }
+                }
+                Ok(WindowsFilterCaptureOutput::Fault(fault)) => {
+                    tracing::error!("Virtual HID capture fault: {fault:?}");
+                    break;
                 }
                 Err(error) => {
                     // Check if queue is empty (normal condition when no events)
@@ -1507,7 +1546,7 @@ mod tests {
         };
         let current_filter = rshare_platform::windows::WindowsDriverVersion {
             major: 0,
-            minor: 3,
+            minor: 4,
             patch: 0,
             abi: 1,
         };
@@ -1538,9 +1577,23 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_filter_status_maps_to_reliable_ingress_fault() {
+        assert_eq!(
+            adapt_windows_filter_capture_event(
+                rshare_platform::windows::WindowsDriverCaptureEvent::Status(
+                    rshare_platform::windows::RawCaptureStatus::ReliableOverflow
+                )
+            ),
+            WindowsFilterCaptureOutput::Fault(crate::IngressFault::ReliableOverflow)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn virtual_hid_inject_requires_keyboard_and_mouse_capabilities() {
         let keyboard_only = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
+            filter_semantic_queue: false,
             virtual_keyboard: true,
             virtual_mouse: false,
             virtual_gamepad_scaffold: false,
@@ -1548,6 +1601,7 @@ mod tests {
         };
         let mouse_only = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
+            filter_semantic_queue: false,
             virtual_keyboard: false,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,
@@ -1555,6 +1609,7 @@ mod tests {
         };
         let keyboard_and_mouse = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
+            filter_semantic_queue: false,
             virtual_keyboard: true,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,

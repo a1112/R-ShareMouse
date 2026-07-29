@@ -107,16 +107,19 @@ static void print_driver_event(const char* prefix, const RSHARE_DRIVER_EVENT* ev
         (unsigned long long)event->DeviceInstanceHash);
 }
 
-static void print_driver_stats(const RSHARE_DRIVER_STATS* stats)
+static void print_filter_stats(const RSHARE_FILTER_STATS_V2* stats)
 {
     printf(
-        "stats abi=%hu stats_bytes=%zu queue=%lu/%lu queued=%llu dropped=%llu keyboard_connect=%llu mouse_connect=%llu keyboard_events=%llu mouse_events=%llu\n",
+        "stats abi=%hu version=%hu stats_bytes=%lu queue=%lu/%lu queued=%llu coalesced_realtime=%llu dropped_realtime=%llu reliable_overflow=%llu keyboard_connect=%llu mouse_connect=%llu keyboard_events=%llu mouse_events=%llu\n",
         stats->Abi,
-        sizeof(*stats),
+        stats->Version,
+        stats->StructSize,
         stats->QueueDepth,
         stats->QueueCapacity,
         (unsigned long long)stats->QueuedEventCount,
-        (unsigned long long)stats->DroppedEventCount,
+        (unsigned long long)stats->RealtimeCoalescedCount,
+        (unsigned long long)stats->RealtimeDroppedCount,
+        (unsigned long long)stats->ReliableOverflowCount,
         (unsigned long long)stats->KeyboardConnectCount,
         (unsigned long long)stats->MouseConnectCount,
         (unsigned long long)stats->KeyboardEventCount,
@@ -228,14 +231,14 @@ static int probe_filter_stats(void)
     }
 
     DWORD returned = 0;
-    RSHARE_DRIVER_STATS stats = {0};
-    if (!DeviceIoControl(device, IOCTL_RSHARE_QUERY_STATS, NULL, 0, &stats, sizeof(stats), &returned, NULL)) {
+    RSHARE_FILTER_STATS_V2 stats = {0};
+    if (!DeviceIoControl(device, IOCTL_RSHARE_QUERY_FILTER_STATS_V2, NULL, 0, &stats, sizeof(stats), &returned, NULL)) {
         wprintf(L"filter query stats failed: %lu\n", GetLastError());
         CloseHandle(device);
         return 22;
     }
 
-    print_driver_stats(&stats);
+    print_filter_stats(&stats);
     CloseHandle(device);
     return 0;
 }

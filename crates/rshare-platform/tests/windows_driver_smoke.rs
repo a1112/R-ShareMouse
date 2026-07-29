@@ -11,11 +11,15 @@ fn rshare_windows_filter_and_vhid_smoke() {
     let filter = WindowsDriverClient::open_filter().expect("open RShare filter control device");
     let version = filter.query_version().expect("query filter version");
     assert_eq!(version.abi, 1);
+    assert!(version.major > 0 || version.minor >= 4);
 
     let capabilities = filter
         .query_capabilities()
         .expect("query filter capabilities");
     assert!(capabilities.filter_events);
+    assert!(capabilities.filter_semantic_queue);
+    let stats = filter.query_stats().expect("query semantic filter stats");
+    assert!(stats.queue_depth <= stats.queue_capacity);
 
     match filter.read_event() {
         Ok(_) => {}
@@ -26,7 +30,12 @@ fn rshare_windows_filter_and_vhid_smoke() {
     filter
         .emit_test_packet(WindowsDriverDeviceKind::Keyboard)
         .expect("emit synthetic filter packet");
-    let event = filter.read_event().expect("read synthetic filter packet");
+    let event = match filter.read_event().expect("read synthetic filter packet") {
+        rshare_platform::windows::WindowsDriverCaptureEvent::Input(event) => event,
+        rshare_platform::windows::WindowsDriverCaptureEvent::Status(status) => {
+            panic!("unexpected filter capture status: {status:?}")
+        }
+    };
     assert_eq!(event.source, WindowsDriverEventSource::DriverTest);
     assert_eq!(event.device_kind, WindowsDriverDeviceKind::Keyboard);
     assert_eq!(event.event_kind, WindowsDriverEventKind::Synthetic);
