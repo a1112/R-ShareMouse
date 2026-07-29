@@ -16,24 +16,28 @@ use rshare_core::{
     local_capability_snapshots, read_json_line, remote_capability_snapshots, write_json_line,
     AudioFormat, BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
     CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine, Config,
-    ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
-    DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult, DisplayIdentifyResult, DisplayNode,
-    DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
-    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
-    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    FeatureConfig, InputRouter, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph,
-    LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult,
-    LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
-    LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource,
-    LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
-    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
-    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
-    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
-    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
-    VirtualDesktopGeometry, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
-    VirtualDisplayStatus,
+    ControlConnectionId, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
+    DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult,
+    DisplayIdentifyResult, DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult,
+    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
+    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, FeatureConfig, InputRouter, LatencyFeedbackSnapshot,
+    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
+    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
+    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+};
+use rshare_daemon::diagnostics_runtime::{
+    DiagnosticPayload, DiagnosticPublicationItem, DiagnosticSubscriberId, DiagnosticsHandle,
+    DiagnosticsRuntime, DiagnosticsSubscription, DIAGNOSTICS_HISTORY_CAPACITY,
 };
 use rshare_daemon::input_runtime::{
     dispatch_system_safety_event, run_authenticated_input_peers, InputRuntime,
@@ -52,7 +56,8 @@ use rshare_input::RDevInputListener;
 use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
     connection::{ConnectionInfo, ConnectionState},
-    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig,
+    qos::{ClassifiedMessage, ConnectionRegistry, TransportSendError},
+    DiscoveredDevice, NetworkEvent, NetworkManager, NetworkManagerConfig, TelemetryFrame,
 };
 use tracing_subscriber::prelude::*;
 
@@ -2205,42 +2210,120 @@ fn latency_feedback_status_priority(status: LatencyFeedbackStatus) -> u8 {
     }
 }
 
-fn diagnostic_message(local_device_id: DeviceId, event: LocalInputDiagnosticEvent) -> Message {
-    Message::InputDiagnostic {
-        device_id: local_device_id,
-        event,
+fn publication_item_to_local_diagnostic(
+    local_device_id: DeviceId,
+    sequence: u64,
+    item: &DiagnosticPublicationItem,
+) -> LocalInputDiagnosticEvent {
+    match &item.payload {
+        DiagnosticPayload::Discrete(event) => event.clone(),
+        DiagnosticPayload::Metrics(snapshot) => {
+            let mut payload = BTreeMap::new();
+            payload.insert("snapshot_json".to_string(), item.json.to_string());
+            payload.insert("captured".to_string(), snapshot.captured.to_string());
+            payload.insert("routed".to_string(), snapshot.routed.to_string());
+            payload.insert(
+                "realtime_replaced".to_string(),
+                snapshot.realtime_replaced.to_string(),
+            );
+            payload.insert(
+                "realtime_dropped".to_string(),
+                snapshot.realtime_dropped.to_string(),
+            );
+            payload.insert(
+                "reliable_overflow".to_string(),
+                snapshot.reliable_overflow.to_string(),
+            );
+            LocalInputDiagnosticEvent {
+                sequence,
+                timestamp_ms: timestamp_ms_now(),
+                device_kind: LocalInputDeviceKind::Backend,
+                event_kind: "control_metrics_sample".to_string(),
+                summary: "Sampled control-path metrics".to_string(),
+                device_id: Some(local_device_id.to_string()),
+                device_instance_id: None,
+                capture_path: Some("diagnostics-runtime".to_string()),
+                source: LocalInputEventSource::System,
+                payload,
+            }
+        }
     }
 }
 
-async fn broadcast_diagnostic_event(
-    network_manager: &Arc<Mutex<NetworkManager>>,
+async fn run_peer_diagnostics_forwarder(
+    mut subscription: DiagnosticsSubscription,
     local_device_id: DeviceId,
-    event: LocalInputDiagnosticEvent,
+    peer_id: DeviceId,
+    mut try_send: impl FnMut(TelemetryFrame) -> std::result::Result<(), TransportSendError>,
 ) {
-    let endpoint_event = EndpointEvent::from_local_diagnostic(local_device_id, event.clone());
-    let result = {
-        let mut manager = network_manager.lock().await;
-        manager
-            .broadcast(diagnostic_message(local_device_id, event))
-            .await
-    };
-
-    if let Err(error) = result {
-        tracing::debug!("Failed to broadcast input diagnostic event: {}", error);
+    while let Some(publication) = subscription.recv().await {
+        for item in publication.items.iter() {
+            let event =
+                publication_item_to_local_diagnostic(local_device_id, publication.sequence, item);
+            let message = Message::InputDiagnostic {
+                device_id: local_device_id,
+                event,
+            };
+            let frame = match ClassifiedMessage::try_from(message) {
+                Ok(ClassifiedMessage::Telemetry(frame)) => frame,
+                Ok(_) => unreachable!("input diagnostics must use the telemetry lane"),
+                Err(error) => {
+                    tracing::debug!(
+                        "Failed to classify sampled diagnostics for {}: {}",
+                        peer_id,
+                        error
+                    );
+                    return;
+                }
+            };
+            match try_send(frame) {
+                Ok(()) => {}
+                Err(TransportSendError::TelemetryLaneFull) => {
+                    tracing::trace!(
+                        "Dropped a stale sampled diagnostics item for {} because telemetry is full",
+                        peer_id
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "Failed to send sampled diagnostics to {}: {}",
+                        peer_id,
+                        error
+                    );
+                    return;
+                }
+            }
+        }
     }
+}
 
-    let result = {
-        let mut manager = network_manager.lock().await;
-        manager
-            .broadcast(Message::EndpointEventDelta {
-                event: endpoint_event,
-            })
-            .await
+fn spawn_peer_diagnostics_forwarder(
+    diagnostics: &DiagnosticsHandle,
+    input_registry: Arc<ConnectionRegistry>,
+    local_device_id: DeviceId,
+    subscriber_id: DiagnosticSubscriberId,
+) {
+    let Some(peer) = input_registry.peer(&subscriber_id.peer_id).filter(|peer| {
+        diagnostic_generation_is_current(subscriber_id, Some(peer.auth.control_connection_id))
+    }) else {
+        return;
     };
+    let Some(subscription) = diagnostics.subscribe_current(subscriber_id) else {
+        return;
+    };
+    tokio::spawn(run_peer_diagnostics_forwarder(
+        subscription,
+        local_device_id,
+        subscriber_id.peer_id,
+        move |frame| peer.transport.try_send_telemetry(frame),
+    ));
+}
 
-    if let Err(error) = result {
-        tracing::debug!("Failed to broadcast endpoint event delta: {}", error);
-    }
+fn diagnostic_generation_is_current(
+    subscriber_id: DiagnosticSubscriberId,
+    current: Option<ControlConnectionId>,
+) -> bool {
+    current == Some(subscriber_id.control_connection_id)
 }
 
 async fn request_remote_endpoint_events(
@@ -3885,11 +3968,12 @@ async fn start_endpoint_switch_latency_probe(
     network_manager: &Arc<Mutex<NetworkManager>>,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    diagnostics: &DiagnosticsHandle,
     target: DeviceId,
     origin_sequence: u64,
 ) {
     let now = timestamp_ms_now();
-    let Some((local_device_id, sequence, event)) = ({
+    let Some((sequence, event)) = ({
         let mut state = state.write().await;
         if !is_device_connected(&state, target) {
             None
@@ -3933,14 +4017,14 @@ async fn start_endpoint_switch_latency_probe(
                 payload,
             };
             push_recent_local_event(&mut state.local_controls, event.clone());
-            Some((state.status.device_id, sequence, event))
+            Some((sequence, event))
         }
     }) else {
         return;
     };
 
     let _ = local_events_tx.send(event.clone());
-    broadcast_diagnostic_event(network_manager, local_device_id, event).await;
+    diagnostics.record_discrete(event);
 
     let result = {
         let mut manager = network_manager.lock().await;
@@ -3981,19 +4065,22 @@ async fn start_endpoint_switch_latency_probe(
             )
         };
         let _ = local_events_tx.send(event.clone());
-        broadcast_diagnostic_event(network_manager, local_device_id, event).await;
+        diagnostics.record_discrete(event);
     }
 }
 
 async fn handle_network_message(
     state: &Arc<RwLock<DaemonState>>,
     network_manager: &Arc<Mutex<NetworkManager>>,
+    input_registry: &Arc<ConnectionRegistry>,
     inject_backend: &InputInjectionHandle,
     audio_runtime: &audio_runtime::AudioRuntimeHandle,
     usb_runtime: &UsbHostRuntime,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: &broadcast::Sender<EndpointEvent>,
+    diagnostics: &DiagnosticsHandle,
     from: DeviceId,
+    control_connection_id: ControlConnectionId,
     message: Message,
 ) {
     match message {
@@ -4015,23 +4102,50 @@ async fn handle_network_message(
             let _ = endpoint_events_tx.send(mirrored);
         }
         Message::EndpointEventSubscribe { filter } => {
-            let events = {
+            let subscriber_id = DiagnosticSubscriberId {
+                peer_id: from,
+                control_connection_id,
+            };
+            let (events, local_device_id) = {
                 let mut state = state.write().await;
-                state.endpoint_events(&filter, None, Some(128))
+                (
+                    state.endpoint_events(&filter, None, Some(128)),
+                    state.status.device_id,
+                )
             };
-            let result = {
-                let mut manager = network_manager.lock().await;
-                manager
-                    .send_to(&from, Message::EndpointEventSnapshot { events })
-                    .await
-            };
+            let result = input_registry
+                .peer(&from)
+                .filter(|peer| {
+                    diagnostic_generation_is_current(
+                        subscriber_id,
+                        Some(peer.auth.control_connection_id),
+                    )
+                })
+                .ok_or_else(|| "diagnostics connection generation is no longer current".to_string())
+                .and_then(|peer| {
+                    match ClassifiedMessage::try_from(Message::EndpointEventSnapshot { events }) {
+                        Ok(ClassifiedMessage::Telemetry(frame)) => peer
+                            .transport
+                            .try_send_telemetry(frame)
+                            .map_err(|error| error.to_string()),
+                        Ok(_) => Err("endpoint snapshot did not select telemetry lane".to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                });
             if let Err(error) = result {
                 tracing::debug!(
                     "Failed to answer endpoint event subscription from {}: {}",
                     from,
                     error
                 );
-            }
+            } else {
+                spawn_peer_diagnostics_forwarder(
+                    diagnostics,
+                    input_registry.clone(),
+                    local_device_id,
+                    subscriber_id,
+                );
+            };
         }
         Message::EndpointEventSnapshot { events } => {
             for event in events {
@@ -4120,6 +4234,7 @@ async fn handle_network_message(
                     network_manager,
                     state,
                     local_events_tx,
+                    diagnostics,
                     from,
                     sequence,
                 )
@@ -4134,7 +4249,7 @@ async fn handle_network_message(
             origin_sequence,
         } => {
             let now = timestamp_ms_now();
-            let (event, should_broadcast, local_device_id) = {
+            let (event, should_broadcast) = {
                 let mut state = state.write().await;
                 let pending = state.pending_latency_probes.remove(&sequence);
                 let target = pending.as_ref().map(|probe| probe.target).unwrap_or(from);
@@ -4203,11 +4318,11 @@ async fn handle_network_message(
                 let event = record_latency_diagnostic_event(
                     &mut state, target, event_kind, summary, payload,
                 );
-                (event, should_broadcast, state.status.device_id)
+                (event, should_broadcast)
             };
             let _ = local_events_tx.send(event.clone());
             if should_broadcast {
-                broadcast_diagnostic_event(network_manager, local_device_id, event).await;
+                diagnostics.record_discrete(event);
             }
         }
         Message::AudioStreamStart {
@@ -6130,6 +6245,24 @@ fn flatten_daemon_task_result(
     }
 }
 
+fn into_authenticated_network_message(
+    event: NetworkEvent,
+) -> std::result::Result<(DeviceId, ControlConnectionId, Message), NetworkEvent> {
+    match event {
+        NetworkEvent::ControlReceived { auth, frame } => Ok((
+            auth.peer_id,
+            auth.control_connection_id,
+            frame.into_message(),
+        )),
+        NetworkEvent::TelemetryReceived { auth, frame } => Ok((
+            auth.peer_id,
+            auth.control_connection_id,
+            frame.into_message(),
+        )),
+        event => Err(event),
+    }
+}
+
 async fn enqueue_router_command(
     sender: &tokio::sync::mpsc::Sender<RouterCommand>,
     command: RouterCommand,
@@ -6483,15 +6616,20 @@ async fn main() -> Result<()> {
     let input_router = InputRouter::new(device_id, router_layout, router_geometry, connected_peers);
     let (input_state, mut input_feeds) = input_state_channel(32);
     let input_metrics = Arc::new(ControlMetrics::default());
+    let diagnostics_runtime =
+        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
+    let diagnostics = diagnostics_runtime.handle();
+    let (diagnostics_shutdown_tx, diagnostics_shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let _diagnostics_task = tokio::spawn(diagnostics_runtime.run(diagnostics_shutdown_rx));
     if !input_backend_healthy {
         enqueue_router_command(&input_command_tx, RouterCommand::BackendDegraded).await?;
     }
     let input_runtime = InputRuntime::new(
         input_consumer,
         input_router,
-        input_registry,
+        input_registry.clone(),
         input_state,
-        input_metrics,
+        input_metrics.clone(),
         injection.clone(),
     );
     let (system_safety_tx, system_safety_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6576,10 +6714,32 @@ async fn main() -> Result<()> {
         let layout_path = layout_path.clone();
         let input_command_tx = input_command_tx.clone();
         let injection = injection.clone();
+        let diagnostics = diagnostics.clone();
         let current_generations = current_generations.clone();
         tokio::spawn(async move {
             tracing::info!("Event task: starting to wait for events");
             while let Some(event) = events.recv().await {
+                let event = match into_authenticated_network_message(event) {
+                    Ok((from, control_connection_id, message)) => {
+                        handle_network_message(
+                            &state,
+                            &network_manager,
+                            &input_registry,
+                            &inject_backend,
+                            &audio_runtime,
+                            &usb_runtime,
+                            &local_events_tx,
+                            &endpoint_events_tx,
+                            &diagnostics,
+                            from,
+                            control_connection_id,
+                            message,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(event) => event,
+                };
                 match event {
                     NetworkEvent::DeviceFound(device) => {
                         let layout_to_save = {
@@ -6594,6 +6754,10 @@ async fn main() -> Result<()> {
                     }
                     NetworkEvent::DeviceConnected(auth) => {
                         let id = auth.peer_id;
+                        diagnostics.activate_generation(DiagnosticSubscriberId {
+                            peer_id: id,
+                            control_connection_id: auth.control_connection_id,
+                        });
                         current_generations
                             .write()
                             .expect("input generation registry poisoned")
@@ -6647,6 +6811,10 @@ async fn main() -> Result<()> {
                         {
                             continue;
                         }
+                        diagnostics.clear_generation(DiagnosticSubscriberId {
+                            peer_id: id,
+                            control_connection_id,
+                        });
                         current_generations
                             .write()
                             .expect("input generation registry poisoned")
@@ -6685,19 +6853,9 @@ async fn main() -> Result<()> {
                         state.remove_device(&id);
                         sync_local_shortcut_suppression(&state);
                     }
-                    NetworkEvent::ControlReceived { auth, frame } => {
-                        handle_network_message(
-                            &state,
-                            &network_manager,
-                            &inject_backend,
-                            &audio_runtime,
-                            &usb_runtime,
-                            &local_events_tx,
-                            &endpoint_events_tx,
-                            auth.peer_id,
-                            frame.into_message(),
-                        )
-                        .await;
+                    NetworkEvent::ControlReceived { .. }
+                    | NetworkEvent::TelemetryReceived { .. } => {
+                        unreachable!("authenticated messages are handled before lifecycle events")
                     }
                     NetworkEvent::ConnectionError {
                         peer_id,
@@ -6719,6 +6877,19 @@ async fn main() -> Result<()> {
                                     != Some(&generation)
                             }) {
                                 continue;
+                            }
+                            let diagnostic_generation = control_connection_id.or_else(|| {
+                                current_generations
+                                    .read()
+                                    .expect("input generation registry poisoned")
+                                    .get(&device_id)
+                                    .copied()
+                            });
+                            if let Some(control_connection_id) = diagnostic_generation {
+                                diagnostics.clear_generation(DiagnosticSubscriberId {
+                                    peer_id: device_id,
+                                    control_connection_id,
+                                });
                             }
                             current_generations
                                 .write()
@@ -6824,6 +6995,7 @@ async fn main() -> Result<()> {
     .await;
 
     tracing::info!("tokio::select! exited, cleaning up");
+    let _ = diagnostics_shutdown_tx.try_send(());
     let _ = enqueue_router_command(&input_command_tx, RouterCommand::Shutdown).await;
     injection.request_release_all_sources(rshare_core::ReleaseAllReason::SessionEnded);
     set_local_shortcut_suppression(false);
@@ -10935,5 +11107,231 @@ mod tests {
             "invalid layout should be retained for inspection"
         );
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn stale_diagnostics_worker_cannot_admit_send_to_replacement_generation() {
+        let peer_id = DeviceId::new_v4();
+        let old_generation = ControlConnectionId::new();
+        let replacement_generation = ControlConnectionId::new();
+        let old_subscription = DiagnosticSubscriberId {
+            peer_id,
+            control_connection_id: old_generation,
+        };
+
+        assert!(diagnostic_generation_is_current(
+            old_subscription,
+            Some(old_generation)
+        ));
+        assert!(!diagnostic_generation_is_current(
+            old_subscription,
+            Some(replacement_generation)
+        ));
+        assert!(!diagnostic_generation_is_current(old_subscription, None));
+    }
+
+    #[test]
+    fn telemetry_subscription_enters_the_authenticated_message_dispatch_path() {
+        let peer_id = DeviceId::new_v4();
+        let control_connection_id = ControlConnectionId::new();
+        let auth = Arc::new(rshare_net::handshake::PeerAuthContext {
+            peer_id,
+            certificate_fingerprint: rshare_net::encryption::PeerCertificateFingerprint::from_der(
+                b"telemetry-peer",
+            ),
+            control_connection_id,
+        });
+        let message = Message::EndpointEventSubscribe {
+            filter: EndpointEventFilter::default(),
+        };
+        let frame = match ClassifiedMessage::try_from(message) {
+            Ok(ClassifiedMessage::Telemetry(frame)) => frame,
+            other => panic!("subscription must classify as telemetry, got {other:?}"),
+        };
+
+        let (actual_peer, actual_generation, actual_message) =
+            into_authenticated_network_message(NetworkEvent::TelemetryReceived { auth, frame })
+                .expect("telemetry must use the same authenticated dispatch path as control");
+
+        assert_eq!(actual_peer, peer_id);
+        assert_eq!(actual_generation, control_connection_id);
+        assert!(matches!(
+            actual_message,
+            Message::EndpointEventSubscribe { .. }
+        ));
+    }
+
+    fn peer_stream_test_event(
+        sequence: u64,
+        device_kind: LocalInputDeviceKind,
+        event_kind: &str,
+    ) -> LocalInputDiagnosticEvent {
+        LocalInputDiagnosticEvent {
+            sequence,
+            timestamp_ms: sequence,
+            device_kind,
+            event_kind: event_kind.to_string(),
+            summary: format!("peer stream event {sequence}"),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: Some("diagnostics-test".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_lane_full_keeps_peer_diagnostics_forwarder_alive_for_the_latest_batch() {
+        let metrics = Arc::new(ControlMetrics::default());
+        let mut runtime = DiagnosticsRuntime::new(metrics, 8);
+        let subscriber_id = DiagnosticSubscriberId {
+            peer_id: DeviceId::new_v4(),
+            control_connection_id: ControlConnectionId::new(),
+        };
+        runtime.activate_generation(subscriber_id);
+        let subscription = runtime
+            .subscribe_current(subscriber_id)
+            .expect("active generation must admit one peer stream");
+        let local_device_id = DeviceId::new_v4();
+        let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::channel(1);
+        telemetry_tx
+            .try_send(rshare_net::TelemetryFrame::latency_probe(1, 1, false, None))
+            .unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let send_attempts = attempts.clone();
+        let forwarder = tokio::spawn(run_peer_diagnostics_forwarder(
+            subscription,
+            local_device_id,
+            subscriber_id.peer_id,
+            move |frame| {
+                send_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                telemetry_tx.try_send(frame).map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        rshare_net::qos::TransportSendError::TelemetryLaneFull
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        rshare_net::qos::TransportSendError::LaneClosed
+                    }
+                })
+            },
+        ));
+
+        runtime.record_discrete(peer_stream_test_event(
+            10,
+            LocalInputDeviceKind::Keyboard,
+            "key",
+        ));
+        assert!(runtime.sample_at(rshare_daemon::diagnostics_runtime::DIAGNOSTICS_SAMPLE_PERIOD));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the full lane must be observed");
+        let _filler = telemetry_rx.recv().await.unwrap();
+
+        runtime.record_discrete(peer_stream_test_event(
+            11,
+            LocalInputDeviceKind::Mouse,
+            "move",
+        ));
+        assert!(
+            runtime.sample_at(rshare_daemon::diagnostics_runtime::DIAGNOSTICS_SAMPLE_PERIOD * 2)
+        );
+        let recovered = tokio::time::timeout(Duration::from_secs(1), telemetry_rx.recv())
+            .await
+            .expect("a later latest batch must be attempted after transient saturation")
+            .expect("typed telemetry lane remains open");
+        assert!(matches!(
+            recovered.into_message(),
+            Message::InputDiagnostic { .. }
+        ));
+        assert!(
+            !forwarder.is_finished(),
+            "TelemetryLaneFull must not cancel the peer subscription"
+        );
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_filters_share_one_broad_peer_stream_and_filter_locally() {
+        let metrics = Arc::new(ControlMetrics::default());
+        let mut runtime = DiagnosticsRuntime::new(metrics, 8);
+        let subscriber_id = DiagnosticSubscriberId {
+            peer_id: DeviceId::new_v4(),
+            control_connection_id: ControlConnectionId::new(),
+        };
+        runtime.activate_generation(subscriber_id);
+        let subscription = runtime
+            .subscribe_current(subscriber_id)
+            .expect("first local view starts the broad peer stream");
+        assert!(
+            runtime.subscribe_current(subscriber_id).is_none(),
+            "a second filter must reuse, not replace, the generation stream"
+        );
+        let local_device_id = DeviceId::new_v4();
+        let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::channel(8);
+        let forwarder = tokio::spawn(run_peer_diagnostics_forwarder(
+            subscription,
+            local_device_id,
+            subscriber_id.peer_id,
+            move |frame| {
+                telemetry_tx.try_send(frame).map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        rshare_net::qos::TransportSendError::TelemetryLaneFull
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        rshare_net::qos::TransportSendError::LaneClosed
+                    }
+                })
+            },
+        ));
+
+        runtime.record_discrete(peer_stream_test_event(
+            21,
+            LocalInputDeviceKind::Keyboard,
+            "key",
+        ));
+        runtime.record_discrete(peer_stream_test_event(
+            22,
+            LocalInputDeviceKind::Mouse,
+            "move",
+        ));
+        assert!(runtime.sample_at(rshare_daemon::diagnostics_runtime::DIAGNOSTICS_SAMPLE_PERIOD));
+
+        let mut peer_events = Vec::new();
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), telemetry_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Message::InputDiagnostic { event, .. } = frame.into_message() {
+                peer_events.push(EndpointEvent::from_local_diagnostic(local_device_id, event));
+            }
+        }
+        let keyboard = EndpointEventFilter {
+            kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+            ..EndpointEventFilter::default()
+        };
+        let mouse = EndpointEventFilter {
+            kinds: vec![rshare_core::EndpointEventKind::Mouse],
+            ..EndpointEventFilter::default()
+        };
+        assert_eq!(
+            peer_events
+                .iter()
+                .filter(|event| keyboard.matches(event))
+                .count(),
+            1
+        );
+        assert_eq!(
+            peer_events
+                .iter()
+                .filter(|event| mouse.matches(event))
+                .count(),
+            1
+        );
+        forwarder.abort();
     }
 }

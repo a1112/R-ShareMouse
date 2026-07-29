@@ -13,7 +13,7 @@ use crate::{
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
     handshake::PeerAuthContext,
     qos::{
-        ClassifiedMessage, ConnectionRegistry, ControlFrame, TerminalReleaseEvent,
+        ClassifiedMessage, ConnectionRegistry, ControlFrame, TelemetryFrame, TerminalReleaseEvent,
         TransportSendError,
     },
     transport::PeerInbound,
@@ -35,6 +35,10 @@ pub enum NetworkEvent {
     ControlReceived {
         auth: Arc<PeerAuthContext>,
         frame: ControlFrame,
+    },
+    TelemetryReceived {
+        auth: Arc<PeerAuthContext>,
+        frame: TelemetryFrame,
     },
     /// Connection error
     ConnectionError {
@@ -115,6 +119,9 @@ fn spawn_connection_event_forwarder(
                 },
                 ManagerEvent::ControlReceived { auth, frame } => {
                     NetworkEvent::ControlReceived { auth, frame }
+                }
+                ManagerEvent::TelemetryReceived { auth, frame } => {
+                    NetworkEvent::TelemetryReceived { auth, frame }
                 }
                 ManagerEvent::ProtocolError { auth, error } => NetworkEvent::ConnectionError {
                     peer_id: Some(auth.peer_id),
@@ -992,6 +999,35 @@ mod tests {
                     Message::Heartbeat {
                         sequence: 1,
                         timestamp: 2
+                    }
+                ));
+            }
+            _ => panic!("Wrong network event"),
+        }
+
+        manager_tx
+            .send(crate::connection::ManagerEvent::TelemetryReceived {
+                auth: auth.clone(),
+                frame: crate::qos::TelemetryFrame::latency_probe(3, 4, false, None),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NetworkEvent::TelemetryReceived {
+                auth: received,
+                frame,
+            } => {
+                assert_eq!(received.control_connection_id, auth.control_connection_id);
+                assert!(matches!(
+                    frame.into_message(),
+                    Message::LatencyProbe {
+                        sequence: 3,
+                        timestamp_ms: 4,
+                        ..
                     }
                 ));
             }

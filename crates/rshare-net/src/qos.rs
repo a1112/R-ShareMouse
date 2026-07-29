@@ -95,6 +95,8 @@ impl TryFrom<Message> for ClassifiedMessage {
 pub enum TransportSendError {
     #[error("reliable input lane is full")]
     ReliableLaneFull,
+    #[error("telemetry lane is full")]
+    TelemetryLaneFull,
     #[error("transport lane is closed")]
     LaneClosed,
     #[error("emergency slot is occupied")]
@@ -585,7 +587,10 @@ impl PeerTransportHandle {
         self.inner
             .telemetry_tx
             .try_send(frame)
-            .map_err(|_| TransportSendError::LaneClosed)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => TransportSendError::TelemetryLaneFull,
+                mpsc::error::TrySendError::Closed(_) => TransportSendError::LaneClosed,
+            })
     }
 
     pub fn is_tombstoned(&self, epoch: SessionEpoch) -> bool {
@@ -833,7 +838,7 @@ impl TelemetryFrame {
         }
     }
 
-    fn into_message(self) -> Message {
+    pub fn into_message(self) -> Message {
         self.message
     }
 }
@@ -1552,6 +1557,7 @@ impl Default for ConnectionRegistry {
 #[cfg(test)]
 struct QosProbe {
     reliable_rx: mpsc::Receiver<ReliableInputFrame>,
+    telemetry_rx: mpsc::Receiver<TelemetryFrame>,
 }
 
 #[cfg(test)]
@@ -1576,7 +1582,7 @@ fn fixture_handle(
     let (emergency_tx, mut emergency_rx) = mpsc::channel::<ReliableInputFrame>(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
-    let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
+    let (telemetry_tx, telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
     let release_emitter = TerminalReleaseEmitter::new(release_tx.clone());
     let worker_release_tx = release_tx.clone();
@@ -1629,7 +1635,10 @@ fn fixture_handle(
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
         },
-        QosProbe { reliable_rx },
+        QosProbe {
+            reliable_rx,
+            telemetry_rx,
+        },
         release_rx,
     )
 }
@@ -1675,7 +1684,7 @@ fn fixture_handle_with_stalled_emergency() -> (
     let (emergency_tx, emergency_rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
-    let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
+    let (telemetry_tx, telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
     let release_emitter = TerminalReleaseEmitter::new(release_tx);
     let (reliable_cancelled_through_tx, _reliable_cancelled_through_rx) = watch::channel(None);
@@ -1713,7 +1722,10 @@ fn fixture_handle_with_stalled_emergency() -> (
                 worker_count: Arc::new(AtomicUsize::new(0)),
             }),
         },
-        QosProbe { reliable_rx },
+        QosProbe {
+            reliable_rx,
+            telemetry_rx,
+        },
         emergency_rx,
         release_rx,
     )
@@ -2008,6 +2020,24 @@ mod tests {
             release.reason,
             rshare_core::ReleaseAllReason::BackendFailure
         );
+    }
+
+    #[tokio::test]
+    async fn telemetry_queue_full_is_transient_and_recovers_after_drain() {
+        let (handle, mut probe, _releases) = fixture_handle(1);
+        handle
+            .try_send_telemetry(TelemetryFrame::latency_probe(1, 2, false, None))
+            .unwrap();
+
+        assert_eq!(
+            handle.try_send_telemetry(TelemetryFrame::latency_probe(3, 4, false, None)),
+            Err(TransportSendError::TelemetryLaneFull)
+        );
+
+        probe.telemetry_rx.recv().await.unwrap();
+        handle
+            .try_send_telemetry(TelemetryFrame::latency_probe(5, 6, false, None))
+            .expect("draining a full telemetry queue must make it writable again");
     }
 
     #[tokio::test]

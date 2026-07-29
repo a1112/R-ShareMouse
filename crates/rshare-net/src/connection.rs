@@ -12,8 +12,8 @@ use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
 use super::qos::{
-    ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TerminalReleaseEvent,
-    TransportSendError,
+    ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
+    TerminalReleaseEvent, TransportSendError,
 };
 use super::transport::{ConnectionPool, PeerInbound, QuicTransport, TransportProtocolError};
 
@@ -85,6 +85,10 @@ pub enum ManagerEvent {
     ControlReceived {
         auth: Arc<super::handshake::PeerAuthContext>,
         frame: ControlFrame,
+    },
+    TelemetryReceived {
+        auth: Arc<super::handshake::PeerAuthContext>,
+        frame: TelemetryFrame,
     },
     ProtocolError {
         auth: Arc<super::handshake::PeerAuthContext>,
@@ -449,6 +453,43 @@ fn spawn_control_event_reader(
     });
 }
 
+fn spawn_telemetry_event_reader(
+    auth: Arc<super::handshake::PeerAuthContext>,
+    generation: u64,
+    mut telemetry: mpsc::Receiver<TelemetryFrame>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    connections: CanonicalConnections,
+    lifecycle_lock: Arc<TokioMutex<()>>,
+) {
+    tokio::spawn(async move {
+        if !wait_for_connected_generation(&connections, auth.peer_id, generation).await {
+            return;
+        }
+        while let Some(frame) = telemetry.recv().await {
+            let permit = event_tx.reserve().await.ok();
+            let _lifecycle = lifecycle_lock.lock().await;
+            if !is_current_generation(&connections, auth.peer_id, generation)
+                || !connections
+                    .read()
+                    .expect("canonical connection registry poisoned")
+                    .get(&auth.peer_id)
+                    .is_some_and(|connection| {
+                        connection.info.control_connection_id == Some(auth.control_connection_id)
+                    })
+            {
+                return;
+            }
+            let Some(permit) = permit else {
+                return;
+            };
+            permit.send(ManagerEvent::TelemetryReceived {
+                auth: auth.clone(),
+                frame,
+            });
+        }
+    });
+}
+
 fn spawn_protocol_error_reader(
     generation: u64,
     mut errors: mpsc::Receiver<TransportProtocolError>,
@@ -725,6 +766,11 @@ impl ConnectionManager {
                     .expect("incoming connection candidate must be present")
                     .take_control_events()
                     .expect("authenticated QoS install must expose control events");
+                let telemetry_events = candidate_connection
+                    .as_mut()
+                    .expect("incoming connection candidate must be present")
+                    .take_telemetry_events()
+                    .expect("authenticated QoS install must expose telemetry events");
                 let protocol_errors = candidate_connection
                     .as_mut()
                     .expect("incoming connection candidate must be present")
@@ -859,6 +905,14 @@ impl ConnectionManager {
                     connections.clone(),
                     lifecycle_lock.clone(),
                 );
+                spawn_telemetry_event_reader(
+                    auth.clone(),
+                    generation,
+                    telemetry_events,
+                    event_tx.clone(),
+                    connections.clone(),
+                    lifecycle_lock.clone(),
+                );
                 spawn_protocol_error_reader(
                     generation,
                     protocol_errors,
@@ -938,6 +992,9 @@ impl ConnectionManager {
         let control_events = conn
             .take_control_events()
             .expect("authenticated QoS install must expose control events");
+        let telemetry_events = conn
+            .take_telemetry_events()
+            .expect("authenticated QoS install must expose telemetry events");
         let protocol_errors = conn
             .take_protocol_errors()
             .expect("authenticated QoS install must expose protocol errors");
@@ -1039,6 +1096,14 @@ impl ConnectionManager {
             auth.clone(),
             generation,
             control_events,
+            self.event_tx.clone(),
+            self.connections.clone(),
+            self.lifecycle_lock.clone(),
+        );
+        spawn_telemetry_event_reader(
+            auth.clone(),
+            generation,
+            telemetry_events,
             self.event_tx.clone(),
             self.connections.clone(),
             self.lifecycle_lock.clone(),
@@ -2393,6 +2458,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_emits_telemetry_only_after_connected_for_exact_generation() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = ConnectionManager::isolated_for_test(server_id);
+        let mut events = server.events().unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.transport_local_addr().unwrap();
+
+        let mut client = ConnectionManager::isolated_for_test(client_id);
+        client
+            .connect(server_id, &address.to_string())
+            .await
+            .unwrap();
+        client
+            .send_to(
+                &server_id,
+                Message::EndpointEventSubscribe {
+                    filter: rshare_core::EndpointEventFilter::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut connected_generation = None;
+            loop {
+                match events.recv().await.unwrap() {
+                    ManagerEvent::Connected(auth) if auth.peer_id == client_id => {
+                        connected_generation = Some(auth.control_connection_id);
+                    }
+                    ManagerEvent::TelemetryReceived { auth, frame }
+                        if auth.peer_id == client_id =>
+                    {
+                        assert_eq!(
+                            connected_generation,
+                            Some(auth.control_connection_id),
+                            "telemetry must never precede Connected for its generation"
+                        );
+                        assert!(matches!(
+                            frame.into_message(),
+                            Message::EndpointEventSubscribe { .. }
+                        ));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("real QoS telemetry must reach the manager event stream");
+    }
+
+    #[tokio::test]
     async fn manager_publishes_one_typed_inbound_set_and_generation_aware_control_event() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
@@ -2971,6 +3089,11 @@ mod tests {
             .get(&remote_id)
             .expect("the first connection should be canonical")
             .generation;
+        let first_auth = manager
+            .qos_registry
+            .peer(&remote_id)
+            .expect("the first QoS generation should be registered")
+            .auth;
         let (late_old_reader_tx, late_old_reader_rx) = mpsc::channel(1);
         let _reader_task = spawn_message_reader(
             remote_id,
@@ -2982,6 +3105,15 @@ mod tests {
             manager.pool.clone(),
             manager.lifecycle_lock.clone(),
             manager.qos_registry.clone(),
+        );
+        let (late_old_telemetry_tx, late_old_telemetry_rx) = mpsc::channel(1);
+        spawn_telemetry_event_reader(
+            first_auth.clone(),
+            first_generation,
+            late_old_telemetry_rx,
+            manager.event_tx.clone(),
+            manager.connections.clone(),
+            manager.lifecycle_lock.clone(),
         );
 
         first_remote.transport.close().await.unwrap();
@@ -3030,6 +3162,34 @@ mod tests {
         .await
         .expect("the replacement connection should emit Connected");
         assert_eq!(replacement_connected, remote_id);
+
+        let ClassifiedMessage::Telemetry(stale_frame) =
+            ClassifiedMessage::try_from(Message::EndpointEventSubscribe {
+                filter: rshare_core::EndpointEventFilter::default(),
+            })
+            .unwrap()
+        else {
+            panic!("endpoint subscription must use telemetry");
+        };
+        late_old_telemetry_tx.send(stale_frame).await.unwrap();
+        let stale_telemetry = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match events.recv().await {
+                    Some(ManagerEvent::TelemetryReceived { auth, .. })
+                        if auth.control_connection_id == first_auth.control_connection_id =>
+                    {
+                        break Some(auth.control_connection_id);
+                    }
+                    Some(_) => {}
+                    None => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            stale_telemetry.is_err(),
+            "a stale telemetry reader must not emit for the replacement generation"
+        );
 
         drop(late_old_reader_tx);
         let stale_disconnect = tokio::time::timeout(Duration::from_millis(100), async {

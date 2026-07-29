@@ -113,6 +113,7 @@ pub(crate) struct TransportProtocolError {
 struct InstalledInboundReceivers {
     peer: Option<PeerInbound>,
     control_events: Option<mpsc::Receiver<ControlFrame>>,
+    telemetry_events: Option<mpsc::Receiver<TelemetryFrame>>,
     protocol_errors: Option<mpsc::Receiver<TransportProtocolError>>,
 }
 
@@ -642,6 +643,7 @@ struct QosReceiveContext {
     control_tx: mpsc::Sender<ControlFrame>,
     control_event_tx: mpsc::Sender<ControlFrame>,
     telemetry_tx: mpsc::Sender<TelemetryFrame>,
+    telemetry_event_tx: mpsc::Sender<TelemetryFrame>,
     bulk_tx: mpsc::Sender<BulkFrame>,
     protocol_error_tx: mpsc::Sender<TransportProtocolError>,
 }
@@ -893,6 +895,7 @@ impl QuicConnection {
         let (control_tx, control_rx) = mpsc::channel(64);
         let (control_event_tx, control_events) = mpsc::channel(64);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
+        let (telemetry_event_tx, telemetry_events) = mpsc::channel(32);
         let (bulk_tx, bulk_rx) = mpsc::channel(8);
         let (protocol_error_tx, protocol_errors) = mpsc::channel(32);
         *self
@@ -909,6 +912,7 @@ impl QuicConnection {
                 bulk_rx,
             }),
             control_events: Some(control_events),
+            telemetry_events: Some(telemetry_events),
             protocol_errors: Some(protocol_errors),
         });
         *self
@@ -923,6 +927,7 @@ impl QuicConnection {
             control_tx,
             control_event_tx,
             telemetry_tx,
+            telemetry_event_tx,
             bulk_tx,
             protocol_error_tx,
         });
@@ -975,6 +980,17 @@ impl QuicConnection {
             .expect("qos receiver set poisoned")
             .as_mut()
             .and_then(|receivers| receivers.control_events.take())
+    }
+
+    /// Takes the bounded, non-blocking authenticated telemetry-event mirror
+    /// owned by `ConnectionManager`.
+    pub fn take_telemetry_events(&self) -> Option<mpsc::Receiver<TelemetryFrame>> {
+        self.inner
+            .qos_receivers
+            .lock()
+            .expect("qos receiver set poisoned")
+            .as_mut()
+            .and_then(|receivers| receivers.telemetry_events.take())
     }
 
     pub(crate) fn take_protocol_errors(&self) -> Option<mpsc::Receiver<TransportProtocolError>> {
@@ -2039,7 +2055,8 @@ async fn read_qos_message_stream(
                 }
             }
             super::qos::ClassifiedMessage::Telemetry(frame) => {
-                let _ = context.telemetry_tx.try_send(frame);
+                let _ = context.telemetry_tx.try_send(frame.clone());
+                let _ = context.telemetry_event_tx.try_send(frame);
             }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
         }
@@ -3870,6 +3887,9 @@ mod tests {
         });
         let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
         let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let mut telemetry_events = server_connection
+            .take_telemetry_events()
+            .expect("authenticated QoS must expose the telemetry-event mirror");
         let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
 
         client_qos
@@ -3901,6 +3921,10 @@ mod tests {
         timeout(Duration::from_secs(1), inbound.telemetry_rx.recv())
             .await
             .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), telemetry_events.recv())
+            .await
+            .expect("telemetry compatibility mirror must receive the authenticated frame")
             .unwrap();
 
         for message in [
@@ -4007,6 +4031,91 @@ mod tests {
         .expect("blocked control receiver must not stop realtime datagram drain");
         assert_eq!(latest.sequence, 100);
         assert_eq!(inbound.auth.control_connection_id, generation);
+    }
+
+    #[tokio::test]
+    async fn saturated_telemetry_mirror_does_not_stop_realtime_or_reliable_drain() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let server_auth = Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let client_auth = Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        });
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let telemetry_events = server_connection
+            .take_telemetry_events()
+            .expect("authenticated QoS must expose a bounded telemetry mirror");
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+
+        for sequence in 0..64 {
+            loop {
+                match client_qos.try_send_telemetry(
+                    super::super::qos::TelemetryFrame::latency_probe(
+                        sequence, sequence, false, None,
+                    ),
+                ) {
+                    Ok(()) => break,
+                    Err(super::super::qos::TransportSendError::TelemetryLaneFull) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected telemetry send error: {error}"),
+                }
+            }
+        }
+        timeout(Duration::from_secs(1), async {
+            while telemetry_events.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the undrained bounded telemetry mirror must become full");
+
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+                .await
+                .expect("full telemetry mirror must not block reliable input")
+                .unwrap()
+                .sequence,
+            1
+        );
+
+        client_qos.try_send_realtime(realtime_frame(1, 7)).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), inbound.realtime_rx.recv())
+                .await
+                .expect("full telemetry mirror must not block realtime input")
+                .unwrap()
+                .sequence,
+            7
+        );
     }
 
     #[tokio::test]
