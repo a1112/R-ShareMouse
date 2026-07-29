@@ -19,8 +19,12 @@ use tauri::{
     AppHandle, Emitter, Manager, WebviewWindow, Wry,
 };
 use tauri_plugin_single_instance::init;
+use ui_state_bridge::{
+    reserve_ui_state_stream, start_ui_state_stream, stop_ui_state_stream, UiStateStreamState,
+};
 
 mod hardware_assets;
+mod ui_state_bridge;
 
 const UNKNOWN_BUILD_VALUE: &str = "unknown";
 const RSHARE_BUILD_INFO_PREFIX: &str = "rshare-build:";
@@ -861,6 +865,7 @@ fn main() {
         }))
         .manage(LocalControlStreamState::default())
         .manage(EndpointEventStreamState::default())
+        .manage(UiStateStreamState::default())
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_event(&event) {
                 if let Err(err) = apply_tray_action(app, action) {
@@ -897,6 +902,9 @@ fn main() {
             inject_endpoint_event,
             start_local_controls_stream,
             stop_local_controls_stream,
+            reserve_ui_state_stream,
+            start_ui_state_stream,
+            stop_ui_state_stream,
             start_endpoint_events_stream,
             stop_endpoint_events_stream,
             run_local_input_test,

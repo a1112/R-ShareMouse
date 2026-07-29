@@ -82,6 +82,11 @@ import {
   resolveActiveHardwareRegions,
   resolveSelectedHardwareAsset,
 } from "./hardware-assets.mjs";
+import {
+  UiStateClient,
+  createTauriUiStateConnector,
+  createWebSocketUiStateConnector,
+} from "./ui-state-client.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
 type SettingsSectionKey =
@@ -609,6 +614,18 @@ type TauriInvoke = <T = unknown>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+type UiStateEnvelope = {
+  type: string;
+  payload: Record<string, unknown>;
+};
+
+type UiStateTransportOptions = {
+  cursor: { boot_id: string; revision: number } | null;
+  onEnvelope: (envelope: unknown) => void;
+  onDisconnect: (error: unknown) => void;
+  signal?: AbortSignal;
+};
+
 type LocalControlSubscription = {
   stop: () => void;
   usesTauriBridge: boolean;
@@ -617,7 +634,6 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const LOCAL_CONTROL_REFRESH_TIMING = getLocalControlRefreshTiming();
-const POLL_INTERVAL_MS = LOCAL_CONTROL_REFRESH_TIMING.dashboardPollMs;
 const ENDPOINT_EVENT_POLL_MS = 750;
 const LOCAL_CONTROL_EVENT_FLUSH_MS = LOCAL_CONTROL_REFRESH_TIMING.eventFlushMs;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
@@ -629,6 +645,7 @@ const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
 const DAEMON_SERVICE_BRIDGE_ENDPOINT = "/__rshare/service";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
+const UI_STATE_WS_PATH = "/ui-state";
 const NETWORK_COMMANDS = new Set([
   "dashboard_state",
   "start_service",
@@ -726,12 +743,126 @@ async function listenTauriEvent<T>(
   return listen(eventName, (event) => handler(event.payload));
 }
 
+function uiStateWebSocketUrl(): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${UI_STATE_WS_PATH}`;
+}
+
+function listenTauriEventTransport(
+  eventName: string,
+  handler: (event: { payload: unknown }) => void,
+): Promise<() => void> {
+  const tauriWindow = window as Window & {
+    __TAURI__?: {
+      event?: {
+        listen?: (
+          event: string,
+          handler: (event: { payload: unknown }) => void,
+        ) => Promise<() => void>;
+      };
+    };
+  };
+  const listen = tauriWindow.__TAURI__?.event?.listen;
+  if (!listen) {
+    return Promise.reject(new Error("Tauri UI 状态事件桥不可用"));
+  }
+  return listen(eventName, handler);
+}
+
+async function connectUiStateTransport(
+  options: UiStateTransportOptions,
+): Promise<unknown> {
+  const invoke = getInvoke();
+  const tauriWindow = window as Window & {
+    __TAURI__?: { event?: { listen?: unknown } };
+  };
+  if (invoke && typeof tauriWindow.__TAURI__?.event?.listen === "function") {
+    return createTauriUiStateConnector({
+      invoke,
+      listen: listenTauriEventTransport,
+    })(options);
+  }
+  return createWebSocketUiStateConnector({
+    WebSocket: window.WebSocket,
+    url: uiStateWebSocketUrl(),
+  })(options);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function dashboardPayloadFromUiSnapshot(snapshot: Record<string, unknown>): DashboardPayload {
+  const layout = snapshot.layout ?? null;
+  return {
+    status: snapshot.status ?? null,
+    devices: (Array.isArray(snapshot.devices) ? snapshot.devices : []) as DashboardPayload["devices"],
+    layout,
+    visible_layout: layout,
+    layout_error: null,
+    capabilities: snapshot.capabilities ?? null,
+  };
+}
+
+function applyUiStateEnvelopeToDashboard(
+  current: DashboardPayload,
+  envelope: unknown,
+): DashboardPayload {
+  if (!isRecord(envelope) || !isRecord(envelope.payload)) {
+    return current;
+  }
+  if (envelope.type === "snapshot") {
+    return dashboardPayloadFromUiSnapshot(envelope.payload);
+  }
+  if (envelope.type !== "delta" || !isRecord(envelope.payload.change)) {
+    return current;
+  }
+
+  const change = envelope.payload.change;
+  switch (change.type) {
+    case "status":
+      return { ...current, status: change.payload ?? null };
+    case "capabilities":
+      return { ...current, capabilities: change.payload ?? null };
+    case "topology":
+      return {
+        ...current,
+        layout: change.payload ?? null,
+        visible_layout: change.payload ?? null,
+        layout_error: null,
+      };
+    case "device_upsert": {
+      if (!isRecord(change.payload) || typeof change.payload.id !== "string") {
+        return current;
+      }
+      const device = change.payload as DashboardPayload["devices"][number];
+      const devices = current.devices.filter((item) => item.id !== device.id);
+      devices.push(device);
+      return { ...current, devices };
+    }
+    case "device_remove": {
+      if (typeof change.payload !== "string") {
+        return current;
+      }
+      return {
+        ...current,
+        devices: current.devices.filter((device) => device.id !== change.payload),
+      };
+    }
+    case "diagnostics":
+      return isRecord(current.status)
+        ? {
+            ...current,
+            status: { ...current.status, latency_feedback: change.payload ?? null },
+          }
+        : current;
+    default:
+      return current;
+  }
 }
 
 async function daemonIpcRequest(request: unknown): Promise<unknown> {
@@ -1970,6 +2101,7 @@ function DesktopApp() {
   const [selectedHardwareAssetIds, setSelectedHardwareAssetIds] =
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
+  const uiStateRevisionRef = useRef(0);
 
   const model = buildDesktopViewModel(payload, localControls);
   const layoutDevices = getLayoutDevices(model.layout.devices);
@@ -1989,13 +2121,24 @@ function DesktopApp() {
   ].filter((id, index, values) => id && values.indexOf(id) === index);
   const endpointPollKey = endpointIds.join("|");
 
-  async function refreshDashboard() {
+  async function refreshDashboard(expectedUiRevision?: number) {
     try {
       const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
+      if (
+        expectedUiRevision !== undefined &&
+        expectedUiRevision !== uiStateRevisionRef.current
+      ) {
+        return;
+      }
       setPayload(snapshot);
       setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
     } catch (refreshError) {
-      setPayload(EMPTY_PAYLOAD);
+      if (
+        expectedUiRevision !== undefined &&
+        expectedUiRevision !== uiStateRevisionRef.current
+      ) {
+        return;
+      }
       setError(errorMessage(refreshError));
     }
   }
@@ -2086,23 +2229,59 @@ function DesktopApp() {
   };
 
   useEffect(() => {
+    let fallbackInFlight: Promise<void> | null = null;
+    const client = new UiStateClient({
+      connect: connectUiStateTransport,
+      onEnvelope: (envelope: UiStateEnvelope) => {
+        if (envelope.type === "snapshot" || envelope.type === "delta") {
+          uiStateRevisionRef.current += 1;
+          setPayload((current) =>
+            applyUiStateEnvelopeToDashboard(current, envelope),
+          );
+          if (
+            envelope.type === "snapshot" ||
+            (isRecord(envelope.payload.change) &&
+              envelope.payload.change.type === "topology")
+          ) {
+            setError(null);
+          }
+        }
+      },
+      onStatus: (status: { state?: string }) => {
+        if (status.state !== "fallback_poll") {
+          return undefined;
+        }
+        if (!fallbackInFlight) {
+          const expectedUiRevision = uiStateRevisionRef.current;
+          fallbackInFlight = refreshDashboard(expectedUiRevision).finally(
+            () => {
+              fallbackInFlight = null;
+            },
+          );
+        }
+        return fallbackInFlight;
+      },
+    });
+
+    void client.start();
+    return () => {
+      void client.stop();
+    };
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
-    refreshDashboard().finally(() => {
+    const expectedUiRevision = uiStateRevisionRef.current;
+    refreshDashboard(expectedUiRevision).finally(() => {
       if (!cancelled) {
         void refreshLocalControls();
         void refreshMobileAccess();
       }
     });
     refreshHardwareAssets();
-    const dashboardTimer = window.setInterval(() => {
-      refreshDashboard();
-      refreshMobileAccess();
-      setRefreshTick((value) => value + 1);
-    }, POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;
-      window.clearInterval(dashboardTimer);
     };
   }, []);
 

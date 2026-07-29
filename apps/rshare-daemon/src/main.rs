@@ -8,7 +8,7 @@ mod mobile_gateway;
 
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
-use futures_util::{future::BoxFuture, SinkExt};
+use futures_util::future::BoxFuture;
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
     local_capability_snapshots, remote_capability_snapshots, AudioFormat, BackendFailureReason,
@@ -49,6 +49,9 @@ use rshare_daemon::ipc_server::{
     ui_state_subscriber_for_request, write_json_response,
 };
 use rshare_daemon::state_aggregator::{StateAggregator, StateAggregatorHandle, UiProjectionSource};
+use rshare_daemon::ui_state_server::{
+    run_ui_state_server, LocalControlsFeed, LocalControlsSnapshotFuture,
+};
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
@@ -79,7 +82,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
 #[derive(Clone)]
 struct TrackedDevice {
@@ -6677,10 +6679,20 @@ async fn main() -> Result<()> {
         layout_path.clone(),
         shutdown_tx.clone(),
     ));
-    let local_controls_ws_task = tokio::spawn(run_local_controls_ws_server(
-        state.clone(),
-        ui_state.clone(),
+    let local_controls_snapshot_state = state.clone();
+    let local_controls_snapshot_ui_state = ui_state.clone();
+    let local_controls_feed = LocalControlsFeed::new(
+        Arc::new(move || -> LocalControlsSnapshotFuture {
+            let state = local_controls_snapshot_state.clone();
+            let ui_state = local_controls_snapshot_ui_state.clone();
+            Box::pin(async move { local_controls_fallback_snapshot(&state, &ui_state).await })
+        }),
         local_events_tx.clone(),
+    );
+    let ui_state_ws_task = tokio::spawn(run_ui_state_server(
+        default_local_controls_ws_addr(),
+        ui_state.clone(),
+        local_controls_feed,
         shutdown_tx.subscribe(),
     ));
     let (mobile_gateway_enabled, mobile_access) = {
@@ -7047,8 +7059,8 @@ async fn main() -> Result<()> {
             tracing::info!("IPC task completed");
             flatten_daemon_task_result(result)
         }
-        result = local_controls_ws_task => {
-            tracing::info!("Local controls websocket task completed");
+        result = ui_state_ws_task => {
+            tracing::info!("UI state websocket task completed");
             flatten_daemon_task_result(result)
         }
         result = &mut mobile_gateway_task => {
@@ -7154,62 +7166,6 @@ async fn run_ipc_server(
                 tracing::debug!("IPC client error: {}", err);
             }
         });
-    }
-}
-
-async fn run_local_controls_ws_server(
-    state: Arc<RwLock<DaemonState>>,
-    ui_state: StateAggregatorHandle,
-    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> Result<()> {
-    let listener = TcpListener::bind(default_local_controls_ws_addr()).await?;
-    tracing::info!(
-        "Local controls websocket listening on {}",
-        default_local_controls_ws_addr()
-    );
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, _) = result?;
-                let state = state.clone();
-                let ui_state = ui_state.clone();
-                let local_events_tx = local_events_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_local_controls_ws_client(stream, state, ui_state, local_events_tx).await {
-                        tracing::debug!("Local controls websocket client error: {}", error);
-                    }
-                });
-            }
-            _ = shutdown_rx.recv() => break,
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_local_controls_ws_client(
-    stream: TcpStream,
-    state: Arc<RwLock<DaemonState>>,
-    ui_state: StateAggregatorHandle,
-    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
-) -> Result<()> {
-    let mut websocket = accept_async(stream).await?;
-    let response =
-        DaemonResponse::LocalControls(local_controls_fallback_snapshot(&state, &ui_state).await?);
-    websocket
-        .send(WsMessage::Text(serde_json::to_string(&response)?))
-        .await?;
-
-    let mut events = local_events_tx.subscribe();
-    loop {
-        let event = events.recv().await?;
-        websocket
-            .send(WsMessage::Text(serde_json::to_string(
-                &DaemonResponse::LocalControlEvent(event),
-            )?))
-            .await?;
     }
 }
 

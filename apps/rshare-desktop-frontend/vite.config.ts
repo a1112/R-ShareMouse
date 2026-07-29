@@ -374,6 +374,13 @@ export default defineConfig({
   server: {
     port: 5176,
     strictPort: true,
+    proxy: {
+      '/ui-state': {
+        target: 'ws://127.0.0.1:27436',
+        ws: true,
+        changeOrigin: false,
+      },
+    },
   },
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
