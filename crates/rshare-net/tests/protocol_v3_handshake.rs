@@ -6,6 +6,7 @@ use rshare_core::{
     ScreenInfo, DISCOVERY_APP_ID, PROTOCOL_VERSION,
 };
 use rshare_net::{
+    codec::MessageCodec,
     connection::{ConnectionManager, ManagerEvent},
     encryption::{Encryption, QuicIdentity},
     handshake::{is_bootstrap_message, BOOTSTRAP_MAX_MESSAGE_SIZE},
@@ -226,5 +227,18 @@ async fn bootstrap_is_bounded_and_has_a_closed_allowlist() {
         device_id: Uuid::new_v4(),
         reason: HandshakeRejectReason::IdentityUnavailable,
     }));
-    assert!(!is_bootstrap_message(&Message::MouseMove { x: 1, y: 2 }));
+    assert!(!is_bootstrap_message(&Message::Heartbeat {
+        sequence: 1,
+        timestamp: 2,
+    }));
+}
+
+#[test]
+fn legacy_peer_input_is_rejected() {
+    let legacy_mouse_move = br#"{"MouseMove":{"x":1,"y":2}}"#;
+
+    assert!(
+        MessageCodec::decode_raw(legacy_mouse_move).is_err(),
+        "legacy peer-input JSON must not decode as a control message"
+    );
 }

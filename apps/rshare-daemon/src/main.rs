@@ -9,37 +9,43 @@ mod mobile_gateway;
 use anyhow::Result;
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::SinkExt;
+#[cfg(test)]
+use rshare_core::Direction;
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
     local_capability_snapshots, read_json_line, remote_capability_snapshots, write_json_line,
     AudioFormat, BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
     CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine, Config,
     ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
-    DeviceCapabilitySnapshot, DeviceId, Direction, DisplayCaptureResult, DisplayIdentifyResult,
-    DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
+    DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult, DisplayIdentifyResult, DisplayNode,
+    DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
     EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
     EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    FeatureConfig, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph, LayoutNode,
-    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
-    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDisplayCreateRequest,
-    VirtualDisplayOperationResult, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot, VirtualDisplayStatus,
+    FeatureConfig, InputRouter, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph,
+    LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult,
+    LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
+    LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource,
+    LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
+    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
+    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
+    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
+    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    VirtualDesktopGeometry, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
+use rshare_daemon::input_runtime::{
+    dispatch_system_safety_event, run_authenticated_input_peers, InputRuntime,
+};
+use rshare_daemon::input_state::{input_state_channel, ControlMetrics};
 use rshare_input::{
-    BackendCandidate, BackendSelector, CaptureBackend, GamepadListenerConfig, GilrsGamepadListener,
-    IngressEvent, InjectBackend, InputEvent, PortableCaptureBackend, PortableInjectBackend,
-    SemanticInputConsumer,
+    BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
+    CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
+    InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle, PointerSample,
+    PortableCaptureBackend, PortableInjectBackend, SemanticInputIngress, SemanticInputProducer,
 };
 
-#[cfg(any(windows, target_os = "linux"))]
-use rshare_input::InputEventChannel;
 #[cfg(not(windows))]
 use rshare_input::RDevInputListener;
 #[cfg(windows)]
@@ -3046,596 +3052,6 @@ fn sync_local_shortcut_suppression(state: &DaemonState) {
     set_local_shortcut_suppression(should_suppress);
 }
 
-#[derive(Debug, Clone)]
-struct InputRoutingState {
-    remote_target: Option<DeviceId>,
-    screen_width: u32,
-    screen_height: u32,
-    edge_threshold: u32,
-    modifiers: ActiveModifiers,
-    pending_return_edge: Option<Direction>,
-}
-
-impl InputRoutingState {
-    fn new(screen_width: u32, screen_height: u32, edge_threshold: u32) -> Self {
-        Self {
-            remote_target: None,
-            screen_width: screen_width.max(1),
-            screen_height: screen_height.max(1),
-            edge_threshold: edge_threshold.max(1),
-            modifiers: ActiveModifiers::default(),
-            pending_return_edge: None,
-        }
-    }
-
-    fn default_with_threshold(edge_threshold: u32) -> Self {
-        Self::new(1920, 1080, edge_threshold)
-    }
-
-    #[cfg(test)]
-    fn for_test(screen_width: u32, screen_height: u32, edge_threshold: u32) -> Self {
-        Self::new(screen_width, screen_height, edge_threshold)
-    }
-
-    #[cfg(test)]
-    fn remote_target(&self) -> Option<DeviceId> {
-        self.remote_target
-    }
-
-    fn clear_remote_target(&mut self) {
-        self.remote_target = None;
-    }
-
-    fn set_remote_target(&mut self, target: DeviceId) {
-        self.remote_target = Some(target);
-    }
-
-    fn schedule_return_to_local(&mut self, return_edge: Direction) {
-        self.pending_return_edge = Some(return_edge);
-    }
-
-    fn take_pending_return_edge(&mut self) -> Option<Direction> {
-        self.pending_return_edge.take()
-    }
-
-    fn update_modifier_state(&mut self, event: &InputEvent) -> ActiveModifiers {
-        match event {
-            InputEvent::Key { keycode, state } => {
-                self.modifiers.update_key(*keycode, state.is_pressed());
-            }
-            InputEvent::KeyExtended {
-                keycode,
-                state,
-                shift,
-                ctrl,
-                alt,
-                meta,
-            } => {
-                self.modifiers = ActiveModifiers {
-                    shift: *shift,
-                    ctrl: *ctrl,
-                    alt: *alt,
-                    meta: *meta,
-                    ..ActiveModifiers::default()
-                };
-                self.modifiers.update_key(*keycode, state.is_pressed());
-            }
-            _ => {}
-        }
-
-        self.modifiers
-    }
-
-    fn hit_edges(&self, event: &InputEvent) -> Vec<Direction> {
-        let InputEvent::MouseMove { x, y } = event else {
-            return Vec::new();
-        };
-
-        let mut edges = Vec::with_capacity(4);
-        let right_edge_start = self.screen_width.saturating_sub(self.edge_threshold) as i32;
-        let bottom_edge_start = self.screen_height.saturating_sub(self.edge_threshold) as i32;
-
-        if *x <= self.edge_threshold as i32 && self.is_vertical_screen_coordinate(*y) {
-            edges.push(Direction::Left);
-        }
-        if *x >= right_edge_start && self.is_vertical_screen_coordinate(*y) {
-            edges.push(Direction::Right);
-        }
-        if *y <= self.edge_threshold as i32 && self.is_horizontal_screen_coordinate(*x) {
-            edges.push(Direction::Top);
-        }
-        if *y >= bottom_edge_start && self.is_horizontal_screen_coordinate(*x) {
-            edges.push(Direction::Bottom);
-        }
-
-        edges
-    }
-
-    fn is_vertical_screen_coordinate(&self, y: i32) -> bool {
-        y >= 0 && y < self.screen_height as i32
-    }
-
-    fn is_horizontal_screen_coordinate(&self, x: i32) -> bool {
-        x >= 0 && x < self.screen_width as i32
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActiveModifiers {
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-    meta: bool,
-    shift_key: u32,
-    ctrl_key: u32,
-    alt_key: u32,
-    meta_key: u32,
-}
-
-impl Default for ActiveModifiers {
-    fn default() -> Self {
-        Self {
-            shift: false,
-            ctrl: false,
-            alt: false,
-            meta: false,
-            shift_key: 0x10,
-            ctrl_key: 0x11,
-            alt_key: 0x12,
-            meta_key: 0x5B,
-        }
-    }
-}
-
-impl ActiveModifiers {
-    fn any(self) -> bool {
-        self.shift || self.ctrl || self.alt || self.meta
-    }
-
-    fn update_key(&mut self, keycode: rshare_input::KeyCode, pressed: bool) {
-        let raw = keycode.to_raw();
-        match raw {
-            0x10 | 0xA0 | 0xA1 => {
-                self.shift = pressed;
-                if pressed {
-                    self.shift_key = raw;
-                }
-            }
-            0x11 | 0xA2 | 0xA3 => {
-                self.ctrl = pressed;
-                if pressed {
-                    self.ctrl_key = raw;
-                }
-            }
-            0x12 | 0xA4 | 0xA5 => {
-                self.alt = pressed;
-                if pressed {
-                    self.alt_key = raw;
-                }
-            }
-            0x5B | 0x5C => {
-                self.meta = pressed;
-                if pressed {
-                    self.meta_key = raw;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn release_messages(self) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(4);
-        if self.meta {
-            messages.push(key_release_message(self.meta_key));
-        }
-        if self.shift {
-            messages.push(key_release_message(self.shift_key));
-        }
-        if self.alt {
-            messages.push(key_release_message(self.alt_key));
-        }
-        if self.ctrl {
-            messages.push(key_release_message(self.ctrl_key));
-        }
-        messages
-    }
-}
-
-fn key_release_message(keycode: u32) -> Message {
-    Message::Key {
-        keycode,
-        state: rshare_core::KeyState::Released,
-    }
-}
-
-fn is_modifier_key(keycode: rshare_input::KeyCode) -> bool {
-    matches!(
-        keycode.to_raw(),
-        0x10 | 0x11 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0x5B | 0x5C
-    )
-}
-
-fn input_event_to_raw_event(
-    event: rshare_input::InputEvent,
-) -> Option<rshare_core::engine::RawInputEvent> {
-    match event {
-        rshare_input::InputEvent::MouseMove { x, y } => {
-            Some(rshare_core::engine::RawInputEvent::MouseMove { x, y })
-        }
-        rshare_input::InputEvent::MouseButton { button, state } => {
-            Some(rshare_core::engine::RawInputEvent::MouseButton {
-                button: button.to_code(),
-                pressed: state.is_pressed(),
-            })
-        }
-        rshare_input::InputEvent::MouseWheel { delta_x, delta_y } => {
-            Some(rshare_core::engine::RawInputEvent::MouseWheel { delta_x, delta_y })
-        }
-        rshare_input::InputEvent::Key { keycode, state } => {
-            Some(rshare_core::engine::RawInputEvent::Key {
-                keycode: keycode.to_raw(),
-                pressed: state.is_pressed(),
-            })
-        }
-        rshare_input::InputEvent::KeyExtended {
-            keycode,
-            state,
-            shift,
-            ctrl,
-            alt,
-            meta,
-        } => Some(rshare_core::engine::RawInputEvent::KeyExtended {
-            keycode: keycode.to_raw(),
-            pressed: state.is_pressed(),
-            shift,
-            ctrl,
-            alt,
-            meta,
-        }),
-        rshare_input::InputEvent::TextCommit { .. } => None,
-        rshare_input::InputEvent::GamepadConnected { info } => {
-            Some(rshare_core::engine::RawInputEvent::GamepadConnected { info })
-        }
-        rshare_input::InputEvent::GamepadDisconnected { gamepad_id } => {
-            Some(rshare_core::engine::RawInputEvent::GamepadDisconnected { gamepad_id })
-        }
-        rshare_input::InputEvent::GamepadButton { state_after, .. } => {
-            Some(rshare_core::engine::RawInputEvent::GamepadState { state: state_after })
-        }
-        rshare_input::InputEvent::GamepadState { state } => {
-            Some(rshare_core::engine::RawInputEvent::GamepadState { state })
-        }
-    }
-}
-
-fn input_event_to_raw_event_with_modifiers(
-    event: rshare_input::InputEvent,
-    modifiers: ActiveModifiers,
-) -> Option<rshare_core::engine::RawInputEvent> {
-    match event {
-        rshare_input::InputEvent::Key { keycode, state }
-            if modifiers.any() && !is_modifier_key(keycode) =>
-        {
-            Some(rshare_core::engine::RawInputEvent::KeyExtended {
-                keycode: keycode.to_raw(),
-                pressed: state.is_pressed(),
-                shift: modifiers.shift,
-                ctrl: modifiers.ctrl,
-                alt: modifiers.alt,
-                meta: modifiers.meta,
-            })
-        }
-        other => input_event_to_raw_event(other),
-    }
-}
-
-fn messages_for_input_event(
-    state: &mut DaemonState,
-    routing: &mut InputRoutingState,
-    forwarder: &mut rshare_core::engine::ForwardingEngine,
-    event: InputEvent,
-    gamepad_forwarding_enabled: bool,
-) -> Vec<Message> {
-    if is_gamepad_input_event(&event) && !gamepad_forwarding_enabled {
-        return Vec::new();
-    }
-
-    let active_modifiers = routing.update_modifier_state(&event);
-
-    // Get connected peers set
-    let connected_peers: std::collections::HashSet<_> = state
-        .devices
-        .values()
-        .filter(|device| device.connected)
-        .map(|device| device.id)
-        .collect();
-    let local_id = state.status.device_id;
-    let edge_hits = routing.hit_edges(&event);
-    let mut activation_edge = None;
-    let mut activation_target = None;
-
-    match state.session.state() {
-        ControlSessionState::RemoteActive {
-            target,
-            entered_via,
-        } => {
-            routing.set_remote_target(target);
-            if !is_device_connected(state, target) {
-                state.session.on_target_disconnect(target);
-                routing.clear_remote_target();
-                forwarder.clear_target();
-                return Vec::new();
-            }
-
-            if is_quick_return_hotkey(&event, active_modifiers) {
-                routing.schedule_return_to_local(entered_via.opposite());
-                return active_modifiers.release_messages();
-            }
-
-            let return_edge = entered_via.opposite();
-            if edge_hits.contains(&return_edge) {
-                let _ = state.session.on_return_edge_hit(return_edge);
-                routing.clear_remote_target();
-                forwarder.clear_target();
-                return Vec::new();
-            }
-        }
-        ControlSessionState::Suspended { .. } => {
-            routing.clear_remote_target();
-            forwarder.clear_target();
-            return Vec::new();
-        }
-        _ => {
-            routing.clear_remote_target();
-            if let Some((edge, target)) = edge_hits.iter().find_map(|edge| {
-                state
-                    .layout
-                    .resolve_target(local_id, *edge, &connected_peers)
-                    .map(|target| (*edge, target))
-            }) {
-                if state.session.on_edge_hit(edge, Some(target)).is_ok() {
-                    routing.set_remote_target(target);
-                    activation_edge = Some(edge);
-                    activation_target = Some(target);
-                } else {
-                    forwarder.clear_target();
-                    return Vec::new();
-                }
-            } else {
-                forwarder.clear_target();
-                return Vec::new();
-            }
-        }
-    }
-
-    let target = if let Some(remote_target) = state.session.active_target() {
-        if !is_device_connected(state, remote_target) {
-            state.session.on_target_disconnect(remote_target);
-            routing.clear_remote_target();
-            forwarder.clear_target();
-            return Vec::new();
-        }
-        routing.set_remote_target(remote_target);
-        remote_target
-    } else {
-        routing.clear_remote_target();
-        forwarder.clear_target();
-        return Vec::new();
-    };
-
-    let activated_on_this_event = Some(target) != forwarder.target();
-    forwarder.set_target(target);
-    let event = match (activation_edge, activation_target) {
-        (Some(edge), Some(target)) => {
-            edge_penetration_mouse_event(state, target, edge, event, routing.edge_threshold)
-        }
-        _ => event,
-    };
-    let Some(raw_event) = input_event_to_raw_event_with_modifiers(event, active_modifiers) else {
-        return Vec::new();
-    };
-
-    let mut messages = forwarder.process_event(raw_event);
-    if activated_on_this_event && messages.is_empty() {
-        messages = forwarder.flush_batch();
-    }
-    messages
-}
-
-#[derive(Debug)]
-struct CapturedInputForwardingOutcome {
-    target: Option<DeviceId>,
-    messages: Vec<Message>,
-    suppress_local_shortcuts: bool,
-}
-
-fn captured_input_forwarding_outcome(
-    state: &mut DaemonState,
-    routing: &mut InputRoutingState,
-    forwarder: &mut rshare_core::engine::ForwardingEngine,
-    event: InputEvent,
-    gamepad_forwarding_enabled: bool,
-) -> CapturedInputForwardingOutcome {
-    captured_input_forwarding_outcome_with_source(
-        state,
-        routing,
-        forwarder,
-        event,
-        LocalInputEventSource::Hardware,
-        gamepad_forwarding_enabled,
-    )
-}
-
-fn captured_input_forwarding_outcome_with_source(
-    state: &mut DaemonState,
-    routing: &mut InputRoutingState,
-    forwarder: &mut rshare_core::engine::ForwardingEngine,
-    event: InputEvent,
-    source: LocalInputEventSource,
-    gamepad_forwarding_enabled: bool,
-) -> CapturedInputForwardingOutcome {
-    if !captured_input_source_should_forward(source) {
-        return CapturedInputForwardingOutcome {
-            target: None,
-            messages: Vec::new(),
-            suppress_local_shortcuts: false,
-        };
-    }
-
-    if !state.features.automatic_input_forwarding {
-        if state.session.is_remote_active() {
-            state.session.reset();
-        }
-        routing.clear_remote_target();
-        forwarder.clear_target();
-        return CapturedInputForwardingOutcome {
-            target: None,
-            messages: Vec::new(),
-            suppress_local_shortcuts: false,
-        };
-    }
-
-    let messages =
-        messages_for_input_event(state, routing, forwarder, event, gamepad_forwarding_enabled);
-    let target = state.session.active_target();
-    let suppress_local_shortcuts = state.features.suppress_local_shortcuts_when_remote
-        && matches!(
-            state.session.state(),
-            ControlSessionState::RemoteActive { .. }
-        );
-
-    CapturedInputForwardingOutcome {
-        target,
-        messages,
-        suppress_local_shortcuts,
-    }
-}
-
-fn captured_input_source_should_forward(source: LocalInputEventSource) -> bool {
-    matches!(source, LocalInputEventSource::Hardware)
-}
-
-fn is_quick_return_hotkey(event: &InputEvent, modifiers: ActiveModifiers) -> bool {
-    let (keycode, state) = match event {
-        InputEvent::Key { keycode, state } | InputEvent::KeyExtended { keycode, state, .. } => {
-            (*keycode, *state)
-        }
-        _ => return false,
-    };
-
-    if !state.is_pressed() || !modifiers.ctrl || !modifiers.alt {
-        return false;
-    }
-
-    matches!(keycode.to_raw(), 0x4C | 0x08 | 0x1B)
-}
-
-fn edge_penetration_mouse_event(
-    state: &DaemonState,
-    target: DeviceId,
-    edge: Direction,
-    event: InputEvent,
-    edge_threshold: u32,
-) -> InputEvent {
-    let (x, y) = match event {
-        InputEvent::MouseMove { x, y } => (x, y),
-        other => return other,
-    };
-
-    let (target_width, target_height) = target_primary_display_size(state, target).unwrap_or((
-        state.local_controls.display.primary_width,
-        state.local_controls.display.primary_height,
-    ));
-    let margin = edge_threshold.max(1) as i32;
-    let max_x = target_width.saturating_sub(1) as i32;
-    let max_y = target_height.saturating_sub(1) as i32;
-
-    let (mapped_x, mapped_y) = match edge {
-        Direction::Right => (margin.min(max_x), y.clamp(0, max_y)),
-        Direction::Left => ((max_x - margin).max(0), y.clamp(0, max_y)),
-        Direction::Top => (x.clamp(0, max_x), (max_y - margin).max(0)),
-        Direction::Bottom => (x.clamp(0, max_x), margin.min(max_y)),
-    };
-
-    InputEvent::mouse_move(mapped_x, mapped_y)
-}
-
-fn target_primary_display_size(state: &DaemonState, target: DeviceId) -> Option<(u32, u32)> {
-    state
-        .layout
-        .get_node(target)?
-        .primary_display()
-        .map(|display| (display.width.max(1), display.height.max(1)))
-}
-
-fn is_gamepad_input_event(event: &InputEvent) -> bool {
-    matches!(
-        event,
-        InputEvent::GamepadConnected { .. }
-            | InputEvent::GamepadDisconnected { .. }
-            | InputEvent::GamepadButton { .. }
-            | InputEvent::GamepadState { .. }
-    )
-}
-
-fn message_to_input_event(message: Message) -> Option<InputEvent> {
-    match message {
-        Message::MouseMove { x, y } => Some(InputEvent::mouse_move(x, y)),
-        Message::MouseButton { button, state } => Some(InputEvent::mouse_button(
-            rshare_input::MouseButton::from_code(button.to_code()),
-            input_button_state(state),
-        )),
-        Message::MouseWheel { delta_x, delta_y } => Some(InputEvent::mouse_wheel(delta_x, delta_y)),
-        Message::Key { keycode, state } => Some(InputEvent::key(
-            input_keycode_from_message(keycode),
-            input_key_state(state),
-        )),
-        Message::KeyExtended {
-            keycode,
-            state,
-            shift,
-            ctrl,
-            alt,
-            meta,
-        } => Some(InputEvent::key_extended(
-            input_keycode_from_message(keycode),
-            input_key_state(state),
-            shift,
-            ctrl,
-            alt,
-            meta,
-        )),
-        Message::GamepadConnected { info } => Some(InputEvent::gamepad_connected(info)),
-        Message::GamepadDisconnected { gamepad_id } => {
-            Some(InputEvent::gamepad_disconnected(gamepad_id))
-        }
-        Message::GamepadState { state } => Some(InputEvent::gamepad_state(state)),
-        _ => None,
-    }
-}
-
-fn input_keycode_from_message(keycode: u32) -> rshare_input::KeyCode {
-    if keycode == rshare_input::RSHARE_KEYPAD_ENTER_RAW {
-        rshare_input::KeyCode::KeypadEnter
-    } else {
-        rshare_input::KeyCode::Raw(keycode)
-    }
-}
-
-fn input_button_state(state: rshare_core::ButtonState) -> rshare_input::ButtonState {
-    match state {
-        rshare_core::ButtonState::Pressed => rshare_input::ButtonState::Pressed,
-        rshare_core::ButtonState::Released => rshare_input::ButtonState::Released,
-    }
-}
-
-fn input_key_state(state: rshare_core::KeyState) -> rshare_input::ButtonState {
-    match state {
-        rshare_core::KeyState::Pressed => rshare_input::ButtonState::Pressed,
-        rshare_core::KeyState::Released => rshare_input::ButtonState::Released,
-    }
-}
-
 fn create_inject_backend(mode: Option<ResolvedInputMode>) -> Result<Box<dyn InjectBackend>> {
     #[cfg(not(target_os = "windows"))]
     let _ = mode;
@@ -3736,49 +3152,6 @@ fn build_inject_backend(
                 Some(error),
             )
         }
-    }
-}
-
-async fn inject_remote_message(
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
-    state: &Arc<RwLock<DaemonState>>,
-    from: DeviceId,
-    message: Message,
-) {
-    let Some(event) = message_to_input_event(message) else {
-        return;
-    };
-    let loopback_device_kind = injected_input_loopback_device_kind(&event);
-
-    let result = {
-        let mut backend = inject_backend.lock().await;
-        backend.inject(event)
-    };
-
-    match result {
-        Ok(()) => {
-            if let Some(device_kind) = loopback_device_kind {
-                state
-                    .write()
-                    .await
-                    .arm_injected_loopback(device_kind, timestamp_ms_now());
-            }
-        }
-        Err(error) => {
-            tracing::warn!("Failed to inject input from {}: {}", from, error);
-        }
-    }
-}
-
-fn injected_input_loopback_device_kind(event: &InputEvent) -> Option<LocalInputDeviceKind> {
-    match event {
-        InputEvent::Key { .. } | InputEvent::KeyExtended { .. } | InputEvent::TextCommit { .. } => {
-            Some(LocalInputDeviceKind::Keyboard)
-        }
-        InputEvent::MouseMove { .. }
-        | InputEvent::MouseButton { .. }
-        | InputEvent::MouseWheel { .. } => Some(LocalInputDeviceKind::Mouse),
-        _ => None,
     }
 }
 
@@ -3969,54 +3342,58 @@ fn parse_key_code(value: &str) -> Result<rshare_input::KeyCode> {
 }
 
 async fn run_local_input_test(
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     test: LocalInputTestRequest,
 ) -> LocalInputTestResult {
     let mut diagnostic_payload = BTreeMap::new();
+    if !inject_backend.backend_snapshot().active {
+        return LocalInputTestResult::failed(
+            LocalInputTestStatus::BackendUnavailable,
+            "Input injection backend is not active.",
+        );
+    }
     let result = match test.kind {
         LocalInputTestKind::KeyboardShift => {
-            let mut backend = inject_backend.lock().await;
-            if !backend.is_active() {
-                return LocalInputTestResult::failed(
-                    LocalInputTestStatus::BackendUnavailable,
-                    "Input injection backend is not active.",
-                );
-            }
-            backend
-                .inject(InputEvent::key(
+            match inject_backend
+                .inject_trusted_local(InputEvent::key(
                     rshare_input::KeyCode::ShiftLeft,
                     rshare_input::ButtonState::Pressed,
                 ))
-                .and_then(|_| {
-                    backend.inject(InputEvent::key(
+                .await
+            {
+                Ok(()) => inject_backend
+                    .inject_trusted_local(InputEvent::key(
                         rshare_input::KeyCode::ShiftLeft,
                         rshare_input::ButtonState::Released,
                     ))
-                })
+                    .await
+                    .map_err(anyhow::Error::new),
+                Err(error) => Err(anyhow::Error::new(error)),
+            }
         }
         LocalInputTestKind::MouseMove => {
             let (x, y) = {
                 let state = state.read().await;
                 (state.local_controls.mouse.x, state.local_controls.mouse.y)
             };
-            let mut backend = inject_backend.lock().await;
-            if !backend.is_active() {
-                return LocalInputTestResult::failed(
-                    LocalInputTestStatus::BackendUnavailable,
-                    "Input injection backend is not active.",
-                );
-            }
             let ((first_x, first_y), (second_x, second_y)) =
                 ((x.saturating_add(8), y.saturating_add(8)), (x, y));
             diagnostic_payload.insert("x".to_string(), first_x.to_string());
             diagnostic_payload.insert("y".to_string(), first_y.to_string());
             diagnostic_payload.insert("return_x".to_string(), second_x.to_string());
             diagnostic_payload.insert("return_y".to_string(), second_y.to_string());
-            backend
-                .inject(InputEvent::mouse_move(first_x, first_y))
-                .and_then(|_| backend.inject(InputEvent::mouse_move(second_x, second_y)))
+            match inject_backend
+                .inject_trusted_local(InputEvent::mouse_move(first_x, first_y))
+                .await
+            {
+                Ok(()) => inject_backend
+                    .inject_trusted_local(InputEvent::mouse_move(second_x, second_y))
+                    .await
+                    .map_err(anyhow::Error::new),
+                Err(error) => Err(anyhow::Error::new(error)),
+            }
         }
         LocalInputTestKind::VirtualGamepadStatus => {
             return LocalInputTestResult::failed(
@@ -4611,7 +3988,7 @@ async fn start_endpoint_switch_latency_probe(
 async fn handle_network_message(
     state: &Arc<RwLock<DaemonState>>,
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     audio_runtime: &audio_runtime::AudioRuntimeHandle,
     usb_runtime: &UsbHostRuntime,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
@@ -5420,9 +4797,11 @@ async fn handle_network_message(
                 flow.max_in_flight_transfers
             );
         }
-        other => {
-            inject_remote_message(inject_backend, state, from, other).await;
-        }
+        other => tracing::debug!(
+            "Ignoring unsupported control-plane message from {}: {:?}",
+            from,
+            other
+        ),
     }
 }
 
@@ -6193,121 +5572,37 @@ async fn run_audio_test(state: &Arc<RwLock<DaemonState>>) -> LocalAudioTestResul
     }
 }
 
-async fn send_forwarded_messages(
-    network_manager: &Arc<Mutex<NetworkManager>>,
-    target: DeviceId,
-    messages: Vec<Message>,
+async fn apply_legacy_input_projection(
+    state: &Arc<RwLock<DaemonState>>,
+    projection: &rshare_daemon::input_state::InputReliableUiProjection,
 ) {
-    for message in messages {
-        let result = {
-            let mut manager = network_manager.lock().await;
-            manager.send_to(&target, message).await
-        };
-
-        if let Err(error) = result {
-            tracing::warn!("Failed to forward input to {}: {}", target, error);
+    let mut state = state.write().await;
+    state.local_controls.keyboard.pressed_keys = projection
+        .discrete
+        .pressed_keys
+        .iter()
+        .map(|keycode| format!("{:?}", rshare_input::KeyCode::Raw(*keycode)))
+        .collect();
+    state.local_controls.mouse.pressed_buttons = projection
+        .discrete
+        .pressed_buttons
+        .iter()
+        .map(|button| format!("{button:?}"))
+        .collect();
+    match &projection.session {
+        ControlSessionState::RemoteActive {
+            target,
+            entered_via,
+        } => {
+            state.session.reset();
+            let _ = state.session.on_edge_hit(*entered_via, Some(*target));
         }
+        ControlSessionState::Suspended { .. } => state.session.on_backend_degraded(),
+        ControlSessionState::LocalReady
+        | ControlSessionState::TransitioningToRemote { .. }
+        | ControlSessionState::ReturningLocal { .. } => state.session.reset(),
     }
-}
-
-async fn run_input_forwarding_loop(
-    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<CapturedInputEvent>,
-    state: Arc<RwLock<DaemonState>>,
-    network_manager: Arc<Mutex<NetworkManager>>,
-    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-    edge_threshold: u32,
-    gamepad_forwarding_enabled: bool,
-) -> Result<()> {
-    let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-    let mut routing = InputRoutingState::default_with_threshold(edge_threshold);
-    let mut flush_interval = tokio::time::interval(Duration::from_millis(2));
-
-    loop {
-        tokio::select! {
-            captured = input_rx.recv() => {
-                let Some(captured) = captured else {
-                    break;
-                };
-                let event = captured.event;
-                let metadata = captured.metadata;
-
-                let (target, messages, diagnostic, suppress_local_shortcuts) = {
-                    let mut state = state.write().await;
-                    let local_event =
-                        state.record_local_input_event_with_metadata(&event, metadata.as_ref());
-                    let source = local_event.source;
-                    let diagnostic = (state.status.device_id, local_event.clone());
-                    let _ = local_events_tx.send(local_event);
-                    let outcome = captured_input_forwarding_outcome_with_source(
-                        &mut state,
-                        &mut routing,
-                        &mut forwarder,
-                        event,
-                        source,
-                        gamepad_forwarding_enabled,
-                    );
-                    (
-                        outcome.target,
-                        outcome.messages,
-                        diagnostic,
-                        outcome.suppress_local_shortcuts,
-                    )
-                };
-                set_local_shortcut_suppression(suppress_local_shortcuts);
-
-                broadcast_diagnostic_event(&network_manager, diagnostic.0, diagnostic.1).await;
-
-                if let Some(target) = target {
-                    send_forwarded_messages(&network_manager, target, messages).await;
-                }
-                if let Some(return_edge) = routing.take_pending_return_edge() {
-                    let mut state = state.write().await;
-                    let _ = state.session.on_return_edge_hit(return_edge);
-                    routing.clear_remote_target();
-                    forwarder.clear_target();
-                    set_local_shortcut_suppression(false);
-                }
-            }
-            _ = flush_interval.tick() => {
-                if !forwarder.should_flush_batch() {
-                    continue;
-                }
-
-                let target = {
-                    let mut state = state.write().await;
-                    if !state.features.automatic_input_forwarding {
-                        if state.session.is_remote_active() {
-                            state.session.reset();
-                        }
-                        None
-                    } else {
-                        state
-                            .session
-                            .active_target()
-                            .filter(|target| is_device_connected(&state, *target))
-                    }
-                };
-
-                let Some(target) = target else {
-                    set_local_shortcut_suppression(false);
-                    routing.clear_remote_target();
-                    forwarder.clear_target();
-                    continue;
-                };
-
-                forwarder.set_target(target);
-                let messages = forwarder.flush_batch();
-                send_forwarded_messages(&network_manager, target, messages).await;
-            }
-            _ = shutdown_rx.recv() => {
-                break;
-            }
-        }
-    }
-
-    set_local_shortcut_suppression(false);
-    Ok(())
+    sync_local_shortcut_suppression(&state);
 }
 
 #[cfg(windows)]
@@ -6433,117 +5728,172 @@ fn resolve_windows_driver_local_source(
 }
 
 #[cfg(windows)]
-async fn run_windows_driver_capture_loop(
-    state: Arc<RwLock<DaemonState>>,
-    network_manager: Arc<Mutex<NetworkManager>>,
-    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-    edge_threshold: u32,
-) -> Result<()> {
-    let (driver_tx, mut driver_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rshare_platform::windows::WindowsDriverInputEvent>();
-
-    tokio::task::spawn_blocking(move || {
-        let client = match rshare_platform::windows::WindowsDriverClient::open() {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::info!(
-                    "RShare Windows driver unavailable, using fallback input path: {error}"
-                );
-                return;
-            }
+fn publish_windows_driver_event(
+    producer: &SemanticInputProducer,
+    driver_event: rshare_platform::windows::WindowsDriverInputEvent,
+) {
+    use rshare_platform::windows::{WindowsDriverDeviceKind, WindowsDriverEventKind};
+    const MOUSE_MOVE_ABSOLUTE: u32 = 0x0001;
+    let payload = if driver_event.device_kind == WindowsDriverDeviceKind::Mouse
+        && driver_event.event_kind == WindowsDriverEventKind::MouseMove
+        && driver_event.flags & MOUSE_MOVE_ABSOLUTE == 0
+    {
+        CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+            dx: driver_event.value0,
+            dy: driver_event.value1,
+            observed_x: None,
+            observed_y: None,
+        }))
+    } else {
+        let Some(event) = input_event_from_windows_driver_event(&driver_event) else {
+            return;
         };
+        CapturedInputPayload::from_input_event(event)
+    };
+    let origin = CaptureOrigin {
+        source: CaptureSource::WindowsFilter,
+        device_token: driver_event.device_id.parse().unwrap_or(0),
+        instance_token: 0,
+    };
+    let _ = producer.try_push(producer.capture(origin, payload));
+}
 
-        loop {
-            match client.read_event() {
-                Ok(event) => {
-                    if driver_tx.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    if rshare_platform::windows::is_driver_event_queue_empty(&error) {
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                        continue;
-                    }
-                    tracing::warn!("RShare Windows driver event read failed: {error}");
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsDriverCapture {
+    running: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+enum WindowsCaptureSelection<Driver, Hook> {
+    Filter(Driver),
+    Hook {
+        listener: Hook,
+        filter_error: Option<String>,
+    },
+}
+
+#[cfg(windows)]
+fn start_windows_capture_with_fallback<Driver, Hook, StartDriver, StartHook>(
+    use_filter: bool,
+    start_driver: StartDriver,
+    start_hook: StartHook,
+) -> Result<WindowsCaptureSelection<Driver, Hook>>
+where
+    StartDriver: FnOnce() -> Result<Driver>,
+    StartHook: FnOnce() -> Result<Hook>,
+{
+    if use_filter {
+        match start_driver() {
+            Ok(driver) => return Ok(WindowsCaptureSelection::Filter(driver)),
+            Err(error) => {
+                let filter_error = error.to_string();
+                let listener = start_hook()?;
+                return Ok(WindowsCaptureSelection::Hook {
+                    listener,
+                    filter_error: Some(filter_error),
+                });
             }
         }
-    });
+    }
+    Ok(WindowsCaptureSelection::Hook {
+        listener: start_hook()?,
+        filter_error: None,
+    })
+}
 
-    let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-    let mut routing = InputRoutingState::default_with_threshold(edge_threshold);
+#[cfg(windows)]
+impl WindowsDriverCapture {
+    fn start(producer: SemanticInputProducer) -> Result<Self> {
+        Self::start_with_opener(
+            producer,
+            rshare_platform::windows::WindowsDriverClient::open,
+        )
+    }
 
-    loop {
-        tokio::select! {
-            event = driver_rx.recv() => {
-                let Some(driver_event) = event else {
-                    break;
+    fn start_with_opener<Open>(producer: SemanticInputProducer, open: Open) -> Result<Self>
+    where
+        Open: FnOnce() -> Result<rshare_platform::windows::WindowsDriverClient> + Send + 'static,
+    {
+        Self::start_with_opener_timeout(producer, Duration::from_secs(2), open)
+    }
+
+    fn start_with_opener_timeout<Open>(
+        producer: SemanticInputProducer,
+        startup_timeout: Duration,
+        open: Open,
+    ) -> Result<Self>
+    where
+        Open: FnOnce() -> Result<rshare_platform::windows::WindowsDriverClient> + Send + 'static,
+    {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_running = running.clone();
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("rshare-windows-filter-capture".to_owned())
+            .spawn(move || {
+                let client = match open() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error.to_string()));
+                        return;
+                    }
                 };
-
-                let (target, messages, diagnostic, suppress_local_shortcuts) = {
-                    let mut state = state.write().await;
-                    let Some(input_event) = input_event_from_windows_driver_event_with_pointer(
-                        &driver_event,
-                        state.local_controls.mouse.x,
-                        state.local_controls.mouse.y,
-                        &state.local_controls.display,
-                    ) else {
-                        continue;
-                    };
-                    let mut local_event =
-                        state.record_local_input_event_with_metadata(&input_event, None);
-                    local_event.device_id = Some(driver_event.device_id.clone());
-                    local_event.device_instance_id = Some(driver_event.device_instance_id.clone());
-                    local_event.capture_path = Some("rshare-filter".to_string());
-                    local_event.source = resolve_windows_driver_local_source(
-                        local_event.source,
-                        local_source_from_windows_driver_event(driver_event.source),
-                    );
-                    let source = local_event.source;
-                    local_event.payload.insert("driver_flags".to_string(), driver_event.flags.to_string());
-                    update_driver_device_from_event(&mut state.local_controls, &driver_event, local_event.timestamp_ms);
-                    replace_recent_local_event(&mut state.local_controls, local_event.clone());
-                    let diagnostic = (state.status.device_id, local_event.clone());
-                    let _ = local_events_tx.send(local_event);
-                    let outcome = captured_input_forwarding_outcome_with_source(
-                        &mut state,
-                        &mut routing,
-                        &mut forwarder,
-                        input_event,
-                        source,
-                        true,
-                    );
-                    (
-                        outcome.target,
-                        outcome.messages,
-                        diagnostic,
-                        outcome.suppress_local_shortcuts,
-                    )
-                };
-                set_local_shortcut_suppression(suppress_local_shortcuts);
-
-                broadcast_diagnostic_event(&network_manager, diagnostic.0, diagnostic.1).await;
-
-                if let Some(target) = target {
-                    send_forwarded_messages(&network_manager, target, messages).await;
+                if startup_tx.send(Ok(())).is_err() {
+                    return;
                 }
-                if let Some(return_edge) = routing.take_pending_return_edge() {
-                    let mut state = state.write().await;
-                    let _ = state.session.on_return_edge_hit(return_edge);
-                    routing.clear_remote_target();
-                    forwarder.clear_target();
-                    set_local_shortcut_suppression(false);
+                while worker_running.load(std::sync::atomic::Ordering::Acquire) {
+                    match client.read_event() {
+                        Ok(event) => publish_windows_driver_event(&producer, event),
+                        Err(error)
+                            if rshare_platform::windows::is_driver_event_queue_empty(&error) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => {
+                            tracing::warn!("RShare Windows driver event read failed: {error}");
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                    }
                 }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to spawn Windows filter capture: {error}"))?;
+        match startup_rx.recv_timeout(startup_timeout) {
+            Ok(Ok(())) => Ok(Self {
+                running,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(anyhow::anyhow!(
+                    "failed to open Windows filter capture: {error}"
+                ))
             }
-            _ = shutdown_rx.recv() => break,
+            Err(error) => {
+                running.store(false, std::sync::atomic::Ordering::Release);
+                drop(thread);
+                Err(anyhow::anyhow!(
+                    "Windows filter capture startup handshake failed: {error}"
+                ))
+            }
         }
     }
 
-    set_local_shortcut_suppression(false);
-    Ok(())
+    fn stop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsDriverCapture {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 fn get_log_file_path() -> PathBuf {
@@ -6631,9 +5981,7 @@ fn check_evdev_devices_available() -> BackendHealth {
 /// Try to start Evdev capture backend for kernel-level input capture on Linux.
 /// Returns Ok(task handle) if Evdev capture is available and started successfully.
 #[cfg(target_os = "linux")]
-fn try_start_evdev_capture(
-    tx: tokio::sync::mpsc::UnboundedSender<CapturedInputEvent>,
-) -> Result<tokio::task::JoinHandle<()>> {
+fn try_start_evdev_capture(producer: SemanticInputProducer) -> Result<tokio::task::JoinHandle<()>> {
     use rshare_platform::EvdevDriverEvent;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -6659,13 +6007,18 @@ fn try_start_evdev_capture(
             // Log the raw evdev event for debugging
             tracing::debug!("Evdev event: {:?}", evdev_event);
 
-            let Some(input_event) = captured_input_from_evdev_driver_event(evdev_event) else {
+            let Some(input_event) = input_event_from_evdev_driver_event(evdev_event) else {
                 return;
             };
-
-            if tx.send(input_event).is_err() {
-                tracing::warn!("Failed to send input event through channel");
-            }
+            let captured = producer.capture(
+                CaptureOrigin {
+                    source: CaptureSource::Evdev,
+                    device_token: 0,
+                    instance_token: 0,
+                },
+                CapturedInputPayload::from_input_event(input_event),
+            );
+            let _ = producer.try_push(captured);
         };
 
         // Start the listener
@@ -6700,13 +6053,13 @@ fn try_start_evdev_capture(
 }
 
 #[cfg(target_os = "linux")]
-fn captured_input_from_evdev_driver_event(
+fn input_event_from_evdev_driver_event(
     event: rshare_platform::EvdevDriverEvent,
-) -> Option<CapturedInputEvent> {
+) -> Option<InputEvent> {
     use rshare_input::{ButtonState, KeyCode, MouseButton};
     use rshare_platform::EvdevDriverEvent;
 
-    let (event, device_kind, device_path) = match event {
+    let (event, device_kind, _device_path) = match event {
         EvdevDriverEvent::MouseMove { x, y, device_path } => (
             InputEvent::MouseMove { x, y },
             LocalInputDeviceKind::Mouse,
@@ -6761,55 +6114,11 @@ fn captured_input_from_evdev_driver_event(
         }
     };
 
-    let event_name = Path::new(&device_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-    let kind_label = match device_kind {
-        LocalInputDeviceKind::Keyboard => "keyboard",
-        LocalInputDeviceKind::Mouse => "mouse",
+    match device_kind {
+        LocalInputDeviceKind::Keyboard | LocalInputDeviceKind::Mouse => {}
         _ => return None,
-    };
-    let device_id = event_name
-        .as_ref()
-        .map(|event_name| format!("linux-evdev-{kind_label}-{event_name}"))
-        .unwrap_or_else(|| format!("linux-evdev-{kind_label}-unknown"));
-
-    Some(CapturedInputEvent {
-        event,
-        metadata: Some(LocalInputDeviceMetadata {
-            device_id,
-            device_instance_id: event_name,
-            capture_path: Some(device_path),
-        }),
-    })
-}
-
-fn forward_input_events_to_captured_channel(
-    mut rx: SemanticInputConsumer,
-    tx: tokio::sync::mpsc::UnboundedSender<CapturedInputEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv_event().await {
-            match event {
-                IngressEvent::Input(captured) => match captured.into_input_event() {
-                    Ok(event) => {
-                        if tx.send(CapturedInputEvent::from(event)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!("Captured input cannot enter the legacy router: {error}");
-                    }
-                },
-                IngressEvent::Fault(fault) => {
-                    // Task 12 owns suspend/ReleaseAll policy. The bounded ingress
-                    // still surfaces the fault explicitly instead of losing it.
-                    tracing::error!("Input capture ingress fault: {fault:?}");
-                }
-            }
-        }
-    });
+    }
+    Some(event)
 }
 
 fn flatten_daemon_task_result(
@@ -6819,6 +6128,16 @@ fn flatten_daemon_task_result(
         Ok(result) => result,
         Err(error) => Err(error.into()),
     }
+}
+
+async fn enqueue_router_command(
+    sender: &tokio::sync::mpsc::Sender<RouterCommand>,
+    command: RouterCommand,
+) -> Result<()> {
+    sender
+        .send(command)
+        .await
+        .map_err(|_| anyhow::anyhow!("input router command channel is closed"))
 }
 
 async fn complete_mobile_gateway_shutdown(
@@ -6894,7 +6213,14 @@ async fn main() -> Result<()> {
             ..Default::default()
         });
 
-    let mut events = network_manager.events();
+    let receivers = network_manager.receivers();
+    let mut events = receivers.events;
+    let authenticated_peers = receivers.authenticated_peers;
+    let input_registry = network_manager.input_registry();
+    let mut terminal_releases = network_manager
+        .terminal_release_events()
+        .await
+        .expect("new network manager must expose terminal release events");
     let network_manager = Arc::new(Mutex::new(network_manager));
     {
         let mut manager = network_manager.lock().await;
@@ -6938,6 +6264,8 @@ async fn main() -> Result<()> {
     let inject_kind = inject_backend.kind();
     let text_commit_supported = inject_backend.supports_text_commit();
     let last_backend_error = inject_error.or(backend_error);
+    let input_backend_healthy = matches!(backend_health, BackendHealth::Healthy)
+        && matches!(inject_health, BackendHealth::Healthy);
 
     // Initialize backend state
     {
@@ -6952,7 +6280,8 @@ async fn main() -> Result<()> {
             last_backend_error,
         );
     }
-    let inject_backend = Arc::new(Mutex::new(inject_backend));
+    let injection = InputInjectionHandle::spawn(inject_backend, InjectionActorConfig::default())?;
+    let inject_backend = injection.clone();
 
     let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
@@ -6963,90 +6292,111 @@ async fn main() -> Result<()> {
         rshare_platform::ExperimentalUsbHostRuntime::new(),
     ));
 
-    // Input capture: try Evdev on Linux for kernel-level access, fallback to RDev
+    let (capture_producer, input_consumer) = SemanticInputIngress::new(256);
+    #[cfg(not(windows))]
+    let portable_origin = CaptureOrigin {
+        source: CaptureSource::PortableHook,
+        device_token: 0,
+        instance_token: 0,
+    };
+
+    // Every capture backend publishes into the same bounded semantic ingress.
     #[cfg(target_os = "linux")]
-    let (input_rx, input_channel, gamepad_input_channel) = {
-        use tokio::sync::mpsc;
-
-        let (tx, rx) = mpsc::unbounded_channel::<CapturedInputEvent>();
-        let (gamepad_input_channel, gamepad_rx) = InputEventChannel::new();
-        forward_input_events_to_captured_channel(gamepad_rx, tx.clone());
-
-        // Try to use EvdevCaptureBackend for kernel-level input capture
-        match try_start_evdev_capture(tx.clone()) {
+    let mut input_channel = {
+        match try_start_evdev_capture(capture_producer.clone()) {
             Ok(_evdev_task) => {
                 tracing::info!("Using Evdev backend for input capture (kernel-level)");
-                // Evdev capture is running in the background task
-                (rx, None, gamepad_input_channel)
+                None
             }
             Err(e) => {
                 tracing::warn!(
                     "Evdev capture unavailable: {:?}, using RDev (Portable) backend",
                     e
                 );
-                // Fallback to RDev (Portable) backend
-                let mut input_listener = RDevInputListener::new();
-                let rdev_rx = input_listener.receiver();
-                forward_input_events_to_captured_channel(rdev_rx, tx);
-                let channel = Some(input_listener);
-                (rx, channel, gamepad_input_channel)
+                Some(RDevInputListener::from_producer(
+                    capture_producer.clone(),
+                    portable_origin,
+                ))
             }
         }
     };
 
     #[cfg(windows)]
-    let (input_rx, input_event_channel, _input_listener, use_windows_filter_capture) = {
-        let (input_event_channel, raw_input_rx) = InputEventChannel::new();
-        let (captured_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInputEvent>();
-        forward_input_events_to_captured_channel(raw_input_rx, captured_tx);
+    let (_input_listener, mut windows_driver_capture) = {
+        let windows_hook_origin = CaptureOrigin {
+            source: CaptureSource::WindowsHook,
+            device_token: 0,
+            instance_token: 0,
+        };
         set_local_shortcut_suppression(false);
         let use_windows_filter_capture = {
             let state = state.read().await;
             windows_should_use_filter_capture(input_mode, &state.local_controls.driver)
         };
 
-        if use_windows_filter_capture {
-            tracing::info!("Using RShare Windows filter driver input capture");
-            (input_rx, input_event_channel, None, true)
-        } else {
-            let callback_channel = input_event_channel.clone();
-            let mut input_listener = DefaultInputListener::new();
-            input_listener.start(Box::new(move |event| {
-                let _ = callback_channel.send(event);
-            }))?;
-            tracing::info!("Using native Windows low-level hook input capture");
-            (input_rx, input_event_channel, Some(input_listener), false)
+        let selection = start_windows_capture_with_fallback(
+            use_windows_filter_capture,
+            {
+                let producer = capture_producer.clone();
+                move || WindowsDriverCapture::start(producer)
+            },
+            {
+                let producer = capture_producer.clone();
+                move || {
+                    let mut input_listener = DefaultInputListener::new();
+                    input_listener.start(Box::new(move |event| {
+                        let _ = producer.try_push_event(windows_hook_origin, event);
+                    }))?;
+                    Ok(input_listener)
+                }
+            },
+        )?;
+        match selection {
+            WindowsCaptureSelection::Filter(capture) => {
+                tracing::info!("Using RShare Windows filter driver input capture");
+                (None, Some(capture))
+            }
+            WindowsCaptureSelection::Hook {
+                listener,
+                filter_error,
+            } => {
+                if let Some(error) = filter_error {
+                    tracing::warn!(
+                        "Windows filter capture failed; using low-level hook fallback: {error}"
+                    );
+                    let mut state = state.write().await;
+                    state.local_controls.capture_backend.mode =
+                        Some(ResolvedInputMode::WindowsNative);
+                    state.local_controls.capture_backend.kind = Some(BackendKind::WindowsNative);
+                    state.local_controls.capture_backend.health = Some(BackendHealth::Healthy);
+                    state.local_controls.capture_backend.active = true;
+                    state.local_controls.last_error =
+                        Some(format!("Filter capture fallback: {error}"));
+                } else {
+                    tracing::info!("Using native Windows low-level hook input capture");
+                }
+                (Some(listener), None)
+            }
         }
     };
 
     #[cfg(all(not(target_os = "linux"), not(windows)))]
-    let (input_rx, mut input_channel) = {
-        let mut input_listener = RDevInputListener::new();
-        let raw_input_rx = input_listener.receiver();
-        let (captured_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInputEvent>();
-        forward_input_events_to_captured_channel(raw_input_rx, captured_tx);
-        (input_rx, Some(input_listener))
-    };
+    let mut input_channel = Some(RDevInputListener::from_producer(
+        capture_producer.clone(),
+        portable_origin,
+    ));
 
     let mut gamepad_listener_config = GamepadListenerConfig::from(&config.gamepad);
     gamepad_listener_config.enabled = true;
-    let mut gamepad_listener = {
-        #[cfg(target_os = "linux")]
-        {
-            GilrsGamepadListener::new(gamepad_input_channel.clone(), gamepad_listener_config)
-        }
-        #[cfg(windows)]
-        {
-            GilrsGamepadListener::new(input_event_channel.clone(), gamepad_listener_config)
-        }
-        #[cfg(all(not(target_os = "linux"), not(windows)))]
-        {
-            GilrsGamepadListener::new(
-                input_channel.as_ref().unwrap().channel(),
-                gamepad_listener_config,
-            )
-        }
-    };
+    let mut gamepad_listener = GilrsGamepadListener::new(
+        capture_producer.clone(),
+        CaptureOrigin {
+            source: CaptureSource::Gamepad,
+            device_token: 0,
+            instance_token: 0,
+        },
+        gamepad_listener_config,
+    );
     gamepad_listener.start()?;
 
     // Start RDev listener if we're using it
@@ -7067,11 +6417,13 @@ async fn main() -> Result<()> {
     tracing::info!("Local IPC listening on {}", default_ipc_addr());
 
     let layout_path = Arc::new(layout_path);
+    let (input_command_tx, input_command_rx) = tokio::sync::mpsc::channel(64);
 
     let ipc_task = tokio::spawn(run_ipc_server(
         ipc_listener,
         state.clone(),
         network_manager.clone(),
+        input_command_tx.clone(),
         inject_backend.clone(),
         audio_runtime.clone(),
         usb_runtime.clone(),
@@ -7115,28 +6467,103 @@ async fn main() -> Result<()> {
         }
     });
 
-    let input_forwarding_task = tokio::spawn(run_input_forwarding_loop(
-        input_rx,
-        state.clone(),
-        network_manager.clone(),
-        local_events_tx.clone(),
-        shutdown_tx.subscribe(),
-        config.edge_threshold(),
-        config.gamepad.enabled,
-    ));
-
-    #[cfg(windows)]
-    let _windows_driver_capture_task = if use_windows_filter_capture {
-        Some(tokio::spawn(run_windows_driver_capture_loop(
-            state.clone(),
-            network_manager.clone(),
-            local_events_tx.clone(),
-            shutdown_tx.subscribe(),
-            config.edge_threshold(),
-        )))
-    } else {
-        None
+    let (router_layout, router_geometry, connected_peers) = {
+        let state = state.read().await;
+        (
+            state.layout.clone(),
+            VirtualDesktopGeometry::from(&state.local_controls.display),
+            state
+                .devices
+                .values()
+                .filter(|peer| peer.connected)
+                .map(|peer| peer.id)
+                .collect::<Vec<_>>(),
+        )
     };
+    let input_router = InputRouter::new(device_id, router_layout, router_geometry, connected_peers);
+    let (input_state, mut input_feeds) = input_state_channel(32);
+    let input_metrics = Arc::new(ControlMetrics::default());
+    if !input_backend_healthy {
+        enqueue_router_command(&input_command_tx, RouterCommand::BackendDegraded).await?;
+    }
+    let input_runtime = InputRuntime::new(
+        input_consumer,
+        input_router,
+        input_registry,
+        input_state,
+        input_metrics,
+        injection.clone(),
+    );
+    let (system_safety_tx, system_safety_rx) = tokio::sync::mpsc::unbounded_channel();
+    let system_safety_injection = injection.clone();
+    let system_safety_watcher = rshare_platform::SystemSafetyWatcher::start(move |event| {
+        let _ = dispatch_system_safety_event(&system_safety_injection, &system_safety_tx, event);
+    })?;
+    if system_safety_watcher.is_supported() {
+        tracing::info!("Native session-lock and system-suspend safety watcher active");
+    }
+    let input_forwarding_task =
+        tokio::spawn(input_runtime.run_with_safety(input_command_rx, system_safety_rx));
+    let mut authenticated_input_task = tokio::spawn(run_authenticated_input_peers(
+        authenticated_peers,
+        injection.clone(),
+        Duration::from_secs(2),
+        shutdown_tx.subscribe(),
+    ));
+    let legacy_input_state = state.clone();
+    let mut legacy_input_shutdown = shutdown_tx.subscribe();
+    let _legacy_input_adapter_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                mutation = input_feeds.reliable_rx.recv() => {
+                    let Some(_mutation) = mutation else { break; };
+                    let projection = input_feeds.authoritative_rx.borrow().clone();
+                    apply_legacy_input_projection(&legacy_input_state, &projection).await;
+                }
+                changed = input_feeds.pointer_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let pointer = *input_feeds.pointer_rx.borrow_and_update();
+                    if let Some(pointer) = pointer {
+                        let mut state = legacy_input_state.write().await;
+                        state.local_controls.mouse.x = pointer.x;
+                        state.local_controls.mouse.y = pointer.y;
+                    }
+                }
+                _ = input_feeds.dirty.notified() => {
+                    if input_feeds.dirty.take() {
+                        let projection = input_feeds.authoritative_rx.borrow().clone();
+                        apply_legacy_input_projection(&legacy_input_state, &projection).await;
+                    }
+                }
+                _ = legacy_input_shutdown.recv() => break,
+            }
+        }
+    });
+
+    let current_generations = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let terminal_generation_view = current_generations.clone();
+    let terminal_injection = injection.clone();
+    let _terminal_release_task = tokio::spawn(async move {
+        while let Some(release) = terminal_releases.recv().await {
+            let current = terminal_generation_view
+                .read()
+                .expect("input generation registry poisoned")
+                .get(&release.auth.peer_id)
+                .copied();
+            if current == Some(release.auth.control_connection_id) {
+                terminal_injection.request_release_through(
+                    rshare_core::AuthenticatedInputOwner {
+                        peer_id: release.auth.peer_id,
+                        control_connection_id: release.auth.control_connection_id,
+                    },
+                    release.epoch,
+                    release.reason,
+                );
+            }
+        }
+    });
 
     let event_task = {
         let state = state.clone();
@@ -7147,6 +6574,9 @@ async fn main() -> Result<()> {
         let local_events_tx = local_events_tx.clone();
         let endpoint_events_tx = endpoint_events_tx.clone();
         let layout_path = layout_path.clone();
+        let input_command_tx = input_command_tx.clone();
+        let injection = injection.clone();
+        let current_generations = current_generations.clone();
         tokio::spawn(async move {
             tracing::info!("Event task: starting to wait for events");
             while let Some(event) = events.recv().await {
@@ -7164,6 +6594,25 @@ async fn main() -> Result<()> {
                     }
                     NetworkEvent::DeviceConnected(auth) => {
                         let id = auth.peer_id;
+                        current_generations
+                            .write()
+                            .expect("input generation registry poisoned")
+                            .insert(id, auth.control_connection_id);
+                        if let Err(error) = enqueue_router_command(
+                            &input_command_tx,
+                            RouterCommand::ConnectivityChanged {
+                                peer: id,
+                                connected: true,
+                            },
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to queue connected snapshot: {error}");
+                            injection.request_release_all_sources(
+                                rshare_core::ReleaseAllReason::BackendFailure,
+                            );
+                            break;
+                        }
                         let (should_advertise_usb, layout_to_save) = {
                             let mut state = state.write().await;
                             let layout_changed = state.mark_connected(&id, true);
@@ -7188,8 +6637,43 @@ async fn main() -> Result<()> {
                     }
                     NetworkEvent::DeviceDisconnected {
                         peer_id: id,
-                        control_connection_id: _,
+                        control_connection_id,
                     } => {
+                        if current_generations
+                            .read()
+                            .expect("input generation registry poisoned")
+                            .get(&id)
+                            != Some(&control_connection_id)
+                        {
+                            continue;
+                        }
+                        current_generations
+                            .write()
+                            .expect("input generation registry poisoned")
+                            .remove(&id);
+                        injection.request_release_through(
+                            rshare_core::AuthenticatedInputOwner {
+                                peer_id: id,
+                                control_connection_id,
+                            },
+                            rshare_core::SessionEpoch(u64::MAX),
+                            rshare_core::ReleaseAllReason::SessionEnded,
+                        );
+                        if let Err(error) = enqueue_router_command(
+                            &input_command_tx,
+                            RouterCommand::ConnectivityChanged {
+                                peer: id,
+                                connected: false,
+                            },
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to queue disconnected snapshot: {error}");
+                            injection.request_release_all_sources(
+                                rshare_core::ReleaseAllReason::BackendFailure,
+                            );
+                            break;
+                        }
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
                         state.session.on_target_disconnect(id);
@@ -7227,6 +6711,50 @@ async fn main() -> Result<()> {
                             error
                         );
                         if let Some(device_id) = peer_id {
+                            if control_connection_id.is_some_and(|generation| {
+                                current_generations
+                                    .read()
+                                    .expect("input generation registry poisoned")
+                                    .get(&device_id)
+                                    != Some(&generation)
+                            }) {
+                                continue;
+                            }
+                            current_generations
+                                .write()
+                                .expect("input generation registry poisoned")
+                                .remove(&device_id);
+                            if let Some(control_connection_id) = control_connection_id {
+                                injection.request_release_through(
+                                    rshare_core::AuthenticatedInputOwner {
+                                        peer_id: device_id,
+                                        control_connection_id,
+                                    },
+                                    rshare_core::SessionEpoch(u64::MAX),
+                                    rshare_core::ReleaseAllReason::SessionEnded,
+                                );
+                            } else {
+                                injection.request_release_all(
+                                    rshare_core::ReleaseAllReason::SessionEnded,
+                                );
+                            }
+                            if let Err(command_error) = enqueue_router_command(
+                                &input_command_tx,
+                                RouterCommand::ConnectivityChanged {
+                                    peer: device_id,
+                                    connected: false,
+                                },
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    "Failed to queue connection-error snapshot: {command_error}"
+                                );
+                                injection.request_release_all_sources(
+                                    rshare_core::ReleaseAllReason::BackendFailure,
+                                );
+                                break;
+                            }
                             let mut state = state.write().await;
                             state.session.on_target_disconnect(device_id);
                             fail_pending_usb_for_device(
@@ -7277,7 +6805,11 @@ async fn main() -> Result<()> {
         }
         result = input_forwarding_task => {
             tracing::info!("Input forwarding task completed");
-            flatten_daemon_task_result(result)
+            result.map_err(Into::into)
+        }
+        result = &mut authenticated_input_task => {
+            tracing::info!("Authenticated input task completed");
+            result.map_err(Into::into)
         }
     };
 
@@ -7292,16 +6824,25 @@ async fn main() -> Result<()> {
     .await;
 
     tracing::info!("tokio::select! exited, cleaning up");
+    let _ = enqueue_router_command(&input_command_tx, RouterCommand::Shutdown).await;
+    injection.request_release_all_sources(rshare_core::ReleaseAllReason::SessionEnded);
     set_local_shortcut_suppression(false);
     audio_runtime.stop_capture();
     audio_runtime.stop_render();
     audio_runtime.shutdown();
+    drop(system_safety_watcher);
+    #[cfg(windows)]
+    if let Some(capture) = windows_driver_capture.as_mut() {
+        capture.stop();
+    }
     // Input listener cleanup is handled automatically by task drops
     let network_stop_result = network_manager.lock().await.stop().await;
+    let injection_stop_result = tokio::task::spawn_blocking(move || injection.shutdown()).await?;
 
     shutdown_reason?;
     mobile_shutdown_result?;
     network_stop_result?;
+    injection_stop_result?;
 
     tracing::info!("R-ShareMouse daemon stopped");
     std::process::exit(0);
@@ -7311,7 +6852,8 @@ async fn run_ipc_server(
     listener: TcpListener,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    input_command_tx: tokio::sync::mpsc::Sender<RouterCommand>,
+    inject_backend: InputInjectionHandle,
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
@@ -7323,6 +6865,7 @@ async fn run_ipc_server(
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
         let network_manager = network_manager.clone();
+        let input_command_tx = input_command_tx.clone();
         let inject_backend = inject_backend.clone();
         let audio_runtime = audio_runtime.clone();
         let usb_runtime = usb_runtime.clone();
@@ -7336,6 +6879,7 @@ async fn run_ipc_server(
                 stream,
                 state,
                 network_manager,
+                input_command_tx,
                 inject_backend,
                 audio_runtime,
                 usb_runtime,
@@ -7414,7 +6958,8 @@ async fn handle_ipc_client(
     mut stream: TcpStream,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    input_command_tx: tokio::sync::mpsc::Sender<RouterCommand>,
+    inject_backend: InputInjectionHandle,
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
@@ -7580,15 +7125,38 @@ async fn handle_ipc_client(
             DaemonResponse::Layout(state.layout.clone())
         }
         DaemonRequest::SetLayout { layout } => {
-            let mut state = state.write().await;
             let mut canonical_layout = layout;
-            canonical_layout.canonicalize_local_device(state.status.device_id);
+            let (local_device_id, previous_layout) = {
+                let state = state.read().await;
+                (state.status.device_id, state.layout.clone())
+            };
+            canonical_layout.canonicalize_local_device(local_device_id);
 
             match save_layout_to_path(&canonical_layout, layout_path.as_ref()) {
-                Ok(()) => {
-                    state.layout = canonical_layout;
-                    DaemonResponse::Ack
-                }
+                Ok(()) => match enqueue_router_command(
+                    &input_command_tx,
+                    RouterCommand::LayoutChanged(canonical_layout.clone()),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        state.write().await.layout = canonical_layout;
+                        DaemonResponse::Ack
+                    }
+                    Err(error) => {
+                        inject_backend.request_release_all_sources(
+                            rshare_core::ReleaseAllReason::BackendFailure,
+                        );
+                        if let Err(rollback_error) =
+                            save_layout_to_path(&previous_layout, layout_path.as_ref())
+                        {
+                            tracing::error!(
+                                "Failed to roll back layout after router channel closed: {rollback_error}"
+                            );
+                        }
+                        DaemonResponse::Error(error.to_string())
+                    }
+                },
                 Err(err) => DaemonResponse::Error(err.to_string()),
             }
         }
@@ -7935,6 +7503,63 @@ mod tests {
         ))
     }
 
+    fn test_injection_handle(backend: impl InjectBackend + 'static) -> InputInjectionHandle {
+        InputInjectionHandle::spawn(Box::new(backend), InjectionActorConfig::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_projection_applies_key_button_and_dirty_authoritative_truth() {
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let target = DeviceId::new_v4();
+        let projection = rshare_daemon::input_state::InputReliableUiProjection {
+            discrete: rshare_daemon::input_state::InputDiscreteProjection {
+                session_epoch: rshare_core::SessionEpoch(9),
+                pressed_keys: vec![0x41],
+                pressed_buttons: vec![rshare_core::MouseButton::Left],
+            },
+            session: ControlSessionState::RemoteActive {
+                target,
+                entered_via: Direction::Right,
+            },
+        };
+
+        apply_legacy_input_projection(&state, &projection).await;
+        {
+            let current = state.read().await;
+            assert_eq!(
+                current.local_controls.keyboard.pressed_keys,
+                vec!["Raw(65)"]
+            );
+            assert_eq!(current.local_controls.mouse.pressed_buttons, vec!["Left"]);
+            assert!(matches!(
+                current.session.state(),
+                ControlSessionState::RemoteActive {
+                    target: actual_target,
+                    ..
+                } if actual_target == target
+            ));
+        }
+
+        let cleared = rshare_daemon::input_state::InputReliableUiProjection {
+            discrete: rshare_daemon::input_state::InputDiscreteProjection {
+                session_epoch: rshare_core::SessionEpoch(10),
+                pressed_keys: Vec::new(),
+                pressed_buttons: Vec::new(),
+            },
+            session: ControlSessionState::Suspended {
+                reason: rshare_core::SuspendReason::BackendDegraded,
+            },
+        };
+        apply_legacy_input_projection(&state, &cleared).await;
+        let current = state.read().await;
+        assert!(current.local_controls.keyboard.pressed_keys.is_empty());
+        assert!(current.local_controls.mouse.pressed_buttons.is_empty());
+        assert!(matches!(
+            current.session.state(),
+            ControlSessionState::Suspended { .. }
+        ));
+    }
+
     #[test]
     fn default_daemon_state_disables_mobile_access_without_credentials() {
         let snapshot = test_daemon_state().mobile_access.snapshot();
@@ -7990,6 +7615,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(events_rx.try_recv(), Ok("Released"));
+    }
+
+    #[tokio::test]
+    async fn saturated_router_command_queue_eventually_accepts_latest_snapshot() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(RouterCommand::BackendDegraded).unwrap();
+        let layout = LayoutGraph::new(DeviceId::new_v4());
+        let pending = tokio::spawn({
+            let tx = tx.clone();
+            let layout = layout.clone();
+            async move { enqueue_router_command(&tx, RouterCommand::LayoutChanged(layout)).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(RouterCommand::BackendDegraded)
+        ));
+        pending
+            .await
+            .unwrap()
+            .expect("latest layout snapshot must eventually be queued");
+        assert!(matches!(
+            rx.recv().await,
+            Some(RouterCommand::LayoutChanged(applied)) if applied == layout
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_router_command_queue_returns_explicit_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let error = enqueue_router_command(&tx, RouterCommand::Shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("channel is closed"));
     }
 
     #[test]
@@ -10019,12 +9682,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_local_input_test_reports_success_and_broadcasts_feedback() {
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(TestInjectBackend {
-                active: true,
-                fail: false,
-                injected: Vec::new(),
-            })));
+        let backend = test_injection_handle(TestInjectBackend {
+            active: true,
+            fail: false,
+            injected: Vec::new(),
+        });
         let state = Arc::new(RwLock::new(test_daemon_state()));
         let (events, mut rx) = broadcast::channel(4);
 
@@ -10048,11 +9710,10 @@ mod tests {
     #[tokio::test]
     async fn virtual_hid_mouse_test_uses_absolute_round_trip_coordinates() {
         let injected = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(RecordingKindInjectBackend {
-                kind: BackendKind::VirtualHid,
-                injected: injected.clone(),
-            })));
+        let backend = test_injection_handle(RecordingKindInjectBackend {
+            kind: BackendKind::VirtualHid,
+            injected: injected.clone(),
+        });
         let mut daemon = test_daemon_state();
         daemon.local_controls.mouse.x = 500;
         daemon.local_controls.mouse.y = 300;
@@ -10112,100 +9773,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn remote_message_injection_marks_immediate_capture_feedback_as_loopback() {
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(TestInjectBackend {
-                active: true,
-                fail: false,
-                injected: Vec::new(),
-            })));
-        let state = Arc::new(RwLock::new(test_daemon_state()));
-        let remote_id = DeviceId::new_v4();
-
-        inject_remote_message(
-            &backend,
-            &state,
-            remote_id,
-            Message::Key {
-                keycode: 0x20,
-                state: rshare_core::KeyState::Pressed,
-            },
-        )
-        .await;
-
-        let feedback =
-            state
-                .write()
-                .await
-                .record_local_input_event(&rshare_input::InputEvent::key(
-                    rshare_input::KeyCode::Space,
-                    rshare_input::ButtonState::Pressed,
-                ));
-
-        assert_eq!(feedback.source, LocalInputEventSource::InjectedLoopback);
-    }
-
-    #[test]
-    fn injected_loopback_capture_is_not_forwarded_back_to_remote_peer() {
-        use rshare_core::{Direction, LayoutLink};
-
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.features.automatic_input_forwarding = true;
-        state.layout.upsert_link_for_edge(LayoutLink::new(
-            local_id,
-            Direction::Right,
-            remote_id,
-            Direction::Left,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = captured_input_forwarding_outcome(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let outcome = captured_input_forwarding_outcome_with_source(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::Space,
-                rshare_input::ButtonState::Pressed,
-            ),
-            LocalInputEventSource::InjectedLoopback,
-            true,
-        );
-
-        assert!(outcome.messages.is_empty());
-        assert_eq!(outcome.target, None);
-        assert_eq!(forwarder.target(), Some(remote_id));
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_driver_source_keeps_pending_loopback_classification() {
@@ -10227,12 +9794,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_local_input_test_reports_backend_unavailable() {
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(TestInjectBackend {
-                active: false,
-                fail: false,
-                injected: Vec::new(),
-            })));
+        let backend = test_injection_handle(TestInjectBackend {
+            active: false,
+            fail: false,
+            injected: Vec::new(),
+        });
         let state = Arc::new(RwLock::new(test_daemon_state()));
         let (events, _rx) = broadcast::channel(4);
 
@@ -10251,12 +9817,11 @@ mod tests {
 
     #[tokio::test]
     async fn inject_endpoint_event_reports_result_and_correlated_loopback() {
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(TestInjectBackend {
-                active: true,
-                fail: false,
-                injected: Vec::new(),
-            })));
+        let backend = test_injection_handle(TestInjectBackend {
+            active: true,
+            fail: false,
+            injected: Vec::new(),
+        });
         let state = Arc::new(RwLock::new(test_daemon_state()));
         let network_manager = Arc::new(Mutex::new(NetworkManager::new(
             DeviceId::new_v4(),
@@ -10312,11 +9877,10 @@ mod tests {
     #[tokio::test]
     async fn inject_endpoint_event_accepts_unicode_text_commit() {
         let injected = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(RecordingKindInjectBackend {
-                kind: BackendKind::Portable,
-                injected: injected.clone(),
-            })));
+        let backend = test_injection_handle(RecordingKindInjectBackend {
+            kind: BackendKind::Portable,
+            injected: injected.clone(),
+        });
         let state = Arc::new(RwLock::new(test_daemon_state()));
         let network_manager = Arc::new(Mutex::new(NetworkManager::new(
             DeviceId::new_v4(),
@@ -10477,12 +10041,11 @@ mod tests {
 
     #[tokio::test]
     async fn remote_endpoint_inject_returns_transport_failure_without_connection() {
-        let backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(TestInjectBackend {
-                active: true,
-                fail: false,
-                injected: Vec::new(),
-            })));
+        let backend = test_injection_handle(TestInjectBackend {
+            active: true,
+            fail: false,
+            injected: Vec::new(),
+        });
         let remote = DeviceId::new_v4();
         let mut daemon_state = test_daemon_state();
         daemon_state.devices.insert(
@@ -10719,103 +10282,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn input_event_maps_to_forwarding_raw_event() {
-        let raw = input_event_to_raw_event(rshare_input::InputEvent::mouse_button(
-            rshare_input::MouseButton::Back,
-            rshare_input::ButtonState::Pressed,
-        ))
-        .unwrap();
-
-        match raw {
-            rshare_core::engine::RawInputEvent::MouseButton { button, pressed } => {
-                assert_eq!(button, 4);
-                assert!(pressed);
-            }
-            _ => panic!("Wrong raw input event"),
-        }
-    }
-
-    #[test]
-    fn gamepad_input_event_maps_to_forwarding_raw_event() {
-        let raw = input_event_to_raw_event(rshare_input::InputEvent::gamepad_state(
-            rshare_core::GamepadState::neutral(0, 1, 123),
-        ))
-        .unwrap();
-
-        assert!(matches!(
-            raw,
-            rshare_core::engine::RawInputEvent::GamepadState { .. }
-        ));
-    }
-
-    #[test]
-    fn gamepad_button_maps_its_complete_post_transition_state() {
-        let mut state_after = rshare_core::GamepadState::neutral(6, 42, 777);
-        state_after.left_stick_x = 12_345;
-        state_after.buttons.push(rshare_core::GamepadButtonState {
-            button: rshare_core::GamepadButton::South,
-            pressed: true,
-        });
-        let raw = input_event_to_raw_event(rshare_input::InputEvent::gamepad_button(
-            6,
-            rshare_core::GamepadButton::South,
-            true,
-            state_after,
-        ))
-        .unwrap();
-
-        assert!(matches!(
-            raw,
-            rshare_core::engine::RawInputEvent::GamepadState {
-                state: rshare_core::GamepadState {
-                    gamepad_id: 6,
-                    sequence: 42,
-                    left_stick_x: 12_345,
-                    buttons,
-                    ..
-                }
-            } if buttons == vec![rshare_core::GamepadButtonState {
-                button: rshare_core::GamepadButton::South,
-                pressed: true,
-            }]
-        ));
-    }
-
-    #[test]
-    fn keypad_enter_uses_distinct_forwarding_keycode() {
-        let raw = input_event_to_raw_event(rshare_input::InputEvent::key(
-            rshare_input::KeyCode::KeypadEnter,
-            rshare_input::ButtonState::Pressed,
-        ))
-        .unwrap();
-
-        assert!(matches!(
-            raw,
-            rshare_core::engine::RawInputEvent::Key {
-                keycode: rshare_input::RSHARE_KEYPAD_ENTER_RAW,
-                pressed: true,
-            }
-        ));
-    }
-
-    #[test]
-    fn forwarded_keypad_enter_restores_key_identity() {
-        let input = message_to_input_event(rshare_core::Message::Key {
-            keycode: rshare_input::RSHARE_KEYPAD_ENTER_RAW,
-            state: rshare_core::KeyState::Pressed,
-        })
-        .unwrap();
-
-        assert!(matches!(
-            input,
-            rshare_input::InputEvent::Key {
-                keycode: rshare_input::KeyCode::KeypadEnter,
-                state: rshare_input::ButtonState::Pressed,
-            }
-        ));
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_driver_event_maps_to_local_input_event() {
@@ -10845,6 +10311,94 @@ mod tests {
             local_source_from_windows_driver_event(event.source),
             LocalInputEventSource::DriverTest
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_driver_capture_publishes_directly_with_filter_origin() {
+        let (producer, mut consumer) = SemanticInputIngress::new(4);
+        publish_windows_driver_event(
+            &producer,
+            rshare_platform::windows::WindowsDriverInputEvent {
+                source: rshare_platform::windows::WindowsDriverEventSource::Hardware,
+                device_kind: rshare_platform::windows::WindowsDriverDeviceKind::Keyboard,
+                event_kind: rshare_platform::windows::WindowsDriverEventKind::Key,
+                device_id: "17".to_string(),
+                device_instance_id: "instance".to_string(),
+                value0: 0x1E,
+                value1: 1,
+                value2: 0,
+                flags: 0,
+                timestamp_us: 1,
+            },
+        );
+
+        let captured = consumer.recv().await.expect("direct driver capture");
+        assert_eq!(captured.origin.source, CaptureSource::WindowsFilter);
+        assert_eq!(captured.origin.device_token, 17);
+        assert!(matches!(
+            captured.payload,
+            CapturedInputPayload::Discrete(InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Pressed,
+            })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_filter_open_failure_starts_real_hook_fallback_seam() {
+        let hook_started = Cell::new(false);
+        let selection: WindowsCaptureSelection<(), &str> = start_windows_capture_with_fallback(
+            true,
+            || Err(anyhow::anyhow!("synthetic filter open failure")),
+            || {
+                hook_started.set(true);
+                Ok("hook-listener")
+            },
+        )
+        .unwrap();
+
+        assert!(hook_started.get());
+        assert!(matches!(
+            selection,
+            WindowsCaptureSelection::Hook {
+                listener: "hook-listener",
+                filter_error: Some(error),
+            } if error.contains("synthetic filter open failure")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_driver_start_waits_for_open_failure_before_returning() {
+        let (producer, _consumer) = SemanticInputIngress::new(4);
+        let result = WindowsDriverCapture::start_with_opener(producer, || {
+            Err(anyhow::anyhow!("synthetic startup failure"))
+        });
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("synthetic startup failure"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_driver_startup_handshake_times_out_without_blocking_daemon() {
+        let (producer, _consumer) = SemanticInputIngress::new(4);
+        let started = std::time::Instant::now();
+        let result = WindowsDriverCapture::start_with_opener_timeout(
+            producer,
+            Duration::from_millis(10),
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                rshare_platform::windows::WindowsDriverClient::open()
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("handshake failed"));
+        assert!(started.elapsed() < Duration::from_millis(80));
     }
 
     #[cfg(windows)]
@@ -10904,798 +10458,6 @@ mod tests {
                 .resolve_target(local_id, Direction::Right, &connected_peers),
             Some(remote_id)
         );
-    }
-
-    #[test]
-    fn input_event_forwarding_requires_connected_target() {
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            DeviceId::new_v4(),
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::Raw(0x20),
-                rshare_input::ButtonState::Pressed,
-            ),
-            true,
-        );
-
-        assert!(messages.is_empty());
-    }
-
-    #[test]
-    fn input_event_forwarding_stays_local_until_edge_activation() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::Raw(0x20),
-                rshare_input::ButtonState::Pressed,
-            ),
-            true,
-        );
-
-        assert!(messages.is_empty());
-        assert_eq!(forwarder.target(), None);
-    }
-
-    #[test]
-    fn captured_input_does_not_auto_forward_when_disabled_by_config() {
-        use rshare_core::{Direction, LayoutLink};
-
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.features.automatic_input_forwarding = false;
-        state.layout.upsert_link_for_edge(LayoutLink::new(
-            local_id,
-            Direction::Right,
-            remote_id,
-            Direction::Left,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-        let outcome = captured_input_forwarding_outcome(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::MouseMove { x: 1919, y: 540 },
-            true,
-        );
-
-        assert!(outcome.messages.is_empty());
-        assert_eq!(outcome.target, None);
-        assert_eq!(state.session.active_target(), None);
-        assert_eq!(forwarder.target(), None);
-        assert_eq!(routing.remote_target(), None);
-    }
-
-    #[test]
-    fn captured_input_forwards_by_default_when_layout_link_is_connected() {
-        use rshare_core::{Direction, LayoutLink};
-
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.layout.upsert_link_for_edge(LayoutLink::new(
-            local_id,
-            Direction::Right,
-            remote_id,
-            Direction::Left,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-        let outcome = captured_input_forwarding_outcome(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::MouseMove { x: 1919, y: 540 },
-            true,
-        );
-
-        assert_eq!(outcome.target, Some(remote_id));
-        assert_eq!(state.session.active_target(), Some(remote_id));
-        assert_eq!(forwarder.target(), Some(remote_id));
-    }
-
-    #[test]
-    fn right_edge_activates_remote_forwarding() {
-        use rshare_core::{Direction, LayoutLink};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        // Add layout link for routing
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-
-        assert_eq!(routing.remote_target(), Some(remote_id));
-        assert_eq!(forwarder.target(), Some(remote_id));
-        assert!(!messages.is_empty());
-        assert!(matches!(
-            state.status_snapshot().session_state,
-            Some(rshare_core::ControlSessionState::RemoteActive {
-                target,
-                entered_via: Direction::Right
-            }) if target == remote_id
-        ));
-    }
-
-    #[test]
-    fn left_edge_releases_remote_forwarding() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(0, 500),
-            true,
-        );
-
-        assert!(messages.is_empty());
-        assert_eq!(routing.remote_target(), None);
-        assert_eq!(forwarder.target(), None);
-    }
-
-    #[test]
-    fn left_edge_layout_can_activate_remote_forwarding() {
-        use rshare_core::{Direction, LayoutLink};
-
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, -1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Left,
-            to_device: remote_id,
-            to_edge: Direction::Right,
-        });
-
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(0, 500),
-            true,
-        );
-
-        assert_eq!(routing.remote_target(), Some(remote_id));
-        assert_eq!(forwarder.target(), Some(remote_id));
-        assert!(!messages.is_empty());
-    }
-
-    #[test]
-    fn input_event_forwarding_targets_first_connected_device() {
-        use rshare_core::{Direction, LayoutLink};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        // Add layout link for routing
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::Raw(0x20),
-                rshare_input::ButtonState::Pressed,
-            ),
-            true,
-        );
-
-        assert_eq!(forwarder.target(), Some(remote_id));
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages[0],
-            rshare_core::Message::Key {
-                keycode: 0x20,
-                state: rshare_core::KeyState::Pressed
-            }
-        ));
-    }
-
-    #[test]
-    fn key_extended_forwarding_preserves_combo_modifiers() {
-        use rshare_core::{Direction, LayoutLink, Message};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key_extended(
-                rshare_input::KeyCode::Raw(0x41),
-                rshare_input::ButtonState::Pressed,
-                true,
-                true,
-                false,
-                false,
-            ),
-            true,
-        );
-
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages[0],
-            Message::KeyExtended {
-                keycode: 0x41,
-                state: rshare_core::KeyState::Pressed,
-                shift: true,
-                ctrl: true,
-                alt: false,
-                meta: false
-            }
-        ));
-    }
-
-    #[test]
-    fn right_edge_activation_enters_remote_from_opposite_edge() {
-        use rshare_core::{Direction, LayoutLink, Message};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 2560, 1440));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-
-        assert!(matches!(
-            messages.first(),
-            Some(Message::MouseMove { x: 10, y: 500 })
-        ));
-    }
-
-    #[test]
-    fn quick_return_hotkey_exits_remote_without_forwarding_shortcut() {
-        use rshare_core::{Direction, LayoutLink, Message};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key_extended(
-                rshare_input::KeyCode::Raw(0x4C),
-                rshare_input::ButtonState::Pressed,
-                false,
-                true,
-                true,
-                false,
-            ),
-            true,
-        );
-
-        assert_eq!(messages.len(), 2);
-        assert!(messages.iter().any(|message| {
-            matches!(
-                message,
-                Message::Key {
-                    keycode: 0x11,
-                    state: rshare_core::KeyState::Released
-                }
-            )
-        }));
-        assert!(messages.iter().any(|message| {
-            matches!(
-                message,
-                Message::Key {
-                    keycode: 0x12,
-                    state: rshare_core::KeyState::Released
-                }
-            )
-        }));
-        let return_edge = routing.take_pending_return_edge().unwrap();
-        let _ = state.session.on_return_edge_hit(return_edge);
-        routing.clear_remote_target();
-        forwarder.clear_target();
-
-        assert_eq!(routing.remote_target(), None);
-        assert_eq!(forwarder.target(), None);
-        assert!(matches!(
-            state.status_snapshot().session_state,
-            Some(rshare_core::ControlSessionState::LocalReady)
-        ));
-    }
-
-    #[test]
-    fn ordinary_key_with_tracked_modifiers_forwards_as_combo() {
-        use rshare_core::{Direction, LayoutLink, Message};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::ControlLeft,
-                rshare_input::ButtonState::Pressed,
-            ),
-            true,
-        );
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            true,
-        );
-        let messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::key(
-                rshare_input::KeyCode::Raw(0x43),
-                rshare_input::ButtonState::Pressed,
-            ),
-            true,
-        );
-
-        assert!(matches!(
-            messages.first(),
-            Some(Message::KeyExtended {
-                keycode: 0x43,
-                state: rshare_core::KeyState::Pressed,
-                ctrl: true,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn gamepad_forwarding_respects_config_after_remote_activation() {
-        use rshare_core::{Direction, LayoutLink, Message};
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut state = DaemonState::new(ServiceStatusSnapshot::new(
-            local_id,
-            "local".to_string(),
-            "local-host".to_string(),
-            "127.0.0.1:27431".to_string(),
-            27432,
-            1,
-        ));
-        state.devices.insert(
-            remote_id,
-            TrackedDevice {
-                id: remote_id,
-                name: "remote".to_string(),
-                hostname: "remote-host".to_string(),
-                addresses: vec!["127.0.0.1:27431".to_string()],
-                connected: true,
-                capabilities: DeviceCapabilities::default(),
-                last_seen_at: Instant::now(),
-            },
-        );
-        state
-            .layout
-            .add_node(LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
-        state.layout.add_link(LayoutLink {
-            from_device: local_id,
-            from_edge: Direction::Right,
-            to_device: remote_id,
-            to_edge: Direction::Left,
-        });
-        let mut forwarder = rshare_core::engine::ForwardingEngine::new();
-        let mut routing = InputRoutingState::for_test(1920, 1080, 10);
-
-        let _ = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::mouse_move(1919, 500),
-            false,
-        );
-        let disabled_messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::gamepad_state(rshare_core::GamepadState::neutral(0, 1, 123)),
-            false,
-        );
-        assert!(disabled_messages.is_empty());
-
-        let enabled_messages = messages_for_input_event(
-            &mut state,
-            &mut routing,
-            &mut forwarder,
-            rshare_input::InputEvent::gamepad_state(rshare_core::GamepadState::neutral(0, 2, 456)),
-            true,
-        );
-        assert!(enabled_messages
-            .iter()
-            .any(|message| matches!(message, Message::GamepadState { .. })));
-    }
-
-    #[test]
-    fn remote_input_message_maps_to_injectable_input_event() {
-        let event = message_to_input_event(rshare_core::Message::MouseButton {
-            button: rshare_core::MouseButton::Forward,
-            state: rshare_core::ButtonState::Released,
-        })
-        .unwrap();
-
-        match event {
-            rshare_input::InputEvent::MouseButton { button, state } => {
-                assert_eq!(button, rshare_input::MouseButton::Forward);
-                assert_eq!(state, rshare_input::ButtonState::Released);
-            }
-            _ => panic!("Wrong input event"),
-        }
-    }
-
-    #[test]
-    fn remote_gamepad_message_maps_to_input_event() {
-        let event = message_to_input_event(rshare_core::Message::GamepadState {
-            state: rshare_core::GamepadState::neutral(0, 9, 456),
-        })
-        .unwrap();
-
-        match event {
-            rshare_input::InputEvent::GamepadState { state } => {
-                assert_eq!(state.gamepad_id, 0);
-                assert_eq!(state.sequence, 9);
-                assert_eq!(state.timestamp_ms, 456);
-            }
-            _ => panic!("Wrong input event"),
-        }
-    }
-
-    #[test]
-    fn non_input_message_is_not_injected() {
-        let event = message_to_input_event(rshare_core::Message::Heartbeat {
-            sequence: 1,
-            timestamp: 2,
-        });
-
-        assert!(event.is_none());
     }
 
     // Alpha-2 layout-driven routing tests

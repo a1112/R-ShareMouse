@@ -23,7 +23,6 @@ pub enum LaneDiscriminator {
     Control = 3,
     Bulk = 4,
     Telemetry = 5,
-    ReliableCompat = 6,
 }
 
 #[derive(Debug, Clone)]
@@ -42,16 +41,10 @@ pub struct BulkFrame {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReliableCompatFrame {
-    message: Message,
-}
-
-#[derive(Debug, Clone)]
 pub enum ClassifiedMessage {
     Control(ControlFrame),
     Bulk(BulkFrame),
     Telemetry(TelemetryFrame),
-    ReliableCompat(ReliableCompatFrame),
     Unsupported,
 }
 
@@ -65,8 +58,6 @@ impl TryFrom<Message> for ClassifiedMessage {
             | Message::Heartbeat { .. }
             | Message::Ack { .. }
             | Message::Error { .. }
-            | Message::ScreenEnter { .. }
-            | Message::ScreenLeave { .. }
             | Message::ScreenUpdate { .. }) => Self::Control(ControlFrame { message }),
             message @ (Message::InputDiagnostic { .. }
             | Message::EndpointEventSubscribe { .. }
@@ -93,19 +84,9 @@ impl TryFrom<Message> for ClassifiedMessage {
             | Message::UsbFlowControl { .. }
             | Message::ClipboardData { .. }
             | Message::ClipboardResponse { .. }) => Self::Bulk(BulkFrame { message }),
-            message @ (Message::MouseButton { .. }
-            | Message::MouseWheel { .. }
-            | Message::Key { .. }
-            | Message::KeyExtended { .. }
-            | Message::GamepadConnected { .. }
-            | Message::GamepadDisconnected { .. }) => {
-                Self::ReliableCompat(ReliableCompatFrame { message })
+            Message::Hello { .. } | Message::HelloBack { .. } | Message::HelloRejected { .. } => {
+                Self::Unsupported
             }
-            Message::Hello { .. }
-            | Message::HelloBack { .. }
-            | Message::HelloRejected { .. }
-            | Message::MouseMove { .. }
-            | Message::GamepadState { .. } => Self::Unsupported,
         })
     }
 }
@@ -328,7 +309,6 @@ struct PeerTransportInner {
     reliable_tx: mpsc::Sender<ReliableInputFrame>,
     emergency_tx: mpsc::Sender<ReliableInputFrame>,
     control_tx: mpsc::Sender<AwaitedFrame<ControlFrame>>,
-    reliable_compat_tx: mpsc::Sender<AwaitedFrame<ReliableCompatFrame>>,
     bulk_tx: mpsc::Sender<AwaitedFrame<BulkFrame>>,
     telemetry_tx: mpsc::Sender<TelemetryFrame>,
     epoch_state: Mutex<SenderEpochState>,
@@ -398,7 +378,6 @@ impl PeerTransportHandle {
         let (reliable_tx, reliable_rx) = mpsc::channel(256);
         let (emergency_tx, emergency_rx) = mpsc::channel(1);
         let (control_tx, control_rx) = mpsc::channel(64);
-        let (reliable_compat_tx, reliable_compat_rx) = mpsc::channel(128);
         let (bulk_tx, bulk_rx) = mpsc::channel(8);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
         let (reliable_cancelled_through_tx, reliable_cancelled_through_rx) = watch::channel(None);
@@ -410,7 +389,6 @@ impl PeerTransportHandle {
             reliable_tx,
             emergency_tx,
             control_tx,
-            reliable_compat_tx,
             bulk_tx,
             telemetry_tx,
             epoch_state: Mutex::new(SenderEpochState::default()),
@@ -448,14 +426,6 @@ impl PeerTransportHandle {
             connection.clone(),
             emergency_rx,
             worker_count.clone(),
-        );
-        spawn_awaited_writer(
-            connection.clone(),
-            LaneDiscriminator::ReliableCompat,
-            reliable_compat_rx,
-            ReliableCompatFrame::into_message,
-            worker_count.clone(),
-            awaited_write_probes.clone(),
         );
         spawn_awaited_writer(
             connection.clone(),
@@ -605,13 +575,6 @@ impl PeerTransportHandle {
 
     pub async fn send_control(&self, frame: ControlFrame) -> Result<(), TransportSendError> {
         send_awaited(&self.inner.control_tx, frame).await
-    }
-
-    pub(crate) async fn send_reliable_compat(
-        &self,
-        frame: ReliableCompatFrame,
-    ) -> Result<(), TransportSendError> {
-        send_awaited(&self.inner.reliable_compat_tx, frame).await
     }
 
     pub async fn send_bulk(&self, frame: BulkFrame) -> Result<(), TransportSendError> {
@@ -872,12 +835,6 @@ impl TelemetryFrame {
 
     fn into_message(self) -> Message {
         self.message
-    }
-}
-
-impl ReliableCompatFrame {
-    fn into_message(self) -> Result<Message, TransportSendError> {
-        Ok(self.message)
     }
 }
 
@@ -1545,49 +1502,6 @@ impl ConnectionRegistry {
         results
     }
 
-    pub(crate) async fn broadcast_reliable_compat(
-        &self,
-        frame: ReliableCompatFrame,
-    ) -> Vec<(DeviceId, Result<(), TransportSendError>)> {
-        let mut sends = FuturesUnordered::new();
-        for (device_id, peer) in self.snapshot() {
-            let frame = frame.clone();
-            sends
-                .push(async move { (device_id, peer.transport.send_reliable_compat(frame).await) });
-        }
-        let mut results = Vec::new();
-        while let Some(result) = sends.next().await {
-            results.push(result);
-        }
-        results
-    }
-
-    pub(crate) async fn broadcast_reliable_compat_with_generation(
-        &self,
-        frame: ReliableCompatFrame,
-    ) -> Vec<(
-        DeviceId,
-        ControlConnectionId,
-        Result<(), TransportSendError>,
-    )> {
-        let mut sends = FuturesUnordered::new();
-        for (device_id, peer) in self.snapshot() {
-            let frame = frame.clone();
-            sends.push(async move {
-                (
-                    device_id,
-                    peer.auth.control_connection_id,
-                    peer.transport.send_reliable_compat(frame).await,
-                )
-            });
-        }
-        let mut results = Vec::new();
-        while let Some(result) = sends.next().await {
-            results.push(result);
-        }
-        results
-    }
-
     pub fn broadcast_telemetry(
         &self,
         frame: TelemetryFrame,
@@ -1661,7 +1575,6 @@ fn fixture_handle(
     let (reliable_tx, reliable_rx) = mpsc::channel(reliable_capacity);
     let (emergency_tx, mut emergency_rx) = mpsc::channel::<ReliableInputFrame>(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
-    let (reliable_compat_tx, _reliable_compat_rx) = mpsc::channel(1);
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
     let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
@@ -1690,7 +1603,6 @@ fn fixture_handle(
                 reliable_tx,
                 emergency_tx,
                 control_tx,
-                reliable_compat_tx,
                 bulk_tx,
                 telemetry_tx,
                 epoch_state: Mutex::new(SenderEpochState::default()),
@@ -1762,7 +1674,6 @@ fn fixture_handle_with_stalled_emergency() -> (
     let (reliable_tx, reliable_rx) = mpsc::channel(1);
     let (emergency_tx, emergency_rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
-    let (reliable_compat_tx, _reliable_compat_rx) = mpsc::channel(1);
     let (bulk_tx, _bulk_rx) = mpsc::channel(1);
     let (telemetry_tx, _telemetry_rx) = mpsc::channel(1);
     let (release_tx, release_rx) = mpsc::channel(4);
@@ -1776,7 +1687,6 @@ fn fixture_handle_with_stalled_emergency() -> (
                 reliable_tx,
                 emergency_tx,
                 control_tx,
-                reliable_compat_tx,
                 bulk_tx,
                 telemetry_tx,
                 epoch_state: Mutex::new(SenderEpochState::default()),
@@ -2050,15 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_compatibility_messages_have_explicit_closed_lanes() {
-        assert!(matches!(
-            ClassifiedMessage::try_from(Message::Key {
-                keycode: 0x41,
-                state: KeyState::Pressed,
-            })
-            .unwrap(),
-            ClassifiedMessage::ReliableCompat(_)
-        ));
+    fn non_input_messages_have_explicit_qos_lanes() {
         assert!(matches!(
             ClassifiedMessage::try_from(Message::ClipboardData {
                 mime_type: "text/plain".into(),

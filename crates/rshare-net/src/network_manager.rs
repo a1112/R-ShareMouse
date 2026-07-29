@@ -292,6 +292,11 @@ impl NetworkManager {
         }
     }
 
+    /// Shared generation-aware registry used by the daemon's input actor.
+    pub fn input_registry(&self) -> Arc<ConnectionRegistry> {
+        self.qos_registry.clone()
+    }
+
     /// Get all discovered devices
     pub async fn discovered_devices(&self) -> Vec<DiscoveredDevice> {
         self.discovered_devices
@@ -353,12 +358,6 @@ impl NetworkManager {
                         .record_send_success(device_id, generation);
                     return Ok(());
                 }
-                ClassifiedMessage::ReliableCompat(frame) => {
-                    peer.transport.send_reliable_compat(frame).await?;
-                    self.connection_view
-                        .record_send_success(device_id, generation);
-                    return Ok(());
-                }
                 ClassifiedMessage::Unsupported => {}
             }
         }
@@ -400,20 +399,6 @@ impl NetworkManager {
             }
             ClassifiedMessage::Telemetry(frame) if !self.qos_registry.is_empty() => {
                 let results = self.qos_registry.broadcast_telemetry_with_generation(frame);
-                record_qos_broadcast_successes(&self.connection_view, &results);
-                if let Some((id, error)) = results
-                    .into_iter()
-                    .find_map(|(id, _, result)| result.err().map(|error| (id, error)))
-                {
-                    anyhow::bail!("QoS broadcast to {id} failed: {error}");
-                }
-                return Ok(());
-            }
-            ClassifiedMessage::ReliableCompat(frame) if !self.qos_registry.is_empty() => {
-                let results = self
-                    .qos_registry
-                    .broadcast_reliable_compat_with_generation(frame)
-                    .await;
                 record_qos_broadcast_successes(&self.connection_view, &results);
                 if let Some((id, error)) = results
                     .into_iter()
@@ -653,7 +638,14 @@ mod tests {
 
         let send = tokio::spawn(async move {
             manager
-                .send_to(&remote_id, Message::MouseMove { x: 29, y: 31 })
+                .send_to(
+                    &remote_id,
+                    Message::HelloRejected {
+                        app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                        device_id: remote_id,
+                        reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                    },
+                )
                 .await
         });
         let old_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -747,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_realtime_send_does_not_wait_for_outer_connection_manager_lock() {
+    async fn message_send_does_not_wait_for_outer_connection_manager_lock() {
         let mut manager = NetworkManager::isolated_for_test(
             DeviceId::new_v4(),
             "Test".to_string(),
@@ -758,10 +750,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            manager.send_to(&DeviceId::new_v4(), Message::MouseMove { x: 10, y: 20 }),
+            manager.send_to(
+                &DeviceId::new_v4(),
+                Message::Heartbeat {
+                    sequence: 10,
+                    timestamp: 20,
+                },
+            ),
         )
         .await
-        .expect("legacy realtime send must bypass the lifecycle manager lock");
+        .expect("message send must bypass the lifecycle manager lock");
         assert!(
             result.is_err(),
             "missing peer must still report send failure"
@@ -1055,26 +1053,46 @@ mod tests {
             .to_string();
 
         let mut retained_clients = Vec::new();
-        let mut retained_ids = Vec::new();
+        let mut retained_generations = HashMap::new();
         for _ in 0..32 {
             let client_id = DeviceId::new_v4();
             let mut client = ConnectionManager::isolated_for_test(client_id);
             client.connect(server_id, &address).await.unwrap();
-            retained_ids.push(client_id);
+            let connected = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(NetworkEvent::DeviceConnected(auth)) if auth.peer_id == client_id => {
+                            break auth;
+                        }
+                        Some(NetworkEvent::ConnectionError {
+                            peer_id: Some(peer_id),
+                            error,
+                            ..
+                        }) if peer_id == client_id => {
+                            panic!("retained peer {client_id} failed before publication: {error}");
+                        }
+                        Some(_) => {}
+                        None => panic!("network event channel closed before peer publication"),
+                    }
+                }
+            })
+            .await
+            .expect("each retained peer must publish its generation-aware connected event");
+            assert!(retained_generations
+                .insert(client_id, connected.control_connection_id)
+                .is_none());
             retained_clients.push(client);
         }
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while authenticated_peers.len() != 32 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the public authenticated peer queue must contain exactly its 32 entries");
+        assert_eq!(
+            authenticated_peers.len(),
+            32,
+            "every connected publication must already have reserved and filled its public peer slot"
+        );
 
         let overflow_id = DeviceId::new_v4();
         let mut overflow_client = ConnectionManager::isolated_for_test(overflow_id);
         overflow_client.connect(server_id, &address).await.unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), async {
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(NetworkEvent::ConnectionError {
                     peer_id: Some(peer_id),
@@ -1104,14 +1122,19 @@ mod tests {
             "overflow generation must fail before registry publication"
         );
         assert_eq!(authenticated_peers.len(), 32);
-        let mut published_ids = Vec::new();
+        let mut published_generations = HashMap::new();
         while let Ok(peer) = authenticated_peers.try_recv() {
-            published_ids.push(peer.auth.peer_id);
+            assert!(
+                published_generations
+                    .insert(peer.auth.peer_id, peer.auth.control_connection_id)
+                    .is_none(),
+                "one public entry is allowed per retained peer generation"
+            );
         }
-        assert_eq!(published_ids.len(), 32);
-        assert!(!published_ids.contains(&overflow_id));
-        for retained_id in retained_ids {
-            assert!(published_ids.contains(&retained_id));
+        assert_eq!(published_generations.len(), 32);
+        assert!(!published_generations.contains_key(&overflow_id));
+        for (retained_id, generation) in retained_generations {
+            assert_eq!(published_generations.get(&retained_id), Some(&generation));
             assert!(manager.is_connected(&retained_id).await);
         }
         drop(retained_clients);

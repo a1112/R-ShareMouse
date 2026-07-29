@@ -15,6 +15,7 @@ use rshare_core::{
 };
 use smallvec::{smallvec, SmallVec};
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::{ButtonState, InjectBackend, InputEvent, KeyCode, MouseButton};
 
@@ -97,6 +98,26 @@ pub enum InjectionShutdownError {
     WorkerPanicked,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TrustedLocalInjectionError {
+    #[error("the trusted-local injection queue is full")]
+    QueueFull,
+    #[error("the injection actor is shutting down")]
+    ShuttingDown,
+    #[error("the injection actor stopped before acknowledging the event")]
+    WorkerStopped,
+    #[error("the injection backend rejected the event: {0}")]
+    Backend(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct InjectionBackendSnapshot {
+    pub kind: rshare_core::BackendKind,
+    pub health: rshare_core::BackendHealth,
+    pub active: bool,
+    pub text_commit_supported: bool,
+}
+
 /// Most recent receiver-side injection timing sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InjectionTimingSample {
@@ -116,6 +137,7 @@ pub struct InputInjectionHandle {
 struct ActorInner {
     queue: Arc<InjectionQueue>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    backend: Arc<Mutex<InjectionBackendSnapshot>>,
 }
 
 impl InputInjectionHandle {
@@ -127,6 +149,12 @@ impl InputInjectionHandle {
             return Err(InjectionStartError::ZeroReliableCapacity);
         }
 
+        let backend_snapshot = Arc::new(Mutex::new(InjectionBackendSnapshot {
+            kind: backend.kind(),
+            health: backend.health(),
+            active: backend.is_active(),
+            text_commit_supported: backend.supports_text_commit(),
+        }));
         let clock = LocalMonotonicClock::new();
         let queue = Arc::new(InjectionQueue {
             state: Mutex::new(QueueState::new(config.reliable_capacity)),
@@ -137,17 +165,47 @@ impl InputInjectionHandle {
             realtime_coalesce_window: config.realtime_coalesce_window,
         });
         let worker_queue = Arc::clone(&queue);
+        let worker_backend_snapshot = backend_snapshot.clone();
         let worker = thread::Builder::new()
             .name(config.thread_name)
-            .spawn(move || run_worker(worker_queue, backend))
+            .spawn(move || run_worker(worker_queue, backend, worker_backend_snapshot))
             .map_err(InjectionStartError::Spawn)?;
 
         Ok(Self {
             inner: Arc::new(ActorInner {
                 queue,
                 worker: Mutex::new(Some(worker)),
+                backend: backend_snapshot,
             }),
         })
+    }
+
+    pub fn backend_snapshot(&self) -> InjectionBackendSnapshot {
+        self.inner.backend.lock().unwrap().clone()
+    }
+
+    pub async fn inject_trusted_local(
+        &self,
+        event: InputEvent,
+    ) -> Result<(), TrustedLocalInjectionError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        {
+            let mut state = self.inner.queue.state.lock().unwrap();
+            if state.shutdown {
+                return Err(TrustedLocalInjectionError::ShuttingDown);
+            }
+            if state.trusted_local.len() >= state.reliable_capacity {
+                return Err(TrustedLocalInjectionError::QueueFull);
+            }
+            state
+                .trusted_local
+                .push_back(TrustedLocalCommand { event, result_tx });
+            self.inner.queue.changed.notify_one();
+        }
+        result_rx
+            .await
+            .map_err(|_| TrustedLocalInjectionError::WorkerStopped)?
+            .map_err(TrustedLocalInjectionError::Backend)
     }
 
     pub fn begin_session(
@@ -348,6 +406,47 @@ impl InputInjectionHandle {
         }
     }
 
+    /// Release both authenticated-remote and trusted-local pressed state.
+    ///
+    /// This safety path owns one reserved, coalesced slot outside the ordinary
+    /// and control queues, so repeated OS lifecycle notifications remain
+    /// bounded even while input queues are saturated.
+    pub fn request_release_all_sources(&self, reason: ReleaseAllReason) {
+        let mut state = self.inner.queue.state.lock().unwrap();
+        if state.shutdown {
+            return;
+        }
+        if let Some(active) = state.active.as_mut() {
+            active.closed = true;
+        }
+        state.clear_ordinary();
+        state.controls.clear();
+        reject_trusted_local(&mut state);
+        if state.release_all_sources.is_none() {
+            state.release_all_sources = Some(reason);
+        }
+        self.inner.queue.changed.notify_one();
+    }
+
+    /// Apply a generation-scoped cumulative terminal-release high-water.
+    ///
+    /// A delayed release for an older epoch must never close a newer epoch on
+    /// the same authenticated connection generation.
+    pub fn request_release_through(
+        &self,
+        owner: AuthenticatedInputOwner,
+        epoch: SessionEpoch,
+        reason: ReleaseAllReason,
+    ) {
+        let mut state = self.inner.queue.state.lock().unwrap();
+        if let Some(active) = state.active {
+            if active.key.owner == owner && active.key.epoch.0 <= epoch.0 {
+                close_admission(&mut state, active.key, reason);
+                self.inner.queue.changed.notify_one();
+            }
+        }
+    }
+
     pub fn latest_timing(&self) -> Option<InjectionTimingSample> {
         self.inner
             .queue
@@ -408,6 +507,7 @@ impl InputInjectionHandle {
             let mut state = self.inner.queue.state.lock().unwrap();
             state.shutdown = true;
             state.clear_ordinary();
+            reject_trusted_local(&mut state);
             self.inner.queue.changed.notify_one();
         }
         worker
@@ -424,12 +524,21 @@ impl Drop for ActorInner {
                 let mut state = self.queue.state.lock().unwrap();
                 state.shutdown = true;
                 state.clear_ordinary();
+                reject_trusted_local(&mut state);
                 self.queue.changed.notify_one();
             }
             // Dropping a JoinHandle detaches it. Explicit `shutdown` remains
             // available when a caller needs a synchronous join.
             drop(worker);
         }
+    }
+}
+
+fn reject_trusted_local(state: &mut QueueState) {
+    for command in state.trusted_local.drain(..) {
+        let _ = command
+            .result_tx
+            .send(Err("injection actor is shutting down".to_owned()));
     }
 }
 
@@ -496,6 +605,8 @@ impl TimingState {
 struct QueueState {
     active: Option<AdmissionSession>,
     controls: VecDeque<ControlCommand>,
+    release_all_sources: Option<ReleaseAllReason>,
+    trusted_local: VecDeque<TrustedLocalCommand>,
     ordinary: VecDeque<QueuedInput>,
     reliable_len: usize,
     reliable_capacity: usize,
@@ -507,6 +618,8 @@ impl QueueState {
         Self {
             active: None,
             controls: VecDeque::new(),
+            release_all_sources: None,
+            trusted_local: VecDeque::with_capacity(reliable_capacity),
             ordinary: VecDeque::with_capacity(
                 reliable_capacity.saturating_mul(2).saturating_add(1),
             ),
@@ -546,6 +659,11 @@ enum ControlCommand {
         key: SessionKey,
         reason: ReleaseAllReason,
     },
+}
+
+struct TrustedLocalCommand {
+    event: InputEvent,
+    result_tx: oneshot::Sender<Result<(), String>>,
 }
 
 struct QueuedRealtime {
@@ -719,29 +837,46 @@ struct WorkerSession {
 
 enum WorkItem {
     Control(ControlCommand),
+    ReleaseAllSources(ReleaseAllReason),
+    TrustedLocal(TrustedLocalCommand),
     Realtime(QueuedRealtime),
     Reliable(QueuedReliable),
     LeaseExpired(SessionKey),
     Shutdown,
 }
 
-fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
+fn run_worker(
+    queue: Arc<InjectionQueue>,
+    mut backend: Box<dyn InjectBackend>,
+    backend_snapshot: Arc<Mutex<InjectionBackendSnapshot>>,
+) {
     let mut session: Option<WorkerSession> = None;
-    let mut ledger = PressedStateLedger::new();
+    let mut remote_ledger = PressedStateLedger::new();
+    let mut trusted_ledger = PressedStateLedger::new();
     let mut gamepads: HashMap<u8, GamepadState> = HashMap::new();
+    let mut local_pointer = (0, 0);
 
     loop {
         let item = next_work_item(&queue, session.as_ref());
         match item {
             WorkItem::Shutdown => {
-                release_held(&mut *backend, &mut ledger, ReleaseAllReason::SessionEnded);
+                release_held(
+                    &mut *backend,
+                    &mut remote_ledger,
+                    ReleaseAllReason::SessionEnded,
+                );
+                release_held(
+                    &mut *backend,
+                    &mut trusted_ledger,
+                    ReleaseAllReason::SessionEnded,
+                );
                 return;
             }
             WorkItem::Control(ControlCommand::Begin { key }) => {
                 if session.as_ref().is_some_and(|current| current.key != key) {
                     release_held(
                         &mut *backend,
-                        &mut ledger,
+                        &mut remote_ledger,
                         ReleaseAllReason::OwnershipTransfer,
                     );
                 }
@@ -754,17 +889,58 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
             }
             WorkItem::Control(ControlCommand::Close { key, reason }) => {
                 if session.as_ref().is_some_and(|current| current.key == key) {
-                    release_held(&mut *backend, &mut ledger, reason);
+                    release_held(&mut *backend, &mut remote_ledger, reason);
                     session = None;
                     gamepads.clear();
                 }
             }
+            WorkItem::ReleaseAllSources(reason) => {
+                release_held(&mut *backend, &mut remote_ledger, reason);
+                release_held(&mut *backend, &mut trusted_ledger, reason);
+                session = None;
+                gamepads.clear();
+            }
             WorkItem::LeaseExpired(key) => {
                 if session.as_ref().is_some_and(|current| current.key == key) {
-                    release_held(&mut *backend, &mut ledger, ReleaseAllReason::Timeout);
+                    release_held(&mut *backend, &mut remote_ledger, ReleaseAllReason::Timeout);
                     session = None;
                     gamepads.clear();
                 }
+            }
+            WorkItem::TrustedLocal(command) => {
+                let event = command.event;
+                let result = backend.inject(event.clone());
+                update_backend_snapshot(&*backend, &backend_snapshot);
+                if result.is_ok() {
+                    if record_trusted_local_ledger(&mut trusted_ledger, &event, &mut local_pointer)
+                        .is_err()
+                    {
+                        release_held(
+                            &mut *backend,
+                            &mut trusted_ledger,
+                            ReleaseAllReason::BackendFailure,
+                        );
+                        release_held(
+                            &mut *backend,
+                            &mut remote_ledger,
+                            ReleaseAllReason::BackendFailure,
+                        );
+                    }
+                } else {
+                    release_held(
+                        &mut *backend,
+                        &mut trusted_ledger,
+                        ReleaseAllReason::BackendFailure,
+                    );
+                    release_held(
+                        &mut *backend,
+                        &mut remote_ledger,
+                        ReleaseAllReason::BackendFailure,
+                    );
+                }
+                let _ = command
+                    .result_tx
+                    .send(result.map_err(|error| error.to_string()));
             }
             WorkItem::Realtime(queued) => {
                 let Some(current) = session.as_mut() else {
@@ -802,7 +978,12 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
                     completed,
                 );
                 if result.is_err() {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut ledger);
+                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    release_held(
+                        &mut *backend,
+                        &mut trusted_ledger,
+                        ReleaseAllReason::BackendFailure,
+                    );
                     session = None;
                     gamepads.clear();
                 } else {
@@ -819,7 +1000,12 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
                     queued.frame.sequence,
                 );
                 if !matches!(accepted, AcceptReliable::Accepted) {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut ledger);
+                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    release_held(
+                        &mut *backend,
+                        &mut trusted_ledger,
+                        ReleaseAllReason::BackendFailure,
+                    );
                     session = None;
                     gamepads.clear();
                     continue;
@@ -828,7 +1014,7 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
                 let started = queue.clock.now();
                 let result = inject_reliable(
                     &mut *backend,
-                    &mut ledger,
+                    &mut remote_ledger,
                     &mut gamepads,
                     current,
                     queued.frame.event,
@@ -844,7 +1030,12 @@ fn run_worker(queue: Arc<InjectionQueue>, mut backend: Box<dyn InjectBackend>) {
                     completed,
                 );
                 if result.is_err() {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut ledger);
+                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    release_held(
+                        &mut *backend,
+                        &mut trusted_ledger,
+                        ReleaseAllReason::BackendFailure,
+                    );
                     session = None;
                     gamepads.clear();
                 }
@@ -858,6 +1049,9 @@ fn next_work_item(queue: &InjectionQueue, session: Option<&WorkerSession>) -> Wo
     loop {
         if state.shutdown {
             return WorkItem::Shutdown;
+        }
+        if let Some(reason) = state.release_all_sources.take() {
+            return WorkItem::ReleaseAllSources(reason);
         }
         if let Some(control) = state.controls.pop_front() {
             return WorkItem::Control(control);
@@ -878,6 +1072,9 @@ fn next_work_item(queue: &InjectionQueue, session: Option<&WorkerSession>) -> Wo
                 }
                 return WorkItem::LeaseExpired(current.key);
             }
+        }
+        if let Some(command) = state.trusted_local.pop_front() {
+            return WorkItem::TrustedLocal(command);
         }
 
         if let Some(prefix) = split_front_relative_for_late_anchor(&mut state) {
@@ -1047,6 +1244,54 @@ fn group_representable_relative_components(components: RelativeComponents) -> Re
         groups.push(current);
     }
     groups
+}
+
+fn update_backend_snapshot(
+    backend: &dyn InjectBackend,
+    snapshot: &Mutex<InjectionBackendSnapshot>,
+) {
+    let mut snapshot = snapshot.lock().unwrap();
+    snapshot.kind = backend.kind();
+    snapshot.health = backend.health();
+    snapshot.active = backend.is_active();
+    snapshot.text_commit_supported = backend.supports_text_commit();
+}
+
+fn record_trusted_local_ledger(
+    ledger: &mut PressedStateLedger,
+    event: &InputEvent,
+    pointer: &mut (i32, i32),
+) -> Result<(), rshare_core::PressedStateLedgerError> {
+    match event {
+        InputEvent::MouseMove { x, y } => {
+            *pointer = (*x, *y);
+        }
+        InputEvent::MouseButton { button, state } => {
+            ledger.record_mouse_button(
+                WireMouseButton::from_code(button.to_code()),
+                if state.is_pressed() {
+                    WireButtonState::Pressed
+                } else {
+                    WireButtonState::Released
+                },
+                pointer.0,
+                pointer.1,
+                0,
+            )?;
+        }
+        InputEvent::Key { keycode, state } | InputEvent::KeyExtended { keycode, state, .. } => {
+            ledger.record_key(
+                keycode.to_raw(),
+                if state.is_pressed() {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                },
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn inject_realtime(

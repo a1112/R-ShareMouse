@@ -3,8 +3,10 @@
 use crate::events::{
     GamepadButton, GamepadButtonState, GamepadDeviceInfo, GamepadState, InputEvent,
 };
-use crate::ingress::{CapturedInputPayload, ContinuousInput, GamepadAxes};
-use crate::listener::InputEventChannel;
+use crate::ingress::{
+    CaptureOrigin, CaptureSource, CapturedInputPayload, ContinuousInput, GamepadAxes, PushOutcome,
+    SemanticInputProducer,
+};
 use anyhow::Result;
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 use std::collections::{BTreeSet, HashMap};
@@ -44,19 +46,28 @@ impl From<&rshare_core::GamepadConfig> for GamepadListenerConfig {
     }
 }
 
-/// Background gamepad listener that forwards snapshots to an input event channel.
+/// Background gamepad listener that publishes directly into semantic ingress.
 pub struct GilrsGamepadListener {
     config: GamepadListenerConfig,
-    channel: InputEventChannel,
+    producer: SemanticInputProducer,
+    origin: CaptureOrigin,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl GilrsGamepadListener {
-    pub fn new(channel: InputEventChannel, config: GamepadListenerConfig) -> Self {
+    pub fn new(
+        producer: SemanticInputProducer,
+        origin: CaptureOrigin,
+        config: GamepadListenerConfig,
+    ) -> Self {
         Self {
             config,
-            channel,
+            producer,
+            origin: CaptureOrigin {
+                source: CaptureSource::Gamepad,
+                ..origin
+            },
             running: Arc::new(AtomicBool::new(false)),
             thread: None,
         }
@@ -72,13 +83,14 @@ impl GilrsGamepadListener {
         }
 
         let running = self.running.clone();
-        let channel = self.channel.clone();
+        let producer = self.producer.clone();
+        let origin = self.origin;
         let config = self.config.clone();
 
         self.thread = Some(
             std::thread::Builder::new()
                 .name("rshare-gilrs-gamepad-listener".to_string())
-                .spawn(move || run_gamepad_loop(running, channel, config))
+                .spawn(move || run_gamepad_loop(running, producer, origin, config))
                 .map_err(|error| anyhow::anyhow!("Failed to spawn gamepad listener: {error}"))?,
         );
 
@@ -92,6 +104,11 @@ impl GilrsGamepadListener {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+
+    #[cfg(test)]
+    fn publish_for_test(&self, payload: CapturedInputPayload) -> PushOutcome {
+        publish_payload(&self.producer, self.origin, payload)
+    }
 }
 
 impl Drop for GilrsGamepadListener {
@@ -102,7 +119,8 @@ impl Drop for GilrsGamepadListener {
 
 fn run_gamepad_loop(
     running: Arc<AtomicBool>,
-    channel: InputEventChannel,
+    producer: SemanticInputProducer,
+    origin: CaptureOrigin,
     config: GamepadListenerConfig,
 ) {
     let mut gilrs = match Gilrs::new() {
@@ -129,14 +147,18 @@ fn run_gamepad_loop(
             vendor_id: gamepad.vendor_id(),
             product_id: gamepad.product_id(),
         };
-        let _ = channel.send(InputEvent::gamepad_connected(info));
+        let _ = publish_event(&producer, origin, InputEvent::gamepad_connected(info));
 
         let state = GamepadState::neutral(gamepad_id, 0, timestamp_ms());
         states.insert(gamepad_id, state.clone());
         last_sent_states.insert(gamepad_id, state.clone());
-        let _ = channel.send_payload(CapturedInputPayload::Continuous(
-            ContinuousInput::GamepadAxes(GamepadAxes::from(&state)),
-        ));
+        let _ = publish_payload(
+            &producer,
+            origin,
+            CapturedInputPayload::Continuous(ContinuousInput::GamepadAxes(GamepadAxes::from(
+                &state,
+            ))),
+        );
     }
 
     while running.load(Ordering::SeqCst) {
@@ -151,21 +173,29 @@ fn run_gamepad_loop(
         match event.event {
             EventType::Connected => {
                 if let Some(info) = gamepad_info(&gilrs, event.id, gamepad_id) {
-                    let _ = channel.send(InputEvent::gamepad_connected(info));
+                    let _ = publish_event(&producer, origin, InputEvent::gamepad_connected(info));
                 }
 
                 let state = GamepadState::neutral(gamepad_id, 0, timestamp_ms());
                 states.insert(gamepad_id, state.clone());
                 last_sent_states.insert(gamepad_id, state.clone());
-                let _ = channel.send_payload(CapturedInputPayload::Continuous(
-                    ContinuousInput::GamepadAxes(GamepadAxes::from(&state)),
-                ));
+                let _ = publish_payload(
+                    &producer,
+                    origin,
+                    CapturedInputPayload::Continuous(ContinuousInput::GamepadAxes(
+                        GamepadAxes::from(&state),
+                    )),
+                );
             }
             EventType::Disconnected => {
                 states.remove(&gamepad_id);
                 last_sent_at.remove(&gamepad_id);
                 last_sent_states.remove(&gamepad_id);
-                let _ = channel.send(InputEvent::gamepad_disconnected(gamepad_id));
+                let _ = publish_event(
+                    &producer,
+                    origin,
+                    InputEvent::gamepad_disconnected(gamepad_id),
+                );
             }
             EventType::ButtonPressed(button, _)
             | EventType::ButtonRepeated(button, _)
@@ -177,7 +207,8 @@ fn run_gamepad_loop(
                     .update_button(button, pressed)
                 {
                     send_state(
-                        &channel,
+                        &producer,
+                        origin,
                         state,
                         &mut last_sent_at,
                         &mut last_sent_states,
@@ -194,7 +225,8 @@ fn run_gamepad_loop(
                     .update_button(button, pressed)
                 {
                     send_state(
-                        &channel,
+                        &producer,
+                        origin,
                         state,
                         &mut last_sent_at,
                         &mut last_sent_states,
@@ -210,7 +242,8 @@ fn run_gamepad_loop(
                     .update_axis(axis, value, config.deadzone_basis_points)
                 {
                     send_state(
-                        &channel,
+                        &producer,
+                        origin,
                         state,
                         &mut last_sent_at,
                         &mut last_sent_states,
@@ -236,7 +269,8 @@ fn gamepad_info(gilrs: &Gilrs, id: GamepadId, gamepad_id: u8) -> Option<GamepadD
 }
 
 fn send_state(
-    channel: &InputEventChannel,
+    producer: &SemanticInputProducer,
+    origin: CaptureOrigin,
     state: &mut GamepadState,
     last_sent_at: &mut HashMap<u8, Instant>,
     last_sent_states: &mut HashMap<u8, GamepadState>,
@@ -260,10 +294,30 @@ fn send_state(
         .cloned()
         .unwrap_or_else(|| GamepadState::neutral(state.gamepad_id, 0, state.timestamp_ms));
     for payload in adapt_gamepad_snapshots(&previous, state) {
-        let _ = channel.send_payload(payload);
+        let _ = publish_payload(producer, origin, payload);
     }
     last_sent_at.insert(state.gamepad_id, now);
     last_sent_states.insert(state.gamepad_id, state.clone());
+}
+
+fn publish_event(
+    producer: &SemanticInputProducer,
+    origin: CaptureOrigin,
+    event: InputEvent,
+) -> PushOutcome {
+    publish_payload(
+        producer,
+        origin,
+        CapturedInputPayload::from_input_event(event),
+    )
+}
+
+fn publish_payload(
+    producer: &SemanticInputProducer,
+    origin: CaptureOrigin,
+    payload: CapturedInputPayload,
+) -> PushOutcome {
+    producer.try_push(producer.capture(origin, payload))
 }
 
 /// Split full gamepad snapshots into ordered reliable button transitions and
@@ -455,6 +509,31 @@ fn timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::{CaptureOrigin, CaptureSource, SemanticInputIngress};
+
+    #[tokio::test]
+    async fn production_listener_publishes_with_gamepad_origin() {
+        let (producer, mut consumer) = SemanticInputIngress::new(4);
+        let origin = CaptureOrigin {
+            source: CaptureSource::Gamepad,
+            device_token: 7,
+            instance_token: 11,
+        };
+        let listener = GilrsGamepadListener::new(
+            producer,
+            origin,
+            GamepadListenerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        listener.publish_for_test(CapturedInputPayload::Discrete(
+            InputEvent::gamepad_disconnected(3),
+        ));
+        let captured = consumer.recv().await.expect("gamepad event");
+        assert_eq!(captured.origin, origin);
+    }
 
     #[test]
     fn maps_standard_buttons_to_protocol_buttons() {

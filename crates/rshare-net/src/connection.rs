@@ -1128,10 +1128,6 @@ impl ConnectionManager {
                 peer.transport.try_send_telemetry(frame)?;
                 SelectedSendIdentity::Control(peer.auth.control_connection_id)
             }
-            (Some(peer), ClassifiedMessage::ReliableCompat(frame)) => {
-                peer.transport.send_reliable_compat(frame).await?;
-                SelectedSendIdentity::Control(peer.auth.control_connection_id)
-            }
             (_, ClassifiedMessage::Unsupported) | (None, _) => SelectedSendIdentity::Pool(
                 self.pool.send_to_with_identity(device_id, &message).await?,
             ),
@@ -1171,9 +1167,6 @@ impl ConnectionManager {
             }
             ClassifiedMessage::Telemetry(frame) => {
                 ensure_broadcast_success(self.qos_registry.broadcast_telemetry(frame))
-            }
-            ClassifiedMessage::ReliableCompat(frame) => {
-                ensure_broadcast_success(self.qos_registry.broadcast_reliable_compat(frame).await)
             }
             ClassifiedMessage::Unsupported => self.pool.broadcast(&message).await,
         }
@@ -1531,7 +1524,14 @@ mod tests {
         let connections = manager.connections.clone();
         let send = tokio::spawn(async move {
             manager
-                .send_to(&peer_id, Message::MouseMove { x: 9, y: 11 })
+                .send_to(
+                    &peer_id,
+                    Message::HelloRejected {
+                        app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                        device_id: peer_id,
+                        reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                    },
+                )
                 .await
         });
         let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -1606,7 +1606,14 @@ mod tests {
         let connections = manager.connections.clone();
         let send = tokio::spawn(async move {
             manager
-                .send_to(&peer_id, Message::MouseMove { x: 13, y: 17 })
+                .send_to(
+                    &peer_id,
+                    Message::HelloRejected {
+                        app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                        device_id: peer_id,
+                        reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                    },
+                )
                 .await
         });
         let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -1673,7 +1680,14 @@ mod tests {
         let next_generation = manager.next_generation.clone();
         let send = tokio::spawn(async move {
             manager
-                .send_to(&peer_id, Message::MouseMove { x: 19, y: 23 })
+                .send_to(
+                    &peer_id,
+                    Message::HelloRejected {
+                        app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                        device_id: peer_id,
+                        reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                    },
+                )
                 .await
         });
         let blocked_frame = tokio::time::timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -1826,7 +1840,10 @@ mod tests {
             remote_id,
             generation,
             messages,
-            Some(Message::MouseMove { x: 3, y: 5 }),
+            Some(Message::Heartbeat {
+                sequence: 3,
+                timestamp: 5,
+            }),
             manager.event_tx.clone(),
             manager.connections.clone(),
             manager.pool.clone(),

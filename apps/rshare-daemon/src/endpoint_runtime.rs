@@ -4,7 +4,7 @@ use rshare_core::{
     DeviceId, EndpointInjectError, EndpointInjectMode, EndpointInjectRequest, EndpointInjectResult,
     EndpointInjectTarget, LocalInputDiagnosticEvent, Message,
 };
-use rshare_input::InjectBackend;
+use rshare_input::InputInjectionHandle;
 use rshare_net::NetworkManager;
 use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio::time::Duration;
@@ -17,7 +17,7 @@ use crate::{
 
 pub(crate) async fn inject_endpoint_event(
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    injection: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     target: EndpointInjectTarget,
@@ -57,13 +57,13 @@ pub(crate) async fn inject_endpoint_event(
     };
 
     let (backend_kind, health, result) = {
-        let mut backend = inject_backend.lock().await;
-        let backend_kind = Some(backend.kind());
-        let health = backend.health();
+        let backend = injection.backend_snapshot();
+        let backend_kind = Some(backend.kind);
+        let health = backend.health;
         if matches!(
             request.mode,
             EndpointInjectMode::RequireHealthyBackend | EndpointInjectMode::TestLoopback
-        ) && !backend.is_active()
+        ) && !backend.active
         {
             (
                 backend_kind,
@@ -71,7 +71,14 @@ pub(crate) async fn inject_endpoint_event(
                 Err(anyhow::anyhow!("Input injection backend is not active.")),
             )
         } else {
-            (backend_kind, health, backend.inject(input_event))
+            (
+                backend_kind,
+                health,
+                injection
+                    .inject_trusted_local(input_event)
+                    .await
+                    .map_err(anyhow::Error::new),
+            )
         }
     };
 

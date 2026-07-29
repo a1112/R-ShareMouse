@@ -76,6 +76,18 @@ impl InputEventChannel {
         )
     }
 
+    /// Bind another capture adapter to an existing semantic ingress.
+    ///
+    /// Clones of this channel share the same bounded queue, clock and ordering
+    /// domain; no adapter-specific forwarding queue is introduced.
+    pub fn from_producer(producer: SemanticInputProducer, origin: CaptureOrigin) -> Self {
+        Self { producer, origin }
+    }
+
+    pub fn producer(&self) -> SemanticInputProducer {
+        self.producer.clone()
+    }
+
     /// Send an event
     pub fn send(&self, event: InputEvent) -> Result<()> {
         push_outcome_to_result(self.try_send(event))
@@ -143,7 +155,8 @@ impl Default for InputEventChannel {
 pub struct RDevInputListener {
     config: ListenerConfig,
     running: Arc<Mutex<bool>>,
-    channel: InputEventChannel,
+    producer: SemanticInputProducer,
+    origin: CaptureOrigin,
     _rx: Option<SemanticInputConsumer>,
     last_mouse_time: Arc<Mutex<Instant>>,
     last_mouse_pos: Arc<Mutex<Option<(i32, i32)>>>,
@@ -156,8 +169,27 @@ impl RDevInputListener {
         Self {
             config: ListenerConfig::default(),
             running: Arc::new(Mutex::new(false)),
-            channel,
+            producer: channel.producer(),
+            origin: CaptureOrigin::default(),
             _rx: Some(rx),
+            last_mouse_time: Arc::new(Mutex::new(Instant::now())),
+            last_mouse_pos: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Build the portable listener on the daemon's shared semantic ingress.
+    pub fn from_channel(channel: InputEventChannel) -> Self {
+        Self::from_producer(channel.producer(), channel.origin)
+    }
+
+    /// Build the portable listener directly on the daemon's semantic ingress.
+    pub fn from_producer(producer: SemanticInputProducer, origin: CaptureOrigin) -> Self {
+        Self {
+            config: ListenerConfig::default(),
+            running: Arc::new(Mutex::new(false)),
+            producer,
+            origin,
+            _rx: None,
             last_mouse_time: Arc::new(Mutex::new(Instant::now())),
             last_mouse_pos: Arc::new(Mutex::new(None)),
         }
@@ -176,7 +208,7 @@ impl RDevInputListener {
 
     /// Get a clone of the event channel
     pub fn channel(&self) -> InputEventChannel {
-        self.channel.clone()
+        InputEventChannel::from_producer(self.producer.clone(), self.origin)
     }
 
     /// Start listening
@@ -191,7 +223,8 @@ impl RDevInputListener {
         tracing::info!("RDev input listener starting");
 
         let running = self.running.clone();
-        let channel = self.channel.clone();
+        let producer = self.producer.clone();
+        let origin = self.origin;
         let config = self.config.clone();
         let last_mouse_time = self.last_mouse_time.clone();
         let last_mouse_pos = self.last_mouse_pos.clone();
@@ -224,7 +257,7 @@ impl RDevInputListener {
 
                             if should_send {
                                 let input_event = InputEvent::mouse_move(x as i32, y as i32);
-                                let _ = channel.send(input_event);
+                                let _ = producer.try_push_event(origin, input_event);
                             }
 
                             *last_mouse_pos.blocking_lock() = Some((x as i32, y as i32));
@@ -235,7 +268,7 @@ impl RDevInputListener {
                             let mouse_button = rdev_button_to_mouse_button(button);
                             let input_event =
                                 InputEvent::mouse_button(mouse_button, ButtonState::Pressed);
-                            let _ = channel.send(input_event);
+                            let _ = producer.try_push_event(origin, input_event);
                         }
                     }
                     EventType::ButtonRelease(button) => {
@@ -243,21 +276,21 @@ impl RDevInputListener {
                             let mouse_button = rdev_button_to_mouse_button(button);
                             let input_event =
                                 InputEvent::mouse_button(mouse_button, ButtonState::Released);
-                            let _ = channel.send(input_event);
+                            let _ = producer.try_push_event(origin, input_event);
                         }
                     }
                     EventType::Wheel { delta_x, delta_y } => {
                         if config.capture_mouse {
                             let input_event =
                                 InputEvent::mouse_wheel(delta_x as i32, delta_y as i32);
-                            let _ = channel.send(input_event);
+                            let _ = producer.try_push_event(origin, input_event);
                         }
                     }
                     EventType::KeyPress(key) => {
                         if config.capture_keyboard {
                             if let Some(key_code) = rdev_key_to_key_code(key) {
                                 let input_event = InputEvent::key(key_code, ButtonState::Pressed);
-                                let _ = channel.send(input_event);
+                                let _ = producer.try_push_event(origin, input_event);
                             }
                         }
                     }
@@ -265,7 +298,7 @@ impl RDevInputListener {
                         if config.capture_keyboard {
                             if let Some(key_code) = rdev_key_to_key_code(key) {
                                 let input_event = InputEvent::key(key_code, ButtonState::Released);
-                                let _ = channel.send(input_event);
+                                let _ = producer.try_push_event(origin, input_event);
                             }
                         }
                     }
@@ -297,7 +330,8 @@ impl RDevInputListener {
         tracing::info!("RDev input listener starting on background thread");
 
         let running = self.running.clone();
-        let channel = self.channel.clone();
+        let producer = self.producer.clone();
+        let origin = self.origin;
         let config = self.config.clone();
         let last_mouse_time = self.last_mouse_time.clone();
         let last_mouse_pos = self.last_mouse_pos.clone();
@@ -328,8 +362,10 @@ impl RDevInputListener {
                                 };
 
                                 if should_send {
-                                    let _ =
-                                        channel.send(InputEvent::mouse_move(x as i32, y as i32));
+                                    let _ = producer.try_push_event(
+                                        origin,
+                                        InputEvent::mouse_move(x as i32, y as i32),
+                                    );
                                 }
 
                                 *last_mouse_pos.blocking_lock() = Some((x as i32, y as i32));
@@ -338,40 +374,46 @@ impl RDevInputListener {
                         EventType::ButtonPress(button) => {
                             if config.capture_mouse {
                                 let mouse_button = rdev_button_to_mouse_button(button);
-                                let _ = channel.send(InputEvent::mouse_button(
-                                    mouse_button,
-                                    ButtonState::Pressed,
-                                ));
+                                let _ = producer.try_push_event(
+                                    origin,
+                                    InputEvent::mouse_button(mouse_button, ButtonState::Pressed),
+                                );
                             }
                         }
                         EventType::ButtonRelease(button) => {
                             if config.capture_mouse {
                                 let mouse_button = rdev_button_to_mouse_button(button);
-                                let _ = channel.send(InputEvent::mouse_button(
-                                    mouse_button,
-                                    ButtonState::Released,
-                                ));
+                                let _ = producer.try_push_event(
+                                    origin,
+                                    InputEvent::mouse_button(mouse_button, ButtonState::Released),
+                                );
                             }
                         }
                         EventType::Wheel { delta_x, delta_y } => {
                             if config.capture_mouse {
-                                let _ = channel
-                                    .send(InputEvent::mouse_wheel(delta_x as i32, delta_y as i32));
+                                let _ = producer.try_push_event(
+                                    origin,
+                                    InputEvent::mouse_wheel(delta_x as i32, delta_y as i32),
+                                );
                             }
                         }
                         EventType::KeyPress(key) => {
                             if config.capture_keyboard {
                                 if let Some(key_code) = rdev_key_to_key_code(key) {
-                                    let _ = channel
-                                        .send(InputEvent::key(key_code, ButtonState::Pressed));
+                                    let _ = producer.try_push_event(
+                                        origin,
+                                        InputEvent::key(key_code, ButtonState::Pressed),
+                                    );
                                 }
                             }
                         }
                         EventType::KeyRelease(key) => {
                             if config.capture_keyboard {
                                 if let Some(key_code) = rdev_key_to_key_code(key) {
-                                    let _ = channel
-                                        .send(InputEvent::key(key_code, ButtonState::Released));
+                                    let _ = producer.try_push_event(
+                                        origin,
+                                        InputEvent::key(key_code, ButtonState::Released),
+                                    );
                                 }
                             }
                         }

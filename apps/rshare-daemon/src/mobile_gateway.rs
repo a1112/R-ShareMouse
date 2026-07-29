@@ -4,13 +4,20 @@ use rshare_core::{
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LocalInputDiagnosticEvent,
     MobileAccessSnapshot,
 };
+#[cfg(test)]
 use rshare_input::InjectBackend;
+use rshare_input::InputInjectionHandle;
 use rshare_net::NetworkManager;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,6 +89,7 @@ struct HeldKeyIdentity(u64);
 struct MobileClientSession {
     last_sequence: u64,
     last_seen: Instant,
+    in_flight: Option<u64>,
     held_keys: BTreeMap<HeldKeyIdentity, rshare_input::KeyCode>,
     held_mouse_buttons: BTreeMap<u8, rshare_input::MouseButton>,
     last_mouse_position: (i32, i32),
@@ -91,6 +99,12 @@ struct MobileClientSession {
 struct MobileHeldOwnership {
     key_owners: BTreeMap<HeldKeyIdentity, BTreeSet<String>>,
     mouse_button_owners: BTreeMap<u8, BTreeSet<String>>,
+    reservations: BTreeMap<u64, MobileOwnershipReservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileOwnershipReservation {
+    client_id: String,
 }
 
 impl MobileClientSession {
@@ -98,6 +112,7 @@ impl MobileClientSession {
         Self {
             last_sequence: 0,
             last_seen: now,
+            in_flight: None,
             held_keys: BTreeMap::new(),
             held_mouse_buttons: BTreeMap::new(),
             last_mouse_position: (0, 0),
@@ -113,6 +128,7 @@ impl MobileClientSession {
 struct MobileClientSessions {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<MobileClientSession>>>>>,
     ownership: Arc<Mutex<MobileHeldOwnership>>,
+    next_operation_token: Arc<AtomicU64>,
     max_sessions: usize,
     held_input_lease: Duration,
 }
@@ -122,8 +138,20 @@ impl MobileClientSessions {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ownership: Arc::new(Mutex::new(MobileHeldOwnership::default())),
+            next_operation_token: Arc::new(AtomicU64::new(1)),
             max_sessions: max_sessions.max(1),
             held_input_lease,
+        }
+    }
+
+    fn next_operation_token(&self) -> u64 {
+        loop {
+            let token = self
+                .next_operation_token
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if token != 0 {
+                return token;
+            }
         }
     }
 
@@ -180,30 +208,48 @@ impl MobileClientSessions {
         &self,
         now: Instant,
         network_manager: &Arc<Mutex<NetworkManager>>,
-        inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+        inject_backend: &InputInjectionHandle,
         state: &Arc<RwLock<DaemonState>>,
         local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     ) {
         let sessions = self.snapshot().await;
+        let mut release_tasks = JoinSet::new();
 
         for (client_id, session) in &sessions {
-            let mut session = session.lock().await;
-            let elapsed = now
-                .checked_duration_since(session.last_seen)
-                .unwrap_or_default();
-            if elapsed < self.held_input_lease || !session.has_held_input() {
+            let expired = {
+                let session = session.lock().await;
+                let elapsed = now
+                    .checked_duration_since(session.last_seen)
+                    .unwrap_or_default();
+                elapsed >= self.held_input_lease && session.has_held_input()
+            };
+            if !expired {
                 continue;
             }
-            release_held_inputs(
-                client_id,
-                &mut session,
-                &self.ownership,
-                network_manager,
-                inject_backend,
-                state,
-                local_events_tx,
-            )
-            .await;
+            let client_id = client_id.clone();
+            let session = session.clone();
+            let sessions = self.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let state = state.clone();
+            let local_events_tx = local_events_tx.clone();
+            release_tasks.spawn(async move {
+                release_held_inputs(
+                    &client_id,
+                    &session,
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                )
+                .await;
+            });
+        }
+        while let Some(result) = release_tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!("mobile lease cleanup task failed: {error}");
+            }
         }
         drop(sessions);
 
@@ -214,16 +260,15 @@ impl MobileClientSessions {
     async fn release_all_held_inputs(
         &self,
         network_manager: &Arc<Mutex<NetworkManager>>,
-        inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+        inject_backend: &InputInjectionHandle,
         state: &Arc<RwLock<DaemonState>>,
         local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     ) {
         for (client_id, session) in self.snapshot().await {
-            let mut session = session.lock().await;
             release_held_inputs(
                 &client_id,
-                &mut session,
-                &self.ownership,
+                &session,
+                self,
                 network_manager,
                 inject_backend,
                 state,
@@ -245,19 +290,45 @@ impl MobileClientSessions {
 
 async fn release_held_inputs(
     client_id: &str,
-    session: &mut MobileClientSession,
-    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    session: &Arc<Mutex<MobileClientSession>>,
+    sessions: &MobileClientSessions,
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
 ) {
-    let mut ownership = ownership.lock().await;
-    let held_keys = session
-        .held_keys
-        .iter()
-        .map(|(identity, keycode)| (*identity, *keycode))
-        .collect::<Vec<_>>();
+    let token = sessions.next_operation_token();
+    let (previous_token, held_keys, held_buttons, last_mouse_position) = {
+        let mut session = session.lock().await;
+        let previous_token = session.in_flight.replace(token);
+        let held_keys = session
+            .held_keys
+            .iter()
+            .map(|(identity, keycode)| (*identity, *keycode))
+            .collect::<Vec<_>>();
+        let held_buttons = session
+            .held_mouse_buttons
+            .iter()
+            .map(|(identity, button)| (*identity, *button))
+            .collect::<Vec<_>>();
+        (
+            previous_token,
+            held_keys,
+            held_buttons,
+            session.last_mouse_position,
+        )
+    };
+    if let Some(previous_token) = previous_token {
+        let mut ownership = sessions.ownership.lock().await;
+        if ownership
+            .reservations
+            .get(&previous_token)
+            .is_some_and(|reservation| reservation.client_id == client_id)
+        {
+            ownership.reservations.remove(&previous_token);
+        }
+    }
+
     for (_identity, keycode) in held_keys {
         let request = lease_release_request(
             client_id,
@@ -267,10 +338,11 @@ async fn release_held_inputs(
                 state: "Released".to_string(),
             },
         );
-        let _ = process_mobile_request_locked(
+        let _ = process_reserved_mobile_request(
             client_id,
             session,
-            &mut ownership,
+            &sessions.ownership,
+            token,
             network_manager,
             inject_backend,
             state,
@@ -280,13 +352,8 @@ async fn release_held_inputs(
         .await;
     }
 
-    let held_buttons = session
-        .held_mouse_buttons
-        .iter()
-        .map(|(identity, button)| (*identity, *button))
-        .collect::<Vec<_>>();
     for (_identity, button) in held_buttons {
-        let (x, y) = session.last_mouse_position;
+        let (x, y) = last_mouse_position;
         let request = lease_release_request(
             client_id,
             EndpointEventKind::Mouse,
@@ -297,10 +364,11 @@ async fn release_held_inputs(
                 y,
             },
         );
-        let _ = process_mobile_request_locked(
+        let _ = process_reserved_mobile_request(
             client_id,
             session,
-            &mut ownership,
+            &sessions.ownership,
+            token,
             network_manager,
             inject_backend,
             state,
@@ -309,6 +377,7 @@ async fn release_held_inputs(
         )
         .await;
     }
+    end_mobile_operation(client_id, session, &sessions.ownership, token).await;
 }
 
 fn validate_mobile_client_id(client_id: &str) -> Result<()> {
@@ -522,7 +591,7 @@ pub(crate) async fn run_mobile_gateway_server(
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: InputInjectionHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -563,7 +632,7 @@ async fn run_mobile_gateway_server_on_listener(
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: InputInjectionHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
     limits: MobileGatewayLimits,
@@ -688,7 +757,7 @@ async fn handle_mobile_gateway_client(
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: InputInjectionHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
 ) -> Result<()> {
     let limits = MobileGatewayLimits::default();
@@ -713,7 +782,7 @@ async fn handle_mobile_gateway_client_with_context(
     access: MobileGatewayAccess,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
-    inject_backend: Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: InputInjectionHandle,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     sessions: MobileClientSessions,
     limits: MobileGatewayLimits,
@@ -933,55 +1002,253 @@ fn validate_mobile_sequence(sequence: u64) -> Result<()> {
     Ok(())
 }
 
-async fn process_mobile_request_locked(
+enum ReservedMobileRequest {
+    Noop(EndpointInjectRequest),
+    Inject {
+        request: EndpointInjectRequest,
+        held_transition: Option<MobileHeldTransition>,
+        provisional_press: Option<ProvisionalHeldPress>,
+        provisional_ownership: Option<ProvisionalMobileOwnership>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MobileSubmissionBarrier {
+    correlation_id: String,
+    reserved: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static MOBILE_SUBMISSION_BARRIER: OnceLock<StdMutex<Option<Arc<MobileSubmissionBarrier>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn mobile_submission_barrier() -> &'static StdMutex<Option<Arc<MobileSubmissionBarrier>>> {
+    MOBILE_SUBMISSION_BARRIER.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+async fn pause_mobile_submission_for_test(correlation_id: &str) {
+    let barrier = mobile_submission_barrier()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|barrier| barrier.correlation_id == correlation_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.reserved.notify_one();
+        barrier.resume.notified().await;
+    }
+}
+
+async fn begin_mobile_operation(
+    sessions: &MobileClientSessions,
+    session: &Arc<Mutex<MobileClientSession>>,
+    sequence: u64,
+    now: Instant,
+) -> Result<u64> {
+    let token = sessions.next_operation_token();
+    let mut session = session.lock().await;
+    if session.in_flight.is_some() {
+        bail!("mobile client already has an injection in flight");
+    }
+    accept_mobile_sequence(&mut session, sequence, now)?;
+    session.in_flight = Some(token);
+    Ok(token)
+}
+
+async fn reserve_mobile_request(
     client_id: &str,
-    session: &mut MobileClientSession,
-    ownership: &mut MobileHeldOwnership,
+    session: &Arc<Mutex<MobileClientSession>>,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    token: u64,
+    request: EndpointInjectRequest,
+) -> Result<ReservedMobileRequest> {
+    let held_transition = mobile_held_transition(&request)?;
+    let mut ownership = ownership.lock().await;
+    let mut session = session.lock().await;
+    if session.in_flight != Some(token) {
+        bail!("mobile injection operation was superseded");
+    }
+    validate_mobile_held_capacity(&session, held_transition)?;
+
+    if mobile_release_is_noop(&ownership, client_id, held_transition) {
+        apply_mobile_held_transition(&mut session, held_transition);
+        apply_mobile_ownership_transition(&mut ownership, client_id, held_transition);
+        return Ok(ReservedMobileRequest::Noop(request));
+    }
+
+    let provisional_press = provision_mobile_held_press(&mut session, held_transition);
+    let provisional_ownership =
+        provision_mobile_ownership_press(&mut ownership, client_id, held_transition);
+    ownership.reservations.insert(
+        token,
+        MobileOwnershipReservation {
+            client_id: client_id.to_string(),
+        },
+    );
+    Ok(ReservedMobileRequest::Inject {
+        request,
+        held_transition,
+        provisional_press,
+        provisional_ownership,
+    })
+}
+
+async fn process_reserved_mobile_request(
+    client_id: &str,
+    session: &Arc<Mutex<MobileClientSession>>,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    token: u64,
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     request: EndpointInjectRequest,
 ) -> Result<EndpointInjectResult> {
-    let held_transition = mobile_held_transition(&request)?;
-    validate_mobile_held_capacity(session, held_transition)?;
+    let reservation = reserve_mobile_request(client_id, session, ownership, token, request).await?;
+    let ReservedMobileRequest::Inject {
+        request,
+        held_transition,
+        provisional_press,
+        provisional_ownership,
+    } = reservation
+    else {
+        let ReservedMobileRequest::Noop(request) = reservation else {
+            unreachable!()
+        };
+        return Ok(accepted_mobile_noop(&request, inject_backend));
+    };
 
-    if mobile_release_is_noop(ownership, client_id, held_transition) {
-        apply_mobile_held_transition(session, held_transition);
-        apply_mobile_ownership_transition(ownership, client_id, held_transition);
-        return Ok(accepted_mobile_noop(&request, inject_backend).await);
-    }
+    #[cfg(test)]
+    pause_mobile_submission_for_test(&request.correlation_id).await;
 
-    let provisional_press = provision_mobile_held_press(session, held_transition);
-    let provisional_ownership =
-        provision_mobile_ownership_press(ownership, client_id, held_transition);
-    let result = inject_endpoint_event(
+    let result = submit_reserved_mobile_injection(
+        client_id,
+        session,
+        ownership,
+        token,
+        network_manager,
+        inject_backend,
+        state,
+        local_events_tx,
+        request,
+    )
+    .await?;
+    finish_mobile_request(
+        client_id,
+        session,
+        ownership,
+        token,
+        held_transition,
+        provisional_press,
+        provisional_ownership,
+        result.accepted,
+    )
+    .await;
+    Ok(result)
+}
+
+async fn submit_reserved_mobile_injection(
+    client_id: &str,
+    session: &Arc<Mutex<MobileClientSession>>,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    token: u64,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &InputInjectionHandle,
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    request: EndpointInjectRequest,
+) -> Result<EndpointInjectResult> {
+    let mut injection = Box::pin(inject_endpoint_event(
         network_manager,
         inject_backend,
         state,
         local_events_tx,
         EndpointInjectTarget::Local,
         request,
-    )
-    .await;
-    if result.accepted {
-        apply_mobile_held_transition(session, held_transition);
-        apply_mobile_ownership_transition(ownership, client_id, held_transition);
-    } else {
-        rollback_mobile_held_press(session, provisional_press);
-        rollback_mobile_ownership_press(ownership, client_id, provisional_ownership);
+    ));
+    let initial_poll = {
+        let ownership = ownership.lock().await;
+        let session = session.lock().await;
+        let reservation_matches = ownership
+            .reservations
+            .get(&token)
+            .is_some_and(|reservation| reservation.client_id == client_id);
+        if session.in_flight != Some(token) || !reservation_matches {
+            bail!("mobile injection operation was superseded before backend submission");
+        }
+
+        // The local endpoint future enqueues its trusted-local actor command before its first
+        // Pending. Polling once while the token is guarded closes the supersede/submit gap
+        // without retaining either mobile mutex while the backend acknowledgement is awaited.
+        let mut context = TaskContext::from_waker(std::task::Waker::noop());
+        injection.as_mut().poll(&mut context)
+    };
+
+    match initial_poll {
+        Poll::Ready(result) => Ok(result),
+        Poll::Pending => Ok(injection.await),
     }
-    Ok(result)
 }
 
-async fn accepted_mobile_noop(
+async fn finish_mobile_request(
+    client_id: &str,
+    session: &Arc<Mutex<MobileClientSession>>,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    token: u64,
+    held_transition: Option<MobileHeldTransition>,
+    provisional_press: Option<ProvisionalHeldPress>,
+    provisional_ownership: Option<ProvisionalMobileOwnership>,
+    accepted: bool,
+) {
+    let mut ownership = ownership.lock().await;
+    let mut session = session.lock().await;
+    let reservation_matches = ownership
+        .reservations
+        .get(&token)
+        .is_some_and(|reservation| reservation.client_id == client_id);
+    if session.in_flight != Some(token) || !reservation_matches {
+        return;
+    }
+    ownership.reservations.remove(&token);
+    if accepted {
+        apply_mobile_held_transition(&mut session, held_transition);
+        apply_mobile_ownership_transition(&mut ownership, client_id, held_transition);
+    } else {
+        rollback_mobile_held_press(&mut session, provisional_press);
+        rollback_mobile_ownership_press(&mut ownership, client_id, provisional_ownership);
+    }
+}
+
+async fn end_mobile_operation(
+    client_id: &str,
+    session: &Arc<Mutex<MobileClientSession>>,
+    ownership: &Arc<Mutex<MobileHeldOwnership>>,
+    token: u64,
+) {
+    let mut ownership = ownership.lock().await;
+    if ownership
+        .reservations
+        .get(&token)
+        .is_some_and(|reservation| reservation.client_id == client_id)
+    {
+        ownership.reservations.remove(&token);
+    }
+    let mut session = session.lock().await;
+    if session.in_flight == Some(token) {
+        session.in_flight = None;
+    }
+}
+
+fn accepted_mobile_noop(
     request: &EndpointInjectRequest,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
 ) -> EndpointInjectResult {
-    let (backend_kind, health) = {
-        let backend = inject_backend.lock().await;
-        (Some(backend.kind()), backend.health())
-    };
+    let backend = inject_backend.backend_snapshot();
+    let (backend_kind, health) = (Some(backend.kind), backend.health);
     EndpointInjectResult {
         correlation_id: request.correlation_id.clone(),
         target: EndpointInjectTarget::Local,
@@ -997,41 +1264,45 @@ async fn accepted_mobile_noop(
 async fn process_mobile_inject_envelope(
     sessions: &MobileClientSessions,
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     envelope: MobileInjectEnvelope,
 ) -> Result<EndpointInjectResult> {
     let now = Instant::now();
     let session = sessions.session_at(&envelope.client_id, now).await?;
-    let mut session = session.lock().await;
-    accept_mobile_sequence(&mut session, envelope.sequence, now)?;
+    let token = begin_mobile_operation(sessions, &session, envelope.sequence, now).await?;
 
     let request = match envelope.request {
         DaemonRequest::InjectEndpointEvent {
             target: EndpointInjectTarget::Local,
             request,
         } => request,
-        _ => bail!("mobile envelope only accepts a local InjectEndpointEvent"),
+        _ => {
+            end_mobile_operation(&envelope.client_id, &session, &sessions.ownership, token).await;
+            bail!("mobile envelope only accepts a local InjectEndpointEvent")
+        }
     };
-    let mut ownership = sessions.ownership.lock().await;
-    process_mobile_request_locked(
+    let result = process_reserved_mobile_request(
         &envelope.client_id,
-        &mut session,
-        &mut ownership,
+        &session,
+        &sessions.ownership,
+        token,
         network_manager,
         inject_backend,
         state,
         local_events_tx,
         request,
     )
-    .await
+    .await;
+    end_mobile_operation(&envelope.client_id, &session, &sessions.ownership, token).await;
+    result
 }
 
 async fn process_mobile_release_batch(
     sessions: &MobileClientSessions,
     network_manager: &Arc<Mutex<NetworkManager>>,
-    inject_backend: &Arc<Mutex<Box<dyn InjectBackend>>>,
+    inject_backend: &InputInjectionHandle,
     state: &Arc<RwLock<DaemonState>>,
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     batch: MobileReleaseBatch,
@@ -1039,9 +1310,7 @@ async fn process_mobile_release_batch(
     validate_mobile_release_batch(&batch)?;
     let now = Instant::now();
     let session = sessions.session_at(&batch.client_id, now).await?;
-    let mut session = session.lock().await;
-    accept_mobile_sequence(&mut session, batch.sequence, now)?;
-    let mut ownership = sessions.ownership.lock().await;
+    let token = begin_mobile_operation(sessions, &session, batch.sequence, now).await?;
 
     let mut results = Vec::with_capacity(batch.requests.len());
     for request in batch.requests {
@@ -1052,19 +1321,28 @@ async fn process_mobile_release_batch(
             } => request,
             _ => unreachable!("release batch was validated before processing"),
         };
-        let result = process_mobile_request_locked(
+        let result = process_reserved_mobile_request(
             &batch.client_id,
-            &mut session,
-            &mut ownership,
+            &session,
+            &sessions.ownership,
+            token,
             network_manager,
             inject_backend,
             state,
             local_events_tx,
             request,
         )
-        .await?;
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                end_mobile_operation(&batch.client_id, &session, &sessions.ownership, token).await;
+                return Err(error);
+            }
+        };
         results.push(result);
     }
+    end_mobile_operation(&batch.client_id, &session, &sessions.ownership, token).await;
     Ok(results)
 }
 
@@ -2797,9 +3075,10 @@ mod tests {
         BackendFailureReason, BackendHealth, BackendKind, DeviceId, EndpointEventKind,
         EndpointEventPayload, EndpointInjectMode, EndpointInjectRequest, ServiceStatusSnapshot,
     };
-    use rshare_input::InputEvent;
+    use rshare_input::{InjectionActorConfig, InputEvent};
     use std::fmt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Condvar;
     use tokio::sync::Notify;
     use tokio::time::{sleep, timeout, Duration};
 
@@ -3005,12 +3284,80 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingInjectBackend {
+        started: Arc<AtomicBool>,
+        gate: Arc<(StdMutex<bool>, Condvar)>,
+    }
+
+    impl InjectBackend for BlockingInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, _event: InputEvent) -> Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            let (released, wake) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    struct MobileSubmissionBarrierReset;
+
+    impl Drop for MobileSubmissionBarrierReset {
+        fn drop(&mut self) {
+            *mobile_submission_barrier().lock().unwrap() = None;
+        }
+    }
+
+    #[derive(Debug)]
+    struct SwitchableInjectBackend {
+        reject: Arc<AtomicBool>,
+        attempted: Arc<StdMutex<Vec<InputEvent>>>,
+        injected: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InjectBackend for SwitchableInjectBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> Result<()> {
+            self.attempted.lock().unwrap().push(event.clone());
+            if self.reject.load(Ordering::SeqCst) {
+                bail!("test injection rejected");
+            }
+            self.injected.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
     fn test_mobile_runtime(
         backend: Box<dyn InjectBackend>,
     ) -> (
         Arc<RwLock<DaemonState>>,
         Arc<Mutex<NetworkManager>>,
-        Arc<Mutex<Box<dyn InjectBackend>>>,
+        InputInjectionHandle,
         broadcast::Sender<LocalInputDiagnosticEvent>,
     ) {
         let state = Arc::new(RwLock::new(DaemonState::new(ServiceStatusSnapshot::new(
@@ -3026,7 +3373,8 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         )));
-        let inject_backend = Arc::new(Mutex::new(backend));
+        let inject_backend =
+            InputInjectionHandle::spawn(backend, InjectionActorConfig::default()).unwrap();
         let (local_events_tx, _) = broadcast::channel(32);
         (state, network_manager, inject_backend, local_events_tx)
     }
@@ -3212,6 +3560,302 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_client_does_not_hold_global_mobile_ownership_lock() {
+        let started = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(BlockingInjectBackend {
+                started: started.clone(),
+                gate: gate.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+
+        let blocked = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            tokio::spawn(async move {
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope("blocked-client", 1, "A", "Pressed"),
+                )
+                .await
+            })
+        };
+        timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let other = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            tokio::spawn(async move {
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope("other-client", 1, "B", "Pressed"),
+                )
+                .await
+            })
+        };
+
+        let other_reserved = timeout(Duration::from_millis(100), async {
+            loop {
+                let ownership = sessions.ownership.lock().await;
+                let reserved = ownership
+                    .key_owners
+                    .get(&held_key_identity(rshare_input::KeyCode::Char(b'B')))
+                    .is_some_and(|owners| owners.contains("other-client"));
+                drop(ownership);
+                if reserved {
+                    break true;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        {
+            let (released, wake) = &*gate;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+
+        assert!(
+            other_reserved,
+            "a blocked backend acknowledgement must not retain the global ownership mutex"
+        );
+        assert!(blocked.await.unwrap().unwrap().accepted);
+        assert!(other.await.unwrap().unwrap().accepted);
+    }
+
+    #[tokio::test]
+    async fn lease_reaper_reserves_all_expired_clients_before_backend_ack() {
+        let started = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(BlockingInjectBackend {
+                started: started.clone(),
+                gate: gate.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_millis(10));
+        let expired_at = Instant::now();
+        for (client_id, key) in [("expired-a", b'A'), ("expired-b", b'B')] {
+            let session = sessions
+                .session_at(client_id, expired_at - Duration::from_secs(1))
+                .await
+                .unwrap();
+            let identity = held_key_identity(rshare_input::KeyCode::Char(key));
+            session
+                .lock()
+                .await
+                .held_keys
+                .insert(identity, rshare_input::KeyCode::Char(key));
+            sessions
+                .ownership
+                .lock()
+                .await
+                .key_owners
+                .entry(identity)
+                .or_default()
+                .insert(client_id.to_string());
+        }
+
+        let reaper = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            tokio::spawn(async move {
+                sessions
+                    .reap_expired_at(
+                        expired_at,
+                        &network_manager,
+                        &inject_backend,
+                        &state,
+                        &local_events_tx,
+                    )
+                    .await;
+            })
+        };
+        timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let both_reserved = timeout(Duration::from_millis(100), async {
+            loop {
+                if sessions.ownership.lock().await.reservations.len() >= 2 {
+                    break true;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        {
+            let (released, wake) = &*gate;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+
+        assert!(
+            both_reserved,
+            "one expired client's slow acknowledgement must not serialize other cleanup reservations"
+        );
+        reaper.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_failed_token_cannot_rollback_successor_held_state() {
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        let now = Instant::now();
+        let session = sessions.session_at("token-client", now).await.unwrap();
+        let stale_token = begin_mobile_operation(&sessions, &session, 1, now)
+            .await
+            .unwrap();
+        let request = match keyboard_envelope("token-client", 1, "A", "Pressed").request {
+            DaemonRequest::InjectEndpointEvent { request, .. } => request,
+            _ => unreachable!(),
+        };
+        let ReservedMobileRequest::Inject {
+            held_transition,
+            provisional_press,
+            provisional_ownership,
+            ..
+        } = reserve_mobile_request(
+            "token-client",
+            &session,
+            &sessions.ownership,
+            stale_token,
+            request,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("a press must reserve a backend injection");
+        };
+
+        let successor_token = sessions.next_operation_token();
+        session.lock().await.in_flight = Some(successor_token);
+        {
+            let mut ownership = sessions.ownership.lock().await;
+            ownership.reservations.remove(&stale_token);
+            ownership.reservations.insert(
+                successor_token,
+                MobileOwnershipReservation {
+                    client_id: "token-client".to_string(),
+                },
+            );
+        }
+
+        finish_mobile_request(
+            "token-client",
+            &session,
+            &sessions.ownership,
+            stale_token,
+            held_transition,
+            provisional_press,
+            provisional_ownership,
+            false,
+        )
+        .await;
+
+        let identity = held_key_identity(rshare_input::KeyCode::Char(b'A'));
+        assert!(session.lock().await.held_keys.contains_key(&identity));
+        assert!(sessions
+            .ownership
+            .lock()
+            .await
+            .key_owners
+            .get(&identity)
+            .is_some_and(|owners| owners.contains("token-client")));
+    }
+
+    #[tokio::test]
+    async fn cleanup_supersede_prevents_reserved_press_from_reaching_backend() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network_manager, inject_backend, local_events_tx) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
+        let barrier = Arc::new(MobileSubmissionBarrier {
+            correlation_id: "race-old-1".to_string(),
+            reserved: Notify::new(),
+            resume: Notify::new(),
+        });
+        *mobile_submission_barrier().lock().unwrap() = Some(barrier.clone());
+        let _reset = MobileSubmissionBarrierReset;
+
+        let old_press = {
+            let sessions = sessions.clone();
+            let state = state.clone();
+            let network_manager = network_manager.clone();
+            let inject_backend = inject_backend.clone();
+            let local_events_tx = local_events_tx.clone();
+            tokio::spawn(async move {
+                process_mobile_inject_envelope(
+                    &sessions,
+                    &network_manager,
+                    &inject_backend,
+                    &state,
+                    &local_events_tx,
+                    keyboard_envelope("race-old", 1, "A", "Pressed"),
+                )
+                .await
+            })
+        };
+        timeout(Duration::from_secs(1), barrier.reserved.notified())
+            .await
+            .unwrap();
+
+        sessions
+            .release_all_held_inputs(&network_manager, &inject_backend, &state, &local_events_tx)
+            .await;
+        barrier.resume.notify_one();
+        let old_result = old_press.await.unwrap();
+
+        assert!(
+            old_result.is_err(),
+            "a reservation superseded before actor submission must be rejected"
+        );
+        let injected = injected.lock().unwrap();
+        assert_eq!(
+            injected.len(),
+            1,
+            "cleanup may release the provisional press, but the stale press must never follow it"
+        );
+        assert!(matches!(
+            injected[0],
+            InputEvent::Key {
+                keycode: rshare_input::KeyCode::Char(b'A'),
+                state: rshare_input::ButtonState::Released,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3830,9 +4474,13 @@ mod tests {
 
     #[tokio::test]
     async fn failed_best_effort_release_batch_retains_server_held_state() {
+        let reject = Arc::new(AtomicBool::new(false));
+        let attempted = Arc::new(StdMutex::new(Vec::new()));
         let injected = Arc::new(StdMutex::new(Vec::new()));
         let (state, network_manager, inject_backend, local_events_tx) =
-            test_mobile_runtime(Box::new(RecordingInjectBackend {
+            test_mobile_runtime(Box::new(SwitchableInjectBackend {
+                reject: reject.clone(),
+                attempted: attempted.clone(),
                 injected: injected.clone(),
             }));
         let sessions = MobileClientSessions::new(8, Duration::from_secs(10));
@@ -3850,10 +4498,7 @@ mod tests {
             .accepted
         );
 
-        let attempted = Arc::new(StdMutex::new(Vec::new()));
-        *inject_backend.lock().await = Box::new(RejectingInjectBackend {
-            attempted: attempted.clone(),
-        });
+        reject.store(true, Ordering::SeqCst);
         let mut release = keyboard_envelope("ignored", 1, "A", "Released").request;
         let DaemonRequest::InjectEndpointEvent { request, .. } = &mut release else {
             unreachable!("keyboard helper must build an inject request");
@@ -3876,17 +4521,17 @@ mod tests {
         .unwrap();
 
         assert!(!results[0].accepted);
-        assert_eq!(attempted.lock().unwrap().len(), 1);
+        assert!(
+            attempted.lock().unwrap().len() >= 2,
+            "the failed release and actor cleanup must both reach the backend"
+        );
         let session = sessions
             .session_at("failed-release-batch", Instant::now())
             .await
             .unwrap();
         assert_eq!(session.lock().await.held_keys.len(), 1);
 
-        let retry_injected = Arc::new(StdMutex::new(Vec::new()));
-        *inject_backend.lock().await = Box::new(RecordingInjectBackend {
-            injected: retry_injected.clone(),
-        });
+        reject.store(false, Ordering::SeqCst);
         let retry = process_mobile_inject_envelope(
             &sessions,
             &network_manager,
@@ -3899,8 +4544,8 @@ mod tests {
         .unwrap();
         assert!(retry.accepted);
         assert_eq!(
-            retry_injected.lock().unwrap().len(),
-            1,
+            injected.lock().unwrap().len(),
+            2,
             "a rejected last-owner release must retain ownership for retry"
         );
     }
@@ -5270,8 +5915,11 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         )));
-        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let inject_backend = InputInjectionHandle::spawn(
+            Box::new(NoopInjectBackend),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
         let (local_events_tx, _) = broadcast::channel(1);
 
         handle_mobile_gateway_client(
@@ -5341,8 +5989,11 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         )));
-        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let inject_backend = InputInjectionHandle::spawn(
+            Box::new(NoopInjectBackend),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
         let (local_events_tx, _) = broadcast::channel(1);
 
         handle_mobile_gateway_client(
@@ -5386,8 +6037,11 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         )));
-        let inject_backend: Arc<Mutex<Box<dyn InjectBackend>>> =
-            Arc::new(Mutex::new(Box::new(NoopInjectBackend)));
+        let inject_backend = InputInjectionHandle::spawn(
+            Box::new(NoopInjectBackend),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
         let (local_events_tx, _) = broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 

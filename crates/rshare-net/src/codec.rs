@@ -366,15 +366,7 @@ impl MessageCodec {
             Message::Goodbye { .. } => 2,
             Message::HelloRejected { .. } => 3,
 
-            // Input events (10-19)
-            Message::MouseMove { .. } => 10,
-            Message::MouseButton { .. } => 11,
-            Message::MouseWheel { .. } => 12,
-            Message::Key { .. } => 13,
-            Message::KeyExtended { .. } => 14,
-            Message::GamepadConnected { .. } => 15,
-            Message::GamepadDisconnected { .. } => 16,
-            Message::GamepadState { .. } => 17,
+            // Input-adjacent control and diagnostics (10-19)
             Message::InputDiagnostic { .. } => 25,
             Message::LatencyProbe { .. } => 26,
             Message::LatencyProbeAck { .. } => 27,
@@ -394,8 +386,6 @@ impl MessageCodec {
             Message::ClipboardResponse { .. } => 22,
 
             // Screen control (30-39)
-            Message::ScreenEnter { .. } => 30,
-            Message::ScreenLeave { .. } => 31,
             Message::ScreenUpdate { .. } => 32,
 
             // Synchronization (40-49)
@@ -512,11 +502,11 @@ mod tests {
     use super::*;
     use rshare_core::{
         hello_message, AcceptRealtime, AuthenticatedInputOwner, ButtonState, ClockDomainId,
-        ControlConnectionId, DeviceId, GamepadButton, GamepadDeviceInfo, GamepadState,
-        InputOwnershipGate, KeyState, MonotonicStamp, MouseButton, RealtimeInputFrame,
-        RealtimeInputPayload, ReleaseAllReason, ReliableInputEvent, ReliableInputFrame,
-        SessionEpoch, UsbDeviceClaimRequest, UsbTransferDirection, UsbTransferKind,
-        UsbTransferPayload, INPUT_PROTOCOL_VERSION,
+        ControlConnectionId, DeviceId, GamepadButton, GamepadDeviceInfo, InputOwnershipGate,
+        KeyState, MonotonicStamp, MouseButton, RealtimeInputFrame, RealtimeInputPayload,
+        ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, SessionEpoch,
+        UsbDeviceClaimRequest, UsbTransferDirection, UsbTransferKind, UsbTransferPayload,
+        INPUT_PROTOCOL_VERSION,
     };
 
     fn realtime_frame(sequence: u64, payload: RealtimeInputPayload) -> RealtimeInputFrame {
@@ -560,15 +550,21 @@ mod tests {
 
     #[test]
     fn test_raw_encode_decode() {
-        let msg = Message::MouseMove { x: 100, y: 200 };
+        let msg = Message::Heartbeat {
+            sequence: 100,
+            timestamp: 200,
+        };
 
         let encoded = MessageCodec::encode_raw(&msg).unwrap();
         let decoded = MessageCodec::decode_raw(&encoded).unwrap();
 
         match decoded {
-            Message::MouseMove { x, y } => {
-                assert_eq!(x, 100);
-                assert_eq!(y, 200);
+            Message::Heartbeat {
+                sequence,
+                timestamp,
+            } => {
+                assert_eq!(sequence, 100);
+                assert_eq!(timestamp, 200);
             }
             _ => panic!("Wrong message type"),
         }
@@ -576,8 +572,14 @@ mod tests {
 
     #[test]
     fn test_decoder_streaming() {
-        let msg1 = Message::MouseMove { x: 100, y: 200 };
-        let msg2 = Message::MouseMove { x: 300, y: 400 };
+        let msg1 = Message::Heartbeat {
+            sequence: 100,
+            timestamp: 200,
+        };
+        let msg2 = Message::Heartbeat {
+            sequence: 300,
+            timestamp: 400,
+        };
 
         let enc1 = MessageCodec::frame_message(&msg1).unwrap();
         let enc2 = MessageCodec::frame_message(&msg2).unwrap();
@@ -592,9 +594,12 @@ mod tests {
         decoder.feed(&enc1[5..]);
         let dec1 = decoder.try_decode().unwrap().unwrap();
         match dec1 {
-            Message::MouseMove { x, y } => {
-                assert_eq!(x, 100);
-                assert_eq!(y, 200);
+            Message::Heartbeat {
+                sequence,
+                timestamp,
+            } => {
+                assert_eq!(sequence, 100);
+                assert_eq!(timestamp, 200);
             }
             _ => panic!("Wrong message type"),
         }
@@ -603,9 +608,12 @@ mod tests {
         decoder.feed(&enc2[..]);
         let dec2 = decoder.try_decode().unwrap().unwrap();
         match dec2 {
-            Message::MouseMove { x, y } => {
-                assert_eq!(x, 300);
-                assert_eq!(y, 400);
+            Message::Heartbeat {
+                sequence,
+                timestamp,
+            } => {
+                assert_eq!(sequence, 300);
+                assert_eq!(timestamp, 400);
             }
             _ => panic!("Wrong message type"),
         }
@@ -632,18 +640,6 @@ mod tests {
                 reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
             }),
             3
-        );
-
-        assert_eq!(
-            MessageCodec::message_type_tag(&Message::MouseMove { x: 0, y: 0 }),
-            10
-        );
-
-        assert_eq!(
-            MessageCodec::message_type_tag(&Message::GamepadState {
-                state: GamepadState::neutral(0, 1, 123),
-            }),
-            17
         );
 
         assert_eq!(
@@ -703,28 +699,6 @@ mod tests {
                     received: 2
                 },
                 ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_gamepad_state_raw_encode_decode() {
-        let msg = Message::GamepadState {
-            state: GamepadState::neutral(0, 7, 456),
-        };
-
-        let encoded = MessageCodec::encode_raw(&msg).unwrap();
-        let decoded = MessageCodec::decode_raw(&encoded).unwrap();
-
-        assert!(matches!(
-            decoded,
-            Message::GamepadState {
-                state: GamepadState {
-                    gamepad_id: 0,
-                    sequence: 7,
-                    timestamp_ms: 456,
-                    ..
-                }
             }
         ));
     }

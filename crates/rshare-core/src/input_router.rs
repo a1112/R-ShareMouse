@@ -193,6 +193,7 @@ pub enum RouterCommand {
     LayoutChanged(LayoutGraph),
     ConnectivityChanged { peer: DeviceId, connected: bool },
     QuickReturn,
+    SystemSuspended,
     BackendDegraded,
     LeaseExpired,
     Shutdown,
@@ -290,6 +291,7 @@ impl InputRouter {
                 self.handle_connectivity_changed(peer, connected)
             }
             RouterCommand::QuickReturn => self.return_to_local(ReleaseAllReason::OwnershipTransfer),
+            RouterCommand::SystemSuspended => self.return_to_local(ReleaseAllReason::Suspended),
             RouterCommand::BackendDegraded => self.handle_backend_degraded(),
             RouterCommand::LeaseExpired => self.return_to_local(ReleaseAllReason::Timeout),
             RouterCommand::Shutdown => self.return_to_local(ReleaseAllReason::SessionEnded),
@@ -1154,6 +1156,40 @@ mod tests {
         ));
         assert_eq!(router.held_key_count(), 1);
         assert!(router.pending_release_token().is_some());
+    }
+
+    #[test]
+    fn system_suspend_emits_suspended_release_and_clears_shortcut_suppression() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let outputs = router.handle(RouterCommand::SystemSuspended);
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [
+                RouterOutput::EmergencyReleaseAll {
+                    target: actual_target,
+                    frame: ReliableInputFrame {
+                        event: ReliableInputEvent::ReleaseAll {
+                            reason: ReleaseAllReason::Suspended,
+                        },
+                        ..
+                    },
+                    ..
+                },
+                RouterOutput::LocalSessionChanged(crate::ControlSessionState::LocalReady),
+                RouterOutput::SuppressLocalShortcuts(false),
+            ] if *actual_target == target
+        ));
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! Quinn QUIC transport layer for low-latency encrypted communication.
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     ClientConfig, Endpoint, IdleTimeout, ServerConfig as QuinnServerConfig,
@@ -572,6 +571,7 @@ struct QuicConnectionInner {
     bootstrap_commit_acks: AtomicU8,
     bootstrap_commit_ack_notify: Notify,
     qos_required: bool,
+    compatibility_bootstrap_consumed: AtomicBool,
     datagram_reader_start_barrier: Option<Arc<Notify>>,
     qos_receive: StdMutex<Option<QosReceiveContext>>,
     qos_receivers: StdMutex<Option<InstalledInboundReceivers>>,
@@ -780,6 +780,7 @@ impl QuicConnection {
             }),
             bootstrap_commit_ack_notify: Notify::new(),
             qos_required: peer_protocol_handshake_required,
+            compatibility_bootstrap_consumed: AtomicBool::new(false),
             datagram_reader_start_barrier,
             qos_receive: StdMutex::new(None),
             qos_receivers: StdMutex::new(None),
@@ -1554,53 +1555,11 @@ async fn send_outbound_message(
             );
         }
     }
-    let legacy_realtime_datagram = match encode_legacy_realtime_message(message) {
-        Ok(datagram) => datagram,
-        Err(error) => {
-            inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("QUIC realtime datagram dropped during encoding: {}", error);
-            return Ok(());
-        }
-    };
-    if let Some(datagram) = legacy_realtime_datagram {
-        if let Some(max_datagram_size) = inner.connection.max_datagram_size() {
-            if datagram.len() <= max_datagram_size {
-                match inner.connection.send_datagram(datagram) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!("QUIC realtime datagram dropped: {}", error);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        inner.datagram_tx_dropped.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(
-            "QUIC realtime datagram dropped because datagrams are unavailable or too small"
-        );
-        return Ok(());
-    }
-
     let encoded = ControlMessageCodec::encode(message)?;
     if encoded.len() > config.max_message_size {
         anyhow::bail!("Reliable message too large: {} bytes", encoded.len());
     }
     write_reliable_frame(inner, &encoded).await
-}
-
-/// Temporary adapter for the legacy `Message` transport.
-///
-/// The epoch-scoped realtime codec remains lossless and independent. Task 9
-/// replaces this adapter when the transport accepts `RealtimeInputFrame`
-/// directly.
-pub(crate) fn encode_legacy_realtime_message(message: &Message) -> Result<Option<Bytes>> {
-    match message {
-        Message::MouseMove { .. } | Message::GamepadState { .. } => {
-            Ok(Some(Bytes::from(ControlMessageCodec::encode(message)?)))
-        }
-        _ => Ok(None),
-    }
 }
 
 async fn write_reliable_frame(inner: &Arc<QuicConnectionInner>, payload: &[u8]) -> Result<()> {
@@ -1797,8 +1756,32 @@ async fn read_authenticated_uni_stream(
     message_tx: mpsc::Sender<Message>,
     max_message_size: usize,
 ) {
+    let compatibility_candidate = !inner.qos_required
+        && inner
+            .qos_receive
+            .lock()
+            .expect("qos receive context poisoned")
+            .is_none();
     let mut prefix = [0u8; 4];
-    if let Err(error) = stream.read_exact(&mut prefix).await {
+    let prefix_result = if compatibility_candidate {
+        match tokio::time::timeout(
+            super::handshake::BOOTSTRAP_TIMEOUT,
+            stream.read_exact(&mut prefix),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                inner
+                    .connection
+                    .close(0u32.into(), b"compatibility bootstrap prefix timed out");
+                return;
+            }
+        }
+    } else {
+        stream.read_exact(&mut prefix).await
+    };
+    if let Err(error) = prefix_result {
         if is_terminal_cancel_reset(&error) {
             #[cfg(test)]
             inner
@@ -1881,8 +1864,7 @@ async fn read_authenticated_uni_stream(
             value
                 if value == LaneDiscriminator::Control as u8
                     || value == LaneDiscriminator::Bulk as u8
-                    || value == LaneDiscriminator::Telemetry as u8
-                    || value == LaneDiscriminator::ReliableCompat as u8 =>
+                    || value == LaneDiscriminator::Telemetry as u8 =>
             {
                 read_qos_message_stream(inner, stream, max_message_size, value).await;
             }
@@ -1897,21 +1879,32 @@ async fn read_authenticated_uni_stream(
         }
         return;
     }
-    let authenticated_qos_installed = inner
+    let qos_installed = inner
         .qos_receive
         .lock()
         .expect("qos receive context poisoned")
         .is_some();
-    if inner.qos_required || authenticated_qos_installed {
+    if !inner.qos_required && !qos_installed {
+        if inner
+            .compatibility_bootstrap_consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            inner
+                .connection
+                .close(0u32.into(), b"duplicate compatibility bootstrap stream");
+            return;
+        }
+        read_compatibility_bootstrap_stream(inner, stream, message_tx, max_message_size, prefix)
+            .await;
+    } else {
         reject_unrecognized_qos_stream(
             &inner,
             &mut stream,
             "missing qos lane preface on authenticated stream".into(),
         )
         .await;
-        return;
     }
-    read_legacy_framed_stream(inner, stream, message_tx, max_message_size, Some(prefix)).await;
 }
 
 async fn reject_unrecognized_qos_stream(
@@ -2025,12 +2018,6 @@ async fn read_qos_message_stream(
                 super::qos::ClassifiedMessage::Telemetry(_),
                 value
             ) if value == LaneDiscriminator::Telemetry as u8
-        ) || matches!(
-            (&classified, lane),
-            (
-                super::qos::ClassifiedMessage::ReliableCompat(_),
-                value
-            ) if value == LaneDiscriminator::ReliableCompat as u8
         );
         if !lane_matches {
             let _ = stream.stop(VarInt::from_u32(0x525350));
@@ -2054,61 +2041,63 @@ async fn read_qos_message_stream(
             super::qos::ClassifiedMessage::Telemetry(frame) => {
                 let _ = context.telemetry_tx.try_send(frame);
             }
-            super::qos::ClassifiedMessage::ReliableCompat(_) => {
-                let _ = stream.stop(VarInt::from_u32(0x525350));
-                try_report_protocol_error(
-                    &context,
-                    "reliable compatibility input lacks authenticated epoch metadata".into(),
-                );
-                fail_close_current_qos_generation(
-                    &inner,
-                    &context,
-                    b"rejected reliable compatibility input",
-                );
-                return;
-            }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
         }
     }
 }
 
-async fn read_legacy_framed_stream(
+async fn read_compatibility_bootstrap_stream(
     inner: Arc<QuicConnectionInner>,
     mut stream: quinn::RecvStream,
     message_tx: mpsc::Sender<Message>,
     max_message_size: usize,
-    mut first_len: Option<[u8; 4]>,
+    first_len: [u8; 4],
 ) {
-    loop {
-        let len_buf = if let Some(prefix) = first_len.take() {
-            prefix
-        } else {
-            let mut bytes = [0u8; 4];
-            if stream.read_exact(&mut bytes).await.is_err() {
-                return;
-            }
-            bytes
-        };
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > max_message_size {
+    let limit = max_message_size.min(super::handshake::BOOTSTRAP_MAX_MESSAGE_SIZE);
+    let len = u32::from_be_bytes(first_len) as usize;
+    if len > limit {
+        inner
+            .connection
+            .close(0u32.into(), b"compatibility bootstrap frame too large");
+        return;
+    }
+    let mut data = vec![0u8; len];
+    match tokio::time::timeout(
+        super::handshake::BOOTSTRAP_TIMEOUT,
+        stream.read_exact(&mut data),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
             inner
                 .connection
-                .close(0u32.into(), b"reliable frame exceeds active protocol limit");
+                .close(0u32.into(), b"truncated compatibility bootstrap message");
             return;
         }
-        let mut data = vec![0u8; len];
-        if stream.read_exact(&mut data).await.is_err() {
+        Err(_) => {
+            inner
+                .connection
+                .close(0u32.into(), b"compatibility bootstrap payload timed out");
             return;
-        }
-        match ControlMessageCodec::decode(&data) {
-            Ok(message) => {
-                if message_tx.send(message).await.is_err() {
-                    return;
-                }
-            }
-            Err(error) => tracing::debug!("Failed to decode reliable message: {}", error),
         }
     }
+    let Ok(message) = ControlMessageCodec::decode(&data) else {
+        inner
+            .connection
+            .close(0u32.into(), b"invalid compatibility bootstrap message");
+        return;
+    };
+    if !super::handshake::is_bootstrap_message(&message) {
+        inner
+            .connection
+            .close(0u32.into(), b"illegal compatibility bootstrap message");
+        return;
+    }
+    if message_tx.send(message).await.is_err() {
+        return;
+    }
+    let _ = enforce_bootstrap_stream_eof(&inner, &mut stream).await;
 }
 
 async fn read_qos_reliable_stream(
@@ -3320,116 +3309,6 @@ mod tests {
             generation,
             _server_qos: server_qos,
         }
-    }
-
-    #[test]
-    fn legacy_realtime_encoder_is_private_and_rejects_reliable_messages() {
-        let realtime = Message::MouseMove { x: 7, y: -4 };
-        assert!(encode_legacy_realtime_message(&realtime).unwrap().is_some());
-
-        let reliable = Message::Key {
-            keycode: 0x41,
-            state: rshare_core::KeyState::Pressed,
-        };
-        assert!(encode_legacy_realtime_message(&reliable).unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn authenticated_legacy_realtime_datagram_never_enters_message_fifo() {
-        let server_id = DeviceId::new_v4();
-        let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(server_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let address = server.local_addr().unwrap();
-        let mut incoming = server.incoming();
-        let mut client = QuicTransport::isolated_for_test(client_id);
-        let client_connection = client
-            .connect(&address.to_string(), server_id)
-            .await
-            .unwrap();
-        let mut server_connection = incoming.recv().await.unwrap().connection;
-        let auth = Arc::new(PeerAuthContext {
-            peer_id: client_id,
-            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
-            control_connection_id: ControlConnectionId::new(),
-        });
-        let (_qos, _releases) = server_connection.install_qos(auth);
-
-        client_connection
-            .send_message(&Message::MouseMove { x: 7, y: 9 })
-            .await
-            .unwrap();
-
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                server_connection.receive_message()
-            )
-            .await
-            .is_err(),
-            "authenticated realtime input must never return as legacy Message"
-        );
-    }
-
-    #[tokio::test]
-    async fn authenticated_reliable_compat_input_fails_closed_without_entering_message_fifo() {
-        let server_id = DeviceId::new_v4();
-        let client_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(server_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let address = server.local_addr().unwrap();
-        let mut incoming = server.incoming();
-        let mut client = QuicTransport::isolated_for_test(client_id);
-        let client_connection = client
-            .connect(&address.to_string(), server_id)
-            .await
-            .unwrap();
-        let mut server_connection = incoming.recv().await.unwrap().connection;
-        let auth = Arc::new(PeerAuthContext {
-            peer_id: client_id,
-            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
-            control_connection_id: ControlConnectionId::new(),
-        });
-        let (_qos, _releases) = server_connection.install_qos(auth);
-        let client_auth = Arc::new(PeerAuthContext {
-            peer_id: server_id,
-            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
-            control_connection_id: ControlConnectionId::new(),
-        });
-        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
-        let mut protocol_errors = server_connection.take_protocol_errors().unwrap();
-
-        let super::super::qos::ClassifiedMessage::ReliableCompat(frame) =
-            super::super::qos::ClassifiedMessage::try_from(Message::Key {
-                keycode: 0x41,
-                state: rshare_core::KeyState::Pressed,
-            })
-            .unwrap()
-        else {
-            panic!("legacy key must classify as reliable compatibility input");
-        };
-        client_qos.send_reliable_compat(frame).await.unwrap();
-
-        let error = timeout(Duration::from_secs(1), protocol_errors.recv())
-            .await
-            .expect("legacy input must report a protocol error")
-            .unwrap();
-        assert!(error.error.contains("reliable compatibility input"));
-        timeout(
-            Duration::from_secs(1),
-            client_connection.inner.connection.closed(),
-        )
-        .await
-        .expect("legacy input without authenticated epoch metadata must fail closed");
-        let message = timeout(
-            Duration::from_millis(100),
-            server_connection.receive_message(),
-        )
-        .await;
-        assert!(
-            !matches!(message, Ok(Ok(_))),
-            "legacy input must never enter the general Message FIFO"
-        );
     }
 
     #[tokio::test]
@@ -6281,7 +6160,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_bootstrap_stream_with_prequeued_input_is_closed() {
+    async fn compatibility_bootstrap_accepts_only_one_allowlisted_frame_per_stream() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let first = ControlMessageCodec::encode(&Message::HelloRejected {
+            app_id: rshare_core::DISCOVERY_APP_ID.into(),
+            device_id: client_id,
+            reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+        })
+        .unwrap();
+        let second = ControlMessageCodec::encode(&Message::HelloRejected {
+            app_id: rshare_core::DISCOVERY_APP_ID.into(),
+            device_id: client_id,
+            reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
+        })
+        .unwrap();
+
+        write_raw_reliable_payloads(&client_connection, &[first, second]).await;
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server_connection.receive_message())
+                .await
+                .unwrap()
+                .unwrap(),
+            Message::HelloRejected {
+                reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                ..
+            }
+        ));
+        timeout(
+            super::super::handshake::BOOTSTRAP_TIMEOUT + Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("a second compatibility-bootstrap frame must close the connection");
+        assert!(
+            !matches!(
+                timeout(
+                    Duration::from_millis(50),
+                    server_connection.receive_message()
+                )
+                .await,
+                Ok(Ok(Message::HelloRejected {
+                    reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
+                    ..
+                }))
+            ),
+            "only the first compatibility-bootstrap frame may enter the message queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_compatibility_bootstrap_payload_times_out_and_closes() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let mut stream = client_connection.inner.connection.open_uni().await.unwrap();
+        stream.write_all(&128u32.to_be_bytes()).await.unwrap();
+        stream.write_all(b"{").await.unwrap();
+
+        timeout(
+            super::super::handshake::BOOTSTRAP_TIMEOUT + Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("a partial compatibility-bootstrap frame must time out and close the connection");
+    }
+
+    #[tokio::test]
+    async fn compatibility_bootstrap_cannot_reopen_a_second_message_stream() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let client_connection = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let first = ControlMessageCodec::encode(&Message::HelloRejected {
+            app_id: rshare_core::DISCOVERY_APP_ID.into(),
+            device_id: client_id,
+            reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+        })
+        .unwrap();
+        let second = ControlMessageCodec::encode(&Message::HelloRejected {
+            app_id: rshare_core::DISCOVERY_APP_ID.into(),
+            device_id: client_id,
+            reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
+        })
+        .unwrap();
+
+        write_raw_reliable_payloads(&client_connection, &[first]).await;
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server_connection.receive_message())
+                .await
+                .unwrap()
+                .unwrap(),
+            Message::HelloRejected {
+                reason: rshare_core::HandshakeRejectReason::IdentityUnavailable,
+                ..
+            }
+        ));
+        write_raw_reliable_payloads(&client_connection, &[second]).await;
+
+        timeout(
+            super::super::handshake::BOOTSTRAP_TIMEOUT + Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("a second compatibility-bootstrap stream must close the connection");
+        assert!(
+            !matches!(
+                timeout(
+                    Duration::from_millis(50),
+                    server_connection.receive_message()
+                )
+                .await,
+                Ok(Ok(Message::HelloRejected {
+                    reason: rshare_core::HandshakeRejectReason::ApplicationMismatch,
+                    ..
+                }))
+            ),
+            "a compatibility connection may publish only one bootstrap message"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_bootstrap_stream_with_prequeued_non_bootstrap_message_is_closed() {
         let server_id = DeviceId::new_v4();
         let client_id = DeviceId::new_v4();
         let mut server = QuicTransport::isolated_for_test(server_id);
@@ -6302,9 +6330,13 @@ mod tests {
             "host".into(),
         ))
         .unwrap();
-        let input = ControlMessageCodec::encode(&Message::MouseMove { x: 99, y: 101 }).unwrap();
+        let non_bootstrap = ControlMessageCodec::encode(&Message::Heartbeat {
+            sequence: 99,
+            timestamp: 101,
+        })
+        .unwrap();
 
-        write_raw_reliable_payloads(&client_connection, &[hello, input]).await;
+        write_raw_reliable_payloads(&client_connection, &[hello, non_bootstrap]).await;
         assert!(matches!(
             server_connection.receive_message().await.unwrap(),
             Message::Hello { .. }
@@ -6314,7 +6346,7 @@ mod tests {
                 .complete_peer_protocol_handshake()
                 .await
                 .is_err(),
-            "bootstrap completion must fail when the bootstrap stream carries trailing input"
+            "bootstrap completion must fail when the bootstrap stream carries trailing traffic"
         );
 
         timeout(
@@ -6354,10 +6386,14 @@ mod tests {
             "host".into(),
         ))
         .unwrap();
-        let input = ControlMessageCodec::encode(&Message::MouseMove { x: 7, y: 9 }).unwrap();
+        let non_bootstrap = ControlMessageCodec::encode(&Message::Heartbeat {
+            sequence: 7,
+            timestamp: 9,
+        })
+        .unwrap();
 
         write_raw_reliable_payloads(&client_connection, &[hello]).await;
-        write_raw_reliable_payloads(&client_connection, &[input]).await;
+        write_raw_reliable_payloads(&client_connection, &[non_bootstrap]).await;
 
         timeout(
             Duration::from_secs(1),
@@ -6379,7 +6415,7 @@ mod tests {
                     event,
                     crate::connection::ManagerEvent::MessageReceived {
                         from,
-                        message: Message::MouseMove { .. }
+                        message: Message::Heartbeat { .. }
                     } if from == client_id
                 ),
                 "pre-authentication second stream leaked into ManagerEvent"
@@ -6406,9 +6442,7 @@ mod tests {
             .connect(&address.to_string(), server_id)
             .await
             .unwrap();
-        let datagram = encode_legacy_realtime_message(&Message::MouseMove { x: 13, y: 17 })
-            .unwrap()
-            .unwrap();
+        let datagram = crate::codec::RealtimeInputCodec::encode(&realtime_frame(1, 1)).unwrap();
         client_connection
             .inner
             .connection
@@ -6445,16 +6479,6 @@ mod tests {
                         if auth.peer_id == client_id
                 ),
                 "pre-authentication datagram must prevent registration"
-            );
-            assert!(
-                !matches!(
-                    event,
-                    crate::connection::ManagerEvent::MessageReceived {
-                        from,
-                        message: Message::MouseMove { .. }
-                    } if from == client_id
-                ),
-                "pre-authentication datagram leaked into ManagerEvent"
             );
         }
         assert!(manager.connections().is_empty());
@@ -6953,7 +6977,13 @@ mod tests {
         let missing_id = DeviceId::new_v4();
 
         let result = pool
-            .send_to(&missing_id, &Message::MouseMove { x: 1, y: 2 })
+            .send_to(
+                &missing_id,
+                &Message::Heartbeat {
+                    sequence: 1,
+                    timestamp: 2,
+                },
+            )
             .await;
 
         assert!(result.is_err());
@@ -6991,7 +7021,13 @@ mod tests {
         let sending_pool = pool.clone();
         let send_task = tokio::spawn(async move {
             sending_pool
-                .send_to(&local_id, &Message::MouseMove { x: 1, y: 2 })
+                .send_to(
+                    &local_id,
+                    &Message::Heartbeat {
+                        sequence: 1,
+                        timestamp: 2,
+                    },
+                )
                 .await
         });
         let blocked_frame = timeout(Duration::from_secs(1), blocked_rx.recv())
@@ -7025,8 +7061,7 @@ mod tests {
             .connect(&server_addr.to_string(), server_id)
             .await
             .unwrap();
-        let mut fast_receiver = incoming.recv().await.unwrap().connection;
-        let mut fast_messages = fast_receiver.message_channel();
+        let fast_receiver = incoming.recv().await.unwrap().connection;
 
         let mut slow_client = QuicTransport::isolated_for_test(slow_id);
         let slow_sender = slow_client
@@ -7038,9 +7073,13 @@ mod tests {
         let pool = ConnectionPool::new(server_id);
         pool.insert(fast_id, fast_sender).await;
         pool.insert(slow_id, slow_sender).await;
+        let (fast_tx, mut fast_rx) = mpsc::channel(4);
         let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
         {
             let mut connections = pool.connections.lock().unwrap();
+            connections.get_mut(&fast_id).unwrap().outbound = OutboundSender {
+                send_channel: fast_tx,
+            };
             connections.get_mut(&slow_id).unwrap().outbound = OutboundSender {
                 send_channel: blocked_tx,
             };
@@ -7049,9 +7088,13 @@ mod tests {
         let broadcast_pool = pool.clone();
         let broadcast_task = tokio::spawn(async move {
             broadcast_pool
-                .broadcast(&Message::Heartbeat {
-                    sequence: 7,
-                    timestamp: 11,
+                .broadcast(&Message::HelloRejected {
+                    app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                    device_id: server_id,
+                    reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                        required: 11,
+                        received: 7,
+                    },
                 })
                 .await
         });
@@ -7060,18 +7103,24 @@ mod tests {
             .expect("slow peer must enter the production outbound path")
             .expect("slow peer outbound channel must remain open");
 
+        let fast_frame = timeout(Duration::from_millis(100), fast_rx.recv())
+            .await
+            .expect("fast peer must receive while the slow peer is blocked")
+            .expect("fast peer outbound channel must remain open");
         assert!(
             matches!(
-                timeout(Duration::from_millis(100), fast_messages.recv())
-                    .await
-                    .expect("fast peer must receive while the slow peer is blocked"),
-                Some(Message::Heartbeat {
-                    sequence: 7,
-                    timestamp: 11
-                })
+                fast_frame.message,
+                Message::HelloRejected {
+                    reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                        required: 11,
+                        received: 7,
+                    },
+                    ..
+                }
             ),
             "fast peer must receive the broadcast payload"
         );
+        fast_frame.ack.send(Ok(())).unwrap();
         assert!(
             pool.connections.try_lock().is_ok(),
             "broadcast must release the pool-wide mutex before awaiting peer sends"
@@ -7110,8 +7159,7 @@ mod tests {
             .connect(&server_addr.to_string(), server_id)
             .await
             .unwrap();
-        let mut fast_receiver = incoming.recv().await.unwrap().connection;
-        let mut fast_messages = fast_receiver.message_channel();
+        let fast_receiver = incoming.recv().await.unwrap().connection;
 
         let mut slow_client = QuicTransport::isolated_for_test(slow_id);
         let slow_sender = slow_client
@@ -7123,18 +7171,26 @@ mod tests {
         let pool = ConnectionPool::new(server_id);
         pool.insert(fast_id, fast_sender).await;
         pool.insert(slow_id, slow_sender).await;
+        let (fast_tx, mut fast_rx) = mpsc::channel(4);
         let (blocked_tx, mut blocked_rx) = mpsc::channel(1);
         {
             let mut connections = pool.connections.lock().unwrap();
+            connections.get_mut(&fast_id).unwrap().outbound = OutboundSender {
+                send_channel: fast_tx,
+            };
             connections.get_mut(&slow_id).unwrap().outbound = OutboundSender {
                 send_channel: blocked_tx,
             };
         }
 
         let first = pool
-            .try_fanout(&Message::Heartbeat {
-                sequence: 1,
-                timestamp: 0,
+            .try_fanout(&Message::HelloRejected {
+                app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                device_id: server_id,
+                reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                    required: 0,
+                    received: 1,
+                },
             })
             .await;
         assert!(first.failures.is_empty());
@@ -7147,22 +7203,31 @@ mod tests {
             .expect("slow peer must retain the first frame without acknowledging it");
 
         let second = pool
-            .try_fanout(&Message::Heartbeat {
-                sequence: 2,
-                timestamp: 0,
+            .try_fanout(&Message::HelloRejected {
+                app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                device_id: server_id,
+                reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                    required: 0,
+                    received: 2,
+                },
             })
             .await;
         assert!(second.failures.is_empty());
         assert_eq!(second.enqueued, expected_order);
         for expected_sequence in [1, 2] {
+            let frame = timeout(Duration::from_millis(100), fast_rx.recv())
+                .await
+                .expect("fast peer must receive consecutive fanout frames")
+                .expect("fast peer queue must remain open");
             assert!(matches!(
-                timeout(Duration::from_millis(100), fast_messages.recv())
-                    .await
-                    .expect("fast peer must receive consecutive fanout frames"),
-                Some(Message::Heartbeat {
-                    sequence,
-                    timestamp: 0
-                }) if sequence == expected_sequence
+                frame.message,
+                Message::HelloRejected {
+                    reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                        required: 0,
+                        received,
+                    },
+                    ..
+                } if u64::from(received) == expected_sequence
             ));
         }
         assert!(
@@ -7171,191 +7236,37 @@ mod tests {
         );
 
         let third = pool
-            .try_fanout(&Message::Heartbeat {
-                sequence: 3,
-                timestamp: 0,
+            .try_fanout(&Message::HelloRejected {
+                app_id: rshare_core::DISCOVERY_APP_ID.into(),
+                device_id: server_id,
+                reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                    required: 0,
+                    received: 3,
+                },
             })
             .await;
         assert_eq!(third.enqueued, vec![fast_id]);
         assert_eq!(third.failures.len(), 1);
         assert_eq!(third.failures[0].device_id, slow_id);
         assert_eq!(third.failures[0].kind, FanoutEnqueueFailureKind::QueueFull);
+        let fast_third = timeout(Duration::from_millis(100), fast_rx.recv())
+            .await
+            .expect("fast peer must continue after only the slow queue overflows")
+            .expect("fast peer queue must remain open");
         assert!(matches!(
-            timeout(Duration::from_millis(100), fast_messages.recv())
-                .await
-                .expect("fast peer must continue after only the slow queue overflows"),
-            Some(Message::Heartbeat {
-                sequence: 3,
-                timestamp: 0
-            })
+            fast_third.message,
+            Message::HelloRejected {
+                reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
+                    required: 0,
+                    received: 3,
+                },
+                ..
+            }
         ));
 
         drop(blocked_first);
         drop(slow_receiver);
         fast_receiver.close().await;
         server.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn legacy_realtime_datagram_never_enters_message_fifo_without_qos_context() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(local_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let server_addr = server
-            .server_endpoint
-            .as_ref()
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut incoming = server.incoming();
-
-        let mut client = QuicTransport::isolated_for_test(remote_id);
-        let sender = client
-            .connect(&server_addr.to_string(), local_id)
-            .await
-            .unwrap();
-        let mut receiver = incoming.recv().await.unwrap().connection;
-        let mut messages = receiver.message_channel();
-
-        sender
-            .send_message(&Message::MouseMove { x: 42, y: 24 })
-            .await
-            .unwrap();
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), messages.recv())
-                .await
-                .is_err(),
-            "legacy realtime input must never enter the general Message FIFO"
-        );
-    }
-
-    #[tokio::test]
-    async fn realtime_datagram_send_failure_is_counted_and_never_falls_back() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(local_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let server_addr = server
-            .server_endpoint
-            .as_ref()
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut incoming = server.incoming();
-
-        let mut client = QuicTransport::isolated_for_test(remote_id);
-        let sender = client
-            .connect(&server_addr.to_string(), local_id)
-            .await
-            .unwrap();
-        let receiver = incoming.recv().await.unwrap().connection;
-        let dropped_before = sender.datagram_tx_dropped();
-        let reliable_resets_before = sender.reliable_stream_reset_count();
-
-        receiver.close().await;
-        timeout(Duration::from_secs(1), sender.inner.connection.closed())
-            .await
-            .expect("sender must observe the peer closing");
-
-        sender
-            .send_message(&Message::MouseMove { x: 1, y: 2 })
-            .await
-            .expect("realtime congestion is a counted drop, not a reliable send error");
-
-        assert_eq!(sender.datagram_tx_dropped(), dropped_before + 1);
-        assert_eq!(
-            sender.reliable_stream_reset_count(),
-            reliable_resets_before,
-            "a realtime datagram failure must never touch the reliable stream"
-        );
-    }
-
-    #[tokio::test]
-    async fn oversized_legacy_realtime_encoding_is_counted_and_dropped() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(local_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let server_addr = server
-            .server_endpoint
-            .as_ref()
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut incoming = server.incoming();
-
-        let mut client = QuicTransport::isolated_for_test(remote_id);
-        let sender = client
-            .connect(&server_addr.to_string(), local_id)
-            .await
-            .unwrap();
-        let _receiver = incoming.recv().await.unwrap().connection;
-        let dropped_before = sender.datagram_tx_dropped();
-        let mut state = rshare_core::GamepadState::neutral(0, 1, 0);
-        state.buttons = vec![
-            rshare_core::GamepadButtonState {
-                button: rshare_core::GamepadButton::South,
-                pressed: true,
-            };
-            400_000
-        ];
-        let message = Message::GamepadState { state };
-        assert!(
-            encode_legacy_realtime_message(&message).is_err(),
-            "fixture must exceed the temporary legacy codec bound"
-        );
-
-        sender
-            .send_message(&message)
-            .await
-            .expect("oversized realtime encoding must be treated as a counted drop");
-
-        assert_eq!(sender.datagram_tx_dropped(), dropped_before + 1);
-    }
-
-    #[tokio::test]
-    async fn quinn_loopback_sends_key_over_reliable_stream() {
-        let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
-        let mut server = QuicTransport::isolated_for_test(local_id);
-        server.start_server("127.0.0.1:0").await.unwrap();
-        let server_addr = server
-            .server_endpoint
-            .as_ref()
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut incoming = server.incoming();
-
-        let mut client = QuicTransport::isolated_for_test(remote_id);
-        let sender = client
-            .connect(&server_addr.to_string(), local_id)
-            .await
-            .unwrap();
-        let mut receiver = incoming.recv().await.unwrap().connection;
-        let mut messages = receiver.message_channel();
-
-        sender
-            .send_message(&Message::Key {
-                keycode: 65,
-                state: rshare_core::KeyState::Pressed,
-            })
-            .await
-            .unwrap();
-
-        let received = tokio::time::timeout(Duration::from_secs(1), messages.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(
-            received,
-            Message::Key {
-                keycode: 65,
-                state: rshare_core::KeyState::Pressed
-            }
-        ));
     }
 }

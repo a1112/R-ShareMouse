@@ -666,33 +666,7 @@ pub enum Message {
     /// Device is leaving
     Goodbye { device_id: DeviceId, reason: String },
 
-    // === Input Events ===
-    /// Mouse movement (high frequency)
-    MouseMove { x: i32, y: i32 },
-    /// Mouse button state change
-    MouseButton {
-        button: MouseButton,
-        state: ButtonState,
-    },
-    /// Mouse wheel scroll
-    MouseWheel { delta_x: i32, delta_y: i32 },
-    /// Key event
-    Key { keycode: u32, state: KeyState },
-    /// Key event with modifiers
-    KeyExtended {
-        keycode: u32,
-        state: KeyState,
-        shift: bool,
-        ctrl: bool,
-        alt: bool,
-        meta: bool,
-    },
-    /// Gamepad became available on the sender.
-    GamepadConnected { info: GamepadDeviceInfo },
-    /// Gamepad is no longer available on the sender.
-    GamepadDisconnected { gamepad_id: u8 },
-    /// Full gamepad state snapshot.
-    GamepadState { state: GamepadState },
+    // === Input-adjacent control and diagnostics ===
     /// Diagnostic-only local input event broadcast to connected peers.
     InputDiagnostic {
         device_id: DeviceId,
@@ -808,13 +782,6 @@ pub enum Message {
     },
 
     // === Screen Control ===
-    /// Cursor is entering a screen
-    ScreenEnter { direction: Direction },
-    /// Cursor is leaving a screen
-    ScreenLeave {
-        direction: Direction,
-        target_device: DeviceId,
-    },
     /// Screen configuration update
     ScreenUpdate { screen_info: ScreenInfo },
 
@@ -835,26 +802,16 @@ impl Message {
             Message::Hello { .. }
             | Message::HelloBack { .. }
             | Message::HelloRejected { .. }
-            | Message::Goodbye { .. }
-            | Message::ScreenEnter { .. }
-            | Message::ScreenLeave { .. } => Priority::Critical,
+            | Message::Goodbye { .. } => Priority::Critical,
 
             // High: immediate input feedback
-            Message::MouseButton { .. }
-            | Message::Key { .. }
-            | Message::KeyExtended { .. }
-            | Message::GamepadConnected { .. }
-            | Message::GamepadDisconnected { .. }
-            | Message::EndpointInjectRequest { .. }
+            Message::EndpointInjectRequest { .. }
             | Message::EndpointInjectResult { .. }
             | Message::UsbTransfer { .. }
             | Message::UsbTransferComplete { .. } => Priority::High,
 
             // Normal: continuous updates
-            Message::MouseMove { .. }
-            | Message::MouseWheel { .. }
-            | Message::GamepadState { .. }
-            | Message::InputDiagnostic { .. }
+            Message::InputDiagnostic { .. }
             | Message::EndpointEventSubscribe { .. }
             | Message::EndpointEventSnapshot { .. }
             | Message::EndpointEventDelta { .. }
@@ -892,8 +849,6 @@ impl Message {
             Message::Hello { .. }
                 | Message::HelloBack { .. }
                 | Message::HelloRejected { .. }
-                | Message::ScreenEnter { .. }
-                | Message::ScreenLeave { .. }
                 | Message::ScreenUpdate { .. }
                 | Message::ClipboardRequest
                 | Message::ClipboardResponse { .. }
@@ -1027,13 +982,19 @@ mod tests {
 
     #[test]
     fn test_message_serialization() {
-        let msg = Message::MouseMove { x: 100, y: 200 };
+        let msg = Message::Heartbeat {
+            sequence: 100,
+            timestamp: 200,
+        };
         let serialized = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&serialized).unwrap();
         match deserialized {
-            Message::MouseMove { x, y } => {
-                assert_eq!(x, 100);
-                assert_eq!(y, 200);
+            Message::Heartbeat {
+                sequence,
+                timestamp,
+            } => {
+                assert_eq!(sequence, 100);
+                assert_eq!(timestamp, 200);
             }
             _ => panic!("Wrong message type"),
         }
@@ -1051,66 +1012,6 @@ mod tests {
             transport_capabilities: PeerTransportCapabilities::default(),
         };
         assert_eq!(critical.priority(), Priority::Critical);
-
-        let high = Message::MouseButton {
-            button: MouseButton::Left,
-            state: ButtonState::Pressed,
-        };
-        assert_eq!(high.priority(), Priority::High);
-
-        let normal = Message::MouseMove { x: 100, y: 200 };
-        assert_eq!(normal.priority(), Priority::Normal);
-
-        let gamepad_connect = Message::GamepadConnected {
-            info: GamepadDeviceInfo {
-                gamepad_id: 0,
-                name: "Xbox Wireless Controller".to_string(),
-                vendor_id: Some(0x045e),
-                product_id: Some(0x02fd),
-            },
-        };
-        assert_eq!(gamepad_connect.priority(), Priority::High);
-
-        let gamepad_state = Message::GamepadState {
-            state: GamepadState::neutral(0, 1, 123),
-        };
-        assert_eq!(gamepad_state.priority(), Priority::Normal);
-        assert!(!gamepad_state.requires_ack());
-    }
-
-    #[test]
-    fn test_gamepad_message_serialization() {
-        let msg = Message::GamepadState {
-            state: GamepadState {
-                gamepad_id: 1,
-                sequence: 42,
-                buttons: vec![GamepadButtonState {
-                    button: GamepadButton::South,
-                    pressed: true,
-                }],
-                left_stick_x: -1200,
-                left_stick_y: 3200,
-                right_stick_x: 0,
-                right_stick_y: 1024,
-                left_trigger: 0,
-                right_trigger: 65535,
-                timestamp_ms: 999,
-            },
-        };
-
-        let serialized = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
-        assert!(matches!(
-            deserialized,
-            Message::GamepadState {
-                state: GamepadState {
-                    gamepad_id: 1,
-                    sequence: 42,
-                    right_trigger: 65535,
-                    ..
-                }
-            }
-        ));
     }
 
     #[test]

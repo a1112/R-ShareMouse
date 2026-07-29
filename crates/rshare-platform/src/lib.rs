@@ -37,6 +37,9 @@ pub mod firewall;
 // Cross-platform system integration helpers
 pub mod system;
 
+// Cross-platform session lock and system suspend safety events
+pub mod system_events;
+
 // Cross-platform display settings helpers
 pub mod display;
 
@@ -65,6 +68,7 @@ pub use clipboard::*;
 pub use file_drop::*;
 pub use firewall::*;
 pub use system::*;
+pub use system_events::*;
 pub use usb_forwarding::*;
 
 /// Clipboard listener configuration

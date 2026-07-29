@@ -13,7 +13,7 @@ use rshare_core::{
     ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
 };
 use rshare_input::{
-    ButtonState, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle,
+    ButtonState, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle, KeyCode,
     MouseButton as InjectMouseButton, RealtimeSubmitResult,
 };
 
@@ -50,6 +50,10 @@ impl Recorder {
             assert!(!timeout.timed_out() || calls.len() >= count);
         }
         calls.clone()
+    }
+
+    fn contains(&self, expected: &Call) -> bool {
+        self.calls.lock().unwrap().contains(expected)
     }
 }
 
@@ -1220,6 +1224,259 @@ async fn slow_backend_does_not_block_tokio_receiver() {
     );
     tokio::task::yield_now().await;
     gate.release();
+    actor.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trusted_local_and_remote_ledgers_release_independently() {
+    let recorder = Arc::new(Recorder::default());
+    let actor = InputInjectionHandle::spawn(
+        Box::new(RecordingBackend {
+            recorder: Arc::clone(&recorder),
+            delay: Duration::ZERO,
+            fail_relative: false,
+        }),
+        InjectionActorConfig::default(),
+    )
+    .unwrap();
+    let remote = owner();
+
+    actor
+        .inject_trusted_local(InputEvent::key(KeyCode::Char(b'A'), ButtonState::Pressed))
+        .await
+        .unwrap();
+    actor
+        .begin_session(remote, SessionEpoch(1), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            remote,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: b'B' as u32,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    actor
+        .wait_for_timing(SessionEpoch(1), true, 1, WAIT)
+        .unwrap();
+
+    actor
+        .begin_session(remote, SessionEpoch(2), Duration::from_secs(30))
+        .unwrap();
+    let calls = recorder.wait_for(3);
+    assert!(calls.contains(&Call::Key(
+        b'B' as u32,
+        ButtonState::Released,
+        "rshare-input-injection".to_string(),
+    )));
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::Key(code, ButtonState::Released, _) if *code == b'A' as u32
+        )),
+        "remote ownership transfer must not release trusted-local keys"
+    );
+
+    actor
+        .inject_trusted_local(InputEvent::key(KeyCode::Char(b'A'), ButtonState::Released))
+        .await
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            remote,
+            reliable(
+                2,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: b'C' as u32,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    actor
+        .wait_for_timing(SessionEpoch(2), true, 1, WAIT)
+        .unwrap();
+
+    actor
+        .inject_trusted_local(InputEvent::key(KeyCode::Char(b'D'), ButtonState::Pressed))
+        .await
+        .unwrap();
+    actor
+        .inject_trusted_local(InputEvent::key(KeyCode::Char(b'D'), ButtonState::Released))
+        .await
+        .unwrap();
+    let calls = recorder.wait_for(7);
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::Key(code, ButtonState::Released, _) if *code == b'C' as u32
+        )),
+        "trusted-local release must not close the remote ledger"
+    );
+
+    actor
+        .try_submit_reliable(
+            remote,
+            reliable(
+                2,
+                2,
+                ReliableInputEvent::Key {
+                    keycode: b'C' as u32,
+                    state: KeyState::Released,
+                },
+            ),
+        )
+        .unwrap();
+    actor
+        .wait_for_timing(SessionEpoch(2), true, 2, WAIT)
+        .unwrap();
+    actor.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_sources_safety_release_clears_trusted_keys_and_coalesces_repeats() {
+    let backend = RecordingBackend {
+        recorder: Arc::new(Recorder::default()),
+        delay: Duration::ZERO,
+        fail_relative: false,
+    };
+    let (actor, recorder, owner) = fixture(backend, Duration::ZERO);
+    actor
+        .inject_trusted_local(InputEvent::key(KeyCode::Raw(0x41), ButtonState::Pressed))
+        .await
+        .unwrap();
+    assert_eq!(recorder.wait_for(1).len(), 1);
+
+    for _ in 0..1_000 {
+        actor.request_release_all_sources(ReleaseAllReason::Suspended);
+    }
+    let calls = recorder.wait_for(2);
+    assert!(matches!(
+        calls.as_slice(),
+        [
+            Call::Key(0x41, ButtonState::Pressed, _),
+            Call::Key(0x41, ButtonState::Released, _),
+        ]
+    ));
+
+    actor
+        .begin_session(owner, SessionEpoch(2), Duration::from_secs(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            owner,
+            reliable(
+                2,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: 0x42,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    actor
+        .wait_for_timing(SessionEpoch(2), true, 1, WAIT)
+        .expect("new remote session did not recover after global safety release");
+    assert!(recorder
+        .wait_for(3)
+        .iter()
+        .any(|call| matches!(call, Call::Key(0x42, ButtonState::Pressed, _))));
+    actor.request_release_all(ReleaseAllReason::SessionEnded);
+    actor.shutdown().unwrap();
+    assert_eq!(
+        recorder
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, Call::Key(0x41, ButtonState::Released, _)))
+            .count(),
+        1,
+        "coalesced safety requests must not enqueue repeated trusted releases"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuous_trusted_local_flow_cannot_starve_remote_lease_release() {
+    let recorder = Arc::new(Recorder::default());
+    let actor = InputInjectionHandle::spawn(
+        Box::new(RecordingBackend {
+            recorder: Arc::clone(&recorder),
+            delay: Duration::from_millis(2),
+            fail_relative: false,
+        }),
+        InjectionActorConfig {
+            reliable_capacity: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let remote = owner();
+    actor
+        .begin_session(remote, SessionEpoch(1), Duration::from_millis(30))
+        .unwrap();
+    actor
+        .try_submit_reliable(
+            remote,
+            reliable(
+                1,
+                1,
+                ReliableInputEvent::Key {
+                    keycode: b'B' as u32,
+                    state: KeyState::Pressed,
+                },
+            ),
+        )
+        .unwrap();
+    actor
+        .wait_for_timing(SessionEpoch(1), true, 1, WAIT)
+        .unwrap();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let mut producers = Vec::new();
+    for offset in 0..16_u32 {
+        let producer = actor.clone();
+        let running = Arc::clone(&running);
+        producers.push(tokio::spawn(async move {
+            let key = KeyCode::Raw(0x100 + offset);
+            let mut state = ButtonState::Pressed;
+            while running.load(Ordering::Acquire) {
+                let _ = producer
+                    .inject_trusted_local(InputEvent::key(key, state))
+                    .await;
+                state = if state == ButtonState::Pressed {
+                    ButtonState::Released
+                } else {
+                    ButtonState::Pressed
+                };
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        let released = Call::Key(
+            b'B' as u32,
+            ButtonState::Released,
+            "rshare-input-injection".to_string(),
+        );
+        while !recorder.contains(&released) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("continuous trusted-local flow starved remote lease release");
+
+    running.store(false, Ordering::Release);
+    for producer in producers {
+        producer.await.unwrap();
+    }
     actor.shutdown().unwrap();
 }
 

@@ -1,5 +1,4 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rshare_core::engine::{ForwardingEngine, RawInputEvent};
 use rshare_core::{CaptureSessionStateMachine, Direction, LayoutGraph, LayoutLink, LayoutNode};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -41,16 +40,6 @@ fn control_benches(criterion: &mut Criterion) {
         })
     });
 
-    let mut forwarding = ForwardingEngine::new();
-    forwarding.set_target(remote);
-    group.bench_function("forward_mouse_remote_active", |bencher| {
-        bencher.iter(|| {
-            black_box(forwarding.process_event(RawInputEvent::MouseMove {
-                x: black_box(17),
-                y: black_box(-9),
-            }))
-        })
-    });
     group.finish();
 }
 
