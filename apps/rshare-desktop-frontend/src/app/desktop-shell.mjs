@@ -41,7 +41,8 @@ export function getDeviceSimulatorChrome() {
 
 export function getLocalControlRefreshTiming() {
   return {
-    dashboardPollMs: 1500,
+    fallbackDelayMs: 1000,
+    fallbackPollMs: 2000,
     eventFlushMs: 8,
   };
 }

@@ -52,6 +52,7 @@ import {
   buildVirtualDisplayViewModel,
   describeAudioEndpoint,
   endpointEventToLocalControlEvent,
+  projectUiInputToLocalControls,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 import {
@@ -87,6 +88,16 @@ import {
   createTauriUiStateConnector,
   createWebSocketUiStateConnector,
 } from "./ui-state-client.mjs";
+import {
+  createUiStateAppBindings,
+  selectDashboardPayload,
+  selectDiagnostics,
+  selectHasAuthoritativeSnapshot,
+  selectInputVisuals,
+  selectTopologyProjection,
+  createOwnerlessStreamCoordinator,
+} from "./ui-store.mjs";
+import { uiStateStore, useUiStore } from "./use-ui-store";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
 type SettingsSectionKey =
@@ -185,6 +196,7 @@ type DashboardPayload = {
   visible_layout?: unknown | null;
   layout_error?: string | null;
   capabilities?: unknown | null;
+  display_inventory?: unknown | null;
   auto_started?: boolean;
 };
 
@@ -634,7 +646,6 @@ type LocalControlSubscription = {
 type ThemeMode = "light" | "dark" | "system";
 
 const LOCAL_CONTROL_REFRESH_TIMING = getLocalControlRefreshTiming();
-const ENDPOINT_EVENT_POLL_MS = 750;
 const LOCAL_CONTROL_EVENT_FLUSH_MS = LOCAL_CONTROL_REFRESH_TIMING.eventFlushMs;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 const HARDWARE_RIG_VARIANT_STORAGE_KEY = "rshare.hardwareRigVariant";
@@ -687,11 +698,6 @@ const WEB_NOOP_COMMANDS = new Set([
   "toggle_maximize_window",
   "close_window",
 ]);
-
-const EMPTY_PAYLOAD: DashboardPayload = {
-  status: null,
-  devices: [],
-};
 
 const PAGE_LABELS: Array<{ key: DesktopPage; label: string }> = getPageLabels();
 
@@ -794,75 +800,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function dashboardPayloadFromUiSnapshot(snapshot: Record<string, unknown>): DashboardPayload {
-  const layout = snapshot.layout ?? null;
-  return {
-    status: snapshot.status ?? null,
-    devices: (Array.isArray(snapshot.devices) ? snapshot.devices : []) as DashboardPayload["devices"],
-    layout,
-    visible_layout: layout,
-    layout_error: null,
-    capabilities: snapshot.capabilities ?? null,
-  };
-}
-
-function applyUiStateEnvelopeToDashboard(
-  current: DashboardPayload,
-  envelope: unknown,
-): DashboardPayload {
-  if (!isRecord(envelope) || !isRecord(envelope.payload)) {
-    return current;
-  }
-  if (envelope.type === "snapshot") {
-    return dashboardPayloadFromUiSnapshot(envelope.payload);
-  }
-  if (envelope.type !== "delta" || !isRecord(envelope.payload.change)) {
-    return current;
-  }
-
-  const change = envelope.payload.change;
-  switch (change.type) {
-    case "status":
-      return { ...current, status: change.payload ?? null };
-    case "capabilities":
-      return { ...current, capabilities: change.payload ?? null };
-    case "topology":
-      return {
-        ...current,
-        layout: change.payload ?? null,
-        visible_layout: change.payload ?? null,
-        layout_error: null,
-      };
-    case "device_upsert": {
-      if (!isRecord(change.payload) || typeof change.payload.id !== "string") {
-        return current;
-      }
-      const device = change.payload as DashboardPayload["devices"][number];
-      const devices = current.devices.filter((item) => item.id !== device.id);
-      devices.push(device);
-      return { ...current, devices };
-    }
-    case "device_remove": {
-      if (typeof change.payload !== "string") {
-        return current;
-      }
-      return {
-        ...current,
-        devices: current.devices.filter((device) => device.id !== change.payload),
-      };
-    }
-    case "diagnostics":
-      return isRecord(current.status)
-        ? {
-            ...current,
-            status: { ...current.status, latency_feedback: change.payload ?? null },
-          }
-        : current;
-    default:
-      return current;
-  }
 }
 
 async function daemonIpcRequest(request: unknown): Promise<unknown> {
@@ -1448,6 +1385,19 @@ async function invokeCommand<T = unknown>(
 
   throw new Error(`命令 ${command} 需要 Tauri bridge 或 daemon 网络网关`);
 }
+
+const localControlsStreamCoordinator = createOwnerlessStreamCoordinator({
+  start: () => invokeCommand("start_local_controls_stream"),
+  stop: () => invokeCommand("stop_local_controls_stream"),
+});
+
+const endpointEventsStreamCoordinator = createOwnerlessStreamCoordinator({
+  start: () =>
+    invokeCommand("start_endpoint_events_stream", {
+      filter: endpointEventFilter(null),
+    }),
+  stop: () => invokeCommand("stop_endpoint_events_stream"),
+});
 
 function loadHiddenMonitorIds(): Set<string> {
   try {
@@ -2073,7 +2023,7 @@ function DesktopApp() {
   usePreventBrowserNavigationEvents();
 
   const [page, setPage] = useState<DesktopPage>("layout");
-  const [payload, setPayload] = useState<DashboardPayload>(EMPTY_PAYLOAD);
+  const payload = useUiStore(selectDashboardPayload) as DashboardPayload;
   const [busy, setBusy] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [systemPrefersDark, setSystemPrefersDark] = useState(true);
@@ -2087,6 +2037,7 @@ function DesktopApp() {
   const [remoteLatencyTestResult, setRemoteLatencyTestResult] =
     useState<LocalInputTestResult | null>(null);
   const [confirmingInputTest, setConfirmingInputTest] = useState<string | null>(null);
+  const [uiStreamHealthy, setUiStreamHealthy] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
   const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
     loadHiddenMonitorIds,
@@ -2101,9 +2052,12 @@ function DesktopApp() {
   const [selectedHardwareAssetIds, setSelectedHardwareAssetIds] =
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
-  const uiStateRevisionRef = useRef(0);
+  const uiStreamHealthyRef = useRef(false);
 
-  const model = buildDesktopViewModel(payload, localControls);
+  const model = buildDesktopViewModel(
+    payload,
+    localControls ? { display: localControls.display } : null,
+  );
   const layoutDevices = getLayoutDevices(model.layout.devices);
   const layoutMonitors = getLayoutMonitors(model.layout.monitors, hiddenMonitorIds);
   const isDark = themeMode === "system" ? systemPrefersDark : themeMode === "dark";
@@ -2121,22 +2075,18 @@ function DesktopApp() {
   ].filter((id, index, values) => id && values.indexOf(id) === index);
   const endpointPollKey = endpointIds.join("|");
 
-  async function refreshDashboard(expectedUiRevision?: number) {
+  async function refreshDashboard(expectedUiVersion?: number) {
+    const expectedVersion =
+      expectedUiVersion ?? uiStateStore.currentVersion();
     try {
       const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
-      if (
-        expectedUiRevision !== undefined &&
-        expectedUiRevision !== uiStateRevisionRef.current
-      ) {
+      if (expectedVersion !== uiStateStore.currentVersion()) {
         return;
       }
-      setPayload(snapshot);
+      uiStateStore.applyDashboardSnapshot(snapshot, expectedVersion);
       setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
     } catch (refreshError) {
-      if (
-        expectedUiRevision !== undefined &&
-        expectedUiRevision !== uiStateRevisionRef.current
-      ) {
+      if (expectedVersion !== uiStateStore.currentVersion()) {
         return;
       }
       setError(errorMessage(refreshError));
@@ -2229,15 +2179,22 @@ function DesktopApp() {
   };
 
   useEffect(() => {
-    let fallbackInFlight: Promise<void> | null = null;
+    let cancelled = false;
+    const bindings = createUiStateAppBindings({
+      store: uiStateStore,
+      loadFallbackSnapshot: () =>
+        invokeCommand<DashboardPayload>("dashboard_state"),
+      onFallbackApplied: (snapshot: DashboardPayload) => {
+        setError(
+          snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null,
+        );
+      },
+    });
     const client = new UiStateClient({
       connect: connectUiStateTransport,
       onEnvelope: (envelope: UiStateEnvelope) => {
+        bindings.onEnvelope(envelope);
         if (envelope.type === "snapshot" || envelope.type === "delta") {
-          uiStateRevisionRef.current += 1;
-          setPayload((current) =>
-            applyUiStateEnvelopeToDashboard(current, envelope),
-          );
           if (
             envelope.type === "snapshot" ||
             (isRecord(envelope.payload.change) &&
@@ -2248,33 +2205,30 @@ function DesktopApp() {
         }
       },
       onStatus: (status: { state?: string }) => {
-        if (status.state !== "fallback_poll") {
-          return undefined;
+        const healthy = status.state === "healthy";
+        uiStreamHealthyRef.current = healthy;
+        if (!cancelled) {
+          setUiStreamHealthy(healthy);
         }
-        if (!fallbackInFlight) {
-          const expectedUiRevision = uiStateRevisionRef.current;
-          fallbackInFlight = refreshDashboard(expectedUiRevision).finally(
-            () => {
-              fallbackInFlight = null;
-            },
-          );
-        }
-        return fallbackInFlight;
+        return bindings.onStatus(status);
       },
     });
 
     void client.start();
     return () => {
+      cancelled = true;
       void client.stop();
     };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    const expectedUiRevision = uiStateRevisionRef.current;
-    refreshDashboard(expectedUiRevision).finally(() => {
+    const expectedUiVersion = uiStateStore.currentVersion();
+    refreshDashboard(expectedUiVersion).finally(() => {
       if (!cancelled) {
-        void refreshLocalControls();
+        if (!uiStreamHealthyRef.current) {
+          void refreshLocalControls();
+        }
         void refreshMobileAccess();
       }
     });
@@ -2304,8 +2258,12 @@ function DesktopApp() {
   }, [selectedHardwareAssetIds]);
 
   useEffect(() => {
+    if (uiStreamHealthy) {
+      return;
+    }
     let cancelled = false;
     let subscription: LocalControlSubscription | null = null;
+    let streamLease: any = null;
     let flushTimer: number | null = null;
     const pendingEvents: LocalControlEvent[] = [];
 
@@ -2383,10 +2341,13 @@ function DesktopApp() {
 
         subscription = nextSubscription;
         if (subscription?.usesTauriBridge) {
-          await invokeCommand("start_local_controls_stream");
+          streamLease = localControlsStreamCoordinator.acquire();
+          await streamLease.ready;
         }
       } catch (streamError) {
-        setLocalControlsError(errorMessage(streamError));
+        if (!cancelled) {
+          setLocalControlsError(errorMessage(streamError));
+        }
       }
     }
 
@@ -2396,21 +2357,23 @@ function DesktopApp() {
       clearFlushTimer();
       const usesTauriBridge = subscription?.usesTauriBridge ?? false;
       subscription?.stop();
-      if (usesTauriBridge) {
-        invokeCommand("stop_local_controls_stream").catch(() => {});
+      if (usesTauriBridge && streamLease) {
+        localControlsStreamCoordinator.release(streamLease).catch(() => {});
       }
     };
-  }, []);
+  }, [uiStreamHealthy]);
 
   useEffect(() => {
+    if (uiStreamHealthy) {
+      return;
+    }
     if (!endpointIds.length) {
       return;
     }
 
     let cancelled = false;
     let subscription: LocalControlSubscription | null = null;
-    let timer: number | null = null;
-    let pollInFlight = false;
+    let streamLease: any = null;
 
     const rememberSequences = (events: EndpointEvent[]) => {
       for (const event of events) {
@@ -2450,38 +2413,6 @@ function DesktopApp() {
       }
     };
 
-    async function pollEndpoint(endpointId: string) {
-      const events = await invokeCommand<EndpointEvent[]>("endpoint_events_state", {
-        filter: endpointEventFilter(endpointId),
-        after_sequence: endpointSequencesRef.current[endpointId] ?? null,
-        limit: 128,
-      });
-      applyEvents(events);
-    }
-
-    async function pollAllEndpoints() {
-      if (pollInFlight) {
-        return;
-      }
-      pollInFlight = true;
-      try {
-        for (const endpointId of endpointIds) {
-          if (cancelled) {
-            return;
-          }
-          try {
-            await pollEndpoint(endpointId);
-          } catch (pollError) {
-            if (!cancelled) {
-              setLocalControlsError(errorMessage(pollError));
-            }
-          }
-        }
-      } finally {
-        pollInFlight = false;
-      }
-    }
-
     async function startEndpointStream() {
       subscription = await listenEndpointEvent(handleEndpointPayload);
       if (cancelled) {
@@ -2489,9 +2420,8 @@ function DesktopApp() {
         return;
       }
       if (subscription?.usesTauriBridge) {
-        await invokeCommand("start_endpoint_events_stream", {
-          filter: endpointEventFilter(null),
-        });
+        streamLease = endpointEventsStreamCoordinator.acquire();
+        await streamLease.ready;
       }
     }
 
@@ -2500,23 +2430,21 @@ function DesktopApp() {
         setLocalControlsError(errorMessage(streamError));
       }
     });
-    pollAllEndpoints();
-    timer = window.setInterval(pollAllEndpoints, ENDPOINT_EVENT_POLL_MS);
 
     return () => {
       cancelled = true;
-      if (timer !== null) {
-        window.clearInterval(timer);
-      }
       const usesTauriBridge = subscription?.usesTauriBridge ?? false;
       subscription?.stop();
-      if (usesTauriBridge) {
-        invokeCommand("stop_endpoint_events_stream").catch(() => {});
+      if (usesTauriBridge && streamLease) {
+        endpointEventsStreamCoordinator.release(streamLease).catch(() => {});
       }
     };
-  }, [endpointPollKey]);
+  }, [endpointPollKey, uiStreamHealthy]);
 
   useEffect(() => {
+    if (uiStreamHealthy) {
+      return;
+    }
     if (typeof navigator.getGamepads !== "function") {
       return;
     }
@@ -2526,7 +2454,7 @@ function DesktopApp() {
     }, 50);
 
     return () => window.clearInterval(timer);
-  }, []);
+  }, [uiStreamHealthy]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -2592,7 +2520,14 @@ function DesktopApp() {
     setConfirmingInputTest(null);
     try {
       const results: EndpointInjectResult[] = [];
-      for (const request of endpointInjectRequests(kind, localControls)) {
+      const currentUiState = uiStateStore.getState();
+      const effectiveLocalControls = projectUiInputToLocalControls(
+        currentUiState.inputVisuals,
+        currentUiState.topology,
+        localControls,
+        { authoritative: currentUiState.bootId !== null },
+      ) as LocalControlsSnapshot;
+      for (const request of endpointInjectRequests(kind, effectiveLocalControls)) {
         const result = await invokeCommand<EndpointInjectResult>("inject_endpoint_event", {
           target: endpointInjectTarget(remoteDeviceId),
           request,
@@ -2660,19 +2595,10 @@ function DesktopApp() {
     setBusy(true);
     try {
       await invokeCommand("set_layout", { layout: nextLayout });
-      setPayload((current) => ({
-        ...current,
-        layout: nextLayout,
-        layout_error: null,
-      }));
       setError(null);
       await refreshDashboard();
     } catch (layoutSaveError) {
       const message = `布局未保存：${errorMessage(layoutSaveError)}`;
-      setPayload((current) => ({
-        ...current,
-        layout_error: message,
-      }));
       setError(message);
     } finally {
       setBusy(false);
@@ -3034,14 +2960,25 @@ function DevicesPage({
   busy: boolean;
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
+  const inputVisuals = useUiStore(selectInputVisuals);
+  const topology = useUiStore(selectTopologyProjection);
+  const liveDiagnostics = useUiStore(selectDiagnostics);
+  const hasAuthoritativeSnapshot = useUiStore(selectHasAuthoritativeSnapshot);
+  const effectiveLocalControls = projectUiInputToLocalControls(
+    inputVisuals,
+    topology,
+    localControls,
+    { authoritative: hasAuthoritativeSnapshot },
+  ) as LocalControlsSnapshot;
+
   return (
     <DevicesPageWithLocalControls
       devices={devices}
       capabilities={capabilities}
       visibleLayout={visibleLayout}
       localDevice={localDevice}
-      latencyFeedback={latencyFeedback}
-      localControls={localControls}
+      latencyFeedback={liveDiagnostics ?? latencyFeedback}
+      localControls={effectiveLocalControls}
       localControlsError={localControlsError}
       localInputTestResult={localInputTestResult}
       remoteLatencyTestResult={remoteLatencyTestResult}

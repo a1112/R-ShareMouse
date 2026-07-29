@@ -2931,12 +2931,16 @@ export function buildDesktopViewModel(payload, localControls = null) {
   const localDevice = buildLocalDevice(status);
   const discoveredRemoteDevices = (payload?.devices ?? []).map(buildRemoteDevice);
   const remoteDevices = discoveredRemoteDevices;
+  const localDisplaySource =
+    (payload?.display_inventory
+      ? { display: payload.display_inventory }
+      : localControls);
   const daemonLayout = buildLayoutFromVisibleGraph(
     payload?.visible_layout,
     payload?.layout,
     localDevice,
     remoteDevices,
-    localControls,
+    localDisplaySource,
   );
   const layoutUnavailable = Boolean(payload?.layout_error && status && !payload?.visible_layout);
   const fallbackDevices = layoutUnavailable ? [localDevice] : [localDevice, ...remoteDevices];
@@ -2990,5 +2994,108 @@ export function buildDesktopViewModel(payload, localControls = null) {
       privilegeState: status?.privilege_state ?? "不可用",
     },
     acceptance: buildAcceptance(payload, status, discoveredRemoteDevices, layout, inputMode),
+  };
+}
+
+export function equalLayoutDevices(previous, incoming) {
+  if (previous === incoming) {
+    return true;
+  }
+  if (!Array.isArray(previous) || !Array.isArray(incoming)) {
+    return false;
+  }
+  if (previous.length !== incoming.length) {
+    return false;
+  }
+  return previous.every((device, index) => {
+    const next = incoming[index];
+    return (
+      device.id === next?.id &&
+      device.name === next.name &&
+      device.color === next.color &&
+      device.online === next.online &&
+      device.type === (next.type ?? "desktop") &&
+      device.connected === next.connected
+    );
+  });
+}
+
+export function reconcileLayoutDevices(previous, incoming) {
+  const expandedById = new Map(
+    previous.map((device) => [device.id, device.expanded]),
+  );
+  const normalized = incoming.map((device) => ({
+    ...device,
+    type: device.type ?? "desktop",
+    expanded: expandedById.get(device.id) ?? device.expanded ?? true,
+  }));
+  return equalLayoutDevices(previous, normalized) ? previous : normalized;
+}
+
+export function projectUiInputToLocalControls(
+  input,
+  topology,
+  fallback = null,
+  { authoritative = true } = {},
+) {
+  if (!authoritative) {
+    return fallback;
+  }
+  const pointer = input?.pointer;
+  const displayInventory = topology?.displayInventory ?? {};
+  return {
+    ...(fallback ?? {}),
+    sequence: Math.max(
+      Number(fallback?.sequence ?? 0),
+      Number(pointer?.observed_at_ms ?? 0),
+    ),
+    keyboard: {
+      ...(fallback?.keyboard ?? {}),
+      detected: Boolean(
+        fallback?.keyboard?.detected ||
+          input?.pressedKeys?.length ||
+          input?.lastDiscreteTransition?.type === "key",
+      ),
+      event_count: Number(fallback?.keyboard?.event_count ?? 0),
+      capture_source: fallback?.keyboard?.capture_source ?? "ui-state",
+      pressed_keys: (input?.pressedKeys ?? []).map(String),
+    },
+    mouse: {
+      ...(fallback?.mouse ?? {}),
+      detected: Boolean(
+        fallback?.mouse?.detected ||
+          pointer ||
+          input?.pressedMouseButtons?.length ||
+          ["mouse_button", "wheel"].includes(
+            input?.lastDiscreteTransition?.type,
+          ),
+      ),
+      x: Number(pointer?.x ?? fallback?.mouse?.x ?? 0),
+      y: Number(pointer?.y ?? fallback?.mouse?.y ?? 0),
+      event_count: Number(fallback?.mouse?.event_count ?? 0),
+      capture_source: fallback?.mouse?.capture_source ?? "ui-state",
+      pressed_buttons: input?.pressedMouseButtons ?? [],
+      current_display_id:
+        pointer?.display_id ?? fallback?.mouse?.current_display_id ?? null,
+    },
+    gamepads: input?.gamepads ?? fallback?.gamepads ?? [],
+    display: {
+      ...(fallback?.display ?? {}),
+      ...displayInventory,
+      displays:
+        displayInventory.displays ?? fallback?.display?.displays ?? [],
+      display_count: Number(
+        displayInventory.display_count ??
+          displayInventory.displays?.length ??
+          fallback?.display?.display_count ??
+          0,
+      ),
+    },
+    capture_backend: fallback?.capture_backend ?? {},
+    inject_backend: fallback?.inject_backend ?? {},
+    virtual_gamepad: fallback?.virtual_gamepad ?? {
+      status: "unknown",
+      detail: "由 UI state 流提供实时输入状态",
+    },
   };
 }

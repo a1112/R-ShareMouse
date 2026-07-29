@@ -103,9 +103,27 @@ test("getDeviceSimulatorChrome keeps simulator devices texture first and unframe
 test("getLocalControlRefreshTiming makes local input feedback event driven", () => {
   const timing = getLocalControlRefreshTiming();
 
-  assert.equal(timing.dashboardPollMs, 1500);
+  assert.equal(timing.fallbackDelayMs, 1000);
+  assert.equal(timing.fallbackPollMs, 2000);
+  assert.equal(Object.hasOwn(timing, "dashboardPollMs"), false);
+  assert.equal(Object.hasOwn(timing, "endpointPollMs"), false);
   assert.equal(Object.hasOwn(timing, "localControlsPollMs"), false);
   assert.ok(timing.eventFlushMs <= 16);
+});
+
+test("desktop app routes revisioned state through the selector store without fast polls", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /useUiStore\(selectDashboardPayload\)/);
+  assert.match(source, /createUiStateAppBindings\(\{/);
+  assert.match(source, /if \(uiStreamHealthy\) \{\s*return;\s*\}/);
+  assert.doesNotMatch(source, /ENDPOINT_EVENT_POLL_MS/);
+  assert.doesNotMatch(source, /setInterval\(pollAllEndpoints/);
+  assert.doesNotMatch(source, /setPayload\(/);
+  assert.match(
+    source,
+    /projectUiInputToLocalControls\(\s*currentUiState\.inputVisuals,\s*currentUiState\.topology,\s*localControls,\s*\{\s*authoritative:\s*currentUiState\.bootId\s*!==\s*null\s*\}/,
+  );
 });
 
 test("formatNetworkGatewayError hides raw browser fetch failures", () => {

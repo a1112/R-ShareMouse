@@ -2059,6 +2059,71 @@ test("buildDesktopViewModel labels local visible displays from local controls na
   assert.equal(model.layout.monitors[1].name, "GX217UR (DISPLAY2)");
 });
 
+test("buildDesktopViewModel uses authoritative UI display inventory without local controls", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Studio PC",
+      hostname: "studio",
+      healthy: true,
+    },
+    devices: [],
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [
+            {
+              display_id: "primary",
+              x: 0,
+              y: 0,
+              width: 1920,
+              height: 1080,
+              primary: true,
+            },
+          ],
+        },
+      ],
+      links: [],
+    },
+    display_inventory: {
+      display_count: 1,
+      displays: [
+        {
+          display_id: "primary",
+          friendly_name: "Authoritative Panel",
+          x: 0,
+          y: 0,
+          width: 2560,
+          height: 1440,
+          raw_dpi_x: 93,
+          raw_dpi_y: 93,
+          primary: true,
+        },
+      ],
+    },
+  }, {
+    display: {
+      display_count: 1,
+      displays: [
+        {
+          display_id: "primary",
+          friendly_name: "Stale Fallback Panel",
+          width: 800,
+          height: 600,
+          primary: true,
+        },
+      ],
+    },
+  });
+
+  assert.equal(model.layout.monitors[0].name, "Authoritative Panel");
+  assert.equal(model.layout.monitors[0].resWidth, 2560);
+  assert.equal(model.layout.monitors[0].w, 307);
+});
+
 test("buildDesktopViewModel draws local displays from physical DPI while preserving bottom alignment", () => {
   const model = buildDesktopViewModel(
     {

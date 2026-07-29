@@ -39,6 +39,7 @@ import {
   ContextMenuTrigger,
 } from "./ui/context-menu";
 import { buildMonitorContextMenuModel } from "../monitor-context-menu.mjs";
+import { reconcileLayoutDevices } from "../desktop-model.mjs";
 
 /* ---------- Types ---------- */
 export interface MonitorData {
@@ -442,11 +443,7 @@ export default function MonitorManager({
     }
 
     setDevices((prev) => {
-      const expandedLookup = new Map(prev.map((device) => [device.id, device.expanded]));
-      return externalDevices.map((device) => ({
-        ...normalizeDevice(device),
-        expanded: expandedLookup.get(device.id) ?? device.expanded ?? true,
-      }));
+      return reconcileLayoutDevices(prev, externalDevices);
     });
   }, [externalDevices]);
 
