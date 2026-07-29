@@ -4712,6 +4712,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "bincode",
+ "bytes",
  "criterion",
  "dhat",
  "directories",
@@ -4832,6 +4833,7 @@ dependencies = [
  "clap",
  "jsonschema",
  "rshare-core",
+ "rshare-daemon",
  "rshare-net",
  "serde",
  "serde_json",
@@ -4839,6 +4841,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml 0.8.2",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 

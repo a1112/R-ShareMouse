@@ -13,27 +13,27 @@ use futures_util::SinkExt;
 use rshare_core::Direction;
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
-    local_capability_snapshots, read_json_line, remote_capability_snapshots, write_json_line,
-    AudioFormat, BackendFailureReason, BackendHealth, BackendKind, BackendRuntimeState,
-    CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine, Config,
-    ControlConnectionId, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse,
-    DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult,
-    DisplayIdentifyResult, DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult,
-    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
-    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, FeatureConfig, InputRouter, LatencyFeedbackSnapshot,
-    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
-    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
-    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
-    UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
-    UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    local_capability_snapshots, remote_capability_snapshots, AudioFormat, BackendFailureReason,
+    BackendHealth, BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
+    CaptureSessionStateMachine, Config, ControlConnectionId, ControlSessionState,
+    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
+    DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult, DisplayIdentifyResult, DisplayNode,
+    DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
+    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
+    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
+    FeatureConfig, InputRouter, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph,
+    LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult,
+    LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
+    LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource,
+    LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
+    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
+    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
+    ServiceStatusSnapshot, TransportFeedback, UsbControlSetupPacket, UsbDescriptorProbeResult,
+    UsbDescriptorProbeStatus, UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed,
+    UsbTransferDirection, UsbTransferKind, UsbTransferPayload, UsbTransferStatus,
+    VirtualDesktopGeometry, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    VirtualDisplayStatus,
 };
 use rshare_daemon::diagnostics_runtime::{
     DiagnosticPayload, DiagnosticPublicationItem, DiagnosticSubscriberId, DiagnosticsHandle,
@@ -43,6 +43,9 @@ use rshare_daemon::input_runtime::{
     dispatch_system_safety_event, run_authenticated_input_peers, InputRuntime,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetrics};
+use rshare_daemon::ipc_server::{
+    handle_persistent_json_connection_with_first, read_json_request, write_json_response,
+};
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
@@ -7160,19 +7163,22 @@ async fn handle_ipc_client(
     layout_path: Arc<PathBuf>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
-    let request: DaemonRequest = read_json_line(&mut stream).await?;
+    let Some(request) = read_json_request(&mut stream).await? else {
+        return Ok(());
+    };
 
     if matches!(request, DaemonRequest::SubscribeLocalControls) {
         let snapshot = {
             let state = state.read().await;
             state.local_control_snapshot()
         };
-        write_json_line(&mut stream, &DaemonResponse::LocalControls(snapshot)).await?;
+        write_json_response(&mut stream, &DaemonResponse::LocalControls(snapshot)).await?;
         let mut events = local_events_tx.subscribe();
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    write_json_line(&mut stream, &DaemonResponse::LocalControlEvent(event)).await?;
+                    write_json_response(&mut stream, &DaemonResponse::LocalControlEvent(event))
+                        .await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -7187,7 +7193,7 @@ async fn handle_ipc_client(
             let mut state = state.write().await;
             state.endpoint_events(filter, None, Some(128))
         };
-        write_json_line(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
+        write_json_response(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
         let mut local_events = local_events_tx.subscribe();
         let mut endpoint_events = endpoint_events_tx.subscribe();
         loop {
@@ -7200,7 +7206,7 @@ async fn handle_ipc_client(
                                 state.endpoint_event_from_local(event)
                             };
                             if filter.matches(&endpoint_event) {
-                                write_json_line(
+                                write_json_response(
                                     &mut stream,
                                     &DaemonResponse::EndpointEvent(endpoint_event),
                                 )
@@ -7215,7 +7221,7 @@ async fn handle_ipc_client(
                     match event {
                         Ok(endpoint_event) => {
                             if filter.matches(&endpoint_event) {
-                                write_json_line(
+                                write_json_response(
                                     &mut stream,
                                     &DaemonResponse::EndpointEvent(endpoint_event),
                                 )
@@ -7231,6 +7237,47 @@ async fn handle_ipc_client(
         return Ok(());
     }
 
+    handle_persistent_json_connection_with_first(stream, request, move |request| {
+        let state = Arc::clone(&state);
+        let network_manager = Arc::clone(&network_manager);
+        let input_command_tx = input_command_tx.clone();
+        let inject_backend = inject_backend.clone();
+        let audio_runtime = audio_runtime.clone();
+        let usb_runtime = Arc::clone(&usb_runtime);
+        let local_events_tx = local_events_tx.clone();
+        let layout_path = Arc::clone(&layout_path);
+        let shutdown_tx = shutdown_tx.clone();
+        async move {
+            dispatch_ipc_request(
+                request,
+                state,
+                network_manager,
+                input_command_tx,
+                inject_backend,
+                audio_runtime,
+                usb_runtime,
+                local_events_tx,
+                layout_path,
+                shutdown_tx,
+            )
+            .await
+        }
+    })
+    .await
+}
+
+async fn dispatch_ipc_request(
+    request: DaemonRequest,
+    state: Arc<RwLock<DaemonState>>,
+    network_manager: Arc<Mutex<NetworkManager>>,
+    input_command_tx: tokio::sync::mpsc::Sender<RouterCommand>,
+    inject_backend: InputInjectionHandle,
+    audio_runtime: audio_runtime::AudioRuntimeHandle,
+    usb_runtime: UsbHostRuntime,
+    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    layout_path: Arc<PathBuf>,
+    shutdown_tx: broadcast::Sender<()>,
+) -> Result<DaemonResponse> {
     let response = match request {
         DaemonRequest::Status => {
             let connection_infos = {
@@ -7519,9 +7566,11 @@ async fn handle_ipc_client(
             state.refresh_local_controls_platform();
             DaemonResponse::VirtualDisplayOperation(result)
         }
-        DaemonRequest::SubscribeLocalControls => unreachable!("handled before response match"),
-        DaemonRequest::SubscribeEndpointEvents { .. } => {
-            unreachable!("handled before response match")
+        DaemonRequest::SubscribeLocalControls | DaemonRequest::SubscribeEndpointEvents { .. } => {
+            DaemonResponse::Error(
+                "streaming subscriptions must be the first request on a dedicated connection"
+                    .to_string(),
+            )
         }
         DaemonRequest::Shutdown => {
             let _ = shutdown_tx.send(());
@@ -7529,7 +7578,7 @@ async fn handle_ipc_client(
         }
     };
 
-    write_json_line(&mut stream, &response).await
+    Ok(response)
 }
 
 #[cfg(test)]

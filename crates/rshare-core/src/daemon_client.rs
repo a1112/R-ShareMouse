@@ -11,7 +11,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    default_ipc_addr, default_local_controls_ws_url, read_json_line, write_json_line,
+    default_ipc_addr, default_local_controls_ws_url, read_json_frame, write_json_frame,
     CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
@@ -27,8 +27,8 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
 
-    write_json_line(&mut stream, &request).await?;
-    read_json_line(&mut stream).await
+    write_json_frame(&mut stream, &request).await?;
+    read_json_frame(&mut stream).await
 }
 
 pub async fn request_status() -> Result<ServiceStatusSnapshot> {
@@ -344,7 +344,7 @@ pub async fn subscribe_local_controls() -> Result<TcpStream> {
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
-    write_json_line(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
+    write_json_frame(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
     Ok(stream)
 }
 
@@ -352,7 +352,7 @@ pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<Tc
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
-    write_json_line(
+    write_json_frame(
         &mut stream,
         &DaemonRequest::SubscribeEndpointEvents { filter },
     )
@@ -361,7 +361,7 @@ pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<Tc
 }
 
 pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonResponse> {
-    let response: DaemonResponse = read_json_line(stream).await?;
+    let response: DaemonResponse = read_json_frame(stream).await?;
     match response {
         DaemonResponse::LocalControls(_)
         | DaemonResponse::LocalControlEvent(_)

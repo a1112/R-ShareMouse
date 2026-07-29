@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode,
@@ -17,6 +17,7 @@ use crate::{
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
     VirtualDisplaySnapshot,
 };
+use crate::{IpcEnvelopeKind, IpcFrameCodec};
 
 /// Default TCP port for localhost daemon IPC.
 pub const DEFAULT_IPC_PORT: u16 = 27435;
@@ -539,52 +540,30 @@ pub fn default_mobile_gateway_addr() -> SocketAddr {
     )
 }
 
-/// Read a single newline-delimited JSON value from a stream.
-pub async fn read_json_line<T, R>(reader: &mut R) -> Result<T>
+/// Read a single bounded JSON frame from a stream.
+pub async fn read_json_frame<T, R>(reader: &mut R) -> Result<T>
 where
     T: DeserializeOwned,
     R: AsyncRead + Unpin,
 {
-    let mut buf = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let read = reader
-            .read(&mut byte)
-            .await
-            .context("Failed to read IPC stream")?;
-        if read == 0 {
-            break;
-        }
-
-        if byte[0] == b'\n' {
-            break;
-        }
-
-        buf.push(byte[0]);
-    }
-
-    if buf.is_empty() {
-        anyhow::bail!("IPC stream closed before receiving a JSON line");
-    }
-
-    serde_json::from_slice(&buf).context("Failed to decode IPC JSON line")
+    let frame = IpcFrameCodec::default()
+        .read_frame_for_kind(reader, IpcEnvelopeKind::Json)
+        .await
+        .context("Failed to read IPC JSON frame")?
+        .context("IPC stream closed before receiving a JSON frame")?;
+    serde_json::from_slice(&frame.payload).context("Failed to decode IPC JSON frame")
 }
 
-/// Write a single newline-delimited JSON value to a stream.
-pub async fn write_json_line<T, W>(writer: &mut W, value: &T) -> Result<()>
+/// Write a single bounded JSON frame and flush once.
+pub async fn write_json_frame<T, W>(writer: &mut W, value: &T) -> Result<()>
 where
     T: Serialize,
     W: AsyncWrite + Unpin,
 {
-    let mut payload = serde_json::to_vec(value).context("Failed to encode IPC JSON line")?;
-    payload.push(b'\n');
-    writer
-        .write_all(&payload)
+    let payload = serde_json::to_vec(value).context("Failed to encode IPC JSON frame")?;
+    IpcFrameCodec::default()
+        .write_frame(writer, IpcEnvelopeKind::Json, &payload)
         .await
-        .context("Failed to write IPC JSON line")?;
-    writer
-        .flush()
-        .await
-        .context("Failed to flush IPC JSON line")?;
+        .context("Failed to write IPC JSON frame")?;
     Ok(())
 }

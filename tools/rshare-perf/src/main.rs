@@ -1,6 +1,7 @@
 mod compare;
 mod control;
 mod dual;
+mod ipc;
 mod quic;
 mod report;
 
@@ -45,6 +46,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Quic(QuicArgs),
+    Ipc(IpcArgs),
     Compare(CompareArgs),
     Dual(DualArgs),
 }
@@ -61,6 +63,16 @@ struct QuicArgs {
     slow_fast_isolation: bool,
     #[arg(long)]
     stall_ms: Option<u64>,
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct IpcArgs {
+    #[arg(long)]
+    requests: usize,
+    #[arg(long, value_delimiter = ',')]
+    concurrency: Vec<usize>,
     #[arg(long)]
     output: PathBuf,
 }
@@ -98,9 +110,21 @@ struct Budget {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Quic(args) => run_quic(args),
+        Command::Ipc(args) => run_ipc(args),
         Command::Compare(args) => run_compare(args),
         Command::Dual(args) => run_dual(args),
     }
+}
+
+fn run_ipc(args: IpcArgs) -> Result<()> {
+    let report = tokio::runtime::Runtime::new()?
+        .block_on(ipc::run_matrix(args.requests, &args.concurrency))?;
+    if let Some(parent) = args.output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(&args.output, &serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn run_dual(args: DualArgs) -> Result<()> {

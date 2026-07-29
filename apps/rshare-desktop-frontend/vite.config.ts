@@ -6,6 +6,11 @@ import net from 'node:net'
 import { spawn } from 'node:child_process'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
+import {
+  IPC_ENVELOPE_KIND,
+  IpcFrameDecoder,
+  encodeIpcFrame,
+} from './src/app/ipc-frame.mjs'
 
 const DAEMON_IPC_HOST = '127.0.0.1'
 const DAEMON_IPC_PORT = Number(process.env.RSHARE_DAEMON_IPC_PORT ?? 27435)
@@ -33,7 +38,7 @@ function isDaemonIpcUnavailable(error: unknown): boolean {
 function sendDaemonIpc(request: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(DAEMON_IPC_PORT, DAEMON_IPC_HOST)
-    let buffer = ''
+    const decoder = new IpcFrameDecoder()
     let settled = false
 
     const settle = (callback: () => void) => {
@@ -50,24 +55,28 @@ function sendDaemonIpc(request: unknown): Promise<unknown> {
     })
 
     socket.on('connect', () => {
-      socket.write(`${JSON.stringify(request)}\n`)
+      const payload = new TextEncoder().encode(JSON.stringify(request))
+      socket.write(encodeIpcFrame(IPC_ENVELOPE_KIND.JSON, payload))
     })
 
     socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf8')
-      const lineEnd = buffer.indexOf('\n')
-      if (lineEnd < 0) {
-        return
-      }
-
-      const line = buffer.slice(0, lineEnd).trim()
-      settle(() => {
-        try {
-          resolve(JSON.parse(line))
-        } catch (error) {
-          reject(error)
+      try {
+        const frames = decoder.push(chunk)
+        if (frames.length > 1) {
+          throw new Error('daemon IPC returned multiple response frames')
         }
-      })
+        const frame = frames[0]
+        if (!frame) {
+          return
+        }
+        if (frame.kind !== IPC_ENVELOPE_KIND.JSON) {
+          throw new Error(`expected daemon JSON response, received frame kind ${frame.kind}`)
+        }
+        const json = new TextDecoder().decode(frame.payload)
+        settle(() => resolve(JSON.parse(json)))
+      } catch (error) {
+        settle(() => reject(error))
+      }
     })
 
     socket.on('error', (error) => {

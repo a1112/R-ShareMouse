@@ -1,6 +1,6 @@
 use rshare_core::{
     ipc::{
-        default_ipc_addr, default_mobile_gateway_addr, read_json_line, write_json_line,
+        default_ipc_addr, default_mobile_gateway_addr, read_json_frame, write_json_frame,
         DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, ServiceStatusSnapshot,
     },
     service::{pid_file_path, state_dir},
@@ -26,12 +26,12 @@ use tokio::io::duplex;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn daemon_requests_round_trip_over_json_lines() {
+async fn daemon_requests_round_trip_over_json_frames() {
     let (mut writer, mut reader) = duplex(1024);
     let request = DaemonRequest::Status;
 
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 }
@@ -43,14 +43,14 @@ async fn daemon_connect_request_round_trips_target_device() {
         device_id: Uuid::nil(),
     };
 
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 }
 
 #[tokio::test]
-async fn local_control_requests_round_trip_over_json_lines() {
+async fn local_control_requests_round_trip_over_json_frames() {
     let (mut writer, mut reader) = duplex(1024);
     let request = DaemonRequest::RunLocalInputTest {
         test: LocalInputTestRequest {
@@ -58,14 +58,14 @@ async fn local_control_requests_round_trip_over_json_lines() {
         },
     };
 
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 }
 
 #[tokio::test]
-async fn audio_control_requests_round_trip_over_json_lines() {
+async fn audio_control_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::SetAudioOutputVolume {
             endpoint_id: "endpoint-1".to_string(),
@@ -90,14 +90,14 @@ async fn audio_control_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn ipc_contract_display_operation_requests_round_trip_over_json_lines() {
+async fn ipc_contract_display_operation_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::CaptureDisplay(DisplayCaptureRequest {
             display_id: "primary".to_string(),
@@ -122,15 +122,15 @@ async fn ipc_contract_display_operation_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn ipc_contract_display_operation_responses_round_trip_over_json_lines() {
+async fn ipc_contract_display_operation_responses_round_trip_over_json_frames() {
     let responses = [
         DaemonResponse::DisplayCapture(DisplayCaptureResult {
             status: DisplayOperationStatus::Success,
@@ -153,8 +153,8 @@ async fn ipc_contract_display_operation_responses_round_trip_over_json_lines() {
 
     for response in responses {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &response).await.unwrap();
-        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, response);
     }
@@ -197,7 +197,7 @@ fn ipc_contract_daemon_client_display_helpers_have_expected_signatures() {
 }
 
 #[tokio::test]
-async fn virtual_display_requests_round_trip_over_json_lines() {
+async fn virtual_display_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::ListVirtualDisplays,
         DaemonRequest::CreateVirtualDisplay(VirtualDisplayCreateRequest {
@@ -214,15 +214,15 @@ async fn virtual_display_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn virtual_display_responses_round_trip_over_json_lines() {
+async fn virtual_display_responses_round_trip_over_json_frames() {
     let display = VirtualDisplaySnapshot {
         id: "vd-1".to_string(),
         width: 1920,
@@ -244,8 +244,8 @@ async fn virtual_display_responses_round_trip_over_json_lines() {
 
     for response in responses {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &response).await.unwrap();
-        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, response);
     }
@@ -280,7 +280,7 @@ fn ipc_contract_daemon_client_virtual_display_helpers_have_expected_signatures()
 }
 
 #[tokio::test]
-async fn usb_device_requests_round_trip_over_json_lines() {
+async fn usb_device_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::ListUsbDevices,
         DaemonRequest::RunRemoteUsbDescriptorProbe {
@@ -291,15 +291,15 @@ async fn usb_device_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn endpoint_event_requests_round_trip_over_json_lines() {
+async fn endpoint_event_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::EndpointEvents {
             filter: EndpointEventFilter {
@@ -322,15 +322,15 @@ async fn endpoint_event_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn endpoint_inject_request_round_trips_over_json_lines() {
+async fn endpoint_inject_request_round_trips_over_json_frames() {
     let request = DaemonRequest::InjectEndpointEvent {
         target: EndpointInjectTarget::Local,
         request: EndpointInjectRequest {
@@ -346,14 +346,14 @@ async fn endpoint_inject_request_round_trips_over_json_lines() {
     };
 
     let (mut writer, mut reader) = duplex(4096);
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 }
 
 #[tokio::test]
-async fn endpoint_text_commit_request_round_trips_over_json_lines() {
+async fn endpoint_text_commit_request_round_trips_over_json_frames() {
     let request = DaemonRequest::InjectEndpointEvent {
         target: EndpointInjectTarget::Local,
         request: EndpointInjectRequest {
@@ -368,14 +368,14 @@ async fn endpoint_text_commit_request_round_trips_over_json_lines() {
     };
 
     let (mut writer, mut reader) = duplex(4096);
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 }
 
 #[tokio::test]
-async fn capability_requests_round_trip_over_json_lines() {
+async fn capability_requests_round_trip_over_json_frames() {
     let requests = [
         DaemonRequest::Capabilities { device_id: None },
         DaemonRequest::Capabilities {
@@ -385,15 +385,15 @@ async fn capability_requests_round_trip_over_json_lines() {
 
     for request in requests {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &request).await.unwrap();
-        let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, request);
     }
 }
 
 #[tokio::test]
-async fn capability_response_round_trips_over_json_lines() {
+async fn capability_response_round_trips_over_json_frames() {
     let registry = CapabilityRegistrySnapshot {
         local_device_id: Uuid::nil(),
         generated_at_ms: 42,
@@ -411,8 +411,8 @@ async fn capability_response_round_trips_over_json_lines() {
     let response = DaemonResponse::Capabilities(registry.clone());
 
     let (mut writer, mut reader) = duplex(4096);
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, DaemonResponse::Capabilities(registry));
 }
@@ -429,8 +429,8 @@ async fn daemon_responses_round_trip_device_payloads() {
         last_seen_secs: Some(4),
     }]);
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 }
@@ -458,8 +458,8 @@ async fn daemon_responses_round_trip_usb_device_payloads() {
         endpoints: Vec::new(),
     }]);
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 }
@@ -481,8 +481,8 @@ async fn daemon_responses_round_trip_usb_descriptor_probe_payload() {
         descriptor_bytes: vec![18, 1, 0, 2],
     });
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 }
@@ -517,8 +517,8 @@ async fn daemon_responses_round_trip_endpoint_event_payloads() {
         DaemonResponse::EndpointEvent(event),
     ] {
         let (mut writer, mut reader) = duplex(4096);
-        write_json_line(&mut writer, &response).await.unwrap();
-        let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+        write_json_frame(&mut writer, &response).await.unwrap();
+        let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
         assert_eq!(decoded, response);
     }
@@ -538,8 +538,8 @@ async fn daemon_responses_round_trip_endpoint_inject_result() {
     });
 
     let (mut writer, mut reader) = duplex(4096);
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 }
@@ -578,8 +578,8 @@ async fn local_control_response_round_trips_snapshot_payload() {
     snapshot.audio_capture_state.status = LocalAudioCaptureStatus::CapturingLocal;
     let response = DaemonResponse::LocalControls(snapshot.clone());
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 }
@@ -726,8 +726,8 @@ async fn latency_feedback_status_response_round_trips_populated_payload() {
     let response = DaemonResponse::Status(snapshot.clone());
     let (mut writer, mut reader) = duplex(4096);
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
 
@@ -813,12 +813,12 @@ fn default_ipc_addr_binds_to_loopback() {
 }
 
 #[tokio::test]
-async fn mobile_access_request_round_trips_over_json_lines() {
+async fn mobile_access_request_round_trips_over_json_frames() {
     let (mut writer, mut reader) = duplex(2048);
     let request = DaemonRequest::MobileAccess;
 
-    write_json_line(&mut writer, &request).await.unwrap();
-    let decoded: DaemonRequest = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &request).await.unwrap();
+    let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, request);
 
@@ -834,8 +834,8 @@ async fn mobile_access_request_round_trips_over_json_lines() {
     let response = DaemonResponse::MobileAccess(snapshot.clone());
     let (mut writer, mut reader) = duplex(2048);
 
-    write_json_line(&mut writer, &response).await.unwrap();
-    let decoded: DaemonResponse = read_json_line(&mut reader).await.unwrap();
+    write_json_frame(&mut writer, &response).await.unwrap();
+    let decoded: DaemonResponse = read_json_frame(&mut reader).await.unwrap();
 
     assert_eq!(decoded, response);
     assert!(snapshot.page_url.contains(&snapshot.token));
