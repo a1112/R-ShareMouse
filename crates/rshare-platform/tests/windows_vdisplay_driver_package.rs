@@ -812,6 +812,44 @@ fn windows_driver_abi_keeps_shared_v1_and_versions_filter_queue_independently() 
 }
 
 #[test]
+fn windows_filter_capture_uses_wait_event() {
+    let ioctls = read_repo_file("drivers/windows/rshare-common/rshare_ioctls.h");
+    let filter = read_repo_file("drivers/windows/rshare-filter/driver.c");
+    let platform = read_repo_file("crates/rshare-platform/src/windows.rs");
+    let daemon = read_repo_file("apps/rshare-daemon/src/main.rs");
+    let probe = read_repo_file("drivers/windows/tools/rshare-driver-probe.c");
+
+    assert!(ioctls.contains("#define RSHARE_CAP_WAIT_EVENT"));
+    assert!(ioctls.contains("#define IOCTL_RSHARE_WAIT_EVENT"));
+    assert!(ioctls.contains("#define IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE"));
+    assert!(ioctls.contains("RSHARE_FILTER_WAIT_STATE"));
+    assert!(filter.contains("WdfIoQueueDispatchManual"));
+    assert!(filter.contains("PendingLock"));
+    assert!(filter.contains("RShareFilterEvtFileCleanup"));
+    assert!(filter.contains("RShareFilterEvtIoCanceledOnQueue"));
+    assert!(filter.contains("queueConfig.EvtIoCanceledOnQueue"));
+    assert!(filter.contains("IOCTL_RSHARE_WAIT_EVENT"));
+    assert!(filter.contains("IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE"));
+    assert!(platform.contains("FILE_FLAG_OVERLAPPED"));
+    assert!(platform.contains("CancelIoEx"));
+    assert!(daemon.contains("WindowsDriverEventStream::open_filter"));
+    assert!(!daemon.contains("is_driver_event_queue_empty(&error)"));
+    assert!(!probe.contains("Sleep(10)"));
+    let watch = probe
+        .find("static int probe_filter_watch")
+        .map(|start| &probe[start..])
+        .expect("missing filter watch");
+    assert!(watch.contains("if (now >= deadline)"));
+    assert!(watch.find("if (now >= deadline)").unwrap() < watch.find("deadline - now").unwrap());
+    let drain = probe
+        .find("static int probe_filter_drain")
+        .map(|start| &probe[start..])
+        .expect("missing filter drain");
+    assert!(drain.contains("if (now >= deadline)"));
+    assert!(drain.find("if (now >= deadline)").unwrap() < drain.find("deadline - now").unwrap());
+}
+
+#[test]
 fn virtual_display_supported_mode_tables_stay_synchronized() {
     let driver = read_repo_file("drivers/windows/rshare-vdisplay/driver.cpp");
     let platform = read_repo_file("crates/rshare-platform/src/virtual_display.rs");

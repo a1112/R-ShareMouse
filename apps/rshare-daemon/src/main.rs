@@ -5877,6 +5877,7 @@ fn publish_windows_driver_event(
 #[derive(Debug)]
 struct WindowsDriverCapture {
     running: Arc<std::sync::atomic::AtomicBool>,
+    cancel: rshare_platform::windows::WindowsDriverEventStreamCancel,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -5923,13 +5924,17 @@ impl WindowsDriverCapture {
     fn start(producer: SemanticInputProducer) -> Result<Self> {
         Self::start_with_opener(
             producer,
-            rshare_platform::windows::WindowsDriverClient::open,
+            rshare_platform::windows::WindowsDriverEventStream::open_filter,
         )
     }
 
     fn start_with_opener<Open>(producer: SemanticInputProducer, open: Open) -> Result<Self>
     where
-        Open: FnOnce() -> Result<rshare_platform::windows::WindowsDriverClient> + Send + 'static,
+        Open: FnOnce() -> Result<(
+                rshare_platform::windows::WindowsDriverEventStream,
+                rshare_platform::windows::WindowsDriverEventStreamCancel,
+            )> + Send
+            + 'static,
     {
         Self::start_with_opener_timeout(producer, Duration::from_secs(2), open)
     }
@@ -5940,27 +5945,31 @@ impl WindowsDriverCapture {
         open: Open,
     ) -> Result<Self>
     where
-        Open: FnOnce() -> Result<rshare_platform::windows::WindowsDriverClient> + Send + 'static,
+        Open: FnOnce() -> Result<(
+                rshare_platform::windows::WindowsDriverEventStream,
+                rshare_platform::windows::WindowsDriverEventStreamCancel,
+            )> + Send
+            + 'static,
     {
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_running = running.clone();
-        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(0);
         let thread = std::thread::Builder::new()
             .name("rshare-windows-filter-capture".to_owned())
             .spawn(move || {
-                let client = match open() {
-                    Ok(client) => client,
+                let (mut stream, cancel) = match open() {
+                    Ok(stream) => stream,
                     Err(error) => {
                         let _ = startup_tx.send(Err(error.to_string()));
                         return;
                     }
                 };
-                if startup_tx.send(Ok(())).is_err() {
+                if startup_tx.send(Ok(cancel)).is_err() {
                     return;
                 }
                 while worker_running.load(std::sync::atomic::Ordering::Acquire) {
-                    match client
-                        .read_event()
+                    match stream
+                        .wait_event()
                         .map(rshare_input::backend::adapt_windows_filter_capture_event)
                     {
                         Ok(rshare_input::backend::WindowsFilterCaptureOutput::Input(event)) => {
@@ -5969,22 +5978,23 @@ impl WindowsDriverCapture {
                         Ok(rshare_input::backend::WindowsFilterCaptureOutput::Fault(fault)) => {
                             producer.report_fault(fault);
                         }
-                        Err(error)
-                            if rshare_platform::windows::is_driver_event_queue_empty(&error) =>
+                        Err(rshare_platform::windows::DriverWaitError::Cancelled)
+                            if !worker_running.load(std::sync::atomic::Ordering::Acquire) =>
                         {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            break;
                         }
                         Err(error) => {
-                            tracing::warn!("RShare Windows driver event read failed: {error}");
-                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            tracing::warn!("RShare Windows driver event wait failed: {error}");
+                            break;
                         }
                     }
                 }
             })
             .map_err(|error| anyhow::anyhow!("failed to spawn Windows filter capture: {error}"))?;
         match startup_rx.recv_timeout(startup_timeout) {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(cancel)) => Ok(Self {
                 running,
+                cancel,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -6006,6 +6016,9 @@ impl WindowsDriverCapture {
     fn stop(&mut self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
+        if let Err(error) = self.cancel.cancel() {
+            tracing::warn!("failed to cancel Windows filter capture wait: {error}");
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -7523,6 +7536,48 @@ async fn handle_ipc_client(
 fn apply_layout_update(state: &mut DaemonState, mut layout: LayoutGraph) {
     layout.canonicalize_local_device(state.status.device_id);
     state.layout = layout;
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_daemon_filter_capture_uses_cancellable_wait_event() {
+    let source = include_str!("main.rs");
+    let start = source
+        .find("impl WindowsDriverCapture")
+        .expect("missing Windows driver capture implementation");
+    let end = source[start..]
+        .find("impl Drop for WindowsDriverCapture")
+        .map(|offset| start + offset)
+        .expect("missing Windows capture drop implementation");
+    let capture = &source[start..end];
+
+    assert!(capture.contains("WindowsDriverEventStream::open_filter"));
+    assert!(capture.contains(".wait_event()"));
+    assert!(capture.contains(".cancel()"));
+    assert!(!capture.contains(".read_event()"));
+    assert!(!capture.contains("Duration::from_millis(1)"));
+    assert!(capture.contains("sync_channel(0)"));
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_capture_startup_rendezvous_disconnect_prevents_wait_entry() {
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let (open_complete_tx, open_complete_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let wait_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_wait_entered = wait_entered.clone();
+    let worker = std::thread::spawn(move || {
+        open_complete_rx.recv().unwrap();
+        if startup_tx.send(()).is_err() {
+            return;
+        }
+        worker_wait_entered.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    drop(startup_rx);
+    open_complete_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(!wait_entered.load(std::sync::atomic::Ordering::Acquire));
 }
 
 fn current_primary_screen_info() -> ScreenInfo {
@@ -10573,7 +10628,7 @@ mod tests {
             Duration::from_millis(10),
             || {
                 std::thread::sleep(Duration::from_millis(100));
-                rshare_platform::windows::WindowsDriverClient::open()
+                rshare_platform::windows::WindowsDriverEventStream::open_filter()
             },
         );
 

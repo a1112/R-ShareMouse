@@ -31,7 +31,7 @@ mod windows_impl {
     use std::mem::size_of;
     use std::os::windows::process::CommandExt;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     };
     use std::thread::{self, JoinHandle};
@@ -565,6 +565,7 @@ mod windows_impl {
     pub struct WindowsDriverCapabilities {
         pub filter_events: bool,
         pub filter_semantic_queue: bool,
+        pub wait_event: bool,
         pub virtual_keyboard: bool,
         pub virtual_mouse: bool,
         pub virtual_gamepad_scaffold: bool,
@@ -590,6 +591,11 @@ mod windows_impl {
         pub mouse_connects: u64,
         pub keyboard_events: u64,
         pub mouse_events: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WindowsDriverWaitState {
+        pub pending_waiters: u32,
     }
 
     impl WindowsDriverStats {
@@ -640,6 +646,188 @@ mod windows_impl {
     pub enum WindowsDriverCaptureEvent {
         Input(WindowsDriverInputEvent),
         Status(RawCaptureStatus),
+    }
+
+    #[derive(Debug)]
+    pub enum DriverWaitError {
+        Cancelled,
+        Other(anyhow::Error),
+    }
+
+    impl fmt::Display for DriverWaitError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Cancelled => f.write_str("RShare driver event wait was cancelled"),
+                Self::Other(error) => error.fmt(f),
+            }
+        }
+    }
+
+    impl std::error::Error for DriverWaitError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Cancelled => None,
+                Self::Other(error) => Some(error.as_ref()),
+            }
+        }
+    }
+
+    impl From<anyhow::Error> for DriverWaitError {
+        fn from(error: anyhow::Error) -> Self {
+            Self::Other(error)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WaitRegistrationOutcome {
+        Registered,
+        Cancelled,
+    }
+
+    #[derive(Debug, Default)]
+    struct WaitRegistrationState {
+        cancelled: bool,
+        overlapped: Option<usize>,
+    }
+
+    impl WaitRegistrationState {
+        fn register(&mut self, overlapped: usize) -> WaitRegistrationOutcome {
+            if self.cancelled {
+                return WaitRegistrationOutcome::Cancelled;
+            }
+            debug_assert!(self.overlapped.is_none());
+            self.overlapped = Some(overlapped);
+            WaitRegistrationOutcome::Registered
+        }
+
+        fn complete(&mut self, overlapped: usize) {
+            if self.overlapped == Some(overlapped) {
+                self.overlapped = None;
+            }
+        }
+
+        fn cancel(&mut self) -> Option<usize> {
+            self.cancelled = true;
+            self.overlapped
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled
+        }
+    }
+
+    fn with_cancelled_registration_or_force_close<T>(
+        registration: &Mutex<WaitRegistrationState>,
+        force_close: impl FnOnce(),
+        action: impl FnOnce(Option<usize>) -> T,
+    ) -> std::result::Result<T, ()> {
+        let mut state = match registration.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                force_close();
+                return Err(());
+            }
+        };
+        let overlapped = state.cancel();
+        // Keep the guard alive across `action`: the waiter must clear the same
+        // registration under this lock before its OVERLAPPED allocation can drop.
+        let result = action(overlapped);
+        drop(state);
+        Ok(result)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WaitFailureDisposition<E> {
+        error: E,
+        leak_pending: bool,
+    }
+
+    fn settle_wait_failure<E>(
+        error: E,
+        cancel_exact: impl FnOnce() -> std::result::Result<(), ()>,
+        force_close: impl FnOnce(),
+        await_terminal: impl FnOnce() -> bool,
+    ) -> WaitFailureDisposition<E> {
+        if cancel_exact().is_err() {
+            force_close();
+        }
+        WaitFailureDisposition {
+            error,
+            leak_pending: !await_terminal(),
+        }
+    }
+
+    fn cancel_with_force_close(
+        overlapped: Option<usize>,
+        cancel_exact: impl FnOnce(usize) -> std::result::Result<(), DriverWaitError>,
+        force_close: impl FnOnce(),
+    ) -> std::result::Result<(), DriverWaitError> {
+        let Some(overlapped) = overlapped else {
+            return Ok(());
+        };
+        match cancel_exact(overlapped) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                force_close();
+                Err(error)
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct WindowsDriverHandle(AtomicIsize);
+
+    unsafe impl Send for WindowsDriverHandle {}
+    unsafe impl Sync for WindowsDriverHandle {}
+
+    impl WindowsDriverHandle {
+        fn new(handle: isize) -> Self {
+            Self(AtomicIsize::new(handle))
+        }
+
+        fn raw(&self) -> isize {
+            self.0.load(Ordering::Acquire)
+        }
+
+        fn close_once(&self) {
+            let handle = self.0.swap(INVALID_HANDLE_VALUE, Ordering::AcqRel);
+            unsafe {
+                if handle != INVALID_HANDLE_VALUE && handle != 0 {
+                    CloseHandle(handle);
+                }
+            }
+        }
+    }
+
+    impl Drop for WindowsDriverHandle {
+        fn drop(&mut self) {
+            self.close_once();
+        }
+    }
+
+    pub struct WindowsDriverEventStream {
+        handle: Arc<WindowsDriverHandle>,
+        registration: Arc<Mutex<WaitRegistrationState>>,
+    }
+
+    #[derive(Clone)]
+    pub struct WindowsDriverEventStreamCancel {
+        handle: Arc<WindowsDriverHandle>,
+        registration: Arc<Mutex<WaitRegistrationState>>,
+    }
+
+    impl fmt::Debug for WindowsDriverEventStream {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WindowsDriverEventStream")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for WindowsDriverEventStreamCancel {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WindowsDriverEventStreamCancel")
+                .finish_non_exhaustive()
+        }
     }
 
     pub struct WindowsDriverClient {
@@ -769,6 +957,21 @@ mod windows_impl {
             raw.try_into()
         }
 
+        pub fn query_wait_state(&self) -> Result<WindowsDriverWaitState> {
+            let mut raw = RShareFilterWaitStateRaw::default();
+            unsafe {
+                device_io_control(
+                    self.handle,
+                    IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE,
+                    std::ptr::null_mut(),
+                    0,
+                    (&mut raw as *mut RShareFilterWaitStateRaw).cast(),
+                    size_of::<RShareFilterWaitStateRaw>() as u32,
+                )?;
+            }
+            raw.try_into()
+        }
+
         pub fn inject_keyboard(&self, vk: u16, pressed: bool) -> Result<()> {
             let mut raw = RShareInjectReportRaw {
                 report_kind: RSHARE_REPORT_KEYBOARD,
@@ -877,6 +1080,206 @@ mod windows_impl {
                     0,
                 )
             }
+        }
+    }
+
+    impl WindowsDriverEventStream {
+        pub fn open_filter() -> Result<(Self, WindowsDriverEventStreamCancel)> {
+            let capabilities = WindowsDriverClient::open_filter()?.query_capabilities()?;
+            if !capabilities.wait_event {
+                anyhow::bail!("RShare filter driver does not support cancellable event waits");
+            }
+
+            let handle = unsafe {
+                let path = wide_null(RSHARE_DRIVER_DEVICE_PATH);
+                let handle = CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                    0,
+                );
+                if handle == INVALID_HANDLE_VALUE {
+                    anyhow::bail!(
+                        "RShare filter event stream is unavailable: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                Arc::new(WindowsDriverHandle::new(handle))
+            };
+            let registration = Arc::new(Mutex::new(WaitRegistrationState::default()));
+            Ok((
+                Self {
+                    handle: handle.clone(),
+                    registration: registration.clone(),
+                },
+                WindowsDriverEventStreamCancel {
+                    handle,
+                    registration,
+                },
+            ))
+        }
+
+        pub fn wait_event(
+            &mut self,
+        ) -> std::result::Result<WindowsDriverCaptureEvent, DriverWaitError> {
+            let event_handle =
+                unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+            if event_handle == 0 {
+                return Err(DriverWaitError::Other(anyhow::anyhow!(
+                    "CreateEventW for driver wait failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let event_handle = WindowsDriverHandle::new(event_handle);
+            let mut pending = Box::new(PendingDriverWait {
+                overlapped: Overlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset_or_pointer: OverlappedOffsetOrPointer {
+                        offset: OverlappedOffset {
+                            offset: 0,
+                            offset_high: 0,
+                        },
+                    },
+                    h_event: event_handle.raw(),
+                },
+                raw: RShareDriverEventRaw::default(),
+            });
+            let overlapped_address =
+                (&mut pending.overlapped as *mut Overlapped).cast::<std::ffi::c_void>() as usize;
+
+            {
+                let mut registration = self.registration.lock().map_err(|_| {
+                    DriverWaitError::Other(anyhow::anyhow!(
+                        "driver wait registration lock is poisoned"
+                    ))
+                })?;
+                if registration.register(overlapped_address) == WaitRegistrationOutcome::Cancelled {
+                    return Err(DriverWaitError::Cancelled);
+                }
+            }
+
+            let (result, leak_pending) =
+                unsafe { self.wait_event_registered((&mut *pending) as *mut PendingDriverWait) };
+            if let Ok(mut registration) = self.registration.lock() {
+                registration.complete(overlapped_address);
+            }
+            if leak_pending {
+                Box::leak(pending);
+                std::mem::forget(event_handle);
+            }
+            result
+        }
+
+        unsafe fn wait_event_registered(
+            &self,
+            pending: *mut PendingDriverWait,
+        ) -> (
+            std::result::Result<WindowsDriverCaptureEvent, DriverWaitError>,
+            bool,
+        ) {
+            let overlapped = &mut (*pending).overlapped as *mut Overlapped;
+            let raw = &mut (*pending).raw;
+            let mut bytes_returned = 0u32;
+            let io_handle = self.handle.raw();
+            let submitted = DeviceIoControl(
+                io_handle,
+                IOCTL_RSHARE_WAIT_EVENT,
+                std::ptr::null_mut(),
+                0,
+                (raw as *mut RShareDriverEventRaw).cast(),
+                size_of::<RShareDriverEventRaw>() as u32,
+                std::ptr::null_mut(),
+                overlapped.cast(),
+            );
+
+            if submitted == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_IO_PENDING) {
+                    return (Err(driver_wait_error(error)), false);
+                }
+
+                let mut cancellation_error = None;
+                let cancelled = self
+                    .registration
+                    .lock()
+                    .map(|state| state.is_cancelled())
+                    .unwrap_or(true);
+                if cancelled {
+                    if let Err(error) = cancel_exact_overlapped(io_handle, overlapped) {
+                        self.handle.close_once();
+                        cancellation_error = Some(error);
+                    }
+                }
+
+                let wait_result = WaitForSingleObject((*overlapped).h_event, INFINITE);
+                if wait_result != WAIT_OBJECT_0 {
+                    let wait_error = DriverWaitError::Other(anyhow::anyhow!(
+                        "waiting for driver event completion failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                    let disposition = settle_wait_failure(
+                        wait_error,
+                        || cancel_exact_overlapped(io_handle, overlapped).map_err(|_| ()),
+                        || self.handle.close_once(),
+                        || await_overlapped_terminal(io_handle, overlapped),
+                    );
+                    return (Err(disposition.error), disposition.leak_pending);
+                }
+                if let Some(error) = cancellation_error {
+                    return (Err(error), false);
+                }
+                if self.handle.raw() == INVALID_HANDLE_VALUE {
+                    return (Err(DriverWaitError::Cancelled), false);
+                }
+            }
+
+            let completed =
+                GetOverlappedResult(io_handle, overlapped.cast(), &mut bytes_returned, 0);
+            if completed == 0 {
+                return (
+                    Err(driver_wait_error(std::io::Error::last_os_error())),
+                    false,
+                );
+            }
+
+            if bytes_returned as usize != size_of::<RShareDriverEventRaw>() {
+                return (
+                    Err(DriverWaitError::Other(anyhow::anyhow!(
+                        "RShare driver wait returned {} bytes, expected {}",
+                        bytes_returned,
+                        size_of::<RShareDriverEventRaw>()
+                    ))),
+                    false,
+                );
+            }
+            ((*raw).try_into().map_err(DriverWaitError::Other), false)
+        }
+    }
+
+    impl WindowsDriverEventStreamCancel {
+        pub fn cancel(&self) -> Result<()> {
+            with_cancelled_registration_or_force_close(
+                &self.registration,
+                || self.handle.close_once(),
+                |overlapped| {
+                    cancel_with_force_close(
+                        overlapped,
+                        |overlapped| unsafe {
+                            cancel_exact_overlapped(
+                                self.handle.raw(),
+                                overlapped as *mut Overlapped,
+                            )
+                        },
+                        || self.handle.close_once(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("driver wait registration lock is poisoned"))?
         }
     }
 
@@ -1640,11 +2043,13 @@ mod windows_impl {
     pub const RSHARE_DRIVER_ABI: u16 = 1;
     const RSHARE_FILTER_EVENT_FORMAT_VERSION: u32 = 2;
     const RSHARE_FILTER_STATS_VERSION: u16 = 2;
+    const RSHARE_FILTER_WAIT_STATE_VERSION: u16 = 1;
     const RSHARE_CAP_FILTER_EVENTS: u32 = 0x0000_0001;
     const RSHARE_CAP_VIRTUAL_KEYBOARD: u32 = 0x0000_0002;
     const RSHARE_CAP_VIRTUAL_MOUSE: u32 = 0x0000_0004;
     const RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD: u32 = 0x0000_0008;
     const RSHARE_CAP_FILTER_SEMANTIC_QUEUE: u32 = 0x0000_0020;
+    const RSHARE_CAP_WAIT_EVENT: u32 = 0x0000_0040;
 
     const RSHARE_SOURCE_HARDWARE: u16 = 1;
     const RSHARE_SOURCE_INJECTED_LOOPBACK: u16 = 2;
@@ -1688,7 +2093,18 @@ mod windows_impl {
         ctl_code(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA);
     const IOCTL_RSHARE_QUERY_FILTER_STATS_V2: u32 =
         ctl_code(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_DATA);
+    const IOCTL_RSHARE_WAIT_EVENT: u32 =
+        ctl_code(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_READ_DATA);
+    const IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE: u32 =
+        ctl_code(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_READ_DATA);
     const ERROR_NO_MORE_ITEMS: i32 = 259;
+    const ERROR_INVALID_HANDLE: i32 = 6;
+    const ERROR_OPERATION_ABORTED: i32 = 995;
+    const ERROR_IO_INCOMPLETE: i32 = 996;
+    const ERROR_IO_PENDING: i32 = 997;
+    const ERROR_NOT_FOUND: i32 = 1168;
+    const WAIT_OBJECT_0: u32 = 0;
+    const INFINITE: u32 = u32::MAX;
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -1696,6 +2112,7 @@ mod windows_impl {
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const OPEN_EXISTING: u32 = 3;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     const INVALID_HANDLE_VALUE: isize = -1isize;
 
     const MOUSEEVENTF_MOVE: u32 = 0x0001;
@@ -2189,6 +2606,43 @@ mod windows_impl {
         mouse_events: u64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RShareFilterWaitStateRaw {
+        abi: u16,
+        version: u16,
+        struct_size: u32,
+        pending_waiters: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct OverlappedOffset {
+        offset: u32,
+        offset_high: u32,
+    }
+
+    #[repr(C)]
+    union OverlappedOffsetOrPointer {
+        offset: OverlappedOffset,
+        pointer: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset_or_pointer: OverlappedOffsetOrPointer,
+        h_event: isize,
+    }
+
+    #[repr(C)]
+    struct PendingDriverWait {
+        overlapped: Overlapped,
+        raw: RShareDriverEventRaw,
+    }
+
     impl TryFrom<RShareDriverCapabilitiesRaw> for WindowsDriverCapabilities {
         type Error = anyhow::Error;
 
@@ -2208,10 +2662,36 @@ mod windows_impl {
             Ok(Self {
                 filter_events: raw.flags & RSHARE_CAP_FILTER_EVENTS != 0,
                 filter_semantic_queue: raw.flags & RSHARE_CAP_FILTER_SEMANTIC_QUEUE != 0,
+                wait_event: raw.flags & RSHARE_CAP_WAIT_EVENT != 0,
                 virtual_keyboard: raw.flags & RSHARE_CAP_VIRTUAL_KEYBOARD != 0,
                 virtual_mouse: raw.flags & RSHARE_CAP_VIRTUAL_MOUSE != 0,
                 virtual_gamepad_scaffold: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD != 0,
                 max_event_size: raw.max_event_size,
+            })
+        }
+    }
+
+    impl TryFrom<RShareFilterWaitStateRaw> for WindowsDriverWaitState {
+        type Error = anyhow::Error;
+
+        fn try_from(raw: RShareFilterWaitStateRaw) -> Result<Self> {
+            if raw.abi != RSHARE_DRIVER_ABI {
+                anyhow::bail!("Unsupported RShare filter wait-state ABI {}", raw.abi);
+            }
+            if raw.version != RSHARE_FILTER_WAIT_STATE_VERSION {
+                anyhow::bail!(
+                    "Unsupported RShare filter wait-state version {}",
+                    raw.version
+                );
+            }
+            if raw.struct_size as usize != size_of::<RShareFilterWaitStateRaw>() {
+                anyhow::bail!(
+                    "Unsupported RShare filter wait-state size {}",
+                    raw.struct_size
+                );
+            }
+            Ok(Self {
+                pending_waiters: raw.pending_waiters,
             })
         }
     }
@@ -2668,6 +3148,20 @@ mod windows_impl {
             h_template_file: isize,
         ) -> isize;
         fn CloseHandle(h_object: isize) -> i32;
+        fn CreateEventW(
+            event_attributes: *mut std::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> isize;
+        fn CancelIoEx(h_file: isize, overlapped: *mut std::ffi::c_void) -> i32;
+        fn GetOverlappedResult(
+            h_file: isize,
+            overlapped: *mut std::ffi::c_void,
+            bytes_transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
         fn DeviceIoControl(
             h_device: isize,
             dw_io_control_code: u32,
@@ -2759,6 +3253,39 @@ mod windows_impl {
         }
 
         Ok(())
+    }
+
+    fn driver_wait_error(error: std::io::Error) -> DriverWaitError {
+        if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED) {
+            DriverWaitError::Cancelled
+        } else {
+            DriverWaitError::Other(anyhow::anyhow!("RShare driver event wait failed: {error}"))
+        }
+    }
+
+    unsafe fn cancel_exact_overlapped(
+        handle: isize,
+        overlapped: *mut Overlapped,
+    ) -> std::result::Result<(), DriverWaitError> {
+        if CancelIoEx(handle, overlapped.cast()) != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_NOT_FOUND) {
+            return Ok(());
+        }
+        Err(driver_wait_error(error))
+    }
+
+    unsafe fn await_overlapped_terminal(handle: isize, overlapped: *mut Overlapped) -> bool {
+        let mut bytes_transferred = 0u32;
+        if GetOverlappedResult(handle, overlapped.cast(), &mut bytes_transferred, 1) != 0 {
+            return true;
+        }
+        !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(ERROR_INVALID_HANDLE) | Some(ERROR_IO_INCOMPLETE) | Some(ERROR_IO_PENDING)
+        )
     }
 
     unsafe fn send_input(input: &Input, context: &str) -> Result<()> {
@@ -4889,10 +5416,23 @@ mod windows_impl {
             assert_eq!(size_of::<RShareDriverEventRaw>(), 56);
             assert_eq!(size_of::<RShareDriverStatsRaw>(), 64);
             assert_eq!(size_of::<RShareFilterStatsV2Raw>(), 80);
+            assert_eq!(size_of::<RShareFilterWaitStateRaw>(), 16);
+            #[cfg(target_pointer_width = "64")]
+            {
+                assert_eq!(size_of::<Overlapped>(), 32);
+                assert_eq!(std::mem::align_of::<Overlapped>(), 8);
+            }
+            #[cfg(target_pointer_width = "32")]
+            {
+                assert_eq!(size_of::<Overlapped>(), 20);
+                assert_eq!(std::mem::align_of::<Overlapped>(), 4);
+            }
             assert_eq!(IOCTL_RSHARE_QUERY_VERSION, 0x0022_2004);
             assert_eq!(IOCTL_RSHARE_READ_EVENT, 0x0022_600c);
             assert_eq!(IOCTL_RSHARE_QUERY_STATS, 0x0022_6018);
             assert_eq!(IOCTL_RSHARE_QUERY_FILTER_STATS_V2, 0x0022_601c);
+            assert_eq!(IOCTL_RSHARE_WAIT_EVENT, 0x0022_6020);
+            assert_eq!(IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE, 0x0022_6024);
         }
 
         #[test]
@@ -4910,6 +5450,135 @@ mod windows_impl {
             }
             .into();
             assert!(!is_driver_event_queue_empty(&other_error));
+        }
+
+        #[test]
+        fn driver_wait_cancel_before_register_prevents_submission() {
+            let mut state = WaitRegistrationState::default();
+            assert_eq!(state.cancel(), None);
+
+            assert_eq!(state.register(0x1000), WaitRegistrationOutcome::Cancelled);
+        }
+
+        #[test]
+        fn driver_wait_cancel_during_registration_targets_exact_overlapped() {
+            let mut state = WaitRegistrationState::default();
+            assert_eq!(state.register(0x2000), WaitRegistrationOutcome::Registered);
+
+            assert_eq!(state.cancel(), Some(0x2000));
+        }
+
+        #[test]
+        fn driver_wait_completion_wins_race_without_stale_registration() {
+            let mut state = WaitRegistrationState::default();
+            assert_eq!(state.register(0x3000), WaitRegistrationOutcome::Registered);
+            state.complete(0x3000);
+
+            assert_eq!(state.cancel(), None);
+        }
+
+        #[test]
+        fn driver_wait_repeated_shutdown_is_idempotent() {
+            let mut state = WaitRegistrationState::default();
+            assert_eq!(state.register(0x4000), WaitRegistrationOutcome::Registered);
+
+            assert_eq!(state.cancel(), Some(0x4000));
+            assert_eq!(state.cancel(), Some(0x4000));
+            state.complete(0x4000);
+            assert_eq!(state.cancel(), None);
+            assert_eq!(state.register(0x5000), WaitRegistrationOutcome::Cancelled);
+        }
+
+        #[test]
+        fn driver_wait_cancel_holds_registration_lock_through_os_cancel() {
+            let registration = Mutex::new(WaitRegistrationState::default());
+            registration.lock().unwrap().register(0x6000);
+
+            with_cancelled_registration_or_force_close(
+                &registration,
+                || panic!("healthy registration must not force-close"),
+                |overlapped| {
+                    assert_eq!(overlapped, Some(0x6000));
+                    assert!(matches!(
+                        registration.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                },
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn driver_wait_exact_cancel_failure_force_closes_handle_once() {
+            let force_close_calls = std::cell::Cell::new(0);
+            let result = cancel_with_force_close(
+                Some(0x7000),
+                |_| {
+                    Err(DriverWaitError::Other(anyhow::anyhow!(
+                        "synthetic CancelIoEx failure"
+                    )))
+                },
+                || force_close_calls.set(force_close_calls.get() + 1),
+            );
+
+            assert!(result.is_err());
+            assert_eq!(force_close_calls.get(), 1);
+        }
+
+        #[test]
+        fn driver_wait_error_uses_independent_terminal_seam_before_release() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let disposition = settle_wait_failure(
+                "original wait failure",
+                || {
+                    calls.borrow_mut().push("cancel");
+                    Err(())
+                },
+                || calls.borrow_mut().push("force-close"),
+                || {
+                    calls.borrow_mut().push("terminal");
+                    true
+                },
+            );
+
+            assert_eq!(
+                calls.into_inner(),
+                vec!["cancel", "force-close", "terminal"]
+            );
+            assert_eq!(disposition.error, "original wait failure");
+            assert!(!disposition.leak_pending);
+        }
+
+        #[test]
+        fn driver_wait_error_leaks_stable_pending_state_when_terminal_is_unproven() {
+            let disposition = settle_wait_failure(
+                "wait failed",
+                || Ok(()),
+                || panic!("successful exact cancel must not force-close"),
+                || false,
+            );
+
+            assert_eq!(disposition.error, "wait failed");
+            assert!(disposition.leak_pending);
+        }
+
+        #[test]
+        fn poisoned_cancel_registration_force_closes_before_returning_error() {
+            let registration = Mutex::new(WaitRegistrationState::default());
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registration.lock().unwrap();
+                panic!("poison registration");
+            });
+            let force_close_calls = std::cell::Cell::new(0);
+
+            let result = with_cancelled_registration_or_force_close(
+                &registration,
+                || force_close_calls.set(force_close_calls.get() + 1),
+                |_| (),
+            );
+
+            assert!(result.is_err());
+            assert_eq!(force_close_calls.get(), 1);
         }
 
         #[test]

@@ -848,7 +848,7 @@ impl CaptureBackend for VirtualHidCaptureBackend {
 
 #[cfg(target_os = "windows")]
 struct VirtualHidCaptureDriver {
-    client: Option<rshare_platform::windows::WindowsDriverClient>,
+    cancel: Option<rshare_platform::windows::WindowsDriverEventStreamCancel>,
     thread: Option<std::thread::JoinHandle<()>>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     callback: std::sync::Arc<std::sync::Mutex<Option<DriverEventCallback>>>,
@@ -862,7 +862,7 @@ type DriverEventCallback =
 impl VirtualHidCaptureDriver {
     fn new() -> Self {
         Self {
-            client: None,
+            cancel: None,
             thread: None,
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             callback: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -898,7 +898,8 @@ impl VirtualHidCaptureDriver {
             anyhow::bail!("RShare filter driver event filtering is not active");
         }
 
-        self.client = Some(client);
+        let (stream, cancel) = rshare_platform::windows::WindowsDriverEventStream::open_filter()
+            .map_err(|error| anyhow::anyhow!("Failed to open filter event stream: {error}"))?;
 
         // Start the event reading thread
         let running = self.running.clone();
@@ -906,12 +907,21 @@ impl VirtualHidCaptureDriver {
 
         running.store(true, std::sync::atomic::Ordering::Release);
 
-        let thread = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("rshare-vhid-capture".to_string())
             .spawn(move || {
-                Self::event_loop(running, callback);
-            })?;
+                Self::event_loop(stream, running, callback);
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.running
+                    .store(false, std::sync::atomic::Ordering::Release);
+                let _ = cancel.cancel();
+                return Err(error.into());
+            }
+        };
 
+        self.cancel = Some(cancel);
         self.thread = Some(thread);
         Ok(())
     }
@@ -919,13 +929,18 @@ impl VirtualHidCaptureDriver {
     fn stop(&mut self) -> Result<()> {
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
+        let cancel_result = self
+            .cancel
+            .as_ref()
+            .map(|cancel| cancel.cancel())
+            .unwrap_or(Ok(()));
 
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
 
-        self.client = None;
-        Ok(())
+        self.cancel = None;
+        cancel_result
     }
 
     fn is_running(&self) -> bool {
@@ -933,23 +948,12 @@ impl VirtualHidCaptureDriver {
     }
 
     fn event_loop(
+        mut stream: rshare_platform::windows::WindowsDriverEventStream,
         running: std::sync::Arc<std::sync::atomic::AtomicBool>,
         callback: std::sync::Arc<std::sync::Mutex<Option<DriverEventCallback>>>,
     ) {
-        let client = match rshare_platform::windows::WindowsDriverClient::open_filter() {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::error!(
-                    "Virtual HID capture failed to open filter driver: {}",
-                    error
-                );
-                running.store(false, std::sync::atomic::Ordering::Release);
-                return;
-            }
-        };
-
         while running.load(std::sync::atomic::Ordering::Acquire) {
-            match client.read_event().map(adapt_windows_filter_capture_event) {
+            match stream.wait_event().map(adapt_windows_filter_capture_event) {
                 Ok(WindowsFilterCaptureOutput::Input(event)) => {
                     // Only forward hardware events (ignore injected loopback)
                     if matches!(
@@ -967,14 +971,12 @@ impl VirtualHidCaptureDriver {
                     tracing::error!("Virtual HID capture fault: {fault:?}");
                     break;
                 }
+                Err(rshare_platform::windows::DriverWaitError::Cancelled)
+                    if !running.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    break;
+                }
                 Err(error) => {
-                    // Check if queue is empty (normal condition when no events)
-                    if rshare_platform::windows::is_driver_event_queue_empty(&error) {
-                        // Sleep a bit to avoid busy-waiting
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
-                    // Real error - log and stop
                     tracing::error!("Virtual HID capture error: {}", error);
                     break;
                 }
@@ -1577,6 +1579,33 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn virtual_hid_capture_uses_wait_event() {
+        let source = include_str!("backend.rs");
+        let start = source
+            .find("struct VirtualHidCaptureDriver")
+            .expect("missing Virtual HID capture implementation");
+        let end = source[start..]
+            .find("impl CaptureDriver for VirtualHidCaptureDriver")
+            .map(|offset| start + offset)
+            .expect("missing Virtual HID CaptureDriver implementation");
+        let capture = &source[start..end];
+
+        assert!(capture.contains("WindowsDriverEventStream::open_filter"));
+        assert!(capture.contains(".wait_event()"));
+        assert!(capture.contains(".cancel()"));
+        assert!(!capture.contains(".read_event()"));
+        assert!(!capture.contains("Duration::from_millis(1)"));
+        assert!(capture.contains("let cancel_result"));
+        assert!(
+            capture.find("let cancel_result").unwrap() < capture.find("thread.join()").unwrap()
+        );
+        assert!(
+            capture.find("thread.join()").unwrap() < capture.find("self.cancel = None").unwrap()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn windows_filter_status_maps_to_reliable_ingress_fault() {
         assert_eq!(
             adapt_windows_filter_capture_event(
@@ -1594,6 +1623,7 @@ mod tests {
         let keyboard_only = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
             filter_semantic_queue: false,
+            wait_event: false,
             virtual_keyboard: true,
             virtual_mouse: false,
             virtual_gamepad_scaffold: false,
@@ -1602,6 +1632,7 @@ mod tests {
         let mouse_only = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
             filter_semantic_queue: false,
+            wait_event: false,
             virtual_keyboard: false,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,
@@ -1610,6 +1641,7 @@ mod tests {
         let keyboard_and_mouse = rshare_platform::windows::WindowsDriverCapabilities {
             filter_events: false,
             filter_semantic_queue: false,
+            wait_event: false,
             virtual_keyboard: true,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,

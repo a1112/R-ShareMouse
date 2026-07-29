@@ -91,6 +91,85 @@ static HANDLE open_device(const wchar_t* path, const wchar_t* label)
     return device;
 }
 
+static HANDLE open_filter_event_stream(void)
+{
+    HANDLE device = CreateFileW(
+        L"\\\\.\\RShareInputControl",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        NULL);
+    if (device == INVALID_HANDLE_VALUE) {
+        wprintf(L"filter event stream open failed: %lu\n", GetLastError());
+    }
+    return device;
+}
+
+static DWORD wait_filter_event(
+    HANDLE device,
+    DWORD timeout_ms,
+    RSHARE_DRIVER_EVENT* event)
+{
+    OVERLAPPED overlapped = {0};
+    DWORD returned = 0;
+    DWORD error;
+    DWORD wait_result;
+
+    overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (overlapped.hEvent == NULL) {
+        return GetLastError();
+    }
+
+    if (DeviceIoControl(
+        device,
+        IOCTL_RSHARE_WAIT_EVENT,
+        NULL,
+        0,
+        event,
+        sizeof(*event),
+        NULL,
+        &overlapped)) {
+        if (!GetOverlappedResult(device, &overlapped, &returned, FALSE)) {
+            error = GetLastError();
+            CloseHandle(overlapped.hEvent);
+            return error;
+        }
+        CloseHandle(overlapped.hEvent);
+        return returned == sizeof(*event) ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+    }
+
+    error = GetLastError();
+    if (error != ERROR_IO_PENDING) {
+        CloseHandle(overlapped.hEvent);
+        return error;
+    }
+
+    wait_result = WaitForSingleObject(overlapped.hEvent, timeout_ms);
+    if (wait_result == WAIT_TIMEOUT) {
+        (VOID)CancelIoEx(device, &overlapped);
+        (VOID)GetOverlappedResult(device, &overlapped, &returned, TRUE);
+        CloseHandle(overlapped.hEvent);
+        return WAIT_TIMEOUT;
+    }
+    if (wait_result != WAIT_OBJECT_0) {
+        error = GetLastError();
+        (VOID)CancelIoEx(device, &overlapped);
+        (VOID)GetOverlappedResult(device, &overlapped, &returned, TRUE);
+        CloseHandle(overlapped.hEvent);
+        return error;
+    }
+
+    if (!GetOverlappedResult(device, &overlapped, &returned, FALSE)) {
+        error = GetLastError();
+        CloseHandle(overlapped.hEvent);
+        return error;
+    }
+    CloseHandle(overlapped.hEvent);
+    return returned == sizeof(*event) ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+}
+
 static void print_driver_event(const char* prefix, const RSHARE_DRIVER_EVENT* event)
 {
     printf(
@@ -254,7 +333,7 @@ static BOOL filter_event_matches_target(const RSHARE_DRIVER_EVENT* event, ULONG 
 
 static int probe_filter_watch(DWORD timeout_seconds, ULONG target_device_kind)
 {
-    HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
+    HANDLE device = open_filter_event_stream();
 
     if (device == INVALID_HANDLE_VALUE) {
         return 14;
@@ -266,9 +345,14 @@ static int probe_filter_watch(DWORD timeout_seconds, ULONG target_device_kind)
 
     ULONGLONG deadline = GetTickCount64() + ((ULONGLONG)timeout_seconds * 1000ULL);
     while (GetTickCount64() < deadline) {
-        DWORD returned = 0;
         RSHARE_DRIVER_EVENT event = {0};
-        if (DeviceIoControl(device, IOCTL_RSHARE_READ_EVENT, NULL, 0, &event, sizeof(event), &returned, NULL)) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            break;
+        }
+        DWORD remaining = (DWORD)(deadline - now);
+        DWORD error = wait_filter_event(device, remaining, &event);
+        if (error == ERROR_SUCCESS) {
             BOOL matches_target = filter_event_matches_target(&event, target_device_kind);
             if (target_device_kind == 0 || matches_target) {
                 print_driver_event("event", &event);
@@ -280,10 +364,8 @@ static int probe_filter_watch(DWORD timeout_seconds, ULONG target_device_kind)
             continue;
         }
 
-        DWORD error = GetLastError();
-        if (error == ERROR_NO_MORE_ITEMS) {
-            Sleep(10);
-            continue;
+        if (error == WAIT_TIMEOUT) {
+            break;
         }
 
         wprintf(L"filter watch read failed: %lu\n", error);
@@ -304,7 +386,7 @@ static int probe_filter_watch(DWORD timeout_seconds, ULONG target_device_kind)
 
 static int probe_filter_drain(DWORD quiet_ms, DWORD timeout_seconds)
 {
-    HANDLE device = open_device(L"\\\\.\\RShareInputControl", L"filter");
+    HANDLE device = open_filter_event_stream();
 
     if (device == INVALID_HANDLE_VALUE) {
         return 14;
@@ -319,30 +401,28 @@ static int probe_filter_drain(DWORD quiet_ms, DWORD timeout_seconds)
 
     DWORD drained = 0;
     ULONGLONG deadline = GetTickCount64() + ((ULONGLONG)timeout_seconds * 1000ULL);
-    ULONGLONG idle_since = 0;
     while (GetTickCount64() < deadline) {
-        DWORD returned = 0;
         RSHARE_DRIVER_EVENT event = {0};
-        if (DeviceIoControl(device, IOCTL_RSHARE_READ_EVENT, NULL, 0, &event, sizeof(event), &returned, NULL)) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            break;
+        }
+        DWORD wait_ms = quiet_ms;
+        DWORD remaining = (DWORD)(deadline - now);
+        if (wait_ms > remaining) {
+            wait_ms = remaining;
+        }
+        DWORD error = wait_filter_event(device, wait_ms, &event);
+        if (error == ERROR_SUCCESS) {
             print_driver_event("drained", &event);
             drained++;
-            idle_since = 0;
             continue;
         }
 
-        DWORD error = GetLastError();
-        if (error == ERROR_NO_MORE_ITEMS) {
-            ULONGLONG now = GetTickCount64();
-            if (idle_since == 0) {
-                idle_since = now;
-            }
-            if (now - idle_since >= quiet_ms) {
-                printf("filter drain idle drained=%lu quiet_ms=%lu\n", drained, quiet_ms);
-                CloseHandle(device);
-                return 0;
-            }
-            Sleep(10);
-            continue;
+        if (error == WAIT_TIMEOUT) {
+            printf("filter drain idle drained=%lu quiet_ms=%lu\n", drained, quiet_ms);
+            CloseHandle(device);
+            return 0;
         }
 
         wprintf(L"filter drain read failed: %lu\n", error);

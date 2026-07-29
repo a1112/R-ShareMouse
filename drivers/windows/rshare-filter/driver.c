@@ -11,13 +11,18 @@
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD RShareFilterEvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP RShareFilterEvtCleanup;
+EVT_WDF_FILE_CLEANUP RShareFilterEvtFileCleanup;
+EVT_WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE RShareFilterEvtIoCanceledOnQueue;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RShareFilterEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL RShareFilterEvtIoInternalDeviceControl;
 
 typedef struct _RSHARE_CONTROL_CONTEXT {
     WDFQUEUE Queue;
+    WDFQUEUE PendingWaitQueue;
     RSHARE_EVENT_QUEUE EventQueue;
     KSPIN_LOCK Lock;
+    KSPIN_LOCK PendingLock;
+    volatile LONG PendingWaiterCount;
     volatile LONG64 KeyboardConnectCount;
     volatile LONG64 MouseConnectCount;
     volatile LONG64 KeyboardEventCount;
@@ -33,6 +38,8 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RSHARE_CONTROL_CONTEXT, RShareControlGetConte
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RSHARE_FILTER_DEVICE_CONTEXT, RShareFilterDeviceGetContext)
 
 static WDFDEVICE g_RShareControlDevice;
+
+static VOID RShareSatisfyPendingWaiter(PRSHARE_CONTROL_CONTEXT context);
 
 static VOID RShareIncrementStatsCounter(volatile LONG64* counter)
 {
@@ -156,6 +163,7 @@ static VOID RShareQueueEvent(const RSHARE_DRIVER_EVENT* event)
         RShareIncrementStatsCounter(&context->MouseEventCount);
     }
     KeReleaseSpinLock(&context->Lock, oldIrql);
+    RShareSatisfyPendingWaiter(context);
 }
 
 static BOOLEAN RSharePopEvent(PRSHARE_CONTROL_CONTEXT context, PRSHARE_DRIVER_EVENT event)
@@ -168,6 +176,58 @@ static BOOLEAN RSharePopEvent(PRSHARE_CONTROL_CONTEXT context, PRSHARE_DRIVER_EV
     KeReleaseSpinLock(&context->Lock, oldIrql);
 
     return hasEvent;
+}
+
+static VOID RShareSatisfyPendingWaiter(PRSHARE_CONTROL_CONTEXT context)
+{
+    WDFREQUEST request;
+    NTSTATUS status;
+    KIRQL oldIrql;
+    BOOLEAN hasEvent = FALSE;
+
+    KeAcquireSpinLock(&context->PendingLock, &oldIrql);
+    status = WdfIoQueueRetrieveNextRequest(context->PendingWaitQueue, &request);
+    if (!NT_SUCCESS(status)) {
+        KeReleaseSpinLock(&context->PendingLock, oldIrql);
+        return;
+    }
+    InterlockedDecrement(&context->PendingWaiterCount);
+
+    {
+        PRSHARE_DRIVER_EVENT event;
+        status = WdfRequestRetrieveOutputBuffer(
+            request,
+            sizeof(*event),
+            (PVOID*)&event,
+            NULL);
+        if (NT_SUCCESS(status)) {
+            hasEvent = RSharePopEvent(context, event);
+        }
+    }
+
+    if (!NT_SUCCESS(status)) {
+        KeReleaseSpinLock(&context->PendingLock, oldIrql);
+        WdfRequestComplete(request, status);
+        return;
+    }
+
+    if (!hasEvent) {
+        InterlockedIncrement(&context->PendingWaiterCount);
+        status = WdfRequestForwardToIoQueue(request, context->PendingWaitQueue);
+        if (!NT_SUCCESS(status)) {
+            InterlockedDecrement(&context->PendingWaiterCount);
+        }
+    }
+    KeReleaseSpinLock(&context->PendingLock, oldIrql);
+
+    if (hasEvent) {
+        WdfRequestCompleteWithInformation(
+            request,
+            STATUS_SUCCESS,
+            sizeof(RSHARE_DRIVER_EVENT));
+    } else if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(request, status);
+    }
 }
 
 static VOID RShareSeedSyntheticEvent(ULONG deviceKind, ULONG eventKind)
@@ -351,11 +411,22 @@ static VOID RShareForwardRequest(WDFDEVICE device, WDFREQUEST request)
 static NTSTATUS RShareCreateControlDevice(WDFDRIVER driver, PWDFDEVICE_INIT deviceInit)
 {
     WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_FILEOBJECT_CONFIG fileConfig;
     WDFDEVICE device;
     WDF_IO_QUEUE_CONFIG queueConfig;
     UNICODE_STRING symbolicLink;
     NTSTATUS status;
     PRSHARE_CONTROL_CONTEXT context;
+
+    WDF_FILEOBJECT_CONFIG_INIT(
+        &fileConfig,
+        WDF_NO_EVENT_CALLBACK,
+        WDF_NO_EVENT_CALLBACK,
+        RShareFilterEvtFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(
+        deviceInit,
+        &fileConfig,
+        WDF_NO_OBJECT_ATTRIBUTES);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, RSHARE_CONTROL_CONTEXT);
     status = WdfDeviceCreate(&deviceInit, &attributes, &device);
@@ -371,11 +442,23 @@ static NTSTATUS RShareCreateControlDevice(WDFDRIVER driver, PWDFDEVICE_INIT devi
 
     context = RShareControlGetContext(device);
     KeInitializeSpinLock(&context->Lock);
+    KeInitializeSpinLock(&context->PendingLock);
     RtlZeroMemory(&context->EventQueue, sizeof(context->EventQueue));
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = RShareFilterEvtIoDeviceControl;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &context->Queue);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
+    queueConfig.EvtIoCanceledOnQueue = RShareFilterEvtIoCanceledOnQueue;
+    status = WdfIoQueueCreate(
+        device,
+        &queueConfig,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &context->PendingWaitQueue);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -456,6 +539,36 @@ VOID RShareFilterEvtCleanup(WDFOBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     g_RShareControlDevice = NULL;
+}
+
+VOID RShareFilterEvtFileCleanup(WDFFILEOBJECT FileObject)
+{
+    WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+    PRSHARE_CONTROL_CONTEXT context = RShareControlGetContext(device);
+    WDFREQUEST request;
+    KIRQL oldIrql;
+
+    for (;;) {
+        KeAcquireSpinLock(&context->PendingLock, &oldIrql);
+        if (!NT_SUCCESS(WdfIoQueueRetrieveRequestByFileObject(
+            context->PendingWaitQueue,
+            FileObject,
+            &request))) {
+            KeReleaseSpinLock(&context->PendingLock, oldIrql);
+            break;
+        }
+        InterlockedDecrement(&context->PendingWaiterCount);
+        KeReleaseSpinLock(&context->PendingLock, oldIrql);
+        WdfRequestComplete(request, STATUS_CANCELLED);
+    }
+}
+
+VOID RShareFilterEvtIoCanceledOnQueue(WDFQUEUE Queue, WDFREQUEST Request)
+{
+    PRSHARE_CONTROL_CONTEXT context =
+        RShareControlGetContext(WdfIoQueueGetDevice(Queue));
+    InterlockedDecrement(&context->PendingWaiterCount);
+    WdfRequestComplete(Request, STATUS_CANCELLED);
 }
 
 VOID RShareFilterEvtIoInternalDeviceControl(
@@ -542,7 +655,9 @@ VOID RShareFilterEvtIoDeviceControl(
         if (NT_SUCCESS(status)) {
             capabilities->Abi = RSHARE_DRIVER_ABI;
             capabilities->Flags =
-                RSHARE_CAP_FILTER_EVENTS | RSHARE_CAP_FILTER_SEMANTIC_QUEUE;
+                RSHARE_CAP_FILTER_EVENTS
+                | RSHARE_CAP_FILTER_SEMANTIC_QUEUE
+                | RSHARE_CAP_WAIT_EVENT;
             capabilities->MaxEventSize = sizeof(RSHARE_DRIVER_EVENT);
             capabilities->Reserved = RSHARE_FILTER_EVENT_FORMAT_VERSION;
             bytes = sizeof(*capabilities);
@@ -578,6 +693,62 @@ VOID RShareFilterEvtIoDeviceControl(
             bytes = sizeof(*stats);
         }
         break;
+    }
+    case IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE: {
+        PRSHARE_FILTER_WAIT_STATE waitState;
+        status = WdfRequestRetrieveOutputBuffer(
+            Request,
+            sizeof(*waitState),
+            (PVOID*)&waitState,
+            NULL);
+        if (NT_SUCCESS(status)) {
+            waitState->Abi = RSHARE_DRIVER_ABI;
+            waitState->Version = RSHARE_FILTER_WAIT_STATE_VERSION;
+            waitState->StructSize = sizeof(*waitState);
+            waitState->PendingWaiters =
+                (ULONG)InterlockedCompareExchange(
+                    &context->PendingWaiterCount,
+                    0,
+                    0);
+            waitState->Reserved = 0;
+            bytes = sizeof(*waitState);
+        }
+        break;
+    }
+    case IOCTL_RSHARE_WAIT_EVENT: {
+        PRSHARE_DRIVER_EVENT event;
+        KIRQL oldIrql;
+        status = WdfRequestRetrieveOutputBuffer(
+            Request,
+            sizeof(*event),
+            (PVOID*)&event,
+            NULL);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        if (RSharePopEvent(context, event)) {
+            bytes = sizeof(*event);
+            break;
+        }
+
+        KeAcquireSpinLock(&context->PendingLock, &oldIrql);
+        InterlockedIncrement(&context->PendingWaiterCount);
+        status = WdfRequestForwardToIoQueue(
+            Request,
+            context->PendingWaitQueue);
+        if (!NT_SUCCESS(status)) {
+            InterlockedDecrement(&context->PendingWaiterCount);
+            KeReleaseSpinLock(&context->PendingLock, oldIrql);
+            break;
+        }
+        KeReleaseSpinLock(&context->PendingLock, oldIrql);
+
+        /*
+         * An event may arrive between the empty check and the manual-queue
+         * forward. Rechecking after the queue owns the request closes that race.
+         */
+        RShareSatisfyPendingWaiter(context);
+        return;
     }
     case IOCTL_RSHARE_READ_EVENT: {
         PRSHARE_DRIVER_EVENT event;

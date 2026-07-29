@@ -927,7 +927,7 @@ async fn send_background_load(
         ClassifiedMessage::Control(frame) => transport.send_control(frame).await?,
         ClassifiedMessage::Telemetry(frame) => transport.try_send_telemetry(frame)?,
         ClassifiedMessage::Bulk(frame) => transport.send_bulk(frame).await?,
-        ClassifiedMessage::ReliableCompat(_) | ClassifiedMessage::Unsupported => {
+        ClassifiedMessage::Unsupported => {
             return Err(anyhow!("background load has no typed QoS lane"));
         }
     }
@@ -1058,12 +1058,12 @@ mod tests {
                 duration_secs: 60,
                 load: vec![],
             },
-            LoopbackRunOptions::test(Duration::from_millis(120)),
+            LoopbackRunOptions::test(Duration::from_millis(500)),
         )
         .await
         .unwrap();
 
-        assert_eq!(measured.run.counters["expected_sent"], 120);
+        assert_eq!(measured.run.counters["expected_sent"], 500);
         assert_eq!(
             measured.run.counters["actual_sent"] + measured.run.counters["end_window_backlog"],
             measured.run.counters["expected_sent"]
