@@ -229,19 +229,31 @@ async fn mobile_access() -> Result<MobileAccessSnapshot, String> {
 }
 
 #[tauri::command]
-async fn capture_display(
+async fn capture_display_binary(
     display_id: String,
     max_width: Option<u32>,
-) -> Result<DisplayCaptureResult, String> {
-    capture_display_with(
+) -> Result<tauri::ipc::Response, String> {
+    let result = capture_display_with(
         DisplayCaptureRequest {
             display_id,
             max_width,
+            format: rshare_core::DisplayCaptureFormat::Png,
         },
         |request| Box::pin(async { daemon_client::request_display_capture(request).await }),
-        |request| rshare_platform::display::capture_display(&request),
+        |request| {
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    rshare_platform::display::capture_display(&request)
+                })
+                .await
+                .map_err(anyhow::Error::from)?
+            })
+        },
     )
-    .await
+    .await?;
+    let body =
+        rshare_core::encode_display_capture_response(&result).map_err(|error| error.to_string())?;
+    Ok(tauri::ipc::Response::new(body.to_vec()))
 }
 
 #[tauri::command]
@@ -582,13 +594,13 @@ async fn capture_display_with<DaemonCapture, PlatformCapture>(
 ) -> Result<DisplayCaptureResult, String>
 where
     DaemonCapture: FnMut(DisplayCaptureRequest) -> BoxFutureResult<'static, DisplayCaptureResult>,
-    PlatformCapture: FnMut(DisplayCaptureRequest) -> AnyhowResult<DisplayCaptureResult>,
+    PlatformCapture: FnMut(DisplayCaptureRequest) -> BoxFutureResult<'static, DisplayCaptureResult>,
 {
     match request_daemon(request.clone()).await {
         Ok(result) => Ok(result),
-        Err(err) if is_ipc_unavailable(&err) => {
-            capture_platform(request).map_err(|fallback_err| fallback_err.to_string())
-        }
+        Err(err) if is_ipc_unavailable(&err) => capture_platform(request)
+            .await
+            .map_err(|fallback_err| fallback_err.to_string()),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -891,7 +903,7 @@ fn main() {
             disconnect_device,
             local_controls_state,
             mobile_access,
-            capture_display,
+            capture_display_binary,
             identify_displays,
             update_display_settings,
             open_display_settings,
@@ -1646,6 +1658,7 @@ mod tests {
         let request = DisplayCaptureRequest {
             display_id: "windows-display-rshare".to_string(),
             max_width: Some(640),
+            format: rshare_core::DisplayCaptureFormat::Png,
         };
 
         let result = capture_display_with(
@@ -1661,15 +1674,17 @@ mod tests {
             {
                 let platform_calls = Arc::clone(&platform_calls);
                 move |platform_request| {
-                    platform_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(DisplayCaptureResult {
-                        status: rshare_core::DisplayOperationStatus::Success,
-                        display_id: platform_request.display_id,
-                        mime_type: Some("image/png".to_string()),
-                        width: platform_request.max_width,
-                        height: Some(360),
-                        bytes: vec![1, 2, 3],
-                        message: None,
+                    let platform_calls = Arc::clone(&platform_calls);
+                    Box::pin(async move {
+                        platform_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(rshare_platform::display_capture::success(
+                            platform_request.display_id,
+                            "image/png",
+                            platform_request.max_width.unwrap_or(640),
+                            360,
+                            bytes::Bytes::from_static(&[1, 2, 3]),
+                            "captured",
+                        ))
                     })
                 }
             },
@@ -1679,8 +1694,9 @@ mod tests {
 
         assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.status, rshare_core::DisplayOperationStatus::Success);
-        assert_eq!(result.display_id, request.display_id);
-        assert_eq!(result.width, request.max_width);
+        let descriptor = result.payload.expect("success descriptor");
+        assert_eq!(descriptor.display_id, request.display_id);
+        assert_eq!(Some(descriptor.width), request.max_width);
     }
 
     #[tokio::test]

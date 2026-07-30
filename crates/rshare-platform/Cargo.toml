@@ -18,6 +18,8 @@ cfg-if = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 arboard = "3.4"
+bytes = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

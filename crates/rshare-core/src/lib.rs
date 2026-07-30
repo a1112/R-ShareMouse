@@ -15,6 +15,7 @@ pub mod input;
 pub mod input_mode;
 pub mod input_router;
 pub mod ipc;
+pub mod ipc_binary;
 pub mod ipc_frame;
 pub mod layout;
 pub mod local_controls;
@@ -86,6 +87,10 @@ pub use ipc::{
     RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
     UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
+pub use ipc_binary::{
+    decode_display_capture_binary, encode_display_capture_binary, encode_display_capture_response,
+    DISPLAY_CAPTURE_ID_BYTES,
+};
 pub use ipc_frame::{
     IpcEnvelopeKind, IpcFrame, IpcFrameCodec, IpcFrameLimits, DEFAULT_MAX_BINARY_FRAME_BYTES,
     DEFAULT_MAX_JSON_FRAME_BYTES, IPC_FRAME_HEADER_LEN,
@@ -102,8 +107,9 @@ pub use endpoint_events::{
 
 // Re-exports from local control diagnostics
 pub use local_controls::{
-    DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-    DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
+    DisplayCaptureBlob, DisplayCaptureDescriptor, DisplayCaptureFormat, DisplayCaptureRequest,
+    DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult, DisplayModeInfo,
+    DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
     DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioCaptureSource,
     LocalAudioCaptureState, LocalAudioCaptureStatus, LocalAudioEndpointFormFactor,
     LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalAudioStreamState,

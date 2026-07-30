@@ -91,6 +91,85 @@ function sendDaemonIpc(request: unknown): Promise<unknown> {
   })
 }
 
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const output = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0))
+  let offset = 0
+  for (const part of parts) {
+    output.set(part, offset)
+    offset += part.byteLength
+  }
+  return output
+}
+
+function sendDaemonDisplayCapture(request: unknown): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(DAEMON_IPC_PORT, DAEMON_IPC_HOST)
+    const decoder = new IpcFrameDecoder()
+    let settled = false
+    let metadataFrame: Uint8Array | null = null
+    let expectsBinary = false
+
+    const settle = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      callback()
+    }
+    socket.setTimeout(5000, () => {
+      settle(() => reject(new Error('daemon display capture timed out')))
+    })
+    socket.on('connect', () => {
+      const payload = new TextEncoder().encode(JSON.stringify(request))
+      socket.write(encodeIpcFrame(IPC_ENVELOPE_KIND.JSON, payload))
+    })
+    socket.on('data', (chunk) => {
+      try {
+        let completed: Uint8Array | null = null
+        for (const frame of decoder.push(chunk)) {
+          if (completed) {
+            throw new Error('daemon returned extra display capture frames')
+          }
+          if (metadataFrame === null) {
+            if (frame.kind !== IPC_ENVELOPE_KIND.JSON) {
+              throw new Error('display capture response did not start with JSON')
+            }
+            const wrapper = JSON.parse(new TextDecoder().decode(frame.payload))
+            const result = wrapper?.DisplayCapture
+            if (!result || typeof result !== 'object') {
+              throw new Error('daemon returned an unexpected display capture response')
+            }
+            metadataFrame = encodeIpcFrame(
+              IPC_ENVELOPE_KIND.JSON,
+              new TextEncoder().encode(JSON.stringify(result)),
+            )
+            expectsBinary = result.status === 'Success' && result.payload != null
+            if (!expectsBinary) {
+              settle(() => resolve(metadataFrame!))
+            }
+            continue
+          }
+          if (!expectsBinary || frame.kind !== IPC_ENVELOPE_KIND.BINARY) {
+            throw new Error('daemon returned an unexpected display capture frame')
+          }
+          const binaryFrame = encodeIpcFrame(IPC_ENVELOPE_KIND.BINARY, frame.payload)
+          completed = concatBytes(metadataFrame!, binaryFrame)
+        }
+        if (completed) {
+          settle(() => resolve(completed!))
+        }
+      } catch (error) {
+        settle(() => reject(error))
+      }
+    })
+    socket.on('error', (error) => settle(() => reject(error)))
+    socket.on('close', () => {
+      if (!settled) {
+        settle(() => reject(new Error('daemon closed before display capture completed')))
+      }
+    })
+  })
+}
+
 async function waitForDaemonStatus(timeoutMs = 8000): Promise<unknown> {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown = null
@@ -291,6 +370,39 @@ function rshareDaemonBridge() {
             JSON.stringify({
               error: error instanceof Error ? error.message : String(error),
             }),
+          )
+        }
+      })
+
+      server.middlewares.use('/__rshare/display-capture', async (request, response, next) => {
+        if (request.method !== 'POST') {
+          next()
+          return
+        }
+        response.setHeader('Content-Type', 'application/octet-stream')
+        try {
+          const body = await readRequestBody(request)
+          const payload = body ? JSON.parse(body) : {}
+          const daemonRequest = {
+            CaptureDisplay: {
+              display_id: payload.display_id ?? payload.displayId ?? 'primary',
+              max_width: payload.max_width ?? payload.maxWidth ?? 900,
+            },
+          }
+          let bytes: Uint8Array
+          try {
+            bytes = await sendDaemonDisplayCapture(daemonRequest)
+          } catch (error) {
+            if (!isDaemonIpcUnavailable(error)) throw error
+            await handleServiceAction('start')
+            bytes = await sendDaemonDisplayCapture(daemonRequest)
+          }
+          response.statusCode = 200
+          response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength))
+        } catch (error) {
+          response.statusCode = 502
+          response.end(
+            JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
           )
         }
       })

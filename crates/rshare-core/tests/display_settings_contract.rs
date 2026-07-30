@@ -63,6 +63,7 @@ fn display_settings_contract_capture_and_identify_requests_round_trip() {
     let capture = DisplayCaptureRequest {
         display_id: "primary".to_string(),
         max_width: Some(640),
+        format: rshare_core::DisplayCaptureFormat::Png,
     };
     let identify = DisplayIdentifyRequest {
         duration_ms: Some(2500),

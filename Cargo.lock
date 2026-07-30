@@ -2799,6 +2799,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4761,6 +4763,7 @@ name = "rshare-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "dirs 5.0.1",
  "futures-util",
  "regex",
@@ -4852,11 +4855,13 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "bytes",
  "cfg-if",
  "cocoa 0.25.0",
  "core-foundation 0.10.1",
  "core-graphics 0.24.0",
  "evdev",
+ "image",
  "libc",
  "nix 0.29.0",
  "objc",

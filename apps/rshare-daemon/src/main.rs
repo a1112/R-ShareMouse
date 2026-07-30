@@ -5,6 +5,7 @@
 mod audio_runtime;
 mod endpoint_runtime;
 mod mobile_gateway;
+mod static_capture;
 
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
@@ -19,15 +20,16 @@ use rshare_core::{
     DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
     EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
     EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    FeatureConfig, InputRouter, LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph,
-    LayoutNode, LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult,
-    LocalAudioTestStatus, LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState,
-    LocalGamepadState, LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource,
-    LocalInputFeedback, LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult,
-    LocalInputTestStatus, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
-    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
-    ServiceStatusSnapshot, TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState,
-    UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    FeatureConfig, InputRouter, IpcEnvelopeKind, IpcFrame, IpcFrameCodec, LatencyFeedbackSnapshot,
+    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
+    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
+    LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
+    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
+    RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
+    TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState, UiSnapshot,
+    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
@@ -2679,18 +2681,78 @@ fn record_usb_diagnostic_event(
 }
 
 fn display_capture_response_from_result(
-    request: &rshare_core::DisplayCaptureRequest,
+    _request: &rshare_core::DisplayCaptureRequest,
     result: Result<DisplayCaptureResult>,
 ) -> DaemonResponse {
     DaemonResponse::DisplayCapture(result.unwrap_or_else(|error| DisplayCaptureResult {
+        request_id: DeviceId::new_v4(),
         status: DisplayOperationStatus::ApplyFailed,
-        display_id: request.display_id.clone(),
-        mime_type: None,
-        width: None,
-        height: None,
-        bytes: Vec::new(),
         message: Some(error.to_string()),
+        payload: None,
+        blob: None,
     }))
+}
+
+fn prepare_display_capture_response(
+    mut result: DisplayCaptureResult,
+) -> (DisplayCaptureResult, Option<IpcFrame>) {
+    let blob = result.blob.take();
+    match (&result.status, result.payload.as_ref(), blob) {
+        (DisplayOperationStatus::Success, Some(descriptor), Some(blob))
+            if descriptor == &blob.descriptor =>
+        {
+            match rshare_core::encode_display_capture_binary(descriptor, blob.bytes) {
+                Ok(payload) => (
+                    result,
+                    Some(IpcFrame {
+                        kind: IpcEnvelopeKind::Binary,
+                        payload,
+                    }),
+                ),
+                Err(error) => (
+                    display_capture_protocol_error(result.request_id, error.to_string()),
+                    None,
+                ),
+            }
+        }
+        (DisplayOperationStatus::Success, _, _) => (
+            display_capture_protocol_error(
+                result.request_id,
+                "display capture metadata/blob mismatch",
+            ),
+            None,
+        ),
+        (_, None, None) => {
+            if result
+                .message
+                .as_deref()
+                .is_none_or(|message| message.trim().is_empty())
+            {
+                result.message = Some("display capture failed".to_string());
+            }
+            (result, None)
+        }
+        _ => (
+            display_capture_protocol_error(
+                result.request_id,
+                "invalid failed display capture payload",
+            ),
+            None,
+        ),
+    }
+}
+
+fn display_capture_protocol_error(
+    request_id: DeviceId,
+    message: impl Into<String>,
+) -> DisplayCaptureResult {
+    DisplayCaptureResult {
+        request_id,
+        status: DisplayOperationStatus::ApplyFailed,
+        message: Some(message.into()),
+        payload: None,
+        blob: None,
+    }
 }
 
 fn display_identify_response_from_result(result: Result<DisplayIdentifyResult>) -> DaemonResponse {
@@ -7257,6 +7319,26 @@ async fn handle_ipc_client(
         return Ok(());
     }
 
+    if let DaemonRequest::CaptureDisplay(capture_request) = &request {
+        let result = static_capture::capture_display(capture_request.clone())
+            .await
+            .unwrap_or_else(|error| DisplayCaptureResult {
+                request_id: DeviceId::new_v4(),
+                status: DisplayOperationStatus::ApplyFailed,
+                message: Some(error.to_string()),
+                payload: None,
+                blob: None,
+            });
+        let (result, binary_frame) = prepare_display_capture_response(result);
+        write_json_response(&mut stream, &DaemonResponse::DisplayCapture(result.clone())).await?;
+        if let Some(frame) = binary_frame {
+            IpcFrameCodec::default()
+                .write_frame(&mut stream, frame.kind, &frame.payload)
+                .await?;
+        }
+        return Ok(());
+    }
+
     handle_persistent_json_connection_with_first(stream, request, move |request| {
         let ui_state = ui_state.clone();
         let state = Arc::clone(&state);
@@ -8956,6 +9038,7 @@ mod tests {
         let request = rshare_core::DisplayCaptureRequest {
             display_id: "display-1".to_string(),
             max_width: Some(640),
+            format: rshare_core::DisplayCaptureFormat::Png,
         };
 
         let response = display_capture_response_from_result(
@@ -8966,12 +9049,37 @@ mod tests {
         match response {
             DaemonResponse::DisplayCapture(result) => {
                 assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
-                assert_eq!(result.display_id, "display-1");
-                assert!(result.bytes.is_empty());
+                assert!(result.payload.is_none());
+                assert!(result.blob.is_none());
                 assert_eq!(result.message.as_deref(), Some("capture backend failed"));
             }
             other => panic!("expected display capture result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_display_capture_never_emits_a_binary_frame() {
+        let mut invalid = rshare_platform::display_capture::success(
+            "display-1",
+            "image/png",
+            1,
+            1,
+            vec![0x89, b'P', b'N', b'G'].into(),
+            "captured",
+        );
+        invalid.status = DisplayOperationStatus::ApplyFailed;
+        invalid.message = Some("capture failed".to_string());
+
+        let (result, binary) = prepare_display_capture_response(invalid);
+
+        assert_eq!(result.status, DisplayOperationStatus::ApplyFailed);
+        assert!(result.payload.is_none());
+        assert!(result.blob.is_none());
+        assert!(binary.is_none());
+        assert_eq!(
+            result.message.as_deref(),
+            Some("invalid failed display capture payload")
+        );
     }
 
     #[test]

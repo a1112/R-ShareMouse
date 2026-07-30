@@ -17,13 +17,17 @@ cfg_if::cfg_if! {
 mod windows_impl {
     use super::RawCaptureStatus;
     use crate::display::{clamp_identify_duration_ms, fit_thumbnail_size};
+    use crate::display_capture::{
+        encode_bgra, error as capture_error, success as capture_success, DisplayCaptureEncoding,
+        RawBgraFrame,
+    };
     use anyhow::{Context, Result};
     use rshare_core::{
-        DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-        DisplayModeInfo, DisplayOperationStatus, DisplayOrientation, DisplaySettingsUpdateRequest,
-        DisplaySettingsUpdateResult, DisplayWriteCapabilities, LocalAudioEndpointFormFactor,
-        LocalAudioInputDevice, LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo,
-        LocalDisplayState, LocalHardwareDevice,
+        DisplayCaptureFormat, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
+        DisplayIdentifyResult, DisplayModeInfo, DisplayOperationStatus, DisplayOrientation,
+        DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, DisplayWriteCapabilities,
+        LocalAudioEndpointFormFactor, LocalAudioInputDevice, LocalAudioInputKind,
+        LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState, LocalHardwareDevice,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
@@ -3653,16 +3657,32 @@ mod windows_impl {
             ));
         }
 
-        match unsafe { capture_display_bmp(display, capture_width, capture_height) } {
-            Ok(bytes) => Ok(DisplayCaptureResult {
-                status: DisplayOperationStatus::Success,
-                display_id: display.display_id.clone(),
-                mime_type: Some("image/bmp".to_string()),
-                width: Some(capture_width),
-                height: Some(capture_height),
+        match unsafe { capture_display_bgra(display, capture_width, capture_height) }.and_then(
+            |pixels| {
+                encode_bgra(
+                    RawBgraFrame {
+                        width: capture_width,
+                        height: capture_height,
+                        pixels,
+                    },
+                    match request.format {
+                        DisplayCaptureFormat::Png => DisplayCaptureEncoding::Png,
+                        DisplayCaptureFormat::Jpeg => DisplayCaptureEncoding::Jpeg { quality: 85 },
+                    },
+                )
+            },
+        ) {
+            Ok(bytes) => Ok(capture_success(
+                display.display_id.clone(),
+                match request.format {
+                    DisplayCaptureFormat::Png => "image/png",
+                    DisplayCaptureFormat::Jpeg => "image/jpeg",
+                },
+                capture_width,
+                capture_height,
                 bytes,
-                message: Some("display captured".to_string()),
-            }),
+                "display captured",
+            )),
             Err(error) => Ok(display_capture_error(
                 DisplayOperationStatus::ApplyFailed,
                 &display.display_id,
@@ -4101,18 +4121,10 @@ mod windows_impl {
 
     fn display_capture_error(
         status: DisplayOperationStatus,
-        display_id: &str,
+        _display_id: &str,
         message: impl Into<String>,
     ) -> DisplayCaptureResult {
-        DisplayCaptureResult {
-            status,
-            display_id: display_id.to_string(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(message.into()),
-        }
+        capture_error(status, message)
     }
 
     fn display_identify_result(
@@ -4144,7 +4156,7 @@ mod windows_impl {
         owner.finish_generation(generation);
     }
 
-    unsafe fn capture_display_bmp(
+    unsafe fn capture_display_bgra(
         display: &LocalDisplayInfo,
         target_width: u32,
         target_height: u32,
@@ -4215,7 +4227,7 @@ mod windows_impl {
 
         let pixel_len = bitmap_pixel_len(target_width, target_height)?;
         let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), pixel_len);
-        encode_bmp(target_width, target_height, pixels)
+        Ok(pixels.to_vec())
     }
 
     unsafe fn create_identify_overlay_windows(displays: &[LocalDisplayInfo]) -> Result<Vec<isize>> {
@@ -4291,48 +4303,6 @@ mod windows_impl {
             },
             colors: [RgbQuad::default()],
         })
-    }
-
-    fn encode_bmp(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>> {
-        let pixel_len = bitmap_pixel_len(width, height)?;
-        if pixels.len() != pixel_len {
-            anyhow::bail!(
-                "unexpected bitmap pixel length: got {}, expected {}",
-                pixels.len(),
-                pixel_len
-            );
-        }
-
-        let header_len = 14usize + size_of::<BitmapInfoHeader>();
-        let file_len = header_len
-            .checked_add(pixel_len)
-            .context("BMP file is too large")?;
-        let file_len_u32 = u32::try_from(file_len).context("BMP file is too large")?;
-        let pixel_offset = u32::try_from(header_len).context("BMP header is too large")?;
-        let width_i32 = i32_from_u32(width, "BMP width")?;
-        let height_i32 = i32_from_u32(height, "BMP height")?;
-        let size_image = u32::try_from(pixel_len).context("BMP pixel data is too large")?;
-
-        let mut bytes = Vec::with_capacity(file_len);
-        bytes.extend_from_slice(b"BM");
-        bytes.extend_from_slice(&file_len_u32.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&pixel_offset.to_le_bytes());
-        bytes.extend_from_slice(&(size_of::<BitmapInfoHeader>() as u32).to_le_bytes());
-        bytes.extend_from_slice(&width_i32.to_le_bytes());
-        bytes.extend_from_slice(&(-height_i32).to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&32u16.to_le_bytes());
-        bytes.extend_from_slice(&BI_RGB.to_le_bytes());
-        bytes.extend_from_slice(&size_image.to_le_bytes());
-        bytes.extend_from_slice(&0i32.to_le_bytes());
-        bytes.extend_from_slice(&0i32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(pixels);
-
-        Ok(bytes)
     }
 
     fn bitmap_pixel_len(width: u32, height: u32) -> Result<usize> {

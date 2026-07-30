@@ -98,6 +98,11 @@ import {
   createOwnerlessStreamCoordinator,
 } from "./ui-store.mjs";
 import { uiStateStore, useUiStore } from "./use-ui-store";
+import {
+  createDisplayCaptureObjectUrl,
+  createDisplayCaptureUrlStore,
+  mapWithConcurrency,
+} from "./display-capture.mjs";
 
 type DesktopPage = "layout" | "devices" | "logs" | "settings";
 type SettingsSectionKey =
@@ -412,13 +417,17 @@ type DisplayOperationStatus =
   | "ApplyFailed";
 
 type DisplayCaptureResult = {
+  request_id: string;
   status: DisplayOperationStatus;
-  display_id?: string;
-  mime_type?: string | null;
-  width?: number | null;
-  height?: number | null;
-  bytes?: number[] | Uint8Array;
   message?: string | null;
+  payload?: {
+    capture_id: string;
+    display_id: string;
+    mime_type: string;
+    width: number;
+    height: number;
+    byte_length: number;
+  } | null;
 };
 
 type DisplaySettingsUpdateResult = {
@@ -653,6 +662,7 @@ const HARDWARE_ASSET_KEYBOARD_STORAGE_KEY = "rshare.hardwareAsset.keyboard";
 const HARDWARE_ASSET_MOUSE_STORAGE_KEY = "rshare.hardwareAsset.mouse";
 const HARDWARE_ASSET_GAMEPAD_STORAGE_KEY = "rshare.hardwareAsset.gamepad";
 const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
+const DISPLAY_CAPTURE_BRIDGE_ENDPOINT = "/__rshare/display-capture";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
 const DAEMON_SERVICE_BRIDGE_ENDPOINT = "/__rshare/service";
 const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
@@ -685,7 +695,6 @@ const NETWORK_COMMANDS = new Set([
   "start_audio_forwarding",
   "stop_audio_forwarding",
   "run_audio_test",
-  "capture_display",
   "identify_displays",
   "update_display_settings",
   "open_display_settings",
@@ -1239,16 +1248,6 @@ async function invokeNetworkCommand<T = unknown>(
         },
         "LocalAudioTest",
       );
-    case "capture_display":
-      return await daemonRequestValue<T>(
-        {
-          CaptureDisplay: {
-            display_id: args?.display_id ?? args?.displayId ?? "primary",
-            max_width: args?.max_width ?? args?.maxWidth ?? 640,
-          },
-        },
-        "DisplayCapture",
-      );
     case "identify_displays":
       return await daemonRequestValue<T>(
         {
@@ -1384,6 +1383,35 @@ async function invokeCommand<T = unknown>(
   }
 
   throw new Error(`命令 ${command} 需要 Tauri bridge 或 daemon 网络网关`);
+}
+
+async function captureDisplayBinary(
+  displayId: string,
+  maxWidth: number,
+): Promise<Uint8Array> {
+  const invoke = getInvoke();
+  if (invoke) {
+    const value = await invoke<unknown>("capture_display_binary", {
+      displayId,
+      maxWidth,
+    });
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    throw new Error("Tauri display capture did not return a binary response");
+  }
+
+  const response = await fetch(DISPLAY_CAPTURE_BRIDGE_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ display_id: displayId, max_width: maxWidth }),
+  });
+  if (!response.ok) {
+    throw new Error(`display capture bridge failed: HTTP ${response.status}`);
+  }
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 const localControlsStreamCoordinator = createOwnerlessStreamCoordinator({
@@ -7229,6 +7257,12 @@ function DisplaySettingsDetail({
   const selected = view.selectedDisplay;
   const [virtualDisplays, setVirtualDisplays] = useState<VirtualDisplaySnapshot[]>([]);
   const [captures, setCaptures] = useState<Record<string, string>>({});
+  const captureUrlStoreRef = useRef<ReturnType<typeof createDisplayCaptureUrlStore> | null>(
+    null,
+  );
+  if (captureUrlStoreRef.current === null) {
+    captureUrlStoreRef.current = createDisplayCaptureUrlStore();
+  }
   const [resolutionValue, setResolutionValue] = useState("");
   const [refreshRateValue, setRefreshRateValue] = useState("");
   const [scaleValue, setScaleValue] = useState("100");
@@ -7272,6 +7306,13 @@ function DisplaySettingsDetail({
     };
   }, []);
 
+  useEffect(
+    () => () => {
+      captureUrlStoreRef.current?.dispose();
+    },
+    [],
+  );
+
   const scaleOptions = displayScaleOptions(selected.scalePercent);
   const resolutionChanged = resolutionValue !== `${selected.width}x${selected.height}`;
   const refreshRateChanged =
@@ -7305,32 +7346,54 @@ function DisplaySettingsDetail({
     void runDisplayAction(
       "capture",
       async () => {
-        const results: Array<{ displayId: string; result: DisplayCaptureResult }> = [];
-        for (const display of view.displays) {
-          const result = await invokeCommand<DisplayCaptureResult>("capture_display", {
-            displayId: display.id,
-            maxWidth: 900,
-          });
-          results.push({ displayId: display.id, result });
-        }
-        return results;
+        const captureGeneration =
+          captureUrlStoreRef.current?.generation() ?? 0;
+        const results = await mapWithConcurrency(view.displays, 2, async (display) => {
+          try {
+            const response = await captureDisplayBinary(display.id, 900);
+            const decoded = createDisplayCaptureObjectUrl(response);
+            return {
+              displayId: display.id,
+              result: decoded.result as DisplayCaptureResult,
+              url: decoded.url as string | null,
+            };
+          } catch (error) {
+            return {
+              displayId: display.id,
+              result: {
+                request_id: crypto.randomUUID(),
+                status: "ApplyFailed" as DisplayOperationStatus,
+                message: errorMessage(error),
+                payload: null,
+              },
+              url: null,
+            };
+          }
+        });
+        return { captureGeneration, results };
       },
-      (results) => {
-        const nextCaptures: Record<string, string> = {};
+      ({ captureGeneration, results }) => {
         const failures: DisplayCaptureResult[] = [];
-        for (const { displayId, result } of results) {
+        let successCount = 0;
+        for (const { displayId, result, url } of results) {
           if (result.status !== "Success") {
             failures.push(result);
             continue;
           }
-          const dataUrl = displayCaptureDataUrl(result);
-          if (dataUrl) {
-            nextCaptures[displayId] = dataUrl;
+          if (url) {
+            if (
+              captureUrlStoreRef.current?.replace(
+                displayId,
+                url,
+                captureGeneration,
+              )
+            ) {
+              successCount += 1;
+            }
           }
         }
-        const successCount = Object.keys(nextCaptures).length;
         if (successCount) {
-          setCaptures((current) => ({ ...current, ...nextCaptures }));
+          setCaptures(captureUrlStoreRef.current?.snapshot() ?? {});
         }
         if (successCount === 0 && failures.length) {
           const firstFailure = failures[0];
@@ -7826,23 +7889,6 @@ function displayScaleOptions(currentScale: number | null) {
     value: String(value),
     label: `${value}%`,
   }));
-}
-
-function displayCaptureDataUrl(result: DisplayCaptureResult) {
-  const bytes = result.bytes instanceof Uint8Array
-    ? result.bytes
-    : Array.isArray(result.bytes)
-      ? Uint8Array.from(result.bytes)
-      : null;
-  if (!bytes?.length) {
-    return null;
-  }
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.slice(offset, offset + chunkSize));
-  }
-  return `data:${result.mime_type ?? "image/bmp"};base64,${btoa(binary)}`;
 }
 
 function displayOperationMessage(

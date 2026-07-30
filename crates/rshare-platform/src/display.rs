@@ -1,13 +1,16 @@
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use bytes::Bytes;
 #[cfg(any(not(windows), test))]
 use rshare_core::DisplayOperationStatus;
+#[cfg(target_os = "linux")]
+use rshare_core::{
+    DisplayCaptureFormat, DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities,
+    LocalDisplayInfo,
+};
 use rshare_core::{
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, LocalDisplayState,
-};
-#[cfg(target_os = "linux")]
-use rshare_core::{
-    DisplayModeInfo, DisplayOrientation, DisplayWriteCapabilities, LocalDisplayInfo,
 };
 
 #[cfg(windows)]
@@ -1023,17 +1026,10 @@ fn linux_capture_display(request: &DisplayCaptureRequest) -> DisplayCaptureResul
     let state = match query_display_state() {
         Ok(state) => state,
         Err(error) => {
-            return DisplayCaptureResult {
-                status: DisplayOperationStatus::ApplyFailed,
-                display_id: request.display_id.clone(),
-                mime_type: None,
-                width: None,
-                height: None,
-                bytes: Vec::new(),
-                message: Some(format!(
-                    "Display enumeration failed before capture: {error}"
-                )),
-            };
+            return linux_capture_error(
+                DisplayOperationStatus::ApplyFailed,
+                format!("Display enumeration failed before capture: {error}"),
+            );
         }
     };
     let display = state
@@ -1047,18 +1043,13 @@ fn linux_capture_display(request: &DisplayCaptureRequest) -> DisplayCaptureResul
                 .find(|display| display.primary && request.display_id == "primary")
         });
     let Some(display) = display else {
-        return DisplayCaptureResult {
-            status: DisplayOperationStatus::InvalidDisplay,
-            display_id: request.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(format!("display '{}' was not found", request.display_id)),
-        };
+        return linux_capture_error(
+            DisplayOperationStatus::InvalidDisplay,
+            format!("display '{}' was not found", request.display_id),
+        );
     };
 
-    let shell_result = linux_gnome_shell_capture_area(display);
+    let shell_result = linux_gnome_shell_capture_area(display, request.max_width, request.format);
     if shell_result.status == DisplayOperationStatus::Success {
         return shell_result;
     }
@@ -1072,6 +1063,7 @@ fn linux_capture_display(request: &DisplayCaptureRequest) -> DisplayCaptureResul
             display,
             shell_result.message.as_deref(),
             request.max_width,
+            request.format,
         );
     }
     shell_result
@@ -1173,7 +1165,11 @@ fn linux_identify_displays(request: &DisplayIdentifyRequest) -> Result<DisplayId
 }
 
 #[cfg(target_os = "linux")]
-fn linux_gnome_shell_capture_area(display: &LocalDisplayInfo) -> DisplayCaptureResult {
+fn linux_gnome_shell_capture_area(
+    display: &LocalDisplayInfo,
+    max_width: Option<u32>,
+    format: DisplayCaptureFormat,
+) -> DisplayCaptureResult {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1212,17 +1208,10 @@ fn linux_gnome_shell_capture_area(display: &LocalDisplayInfo) -> DisplayCaptureR
     let output = match output {
         Ok(output) => output,
         Err(error) => {
-            return DisplayCaptureResult {
-                status: DisplayOperationStatus::Unsupported,
-                display_id: display.display_id.clone(),
-                mime_type: None,
-                width: None,
-                height: None,
-                bytes: Vec::new(),
-                message: Some(format!(
-                    "Failed to invoke GNOME screenshot service: {error}"
-                )),
-            };
+            return linux_capture_error(
+                DisplayOperationStatus::Unsupported,
+                format!("Failed to invoke GNOME screenshot service: {error}"),
+            );
         }
     };
 
@@ -1234,47 +1223,26 @@ fn linux_gnome_shell_capture_area(display: &LocalDisplayInfo) -> DisplayCaptureR
             DisplayOperationStatus::ApplyFailed
         };
         let _ = std::fs::remove_file(&file_path);
-        return DisplayCaptureResult {
-            status,
-            display_id: display.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(format!("GNOME screenshot capture failed: {stderr}")),
-        };
+        return linux_capture_error(status, format!("GNOME screenshot capture failed: {stderr}"));
     }
 
     match std::fs::read(&file_path) {
         Ok(bytes) => {
             let _ = std::fs::remove_file(&file_path);
-            DisplayCaptureResult {
-                status: DisplayOperationStatus::Success,
-                display_id: display.display_id.clone(),
-                mime_type: Some("image/png".to_string()),
-                width: Some(gnome_screenshot_dimension(
-                    display.width,
-                    display.scale_percent,
-                )),
-                height: Some(gnome_screenshot_dimension(
-                    display.height,
-                    display.scale_percent,
-                )),
+            linux_capture_success(
+                display.display_id.clone(),
+                gnome_screenshot_dimension(display.width, display.scale_percent),
+                gnome_screenshot_dimension(display.height, display.scale_percent),
                 bytes,
-                message: Some("Display screenshot captured".to_string()),
-            }
+                "Display screenshot captured",
+                max_width,
+                format,
+            )
         }
-        Err(error) => DisplayCaptureResult {
-            status: DisplayOperationStatus::ApplyFailed,
-            display_id: display.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(format!(
-                "GNOME screenshot service did not write capture: {error}"
-            )),
-        },
+        Err(error) => linux_capture_error(
+            DisplayOperationStatus::ApplyFailed,
+            format!("GNOME screenshot service did not write capture: {error}"),
+        ),
     }
 }
 
@@ -1283,6 +1251,7 @@ fn linux_portal_capture_display_via_screencast(
     display: &LocalDisplayInfo,
     previous_error: Option<&str>,
     max_width: Option<u32>,
+    format: DisplayCaptureFormat,
 ) -> DisplayCaptureResult {
     use std::process::Command;
 
@@ -1325,59 +1294,36 @@ fn linux_portal_capture_display_via_screencast(
             message.push_str(" GNOME Shell capture failed first: ");
             message.push_str(previous_error);
         }
-        return DisplayCaptureResult {
-            status,
-            display_id: display.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(message),
-        };
+        return linux_capture_error(status, message);
     }
 
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
-        return DisplayCaptureResult {
-            status: DisplayOperationStatus::ApplyFailed,
-            display_id: display.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(
-                "xdg-desktop-portal ScreenCast helper returned no capture path".to_string(),
-            ),
-        };
+        return linux_capture_error(
+            DisplayOperationStatus::ApplyFailed,
+            "xdg-desktop-portal ScreenCast helper returned no capture path",
+        );
     }
 
     match std::fs::read(&path) {
         Ok(bytes) => {
             let _ = std::fs::remove_file(&path);
             let dimensions = png_dimensions(&bytes);
-            DisplayCaptureResult {
-                status: DisplayOperationStatus::Success,
-                display_id: display.display_id.clone(),
-                mime_type: Some("image/png".to_string()),
-                width: dimensions.map(|(width, _)| width),
-                height: dimensions.map(|(_, height)| height),
+            let (width, height) = dimensions.unwrap_or((display.width, display.height));
+            linux_capture_success(
+                display.display_id.clone(),
+                width,
+                height,
                 bytes,
-                message: Some(
-                    "Display texture captured via xdg-desktop-portal ScreenCast".to_string(),
-                ),
-            }
+                "Display texture captured via xdg-desktop-portal ScreenCast",
+                max_width,
+                format,
+            )
         }
-        Err(error) => DisplayCaptureResult {
-            status: DisplayOperationStatus::ApplyFailed,
-            display_id: display.display_id.clone(),
-            mime_type: None,
-            width: None,
-            height: None,
-            bytes: Vec::new(),
-            message: Some(format!(
-                "ScreenCast capture file could not be read: {error}"
-            )),
-        },
+        Err(error) => linux_capture_error(
+            DisplayOperationStatus::ApplyFailed,
+            format!("ScreenCast capture file could not be read: {error}"),
+        ),
     }
 }
 
@@ -1397,15 +1343,90 @@ fn linux_wayland_capture_requires_screencast(
         message.push_str(previous_error);
     }
 
-    DisplayCaptureResult {
-        status: DisplayOperationStatus::PermissionDenied,
-        display_id: display.display_id.clone(),
-        mime_type: None,
-        width: None,
-        height: None,
-        bytes: Vec::new(),
-        message: Some(message),
+    linux_capture_error(DisplayOperationStatus::PermissionDenied, message)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_capture_success(
+    display_id: String,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+    message: impl Into<String>,
+    max_width: Option<u32>,
+    format: DisplayCaptureFormat,
+) -> DisplayCaptureResult {
+    let needs_resize = max_width.is_some_and(|max_width| width > max_width);
+    if format == DisplayCaptureFormat::Png && !needs_resize {
+        return crate::display_capture::success(
+            display_id,
+            "image/png",
+            width,
+            height,
+            Bytes::from(bytes),
+            message,
+        );
     }
+
+    let decoded = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return linux_capture_error(
+                DisplayOperationStatus::ApplyFailed,
+                format!("failed to decode PNG preview: {error}"),
+            )
+        }
+    };
+    let image = if let Some(max_width) = max_width.filter(|max_width| width > *max_width) {
+        decoded.thumbnail(max_width, height)
+    } else {
+        decoded
+    };
+    let encoded_width = image.width();
+    let encoded_height = image.height();
+    let mut bgra = image.to_rgba8().into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let (encoding, mime_type) = match format {
+        DisplayCaptureFormat::Png => (
+            crate::display_capture::DisplayCaptureEncoding::Png,
+            "image/png",
+        ),
+        DisplayCaptureFormat::Jpeg => (
+            crate::display_capture::DisplayCaptureEncoding::Jpeg { quality: 85 },
+            "image/jpeg",
+        ),
+    };
+    match crate::display_capture::encode_bgra(
+        crate::display_capture::RawBgraFrame {
+            width: encoded_width,
+            height: encoded_height,
+            pixels: bgra,
+        },
+        encoding,
+    ) {
+        Ok(bytes) => crate::display_capture::success(
+            display_id,
+            mime_type,
+            encoded_width,
+            encoded_height,
+            bytes,
+            message,
+        ),
+        Err(error) => linux_capture_error(
+            DisplayOperationStatus::ApplyFailed,
+            format!("failed to encode compressed preview: {error}"),
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_capture_error(
+    status: DisplayOperationStatus,
+    message: impl Into<String>,
+) -> DisplayCaptureResult {
+    crate::display_capture::error(status, message)
 }
 
 #[cfg(target_os = "linux")]
@@ -1670,16 +1691,8 @@ pub fn get_dpi_scaling() -> f64 {
 }
 
 #[cfg(any(all(not(windows), not(target_os = "linux")), test))]
-fn unsupported_capture(display_id: &str, message: impl Into<String>) -> DisplayCaptureResult {
-    DisplayCaptureResult {
-        status: DisplayOperationStatus::Unsupported,
-        display_id: display_id.to_string(),
-        mime_type: None,
-        width: None,
-        height: None,
-        bytes: Vec::new(),
-        message: Some(message.into()),
-    }
+fn unsupported_capture(_display_id: &str, message: impl Into<String>) -> DisplayCaptureResult {
+    crate::display_capture::error(DisplayOperationStatus::Unsupported, message)
 }
 
 pub(crate) fn fit_thumbnail_size(width: u32, height: u32, max_width: u32) -> (u32, u32) {
@@ -1719,12 +1732,12 @@ mod tests {
     use rshare_core::DisplayOperationStatus;
 
     #[test]
-    fn unsupported_capture_result_names_display() {
+    fn unsupported_capture_result_has_no_binary_payload() {
         let result = unsupported_capture("display-1", "not implemented");
 
         assert_eq!(result.status, DisplayOperationStatus::Unsupported);
-        assert_eq!(result.display_id, "display-1");
-        assert!(result.bytes.is_empty());
+        assert!(result.payload.is_none());
+        assert!(result.blob.is_none());
     }
 
     #[test]

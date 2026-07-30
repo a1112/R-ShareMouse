@@ -14,13 +14,14 @@ use tokio_tungstenite::{
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_frame, read_optional_ui_state_frame,
     write_json_frame, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
-    DisplayIdentifyResult, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
-    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
-    EndpointInjectTarget, LayoutGraph, LocalControlDeviceSnapshot, LocalInputTestRequest,
-    LocalInputTestResult, MobileAccessSnapshot, ServiceStatusSnapshot, UiCursor, UiEnvelope,
-    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
-    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    DaemonResponse, DeviceId, DisplayCaptureBlob, DisplayCaptureRequest, DisplayCaptureResult,
+    DisplayIdentifyRequest, DisplayIdentifyResult, DisplaySettingsUpdateRequest,
+    DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter, EndpointInjectRequest,
+    EndpointInjectResult, EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, MobileAccessSnapshot,
+    ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult, UsbDeviceDescriptor,
+    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
+    VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -204,8 +205,31 @@ pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
 pub async fn request_display_capture(
     request: DisplayCaptureRequest,
 ) -> Result<DisplayCaptureResult> {
-    match send_request(DaemonRequest::CaptureDisplay(request)).await? {
-        DaemonResponse::DisplayCapture(result) => Ok(result),
+    let mut stream = TcpStream::connect(default_ipc_addr())
+        .await
+        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    write_json_frame(&mut stream, &DaemonRequest::CaptureDisplay(request)).await?;
+    match read_json_frame(&mut stream).await? {
+        DaemonResponse::DisplayCapture(mut result) => {
+            match (&result.status, result.payload.clone()) {
+                (crate::DisplayOperationStatus::Success, Some(descriptor)) => {
+                    let frame = IpcFrameCodec::default()
+                        .read_frame_for_kind(&mut stream, IpcEnvelopeKind::Binary)
+                        .await?
+                        .context("daemon closed before display capture binary frame")?;
+                    let bytes = crate::decode_display_capture_binary(&descriptor, frame.payload)?;
+                    result.blob = Some(DisplayCaptureBlob { descriptor, bytes });
+                }
+                (crate::DisplayOperationStatus::Success, None) => {
+                    anyhow::bail!("daemon returned successful display capture without metadata")
+                }
+                (_, Some(_)) => {
+                    anyhow::bail!("daemon returned failed display capture with metadata")
+                }
+                (_, None) => {}
+            }
+            Ok(result)
+        }
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

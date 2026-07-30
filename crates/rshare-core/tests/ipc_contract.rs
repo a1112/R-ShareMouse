@@ -27,6 +27,91 @@ use tokio::io::{duplex, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
 
+#[test]
+fn display_capture_binary_is_correlated_and_length_checked() {
+    let descriptor = rshare_core::DisplayCaptureDescriptor {
+        capture_id: Uuid::from_u128(0x00112233445566778899aabbccddeeff),
+        display_id: "display-1".to_string(),
+        mime_type: "image/png".to_string(),
+        width: 900,
+        height: 506,
+        byte_length: 4,
+    };
+    let body = rshare_core::encode_display_capture_binary(
+        &descriptor,
+        bytes::Bytes::from_static(&[137, 80, 78, 71]),
+    )
+    .unwrap();
+    let decoded = rshare_core::decode_display_capture_binary(&descriptor, body.clone()).unwrap();
+    assert_eq!(&decoded[..], &[137, 80, 78, 71]);
+
+    let mut wrong_id = rshare_core::encode_display_capture_binary(
+        &descriptor,
+        bytes::Bytes::from_static(&[137, 80, 78, 71]),
+    )
+    .unwrap()
+    .to_vec();
+    wrong_id[0] ^= 0xff;
+    assert!(
+        rshare_core::decode_display_capture_binary(&descriptor, bytes::Bytes::from(wrong_id))
+            .is_err()
+    );
+
+    let mut wrong_length = descriptor.clone();
+    wrong_length.byte_length += 1;
+    assert!(rshare_core::decode_display_capture_binary(&wrong_length, body).is_err());
+}
+
+#[test]
+fn display_capture_response_serializes_metadata_then_binary_without_json_bytes() {
+    let descriptor = rshare_core::DisplayCaptureDescriptor {
+        capture_id: Uuid::from_u128(0x00112233445566778899aabbccddeeff),
+        display_id: "display-1".to_string(),
+        mime_type: "image/png".to_string(),
+        width: 900,
+        height: 506,
+        byte_length: 4,
+    };
+    let result = DisplayCaptureResult {
+        request_id: Uuid::from_u128(7),
+        status: DisplayOperationStatus::Success,
+        message: None,
+        payload: Some(descriptor.clone()),
+        blob: Some(rshare_core::DisplayCaptureBlob {
+            descriptor,
+            bytes: bytes::Bytes::from_static(&[137, 80, 78, 71]),
+        }),
+    };
+    let response = rshare_core::encode_display_capture_response(&result).unwrap();
+    let json_len = u32::from_be_bytes(response[..4].try_into().unwrap()) as usize;
+    assert_eq!(response[4], rshare_core::IpcEnvelopeKind::Json as u8);
+    let json = &response[5..5 + json_len];
+    let value: serde_json::Value = serde_json::from_slice(json).unwrap();
+    assert!(value.get("bytes").is_none());
+    assert!(value.get("blob").is_none());
+    assert_eq!(value["payload"]["byte_length"], 4);
+
+    let binary_offset = 5 + json_len;
+    assert_eq!(
+        response[binary_offset + 4],
+        rshare_core::IpcEnvelopeKind::Binary as u8
+    );
+    let binary_len = u32::from_be_bytes(
+        response[binary_offset..binary_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(binary_len, 20);
+    assert_eq!(
+        &response[binary_offset + 5..binary_offset + 21],
+        Uuid::from_u128(0x00112233445566778899aabbccddeeff).as_bytes()
+    );
+
+    let mut invalid_error = result;
+    invalid_error.status = DisplayOperationStatus::ApplyFailed;
+    assert!(rshare_core::encode_display_capture_response(&invalid_error).is_err());
+}
+
 #[tokio::test]
 async fn ui_state_envelopes_round_trip_over_typed_frames() {
     let (mut writer, mut reader) = duplex(4096);
@@ -214,6 +299,7 @@ async fn ipc_contract_display_operation_requests_round_trip_over_json_frames() {
         DaemonRequest::CaptureDisplay(DisplayCaptureRequest {
             display_id: "primary".to_string(),
             max_width: Some(480),
+            format: rshare_core::DisplayCaptureFormat::Png,
         }),
         DaemonRequest::IdentifyDisplays(DisplayIdentifyRequest {
             duration_ms: Some(2500),
@@ -245,13 +331,18 @@ async fn ipc_contract_display_operation_requests_round_trip_over_json_frames() {
 async fn ipc_contract_display_operation_responses_round_trip_over_json_frames() {
     let responses = [
         DaemonResponse::DisplayCapture(DisplayCaptureResult {
+            request_id: Uuid::from_u128(1),
             status: DisplayOperationStatus::Success,
-            display_id: "primary".to_string(),
-            mime_type: Some("image/png".to_string()),
-            width: Some(480),
-            height: Some(270),
-            bytes: vec![137, 80, 78, 71],
             message: None,
+            payload: Some(rshare_core::DisplayCaptureDescriptor {
+                capture_id: Uuid::from_u128(2),
+                display_id: "primary".to_string(),
+                mime_type: "image/png".to_string(),
+                width: 480,
+                height: 270,
+                byte_length: 4,
+            }),
+            blob: None,
         }),
         DaemonResponse::DisplayIdentify(DisplayIdentifyResult {
             status: DisplayOperationStatus::Success,

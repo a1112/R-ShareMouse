@@ -1,7 +1,9 @@
 //! Local control-device diagnostics exposed to desktop clients.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 use crate::{
     BackendHealth, BackendKind, DeviceId, GamepadButtonState, GamepadState, PrivilegeState,
@@ -626,23 +628,43 @@ pub struct DisplayCaptureRequest {
     pub display_id: String,
     #[serde(default)]
     pub max_width: Option<u32>,
+    #[serde(default)]
+    pub format: DisplayCaptureFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayCaptureFormat {
+    #[default]
+    Png,
+    Jpeg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayCaptureResult {
+    pub request_id: Uuid,
     pub status: DisplayOperationStatus,
     #[serde(default)]
-    pub display_id: String,
-    #[serde(default)]
-    pub mime_type: Option<String>,
-    #[serde(default)]
-    pub width: Option<u32>,
-    #[serde(default)]
-    pub height: Option<u32>,
-    #[serde(default)]
-    pub bytes: Vec<u8>,
-    #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub payload: Option<DisplayCaptureDescriptor>,
+    #[serde(skip)]
+    pub blob: Option<DisplayCaptureBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayCaptureDescriptor {
+    pub capture_id: Uuid,
+    pub display_id: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayCaptureBlob {
+    pub descriptor: DisplayCaptureDescriptor,
+    pub bytes: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
