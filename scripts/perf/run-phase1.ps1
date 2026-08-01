@@ -125,8 +125,18 @@ function Invoke-LoggedCommand {
     )
 
     Write-Host ">> $FilePath $($Arguments -join ' ')"
-    & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $LogPath
-    $exitCode = $LASTEXITCODE
+    # PowerShell 5 surfaces native stderr as ErrorRecord objects. Cargo writes
+    # normal progress to stderr, so keep native output non-terminating and
+    # decide success exclusively from the process exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $LogPath
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($exitCode -ne 0) {
         throw "$FilePath failed with exit code $exitCode; see $LogPath"
     }
