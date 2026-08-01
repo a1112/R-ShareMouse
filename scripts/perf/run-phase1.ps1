@@ -17,6 +17,14 @@ $ErrorActionPreference = 'Stop'
 $RunCount = 5
 $IpcRequestsPerConnection = 5000
 $IpcComparativeMetrics = @('median_us', 'p95_us', 'p99_us')
+$UiComparativeMetrics = @(
+    'paint_p50_ms',
+    'paint_p95_ms',
+    'paint_p99_ms',
+    'topology_status_p50_ms',
+    'topology_status_p95_ms',
+    'topology_status_p99_ms'
+)
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $phase1BatchId = [Guid]::NewGuid().ToString('D')
@@ -633,16 +641,7 @@ function Get-UiBatchVariation {
     param([Parameter(Mandatory = $true)][object[]]$RunReports)
 
     $variation = [ordered]@{}
-    foreach ($metric in @(
-        'paint_p50_ms',
-        'paint_p95_ms',
-        'paint_p99_ms',
-        'paint_max_ms',
-        'topology_status_p50_ms',
-        'topology_status_p95_ms',
-        'topology_status_p99_ms',
-        'topology_status_max_ms'
-    )) {
+    foreach ($metric in $UiComparativeMetrics) {
         $available = @($RunReports | Where-Object {
             $_.PSObject.Properties.Name -contains $metric -or
             ($_.PSObject.Properties.Name -contains 'metrics' -and $_.metrics.PSObject.Properties.Name -contains $metric)
@@ -705,22 +704,22 @@ function Assert-UiReport {
         [int]$Report.environment.viewport.height -ne 900) {
         throw "UI run $ExpectedRunIndex did not record the required browser execution environment"
     }
-    if ([int]$Report.pointer_deltas_sent -ne 10000 -or
-        [int]$Report.discrete_transitions_sent -ne 100 -or
-        [int]$Report.discrete_transitions_applied -ne 100 -or
-        [int]$Report.discrete_paint_sample_count -ne 100 -or
+    if ([int]$Report.pointer_deltas_sent -ne 30000 -or
+        [int]$Report.discrete_transitions_sent -ne 300 -or
+        [int]$Report.discrete_transitions_applied -ne 300 -or
+        [int]$Report.discrete_paint_sample_count -ne 300 -or
         [string]$Report.final_discrete_state -ne 'Released') {
         throw "UI run $ExpectedRunIndex did not apply the complete ordered input stream"
     }
-    if ([int]$Report.paint_sample_count -lt 300) {
-        throw "UI run $ExpectedRunIndex produced fewer than 300 applied-event paint samples"
+    if ([int]$Report.paint_sample_count -lt 900) {
+        throw "UI run $ExpectedRunIndex produced fewer than 900 applied-event paint samples"
     }
-    if ([int]$Report.topology_status_sample_count -ne 100) {
-        throw "UI run $ExpectedRunIndex did not paint all 100 topology/status transitions"
+    if ([int]$Report.topology_status_sample_count -ne 300) {
+        throw "UI run $ExpectedRunIndex did not paint all 300 topology/status transitions"
     }
     if (@($Report.paint_samples_ms).Count -ne [int]$Report.paint_sample_count -or
-        @($Report.discrete_paint_samples_ms).Count -ne 100 -or
-        @($Report.topology_status_samples_ms).Count -ne 100) {
+        @($Report.discrete_paint_samples_ms).Count -ne 300 -or
+        @($Report.topology_status_samples_ms).Count -ne 300) {
         throw "UI run $ExpectedRunIndex did not preserve recomputable raw paint samples"
     }
     if ((Get-UiMetric -Report $Report -Name 'paint_p95_ms') -gt 16.7) {
@@ -1052,11 +1051,9 @@ try {
     Add-Artifact -Kind 'ipc-candidate' -Path $ipcCandidatePath -RunIndex 0
 
     $uiMetricNames = @(
-        'paint_max_ms',
         'paint_p50_ms',
         'paint_p95_ms',
         'paint_p99_ms',
-        'topology_status_max_ms',
         'topology_status_p50_ms',
         'topology_status_p95_ms',
         'topology_status_p99_ms'
@@ -1095,10 +1092,11 @@ try {
         }
     }
     $uiScenarioParameters = [ordered]@{
-        discrete_transitions = 100
-        duration_ms = 10000
+        discrete_transitions = 300
+        duration_ms = 30000
         pointer_hz = 1000
-        topology_status_transitions = 100
+        topology_status_transitions = 300
+        warmup_duration_ms = 2000
         environment = $uiEnvironment
         package_lock_sha256 = Get-Sha256File -Path (Join-Path $repositoryRoot 'apps\rshare-desktop-frontend\package-lock.json')
         playwright_config_sha256 = Get-Sha256File -Path (Join-Path $repositoryRoot 'apps\rshare-desktop-frontend\playwright.perf.config.mjs')

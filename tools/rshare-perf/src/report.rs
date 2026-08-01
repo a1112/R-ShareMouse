@@ -203,11 +203,9 @@ impl ScenarioContract {
                     ("paint_p50_ms", MetricDirection::LowerIsBetter),
                     ("paint_p95_ms", MetricDirection::LowerIsBetter),
                     ("paint_p99_ms", MetricDirection::LowerIsBetter),
-                    ("paint_max_ms", MetricDirection::LowerIsBetter),
                     ("topology_status_p50_ms", MetricDirection::LowerIsBetter),
                     ("topology_status_p95_ms", MetricDirection::LowerIsBetter),
                     ("topology_status_p99_ms", MetricDirection::LowerIsBetter),
-                    ("topology_status_max_ms", MetricDirection::LowerIsBetter),
                 ],
                 vec!["rshare-desktop-frontend"],
             ),
@@ -931,6 +929,8 @@ mod tests {
         assert_eq!(ui.binary_roles, vec!["rshare-desktop-frontend"]);
         assert!(ui.metrics.contains(&"paint_p99_ms".into()));
         assert!(ui.metrics.contains(&"topology_status_p99_ms".into()));
+        assert!(!ui.metrics.contains(&"paint_max_ms".into()));
+        assert!(!ui.metrics.contains(&"topology_status_max_ms".into()));
         assert!(ScenarioContract::for_scenario("unknown").is_err());
     }
 

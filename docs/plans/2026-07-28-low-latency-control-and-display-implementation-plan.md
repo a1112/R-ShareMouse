@@ -2854,8 +2854,8 @@ git commit -m "perf: stream compressed display previews as binary"
 
 **Step 1: Write a failing UI performance scenario**
 
-The Playwright scenario must feed 1000 Hz pointer deltas for ten seconds plus
-100 discrete transitions and record real React committed-paint observations
+The Playwright scenario must feed 1000 Hz pointer deltas for thirty seconds plus
+300 discrete transitions and record real React committed-paint observations
 from a passive effect:
 
 - event-to-paint p50/p95/p99/max;
@@ -2894,7 +2894,7 @@ Add `@playwright/test = "1.55.0"` as a dev dependency and a `test:perf` script u
 1. set a caller-selected output directory;
 2. run all Rust correctness suites with `--locked`;
 3. run QUIC 1000 Hz, slow/fast peer, and IPC harnesses as one exactly-five-run batch; the fixed Phase 1 IPC gate uses 5000 requests per persistent connection so p99 is based on enough tail samples, while `max_us` is retained as catastrophe evidence but excluded from comparative CV;
-4. run the UI Playwright scenario as one exactly-five-run batch;
+4. run the UI Playwright scenario as one exactly-five-run batch, warming each fresh browser for 2 seconds before measuring 30 seconds of pointer input plus 300 discrete and 300 topology/status transitions; compare UI p50/p95/p99 while retaining per-run maxima as raw diagnostic evidence rather than cross-run CV metrics;
 5. write every raw JSON plus the per-run latency samples and a combined summary with one batch id and the reproducibility fields from Task 2;
 6. require a reviewed matching-runner baseline resolved and hash-verified through `perf/baselines/manifest.toml`, then compare through `rshare-perf compare --baseline-id ...`;
 7. return nonzero on correctness loss, queue-bound violation, or threshold failure.

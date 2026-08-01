@@ -80,6 +80,15 @@ the 10% CV policy. IPC `max_us` remains preserved in raw evidence and guarded by
 the catastrophe limits, but it is not a baseline-comparative metric and does not
 participate in the batch CV decision.
 
+Every fresh fixed-runner Chromium process performs a 2-second pointer/discrete
+input warmup plus 20 topology/status transitions before the measured 30-second
+UI stream. The measured run applies 300 discrete and 300 topology/status
+transitions, so p99 is supported by multiple tail samples instead of collapsing
+to the single maximum.
+UI p50/p95/p99 values are comparative metrics. Per-run paint and topology/status
+maxima remain in raw evidence for diagnosis, but are not cross-run comparative
+metrics because a single scheduler interruption would make max CV non-repeatable.
+
 ## Reviewed baseline authority
 
 Strict mode resolves a matching scenario/configuration and runner fingerprint
@@ -185,7 +194,7 @@ Playwright-config identity are bound into the scenario configuration. The
 browser environment also binds the Windows version/release, `NODE_OPTIONS`,
 and WebGL vendor/renderer so GPU or runtime drift changes the configuration
 identity. The gate
-also requires all 100 discrete transitions to be applied in
+also requires all 300 discrete transitions to be applied in
 order, the final state to be released, a minimum frame-sample count, zero
 topology-projection commits during the pointer flood, and zero long tasks over
 50 ms.

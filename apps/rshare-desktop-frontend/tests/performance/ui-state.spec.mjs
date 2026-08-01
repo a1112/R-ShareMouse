@@ -255,6 +255,7 @@ async function installHarness(page) {
       discretePaintSamples: [],
       lastDiscretePaintSequence: 0,
       lastDiscreteSequence: 0,
+      nextDiscreteSequence: 0,
       finalDiscreteState: null,
       longTasks: 0,
       topologyStatusActive: false,
@@ -356,7 +357,10 @@ async function runStreamScenario(page, {
       perf.lastPointerObservedAt = null;
       perf.inputCommits = 0;
       perf.discreteApplied = 0;
-      perf.lastDiscreteSequence = 0;
+      perf.discretePaintSamples.length = 0;
+      const discreteSequenceBase = perf.nextDiscreteSequence;
+      perf.lastDiscretePaintSequence = discreteSequenceBase;
+      perf.lastDiscreteSequence = discreteSequenceBase;
       perf.finalDiscreteState = null;
       perf.longTasks = 0;
       reactPerf.reactCommits = 0;
@@ -369,7 +373,7 @@ async function runStreamScenario(page, {
       const ticks = Math.ceil(durationMs / tickMs);
       let pointerDeltasSent = 0;
       let discreteTransitionsSent = 0;
-      let revision = 0;
+      let revision = window.__rsharePerfStoreAccess.store.currentRevision();
       const startedAt = performance.now();
 
       for (let tick = 0; tick < ticks; tick += 1) {
@@ -418,7 +422,8 @@ async function runStreamScenario(page, {
                   key_code: 42,
                   state:
                     discreteTransitionsSent % 2 === 0 ? "Pressed" : "Released",
-                  perf_sequence: discreteTransitionsSent + 1,
+                  perf_sequence:
+                    discreteSequenceBase + discreteTransitionsSent + 1,
                   observed_at_ms: Math.floor(performance.now()),
                 },
               },
@@ -442,6 +447,8 @@ async function runStreamScenario(page, {
       ).length;
       perf.active = false;
       reactPerf.active = false;
+      perf.nextDiscreteSequence =
+        discreteSequenceBase + discreteTransitionsSent;
 
       const samples = [...perf.paintSamples].sort((left, right) => left - right);
       const percentile = (fraction) => {
@@ -585,6 +592,14 @@ async function recordReport(testInfo, metrics) {
 async function executeScenario(page, browser, testInfo, options) {
   const harness = await installHarness(page);
   try {
+    if ((options.warmupDurationMs ?? 0) > 0) {
+      await runStreamScenario(page, {
+        durationMs: options.warmupDurationMs,
+        pointerHz: options.pointerHz,
+        discreteTransitions: 20,
+      });
+      await runTopologyStatusScenario(page, 20);
+    }
     harness.startRequestCounting();
     const pointerMetrics = await runStreamScenario(page, options);
     const topologyStatusMetrics = await runTopologyStatusScenario(
@@ -658,23 +673,24 @@ test("1000 Hz pointer flood and discrete transitions meet the UI gate @fixed-run
   browser,
 }, testInfo) => {
   const report = await executeScenario(page, browser, testInfo, {
-    durationMs: 10_000,
+    durationMs: 30_000,
+    warmupDurationMs: 2_000,
     pointerHz: 1_000,
-    discreteTransitions: 100,
-    topologyStatusTransitions: 100,
+    discreteTransitions: 300,
+    topologyStatusTransitions: 300,
   });
 
-  expect(report.pointer_deltas_sent).toBe(10_000);
-  expect(report.discrete_transitions_sent).toBe(100);
-  expect(report.discrete_transitions_applied).toBe(100);
-  expect(report.discrete_paint_sample_count).toBe(100);
+  expect(report.pointer_deltas_sent).toBe(30_000);
+  expect(report.discrete_transitions_sent).toBe(300);
+  expect(report.discrete_transitions_applied).toBe(300);
+  expect(report.discrete_paint_sample_count).toBe(300);
   expect(report.final_discrete_state).toBe("Released");
-  expect(report.paint_sample_count).toBeGreaterThanOrEqual(300);
+  expect(report.paint_sample_count).toBeGreaterThanOrEqual(900);
   expect(report.topology_commit_probe_mounts).toBeGreaterThan(0);
   expect(report.paint_p95_ms).toBeLessThanOrEqual(16.7);
   expect(report.paint_p99_ms).toBeLessThanOrEqual(33);
   expect(report.topology_commits_during_pointer_flood).toBe(0);
-  expect(report.topology_status_sample_count).toBe(100);
+  expect(report.topology_status_sample_count).toBe(300);
   expect(report.topology_status_p95_ms).toBeLessThanOrEqual(50);
   expect(report.topology_status_p99_ms).toBeLessThanOrEqual(100);
   expect(report.long_tasks_over_50ms).toBe(0);
