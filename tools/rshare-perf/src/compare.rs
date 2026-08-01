@@ -175,7 +175,8 @@ pub fn compare(
         let baseline_median = median(&baseline_values);
         let candidate_median = median(&candidate_values);
         let baseline_cv = coefficient_of_variation(&baseline_values);
-        if baseline_cv > policy.cv_limit {
+        let bounded_correctness_metric = metric == "stall_recovery_us";
+        if !bounded_correctness_metric && baseline_cv > policy.cv_limit {
             return Err(CompareError::UnstableBaseline {
                 metric: metric.clone(),
                 actual: baseline_cv,
@@ -183,7 +184,7 @@ pub fn compare(
             });
         }
         let candidate_cv = coefficient_of_variation(&candidate_values);
-        unstable |= candidate_cv > policy.cv_limit;
+        unstable |= !bounded_correctness_metric && candidate_cv > policy.cv_limit;
         let direction = contract
             .metric_directions
             .get(&metric)
@@ -196,27 +197,31 @@ pub fn compare(
         } else {
             policy.median_regression_limit
         };
-        let regression = match direction {
-            MetricDirection::LowerIsBetter => {
-                if baseline_median == 0.0 {
-                    if candidate_median == 0.0 {
-                        0.0
-                    } else {
-                        f64::INFINITY
-                    }
-                } else {
-                    candidate_median / baseline_median - 1.0
-                }
-            }
-            MetricDirection::HigherIsBetter => {
-                if candidate_median == 0.0 {
+        let regression = if bounded_correctness_metric {
+            0.0
+        } else {
+            match direction {
+                MetricDirection::LowerIsBetter => {
                     if baseline_median == 0.0 {
-                        0.0
+                        if candidate_median == 0.0 {
+                            0.0
+                        } else {
+                            f64::INFINITY
+                        }
                     } else {
-                        f64::INFINITY
+                        candidate_median / baseline_median - 1.0
                     }
-                } else {
-                    baseline_median / candidate_median - 1.0
+                }
+                MetricDirection::HigherIsBetter => {
+                    if candidate_median == 0.0 {
+                        if baseline_median == 0.0 {
+                            0.0
+                        } else {
+                            f64::INFINITY
+                        }
+                    } else {
+                        baseline_median / candidate_median - 1.0
+                    }
                 }
             }
         };

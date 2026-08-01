@@ -277,6 +277,12 @@ fn batch_is_unstable(runs: &[PerfRun]) -> bool {
         return true;
     };
     first.metrics.keys().any(|metric| {
+        // Stall recovery is a bounded correctness metric: every run must
+        // recover within 20 ms. Near-zero measurements (typically 1-2 us on
+        // loopback) make CV mathematically noisy and are not baseline trends.
+        if metric == "stall_recovery_us" {
+            return false;
+        }
         let values: Vec<_> = runs
             .iter()
             .filter_map(|run| run.metrics.get(metric).copied())
@@ -1107,6 +1113,8 @@ async fn run_loopback_once_started(
     }
     if stall_ms.is_some() && stall_recovery_us.is_none() {
         errors.push("stall recovery did not reach three consecutive deliveries".into());
+    } else if stall_recovery_us.is_some_and(|recovery| recovery > 20_000.0) {
+        errors.push("stall recovery exceeded the 20 ms correctness bound".into());
     }
     let run = PerfRun {
         run_id: format!("{}-{}", options.batch_id, options.run_index),
@@ -1810,6 +1818,23 @@ mod tests {
             outcome.infrastructure_failure.as_deref(),
             Some("unstable_after_one_complete_retry")
         );
+    }
+
+    #[test]
+    fn near_zero_stall_recovery_is_not_a_cv_baseline_metric() {
+        let recoveries = [1.0, 2.0, 2.0, 2.0, 2.0];
+        let runs = recoveries
+            .into_iter()
+            .enumerate()
+            .map(|(index, recovery)| {
+                let mut run = fixture_run("stall", index, 100.0);
+                run.metrics.insert("stall_recovery_us".into(), recovery);
+                run
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!batch_is_unstable(&runs));
+        assert!(coefficient_of_variation(&recoveries) > 0.10);
     }
 
     fn fixture_run(batch: &str, index: usize, value: f64) -> PerfRun {

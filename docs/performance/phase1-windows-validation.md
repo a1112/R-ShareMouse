@@ -66,10 +66,13 @@ A run is complete only if the process succeeds, the artifact validates, and all
 required metrics and counters are present. Failed, unavailable, unsupported, or
 outlying runs are never removed or selectively replaced.
 
-If any enforced metric has coefficient of variation (CV) above 10%, the runner
-archives the entire unstable five-run batch and repeats the entire five-run
-batch once with the identical configuration. Both batches are retained. A
-second unstable batch fails as infrastructure instability.
+If any comparative latency/rate metric has coefficient of variation (CV) above
+10%, the runner archives the entire unstable five-run batch and repeats the
+entire five-run batch once with the identical configuration. Both batches are
+retained. A second unstable batch fails as infrastructure instability. Stall
+recovery is instead a per-run bounded correctness metric (every run must be at
+or below 20 ms): its normal 1 us timer quantization around a near-zero loopback
+result must not create a meaningless high CV.
 
 ## Reviewed baseline authority
 
