@@ -21,7 +21,10 @@ use rshare_input::{
     ContinuousInput, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle,
     KeyCode, MouseButton as CaptureMouseButton, PointerSample, PushOutcome, SemanticInputIngress,
 };
-use rshare_net::{encryption::PeerCertificateFingerprint, handshake::PeerAuthContext, PeerInbound};
+use rshare_net::{
+    encryption::PeerCertificateFingerprint, handshake::PeerAuthContext, LatestRealtimeReceiver,
+    LatestRealtimeSender, PeerInbound,
+};
 use rshare_platform::SystemSafetyEvent;
 use tokio::sync::{broadcast, mpsc};
 
@@ -1008,7 +1011,7 @@ fn peer(
     connection_id: ControlConnectionId,
 ) -> (
     PeerInbound,
-    mpsc::Sender<RealtimeInputFrame>,
+    LatestRealtimeSender,
     mpsc::Sender<ReliableInputFrame>,
 ) {
     let auth = Arc::new(PeerAuthContext {
@@ -1016,7 +1019,7 @@ fn peer(
         certificate_fingerprint: PeerCertificateFingerprint::from_der(b"test"),
         control_connection_id: connection_id,
     });
-    let (realtime_tx, realtime_rx) = mpsc::channel(4);
+    let (realtime_tx, realtime_rx) = LatestRealtimeReceiver::channel();
     let (reliable_tx, reliable_input_rx) = mpsc::channel(4);
     let (_control_tx, control_rx) = mpsc::channel(1);
     let (_telemetry_tx, telemetry_rx) = mpsc::channel(1);

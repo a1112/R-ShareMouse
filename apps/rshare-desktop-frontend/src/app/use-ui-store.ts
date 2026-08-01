@@ -1,8 +1,32 @@
 import { useCallback, useRef, useSyncExternalStore } from "react";
 
-import { createUiStore } from "./ui-store.mjs";
+import {
+  createUiStore,
+  selectInputVisuals,
+  selectTopologyProjection,
+} from "./ui-store.mjs";
 
 export const uiStateStore = createUiStore();
+
+if (
+  typeof window !== "undefined" &&
+  (window as Window & { __rsharePerfEnableStoreAccess?: boolean })
+    .__rsharePerfEnableStoreAccess
+) {
+  (
+    window as Window & {
+      __rsharePerfStoreAccess?: {
+        store: typeof uiStateStore;
+        selectInputVisuals: typeof selectInputVisuals;
+        selectTopologyProjection: typeof selectTopologyProjection;
+      };
+    }
+  ).__rsharePerfStoreAccess = {
+    store: uiStateStore,
+    selectInputVisuals,
+    selectTopologyProjection,
+  };
+}
 
 export function createUseUiStore(store: typeof uiStateStore) {
   return function useSelectedUiState<T>(

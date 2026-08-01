@@ -1,6 +1,6 @@
 use crate::report::{
-    parse_and_validate_report, Availability, MetricDirection, PerfReport, PerfRun,
-    ScenarioContract, VerdictStatus, PERF_SCHEMA_VERSION, REQUIRED_COUNTERS,
+    parse_and_validate_report, Availability, BatchArtifactReference, MetricDirection, PerfReport,
+    PerfRun, ScenarioContract, VerdictStatus, PERF_SCHEMA_VERSION, REQUIRED_COUNTERS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -113,6 +113,12 @@ pub enum CompareError {
     MissingMetricDirection { metric: String },
     #[error("report is unavailable: {reason}")]
     Unavailable { reason: String },
+    #[error("reviewed baseline metric {metric} has coefficient of variation {actual:.4}, above {limit:.4}")]
+    UnstableBaseline {
+        metric: String,
+        actual: f64,
+        limit: f64,
+    },
 }
 
 pub fn compare(
@@ -168,6 +174,14 @@ pub fn compare(
             .collect();
         let baseline_median = median(&baseline_values);
         let candidate_median = median(&candidate_values);
+        let baseline_cv = coefficient_of_variation(&baseline_values);
+        if baseline_cv > policy.cv_limit {
+            return Err(CompareError::UnstableBaseline {
+                metric: metric.clone(),
+                actual: baseline_cv,
+                limit: policy.cv_limit,
+            });
+        }
         let candidate_cv = coefficient_of_variation(&candidate_values);
         unstable |= candidate_cv > policy.cv_limit;
         let direction = contract
@@ -294,6 +308,13 @@ fn validate_batch_shape(batch: &ReportBatch, policy: ComparisonPolicy) -> Result
                 },
             });
         }
+        if run.raw_samples.is_empty() || run.raw_samples.values().any(|samples| samples.is_empty())
+        {
+            return Err(CompareError::RunIncomplete {
+                run_id: run.run_id.clone(),
+                reason: "run has no raw latency samples".into(),
+            });
+        }
         for counter in REQUIRED_COUNTERS {
             if !run.counters.contains_key(counter) {
                 return Err(CompareError::MissingCounter {
@@ -315,6 +336,17 @@ fn validate_batch_shape(batch: &ReportBatch, policy: ComparisonPolicy) -> Result
                     reason: reason.clone(),
                 });
             }
+        }
+        if report.verdict != VerdictStatus::Pass {
+            return Err(CompareError::Unavailable {
+                reason: format!("strict comparison report verdict is {:?}", report.verdict),
+            });
+        }
+        if report.batch_artifacts.is_empty() {
+            return Err(CompareError::RunIncomplete {
+                run_id: run.run_id.clone(),
+                reason: "strict comparison artifact has no raw batch sidecars".into(),
+            });
         }
         if report.schema_version != PERF_SCHEMA_VERSION {
             return Err(CompareError::BuildMismatch {
@@ -466,6 +498,8 @@ pub struct VerifiedApproval {
     pub pull_request_merged: bool,
     pub approved_by_non_author: bool,
     pub reviewed_diff_contains_entry_and_hash: bool,
+    pub reviewed_artifact_matches_hash: bool,
+    pub github_api_evidence: serde_json::Value,
     pub github_api_evidence_sha256: String,
 }
 
@@ -492,15 +526,20 @@ pub struct GithubApiEvidence {
     pub merge_commit_reachable_from_default: bool,
     pub pr_base_manifest: String,
     pub pr_head_manifest: String,
+    pub pr_head_artifact_sha256: String,
+    pub pr_head_batch_artifact_references: BTreeMap<String, String>,
+    pub pr_head_batch_artifact_sha256: BTreeMap<String, String>,
     pub reviews: Vec<GithubReview>,
     pub changed_files: Vec<GithubChangedFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GithubReview {
+    pub review_id: u64,
     pub reviewer: String,
     pub state: String,
     pub commit_id: String,
+    pub repository_permission: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -512,6 +551,7 @@ pub struct GithubChangedFile {
 impl VerifiedApproval {
     #[cfg(test)]
     fn test_fixture(approval_ref: &str) -> Self {
+        let github_api_evidence = serde_json::json!({ "fixture": true });
         Self {
             approval_ref: approval_ref.into(),
             default_branch_protected: true,
@@ -519,7 +559,12 @@ impl VerifiedApproval {
             pull_request_merged: true,
             approved_by_non_author: true,
             reviewed_diff_contains_entry_and_hash: true,
-            github_api_evidence_sha256: format!("{:x}", Sha256::digest(b"evidence")),
+            reviewed_artifact_matches_hash: true,
+            github_api_evidence_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&github_api_evidence).unwrap())
+            ),
+            github_api_evidence,
         }
     }
 
@@ -530,7 +575,11 @@ impl VerifiedApproval {
             && self.pull_request_merged
             && self.approved_by_non_author
             && self.reviewed_diff_contains_entry_and_hash
+            && self.reviewed_artifact_matches_hash
             && is_sha256(&self.github_api_evidence_sha256)
+            && serde_json::to_vec(&self.github_api_evidence)
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                .is_ok_and(|actual| actual == self.github_api_evidence_sha256)
     }
 }
 
@@ -566,6 +615,7 @@ pub fn validate_github_trust(
     local_manifest: &[u8],
     evidence: &GithubApiEvidence,
 ) -> Result<VerifiedApproval, BaselineError> {
+    validate_entry(entry, true)?;
     let (approval_repository, approval_number) = parse_approval_ref(&entry.approval_ref)
         .ok_or_else(|| BaselineError::GitHubVerification("invalid approval_ref".into()))?;
     if approval_repository != policy.expected_repository
@@ -614,10 +664,25 @@ pub fn validate_github_trust(
             "pull request base/head commits are malformed or identical".into(),
         ));
     }
-    let approved_head = evidence.reviews.iter().any(|review| {
+    let mut latest_reviews = BTreeMap::<&str, &GithubReview>::new();
+    for review in &evidence.reviews {
+        latest_reviews
+            .entry(&review.reviewer)
+            .and_modify(|latest| {
+                if review.review_id > latest.review_id {
+                    *latest = review;
+                }
+            })
+            .or_insert(review);
+    }
+    let approved_head = latest_reviews.values().any(|review| {
         review.state == "APPROVED"
             && review.reviewer != evidence.pull_request_author
             && review.commit_id == evidence.pull_request_head_sha
+            && matches!(
+                review.repository_permission.as_str(),
+                "write" | "maintain" | "admin"
+            )
     });
     if !approved_head {
         return Err(BaselineError::GitHubVerification(
@@ -631,6 +696,33 @@ pub fn validate_github_trust(
     {
         return Err(BaselineError::GitHubVerification(
             "pull request did not change the protected manifest".into(),
+        ));
+    }
+    if evidence.pr_head_batch_artifact_references != evidence.pr_head_batch_artifact_sha256
+        || evidence
+            .pr_head_batch_artifact_references
+            .iter()
+            .any(|(path, hash)| {
+                !is_sha256(hash)
+                    || !evidence
+                        .changed_files
+                        .iter()
+                        .any(|file| file.filename == *path)
+            })
+    {
+        return Err(BaselineError::GitHubVerification(
+            "approved pull request head does not bind every referenced batch sidecar".into(),
+        ));
+    }
+    if !evidence
+        .changed_files
+        .iter()
+        .any(|file| file.filename == entry.artifact_path)
+        || evidence.pr_head_artifact_sha256 != entry.artifact_sha256
+    {
+        return Err(BaselineError::GitHubVerification(
+            "approved pull request head does not contain the reviewed baseline artifact hash"
+                .into(),
         ));
     }
     let head_manifest: BaselineManifest = toml::from_str(&evidence.pr_head_manifest)
@@ -655,7 +747,9 @@ pub fn validate_github_trust(
             "exact manifest entry already existed at the pull request base".into(),
         ));
     }
-    let evidence_bytes = serde_json::to_vec(evidence)
+    let github_api_evidence = serde_json::to_value(evidence)
+        .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+    let evidence_bytes = serde_json::to_vec(&github_api_evidence)
         .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
     Ok(VerifiedApproval {
         approval_ref: entry.approval_ref.clone(),
@@ -664,6 +758,8 @@ pub fn validate_github_trust(
         pull_request_merged: true,
         approved_by_non_author: true,
         reviewed_diff_contains_entry_and_hash: true,
+        reviewed_artifact_matches_hash: true,
+        github_api_evidence,
         github_api_evidence_sha256: format!("{:x}", Sha256::digest(evidence_bytes)),
     })
 }
@@ -673,6 +769,7 @@ pub fn verify_github_approval(
     manifest_path: &Path,
     expected_repository: &str,
 ) -> Result<VerifiedApproval, BaselineError> {
+    validate_entry(entry, true)?;
     let (approval_repository, number) = parse_approval_ref(&entry.approval_ref)
         .ok_or_else(|| BaselineError::GitHubVerification("invalid approval_ref".into()))?;
     if approval_repository != expected_repository {
@@ -735,16 +832,38 @@ pub fn verify_github_approval(
         &format!("repos/{repository}/pulls/{number}/reviews?per_page=100"),
         "pull request reviews",
     )?;
-    let reviews = reviews_value
-        .iter()
-        .filter_map(|review| {
-            Some(GithubReview {
-                reviewer: review["user"]["login"].as_str()?.into(),
-                state: review["state"].as_str()?.into(),
-                commit_id: review["commit_id"].as_str()?.into(),
-            })
-        })
-        .collect();
+    let mut reviews = Vec::new();
+    for review in &reviews_value {
+        let Some(reviewer) = review["user"]["login"].as_str() else {
+            continue;
+        };
+        let Some(state) = review["state"].as_str() else {
+            continue;
+        };
+        let Some(commit_id) = review["commit_id"].as_str() else {
+            continue;
+        };
+        let Some(review_id) = review["id"].as_u64() else {
+            continue;
+        };
+        let permission_value: serde_json::Value = serde_json::from_slice(&gh_api(
+            &format!("repos/{repository}/collaborators/{reviewer}/permission"),
+            None,
+        )?)
+        .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+        let repository_permission = permission_value["permission"].as_str().ok_or_else(|| {
+            BaselineError::GitHubVerification(format!(
+                "repository permission is absent for reviewer {reviewer}"
+            ))
+        })?;
+        reviews.push(GithubReview {
+            review_id,
+            reviewer: reviewer.into(),
+            state: state.into(),
+            commit_id: commit_id.into(),
+            repository_permission: repository_permission.into(),
+        });
+    }
     let files_value = gh_api_paginated(
         &format!("repos/{repository}/pulls/{number}/files?per_page=100"),
         "pull request files",
@@ -768,6 +887,60 @@ pub fn verify_github_approval(
         Some("application/vnd.github.raw+json"),
     )?)
     .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+    let pr_head_artifact = gh_api(
+        &format!(
+            "repos/{repository}/contents/{}?ref={head_sha}",
+            entry.artifact_path
+        ),
+        Some("application/vnd.github.raw+json"),
+    )?;
+    let artifact_value: serde_json::Value = serde_json::from_slice(&pr_head_artifact)
+        .map_err(|error| BaselineError::GitHubVerification(error.to_string()))?;
+    let mut pr_head_batch_artifact_references = BTreeMap::new();
+    let mut pr_head_batch_artifact_sha256 = BTreeMap::new();
+    let batch_artifacts = artifact_value["batch_artifacts"]
+        .as_array()
+        .ok_or_else(|| {
+            BaselineError::GitHubVerification(
+                "reviewed baseline artifact has no batch_artifacts array".into(),
+            )
+        })?;
+    for reference in batch_artifacts {
+        let batch_id = reference["batch_id"].as_str().ok_or_else(|| {
+            BaselineError::GitHubVerification("batch artifact id is absent".into())
+        })?;
+        let path = reference["path"].as_str().ok_or_else(|| {
+            BaselineError::GitHubVerification("batch artifact path is absent".into())
+        })?;
+        let sha256 = reference["sha256"].as_str().ok_or_else(|| {
+            BaselineError::GitHubVerification("batch artifact SHA-256 is absent".into())
+        })?;
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !is_sha256(sha256)
+        {
+            return Err(BaselineError::GitHubVerification(
+                "batch artifact reference is not a safe repository-relative SHA-256 binding".into(),
+            ));
+        }
+        let bytes = gh_api(
+            &format!("repos/{repository}/contents/{path}?ref={head_sha}"),
+            Some("application/vnd.github.raw+json"),
+        )?;
+        validate_sidecar_envelope(
+            &bytes,
+            artifact_value["scenario"].as_str().unwrap_or_default(),
+            artifact_value["scenario_config_sha256"]
+                .as_str()
+                .unwrap_or_default(),
+            batch_id,
+        )
+        .map_err(BaselineError::GitHubVerification)?;
+        pr_head_batch_artifact_references.insert(path.into(), sha256.into());
+        pr_head_batch_artifact_sha256.insert(path.into(), format!("{:x}", Sha256::digest(bytes)));
+    }
     let evidence = GithubApiEvidence {
         repository: repository.into(),
         default_branch: default_branch.into(),
@@ -785,6 +958,9 @@ pub fn verify_github_approval(
         merge_commit_reachable_from_default,
         pr_base_manifest,
         pr_head_manifest,
+        pr_head_artifact_sha256: format!("{:x}", Sha256::digest(pr_head_artifact)),
+        pr_head_batch_artifact_references,
+        pr_head_batch_artifact_sha256,
         reviews,
         changed_files,
     };
@@ -946,7 +1122,93 @@ pub fn load_reviewed_baseline(
     let report = parse_and_validate_report(&bytes, &schema)
         .map_err(|error| BaselineError::SchemaValidation(error.to_string()))?;
     verify_report_matches_entry(&report, entry)?;
+    verify_local_sidecars(&report, &repository_root)?;
     Ok(report)
+}
+
+fn verify_local_sidecars(report: &PerfReport, repository_root: &Path) -> Result<(), BaselineError> {
+    if report.batch_artifacts.is_empty() {
+        return Err(BaselineError::SchemaValidation(
+            "reviewed baseline has no raw sidecars".into(),
+        ));
+    }
+    for reference in &report.batch_artifacts {
+        let relative = Path::new(&reference.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(BaselineError::SchemaValidation(
+                "reviewed baseline sidecar path is unsafe".into(),
+            ));
+        }
+        let path = repository_root.join(relative);
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| BaselineError::ArtifactRead(error.to_string()))?;
+        if !canonical.starts_with(repository_root) {
+            return Err(BaselineError::SchemaValidation(
+                "reviewed baseline sidecar escapes repository root".into(),
+            ));
+        }
+        let bytes =
+            fs::read(canonical).map_err(|error| BaselineError::ArtifactRead(error.to_string()))?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual != reference.sha256 {
+            return Err(BaselineError::SchemaValidation(format!(
+                "reviewed baseline sidecar {} hash mismatch",
+                reference.path
+            )));
+        }
+        validate_sidecar_envelope(
+            &bytes,
+            &report.scenario,
+            &report.scenario_config_sha256,
+            &reference.batch_id,
+        )
+        .map_err(BaselineError::SchemaValidation)?;
+    }
+    Ok(())
+}
+
+fn validate_sidecar_envelope(
+    bytes: &[u8],
+    scenario: &str,
+    scenario_config_sha256: &str,
+    batch_id: &str,
+) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("reviewed baseline sidecar is empty".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let payload_present = value
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|payload| !payload.is_empty());
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || value.get("scenario").and_then(serde_json::Value::as_str) != Some(scenario)
+        || value
+            .get("scenario_config_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(scenario_config_sha256)
+        || value.get("batch_id").and_then(serde_json::Value::as_str) != Some(batch_id)
+        || !value
+            .get("source_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_sha256)
+        || !payload_present
+    {
+        return Err(
+            "reviewed baseline sidecar is not a non-empty scenario/config/batch-bound envelope"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn verify_report_matches_entry(
@@ -1237,6 +1499,7 @@ mod tests {
                     .into_iter()
                     .map(|counter| (counter.into(), 0))
                     .collect(),
+                raw_samples: BTreeMap::from([("latency_us".into(), vec![1.0])]),
                 errors: vec![],
             }],
         );
@@ -1260,6 +1523,31 @@ mod tests {
         let candidate = five_runs("runner-a", "p99_us", [70, 85, 100, 115, 130]);
         let verdict = compare(&baseline, &candidate, ComparisonPolicy::strict()).unwrap();
         assert_eq!(verdict.status, VerdictStatus::Unstable);
+    }
+
+    #[test]
+    fn unstable_baseline_is_rejected_before_candidate_comparison() {
+        let baseline = five_runs("runner-a", "p99_us", [70, 85, 100, 115, 130]);
+        let candidate = five_runs("runner-a", "p99_us", [100; 5]);
+        assert!(matches!(
+            compare(&baseline, &candidate, ComparisonPolicy::strict()),
+            Err(CompareError::UnstableBaseline { ref metric, .. }) if metric == "p99_us"
+        ));
+    }
+
+    #[test]
+    fn fail_or_unstable_verdict_cannot_be_used_as_a_strict_baseline() {
+        for verdict in [VerdictStatus::Fail, VerdictStatus::Unstable] {
+            let mut baseline = five_runs("runner-a", "p99_us", [100; 5]);
+            for report in &mut baseline.reports {
+                report.verdict = verdict;
+            }
+            let candidate = five_runs("runner-a", "p99_us", [100; 5]);
+            assert!(matches!(
+                compare(&baseline, &candidate, ComparisonPolicy::strict()),
+                Err(CompareError::Unavailable { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1437,6 +1725,44 @@ mod tests {
     }
 
     #[test]
+    fn github_trust_rejects_approval_superseded_by_changes_requested() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        let mut later_review = evidence.reviews[0].clone();
+        later_review.review_id += 1;
+        later_review.state = "CHANGES_REQUESTED".into();
+        evidence.reviews.push(later_review);
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
+    }
+
+    #[test]
+    fn github_trust_rejects_approval_without_repository_write_permission() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        evidence.reviews[0].repository_permission = "read".into();
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
+    }
+
+    #[test]
+    fn github_trust_rejects_artifact_not_bound_to_approved_head() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        evidence.pr_head_artifact_sha256 = hex_sha256(b"different artifact");
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
+    }
+
+    #[test]
+    fn github_trust_rejects_unbound_batch_sidecar() {
+        let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
+        evidence.pr_head_batch_artifact_references.insert(
+            "perf/baselines/raw/run-1.json".into(),
+            hex_sha256(b"expected"),
+        );
+        evidence.pr_head_batch_artifact_sha256.insert(
+            "perf/baselines/raw/run-1.json".into(),
+            hex_sha256(b"different"),
+        );
+        assert!(validate_github_trust(&policy, &entry, &local_manifest, &evidence).is_err());
+    }
+
+    #[test]
     fn github_trust_rejects_comment_only_pr_when_base_already_has_exact_entry() {
         let (policy, entry, local_manifest, mut evidence) = github_trust_fixture();
         evidence.pull_request_base_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
@@ -1498,9 +1824,17 @@ mod tests {
                     scenario_config_sha256: "config".into(),
                     metrics,
                     counters,
+                    raw_samples: BTreeMap::from([("latency_us".into(), vec![*value as f64])]),
                     errors: vec![],
                 };
-                PerfReport::test_fixture("batch-a", runner, vec![run])
+                let mut report = PerfReport::test_fixture("batch-a", runner, vec![run]);
+                report.batch_artifacts.push(BatchArtifactReference {
+                    batch_id: "batch-a".into(),
+                    path: format!("raw/run-{index}.json"),
+                    sha256: hex_sha256(format!("raw-{index}").as_bytes()),
+                    verdict: VerdictStatus::Pass,
+                });
+                report
             })
             .collect();
         let mut batch = ReportBatch::from_reports(reports);
@@ -1608,15 +1942,26 @@ mod tests {
                 merge_commit_reachable_from_default: true,
                 pr_base_manifest: toml::to_string(&BaselineManifest { baseline: vec![] }).unwrap(),
                 pr_head_manifest: manifest_text,
+                pr_head_artifact_sha256: hex_sha256(b"artifact"),
+                pr_head_batch_artifact_references: BTreeMap::new(),
+                pr_head_batch_artifact_sha256: BTreeMap::new(),
                 reviews: vec![GithubReview {
+                    review_id: 1,
                     reviewer: "reviewer".into(),
                     state: "APPROVED".into(),
                     commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    repository_permission: "write".into(),
                 }],
-                changed_files: vec![GithubChangedFile {
-                    filename: "perf/baselines/manifest.toml".into(),
-                    patch: "id artifact".into(),
-                }],
+                changed_files: vec![
+                    GithubChangedFile {
+                        filename: "perf/baselines/manifest.toml".into(),
+                        patch: "id artifact".into(),
+                    },
+                    GithubChangedFile {
+                        filename: "perf/baselines/artifact.json".into(),
+                        patch: "baseline artifact".into(),
+                    },
+                ],
             },
         )
     }

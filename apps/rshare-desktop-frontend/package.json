@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/app/*.test.mjs"
+    "preview:perf": "vite preview --host 127.0.0.1 --port 5176",
+    "test": "node --test src/app/*.test.mjs",
+    "test:perf": "playwright test --config=playwright.perf.config.mjs"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -69,6 +71,7 @@
     "vaul": "1.1.2"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.0",
     "@tailwindcss/vite": "4.1.12",
     "@vitejs/plugin-react": "4.7.0",
     "react-test-renderer": "18.3.1",

@@ -13,6 +13,7 @@ use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme,
 };
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -31,9 +32,9 @@ use super::encryption::{
 };
 use super::handshake::PeerAuthContext;
 use super::qos::{
-    BulkFrame, ControlFrame, LaneDiscriminator, PeerTransportHandle, TelemetryFrame,
-    TerminalReleaseEmitter, TerminalReleaseEvent, AWAITED_CANCEL_RESET_CODE, QOS_LANE_MAGIC,
-    TERMINAL_CANCEL_RESET_CODE,
+    BulkFrame, ControlFrame, LaneDiscriminator, PeerTransportHandle, QosQueueDiagnostics,
+    TelemetryFrame, TerminalReleaseEmitter, TerminalReleaseEvent, AWAITED_CANCEL_RESET_CODE,
+    QOS_LANE_MAGIC, TERMINAL_CANCEL_RESET_CODE,
 };
 use rshare_core::{
     ControlConnectionId, DeviceId, Message, RealtimeInputFrame, ReliableInputEvent,
@@ -119,11 +120,61 @@ pub type PeerTransportConnection = QuicConnection;
 /// Isolated inbound lanes for one authenticated peer connection generation.
 pub struct PeerInbound {
     pub auth: Arc<PeerAuthContext>,
-    pub realtime_rx: mpsc::Receiver<RealtimeInputFrame>,
+    pub realtime_rx: LatestRealtimeReceiver,
     pub reliable_input_rx: mpsc::Receiver<ReliableInputFrame>,
     pub control_rx: mpsc::Receiver<ControlFrame>,
     pub telemetry_rx: mpsc::Receiver<TelemetryFrame>,
     pub bulk_rx: mpsc::Receiver<BulkFrame>,
+}
+
+#[derive(Default)]
+struct InboundQueueProbe {
+    high_watermark: AtomicU64,
+    overwrites: AtomicU64,
+    overflows: AtomicU64,
+}
+
+impl InboundQueueProbe {
+    fn observe_sender<T>(&self, sender: &mpsc::Sender<T>, pending: usize) {
+        let capacity = sender.max_capacity();
+        let queued = capacity
+            .saturating_sub(sender.capacity())
+            .saturating_add(pending)
+            .min(capacity);
+        self.high_watermark
+            .fetch_max(queued as u64, Ordering::Relaxed);
+    }
+
+    fn overflow<T>(&self, sender: &mpsc::Sender<T>) {
+        self.observe_sender(sender, 0);
+        self.overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot<T>(&self, sender: &mpsc::Sender<T>) -> QosQueueDiagnostics {
+        self.snapshot_capacity(sender.max_capacity())
+    }
+
+    fn snapshot_capacity(&self, capacity: usize) -> QosQueueDiagnostics {
+        QosQueueDiagnostics {
+            capacity: capacity as u64,
+            high_watermark: self.high_watermark.load(Ordering::Relaxed),
+            overwrites: self.overwrites.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InboundQueueProbes {
+    realtime: Arc<InboundQueueProbe>,
+    reliable: Arc<InboundQueueProbe>,
+    control: Arc<InboundQueueProbe>,
+    control_events: Arc<InboundQueueProbe>,
+    telemetry: Arc<InboundQueueProbe>,
+    telemetry_events: Arc<InboundQueueProbe>,
+    bulk: Arc<InboundQueueProbe>,
+    bulk_events: Arc<InboundQueueProbe>,
+    protocol_errors: Arc<InboundQueueProbe>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,78 +187,91 @@ struct InstalledInboundReceivers {
     peer: Option<PeerInbound>,
     control_events: Option<mpsc::Receiver<ControlFrame>>,
     telemetry_events: Option<mpsc::Receiver<TelemetryFrame>>,
+    bulk_events: Option<mpsc::Receiver<BulkFrame>>,
     protocol_errors: Option<mpsc::Receiver<TransportProtocolError>>,
 }
 
 #[derive(Clone)]
-struct LatestRealtimeEmitter {
-    latest_tx: watch::Sender<Option<RealtimeInputFrame>>,
-    #[cfg(test)]
-    workers: Arc<AtomicUsize>,
+pub struct LatestRealtimeSender {
+    latest_tx: watch::Sender<Option<(u64, RealtimeInputFrame)>>,
+    generation: Arc<AtomicU64>,
+    pending_generation: Arc<AtomicU64>,
+    probe: Arc<InboundQueueProbe>,
 }
 
-#[cfg(test)]
-struct LatestRealtimeWorkerGuard(Arc<AtomicUsize>);
+/// A bounded newest-value receiver for one realtime input lane.
+pub struct LatestRealtimeReceiver {
+    latest_rx: watch::Receiver<Option<(u64, RealtimeInputFrame)>>,
+    pending_generation: Arc<AtomicU64>,
+}
 
-#[cfg(test)]
-impl Drop for LatestRealtimeWorkerGuard {
-    fn drop(&mut self) {
-        self.0.store(0, Ordering::Release);
+impl LatestRealtimeSender {
+    fn new(probe: Arc<InboundQueueProbe>) -> (Self, LatestRealtimeReceiver) {
+        let (latest_tx, latest_rx) = watch::channel(None::<(u64, RealtimeInputFrame)>);
+        let generation = Arc::new(AtomicU64::new(0));
+        let pending_generation = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                latest_tx,
+                generation,
+                pending_generation: pending_generation.clone(),
+                probe,
+            },
+            LatestRealtimeReceiver {
+                latest_rx,
+                pending_generation,
+            },
+        )
     }
-}
 
-impl LatestRealtimeEmitter {
-    fn new(target: mpsc::Sender<RealtimeInputFrame>) -> Self {
-        let (latest_tx, mut latest_rx) = watch::channel(None::<RealtimeInputFrame>);
-        #[cfg(test)]
-        let workers = Arc::new(AtomicUsize::new(1));
-        #[cfg(test)]
-        let worker_guard = LatestRealtimeWorkerGuard(workers.clone());
-        tokio::spawn(async move {
-            #[cfg(test)]
-            let _worker_guard = worker_guard;
-            while latest_rx.changed().await.is_ok() {
-                let mut latest = latest_rx.borrow_and_update().clone();
-                loop {
-                    let Some(frame) = latest.take() else {
-                        break;
-                    };
-                    let send = target.send(frame);
-                    tokio::pin!(send);
-                    tokio::select! {
-                        biased;
-                        changed = latest_rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            latest = latest_rx.borrow_and_update().clone();
-                        }
-                        sent = &mut send => {
-                            if sent.is_err() {
-                                return;
-                            }
-                            if latest_rx.has_changed().unwrap_or(false) {
-                                latest = latest_rx.borrow_and_update().clone();
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        Self {
-            latest_tx,
-            #[cfg(test)]
-            workers,
+    pub fn send(&self, frame: RealtimeInputFrame) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.pending_generation.swap(generation, Ordering::AcqRel) != 0 {
+            self.probe.overwrites.fetch_add(1, Ordering::Relaxed);
         }
+        self.probe.high_watermark.fetch_max(1, Ordering::Relaxed);
+        self.latest_tx.send_replace(Some((generation, frame)));
+    }
+}
+
+impl LatestRealtimeReceiver {
+    /// Creates an isolated latest-value channel. Production transport and
+    /// integration tests share the same single-slot overwrite semantics.
+    pub fn channel() -> (LatestRealtimeSender, Self) {
+        LatestRealtimeSender::new(Arc::new(InboundQueueProbe::default()))
     }
 
-    fn emit(&self, frame: RealtimeInputFrame) {
-        self.latest_tx.send_replace(Some(frame));
+    fn take_current(&mut self) -> Option<RealtimeInputFrame> {
+        let (generation, frame) = self.latest_rx.borrow_and_update().clone()?;
+        let _ = self.pending_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        Some(frame)
     }
 
-    #[cfg(test)]
-    fn worker_probe_for_test(&self) -> Arc<AtomicUsize> {
-        self.workers.clone()
+    pub async fn recv(&mut self) -> Option<RealtimeInputFrame> {
+        self.latest_rx.changed().await.ok()?;
+        self.take_current()
+    }
+
+    pub fn try_recv(&mut self) -> Option<RealtimeInputFrame> {
+        self.latest_rx
+            .has_changed()
+            .ok()
+            .filter(|changed| *changed)?;
+        self.take_current()
+    }
+
+    pub fn drain_latest(&mut self, mut latest: RealtimeInputFrame) -> (RealtimeInputFrame, u64) {
+        let mut filtered = 0_u64;
+        while let Some(newer) = self.try_recv() {
+            latest = newer;
+            filtered += 1;
+        }
+        (latest, filtered)
     }
 }
 
@@ -592,7 +656,7 @@ struct QuicConnectionInner {
     connection: quinn::Connection,
     _state_lifetime: Option<Arc<StateLifetimeOwner>>,
     reliable_send_stream: TokioMutex<Option<quinn::SendStream>>,
-    datagram_tx_dropped: AtomicU64,
+    datagram_tx_dropped: Arc<AtomicU64>,
     reliable_stream_reset_count: AtomicU64,
     last_datagram_rx_us: AtomicU64,
     diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
@@ -671,14 +735,16 @@ impl Drop for AuthenticatedUniStreamTaskProbe {
 struct QosReceiveContext {
     auth: Arc<PeerAuthContext>,
     release_emitter: TerminalReleaseEmitter,
-    realtime: LatestRealtimeEmitter,
+    realtime: LatestRealtimeSender,
     reliable_input_tx: mpsc::Sender<ReliableInputFrame>,
     control_tx: mpsc::Sender<ControlFrame>,
     control_event_tx: mpsc::Sender<ControlFrame>,
     telemetry_tx: mpsc::Sender<TelemetryFrame>,
     telemetry_event_tx: mpsc::Sender<TelemetryFrame>,
     bulk_tx: mpsc::Sender<BulkFrame>,
+    bulk_event_tx: mpsc::Sender<BulkFrame>,
     protocol_error_tx: mpsc::Sender<TransportProtocolError>,
+    queue_probes: Arc<InboundQueueProbes>,
 }
 
 #[derive(Default)]
@@ -779,6 +845,77 @@ impl OutboundSender {
 }
 
 impl QuicConnection {
+    pub fn inbound_queue_diagnostics(&self) -> BTreeMap<String, QosQueueDiagnostics> {
+        let context = self
+            .inner
+            .qos_receive
+            .lock()
+            .expect("qos receive context poisoned");
+        let Some(context) = context.as_ref() else {
+            return BTreeMap::new();
+        };
+        BTreeMap::from([
+            (
+                "realtime".into(),
+                context.queue_probes.realtime.snapshot_capacity(1),
+            ),
+            (
+                "reliable".into(),
+                context
+                    .queue_probes
+                    .reliable
+                    .snapshot(&context.reliable_input_tx),
+            ),
+            (
+                "control".into(),
+                context.queue_probes.control.snapshot(&context.control_tx),
+            ),
+            (
+                "control_events".into(),
+                context
+                    .queue_probes
+                    .control_events
+                    .snapshot(&context.control_event_tx),
+            ),
+            (
+                "telemetry".into(),
+                context
+                    .queue_probes
+                    .telemetry
+                    .snapshot(&context.telemetry_tx),
+            ),
+            (
+                "telemetry_events".into(),
+                context
+                    .queue_probes
+                    .telemetry_events
+                    .snapshot(&context.telemetry_event_tx),
+            ),
+            (
+                "bulk".into(),
+                context.queue_probes.bulk.snapshot(&context.bulk_tx),
+            ),
+            (
+                "bulk_events".into(),
+                context
+                    .queue_probes
+                    .bulk_events
+                    .snapshot(&context.bulk_event_tx),
+            ),
+            (
+                "protocol_errors".into(),
+                context
+                    .queue_probes
+                    .protocol_errors
+                    .snapshot(&context.protocol_error_tx),
+            ),
+            (
+                "terminal_release".into(),
+                context.release_emitter.queue_diagnostics(),
+            ),
+        ])
+    }
+
     fn from_quinn(
         endpoint: Endpoint,
         connection: quinn::Connection,
@@ -800,7 +937,7 @@ impl QuicConnection {
             connection,
             _state_lifetime: state_lifetime.clone(),
             reliable_send_stream: TokioMutex::new(None),
-            datagram_tx_dropped: AtomicU64::new(0),
+            datagram_tx_dropped: Arc::new(AtomicU64::new(0)),
             reliable_stream_reset_count: AtomicU64::new(0),
             last_datagram_rx_us: AtomicU64::new(0),
             diagnostics_notifier,
@@ -924,14 +1061,15 @@ impl QuicConnection {
     ) -> (PeerTransportHandle, mpsc::Receiver<TerminalReleaseEvent>) {
         let (release_tx, release_rx) = mpsc::channel(8);
         let release_emitter = TerminalReleaseEmitter::new(release_tx);
-        let (realtime_tx, realtime_rx) = mpsc::channel(1);
-        let realtime = LatestRealtimeEmitter::new(realtime_tx);
+        let queue_probes = Arc::new(InboundQueueProbes::default());
+        let (realtime, realtime_rx) = LatestRealtimeSender::new(queue_probes.realtime.clone());
         let (reliable_input_tx, reliable_input_rx) = mpsc::channel(256);
         let (control_tx, control_rx) = mpsc::channel(64);
         let (control_event_tx, control_events) = mpsc::channel(64);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
         let (telemetry_event_tx, telemetry_events) = mpsc::channel(32);
         let (bulk_tx, bulk_rx) = mpsc::channel(8);
+        let (bulk_event_tx, bulk_events) = mpsc::channel(8);
         let (protocol_error_tx, protocol_errors) = mpsc::channel(32);
         *self
             .inner
@@ -948,6 +1086,7 @@ impl QuicConnection {
             }),
             control_events: Some(control_events),
             telemetry_events: Some(telemetry_events),
+            bulk_events: Some(bulk_events),
             protocol_errors: Some(protocol_errors),
         });
         *self
@@ -964,7 +1103,9 @@ impl QuicConnection {
             telemetry_tx,
             telemetry_event_tx,
             bulk_tx,
+            bulk_event_tx,
             protocol_error_tx,
+            queue_probes,
         });
         self.inner.qos_receive_notify.notify_waiters();
         let monitor_inner = self.inner.clone();
@@ -988,7 +1129,12 @@ impl QuicConnection {
             }
         });
         (
-            PeerTransportHandle::from_quinn(auth, self.inner.connection.clone(), release_emitter),
+            PeerTransportHandle::from_quinn(
+                auth,
+                self.inner.connection.clone(),
+                release_emitter,
+                self.inner.datagram_tx_dropped.clone(),
+            ),
             release_rx,
         )
     }
@@ -1026,6 +1172,17 @@ impl QuicConnection {
             .expect("qos receiver set poisoned")
             .as_mut()
             .and_then(|receivers| receivers.telemetry_events.take())
+    }
+
+    /// Takes the lossless authenticated bulk-event mirror owned by
+    /// `ConnectionManager`.
+    pub fn take_bulk_events(&self) -> Option<mpsc::Receiver<BulkFrame>> {
+        self.inner
+            .qos_receivers
+            .lock()
+            .expect("qos receiver set poisoned")
+            .as_mut()
+            .and_then(|receivers| receivers.bulk_events.take())
     }
 
     pub(crate) fn take_protocol_errors(&self) -> Option<mpsc::Receiver<TransportProtocolError>> {
@@ -1981,10 +2138,25 @@ fn try_report_current_protocol_error(inner: &QuicConnectionInner, error: String)
 }
 
 fn try_report_protocol_error(context: &QosReceiveContext, error: String) {
-    let _ = context.protocol_error_tx.try_send(TransportProtocolError {
+    context
+        .queue_probes
+        .protocol_errors
+        .observe_sender(&context.protocol_error_tx, 1);
+    let result = context.protocol_error_tx.try_send(TransportProtocolError {
         auth: context.auth.clone(),
         error,
     });
+    match result {
+        Ok(()) => context
+            .queue_probes
+            .protocol_errors
+            .observe_sender(&context.protocol_error_tx, 0),
+        Err(mpsc::error::TrySendError::Full(_)) => context
+            .queue_probes
+            .protocol_errors
+            .overflow(&context.protocol_error_tx),
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 async fn read_qos_message_stream(
@@ -2077,21 +2249,66 @@ async fn read_qos_message_stream(
         }
         match classified {
             super::qos::ClassifiedMessage::Control(frame) => {
-                if context.control_tx.send(frame.clone()).await.is_err() {
-                    return;
-                }
-                if context.control_event_tx.send(frame).await.is_err() {
+                context
+                    .queue_probes
+                    .control
+                    .observe_sender(&context.control_tx, 1);
+                let primary_open = context.control_tx.send(frame.clone()).await.is_ok();
+                context
+                    .queue_probes
+                    .control_events
+                    .observe_sender(&context.control_event_tx, 1);
+                let event_open = context.control_event_tx.send(frame).await.is_ok();
+                if !primary_open && !event_open {
                     return;
                 }
             }
             super::qos::ClassifiedMessage::Bulk(frame) => {
-                if context.bulk_tx.send(frame).await.is_err() {
+                context
+                    .queue_probes
+                    .bulk
+                    .observe_sender(&context.bulk_tx, 1);
+                let primary_open = context.bulk_tx.send(frame.clone()).await.is_ok();
+                context
+                    .queue_probes
+                    .bulk_events
+                    .observe_sender(&context.bulk_event_tx, 1);
+                let event_open = context.bulk_event_tx.send(frame).await.is_ok();
+                if !primary_open && !event_open {
                     return;
                 }
             }
             super::qos::ClassifiedMessage::Telemetry(frame) => {
-                let _ = context.telemetry_tx.try_send(frame.clone());
-                let _ = context.telemetry_event_tx.try_send(frame);
+                context
+                    .queue_probes
+                    .telemetry
+                    .observe_sender(&context.telemetry_tx, 1);
+                match context.telemetry_tx.try_send(frame.clone()) {
+                    Ok(()) => context
+                        .queue_probes
+                        .telemetry
+                        .observe_sender(&context.telemetry_tx, 0),
+                    Err(mpsc::error::TrySendError::Full(_)) => context
+                        .queue_probes
+                        .telemetry
+                        .overflow(&context.telemetry_tx),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+                context
+                    .queue_probes
+                    .telemetry_events
+                    .observe_sender(&context.telemetry_event_tx, 1);
+                match context.telemetry_event_tx.try_send(frame) {
+                    Ok(()) => context
+                        .queue_probes
+                        .telemetry_events
+                        .observe_sender(&context.telemetry_event_tx, 0),
+                    Err(mpsc::error::TrySendError::Full(_)) => context
+                        .queue_probes
+                        .telemetry_events
+                        .overflow(&context.telemetry_event_tx),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
             }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
         }
@@ -2295,14 +2512,37 @@ async fn read_qos_reliable_stream(
             match disposition {
                 EmergencyDisposition::Ignore => {}
                 EmergencyDisposition::Release(epoch, reason) => {
-                    if context.reliable_input_tx.try_send(frame).is_err() {
-                        fail_close_reliable_delivery(
-                            &inner,
-                            &context,
-                            epoch,
-                            b"qos reliable inbound receiver unavailable",
-                        );
-                        return;
+                    context
+                        .queue_probes
+                        .reliable
+                        .observe_sender(&context.reliable_input_tx, 1);
+                    match context.reliable_input_tx.try_send(frame) {
+                        Ok(()) => context
+                            .queue_probes
+                            .reliable
+                            .observe_sender(&context.reliable_input_tx, 0),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            context
+                                .queue_probes
+                                .reliable
+                                .overflow(&context.reliable_input_tx);
+                            fail_close_reliable_delivery(
+                                &inner,
+                                &context,
+                                epoch,
+                                b"qos reliable inbound receiver unavailable",
+                            );
+                            return;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            fail_close_reliable_delivery(
+                                &inner,
+                                &context,
+                                epoch,
+                                b"qos reliable inbound receiver unavailable",
+                            );
+                            return;
+                        }
                     }
                     context.release_emitter.emit(TerminalReleaseEvent {
                         auth: context.auth,
@@ -2356,14 +2596,37 @@ async fn read_qos_reliable_stream(
             }
             ReliableAccept::Accepted => {}
         }
-        if context.reliable_input_tx.try_send(frame.clone()).is_err() {
-            fail_close_reliable_delivery(
-                &inner,
-                &context,
-                frame.session_epoch,
-                b"qos reliable inbound receiver unavailable",
-            );
-            return;
+        context
+            .queue_probes
+            .reliable
+            .observe_sender(&context.reliable_input_tx, 1);
+        match context.reliable_input_tx.try_send(frame.clone()) {
+            Ok(()) => context
+                .queue_probes
+                .reliable
+                .observe_sender(&context.reliable_input_tx, 0),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                context
+                    .queue_probes
+                    .reliable
+                    .overflow(&context.reliable_input_tx);
+                fail_close_reliable_delivery(
+                    &inner,
+                    &context,
+                    frame.session_epoch,
+                    b"qos reliable inbound receiver unavailable",
+                );
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                fail_close_reliable_delivery(
+                    &inner,
+                    &context,
+                    frame.session_epoch,
+                    b"qos reliable inbound receiver unavailable",
+                );
+                return;
+            }
         }
         if matches!(frame.event, ReliableInputEvent::Enter { .. }) {
             stream_epoch = Some(frame.session_epoch);
@@ -2857,7 +3120,7 @@ async fn read_realtime_datagrams(inner: Arc<QuicConnectionInner>) {
                         if let Some(notifier) = &inner.diagnostics_notifier {
                             notifier.notify();
                         }
-                        context.realtime.emit(frame);
+                        context.realtime.send(frame);
                     }
                     continue;
                 }
@@ -3928,6 +4191,9 @@ mod tests {
         let mut telemetry_events = server_connection
             .take_telemetry_events()
             .expect("authenticated QoS must expose the telemetry-event mirror");
+        let mut bulk_events = server_connection
+            .take_bulk_events()
+            .expect("authenticated QoS must expose the bulk-event mirror");
         let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
 
         client_qos
@@ -3955,6 +4221,10 @@ mod tests {
         timeout(Duration::from_secs(1), inbound.bulk_rx.recv())
             .await
             .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), bulk_events.recv())
+            .await
+            .expect("bulk event mirror must receive the authenticated frame")
             .unwrap();
         timeout(Duration::from_secs(1), inbound.telemetry_rx.recv())
             .await
@@ -3988,6 +4258,10 @@ mod tests {
             timeout(Duration::from_secs(1), inbound.bulk_rx.recv())
                 .await
                 .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(1), bulk_events.recv())
+                .await
+                .expect("bulk event mirror must preserve every authenticated frame")
                 .unwrap();
         }
     }
@@ -4157,38 +4431,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_realtime_downstream_keeps_only_latest_and_worker_exits_on_drop() {
-        let (target_tx, mut target_rx) = mpsc::channel(1);
-        target_tx.try_send(realtime_frame(7, 0)).unwrap();
-        assert_eq!(target_rx.len(), 1, "the downstream must start full");
-
-        let emitter = LatestRealtimeEmitter::new(target_tx);
-        let workers = emitter.worker_probe_for_test();
+    async fn stalled_realtime_receiver_observes_only_latest_without_a_bridge_backlog() {
+        let probe = Arc::new(InboundQueueProbe::default());
+        let (emitter, mut receiver) = LatestRealtimeSender::new(probe.clone());
         for sequence in 1..=100 {
-            emitter.emit(realtime_frame(7, sequence));
+            emitter.send(realtime_frame(7, sequence));
         }
+        assert_eq!(
+            probe.snapshot_capacity(1).overwrites,
+            99,
+            "only replacement of an undelivered latest value counts as overwrite"
+        );
 
-        assert_eq!(target_rx.recv().await.unwrap().sequence, 0);
-        let latest = timeout(Duration::from_secs(1), async {
-            loop {
-                let frame = target_rx.recv().await.unwrap();
-                if frame.sequence == 100 {
-                    break frame;
-                }
-            }
-        })
-        .await
-        .expect("unblocking a full downstream must deliver the latest replacement");
+        let latest = receiver.recv().await.unwrap();
         assert_eq!(latest.sequence, 100);
+        emitter.send(realtime_frame(7, 101));
+        assert_eq!(
+            receiver.recv().await.unwrap().sequence,
+            101,
+            "a value published after the pending slot clears must not be stale"
+        );
+        assert_eq!(
+            probe.snapshot_capacity(1).overwrites,
+            99,
+            "a fresh value after delivery must not count as an overwrite"
+        );
 
         drop(emitter);
-        timeout(Duration::from_secs(1), async {
-            while workers.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the latest bridge worker must exit when its sender lifetime ends");
+        assert!(receiver.recv().await.is_none());
     }
 
     #[tokio::test]

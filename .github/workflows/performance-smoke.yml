@@ -1,0 +1,191 @@
+name: Performance Smoke
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hosted-catastrophe-smoke:
+    name: Hosted correctness and catastrophe smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/rshare-desktop-frontend/package-lock.json
+
+      - name: Install frontend dependencies from lockfile
+        run: npm ci --prefix apps/rshare-desktop-frontend
+
+      - name: Install Playwright Chromium
+        working-directory: apps/rshare-desktop-frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        run: npm --prefix apps/rshare-desktop-frontend run build
+
+      - name: Run functional UI stream scenarios
+        run: npm --prefix apps/rshare-desktop-frontend run test:perf -- --grep-invert @fixed-runner
+
+      - name: Run Rust workspace tests from lockfile
+        run: cargo test --workspace --locked
+
+      - name: Run frontend Node tests
+        run: npm --prefix apps/rshare-desktop-frontend test
+
+      - name: Compile every benchmark from lockfile
+        run: cargo bench --workspace --no-run --locked
+
+      - name: Check 100k CPU path catastrophe ceiling
+        shell: bash
+        run: |
+          mkdir -p artifacts/hosted-smoke
+          started_ms="$(date +%s%3N)"
+          cargo bench -p rshare-core --bench perf_record_alloc --locked \
+            2>&1 | tee artifacts/hosted-smoke/cpu-path.txt
+          elapsed_ms="$(( $(date +%s%3N) - started_ms ))"
+          printf '{"measured_calls":100000,"elapsed_ms":%s,"ceiling_ms":5000}\n' \
+            "$elapsed_ms" > artifacts/hosted-smoke/cpu-path.json
+          if (( elapsed_ms > 5000 )); then
+            echo "100k CPU path took ${elapsed_ms} ms; catastrophe ceiling is 5000 ms" >&2
+            exit 1
+          fi
+
+      - name: Check framed IPC catastrophe ceilings
+        shell: bash
+        run: |
+          cargo run --release --locked -p rshare-perf -- \
+            ipc --requests 1000 --concurrency 1,8 \
+            --output artifacts/hosted-smoke/ipc.json
+          REPORT_PATH=artifacts/hosted-smoke/ipc.json node <<'NODE'
+          const fs = require("node:fs");
+          const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+          const expected = new Map([[1, 100_000], [8, 200_000]]);
+          for (const [concurrency, ceilingUs] of expected) {
+            const run = report.runs.find((item) => item.concurrency === concurrency);
+            if (!run) throw new Error(`missing IPC concurrency ${concurrency}`);
+            if (run.completed_requests !== report.requests_per_connection * concurrency) {
+              throw new Error(`incomplete IPC run at concurrency ${concurrency}`);
+            }
+            if (run.p99_us > ceilingUs) {
+              throw new Error(
+                `IPC p99 ${run.p99_us}us exceeds ${ceilingUs}us at concurrency ${concurrency}`,
+              );
+            }
+          }
+          NODE
+
+      - name: Check QUIC loopback catastrophe ceilings
+        shell: bash
+        run: |
+          cargo run --release --locked -p rshare-perf -- \
+            quic --rate-hz 125 --duration-secs 5 \
+            --output artifacts/hosted-smoke/quic-125hz-5s.json
+          REPORT_PATH=artifacts/hosted-smoke/quic-125hz-5s.json node <<'NODE'
+          const fs = require("node:fs");
+          const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+          if (report.scenario !== "quic-control-v3") {
+            throw new Error(`unexpected QUIC scenario ${report.scenario}`);
+          }
+          if (report.runs.length === 0) throw new Error("QUIC smoke produced no runs");
+          if (!report.queues || Object.keys(report.queues).length === 0) {
+            throw new Error("QUIC smoke produced no bounded-queue evidence");
+          }
+          for (const required of [
+            "producer_realtime",
+            "fast_qos_realtime_direct",
+            "fast_qos_reliable",
+            "fast_qos_emergency",
+            "fast_qos_control",
+            "fast_qos_bulk",
+            "fast_qos_telemetry",
+            "fast_qos_terminal_release",
+            "fast_receiver_qos_realtime_direct",
+            "fast_receiver_qos_reliable",
+            "fast_receiver_qos_emergency",
+            "fast_receiver_qos_control",
+            "fast_receiver_qos_bulk",
+            "fast_receiver_qos_telemetry",
+            "fast_receiver_qos_terminal_release",
+            "fast_inbound_realtime",
+            "fast_inbound_reliable",
+            "fast_inbound_control",
+            "fast_inbound_control_events",
+            "fast_inbound_telemetry",
+            "fast_inbound_telemetry_events",
+            "fast_inbound_bulk",
+            "fast_inbound_bulk_events",
+            "fast_inbound_protocol_errors",
+            "fast_inbound_terminal_release",
+            "fast_sender_inbound_realtime",
+            "fast_sender_inbound_reliable",
+            "fast_sender_inbound_control",
+            "fast_sender_inbound_control_events",
+            "fast_sender_inbound_telemetry",
+            "fast_sender_inbound_telemetry_events",
+            "fast_sender_inbound_bulk",
+            "fast_sender_inbound_bulk_events",
+            "fast_sender_inbound_protocol_errors",
+            "fast_sender_inbound_terminal_release",
+          ]) {
+            if (!(required in report.queues)) {
+              throw new Error(`missing production queue evidence ${required}`);
+            }
+          }
+          for (const [name, queue] of Object.entries(report.queues)) {
+            if (queue.high_watermark > queue.capacity || queue.overflows !== 0) {
+              throw new Error(`bounded queue ${name} exceeded capacity or overflowed`);
+            }
+          }
+          for (const run of report.runs) {
+            const counters = run.counters;
+            if (
+              !run.process_exit_success ||
+              counters.reliable_overflow !== 0 ||
+              counters.reliable_expected !== 100 * counters.reliable_peers ||
+              counters.reliable_delivered !== counters.reliable_expected ||
+              counters.stuck_modifiers !== 0 ||
+              counters.stuck_mouse_buttons !== 0 ||
+              counters.stale_replay_attempted !== 1 ||
+              counters.stale_replay_filtered !== 1 ||
+              counters.stale_replay_delivered !== 0 ||
+              counters.same_epoch_stale_replay !== 0
+            ) {
+              throw new Error(`reliable delivery failed in ${run.run_id}`);
+            }
+            const expected = counters.expected_sent;
+            const delivered = counters.delivered_within_window;
+            if (!(expected > 0) || delivered / expected < 0.999) {
+              throw new Error(
+                `datagram delivery ${(100 * delivered / expected).toFixed(4)}% is below 99.9%`,
+              );
+            }
+            if (run.metrics.p99_us > 100_000) {
+              throw new Error(`QUIC p99 ${run.metrics.p99_us}us exceeds 100000us`);
+            }
+          }
+          NODE
+
+      - name: Upload catastrophe-smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-performance-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/hosted-smoke
+          if-no-files-found: error
+          retention-days: 14

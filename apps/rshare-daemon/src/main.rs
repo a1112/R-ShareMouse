@@ -6407,6 +6407,11 @@ fn into_authenticated_network_message(
             auth.control_connection_id,
             frame.into_message(),
         )),
+        NetworkEvent::BulkReceived { auth, frame } => Ok((
+            auth.peer_id,
+            auth.control_connection_id,
+            frame.into_message(),
+        )),
         event => Err(event),
     }
 }
@@ -7010,7 +7015,8 @@ async fn main() -> Result<()> {
                         sync_local_shortcut_suppression(&state);
                     }
                     NetworkEvent::ControlReceived { .. }
-                    | NetworkEvent::TelemetryReceived { .. } => {
+                    | NetworkEvent::TelemetryReceived { .. }
+                    | NetworkEvent::BulkReceived { .. } => {
                         unreachable!("authenticated messages are handled before lifecycle events")
                     }
                     NetworkEvent::ConnectionError {

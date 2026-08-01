@@ -47,6 +47,7 @@ pub struct IpcPerfRun {
     pub p95_us: u64,
     pub p99_us: u64,
     pub max_us: u64,
+    pub latency_samples_us: Vec<u64>,
 }
 
 pub async fn run_matrix(requests: usize, concurrency: &[usize]) -> Result<IpcPerfReport> {
@@ -144,6 +145,7 @@ async fn run_scenario(requests: usize, concurrency: usize) -> Result<(IpcPerfRun
             p95_us: percentile(&latencies_us, 95),
             p99_us: percentile(&latencies_us, 99),
             max_us: *latencies_us.last().unwrap_or(&0),
+            latency_samples_us: latencies_us,
         },
         address.port() != rshare_core::ipc::DEFAULT_IPC_PORT,
     ))

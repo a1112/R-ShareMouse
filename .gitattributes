@@ -1,0 +1,2 @@
+perf/baselines/**/*.json text eol=lf
+perf/baselines/**/*.toml text eol=lf

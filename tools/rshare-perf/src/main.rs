@@ -48,6 +48,8 @@ enum Command {
     Quic(QuicArgs),
     Ipc(IpcArgs),
     Compare(CompareArgs),
+    Validate(ValidateArgs),
+    ConfigHash(ConfigHashArgs),
     Dual(DualArgs),
 }
 
@@ -85,6 +87,20 @@ struct CompareArgs {
     candidate: PathBuf,
     #[arg(long)]
     budget: PathBuf,
+    #[arg(long)]
+    evidence_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ValidateArgs {
+    #[arg(long)]
+    candidate: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ConfigHashArgs {
+    #[arg(long)]
+    input: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -112,8 +128,48 @@ fn main() -> Result<()> {
         Command::Quic(args) => run_quic(args),
         Command::Ipc(args) => run_ipc(args),
         Command::Compare(args) => run_compare(args),
+        Command::Validate(args) => run_validate(args),
+        Command::ConfigHash(args) => run_config_hash(args),
         Command::Dual(args) => run_dual(args),
     }
+}
+
+fn run_config_hash(args: ConfigHashArgs) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&args.input)
+            .with_context(|| format!("read scenario configuration {}", args.input.display()))?,
+    )?;
+    println!("{}", scenario_config_sha256(&value)?);
+    Ok(())
+}
+
+fn run_validate(args: ValidateArgs) -> Result<()> {
+    let bytes = fs::read(&args.candidate)
+        .with_context(|| format!("read candidate {}", args.candidate.display()))?;
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../perf/baselines/schema.json"))?;
+    let report = parse_and_validate_report(&bytes, &schema)?;
+    let contract = ScenarioContract::for_report(&report)?;
+    report.validate_complete(&contract)?;
+    if report.verdict != VerdictStatus::Pass {
+        bail!(
+            "candidate is structurally complete but cannot pass the gate with verdict {:?}",
+            report.verdict
+        );
+    }
+    if report.batch_artifacts.is_empty() {
+        bail!("candidate has no raw batch sidecar references");
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "pass",
+            "scenario": report.scenario,
+            "scenario_config_sha256": report.scenario_config_sha256,
+            "runs": report.runs.len(),
+        }))?
+    );
+    Ok(())
 }
 
 fn run_ipc(args: IpcArgs) -> Result<()> {
@@ -322,7 +378,12 @@ fn build_quic_report(
         availability: Availability::Available,
         toolchain: fingerprints.toolchain.clone(),
         hardware: fingerprints.hardware.clone(),
-        warmup: DurationSpec { millis: 0 },
+        warmup: DurationSpec {
+            millis: std::env::var("RSHARE_PERF_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        },
         batch_artifacts: vec![],
         runs,
         metrics,
@@ -478,9 +539,24 @@ fn collect_fingerprints() -> Result<Fingerprints> {
     let runner_id = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+    let runner_settings = BTreeMap::from([
+        (
+            "process_affinity_mask",
+            std::env::var("RSHARE_PERF_AFFINITY_MASK").unwrap_or_else(|_| "uncontrolled".into()),
+        ),
+        (
+            "power_plan_guid",
+            std::env::var("RSHARE_PERF_POWER_PLAN_GUID").unwrap_or_else(|_| "uncontrolled".into()),
+        ),
+    ]);
     let runner_fingerprint = format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&(&runner_id, &toolchain, &hardware))?)
+        Sha256::digest(serde_json::to_vec(&(
+            &runner_id,
+            &toolchain,
+            &hardware,
+            &runner_settings
+        ))?)
     );
     Ok(Fingerprints {
         commit,
@@ -676,11 +752,24 @@ fn run_compare(args: CompareArgs) -> Result<()> {
     let contract = ScenarioContract::for_report(&baseline_report)?;
     baseline_report.validate_complete(&contract)?;
     candidate_report.validate_complete(&contract)?;
+    if baseline_report.dirty || candidate_report.dirty {
+        bail!("strict comparison rejects dirty baseline or candidate artifacts");
+    }
 
     let mut baseline = batch_from_artifact(baseline_report);
-    baseline.reviewed_manifest_id = Some(args.baseline_id);
+    baseline.reviewed_manifest_id = Some(args.baseline_id.clone());
     let candidate = batch_from_artifact(candidate_report);
     let verdict = compare(&baseline, &candidate, policy).map_err(anyhow::Error::msg)?;
+    if let Some(path) = &args.evidence_output {
+        let evidence = serde_json::json!({
+            "baseline_id": args.baseline_id,
+            "candidate_path": args.candidate,
+            "candidate_sha256": format!("{:x}", Sha256::digest(&candidate_bytes)),
+            "verified_approval": approval,
+            "comparison_verdict": verdict,
+        });
+        atomic_write(path, &serde_json::to_vec_pretty(&evidence)?)?;
+    }
     println!("{}", serde_json::to_string_pretty(&verdict)?);
     match verdict.status {
         VerdictStatus::Pass => Ok(()),
@@ -912,22 +1001,28 @@ mod tests {
 
     fn complete_report_fixture() -> PerfReport {
         let runs = (0..5)
-            .map(|index| report::PerfRun {
-                run_id: format!("run-{index}"),
-                batch_id: "batch-a".into(),
-                process_exit_success: true,
-                schema_valid: true,
-                scenario_config_sha256: "config".into(),
-                metrics: BTreeMap::from([
-                    ("median_us".into(), 10.0),
-                    ("p95_us".into(), 12.0),
-                    ("p99_us".into(), 14.0),
-                ]),
-                counters: report::REQUIRED_COUNTERS
-                    .into_iter()
-                    .map(|counter| (counter.into(), 0))
-                    .collect(),
-                errors: vec![],
+            .map(|index| {
+                let mut latency_us = vec![10.0; 95];
+                latency_us.extend([12.0; 4]);
+                latency_us.push(14.0);
+                report::PerfRun {
+                    run_id: format!("run-{index}"),
+                    batch_id: "batch-a".into(),
+                    process_exit_success: true,
+                    schema_valid: true,
+                    scenario_config_sha256: "config".into(),
+                    metrics: BTreeMap::from([
+                        ("median_us".into(), 10.0),
+                        ("p95_us".into(), 12.0),
+                        ("p99_us".into(), 14.0),
+                    ]),
+                    counters: report::REQUIRED_COUNTERS
+                        .into_iter()
+                        .map(|counter| (counter.into(), 0))
+                        .collect(),
+                    raw_samples: BTreeMap::from([("latency_us".into(), latency_us)]),
+                    errors: vec![],
+                }
             })
             .collect();
         PerfReport::test_fixture("batch-a", "runner-a", runs)

@@ -13,8 +13,8 @@ use crate::{
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
     handshake::PeerAuthContext,
     qos::{
-        ClassifiedMessage, ConnectionRegistry, ControlFrame, TelemetryFrame, TerminalReleaseEvent,
-        TransportSendError,
+        BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, TelemetryFrame,
+        TerminalReleaseEvent, TransportSendError,
     },
     transport::PeerInbound,
 };
@@ -39,6 +39,10 @@ pub enum NetworkEvent {
     TelemetryReceived {
         auth: Arc<PeerAuthContext>,
         frame: TelemetryFrame,
+    },
+    BulkReceived {
+        auth: Arc<PeerAuthContext>,
+        frame: BulkFrame,
     },
     /// Connection error
     ConnectionError {
@@ -122,6 +126,9 @@ fn spawn_connection_event_forwarder(
                 }
                 ManagerEvent::TelemetryReceived { auth, frame } => {
                     NetworkEvent::TelemetryReceived { auth, frame }
+                }
+                ManagerEvent::BulkReceived { auth, frame } => {
+                    NetworkEvent::BulkReceived { auth, frame }
                 }
                 ManagerEvent::ProtocolError { auth, error } => NetworkEvent::ConnectionError {
                     peer_id: Some(auth.peer_id),

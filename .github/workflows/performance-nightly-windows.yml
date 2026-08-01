@@ -1,0 +1,184 @@
+name: Nightly Windows Performance Gate
+
+on:
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: performance-nightly-windows-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  phase1-strict:
+    name: Phase 1 strict fixed-runner gate
+    runs-on: [self-hosted, Windows, X64, rshare-perf]
+    timeout-minutes: 120
+    env:
+      OUTPUT_DIRECTORY: ${{ runner.temp }}\rshare-phase1-${{ github.run_id }}-${{ github.run_attempt }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}\rshare-target-${{ github.run_id }}-${{ github.run_attempt }}
+      GH_TOKEN: ${{ secrets.PERF_BASELINE_GH_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.PERF_BASELINE_GH_TOKEN }}
+      RSHARE_PERF_AFFINITY_MASK: ${{ vars.RSHARE_PERF_AFFINITY_MASK }}
+
+    steps:
+      - name: Require canonical LF baseline blobs
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Require the protected default branch
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'PERF_BASELINE_GH_TOKEN is required with repository contents/PR read and Administration read permission.'
+          }
+          if ($env:GITHUB_REF_NAME -ne $env:DEFAULT_BRANCH) {
+            throw "Strict performance runs are allowed only on protected default branch '$env:DEFAULT_BRANCH'; received '$env:GITHUB_REF_NAME'."
+          }
+          $protection = gh api "repos/$env:GITHUB_REPOSITORY/branches/$env:DEFAULT_BRANCH/protection"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify protection for default branch '$env:DEFAULT_BRANCH'."
+          }
+          $protection |
+            Out-File -Encoding utf8 "$env:RUNNER_TEMP\default-branch-protection.json"
+
+      - name: Checkout protected default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Verify immutable default-branch source
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags origin $env:DEFAULT_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch protected default branch.' }
+          $remote = (git rev-parse FETCH_HEAD).Trim()
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $remote) {
+            throw "Checkout $head is not current protected default-branch head $remote."
+          }
+          if (-not (Test-Path perf\baselines\manifest.toml)) {
+            throw 'Protected default branch has no baseline manifest.'
+          }
+
+      - name: Set up Node.js from pinned version
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/rshare-desktop-frontend/package-lock.json
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fetch --locked failed.' }
+          npm.cmd ci --prefix apps/rshare-desktop-frontend
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+          Push-Location apps/rshare-desktop-frontend
+          try {
+            npx.cmd playwright install chromium
+            if ($LASTEXITCODE -ne 0) { throw 'Playwright Chromium install failed.' }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Capture original machine state
+        id: machine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:OUTPUT_DIRECTORY | Out-Null
+          $active = (powercfg.exe /getactivescheme | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $active -notmatch '([0-9A-Fa-f-]{36})') {
+            throw "Unable to capture active Windows power plan: $active"
+          }
+          $originalGuid = $Matches[1]
+          "original_guid=$originalGuid" >> $env:GITHUB_OUTPUT
+          $active | Out-File -Encoding utf8 "$env:OUTPUT_DIRECTORY\power-plan-before.txt"
+          powercfg.exe /list |
+            Out-File -Encoding utf8 "$env:OUTPUT_DIRECTORY\power-plans.txt"
+
+      - name: Run one strict exactly-five-run Phase 1 batch
+        id: phase1
+        shell: pwsh
+        env:
+          HIGH_PERFORMANCE_GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powercfg.exe /setactive $env:HIGH_PERFORMANCE_GUID
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to activate the High performance power plan.'
+          }
+
+          $process = Get-Process -Id $PID
+          $beforeMask = [uint64]$process.ProcessorAffinity.ToInt64()
+          $maskText = $env:RSHARE_PERF_AFFINITY_MASK
+          if ([string]::IsNullOrWhiteSpace($maskText)) {
+            $appliedMask = $beforeMask
+          } elseif ($maskText -match '^0[xX][0-9A-Fa-f]+$') {
+            $appliedMask = [Convert]::ToUInt64($maskText.Substring(2), 16)
+          } else {
+            throw 'RSHARE_PERF_AFFINITY_MASK must be an unsigned hexadecimal mask such as 0xFF.'
+          }
+          if ($appliedMask -eq 0 -or $appliedMask -gt [uint64][long]::MaxValue) {
+            throw 'CPU affinity mask must be nonzero and fit in a signed 64-bit process mask.'
+          }
+          $process.ProcessorAffinity = [IntPtr][long]$appliedMask
+
+          [ordered]@{
+            power_plan = (powercfg.exe /getactivescheme | Out-String).Trim()
+            process_id = $PID
+            affinity_before = ('0x{0:X}' -f $beforeMask)
+            affinity_applied = ('0x{0:X}' -f $appliedMask)
+            logical_processors = [Environment]::ProcessorCount
+          } | ConvertTo-Json |
+            Out-File -Encoding utf8 "$env:OUTPUT_DIRECTORY\machine-settings.json"
+
+          # run-phase1 owns the immutable batch id, exactly five measured runs,
+          # CV calculation, and at most one whole-batch retry. Do not loop here.
+          & scripts\perf\run-phase1.ps1 `
+            -OutputDirectory $env:OUTPUT_DIRECTORY `
+            -Mode Strict `
+            -WarmupSeconds 30
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Strict Phase 1 gate failed. Missing/unapproved baselines, hash mismatches, unavailable metrics, and a second unstable batch all fail closed.'
+          }
+
+      - name: Restore original power plan
+        if: always() && steps.machine.outputs.original_guid != ''
+        shell: pwsh
+        env:
+          ORIGINAL_POWER_PLAN: ${{ steps.machine.outputs.original_guid }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powercfg.exe /setactive $env:ORIGINAL_POWER_PLAN
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restore original power plan $env:ORIGINAL_POWER_PLAN."
+          }
+          powercfg.exe /getactivescheme |
+            Out-File -Encoding utf8 "$env:OUTPUT_DIRECTORY\power-plan-restored.txt"
+
+      - name: Upload all raw runs, histograms, and reproducibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-windows-loopback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.OUTPUT_DIRECTORY }}
+            ${{ runner.temp }}\default-branch-protection.json
+          if-no-files-found: error
+          retention-days: 90

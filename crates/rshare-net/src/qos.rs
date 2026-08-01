@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -14,6 +14,61 @@ use crate::handshake::PeerAuthContext;
 pub const QOS_LANE_MAGIC: &[u8; 4] = b"RSQ3";
 pub(crate) const TERMINAL_CANCEL_RESET_CODE: u32 = 0x525351;
 pub(crate) const AWAITED_CANCEL_RESET_CODE: u32 = 0x525352;
+const RELIABLE_CAPACITY: usize = 256;
+const EMERGENCY_CAPACITY: usize = 1;
+const CONTROL_CAPACITY: usize = 64;
+const BULK_CAPACITY: usize = 8;
+const TELEMETRY_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QosQueueDiagnostics {
+    pub capacity: u64,
+    pub high_watermark: u64,
+    pub overwrites: u64,
+    pub overflows: u64,
+}
+
+#[derive(Default)]
+struct QueueProbe {
+    high_watermark: AtomicU64,
+    overwrites: AtomicU64,
+    overflows: AtomicU64,
+}
+
+impl QueueProbe {
+    fn observe_queued(&self, queued: usize, capacity: usize) {
+        self.high_watermark
+            .fetch_max(queued.min(capacity) as u64, Ordering::Relaxed);
+    }
+
+    fn overwrite(&self) {
+        self.overwrites.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn overflow(&self, capacity: usize) {
+        self.observe_queued(capacity, capacity);
+        self.overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, capacity: usize) -> QosQueueDiagnostics {
+        QosQueueDiagnostics {
+            capacity: capacity as u64,
+            high_watermark: self.high_watermark.load(Ordering::Relaxed),
+            overwrites: self.overwrites.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct QosQueueProbes {
+    realtime_direct: QueueProbe,
+    reliable: QueueProbe,
+    emergency: QueueProbe,
+    control: QueueProbe,
+    bulk: QueueProbe,
+    telemetry: QueueProbe,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -138,7 +193,7 @@ pub(crate) struct TerminalReleaseEmitter {
     latest_tx: watch::Sender<Option<TerminalReleaseEvent>>,
     state: Arc<Mutex<TerminalReleaseEmissionState>>,
     pending: Arc<AtomicBool>,
-    #[cfg(test)]
+    queue_probe: Arc<QueueProbe>,
     in_flight: Arc<AtomicUsize>,
     #[cfg(test)]
     workers: Arc<AtomicUsize>,
@@ -155,6 +210,7 @@ impl TerminalReleaseEmitter {
     pub(crate) fn new(target: mpsc::Sender<TerminalReleaseEvent>) -> Self {
         let (latest_tx, mut latest_rx) = watch::channel(None);
         let pending = Arc::new(AtomicBool::new(false));
+        let queue_probe = Arc::new(QueueProbe::default());
         let in_flight = Arc::new(AtomicUsize::new(0));
         let workers = Arc::new(AtomicUsize::new(1));
         let worker_pending = pending.clone();
@@ -163,7 +219,7 @@ impl TerminalReleaseEmitter {
         let worker_target = target.clone();
         tokio::spawn(async move {
             let mut next = None;
-            'worker: loop {
+            loop {
                 let event = if let Some(event) = next.take() {
                     Some(event)
                 } else {
@@ -178,15 +234,17 @@ impl TerminalReleaseEmitter {
                 let send = worker_target.send(event);
                 tokio::pin!(send);
                 let mut latest_changed = false;
+                let mut latest_open = true;
                 let sent = loop {
                     tokio::select! {
                         biased;
                         result = &mut send => break result,
-                        changed = latest_rx.changed() => {
+                        changed = latest_rx.changed(), if latest_open => {
                             if changed.is_err() {
-                                break 'worker;
+                                latest_open = false;
+                            } else {
+                                latest_changed = true;
                             }
-                            latest_changed = true;
                         }
                     }
                 };
@@ -196,6 +254,8 @@ impl TerminalReleaseEmitter {
                 worker_in_flight.store(0, Ordering::Release);
                 if latest_changed || latest_rx.has_changed().unwrap_or(false) {
                     next = latest_rx.borrow_and_update().clone();
+                } else if !latest_open {
+                    break;
                 }
             }
             worker_in_flight.store(0, Ordering::Release);
@@ -206,7 +266,7 @@ impl TerminalReleaseEmitter {
             latest_tx,
             state: Arc::new(Mutex::new(TerminalReleaseEmissionState::default())),
             pending,
-            #[cfg(test)]
+            queue_probe,
             in_flight,
             #[cfg(test)]
             workers,
@@ -228,19 +288,42 @@ impl TerminalReleaseEmitter {
         }
         state.highest = Some(event.epoch);
         if state.coalescing {
-            self.pending.store(true, Ordering::Release);
+            if self.pending.swap(true, Ordering::AcqRel) {
+                self.queue_probe.overwrite();
+            }
+            let queued = self
+                .target
+                .max_capacity()
+                .saturating_sub(self.target.capacity())
+                .saturating_add(self.in_flight.load(Ordering::Acquire))
+                .saturating_add(1);
+            self.queue_probe
+                .observe_queued(queued, self.target.max_capacity().saturating_add(2));
             self.latest_tx.send_replace(Some(event));
             return;
         }
+        self.queue_probe.observe_queued(
+            self.target.max_capacity() - self.target.capacity() + 1,
+            self.target.max_capacity(),
+        );
         match self.target.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
                 state.coalescing = true;
                 self.pending.store(true, Ordering::Release);
+                self.queue_probe.observe_queued(
+                    self.target.max_capacity().saturating_add(1),
+                    self.target.max_capacity().saturating_add(2),
+                );
                 self.latest_tx.send_replace(Some(event));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
+    }
+
+    pub(crate) fn queue_diagnostics(&self) -> QosQueueDiagnostics {
+        self.queue_probe
+            .snapshot(self.target.max_capacity().saturating_add(2))
     }
 
     #[cfg(test)]
@@ -308,6 +391,8 @@ impl SenderEpochState {
 struct PeerTransportInner {
     auth: Arc<PeerAuthContext>,
     realtime_connection: Option<quinn::Connection>,
+    realtime_capacity_bytes: usize,
+    datagram_tx_dropped: Arc<AtomicU64>,
     reliable_tx: mpsc::Sender<ReliableInputFrame>,
     emergency_tx: mpsc::Sender<ReliableInputFrame>,
     control_tx: mpsc::Sender<AwaitedFrame<ControlFrame>>,
@@ -336,6 +421,7 @@ struct PeerTransportInner {
     awaited_write_probes: Arc<AwaitedWriteProbes>,
     #[cfg_attr(not(test), allow(dead_code))]
     worker_count: Arc<AtomicUsize>,
+    queue_probes: QosQueueProbes,
 }
 
 impl Drop for PeerTransportInner {
@@ -376,18 +462,22 @@ impl PeerTransportHandle {
         auth: Arc<PeerAuthContext>,
         connection: quinn::Connection,
         release_emitter: TerminalReleaseEmitter,
+        datagram_tx_dropped: Arc<AtomicU64>,
     ) -> Self {
-        let (reliable_tx, reliable_rx) = mpsc::channel(256);
-        let (emergency_tx, emergency_rx) = mpsc::channel(1);
-        let (control_tx, control_rx) = mpsc::channel(64);
-        let (bulk_tx, bulk_rx) = mpsc::channel(8);
-        let (telemetry_tx, telemetry_rx) = mpsc::channel(32);
+        let (reliable_tx, reliable_rx) = mpsc::channel(RELIABLE_CAPACITY);
+        let (emergency_tx, emergency_rx) = mpsc::channel(EMERGENCY_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_CAPACITY);
+        let (telemetry_tx, telemetry_rx) = mpsc::channel(TELEMETRY_CAPACITY);
         let (reliable_cancelled_through_tx, reliable_cancelled_through_rx) = watch::channel(None);
+        let realtime_capacity_bytes = connection.datagram_send_buffer_space();
         let worker_count = Arc::new(AtomicUsize::new(0));
         let awaited_write_probes = Arc::new(AwaitedWriteProbes::default());
         let inner = Arc::new(PeerTransportInner {
             auth,
             realtime_connection: Some(connection.clone()),
+            realtime_capacity_bytes,
+            datagram_tx_dropped,
             reliable_tx,
             emergency_tx,
             control_tx,
@@ -415,6 +505,7 @@ impl PeerTransportHandle {
             #[cfg(test)]
             awaited_write_probes: awaited_write_probes.clone(),
             worker_count: worker_count.clone(),
+            queue_probes: QosQueueProbes::default(),
         });
         spawn_reliable_writer(
             Arc::downgrade(&inner),
@@ -441,7 +532,7 @@ impl PeerTransportHandle {
             connection.clone(),
             LaneDiscriminator::Bulk,
             bulk_rx,
-            BulkFrame::into_message,
+            |frame| Ok(frame.into_message()),
             worker_count.clone(),
             awaited_write_probes,
         );
@@ -466,9 +557,28 @@ impl PeerTransportHandle {
         };
         let encoded = crate::codec::RealtimeInputCodec::encode(&frame)
             .map_err(|_| TransportSendError::UnsupportedMessage)?;
+        let space = connection.datagram_send_buffer_space();
+        self.inner.queue_probes.realtime_direct.observe_queued(
+            self.inner
+                .realtime_capacity_bytes
+                .saturating_sub(space)
+                .saturating_add(encoded.len()),
+            self.inner.realtime_capacity_bytes,
+        );
+        if space < encoded.len() {
+            self.inner.queue_probes.realtime_direct.overwrite();
+            self.inner
+                .datagram_tx_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
         match connection.send_datagram(encoded) {
             Ok(()) => Ok(RealtimeSendOutcome::Sent),
-            Err(_) => Ok(RealtimeSendOutcome::DroppedLatest),
+            Err(quinn::SendDatagramError::ConnectionLost(_)) => Err(TransportSendError::LaneClosed),
+            Err(
+                quinn::SendDatagramError::UnsupportedByPeer
+                | quinn::SendDatagramError::Disabled
+                | quinn::SendDatagramError::TooLarge,
+            ) => Err(TransportSendError::UnsupportedMessage),
         }
     }
 
@@ -508,9 +618,18 @@ impl PeerTransportHandle {
                 }
             }
         }
+        let reliable_capacity = self.inner.reliable_tx.max_capacity();
+        self.inner.queue_probes.reliable.observe_queued(
+            reliable_capacity - self.inner.reliable_tx.capacity() + 1,
+            reliable_capacity,
+        );
         match self.inner.reliable_tx.try_send(frame.clone()) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.inner
+                    .queue_probes
+                    .reliable
+                    .overflow(self.inner.reliable_tx.max_capacity());
                 self.fail_reliable_frame(frame)?;
                 Err(TransportSendError::ReliableLaneFull)
             }
@@ -560,37 +679,124 @@ impl PeerTransportHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            self.inner
+                .queue_probes
+                .emergency
+                .overflow(self.inner.emergency_tx.max_capacity());
             self.fail_emergency_locked(frame);
             return Err(TransportSendError::EmergencySlotFull);
         }
+        let emergency_capacity = self.inner.emergency_tx.max_capacity();
+        self.inner.queue_probes.emergency.observe_queued(
+            emergency_capacity - self.inner.emergency_tx.capacity() + 1,
+            emergency_capacity,
+        );
         self.inner
             .emergency_tx
             .try_send(frame.clone())
             .map_err(|error| {
                 self.fail_emergency_locked(frame);
                 match error {
-                    mpsc::error::TrySendError::Full(_) => TransportSendError::EmergencySlotFull,
+                    mpsc::error::TrySendError::Full(_) => {
+                        self.inner
+                            .queue_probes
+                            .emergency
+                            .overflow(self.inner.emergency_tx.max_capacity());
+                        TransportSendError::EmergencySlotFull
+                    }
                     mpsc::error::TrySendError::Closed(_) => TransportSendError::LaneClosed,
                 }
             })
     }
 
     pub async fn send_control(&self, frame: ControlFrame) -> Result<(), TransportSendError> {
+        let capacity = self.inner.control_tx.max_capacity();
+        self.inner
+            .queue_probes
+            .control
+            .observe_queued(capacity - self.inner.control_tx.capacity() + 1, capacity);
         send_awaited(&self.inner.control_tx, frame).await
     }
 
     pub async fn send_bulk(&self, frame: BulkFrame) -> Result<(), TransportSendError> {
+        let capacity = self.inner.bulk_tx.max_capacity();
+        self.inner
+            .queue_probes
+            .bulk
+            .observe_queued(capacity - self.inner.bulk_tx.capacity() + 1, capacity);
         send_awaited(&self.inner.bulk_tx, frame).await
     }
 
     pub fn try_send_telemetry(&self, frame: TelemetryFrame) -> Result<(), TransportSendError> {
+        let telemetry_capacity = self.inner.telemetry_tx.max_capacity();
+        self.inner.queue_probes.telemetry.observe_queued(
+            telemetry_capacity - self.inner.telemetry_tx.capacity() + 1,
+            telemetry_capacity,
+        );
         self.inner
             .telemetry_tx
             .try_send(frame)
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => TransportSendError::TelemetryLaneFull,
+                mpsc::error::TrySendError::Full(_) => {
+                    self.inner
+                        .queue_probes
+                        .telemetry
+                        .overflow(self.inner.telemetry_tx.max_capacity());
+                    TransportSendError::TelemetryLaneFull
+                }
                 mpsc::error::TrySendError::Closed(_) => TransportSendError::LaneClosed,
             })
+    }
+
+    pub fn queue_diagnostics(&self) -> BTreeMap<String, QosQueueDiagnostics> {
+        BTreeMap::from([
+            (
+                "realtime_direct".into(),
+                self.inner
+                    .queue_probes
+                    .realtime_direct
+                    .snapshot(self.inner.realtime_capacity_bytes),
+            ),
+            (
+                "reliable".into(),
+                self.inner
+                    .queue_probes
+                    .reliable
+                    .snapshot(self.inner.reliable_tx.max_capacity()),
+            ),
+            (
+                "emergency".into(),
+                self.inner
+                    .queue_probes
+                    .emergency
+                    .snapshot(self.inner.emergency_tx.max_capacity()),
+            ),
+            (
+                "control".into(),
+                self.inner
+                    .queue_probes
+                    .control
+                    .snapshot(self.inner.control_tx.max_capacity()),
+            ),
+            (
+                "bulk".into(),
+                self.inner
+                    .queue_probes
+                    .bulk
+                    .snapshot(self.inner.bulk_tx.max_capacity()),
+            ),
+            (
+                "telemetry".into(),
+                self.inner
+                    .queue_probes
+                    .telemetry
+                    .snapshot(self.inner.telemetry_tx.max_capacity()),
+            ),
+            (
+                "terminal_release".into(),
+                self.inner.release_emitter.queue_diagnostics(),
+            ),
+        ])
     }
 
     pub fn is_tombstoned(&self, epoch: SessionEpoch) -> bool {
@@ -816,8 +1022,8 @@ impl BulkFrame {
         }
     }
 
-    fn into_message(self) -> Result<Message, TransportSendError> {
-        Ok(self.message)
+    pub fn into_message(self) -> Message {
+        self.message
     }
 }
 
@@ -1606,6 +1812,8 @@ fn fixture_handle(
             inner: Arc::new(PeerTransportInner {
                 auth,
                 realtime_connection: None,
+                realtime_capacity_bytes: 0,
+                datagram_tx_dropped: Arc::new(AtomicU64::new(0)),
                 reliable_tx,
                 emergency_tx,
                 control_tx,
@@ -1633,6 +1841,7 @@ fn fixture_handle(
                 #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
+                queue_probes: QosQueueProbes::default(),
             }),
         },
         QosProbe {
@@ -1693,6 +1902,8 @@ fn fixture_handle_with_stalled_emergency() -> (
             inner: Arc::new(PeerTransportInner {
                 auth,
                 realtime_connection: None,
+                realtime_capacity_bytes: 0,
+                datagram_tx_dropped: Arc::new(AtomicU64::new(0)),
                 reliable_tx,
                 emergency_tx,
                 control_tx,
@@ -1720,6 +1931,7 @@ fn fixture_handle_with_stalled_emergency() -> (
                 #[cfg(test)]
                 awaited_write_probes: Arc::new(AwaitedWriteProbes::default()),
                 worker_count: Arc::new(AtomicUsize::new(0)),
+                queue_probes: QosQueueProbes::default(),
             }),
         },
         QosProbe {
@@ -2041,6 +2253,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_diagnostics_report_actual_capacity_high_watermark_and_overflow() {
+        let (handle, _probe, _releases) = fixture_handle(1);
+        handle
+            .try_send_telemetry(TelemetryFrame::latency_probe(1, 2, false, None))
+            .unwrap();
+        assert_eq!(
+            handle.try_send_telemetry(TelemetryFrame::latency_probe(3, 4, false, None)),
+            Err(TransportSendError::TelemetryLaneFull)
+        );
+
+        let telemetry = handle.queue_diagnostics()["telemetry"];
+        assert_eq!(telemetry.capacity, 1);
+        assert_eq!(telemetry.high_watermark, 1);
+        assert_eq!(telemetry.overflows, 1);
+    }
+
+    #[tokio::test]
     async fn occupied_emergency_slot_fails_closed_with_typed_release() {
         let (handle, _reliable, _stalled_emergency, mut releases) =
             fixture_handle_with_stalled_emergency();
@@ -2253,6 +2482,16 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(emitter.worker_count_for_test(), 1);
         assert!(emitter.backlog_for_test() <= 2);
+        assert_eq!(
+            emitter.queue_diagnostics(),
+            QosQueueDiagnostics {
+                capacity: 10,
+                high_watermark: 10,
+                overwrites: 998,
+                overflows: 0,
+            },
+            "terminal release diagnostics must include the target, in-flight send, and latest slot"
+        );
         for epoch in 10..18 {
             assert_eq!(rx.recv().await.unwrap().epoch, SessionEpoch(epoch));
         }
@@ -2411,9 +2650,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_emitter_cancels_worker_blocked_on_full_target() {
+    async fn dropping_emitter_preserves_release_blocked_on_full_target() {
         let auth = fixture_auth(DeviceId::new_v4(), ControlConnectionId::new());
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
         tx.send(TerminalReleaseEvent {
             auth: auth.clone(),
             epoch: SessionEpoch(1),
@@ -2437,12 +2676,14 @@ mod tests {
 
         let workers = emitter.workers.clone();
         drop(emitter);
+        assert_eq!(rx.recv().await.unwrap().epoch, SessionEpoch(1));
+        assert_eq!(rx.recv().await.unwrap().epoch, SessionEpoch(2));
         timeout(Duration::from_secs(1), async {
             while workers.load(Ordering::Acquire) != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("closing the watch sender must cancel the blocked worker");
+        .expect("the worker must stop after delivering the final blocked release");
     }
 }

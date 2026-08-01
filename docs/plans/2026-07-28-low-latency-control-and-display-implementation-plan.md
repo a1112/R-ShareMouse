@@ -2825,17 +2825,38 @@ git commit -m "perf: stream compressed display previews as binary"
 **Files:**
 - Modify: `apps/rshare-desktop-frontend/package.json`
 - Modify: `apps/rshare-desktop-frontend/package-lock.json`
+- Modify: `apps/rshare-desktop-frontend/src/app/App.tsx`
+- Modify: `apps/rshare-desktop-frontend/src/app/use-ui-store.ts`
+- Modify: `apps/rshare-desktop/src-tauri/gen/schemas/acl-manifests.json`
+- Modify: `apps/rshare-desktop/src-tauri/gen/schemas/desktop-schema.json`
+- Modify: `apps/rshare-desktop/src-tauri/gen/schemas/windows-schema.json`
+- Modify: `apps/rshare-daemon/src/input_runtime.rs`
+- Modify: `apps/rshare-daemon/src/main.rs`
+- Modify: `apps/rshare-daemon/tests/input_pipeline_integration.rs`
+- Modify: `crates/rshare-net/src/connection.rs`
+- Modify: `crates/rshare-net/src/network_manager.rs`
+- Modify: `crates/rshare-net/src/qos.rs`
+- Modify: `crates/rshare-net/src/transport.rs`
+- Modify: `perf/baselines/schema.json`
+- Modify: `tools/rshare-perf/src/compare.rs`
+- Modify: `tools/rshare-perf/src/ipc.rs`
+- Modify: `tools/rshare-perf/src/main.rs`
+- Modify: `tools/rshare-perf/src/quic.rs`
+- Modify: `tools/rshare-perf/src/report.rs`
 - Create: `apps/rshare-desktop-frontend/playwright.perf.config.mjs`
 - Create: `apps/rshare-desktop-frontend/tests/performance/ui-state.spec.mjs`
 - Create: `scripts/perf/run-phase1.ps1`
 - Create: `scripts/perf/collect-runner-fingerprint.ps1`
 - Create: `docs/performance/phase1-windows-validation.md`
+- Create: `.gitattributes`
 - Create: `.github/workflows/performance-smoke.yml`
 - Create: `.github/workflows/performance-nightly-windows.yml`
 
 **Step 1: Write a failing UI performance scenario**
 
-The Playwright scenario must feed 1000 Hz pointer deltas for ten seconds plus 100 discrete transitions and record:
+The Playwright scenario must feed 1000 Hz pointer deltas for ten seconds plus
+100 discrete transitions and record real React committed-paint observations
+from a passive effect:
 
 - event-to-paint p50/p95/p99/max;
 - React/topology commit counts;
@@ -2874,7 +2895,7 @@ Add `@playwright/test = "1.55.0"` as a dev dependency and a `test:perf` script u
 2. run all Rust correctness suites with `--locked`;
 3. run QUIC 1000 Hz, slow/fast peer, and IPC harnesses as one exactly-five-run batch;
 4. run the UI Playwright scenario as one exactly-five-run batch;
-5. write every raw JSON plus a combined summary with one batch id and the reproducibility fields from Task 2;
+5. write every raw JSON plus the per-run latency samples and a combined summary with one batch id and the reproducibility fields from Task 2;
 6. require a reviewed matching-runner baseline resolved and hash-verified through `perf/baselines/manifest.toml`, then compare through `rshare-perf compare --baseline-id ...`;
 7. return nonzero on correctness loss, queue-bound violation, or threshold failure.
 
@@ -2888,9 +2909,27 @@ Hosted CI adds:
 
 `performance-nightly-windows.yml` runs only on `[self-hosted, Windows, X64, rshare-perf]`, prevents overlapping jobs, uses `cargo --locked`/`npm ci`, records power plan/CPU affinity/runner fingerprint, warms 30 seconds, and runs exactly five complete same-config runs. It requires a matching baseline manifest entry from the protected default branch, verifies artifact/config hashes and the merged approval PR as specified in Task 2, and uploads all raw histograms. With CV >10%, it archives the whole unstable batch and reruns the entire five-run batch once; it never drops or selectively replaces a run. A second unstable batch fails. It restores the original power plan in `finally`; workflow code never auto-updates a baseline to match a regression.
 
-Bootstrap mode may generate a candidate exactly-five-run artifact but must return `PENDING_BASELINE`, never PASS. Put that artifact and its manifest entry through the dedicated reviewed/merged baseline checkpoint described under Delivery Map, then rerun this task in strict mode from the updated protected branch. The strict rerun—not the candidate-producing run—is the Phase 1 gate.
+Bootstrap mode may generate a candidate exactly-five-run artifact but must
+return `PENDING_BASELINE`, never PASS. It writes a repository-shaped
+`baseline-package` containing the canonical report, at least one nonempty raw
+sidecar envelope, and an exact `manifest-entry.toml.template` whose hashes
+refer to the packaged LF-normalized files. Promotion replaces only the
+template's PR-reference placeholder. Put that package through the dedicated
+reviewed/merged baseline checkpoint described under Delivery Map, then rerun
+this task in strict mode from the updated protected branch. The strict
+rerun—not the candidate-producing run—is the Phase 1 gate.
 
-**Step 4: Run the complete Phase 1 gate**
+**Step 4: Commit the implementation**
+
+Both Bootstrap and Strict reject a dirty worktree. Commit Task 20 before
+measurement so every artifact is bound to one immutable implementation commit:
+
+```powershell
+git add .gitattributes apps/rshare-daemon/src/input_runtime.rs apps/rshare-daemon/src/main.rs apps/rshare-daemon/tests/input_pipeline_integration.rs apps/rshare-desktop-frontend/package.json apps/rshare-desktop-frontend/package-lock.json apps/rshare-desktop-frontend/src/app/App.tsx apps/rshare-desktop-frontend/src/app/use-ui-store.ts apps/rshare-desktop-frontend/playwright.perf.config.mjs apps/rshare-desktop-frontend/tests/performance apps/rshare-desktop/src-tauri/gen/schemas/acl-manifests.json apps/rshare-desktop/src-tauri/gen/schemas/desktop-schema.json apps/rshare-desktop/src-tauri/gen/schemas/windows-schema.json crates/rshare-net/src/connection.rs crates/rshare-net/src/network_manager.rs crates/rshare-net/src/qos.rs crates/rshare-net/src/transport.rs perf/baselines/schema.json tools/rshare-perf/src/compare.rs tools/rshare-perf/src/ipc.rs tools/rshare-perf/src/main.rs tools/rshare-perf/src/quic.rs tools/rshare-perf/src/report.rs scripts/perf/run-phase1.ps1 scripts/perf/collect-runner-fingerprint.ps1 docs/performance/phase1-windows-validation.md docs/plans/2026-07-28-low-latency-control-and-display-implementation-plan.md .github/workflows/performance-smoke.yml .github/workflows/performance-nightly-windows.yml
+git commit -m "test: gate low latency control and ui state"
+```
+
+**Step 5: Run the complete Phase 1 gate**
 
 Run:
 
@@ -2912,12 +2951,11 @@ Expected for the single-machine Phase 1 gate:
 
 Label results `loopback`. Record 3/6/10 ms mouse and 8/15 ms reliable targets as informational only here; the wired two-machine absolute SLO is finalized exclusively in Task 30. An unstable or unavailable metric cannot pass.
 
-**Step 5: Commit**
-
-```powershell
-git add apps/rshare-desktop-frontend/package.json apps/rshare-desktop-frontend/package-lock.json apps/rshare-desktop-frontend/playwright.perf.config.mjs apps/rshare-desktop-frontend/tests/performance scripts/perf/run-phase1.ps1 scripts/perf/collect-runner-fingerprint.ps1 docs/performance/phase1-windows-validation.md .github/workflows/performance-smoke.yml .github/workflows/performance-nightly-windows.yml
-git commit -m "test: gate low latency control and ui state"
-```
+Bootstrap must package all six scenario candidates into one dedicated draft
+baseline PR. After its real PR number is substituted into all six templates,
+merge the approved baseline PR, update/rebase onto the protected branch, and
+run Strict from the resulting clean worktree. Bootstrap remains
+`PENDING_BASELINE`; only that Strict rerun may pass Task 20.
 
 ### Task 21: Scaffold `rshare-media` Contracts and Bounded Newest-Frame Queues
 

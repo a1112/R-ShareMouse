@@ -69,6 +69,7 @@ pub struct PerfRun {
     pub scenario_config_sha256: String,
     pub metrics: BTreeMap<String, f64>,
     pub counters: BTreeMap<String, u64>,
+    pub raw_samples: BTreeMap<String, Vec<f64>>,
     pub errors: Vec<String>,
 }
 
@@ -186,6 +187,30 @@ impl ScenarioContract {
                 ],
                 vec!["rshare-daemon", "rshare-perf"],
             ),
+            "daemon-framed-ipc" => (
+                vec![
+                    ("sequential_median_us", MetricDirection::LowerIsBetter),
+                    ("sequential_p95_us", MetricDirection::LowerIsBetter),
+                    ("sequential_p99_us", MetricDirection::LowerIsBetter),
+                    ("concurrent8_median_us", MetricDirection::LowerIsBetter),
+                    ("concurrent8_p95_us", MetricDirection::LowerIsBetter),
+                    ("concurrent8_p99_us", MetricDirection::LowerIsBetter),
+                ],
+                vec!["rshare-perf"],
+            ),
+            "desktop-ui-state" => (
+                vec![
+                    ("paint_p50_ms", MetricDirection::LowerIsBetter),
+                    ("paint_p95_ms", MetricDirection::LowerIsBetter),
+                    ("paint_p99_ms", MetricDirection::LowerIsBetter),
+                    ("paint_max_ms", MetricDirection::LowerIsBetter),
+                    ("topology_status_p50_ms", MetricDirection::LowerIsBetter),
+                    ("topology_status_p95_ms", MetricDirection::LowerIsBetter),
+                    ("topology_status_p99_ms", MetricDirection::LowerIsBetter),
+                    ("topology_status_max_ms", MetricDirection::LowerIsBetter),
+                ],
+                vec!["rshare-desktop-frontend"],
+            ),
             "desktop-control" | "windows-media" => (
                 vec![
                     ("median_us", MetricDirection::LowerIsBetter),
@@ -270,6 +295,10 @@ pub enum ReportError {
     InvalidMetricValue { location: String, metric: String },
     #[error("run {run_id} is missing counter {counter}")]
     MissingCounter { run_id: String, counter: String },
+    #[error("run {run_id} has no raw latency samples")]
+    MissingRawSamples { run_id: String },
+    #[error("run {run_id} raw samples do not reproduce metric {metric}")]
+    RawSampleMetricMismatch { run_id: String, metric: String },
     #[error("invalid reproducibility field: {field}")]
     InvalidFingerprint { field: String },
     #[error("JSON schema validation failed: {reason}")]
@@ -381,6 +410,14 @@ impl PerfReport {
                     reason: run.errors.join("; "),
                 });
             }
+            if run.raw_samples.is_empty()
+                || run.raw_samples.values().any(|samples| samples.is_empty())
+            {
+                return Err(ReportError::MissingRawSamples {
+                    run_id: run.run_id.clone(),
+                });
+            }
+            self.validate_raw_samples(run)?;
             if run.scenario_config_sha256 != self.scenario_config_sha256 {
                 return Err(ReportError::ScenarioConfigMismatch {
                     run_id: run.run_id.clone(),
@@ -416,6 +453,131 @@ impl PerfReport {
                         run_id: run.run_id.clone(),
                         counter: counter.clone(),
                     });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_raw_samples(&self, run: &PerfRun) -> Result<(), ReportError> {
+        let required = match self.scenario.as_str() {
+            "quic-control-v3" | "daemon-control" | "desktop-control" | "windows-media" => {
+                vec!["latency_us"]
+            }
+            "daemon-framed-ipc" => {
+                vec!["sequential_latency_us", "concurrent8_latency_us"]
+            }
+            "desktop-ui-state" => vec!["paint_ms", "topology_status_ms"],
+            _ => vec![],
+        };
+        for name in required {
+            if !run
+                .raw_samples
+                .get(name)
+                .is_some_and(|samples| !samples.is_empty())
+            {
+                return Err(ReportError::MissingRawSamples {
+                    run_id: run.run_id.clone(),
+                });
+            }
+        }
+        if run.metrics.contains_key("slow_send_p99_us")
+            && !run
+                .raw_samples
+                .get("slow_send_us")
+                .is_some_and(|samples| !samples.is_empty())
+        {
+            return Err(ReportError::MissingRawSamples {
+                run_id: run.run_id.clone(),
+            });
+        }
+        for samples in run.raw_samples.values() {
+            if samples
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return Err(ReportError::MissingRawSamples {
+                    run_id: run.run_id.clone(),
+                });
+            }
+        }
+
+        let mappings: &[(&str, &[(&str, f64)])] = &[
+            (
+                "latency_us",
+                &[
+                    ("median_us", 0.50),
+                    ("p95_us", 0.95),
+                    ("p99_us", 0.99),
+                    ("fast_peer_p99_us", 0.99),
+                ],
+            ),
+            ("slow_send_us", &[("slow_send_p99_us", 0.99)]),
+            (
+                "sequential_latency_us",
+                &[
+                    ("sequential_median_us", 0.50),
+                    ("sequential_p95_us", 0.95),
+                    ("sequential_p99_us", 0.99),
+                ],
+            ),
+            (
+                "concurrent8_latency_us",
+                &[
+                    ("concurrent8_median_us", 0.50),
+                    ("concurrent8_p95_us", 0.95),
+                    ("concurrent8_p99_us", 0.99),
+                ],
+            ),
+            (
+                "paint_ms",
+                &[
+                    ("paint_p50_ms", 0.50),
+                    ("paint_p95_ms", 0.95),
+                    ("paint_p99_ms", 0.99),
+                ],
+            ),
+            (
+                "topology_status_ms",
+                &[
+                    ("topology_status_p50_ms", 0.50),
+                    ("topology_status_p95_ms", 0.95),
+                    ("topology_status_p99_ms", 0.99),
+                ],
+            ),
+        ];
+        for (sample_name, metrics) in mappings {
+            let Some(samples) = run.raw_samples.get(*sample_name) else {
+                continue;
+            };
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            for (metric_name, quantile) in *metrics {
+                let Some(actual) = run.metrics.get(*metric_name) else {
+                    continue;
+                };
+                let expected = percentile(&sorted, *quantile);
+                if (*actual - expected).abs() > 1e-9 {
+                    return Err(ReportError::RawSampleMetricMismatch {
+                        run_id: run.run_id.clone(),
+                        metric: (*metric_name).into(),
+                    });
+                }
+            }
+            let max_metric = match *sample_name {
+                "paint_ms" => Some("paint_max_ms"),
+                "topology_status_ms" => Some("topology_status_max_ms"),
+                _ => None,
+            };
+            if let Some(metric_name) = max_metric {
+                if let Some(actual) = run.metrics.get(metric_name) {
+                    let expected = sorted.last().copied().unwrap_or(0.0);
+                    if (*actual - expected).abs() > 1e-9 {
+                        return Err(ReportError::RawSampleMetricMismatch {
+                            run_id: run.run_id.clone(),
+                            metric: metric_name.into(),
+                        });
+                    }
                 }
             }
         }
@@ -762,6 +924,13 @@ mod tests {
 
         let daemon = ScenarioContract::for_scenario("daemon-control").unwrap();
         assert_eq!(daemon.binary_roles, vec!["rshare-daemon", "rshare-perf"]);
+        let ipc = ScenarioContract::for_scenario("daemon-framed-ipc").unwrap();
+        assert_eq!(ipc.binary_roles, vec!["rshare-perf"]);
+        assert!(ipc.metrics.contains(&"concurrent8_p99_us".into()));
+        let ui = ScenarioContract::for_scenario("desktop-ui-state").unwrap();
+        assert_eq!(ui.binary_roles, vec!["rshare-desktop-frontend"]);
+        assert!(ui.metrics.contains(&"paint_p99_ms".into()));
+        assert!(ui.metrics.contains(&"topology_status_p99_ms".into()));
         assert!(ScenarioContract::for_scenario("unknown").is_err());
     }
 
@@ -802,6 +971,33 @@ mod tests {
         value["runs"][0]["metrics"]["latency_us"] = json!(-1.0);
 
         assert!(validate_json_schema(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn repository_schema_and_complete_validation_require_raw_samples() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
+        let mut value = serde_json::to_value(valid_report()).unwrap();
+        value["runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("raw_samples");
+        assert!(validate_json_schema(&value, &schema).is_err());
+
+        let mut report = valid_report();
+        report.runs[0].raw_samples.clear();
+        assert!(report.validate_complete(&required_contract()).is_err());
+    }
+
+    #[test]
+    fn raw_sample_validation_recomputes_metrics() {
+        let mut report = valid_report();
+        report.runs[0].metrics.insert("median_us".into(), 101.0);
+        assert!(matches!(
+            report.validate_raw_samples(&report.runs[0]),
+            Err(ReportError::RawSampleMetricMismatch { ref metric, .. })
+                if metric == "median_us"
+        ));
     }
 
     #[test]
@@ -874,6 +1070,7 @@ mod tests {
                 scenario_config_sha256: "config".into(),
                 metrics: run_metrics.clone(),
                 counters: counters.clone(),
+                raw_samples: BTreeMap::from([("latency_us".into(), vec![100.0])]),
                 errors: vec![],
             })
             .collect();

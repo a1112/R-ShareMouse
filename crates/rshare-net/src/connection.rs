@@ -12,7 +12,7 @@ use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
 use super::qos::{
-    ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
+    BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
     TerminalReleaseEvent, TransportSendError,
 };
 use super::transport::{
@@ -92,6 +92,10 @@ pub enum ManagerEvent {
     TelemetryReceived {
         auth: Arc<super::handshake::PeerAuthContext>,
         frame: TelemetryFrame,
+    },
+    BulkReceived {
+        auth: Arc<super::handshake::PeerAuthContext>,
+        frame: BulkFrame,
     },
     ProtocolError {
         auth: Arc<super::handshake::PeerAuthContext>,
@@ -545,6 +549,43 @@ fn spawn_telemetry_event_reader(
     });
 }
 
+fn spawn_bulk_event_reader(
+    auth: Arc<super::handshake::PeerAuthContext>,
+    generation: u64,
+    mut bulk: mpsc::Receiver<BulkFrame>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    connections: CanonicalConnections,
+    lifecycle_lock: Arc<TokioMutex<()>>,
+) {
+    tokio::spawn(async move {
+        if !wait_for_connected_generation(&connections, auth.peer_id, generation).await {
+            return;
+        }
+        while let Some(frame) = bulk.recv().await {
+            let permit = event_tx.reserve().await.ok();
+            let _lifecycle = lifecycle_lock.lock().await;
+            if !is_current_generation(&connections, auth.peer_id, generation)
+                || !connections
+                    .read()
+                    .expect("canonical connection registry poisoned")
+                    .get(&auth.peer_id)
+                    .is_some_and(|connection| {
+                        connection.info.control_connection_id == Some(auth.control_connection_id)
+                    })
+            {
+                return;
+            }
+            let Some(permit) = permit else {
+                return;
+            };
+            permit.send(ManagerEvent::BulkReceived {
+                auth: auth.clone(),
+                frame,
+            });
+        }
+    });
+}
+
 fn spawn_protocol_error_reader(
     generation: u64,
     mut errors: mpsc::Receiver<TransportProtocolError>,
@@ -834,6 +875,11 @@ impl ConnectionManager {
                     .expect("incoming connection candidate must be present")
                     .take_telemetry_events()
                     .expect("authenticated QoS install must expose telemetry events");
+                let bulk_events = candidate_connection
+                    .as_mut()
+                    .expect("incoming connection candidate must be present")
+                    .take_bulk_events()
+                    .expect("authenticated QoS install must expose bulk events");
                 let protocol_errors = candidate_connection
                     .as_mut()
                     .expect("incoming connection candidate must be present")
@@ -976,6 +1022,14 @@ impl ConnectionManager {
                     connections.clone(),
                     lifecycle_lock.clone(),
                 );
+                spawn_bulk_event_reader(
+                    auth.clone(),
+                    generation,
+                    bulk_events,
+                    event_tx.clone(),
+                    connections.clone(),
+                    lifecycle_lock.clone(),
+                );
                 spawn_protocol_error_reader(
                     generation,
                     protocol_errors,
@@ -1058,6 +1112,9 @@ impl ConnectionManager {
         let telemetry_events = conn
             .take_telemetry_events()
             .expect("authenticated QoS install must expose telemetry events");
+        let bulk_events = conn
+            .take_bulk_events()
+            .expect("authenticated QoS install must expose bulk events");
         let protocol_errors = conn
             .take_protocol_errors()
             .expect("authenticated QoS install must expose protocol errors");
@@ -1167,6 +1224,14 @@ impl ConnectionManager {
             auth.clone(),
             generation,
             telemetry_events,
+            self.event_tx.clone(),
+            self.connections.clone(),
+            self.lifecycle_lock.clone(),
+        );
+        spawn_bulk_event_reader(
+            auth.clone(),
+            generation,
+            bulk_events,
             self.event_tx.clone(),
             self.connections.clone(),
             self.lifecycle_lock.clone(),

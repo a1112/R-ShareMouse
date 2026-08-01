@@ -1,7 +1,9 @@
 import {
   createContext,
+  memo,
   useContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -38,6 +40,83 @@ import MonitorManager, {
   MonitorData,
 } from "./components/MonitorManager";
 import MobileController from "./MobileController";
+
+const TopologyCommitProbe = memo(function TopologyCommitProbe() {
+  const topology = useUiStore(selectTopologyProjection);
+  useLayoutEffect(() => {
+    (
+      globalThis as typeof globalThis & {
+        __rsharePerfRecordTopologyCommit?: () => void;
+      }
+    ).__rsharePerfRecordTopologyCommit?.();
+  }, [topology]);
+  return null;
+});
+
+const PaintCommitProbe = memo(function PaintCommitProbe() {
+  const input = useUiStore(selectInputVisuals);
+  const topology = useUiStore(selectTopologyProjection);
+  const status = useUiStore((state) => state.connections.status);
+
+  useEffect(() => {
+    const observedAt = Number(input.pointer?.observed_at_ms);
+    if (Number.isFinite(observedAt)) {
+      (
+        globalThis as typeof globalThis & {
+          __rsharePerfRecordInputPaint?: (observedAt: number) => void;
+        }
+      ).__rsharePerfRecordInputPaint?.(observedAt);
+    }
+    const transitionObservedAt = Number(
+      input.lastDiscreteTransition?.observed_at_ms,
+    );
+    const transitionSequence = Number(
+      input.lastDiscreteTransition?.perf_sequence,
+    );
+    if (
+      Number.isFinite(transitionObservedAt) &&
+      Number.isInteger(transitionSequence)
+    ) {
+      (
+        globalThis as typeof globalThis & {
+          __rsharePerfRecordDiscretePaint?: (
+            observedAt: number,
+            sequence: number,
+          ) => void;
+        }
+      ).__rsharePerfRecordDiscretePaint?.(
+        transitionObservedAt,
+        transitionSequence,
+      );
+    }
+  }, [input]);
+
+  useEffect(() => {
+    const observedAt = Number(topology.layout?.observed_at_ms);
+    if (!Number.isFinite(observedAt)) return;
+    (
+      globalThis as typeof globalThis & {
+        __rsharePerfRecordTopologyStatusPaint?: (
+          observedAt: number,
+        ) => void;
+      }
+    ).__rsharePerfRecordTopologyStatusPaint?.(observedAt);
+  }, [topology]);
+
+  useEffect(() => {
+    const observedAt = Number(status?.observed_at_ms);
+    if (!Number.isFinite(observedAt)) return;
+    (
+      globalThis as typeof globalThis & {
+        __rsharePerfRecordTopologyStatusPaint?: (
+          observedAt: number,
+        ) => void;
+      }
+    ).__rsharePerfRecordTopologyStatusPaint?.(observedAt);
+  }, [status]);
+
+  return null;
+});
 import {
   buildDesktopViewModel,
   buildDisplaySettingsViewModel,
@@ -2048,6 +2127,13 @@ export default function App() {
 }
 
 function DesktopApp() {
+  const performanceProbesEnabled =
+    typeof window !== "undefined" &&
+    (
+      window as Window & {
+        __rsharePerfEnableStoreAccess?: boolean;
+      }
+    ).__rsharePerfEnableStoreAccess === true;
   usePreventBrowserNavigationEvents();
 
   const [page, setPage] = useState<DesktopPage>("layout");
@@ -2823,6 +2909,12 @@ function DesktopApp() {
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {performanceProbesEnabled ? (
+          <>
+            <TopologyCommitProbe />
+            <PaintCommitProbe />
+          </>
+        ) : null}
         {error ? (
           <section
             className="mx-4 mt-3 px-4 py-3 text-sm"

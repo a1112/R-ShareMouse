@@ -649,17 +649,32 @@ async fn run_peer_input_lanes(
     let PeerInbound {
         mut realtime_rx,
         mut reliable_input_rx,
-        control_rx,
-        telemetry_rx,
-        bulk_rx,
+        mut control_rx,
+        mut telemetry_rx,
+        mut bulk_rx,
         ..
     } = peer;
-    // Task-10 still mirrors non-input traffic through NetworkEvent. Closing
-    // these unused typed receivers prevents their bounded queues from
-    // backpressuring the dedicated input lanes.
-    drop(control_rx);
-    drop(telemetry_rx);
-    drop(bulk_rx);
+    // Task-10 mirrors non-input traffic through NetworkEvent. Keep draining
+    // the peer-owned copies so the bounded transport queues remain open and
+    // cannot stop the authoritative event mirrors or interfere with input.
+    let non_input_drain = tokio::spawn(async move {
+        let mut control_open = true;
+        let mut telemetry_open = true;
+        let mut bulk_open = true;
+        while control_open || telemetry_open || bulk_open {
+            tokio::select! {
+                value = control_rx.recv(), if control_open => {
+                    control_open = value.is_some();
+                }
+                value = telemetry_rx.recv(), if telemetry_open => {
+                    telemetry_open = value.is_some();
+                }
+                value = bulk_rx.recv(), if bulk_open => {
+                    bulk_open = value.is_some();
+                }
+            }
+        }
+    });
     let mut active_epoch = None;
     let mut terminal_epoch = None;
     let mut realtime_open = true;
@@ -687,6 +702,13 @@ async fn run_peer_input_lanes(
         };
         let Some(frame) = frame else {
             continue;
+        };
+        let frame = match frame {
+            PeerInputFrame::Realtime(frame) => {
+                let (latest, _) = realtime_rx.drain_latest(frame);
+                PeerInputFrame::Realtime(latest)
+            }
+            reliable => reliable,
         };
         if !is_current_generation(&generations, owner) {
             continue;
@@ -740,6 +762,8 @@ async fn run_peer_input_lanes(
             );
         }
     }
+    non_input_drain.abort();
+    let _ = non_input_drain.await;
 }
 
 enum PeerInputFrame {
