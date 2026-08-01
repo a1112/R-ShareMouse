@@ -74,6 +74,12 @@ recovery is instead a per-run bounded correctness metric (every run must be at
 or below 20 ms): its normal 1 us timer quantization around a near-zero loopback
 result must not create a meaningless high CV.
 
+The fixed Phase 1 IPC measurement uses 5000 requests per persistent connection
+(5000 sequential and 8x5000 concurrent). This gives p99 enough tail samples for
+the 10% CV policy. IPC `max_us` remains preserved in raw evidence and guarded by
+the catastrophe limits, but it is not a baseline-comparative metric and does not
+participate in the batch CV decision.
+
 ## Reviewed baseline authority
 
 Strict mode resolves a matching scenario/configuration and runner fingerprint

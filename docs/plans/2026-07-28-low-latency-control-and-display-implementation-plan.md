@@ -2893,7 +2893,7 @@ Add `@playwright/test = "1.55.0"` as a dev dependency and a `test:perf` script u
 
 1. set a caller-selected output directory;
 2. run all Rust correctness suites with `--locked`;
-3. run QUIC 1000 Hz, slow/fast peer, and IPC harnesses as one exactly-five-run batch;
+3. run QUIC 1000 Hz, slow/fast peer, and IPC harnesses as one exactly-five-run batch; the fixed Phase 1 IPC gate uses 5000 requests per persistent connection so p99 is based on enough tail samples, while `max_us` is retained as catastrophe evidence but excluded from comparative CV;
 4. run the UI Playwright scenario as one exactly-five-run batch;
 5. write every raw JSON plus the per-run latency samples and a combined summary with one batch id and the reproducibility fields from Task 2;
 6. require a reviewed matching-runner baseline resolved and hash-verified through `perf/baselines/manifest.toml`, then compare through `rshare-perf compare --baseline-id ...`;

@@ -15,6 +15,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $RunCount = 5
+$IpcRequestsPerConnection = 5000
+$IpcComparativeMetrics = @('median_us', 'p95_us', 'p99_us')
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $phase1BatchId = [Guid]::NewGuid().ToString('D')
@@ -544,14 +546,21 @@ function Assert-IpcRawReport {
     if ($sequential.Count -ne 1 -or $concurrent.Count -ne 1) {
         throw 'IPC harness did not report exactly concurrency 1 and 8'
     }
-    if ([int]$sequential[0].completed_requests -ne 500 -or [int]$sequential[0].handler_dispatches -ne 500) {
+    $expectedSequentialRequests = $IpcRequestsPerConnection
+    $expectedConcurrentRequests = 8 * $IpcRequestsPerConnection
+    if ([int]$Report.requests_per_connection -ne $IpcRequestsPerConnection) {
+        throw "IPC harness reported $($Report.requests_per_connection) requests per connection; expected $IpcRequestsPerConnection"
+    }
+    if ([int]$sequential[0].completed_requests -ne $expectedSequentialRequests -or
+        [int]$sequential[0].handler_dispatches -ne $expectedSequentialRequests) {
         throw 'IPC sequential run was incomplete'
     }
-    if ([int]$concurrent[0].completed_requests -ne 4000 -or [int]$concurrent[0].handler_dispatches -ne 4000) {
+    if ([int]$concurrent[0].completed_requests -ne $expectedConcurrentRequests -or
+        [int]$concurrent[0].handler_dispatches -ne $expectedConcurrentRequests) {
         throw 'IPC concurrency-8 run was incomplete'
     }
-    if (@($sequential[0].latency_samples_us).Count -ne 500 -or
-        @($concurrent[0].latency_samples_us).Count -ne 4000) {
+    if (@($sequential[0].latency_samples_us).Count -ne $expectedSequentialRequests -or
+        @($concurrent[0].latency_samples_us).Count -ne $expectedConcurrentRequests) {
         throw 'IPC raw latency samples are incomplete'
     }
     if ([UInt64]$sequential[0].p99_us -gt 100000) {
@@ -606,7 +615,7 @@ function Get-IpcBatchVariation {
 
     $variation = [ordered]@{}
     foreach ($concurrency in @(1, 8)) {
-        foreach ($metric in @('median_us', 'p95_us', 'p99_us', 'max_us')) {
+        foreach ($metric in $IpcComparativeMetrics) {
             $values = @($RunReports | ForEach-Object {
                 $row = @($_.runs | Where-Object { [int]$_.concurrency -eq $concurrency })
                 if ($row.Count -ne 1) {
@@ -888,7 +897,7 @@ try {
             $logPath = Join-Path $logDirectory "ipc-batch-$attempt-run-$runIndex.log"
             Invoke-LoggedCommand -FilePath 'cargo.exe' -Arguments @(
                 'run', '--release', '--locked', '-p', 'rshare-perf', '--',
-                'ipc', '--requests', '500', '--concurrency', '1,8', '--output', $toolOutputPath
+                'ipc', '--requests', $IpcRequestsPerConnection, '--concurrency', '1,8', '--output', $toolOutputPath
             ) -LogPath $logPath
             $ipcReport = Get-Content -LiteralPath $toolOutputPath -Raw | ConvertFrom-Json
             Assert-IpcRawReport -Report $ipcReport
@@ -1027,7 +1036,7 @@ try {
     $ipcCandidatePath = Join-Path $candidateDirectory 'daemon-framed-ipc.json'
     $ipcCandidate = New-Phase1Candidate `
         -Scenario 'daemon-framed-ipc' `
-        -ScenarioParameters ([ordered]@{ concurrency = @(1, 8); requests = 500 }) `
+        -ScenarioParameters ([ordered]@{ concurrency = @(1, 8); requests = $IpcRequestsPerConnection }) `
         -BatchId "$phase1BatchId-ipc-attempt-$($summary.ipc.selected_attempt)" `
         -RunMetrics $ipcRunMetrics `
         -RunRawSamples $ipcRunRawSamples `
