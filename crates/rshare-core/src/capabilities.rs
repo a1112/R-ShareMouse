@@ -123,7 +123,7 @@ pub fn local_capability_snapshots(
     if let Some(mode) = backend.selected_mode {
         input = input.with_detail("mode", format!("{mode:?}"));
     }
-    if features.suppress_local_shortcuts_when_remote && !shortcut_suppression_supported() {
+    if features.suppress_local_shortcuts_when_remote && !shortcut_suppression_supported(controls) {
         input.state = CapabilityState::Degraded;
         input.health_reason = Some(
             "automatic forwarding is blocked because local shortcut suppression is unavailable"
@@ -303,12 +303,19 @@ pub fn local_capability_snapshots(
 }
 
 #[cfg(windows)]
-fn shortcut_suppression_supported() -> bool {
-    true
+fn shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    // The KMDF filter path captures input before the low-level hook, but does
+    // not start an auxiliary hook suppressor. Only the active native-hook
+    // capture path can therefore suppress local shortcuts.
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(crate::ResolvedInputMode::WindowsNative)
+        )
 }
 
 #[cfg(not(windows))]
-fn shortcut_suppression_supported() -> bool {
+fn shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
     false
 }
 

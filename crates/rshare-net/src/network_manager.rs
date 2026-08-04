@@ -169,14 +169,10 @@ impl AutoConnectScheduler {
         attempt.next_allowed_attempt = Some(now + auto_connect_retry_delay(attempt.failures));
     }
 
-    fn on_device_lost(&mut self, device_id: DeviceId) {
-        if self
-            .attempts
-            .get(&device_id)
-            .is_some_and(|attempt| !attempt.in_flight)
-        {
-            self.attempts.remove(&device_id);
-        }
+    fn on_device_lost(&mut self, _device_id: DeviceId) {
+        // Discovery visibility is not transport authentication. Retain retry
+        // history across DeviceLost/Goodbye churn so a trusted peer cannot
+        // turn bounded backoff into repeated connection attempts.
     }
 }
 
@@ -194,7 +190,10 @@ fn is_operator_approved_discovery(device_id: DeviceId, trust_store: &QuicTrustSt
     )
 }
 
-fn auto_connect_address(device: &DiscoveredDevice, config: &NetworkManagerConfig) -> Option<String> {
+fn auto_connect_address(
+    device: &DiscoveredDevice,
+    config: &NetworkManagerConfig,
+) -> Option<String> {
     device.addresses.first().map(|address| {
         normalize_discovered_connection_address(
             &address.to_string(),
@@ -215,7 +214,9 @@ async fn maybe_auto_connect_discovered_device(
     if !config.auto_connect || device.id == local_device_id {
         return;
     }
-    if let PeerProtocolCompatibility::Incompatible { local, remote } = &device.protocol_compatibility {
+    if let PeerProtocolCompatibility::Incompatible { local, remote } =
+        &device.protocol_compatibility
+    {
         tracing::debug!(
             peer_id = %device.id,
             local_protocol = local,
@@ -250,11 +251,11 @@ async fn maybe_auto_connect_discovered_device(
     if connection_view.is_connected(&device.id).await {
         return;
     }
-    if !scheduler
-        .lock()
-        .await
-        .start_attempt_if_disconnected(device.id, Instant::now(), connection_view.is_connected(&device.id).await)
-    {
+    if !scheduler.lock().await.start_attempt_if_disconnected(
+        device.id,
+        Instant::now(),
+        connection_view.is_connected(&device.id).await,
+    ) {
         return;
     }
 
@@ -932,6 +933,24 @@ mod tests {
         assert_eq!(delays[0], Duration::from_secs(1));
         assert_eq!(delays[1], Duration::from_secs(2));
         assert_eq!(*delays.last().unwrap(), AUTO_CONNECT_RETRY_MAX);
+    }
+
+    #[test]
+    fn trusted_scheduler_keeps_backoff_across_device_lost_and_rediscovery() {
+        let device_id = DeviceId::new_v4();
+        let now = Instant::now();
+        let mut scheduler = AutoConnectScheduler::default();
+
+        assert!(scheduler.start_attempt(device_id, now));
+        scheduler.complete_attempt(device_id, now, false);
+        scheduler.on_device_lost(device_id);
+
+        assert!(
+            !scheduler.start_attempt_if_disconnected(device_id, now, false),
+            "rediscovery during the retry window must not bypass backoff"
+        );
+        let retry_at = scheduler.attempts[&device_id].next_allowed_attempt.unwrap();
+        assert!(scheduler.start_attempt_if_disconnected(device_id, retry_at, false));
     }
 
     #[test]

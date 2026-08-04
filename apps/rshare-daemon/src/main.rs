@@ -3304,6 +3304,26 @@ fn is_device_connected(state: &DaemonState, id: DeviceId) -> bool {
         .unwrap_or(false)
 }
 
+fn take_current_generation_for_connection_error(
+    current_generations: &std::sync::RwLock<HashMap<DeviceId, ControlConnectionId>>,
+    device_id: DeviceId,
+    reported_generation: Option<ControlConnectionId>,
+) -> Option<ControlConnectionId> {
+    // An outbound connection attempt can fail before authentication and has no
+    // generation. It is diagnostic-only and must never evict an authenticated
+    // connection that happens to share the peer id.
+    let reported_generation = reported_generation?;
+    let mut generations = current_generations
+        .write()
+        .expect("input generation registry poisoned");
+    if generations.get(&device_id) == Some(&reported_generation) {
+        generations.remove(&device_id);
+        Some(reported_generation)
+    } else {
+        None
+    }
+}
+
 #[cfg(windows)]
 fn set_local_shortcut_suppression(enabled: bool) {
     rshare_platform::windows::set_local_input_suppressed(enabled);
@@ -3313,12 +3333,19 @@ fn set_local_shortcut_suppression(enabled: bool) {
 fn set_local_shortcut_suppression(_enabled: bool) {}
 
 #[cfg(windows)]
-fn local_shortcut_suppression_supported() -> bool {
-    true
+fn local_shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    // The filter driver is a capture path only. Suppression is provided by the
+    // native low-level hook, so only advertise it when that is the active
+    // resolved capture backend.
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(ResolvedInputMode::WindowsNative)
+        )
 }
 
 #[cfg(not(windows))]
-fn local_shortcut_suppression_supported() -> bool {
+fn local_shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
     false
 }
 
@@ -6896,7 +6923,9 @@ async fn main() -> Result<()> {
             suppress_local_shortcuts_when_remote: state
                 .features
                 .suppress_local_shortcuts_when_remote,
-            shortcut_suppression_supported: local_shortcut_suppression_supported(),
+            shortcut_suppression_supported: local_shortcut_suppression_supported(
+                &state.local_controls,
+            ),
         }
     };
     if !forwarding_policy.admits_remote_input() {
@@ -7130,46 +7159,27 @@ async fn main() -> Result<()> {
                             error
                         );
                         if let Some(device_id) = peer_id {
-                            if control_connection_id.is_some_and(|generation| {
-                                current_generations
-                                    .read()
-                                    .expect("input generation registry poisoned")
-                                    .get(&device_id)
-                                    != Some(&generation)
-                            }) {
+                            let Some(control_connection_id) =
+                                take_current_generation_for_connection_error(
+                                    current_generations.as_ref(),
+                                    device_id,
+                                    control_connection_id,
+                                )
+                            else {
                                 continue;
-                            }
-                            let diagnostic_generation = control_connection_id.or_else(|| {
-                                current_generations
-                                    .read()
-                                    .expect("input generation registry poisoned")
-                                    .get(&device_id)
-                                    .copied()
+                            };
+                            diagnostics.clear_generation(DiagnosticSubscriberId {
+                                peer_id: device_id,
+                                control_connection_id,
                             });
-                            if let Some(control_connection_id) = diagnostic_generation {
-                                diagnostics.clear_generation(DiagnosticSubscriberId {
+                            injection.request_release_through(
+                                rshare_core::AuthenticatedInputOwner {
                                     peer_id: device_id,
                                     control_connection_id,
-                                });
-                            }
-                            current_generations
-                                .write()
-                                .expect("input generation registry poisoned")
-                                .remove(&device_id);
-                            if let Some(control_connection_id) = control_connection_id {
-                                injection.request_release_through(
-                                    rshare_core::AuthenticatedInputOwner {
-                                        peer_id: device_id,
-                                        control_connection_id,
-                                    },
-                                    rshare_core::SessionEpoch(u64::MAX),
-                                    rshare_core::ReleaseAllReason::SessionEnded,
-                                );
-                            } else {
-                                injection.request_release_all(
-                                    rshare_core::ReleaseAllReason::SessionEnded,
-                                );
-                            }
+                                },
+                                rshare_core::SessionEpoch(u64::MAX),
+                                rshare_core::ReleaseAllReason::SessionEnded,
+                            );
                             if let Err(command_error) = enqueue_router_command(
                                 &input_command_tx,
                                 RouterCommand::ConnectivityChanged {
@@ -12062,6 +12072,26 @@ mod tests {
             Some(replacement_generation)
         ));
         assert!(!diagnostic_generation_is_current(old_subscription, None));
+    }
+
+    #[test]
+    fn generationless_connection_error_does_not_clear_live_generation() {
+        let peer_id = DeviceId::new_v4();
+        let live_generation = ControlConnectionId::new();
+        let current_generations =
+            std::sync::RwLock::new(HashMap::from([(peer_id, live_generation)]));
+
+        assert_eq!(
+            take_current_generation_for_connection_error(&current_generations, peer_id, None),
+            None
+        );
+        assert_eq!(
+            current_generations
+                .read()
+                .expect("input generation registry poisoned")
+                .get(&peer_id),
+            Some(&live_generation)
+        );
     }
 
     #[test]

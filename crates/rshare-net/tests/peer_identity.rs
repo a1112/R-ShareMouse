@@ -5,7 +5,9 @@ use rshare_core::{hello_message, HandshakeRejectReason, Message};
 use rshare_net::{
     connection::{ConnectionManager, ManagerEvent},
     discovery::{DiscoveredDevice, PeerProtocolCompatibility},
-    encryption::{Encryption, PeerCertificateFingerprint, QuicIdentity, QuicTrustStore, TrustProvenance},
+    encryption::{
+        Encryption, PeerCertificateFingerprint, QuicIdentity, QuicTrustStore, TrustProvenance,
+    },
     QuicTransport,
 };
 use tokio::time::timeout;
