@@ -1,5 +1,6 @@
 //! CLI command implementations
 
+pub mod approvals;
 pub mod config_cmd;
 pub mod devices;
 pub mod discover;

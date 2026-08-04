@@ -123,6 +123,27 @@ pub fn local_capability_snapshots(
     if let Some(mode) = backend.selected_mode {
         input = input.with_detail("mode", format!("{mode:?}"));
     }
+    if features.suppress_local_shortcuts_when_remote && !shortcut_suppression_supported() {
+        input.state = CapabilityState::Degraded;
+        input.health_reason = Some(
+            "automatic forwarding is blocked because local shortcut suppression is unavailable"
+                .to_string(),
+        );
+        input.details.insert(
+            "shortcut_suppression".to_string(),
+            "unavailable".to_string(),
+        );
+    } else {
+        input.details.insert(
+            "shortcut_suppression".to_string(),
+            if features.suppress_local_shortcuts_when_remote {
+                "required"
+            } else {
+                "opt_out"
+            }
+            .to_string(),
+        );
+    }
     capabilities.push(input);
 
     capabilities.push(EndpointCapabilitySnapshot::new(
@@ -279,6 +300,16 @@ pub fn local_capability_snapshots(
     capabilities.push(diagnostics);
 
     capabilities
+}
+
+#[cfg(windows)]
+fn shortcut_suppression_supported() -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn shortcut_suppression_supported() -> bool {
+    false
 }
 
 /// Derive a peer capability list from advertised protocol capabilities.

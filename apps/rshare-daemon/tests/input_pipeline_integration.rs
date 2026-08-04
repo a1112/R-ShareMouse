@@ -11,8 +11,8 @@ use rshare_core::{
     UiSnapshot, VirtualDesktopGeometry, UI_STATE_PROTOCOL_VERSION,
 };
 use rshare_daemon::input_runtime::{
-    dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch, InputRuntime,
-    InputTransport,
+    dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch,
+    InputForwardingPolicy, InputRuntime, InputTransport, LocalShortcutSuppressor,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetrics, InputStateFeeds};
 use rshare_daemon::state_aggregator::StateAggregator;
@@ -131,6 +131,17 @@ impl InjectBackend for BlockingInjectBackend {
 #[derive(Default)]
 struct RecordingTransport {
     events: Mutex<Vec<InputDispatch>>,
+}
+
+#[derive(Default)]
+struct RecordingSuppressor {
+    values: Mutex<Vec<bool>>,
+}
+
+impl LocalShortcutSuppressor for RecordingSuppressor {
+    fn set_suppressed(&self, enabled: bool) {
+        self.values.lock().unwrap().push(enabled);
+    }
 }
 
 #[derive(Default)]
@@ -384,6 +395,18 @@ fn runtime_with_feeds(
     )
 }
 
+fn automatic_forwarding_policy(
+    automatic_input_forwarding: bool,
+    suppress_local_shortcuts_when_remote: bool,
+    shortcut_suppression_supported: bool,
+) -> InputForwardingPolicy {
+    InputForwardingPolicy {
+        automatic_input_forwarding,
+        suppress_local_shortcuts_when_remote,
+        shortcut_suppression_supported,
+    }
+}
+
 fn origin(source: CaptureSource) -> CaptureOrigin {
     CaptureOrigin {
         source,
@@ -407,6 +430,71 @@ async fn enter_remote<T: InputTransport>(
         PushOutcome::Enqueued
     );
     assert!(runtime.process_next().await);
+}
+
+#[tokio::test]
+async fn automatic_forwarding_disabled_never_enters_remote() {
+    let (producer, runtime, transport) = runtime(8);
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(false, false, true),
+        Arc::new(RecordingSuppressor::default()),
+    );
+
+    assert_eq!(
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x: 99,
+                y: 50,
+            })),
+        )),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    assert!(transport.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn suppression_output_drives_platform_callback_and_clears_on_exit() {
+    let (producer, runtime, _transport) = runtime(8);
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    runtime.handle_command(RouterCommand::QuickReturn);
+    assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+}
+
+#[tokio::test]
+async fn suppression_callback_clears_on_degrade_and_shutdown() {
+    for command in [RouterCommand::BackendDegraded, RouterCommand::Shutdown] {
+        let (producer, runtime, _transport) = runtime(8);
+        let suppressor = Arc::new(RecordingSuppressor::default());
+        let mut runtime = runtime.with_forwarding_policy(
+            automatic_forwarding_policy(true, true, true),
+            suppressor.clone(),
+        );
+
+        enter_remote(&producer, &mut runtime).await;
+        runtime.handle_command(command);
+
+        assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+    }
+}
+
+#[tokio::test]
+async fn suppression_required_but_unsupported_fails_closed() {
+    let (producer, runtime, transport) = runtime(8);
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, false),
+        Arc::new(RecordingSuppressor::default()),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    assert!(transport.events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

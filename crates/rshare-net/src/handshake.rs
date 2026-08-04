@@ -6,7 +6,10 @@ use rshare_core::{
     PeerTransportCapabilities, ScreenInfo, DISCOVERY_APP_ID, PROTOCOL_VERSION,
 };
 
-use crate::{encryption::PeerCertificateFingerprint, transport::QuicConnection};
+use crate::{
+    encryption::{PeerCertificateFingerprint, QuicTrustDecision},
+    transport::QuicConnection,
+};
 
 pub const BOOTSTRAP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(250);
@@ -28,6 +31,7 @@ pub enum ClientCertificatePolicy {
 pub struct NegotiatedPeer {
     pub auth: PeerAuthContext,
     pub transport_capabilities: PeerTransportCapabilities,
+    pub inbound_trust_decision: Option<QuicTrustDecision>,
 }
 
 pub fn is_bootstrap_message(message: &Message) -> bool {
@@ -116,19 +120,35 @@ pub(crate) async fn receive_incoming_handshake(
         anyhow::bail!("peer handshake rejected: {reason:?}");
     }
 
-    let certificate_fingerprint = match conn.confirm_inbound_peer_identity(peer_id) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => {
-            send_rejection(
-                conn,
-                local_device_id,
-                HandshakeRejectReason::IdentityUnavailable,
-            )
-            .await?;
-            return Err(error.context("peer identity unavailable"));
-        }
-    };
+    let (certificate_fingerprint, inbound_trust_decision) =
+        match conn.inspect_inbound_peer_identity(peer_id) {
+            Ok(identity) => identity,
+            Err(error) => {
+                send_rejection(
+                    conn,
+                    local_device_id,
+                    HandshakeRejectReason::IdentityUnavailable,
+                )
+                .await?;
+                return Err(error.context("peer identity unavailable"));
+            }
+        };
 
+    Ok(NegotiatedPeer {
+        auth: PeerAuthContext {
+            peer_id,
+            certificate_fingerprint,
+            control_connection_id: ControlConnectionId::new(),
+        },
+        transport_capabilities,
+        inbound_trust_decision: Some(inbound_trust_decision),
+    })
+}
+
+pub(crate) async fn complete_incoming_handshake(
+    conn: &QuicConnection,
+    local_device_id: DeviceId,
+) -> Result<()> {
     conn.send_message(&hello_back_message(
         local_device_id,
         "R-ShareMouse".to_string(),
@@ -141,14 +161,7 @@ pub(crate) async fn receive_incoming_handshake(
     .await?;
     conn.complete_peer_protocol_handshake().await?;
 
-    Ok(NegotiatedPeer {
-        auth: PeerAuthContext {
-            peer_id,
-            certificate_fingerprint,
-            control_connection_id: ControlConnectionId::new(),
-        },
-        transport_capabilities,
-    })
+    Ok(())
 }
 
 pub(crate) async fn perform_outbound_handshake(
@@ -195,5 +208,6 @@ pub(crate) async fn perform_outbound_handshake(
             control_connection_id: ControlConnectionId::new(),
         },
         transport_capabilities,
+        inbound_trust_decision: None,
     })
 }

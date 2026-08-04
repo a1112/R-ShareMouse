@@ -72,10 +72,20 @@ fn local_capabilities_report_input_and_diagnostics_available_when_backends_are_h
         &FeatureConfig::default(),
     );
 
-    assert_eq!(
-        capability(&capabilities, EndpointCapabilityKind::Input).state,
-        CapabilityState::Available
-    );
+    let input = capability(&capabilities, EndpointCapabilityKind::Input);
+    #[cfg(windows)]
+    assert_eq!(input.state, CapabilityState::Available);
+    #[cfg(not(windows))]
+    {
+        assert_eq!(input.state, CapabilityState::Degraded);
+        assert_eq!(
+            input
+                .details
+                .get("shortcut_suppression")
+                .map(String::as_str),
+            Some("unavailable")
+        );
+    }
     assert_eq!(
         capability(&capabilities, EndpointCapabilityKind::Diagnostics).state,
         CapabilityState::Available

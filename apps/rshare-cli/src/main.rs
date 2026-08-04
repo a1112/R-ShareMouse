@@ -31,7 +31,7 @@ fn build_metadata() -> String {
     )
 }
 
-use commands::{config_cmd, devices, discover, display, doctor, start, stop, usb};
+use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, usb};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -167,6 +167,18 @@ enum Commands {
         #[command(subcommand)]
         usb_cmd: usb::UsbCommands,
     },
+
+    /// List or approve inbound peer requests on this target.
+    Approvals {
+        #[command(subcommand)]
+        approval_cmd: ApprovalCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    List,
+    Approve { approval_id: String },
 }
 
 #[tokio::main]
@@ -241,7 +253,34 @@ async fn main() -> Result<()> {
         Commands::Usb { usb_cmd } => {
             usb::execute(usb_cmd).await?;
         }
+        Commands::Approvals { approval_cmd } => match approval_cmd {
+            ApprovalCommands::List => approvals::list().await?,
+            ApprovalCommands::Approve { approval_id } => approvals::approve(approval_id).await?,
+        },
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_approval_list_and_approve_commands() {
+        let list = Cli::try_parse_from(["rshare", "approvals", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Approvals {
+                approval_cmd: ApprovalCommands::List
+            }
+        ));
+        let approve = Cli::try_parse_from(["rshare", "approvals", "approve", "opaque-id"]).unwrap();
+        assert!(matches!(
+            approve.command,
+            Commands::Approvals {
+                approval_cmd: ApprovalCommands::Approve { approval_id }
+            } if approval_id == "opaque-id"
+        ));
+    }
 }

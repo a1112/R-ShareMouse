@@ -43,7 +43,8 @@ use rshare_daemon::diagnostics_runtime::{
     DiagnosticsRuntime, DiagnosticsSubscription, DIAGNOSTICS_HISTORY_CAPACITY,
 };
 use rshare_daemon::input_runtime::{
-    dispatch_system_safety_event, run_authenticated_input_peers, InputRuntime,
+    dispatch_system_safety_event, run_authenticated_input_peers, InputForwardingPolicy,
+    InputRuntime, LocalShortcutSuppressor,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetricSnapshot, ControlMetrics};
 use rshare_daemon::ipc_server::{
@@ -92,6 +93,7 @@ struct TrackedDevice {
     hostname: String,
     addresses: Vec<String>,
     connected: bool,
+    discovered: bool,
     capabilities: DeviceCapabilities,
     last_seen_at: Instant,
 }
@@ -429,7 +431,7 @@ impl DaemonState {
         }
     }
 
-    fn upsert_discovered(&mut self, device: DiscoveredDevice) {
+    fn upsert_discovered(&mut self, device: DiscoveredDevice) -> bool {
         let connected = self
             .devices
             .get(&device.id)
@@ -448,12 +450,13 @@ impl DaemonState {
                     .map(|addr| addr.to_string())
                     .collect(),
                 connected,
+                discovered: true,
                 capabilities: device.capabilities,
                 last_seen_at: Instant::now(),
             },
         );
         self.layout
-            .merge_discovered_peers_to_right_with_screens([(device.id, screen_info)]);
+            .merge_discovered_peers_to_right_with_screens([(device.id, screen_info)])
     }
 
     fn remove_device(&mut self, id: &DeviceId) {
@@ -482,6 +485,7 @@ impl DaemonState {
                     hostname: "unknown".to_string(),
                     addresses: Vec::new(),
                     connected: true,
+                    discovered: false,
                     capabilities: DeviceCapabilities::default(),
                     last_seen_at: Instant::now(),
                 },
@@ -500,6 +504,28 @@ impl DaemonState {
             }
         }
         layout_changed
+    }
+
+    /// Discovery loss only removes an unconnected peer from live visibility.
+    /// Layout nodes are persisted topology and never removed by discovery churn.
+    fn mark_discovery_lost(&mut self, id: &DeviceId) {
+        if self.devices.get(id).is_some_and(|device| !device.connected) {
+            self.remove_device(id);
+        } else if let Some(device) = self.devices.get_mut(id) {
+            device.discovered = false;
+        }
+    }
+
+    /// A transport disconnect preserves a peer that is still present in discovery.
+    fn mark_disconnected(&mut self, id: &DeviceId) {
+        self.mark_connected(id, false);
+        if self
+            .devices
+            .get(id)
+            .is_some_and(|device| !device.discovered)
+        {
+            self.remove_device(id);
+        }
     }
 
     fn status_snapshot(&self) -> ServiceStatusSnapshot {
@@ -3285,6 +3311,24 @@ fn set_local_shortcut_suppression(enabled: bool) {
 
 #[cfg(not(windows))]
 fn set_local_shortcut_suppression(_enabled: bool) {}
+
+#[cfg(windows)]
+fn local_shortcut_suppression_supported() -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn local_shortcut_suppression_supported() -> bool {
+    false
+}
+
+struct PlatformShortcutSuppressor;
+
+impl LocalShortcutSuppressor for PlatformShortcutSuppressor {
+    fn set_suppressed(&self, enabled: bool) {
+        set_local_shortcut_suppression(enabled);
+    }
+}
 
 fn sync_local_shortcut_suppression(state: &DaemonState) {
     let should_suppress = state.features.suppress_local_shortcuts_when_remote
@@ -6426,6 +6470,38 @@ async fn enqueue_router_command(
         .map_err(|_| anyhow::anyhow!("input router command channel is closed"))
 }
 
+/// Persist and broadcast each canonical runtime layout update before any
+/// subsequent connectivity command can cause the router to resolve an edge.
+async fn persist_and_publish_layout(
+    layout: &LayoutGraph,
+    layout_path: &Path,
+    input_command_tx: &tokio::sync::mpsc::Sender<RouterCommand>,
+) -> Result<()> {
+    save_layout_to_path(layout, layout_path)?;
+    enqueue_router_command(
+        input_command_tx,
+        RouterCommand::LayoutChanged(layout.clone()),
+    )
+    .await
+}
+
+async fn persist_and_publish_connected_peer(
+    layout: &LayoutGraph,
+    layout_path: &Path,
+    input_command_tx: &tokio::sync::mpsc::Sender<RouterCommand>,
+    peer: DeviceId,
+) -> Result<()> {
+    persist_and_publish_layout(layout, layout_path, input_command_tx).await?;
+    enqueue_router_command(
+        input_command_tx,
+        RouterCommand::ConnectivityChanged {
+            peer,
+            connected: true,
+        },
+    )
+    .await
+}
+
 async fn complete_mobile_gateway_shutdown(
     shutdown_tx: &broadcast::Sender<()>,
     mobile_gateway_task: Option<&mut tokio::task::JoinHandle<Result<()>>>,
@@ -6496,6 +6572,10 @@ async fn main() -> Result<()> {
     let mut network_manager = NetworkManager::new(device_id, device_name.clone(), hostname.clone())
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
+            mdns_enabled: config.network.mdns_enabled,
+            // Discovery may only initiate connections to peers with a persisted
+            // operator-approved QUIC certificate pin.
+            auto_connect: true,
             ..Default::default()
         });
 
@@ -6809,6 +6889,21 @@ async fn main() -> Result<()> {
     if !input_backend_healthy {
         enqueue_router_command(&input_command_tx, RouterCommand::BackendDegraded).await?;
     }
+    let forwarding_policy = {
+        let state = state.read().await;
+        InputForwardingPolicy {
+            automatic_input_forwarding: state.features.automatic_input_forwarding,
+            suppress_local_shortcuts_when_remote: state
+                .features
+                .suppress_local_shortcuts_when_remote,
+            shortcut_suppression_supported: local_shortcut_suppression_supported(),
+        }
+    };
+    if !forwarding_policy.admits_remote_input() {
+        tracing::warn!(
+            "automatic input forwarding is unavailable: local shortcut suppression is required but unsupported"
+        );
+    }
     let input_runtime = InputRuntime::new(
         input_consumer,
         input_router,
@@ -6816,7 +6911,8 @@ async fn main() -> Result<()> {
         input_state,
         input_metrics.clone(),
         injection.clone(),
-    );
+    )
+    .with_forwarding_policy(forwarding_policy, Arc::new(PlatformShortcutSuppressor));
     let (system_safety_tx, system_safety_rx) = tokio::sync::mpsc::unbounded_channel();
     let system_safety_injection = injection.clone();
     let system_safety_watcher = rshare_platform::SystemSafetyWatcher::start(move |event| {
@@ -6903,14 +6999,22 @@ async fn main() -> Result<()> {
                 };
                 match event {
                     NetworkEvent::DeviceFound(device) => {
-                        let layout_to_save = {
+                        let layout_to_publish = {
                             let mut state = state.write().await;
-                            state.upsert_discovered(device);
-                            state.layout.clone()
+                            state
+                                .upsert_discovered(device)
+                                .then(|| state.layout.clone())
                         };
-                        if let Err(err) = save_layout_to_path(&layout_to_save, layout_path.as_ref())
-                        {
-                            tracing::warn!("Failed to persist auto-updated layout: {}", err);
+                        if let Some(layout) = layout_to_publish {
+                            if let Err(err) = persist_and_publish_layout(
+                                &layout,
+                                layout_path.as_ref(),
+                                &input_command_tx,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to publish discovered-device layout: {err}");
+                            }
                         }
                     }
                     NetworkEvent::DeviceConnected(auth) => {
@@ -6923,38 +7027,29 @@ async fn main() -> Result<()> {
                             .write()
                             .expect("input generation registry poisoned")
                             .insert(id, auth.control_connection_id);
-                        if let Err(error) = enqueue_router_command(
+                        let (should_advertise_usb, layout) = {
+                            let mut state = state.write().await;
+                            state.mark_connected(&id, true);
+                            (
+                                state.features.usb_advertising_enabled(),
+                                state.layout.clone(),
+                            )
+                        };
+                        if let Err(error) = persist_and_publish_connected_peer(
+                            &layout,
+                            layout_path.as_ref(),
                             &input_command_tx,
-                            RouterCommand::ConnectivityChanged {
-                                peer: id,
-                                connected: true,
-                            },
+                            id,
                         )
                         .await
                         {
-                            tracing::error!("Failed to queue connected snapshot: {error}");
+                            tracing::error!(
+                                "Failed to publish layout before connected snapshot: {error}"
+                            );
                             injection.request_release_all_sources(
                                 rshare_core::ReleaseAllReason::BackendFailure,
                             );
                             break;
-                        }
-                        let (should_advertise_usb, layout_to_save) = {
-                            let mut state = state.write().await;
-                            let layout_changed = state.mark_connected(&id, true);
-                            (
-                                state.features.usb_advertising_enabled(),
-                                layout_changed.then(|| state.layout.clone()),
-                            )
-                        };
-                        if let Some(layout_to_save) = layout_to_save {
-                            if let Err(err) =
-                                save_layout_to_path(&layout_to_save, layout_path.as_ref())
-                            {
-                                tracing::warn!(
-                                    "Failed to persist connected-device layout: {}",
-                                    err
-                                );
-                            }
                         }
                         if should_advertise_usb {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
@@ -7011,8 +7106,12 @@ async fn main() -> Result<()> {
                             id,
                             "USB probe target disconnected.",
                         );
-                        state.remove_device(&id);
+                        state.mark_disconnected(&id);
                         sync_local_shortcut_suppression(&state);
+                    }
+                    NetworkEvent::DeviceLost(id) => {
+                        let mut state = state.write().await;
+                        state.mark_discovery_lost(&id);
                     }
                     NetworkEvent::ControlReceived { .. }
                     | NetworkEvent::TelemetryReceived { .. }
@@ -7095,7 +7194,7 @@ async fn main() -> Result<()> {
                                 device_id,
                                 "USB probe target connection failed.",
                             );
-                            state.mark_connected(&device_id, false);
+                            state.mark_disconnected(&device_id);
                             sync_local_shortcut_suppression(&state);
                         }
                     }
@@ -7520,6 +7619,7 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
             | DaemonRequest::LocalControls
             | DaemonRequest::Connect { .. }
             | DaemonRequest::Disconnect { .. }
+            | DaemonRequest::ApprovePeer { .. }
             | DaemonRequest::SetLayout { .. }
             | DaemonRequest::InjectEndpointEvent { .. }
             | DaemonRequest::RunLocalInputTest { .. }
@@ -7593,19 +7693,22 @@ async fn dispatch_ipc_request(
 
                     match result {
                         Ok(_) => {
-                            let layout_to_save = {
+                            let layout_to_publish = {
                                 let mut state = state.write().await;
                                 state
                                     .mark_connected(&device_id, true)
                                     .then(|| state.layout.clone())
                             };
-                            if let Some(layout_to_save) = layout_to_save {
-                                if let Err(err) =
-                                    save_layout_to_path(&layout_to_save, layout_path.as_ref())
+                            if let Some(layout) = layout_to_publish {
+                                if let Err(err) = persist_and_publish_layout(
+                                    &layout,
+                                    layout_path.as_ref(),
+                                    &input_command_tx,
+                                )
+                                .await
                                 {
                                     tracing::warn!(
-                                        "Failed to persist connected-device layout: {}",
-                                        err
+                                        "Failed to publish connected-device layout: {err}"
                                     );
                                 }
                             }
@@ -7627,11 +7730,23 @@ async fn dispatch_ipc_request(
                 Ok(_) => {
                     let mut state = state.write().await;
                     state.session.on_target_disconnect(device_id);
-                    state.mark_connected(&device_id, false);
+                    state.mark_disconnected(&device_id);
                     sync_local_shortcut_suppression(&state);
                     DaemonResponse::Ack
                 }
                 Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
+        DaemonRequest::ListPendingPeerApprovals => {
+            let manager = network_manager.lock().await;
+            DaemonResponse::PendingPeerApprovals(manager.pending_peer_approvals().await)
+        }
+        DaemonRequest::ApprovePeer { approval_id } => {
+            let manager = network_manager.lock().await;
+            if manager.approve_peer(&approval_id).await {
+                DaemonResponse::Ack
+            } else {
+                DaemonResponse::Error("Unknown, expired, or already-used peer approval".to_string())
             }
         }
         DaemonRequest::GetLayout => {
@@ -7646,32 +7761,29 @@ async fn dispatch_ipc_request(
             };
             canonical_layout.canonicalize_local_device(local_device_id);
 
-            match save_layout_to_path(&canonical_layout, layout_path.as_ref()) {
-                Ok(()) => match enqueue_router_command(
-                    &input_command_tx,
-                    RouterCommand::LayoutChanged(canonical_layout.clone()),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        state.write().await.layout = canonical_layout;
-                        DaemonResponse::Ack
-                    }
-                    Err(error) => {
-                        inject_backend.request_release_all_sources(
-                            rshare_core::ReleaseAllReason::BackendFailure,
-                        );
-                        if let Err(rollback_error) =
-                            save_layout_to_path(&previous_layout, layout_path.as_ref())
-                        {
-                            tracing::error!(
+            match persist_and_publish_layout(
+                &canonical_layout,
+                layout_path.as_ref(),
+                &input_command_tx,
+            )
+            .await
+            {
+                Ok(()) => {
+                    state.write().await.layout = canonical_layout;
+                    DaemonResponse::Ack
+                }
+                Err(error) => {
+                    inject_backend
+                        .request_release_all_sources(rshare_core::ReleaseAllReason::BackendFailure);
+                    if let Err(rollback_error) =
+                        save_layout_to_path(&previous_layout, layout_path.as_ref())
+                    {
+                        tracing::error!(
                                 "Failed to roll back layout after router channel closed: {rollback_error}"
                             );
-                        }
-                        DaemonResponse::Error(error.to_string())
                     }
-                },
-                Err(err) => DaemonResponse::Error(err.to_string()),
+                    DaemonResponse::Error(error.to_string())
+                }
             }
         }
         DaemonRequest::ListUsbDevices => {
@@ -8916,6 +9028,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -9670,6 +9783,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: Vec::new(),
                 connected: false,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -10821,6 +10935,7 @@ mod tests {
                 hostname: "remote".to_string(),
                 addresses: vec!["127.0.0.1:1".to_string()],
                 connected: true,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -11251,6 +11366,7 @@ mod tests {
                 hostname: "remote-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -11291,6 +11407,7 @@ mod tests {
                 hostname: "a-host".to_string(),
                 addresses: vec!["127.0.0.1:27431".to_string()],
                 connected: true,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -11303,6 +11420,7 @@ mod tests {
                 hostname: "b-host".to_string(),
                 addresses: vec!["127.0.0.1:27432".to_string()],
                 connected: true,
+                discovered: true,
                 capabilities: DeviceCapabilities::default(),
                 last_seen_at: Instant::now(),
             },
@@ -11748,6 +11866,94 @@ mod tests {
             27432,
             1,
         )
+    }
+
+    fn discovered_device_for_test(id: DeviceId) -> DiscoveredDevice {
+        DiscoveredDevice {
+            id,
+            name: "remote".to_string(),
+            hostname: "remote-host".to_string(),
+            addresses: vec!["127.0.0.1:27431".parse().unwrap()],
+            screen_info: None,
+            capabilities: DeviceCapabilities::default(),
+            transport_capabilities: rshare_core::PeerTransportCapabilities::required_v3(),
+            protocol_compatibility: rshare_net::PeerProtocolCompatibility::Compatible,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn discovery_lost_removes_unconnected_peer_but_preserves_layout() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(test_status(local_id));
+        state.upsert_discovered(discovered_device_for_test(remote_id));
+
+        state.mark_discovery_lost(&remote_id);
+
+        assert!(!state.devices.contains_key(&remote_id));
+        assert!(state.layout.get_node(remote_id).is_some());
+    }
+
+    #[test]
+    fn discovery_lost_keeps_connected_generation_visible() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(test_status(local_id));
+        state.upsert_discovered(discovered_device_for_test(remote_id));
+        state.mark_connected(&remote_id, true);
+
+        state.mark_discovery_lost(&remote_id);
+
+        let device = state.devices.get(&remote_id).unwrap();
+        assert!(device.connected);
+        assert!(!device.discovered);
+    }
+
+    #[test]
+    fn transport_disconnect_keeps_still_discovered_peer_visible() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(test_status(local_id));
+        state.upsert_discovered(discovered_device_for_test(remote_id));
+        state.mark_connected(&remote_id, true);
+
+        state.mark_disconnected(&remote_id);
+
+        let device = state.devices.get(&remote_id).unwrap();
+        assert!(!device.connected);
+        assert!(device.discovered);
+    }
+
+    #[tokio::test]
+    async fn connected_peer_publishes_exact_layout_before_connectivity() {
+        let state_dir = temp_state_dir();
+        let layout_path = rshare_core::service::layout_graph_path_in(&state_dir);
+        let local_id = DeviceId::new_v4();
+        let peer = DeviceId::new_v4();
+        let layout = remembered_layout(local_id, peer);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+
+        persist_and_publish_connected_peer(&layout, &layout_path, &tx, peer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rx.recv().await,
+            Some(RouterCommand::LayoutChanged(layout.clone()))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(RouterCommand::ConnectivityChanged {
+                peer,
+                connected: true,
+            })
+        );
+        assert_eq!(
+            load_layout_from_path(local_id, &layout_path).unwrap(),
+            layout
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn temp_state_dir() -> PathBuf {

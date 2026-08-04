@@ -48,19 +48,79 @@ impl fmt::Display for PeerCertificateFingerprint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustProvenance {
+    LegacyTofu,
+    OperatorApproved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedPeerEntry {
+    pub fingerprint: PeerCertificateFingerprint,
+    pub provenance: TrustProvenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuicTrustDecision {
     FirstSeen,
-    Trusted,
+    LegacyTofu,
+    OperatorApproved,
     Rejected {
         expected: PeerCertificateFingerprint,
         actual: PeerCertificateFingerprint,
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QuicTrustStore {
-    peers: HashMap<DeviceId, PeerCertificateFingerprint>,
+    version: u8,
+    peers: HashMap<DeviceId, TrustedPeerEntry>,
+}
+
+impl Default for QuicTrustStore {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            peers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TrustStoreWire {
+    Legacy {
+        peers: HashMap<DeviceId, PeerCertificateFingerprint>,
+    },
+    Versioned {
+        #[serde(default, rename = "version")]
+        _version: u8,
+        peers: HashMap<DeviceId, TrustedPeerEntry>,
+    },
+}
+
+impl<'de> Deserialize<'de> for QuicTrustStore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match TrustStoreWire::deserialize(deserializer)? {
+            TrustStoreWire::Legacy { peers } => Ok(Self {
+                version: 2,
+                peers: peers
+                    .into_iter()
+                    .map(|(device_id, fingerprint)| {
+                        (
+                            device_id,
+                            TrustedPeerEntry {
+                                fingerprint,
+                                provenance: TrustProvenance::LegacyTofu,
+                            },
+                        )
+                    })
+                    .collect(),
+            }),
+            TrustStoreWire::Versioned { peers, .. } => Ok(Self { version: 2, peers }),
+        }
+    }
 }
 
 impl QuicTrustStore {
@@ -89,19 +149,22 @@ impl QuicTrustStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("QUIC trust store lock poisoned"))?;
         let mut merged = Self::load(path)?;
-        for (device_id, fingerprint) in &self.peers {
+        for (device_id, entry) in &self.peers {
             match merged.peers.get(device_id) {
-                Some(existing) if existing != fingerprint => {
+                Some(existing) if existing.fingerprint != entry.fingerprint => {
                     anyhow::bail!(
                         "Refusing to overwrite QUIC trust pin for {}: existing {}, requested {}",
                         device_id,
-                        existing,
-                        fingerprint
+                        existing.fingerprint,
+                        entry.fingerprint
                     );
                 }
-                Some(_) => {}
+                Some(existing) if existing.provenance == TrustProvenance::OperatorApproved => {}
+                Some(_) => {
+                    merged.peers.insert(*device_id, entry.clone());
+                }
                 None => {
-                    merged.peers.insert(*device_id, fingerprint.clone());
+                    merged.peers.insert(*device_id, entry.clone());
                 }
             }
         }
@@ -115,9 +178,12 @@ impl QuicTrustStore {
     ) -> QuicTrustDecision {
         match self.peers.get(&device_id) {
             None => QuicTrustDecision::FirstSeen,
-            Some(expected) if expected == fingerprint => QuicTrustDecision::Trusted,
-            Some(expected) => QuicTrustDecision::Rejected {
-                expected: expected.clone(),
+            Some(entry) if entry.fingerprint == *fingerprint => match entry.provenance {
+                TrustProvenance::LegacyTofu => QuicTrustDecision::LegacyTofu,
+                TrustProvenance::OperatorApproved => QuicTrustDecision::OperatorApproved,
+            },
+            Some(entry) => QuicTrustDecision::Rejected {
+                expected: entry.fingerprint.clone(),
                 actual: fingerprint.clone(),
             },
         }
@@ -130,7 +196,13 @@ impl QuicTrustStore {
     ) -> QuicTrustDecision {
         let decision = self.check(device_id, &fingerprint);
         if decision == QuicTrustDecision::FirstSeen {
-            self.peers.insert(device_id, fingerprint);
+            self.peers.insert(
+                device_id,
+                TrustedPeerEntry {
+                    fingerprint,
+                    provenance: TrustProvenance::LegacyTofu,
+                },
+            );
         }
         decision
     }
@@ -160,7 +232,63 @@ impl QuicTrustStore {
     }
 
     pub fn fingerprint_for(&self, device_id: &DeviceId) -> Option<&PeerCertificateFingerprint> {
-        self.peers.get(device_id)
+        self.peers.get(device_id).map(|entry| &entry.fingerprint)
+    }
+
+    pub fn provenance_for(&self, device_id: &DeviceId) -> Option<TrustProvenance> {
+        self.peers
+            .get(device_id)
+            .map(|entry| entry.provenance.clone())
+    }
+
+    pub fn is_operator_approved_exact(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &PeerCertificateFingerprint,
+    ) -> bool {
+        matches!(
+            self.check(device_id, fingerprint),
+            QuicTrustDecision::OperatorApproved
+        )
+    }
+
+    pub fn approve(
+        &mut self,
+        device_id: DeviceId,
+        fingerprint: PeerCertificateFingerprint,
+    ) -> Result<()> {
+        match self.peers.get(&device_id) {
+            Some(existing) if existing.fingerprint != fingerprint => anyhow::bail!(
+                "Refusing to overwrite QUIC trust pin for {}: existing {}, requested {}",
+                device_id,
+                existing.fingerprint,
+                fingerprint
+            ),
+            _ => {
+                self.peers.insert(
+                    device_id,
+                    TrustedPeerEntry {
+                        fingerprint,
+                        provenance: TrustProvenance::OperatorApproved,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn approve_at(
+        path: impl AsRef<Path>,
+        device_id: DeviceId,
+        fingerprint: PeerCertificateFingerprint,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let _guard = TRUST_STORE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("QUIC trust store lock poisoned"))?;
+        let mut store = Self::load(path)?;
+        store.approve(device_id, fingerprint)?;
+        write_trust_store_atomic(path, &store)
     }
 }
 
@@ -426,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             store.check(device_id, &fingerprint_a),
-            QuicTrustDecision::Trusted
+            QuicTrustDecision::LegacyTofu
         );
         assert!(matches!(
             store.check(device_id, &fingerprint_b),
@@ -447,6 +575,66 @@ mod tests {
         let loaded = QuicTrustStore::load(&path).unwrap();
         assert_eq!(loaded.fingerprint_for(&device_id), Some(&fingerprint));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_flat_pins_migrate_as_legacy_tofu_and_are_not_authority() {
+        let dir = temp_dir("legacy-trust");
+        let path = dir.join("trust.json");
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            format!(r#"{{"peers":{{"{}":"{}"}}}}"#, device_id, fingerprint),
+        )
+        .unwrap();
+
+        let store = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(
+            store.check(device_id, &fingerprint),
+            QuicTrustDecision::LegacyTofu
+        );
+        assert_eq!(
+            store.provenance_for(&device_id),
+            Some(TrustProvenance::LegacyTofu)
+        );
+        assert!(!store.is_operator_approved_exact(device_id, &fingerprint));
+        assert!(matches!(
+            store.check(device_id, &PeerCertificateFingerprint::from_der(b"cert-b")),
+            QuicTrustDecision::Rejected { .. }
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn operator_approval_persists_and_merge_never_downgrades() {
+        let dir = temp_dir("operator-trust");
+        let path = dir.join("trust.json");
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        QuicTrustStore::approve_at(&path, device_id, fingerprint.clone()).unwrap();
+        let approved = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(
+            approved.provenance_for(&device_id),
+            Some(TrustProvenance::OperatorApproved)
+        );
+
+        let mut stale_legacy = QuicTrustStore::default();
+        stale_legacy.trust_first_seen(device_id, fingerprint.clone());
+        stale_legacy.save(&path).unwrap();
+        let loaded = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(
+            loaded.provenance_for(&device_id),
+            Some(TrustProvenance::OperatorApproved)
+        );
+        assert!(QuicTrustStore::approve_at(
+            &path,
+            device_id,
+            PeerCertificateFingerprint::from_der(b"cert-b")
+        )
+        .is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
