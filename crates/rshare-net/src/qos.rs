@@ -113,7 +113,8 @@ impl TryFrom<Message> for ClassifiedMessage {
             | Message::Heartbeat { .. }
             | Message::Ack { .. }
             | Message::Error { .. }
-            | Message::ScreenUpdate { .. }) => Self::Control(ControlFrame { message }),
+            | Message::ScreenUpdate { .. }
+            | Message::LayoutSync { .. }) => Self::Control(ControlFrame { message }),
             message @ (Message::InputDiagnostic { .. }
             | Message::EndpointEventSubscribe { .. }
             | Message::EndpointEventSnapshot { .. }

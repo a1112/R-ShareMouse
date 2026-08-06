@@ -387,6 +387,7 @@ impl MessageCodec {
 
             // Screen control (30-39)
             Message::ScreenUpdate { .. } => 32,
+            Message::LayoutSync { .. } => 31,
 
             // Synchronization (40-49)
             Message::Heartbeat { .. } => 40,
@@ -676,6 +677,14 @@ mod tests {
             }),
             55
         );
+
+        assert_eq!(
+            MessageCodec::message_type_tag(&Message::LayoutSync {
+                layout: rshare_core::LayoutGraph::new(DeviceId::new_v4()),
+                revision: 1,
+            }),
+            31
+        );
     }
 
     #[test]
@@ -695,7 +704,7 @@ mod tests {
             MessageCodec::decode(&encoded).unwrap(),
             Message::HelloRejected {
                 reason: rshare_core::HandshakeRejectReason::ProtocolMismatch {
-                    required: 3,
+                    required: 4,
                     received: 2
                 },
                 ..

@@ -1055,6 +1055,40 @@ export default function MonitorManager({
     commitMonitors(nextMonitors);
   }, [commitMonitors, devices]);
 
+  const autoAttach = useCallback(() => {
+    const currentMonitors = monitorsRef.current;
+    if (currentMonitors.length < 2) {
+      return;
+    }
+
+    const ordered = [...currentMonitors].sort((a, b) =>
+      a.x - b.x ||
+      a.y - b.y ||
+      a.deviceId.localeCompare(b.deviceId) ||
+      a.id.localeCompare(b.id),
+    );
+    let cursorX = Math.min(...ordered.map((monitor) => monitor.x));
+    const baseBottom = Math.max(
+      ...ordered.map((monitor) => monitor.y + monitor.h),
+    );
+    const attachedPositions = new Map<string, { x: number; y: number }>();
+
+    for (const monitor of ordered) {
+      attachedPositions.set(monitor.id, {
+        x: cursorX,
+        y: baseBottom - monitor.h,
+      });
+      cursorX += monitor.w;
+    }
+
+    commitMonitors(
+      currentMonitors.map((monitor) => ({
+        ...monitor,
+        ...(attachedPositions.get(monitor.id) ?? { x: monitor.x, y: monitor.y }),
+      })),
+    );
+  }, [commitMonitors]);
+
   /* ---- Toggle monitor ---- */
   const toggleMonitor = useCallback((id: string) => {
     setMonitors((prev) => {
@@ -1364,6 +1398,7 @@ export default function MonitorManager({
           <RotateCcw size={11} /> 自动排列
         </button>
         <button
+          onClick={autoAttach}
           className="flex items-center gap-1 px-2.5 py-[3px] rounded text-[11px] transition-colors"
           style={{ backgroundColor: t.btnBg }}
           onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = t.btnHover)}
