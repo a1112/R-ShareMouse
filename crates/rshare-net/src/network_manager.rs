@@ -11,7 +11,6 @@ use tokio::task::JoinHandle;
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
-    encryption::{QuicTrustStore, TrustProvenance},
     handshake::PeerAuthContext,
     qos::{
         BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, TelemetryFrame,
@@ -70,8 +69,7 @@ pub struct NetworkManagerConfig {
     pub discovery_port: u16,
     /// Transport bind address
     pub bind_address: String,
-    /// Enables trusted-only discovery auto-connect. Unapproved and legacy-TOFU peers
-    /// remain observational.
+    /// Enables automatic connection attempts for compatible discovered peers.
     pub auto_connect: bool,
     /// Discovery broadcast interval
     pub broadcast_interval: Duration,
@@ -87,7 +85,7 @@ impl Default for NetworkManagerConfig {
         Self {
             discovery_port: 27432,
             bind_address: "0.0.0.0:27431".to_string(),
-            auto_connect: false,
+            auto_connect: true,
             broadcast_interval: Duration::from_secs(5),
             device_timeout: Duration::from_secs(30),
             mdns_enabled: false,
@@ -118,7 +116,7 @@ pub struct NetworkManager {
 }
 
 // Repeated UDP discovery broadcasts are expected. These bounds keep a bad or
-// unavailable trusted peer from creating an unbounded stream of QUIC attempts.
+// unavailable discovered peer from creating an unbounded stream of QUIC attempts.
 const AUTO_CONNECT_RETRY_BASE: Duration = Duration::from_secs(1);
 const AUTO_CONNECT_RETRY_MAX: Duration = Duration::from_secs(60);
 
@@ -171,7 +169,7 @@ impl AutoConnectScheduler {
 
     fn on_device_lost(&mut self, _device_id: DeviceId) {
         // Discovery visibility is not transport authentication. Retain retry
-        // history across DeviceLost/Goodbye churn so a trusted peer cannot
+        // history across DeviceLost/Goodbye churn so a discovered peer cannot
         // turn bounded backoff into repeated connection attempts.
     }
 }
@@ -181,13 +179,6 @@ fn auto_connect_retry_delay(failures: u32) -> Duration {
     AUTO_CONNECT_RETRY_BASE
         .saturating_mul(1_u32 << exponent)
         .min(AUTO_CONNECT_RETRY_MAX)
-}
-
-fn is_operator_approved_discovery(device_id: DeviceId, trust_store: &QuicTrustStore) -> bool {
-    matches!(
-        trust_store.provenance_for(&device_id),
-        Some(TrustProvenance::OperatorApproved)
-    )
 }
 
 fn auto_connect_address(
@@ -221,31 +212,13 @@ async fn maybe_auto_connect_discovered_device(
             peer_id = %device.id,
             local_protocol = local,
             remote_protocol = remote,
-            "Skipping trusted discovery auto-connect for incompatible peer"
+            "Skipping discovery auto-connect for incompatible peer"
         );
         return;
     }
 
-    let trust_store = match QuicTrustStore::load_default() {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(
-                peer_id = %device.id,
-                error = %error,
-                "Cannot load QUIC trust store; refusing discovery auto-connect"
-            );
-            return;
-        }
-    };
-    if !is_operator_approved_discovery(device.id, &trust_store) {
-        tracing::debug!(
-            peer_id = %device.id,
-            "Discovery peer is not operator-approved; leaving it observational"
-        );
-        return;
-    }
     let Some(address) = auto_connect_address(&device, config) else {
-        tracing::debug!(peer_id = %device.id, "Trusted discovery peer has no connection address");
+        tracing::debug!(peer_id = %device.id, "Discovered peer has no connection address");
         return;
     };
     if connection_view.is_connected(&device.id).await {
@@ -273,7 +246,7 @@ async fn maybe_auto_connect_discovered_device(
             .await
             .complete_attempt(device_id, Instant::now(), succeeded);
         if let Err(error) = result {
-            tracing::debug!(peer_id = %device_id, error = %error, "Trusted discovery auto-connect failed");
+            tracing::debug!(peer_id = %device_id, error = %error, "Discovery auto-connect failed");
         }
     });
 }
@@ -888,12 +861,12 @@ mod tests {
     fn test_network_manager_config_default() {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
-        assert!(!config.auto_connect);
+        assert!(config.auto_connect);
         assert!(!config.mdns_enabled);
     }
 
     #[test]
-    fn trusted_scheduler_starts_once_and_suppresses_connected_or_in_flight_duplicates() {
+    fn auto_connect_scheduler_starts_once_and_suppresses_connected_or_in_flight_duplicates() {
         let device_id = DeviceId::new_v4();
         let now = Instant::now();
         let mut scheduler = AutoConnectScheduler::default();
@@ -911,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_scheduler_failure_backoff_grows_and_caps() {
+    fn auto_connect_scheduler_failure_backoff_grows_and_caps() {
         let device_id = DeviceId::new_v4();
         let mut now = Instant::now();
         let mut scheduler = AutoConnectScheduler::default();
@@ -936,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_scheduler_keeps_backoff_across_device_lost_and_rediscovery() {
+    fn auto_connect_scheduler_keeps_backoff_across_device_lost_and_rediscovery() {
         let device_id = DeviceId::new_v4();
         let now = Instant::now();
         let mut scheduler = AutoConnectScheduler::default();
@@ -951,21 +924,6 @@ mod tests {
         );
         let retry_at = scheduler.attempts[&device_id].next_allowed_attempt.unwrap();
         assert!(scheduler.start_attempt_if_disconnected(device_id, retry_at, false));
-    }
-
-    #[test]
-    fn unknown_and_legacy_pins_are_not_auto_connect_authority() {
-        let device_id = DeviceId::new_v4();
-        let fingerprint = crate::encryption::PeerCertificateFingerprint::from_der(b"cert");
-        let mut trust_store = QuicTrustStore::default();
-        assert!(!is_operator_approved_discovery(device_id, &trust_store));
-
-        trust_store.trust_first_seen(device_id, fingerprint);
-        assert!(matches!(
-            trust_store.provenance_for(&device_id),
-            Some(TrustProvenance::LegacyTofu)
-        ));
-        assert!(!is_operator_approved_discovery(device_id, &trust_store));
     }
 
     #[test]
@@ -1174,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_auto_connect_true_keeps_found_and_updated_devices_observational() {
+    async fn auto_connect_attempts_found_and_updated_compatible_devices() {
         let local_id = DeviceId::from_bytes([0x10; 16]);
         let remote_id = DeviceId::from_bytes([0xf0; 16]);
         let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1236,10 +1194,10 @@ mod tests {
         );
         let mut packet = [0u8; 2048];
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), probe.recv_from(&mut packet))
+            tokio::time::timeout(Duration::from_secs(1), probe.recv_from(&mut packet))
                 .await
-                .is_err(),
-            "discovery must not send a QUIC connection attempt"
+                .is_ok(),
+            "automatic discovery must start a QUIC connection attempt"
         );
         assert!(manager.connection_infos().await.is_empty());
     }

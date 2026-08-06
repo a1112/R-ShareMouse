@@ -7041,8 +7041,9 @@ async fn main() -> Result<()> {
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
             mdns_enabled: config.network.mdns_enabled,
-            // Discovery may only initiate connections to peers with a persisted
-            // operator-approved QUIC certificate pin.
+            // Compatible discovered peers connect automatically. The first
+            // certificate is pinned during the handshake; security policy can
+            // add an explicit approval mode later.
             auto_connect: true,
             ..Default::default()
         });

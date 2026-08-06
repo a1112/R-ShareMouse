@@ -417,6 +417,9 @@ pub struct ConnectionManager {
     pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
 }
 
+// Retained for the future explicit approval mode. The current single-user
+// runtime automatically pins first-seen peers after identity verification.
+#[allow(dead_code)]
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -457,6 +460,7 @@ impl PendingApprovalRegistry {
         approvals
     }
 
+    #[allow(dead_code)]
     fn observe(
         &mut self,
         device_id: DeviceId,
@@ -498,6 +502,7 @@ impl PendingApprovalRegistry {
         true
     }
 
+    #[allow(dead_code)]
     fn consume_matching(
         &mut self,
         device_id: DeviceId,
@@ -955,7 +960,6 @@ impl ConnectionManager {
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
         let local_device_id = self.local_device_id;
-        let pending_approvals = self.pending_approvals.clone();
 
         tokio::spawn(async move {
             while let Some(mut incoming) = incoming.recv().await {
@@ -975,48 +979,27 @@ impl ConnectionManager {
                         }
                     };
                 let device_id = negotiated.auth.peer_id;
-                let fingerprint = negotiated.auth.certificate_fingerprint.clone();
                 let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
                     Some(QuicTrustDecision::OperatorApproved) => true,
                     Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
-                        let consumed = pending_approvals
-                            .write()
-                            .expect("pending approval registry poisoned")
-                            .consume_matching(
+                        if let Err(error) = incoming
+                            .connection
+                            .commit_inbound_operator_approval(device_id)
+                        {
+                            tracing::warn!(
+                                "Failed to persist automatically trusted inbound peer {}: {}",
                                 device_id,
-                                &fingerprint,
-                                PendingApprovalRegistry::now_ms(),
+                                error
                             );
-                        if consumed {
-                            if let Err(error) = incoming
-                                .connection
-                                .commit_inbound_operator_approval(device_id)
-                            {
-                                tracing::warn!(
-                                    "Failed to persist approved inbound peer {}: {}",
-                                    device_id,
-                                    error
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        } else {
-                            pending_approvals
-                                .write()
-                                .expect("pending approval registry poisoned")
-                                .observe(
-                                    device_id,
-                                    &fingerprint,
-                                    PendingApprovalRegistry::now_ms(),
-                                );
                             false
+                        } else {
+                            true
                         }
                     }
                     Some(QuicTrustDecision::Rejected { .. }) | None => false,
                 };
                 if !inbound_authorized {
-                    tracing::info!("Inbound peer {} requires target-local approval", device_id);
+                    tracing::info!("Inbound peer {} was rejected by the trust store", device_id);
                     incoming.connection.close().await;
                     continue;
                 }

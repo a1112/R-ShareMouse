@@ -71,26 +71,6 @@ async fn event_until_connected(
     .flatten()
 }
 
-async fn pending_approval_until(
-    manager: &ConnectionManager,
-    device_id: Uuid,
-) -> rshare_core::PendingPeerApproval {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(approval) = manager
-                .pending_peer_approvals()
-                .into_iter()
-                .find(|approval| approval.device_id == device_id)
-            {
-                return approval;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("first inbound attempt must create a target-local pending approval")
-}
-
 async fn assert_no_connected_event(
     events: &mut tokio::sync::mpsc::Receiver<ManagerEvent>,
     device_id: Uuid,
@@ -99,7 +79,7 @@ async fn assert_no_connected_event(
         while let Some(event) = events.recv().await {
             assert!(
                 !matches!(event, ManagerEvent::Connected(auth) if auth.peer_id == device_id),
-                "unapproved peer entered the canonical registry"
+                "peer with a changed fingerprint entered the canonical registry"
             );
         }
     })
@@ -108,7 +88,7 @@ async fn assert_no_connected_event(
 }
 
 #[tokio::test]
-async fn v3_peers_exchange_certificate_identity_after_target_approval_and_matching_retry() {
+async fn peers_auto_trust_first_seen_certificate_and_connect() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("mutual");
@@ -117,18 +97,6 @@ async fn v3_peers_exchange_certificate_identity_after_target_approval_and_matchi
     server.start_server("127.0.0.1:0").await.unwrap();
 
     let mut client = network.manager(client_id, "client", generated_identity());
-    assert!(client
-        .connect(
-            server_id,
-            &server.transport_local_addr().unwrap().to_string(),
-        )
-        .await
-        .is_err());
-    let approval = pending_approval_until(&server, client_id).await;
-    assert!(server.connections().is_empty());
-    assert_no_connected_event(&mut events, client_id).await;
-    assert!(server.approve_peer(&approval.approval_id));
-
     client
         .connect(
             server_id,
@@ -145,7 +113,7 @@ async fn v3_peers_exchange_certificate_identity_after_target_approval_and_matchi
 }
 
 #[tokio::test]
-async fn v3_peer_without_client_certificate_is_rejected_after_hello() {
+async fn peer_without_client_certificate_is_rejected_after_hello() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("missing-client-cert");
@@ -191,9 +159,6 @@ async fn changed_fingerprint_never_enters_registry() {
     let first_identity = generated_identity();
     let first_fingerprint = PeerCertificateFingerprint::from_der(&first_identity.cert_der);
     let mut first = network.manager(claimed_id, "client", first_identity);
-    assert!(first.connect(server_id, &address).await.is_err());
-    let approval = pending_approval_until(&server, claimed_id).await;
-    assert!(server.approve_peer(&approval.approval_id));
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
     server.disconnect(&claimed_id).await.unwrap();
@@ -242,7 +207,7 @@ fn discovery_surfaces_old_peer_as_incompatible_without_connecting() {
     assert_eq!(
         discovered.protocol_compatibility,
         PeerProtocolCompatibility::Incompatible {
-            local: 3,
+            local: rshare_core::PROTOCOL_VERSION,
             remote: 2
         }
     );
@@ -260,9 +225,6 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     let address = server.transport_local_addr().unwrap().to_string();
 
     let mut first = network.manager(client_id, "client", client_identity.clone());
-    assert!(first.connect(server_id, &address).await.is_err());
-    let approval = pending_approval_until(&server, client_id).await;
-    assert!(server.approve_peer(&approval.approval_id));
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     let old_control_id = server.connections()[0]
