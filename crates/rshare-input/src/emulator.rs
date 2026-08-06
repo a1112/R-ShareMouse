@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton, RSHARE_KEYPAD_ENTER_RAW};
+#[cfg(target_os = "windows")]
+use crate::events::{is_canonical_raw_keycode, RSHARE_KEYPAD_ENTER_RAW};
+use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton};
 
 /// Input emulator trait
 pub trait InputEmulator {
@@ -133,13 +135,12 @@ impl EnigoInputEmulator {
     }
 
     /// Convert MouseButton to enigo's Button
-    fn convert_mouse_button(button: MouseButton) -> Button {
+    fn convert_mouse_button(button: MouseButton) -> Option<Button> {
         match button {
-            MouseButton::Left => Button::Left,
-            MouseButton::Middle => Button::Middle,
-            MouseButton::Right => Button::Right,
-            MouseButton::Back | MouseButton::Forward => Button::Left,
-            MouseButton::Other(_) => Button::Left, // Default to left
+            MouseButton::Left => Some(Button::Left),
+            MouseButton::Middle => Some(Button::Middle),
+            MouseButton::Right => Some(Button::Right),
+            MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
         }
     }
 
@@ -277,7 +278,8 @@ impl InputEmulator for EnigoInputEmulator {
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock enigo: {}", e))?;
 
-        let enigo_btn = Self::convert_mouse_button(button);
+        let enigo_btn = Self::convert_mouse_button(button)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported portable mouse button: {:?}", button))?;
         tracing::trace!("Pressing mouse button: {:?}", button);
 
         enigo
@@ -293,7 +295,8 @@ impl InputEmulator for EnigoInputEmulator {
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock enigo: {}", e))?;
 
-        let enigo_btn = Self::convert_mouse_button(button);
+        let enigo_btn = Self::convert_mouse_button(button)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported portable mouse button: {:?}", button))?;
         tracing::trace!("Releasing mouse button: {:?}", button);
 
         enigo
@@ -472,22 +475,21 @@ impl MacosNativeInputEmulator {
 
     fn convert_mouse_button(button: MouseButton) -> Result<u8> {
         match button {
-            MouseButton::Left | MouseButton::Middle | MouseButton::Right => Ok(button.to_code()),
-            MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => {
-                anyhow::bail!("Unsupported macOS mouse button: {:?}", button)
-            }
+            MouseButton::Left
+            | MouseButton::Middle
+            | MouseButton::Right
+            | MouseButton::Back
+            | MouseButton::Forward => Ok(button.to_code()),
+            MouseButton::Other(_) => anyhow::bail!("Unsupported macOS mouse button: {:?}", button),
         }
     }
 
     fn convert_keycode(keycode: KeyCode) -> Result<u32> {
-        let raw = match keycode {
-            KeyCode::Char(c) => macos_char_keycode(c)? as u32,
-            KeyCode::Raw(raw) => raw,
-            _ => keycode.to_raw(),
-        };
-
-        rshare_platform::mac_key_code(raw)?;
-        Ok(raw)
+        match keycode {
+            KeyCode::Char(c) => Ok(macos_char_keycode(c)? as u32),
+            KeyCode::Raw(raw) => Ok(rshare_platform::mac_key_code(raw)? as u32),
+            semantic => Ok(rshare_platform::mac_key_code(semantic.to_raw())? as u32),
+        }
     }
 }
 
@@ -570,11 +572,13 @@ impl InputEmulator for MacosNativeInputEmulator {
     }
 
     fn press_key(&mut self, keycode: KeyCode) -> Result<()> {
-        self.inner.send_key(Self::convert_keycode(keycode)?, true)
+        self.inner
+            .send_hardware_key(Self::convert_keycode(keycode)? as u16, true)
     }
 
     fn release_key(&mut self, keycode: KeyCode) -> Result<()> {
-        self.inner.send_key(Self::convert_keycode(keycode)?, false)
+        self.inner
+            .send_hardware_key(Self::convert_keycode(keycode)? as u16, false)
     }
 
     fn type_key(&mut self, keycode: KeyCode) -> Result<()> {
@@ -784,12 +788,18 @@ impl WindowsNativeInputEmulator {
             KeyCode::F11 => 0x7A,
             KeyCode::F12 => 0x7B,
             KeyCode::Space => vk::VK_SPACE,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => vk::VK_SHIFT,
-            KeyCode::ControlLeft | KeyCode::ControlRight => vk::VK_CONTROL,
-            KeyCode::AltLeft | KeyCode::AltRight => vk::VK_MENU,
+            KeyCode::ShiftLeft => vk::VK_LSHIFT,
+            KeyCode::ShiftRight => vk::VK_RSHIFT,
+            KeyCode::ControlLeft => vk::VK_LCONTROL,
+            KeyCode::ControlRight => vk::VK_RCONTROL,
+            KeyCode::AltLeft => vk::VK_LMENU,
+            KeyCode::AltRight => vk::VK_RMENU,
             KeyCode::SuperLeft => vk::VK_LWIN,
             KeyCode::SuperRight => vk::VK_RWIN,
-            KeyCode::Raw(raw) => raw as u16,
+            KeyCode::Raw(raw) if is_canonical_raw_keycode(raw) && raw <= u16::MAX as u32 => {
+                raw as u16
+            }
+            KeyCode::Raw(raw) => anyhow::bail!("Unsupported canonical raw keycode: {raw:#X}"),
             KeyCode::Char(c) => {
                 let c = c.to_ascii_uppercase();
                 if c.is_ascii_alphabetic() {
@@ -1105,15 +1115,23 @@ mod tests {
     fn test_mouse_button_conversion() {
         assert_eq!(
             EnigoInputEmulator::convert_mouse_button(MouseButton::Left),
-            Button::Left
+            Some(Button::Left)
         );
         assert_eq!(
             EnigoInputEmulator::convert_mouse_button(MouseButton::Right),
-            Button::Right
+            Some(Button::Right)
         );
         assert_eq!(
             EnigoInputEmulator::convert_mouse_button(MouseButton::Middle),
-            Button::Middle
+            Some(Button::Middle)
+        );
+        assert_eq!(
+            EnigoInputEmulator::convert_mouse_button(MouseButton::Back),
+            None
+        );
+        assert_eq!(
+            EnigoInputEmulator::convert_mouse_button(MouseButton::Other(6)),
+            None
         );
     }
 
@@ -1131,6 +1149,100 @@ mod tests {
             EnigoInputEmulator::convert_keycode(KeyCode::Enter),
             Some(Key::Return)
         );
+        // Enigo has no reliable press/release contract for canonical raw
+        // punctuation here, so the portable fallback reports it unsupported.
+        assert_eq!(
+            EnigoInputEmulator::convert_keycode(KeyCode::Raw(0xBB)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_semantic_keycodes_map_to_hardware_keycodes() {
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Char(b'A')).unwrap(),
+            0x00
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Char(b'C')).unwrap(),
+            0x08
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Char(b'W')).unwrap(),
+            0x0D
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::ShiftLeft).unwrap(),
+            0x38
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::ShiftRight).unwrap(),
+            0x3C
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::ControlLeft).unwrap(),
+            0x3B
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::ControlRight).unwrap(),
+            0x3E
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::AltLeft).unwrap(),
+            0x3A
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::AltRight).unwrap(),
+            0x3D
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::SuperLeft).unwrap(),
+            0x37
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::SuperRight).unwrap(),
+            0x36
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::CapsLock).unwrap(),
+            0x39
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Left).unwrap(),
+            0x7B
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::KeypadEnter).unwrap(),
+            0x4C
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Raw(0xBB)).unwrap(),
+            0x18
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_keycode(KeyCode::Raw(
+                crate::events::RSHARE_ISO_102ND_RAW
+            ))
+            .unwrap(),
+            0x0A
+        );
+        assert!(MacosNativeInputEmulator::convert_keycode(KeyCode::Raw(0x04)).is_err());
+        assert!(MacosNativeInputEmulator::convert_keycode(KeyCode::Raw(0x1234)).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_mouse_buttons_preserve_side_codes_and_reject_unknowns() {
+        assert_eq!(
+            MacosNativeInputEmulator::convert_mouse_button(MouseButton::Back).unwrap(),
+            4
+        );
+        assert_eq!(
+            MacosNativeInputEmulator::convert_mouse_button(MouseButton::Forward).unwrap(),
+            5
+        );
+        assert!(MacosNativeInputEmulator::convert_mouse_button(MouseButton::Other(6)).is_err());
     }
 
     #[test]
@@ -1148,6 +1260,27 @@ mod tests {
         assert!(macos_impl.contains("InputEvent::TextCommit { text } => self.commit_text(&text)?"));
         assert!(macos_impl.contains("fn commit_text(&mut self, text: &str) -> Result<()>"));
         assert!(macos_impl.contains("self.inner.send_text(text)"));
+    }
+
+    #[test]
+    fn macos_native_key_posting_uses_one_native_conversion_boundary() {
+        let source = include_str!("emulator.rs");
+        let start = source
+            .find("impl InputEmulator for MacosNativeInputEmulator")
+            .expect("missing macOS native emulator");
+        let end = source[start..]
+            .find("impl MacosNativeInputEmulator")
+            .map(|offset| start + offset)
+            .expect("missing end of macOS native emulator trait implementation");
+        let macos_impl = &source[start..end];
+
+        assert!(
+            macos_impl.contains("send_hardware_key(Self::convert_keycode(keycode)? as u16, true)")
+        );
+        assert!(
+            macos_impl.contains("send_hardware_key(Self::convert_keycode(keycode)? as u16, false)")
+        );
+        assert!(!macos_impl.contains("send_key(Self::convert_keycode(keycode)?"));
     }
 
     #[test]
@@ -1222,5 +1355,66 @@ mod tests {
         let result = InjectBackend::inject(&mut emulator, InputEvent::mouse_move(10, 10));
 
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_emulator_accepts_canonical_raw_values_and_rejects_unknown_wire_values() {
+        for raw in [
+            0x13,
+            0x2C,
+            0x91,
+            0xBA,
+            0xBB,
+            0xBC,
+            0xBD,
+            0xBE,
+            0xBF,
+            0xC0,
+            0xDB,
+            0xDC,
+            0xDD,
+            0xDE,
+            crate::events::RSHARE_ISO_102ND_RAW,
+        ] {
+            assert_eq!(
+                WindowsNativeInputEmulator::convert_keycode(KeyCode::Raw(raw)).unwrap(),
+                raw as u16
+            );
+        }
+
+        assert!(WindowsNativeInputEmulator::convert_keycode(KeyCode::from_wire(0xFF)).is_err());
+        assert!(WindowsNativeInputEmulator::convert_keycode(KeyCode::from_wire(0x1_0000)).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_emulator_preserves_left_and_right_modifier_identity() {
+        use rshare_platform::vk;
+
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::ShiftLeft).unwrap(),
+            vk::VK_LSHIFT
+        );
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::ShiftRight).unwrap(),
+            vk::VK_RSHIFT
+        );
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::ControlLeft).unwrap(),
+            vk::VK_LCONTROL
+        );
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::ControlRight).unwrap(),
+            vk::VK_RCONTROL
+        );
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::AltLeft).unwrap(),
+            vk::VK_LMENU
+        );
+        assert_eq!(
+            WindowsNativeInputEmulator::convert_keycode(KeyCode::AltRight).unwrap(),
+            vk::VK_RMENU
+        );
     }
 }

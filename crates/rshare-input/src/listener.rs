@@ -560,7 +560,11 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
         Key::KeyL => KeyCode::Char(b'L'),
         Key::SemiColon => KeyCode::Raw(0xBA),
         Key::Quote => KeyCode::Raw(0xDE),
-        Key::BackSlash | Key::IntlBackslash => KeyCode::Raw(0xDC),
+        // The ISO 102nd key is physically distinct from the ANSI backslash
+        // key. Keep it in its canonical wire slot so it cannot collide with
+        // either BackSlash or the Windows scan-code value 0x56.
+        Key::BackSlash => KeyCode::Raw(0xDC),
+        Key::IntlBackslash => KeyCode::Raw(crate::RSHARE_ISO_102ND_RAW),
         Key::KeyZ => KeyCode::Char(b'Z'),
         Key::KeyX => KeyCode::Char(b'X'),
         Key::KeyC => KeyCode::Char(b'C'),
@@ -587,7 +591,9 @@ fn rdev_key_to_key_code(key: rdev::Key) -> Option<KeyCode> {
         Key::KpPlus => KeyCode::KeypadAdd,
         Key::KpDivide => KeyCode::KeypadDivide,
         Key::KpDelete => KeyCode::KeypadDecimal,
-        Key::Unknown(code) => KeyCode::Raw(code),
+        // rdev's Unknown value is a native keycode, not a canonical wire
+        // value. Publishing it would let unrelated platforms reinterpret it.
+        Key::Unknown(_) => return None,
         _ => return None,
     })
 }
@@ -626,6 +632,56 @@ impl Default for DefaultInputListener {
     }
 }
 
+#[cfg(all(target_os = "macos", not(test)))]
+impl DefaultInputListener {
+    /// Start the native macOS listener and surface tap discontinuities through
+    /// the semantic ingress fault lane.
+    pub fn start_with_fault(
+        &mut self,
+        callback: InputCallback,
+        fault_callback: Arc<dyn Fn(IngressFault) + Send + Sync>,
+    ) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+
+        use std::sync::Mutex as StdMutex;
+
+        tracing::info!("Input listener starting (using native macOS CGEventTap)");
+        let callback = Arc::new(StdMutex::new(callback));
+        let mut listener = rshare_platform::MacosInputListener::new();
+        listener.start_with_callback_and_fault(
+            move |event| {
+                if let Some(input_event) = InputEvent::from_macos_event(event) {
+                    if let Ok(callback) = callback.lock() {
+                        callback(input_event);
+                    }
+                }
+            },
+            move || fault_callback(IngressFault::CaptureDiscontinuity),
+        )?;
+        self.macos_listener = Some(listener);
+        self.running = true;
+        Ok(())
+    }
+
+    /// Report whether the native listener observed a capture discontinuity.
+    pub fn has_capture_fault(&self) -> bool {
+        self.macos_listener
+            .as_ref()
+            .is_some_and(rshare_platform::MacosInputListener::has_capture_fault)
+    }
+
+    /// Clone the native listener's non-mutating runtime status so the daemon
+    /// can detect a stopped/faulted event tap independently of the fault
+    /// callback path.
+    pub fn macos_status_handle(&self) -> Option<rshare_platform::MacosInputListenerStatus> {
+        self.macos_listener
+            .as_ref()
+            .map(rshare_platform::MacosInputListener::status_handle)
+    }
+}
+
 impl InputListener for DefaultInputListener {
     fn start(&mut self, _callback: InputCallback) -> Result<()> {
         if self.running {
@@ -640,9 +696,10 @@ impl InputListener for DefaultInputListener {
             let callback = Arc::new(StdMutex::new(_callback));
             let mut listener = rshare_platform::WindowsInputListener::new();
             listener.start_with_callback(move |event| {
-                let input_event = InputEvent::from_windows_event(event);
-                if let Ok(callback) = callback.lock() {
-                    callback(input_event);
+                if let Some(input_event) = InputEvent::from_windows_event(event) {
+                    if let Ok(callback) = callback.lock() {
+                        callback(input_event);
+                    }
                 }
             })?;
             self.windows_listener = Some(listener);
@@ -652,20 +709,7 @@ impl InputListener for DefaultInputListener {
 
         #[cfg(all(target_os = "macos", not(test)))]
         {
-            use std::sync::{Arc, Mutex as StdMutex};
-
-            tracing::info!("Input listener starting (using native macOS CGEventTap)");
-            let callback = Arc::new(StdMutex::new(_callback));
-            let mut listener = rshare_platform::MacosInputListener::new();
-            listener.start_with_callback(move |event| {
-                let input_event = InputEvent::from_macos_event(event);
-                if let Ok(callback) = callback.lock() {
-                    callback(input_event);
-                }
-            })?;
-            self.macos_listener = Some(listener);
-            self.running = true;
-            return Ok(());
+            return self.start_with_fault(_callback, Arc::new(|_| {}));
         }
 
         #[cfg(not(any(
@@ -706,7 +750,17 @@ impl InputListener for DefaultInputListener {
     }
 
     fn is_running(&self) -> bool {
-        self.running
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            self.macos_listener
+                .as_ref()
+                .is_some_and(rshare_platform::MacosInputListener::is_running)
+        }
+
+        #[cfg(not(all(target_os = "macos", not(test))))]
+        {
+            self.running
+        }
     }
 }
 
@@ -756,6 +810,15 @@ mod tests {
             rdev_key_to_key_code(rdev::Key::KpDelete),
             Some(KeyCode::KeypadDecimal)
         );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::BackSlash),
+            Some(KeyCode::Raw(0xDC))
+        );
+        assert_eq!(
+            rdev_key_to_key_code(rdev::Key::IntlBackslash),
+            Some(KeyCode::Raw(crate::RSHARE_ISO_102ND_RAW))
+        );
+        assert_eq!(rdev_key_to_key_code(rdev::Key::Unknown(0x56)), None);
     }
 
     #[test]

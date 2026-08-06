@@ -31,7 +31,8 @@ pub struct Config {
 pub struct NetworkConfig {
     pub port: u16,
     pub bind_address: String,
-    /// Enable mDNS discovery
+    /// Legacy mDNS switch. Discovery currently uses UDP broadcast only.
+    #[serde(default)]
     pub mdns_enabled: bool,
 }
 
@@ -136,7 +137,7 @@ impl Default for NetworkConfig {
         Self {
             port: 27431,
             bind_address: "0.0.0.0".to_string(),
-            mdns_enabled: true,
+            mdns_enabled: false,
         }
     }
 }
@@ -364,7 +365,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network.port, 27431);
         assert_eq!(config.network.bind_address, "0.0.0.0");
-        assert!(config.network.mdns_enabled);
+        assert!(!config.network.mdns_enabled);
         assert!(config.gui.minimize_to_tray);
         assert!(config.gui.show_notifications);
         assert!(config.gui.show_tray_icon);
@@ -394,6 +395,16 @@ mod tests {
     #[test]
     fn mobile_gateway_is_disabled_by_default() {
         assert!(!Config::default().features.mobile_gateway_enabled);
+    }
+
+    #[test]
+    fn legacy_mdns_true_remains_deserializable_but_default_is_udp_only() {
+        let legacy: Config = toml::from_str(
+            "[network]\nport = 27431\nbind_address = \"0.0.0.0\"\nmdns_enabled = true\n",
+        )
+        .unwrap();
+        assert!(legacy.network.mdns_enabled);
+        assert!(!Config::default().network.mdns_enabled);
     }
 
     #[test]

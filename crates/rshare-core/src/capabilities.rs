@@ -123,6 +123,27 @@ pub fn local_capability_snapshots(
     if let Some(mode) = backend.selected_mode {
         input = input.with_detail("mode", format!("{mode:?}"));
     }
+    if features.suppress_local_shortcuts_when_remote && !shortcut_suppression_supported(controls) {
+        input.state = CapabilityState::Degraded;
+        input.health_reason = Some(
+            "automatic forwarding is blocked because local shortcut suppression is unavailable"
+                .to_string(),
+        );
+        input.details.insert(
+            "shortcut_suppression".to_string(),
+            "unavailable".to_string(),
+        );
+    } else {
+        input.details.insert(
+            "shortcut_suppression".to_string(),
+            if features.suppress_local_shortcuts_when_remote {
+                "required"
+            } else {
+                "opt_out"
+            }
+            .to_string(),
+        );
+    }
     capabilities.push(input);
 
     capabilities.push(EndpointCapabilitySnapshot::new(
@@ -279,6 +300,32 @@ pub fn local_capability_snapshots(
     capabilities.push(diagnostics);
 
     capabilities
+}
+
+#[cfg(windows)]
+fn shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    // The KMDF filter path captures input before the low-level hook, but does
+    // not start an auxiliary hook suppressor. Only the active native-hook
+    // capture path can therefore suppress local shortcuts.
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(crate::ResolvedInputMode::WindowsNative)
+        )
+}
+
+#[cfg(target_os = "macos")]
+fn shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(crate::ResolvedInputMode::Portable)
+        )
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
+    false
 }
 
 /// Derive a peer capability list from advertised protocol capabilities.

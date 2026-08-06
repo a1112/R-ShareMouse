@@ -539,10 +539,26 @@ mod windows_impl {
     /// Input event captured by the native Windows low-level hooks.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum WindowsInputEvent {
-        MouseMove { x: i32, y: i32 },
-        MouseButton { button: u8, down: bool },
-        MouseWheel { delta_x: i32, delta_y: i32 },
-        Key { vk: u32, down: bool },
+        MouseMove {
+            x: i32,
+            y: i32,
+        },
+        MouseButton {
+            button: u8,
+            down: bool,
+        },
+        MouseWheel {
+            delta_x: i32,
+            delta_y: i32,
+        },
+        Key {
+            vk: u32,
+            /// Set-1 scan code reported by the low-level hook.
+            scan_code: u32,
+            /// `KBDLLHOOKSTRUCT::flags`, including `LLKHF_EXTENDED`.
+            flags: u32,
+            down: bool,
+        },
     }
 
     pub const RSHARE_DRIVER_DEVICE_PATH: &str = r"\\.\RShareInputControl";
@@ -1765,10 +1781,14 @@ mod windows_impl {
         match message {
             WM_KEYDOWN | WM_SYSKEYDOWN => Some(WindowsInputEvent::Key {
                 vk: event.vk_code,
+                scan_code: event.scan_code,
+                flags: event.flags,
                 down: true,
             }),
             WM_KEYUP | WM_SYSKEYUP => Some(WindowsInputEvent::Key {
                 vk: event.vk_code,
+                scan_code: event.scan_code,
+                flags: event.flags,
                 down: false,
             }),
             _ => None,
@@ -2154,6 +2174,7 @@ mod windows_impl {
     const WH_KEYBOARD_LL: i32 = 13;
     const LLMHF_INJECTED: u32 = 0x00000001;
     const LLMHF_LOWER_IL_INJECTED: u32 = 0x00000002;
+    const LLKHF_EXTENDED: u32 = 0x00000001;
     const LLKHF_LOWER_IL_INJECTED: u32 = 0x00000002;
     const LLKHF_INJECTED: u32 = 0x00000010;
     const WM_QUIT: u32 = 0x0012;
@@ -3437,10 +3458,15 @@ mod windows_impl {
     }
 
     fn keyboard_input_for_key(vk: u16, down: bool) -> KeyboardInput {
-        let (vk, scan, flags) = if vk == RSHARE_KEYPAD_ENTER_RAW {
-            (0, 0x1C, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
-        } else {
-            (vk, 0, 0)
+        let (vk, scan, flags) = match vk {
+            RSHARE_KEYPAD_ENTER_RAW => (0, 0x1C, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY),
+            // Use set-1 scan-code injection for right-side modifiers. Their
+            // extended bit is required for Windows to preserve the physical
+            // right-hand identity across both key-down and key-up records.
+            vk::VK_RSHIFT => (0, 0x36, KEYEVENTF_SCANCODE),
+            vk::VK_RCONTROL => (0, 0x1D, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY),
+            vk::VK_RMENU => (0, 0x38, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY),
+            vk => (vk, 0, 0),
         };
 
         KeyboardInput {
@@ -4768,6 +4794,12 @@ mod windows_impl {
         pub const VK_SHIFT: u16 = 0x10;
         pub const VK_CONTROL: u16 = 0x11;
         pub const VK_MENU: u16 = 0x12;
+        pub const VK_LSHIFT: u16 = 0xA0;
+        pub const VK_RSHIFT: u16 = 0xA1;
+        pub const VK_LCONTROL: u16 = 0xA2;
+        pub const VK_RCONTROL: u16 = 0xA3;
+        pub const VK_LMENU: u16 = 0xA4;
+        pub const VK_RMENU: u16 = 0xA5;
         pub const VK_PAUSE: u16 = 0x13;
         pub const VK_CAPITAL: u16 = 0x14;
         pub const VK_ESCAPE: u16 = 0x1B;
@@ -5264,6 +5296,49 @@ mod windows_impl {
                 up.flags,
                 KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
             );
+        }
+
+        #[test]
+        fn right_side_modifier_sendinput_records_preserve_physical_identity() {
+            let cases = [
+                (vk::VK_RSHIFT, 0x36, KEYEVENTF_SCANCODE),
+                (
+                    vk::VK_RCONTROL,
+                    0x1D,
+                    KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY,
+                ),
+                (
+                    vk::VK_RMENU,
+                    0x38,
+                    KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY,
+                ),
+            ];
+
+            for (key, scan, flags) in cases {
+                let down = keyboard_input_for_key(key, true);
+                assert_eq!(down.vk, 0);
+                assert_eq!(down.scan, scan);
+                assert_eq!(down.flags, flags);
+
+                let up = keyboard_input_for_key(key, false);
+                assert_eq!(up.vk, 0);
+                assert_eq!(up.scan, scan);
+                assert_eq!(up.flags, flags | KEYEVENTF_KEYUP);
+            }
+
+            for (left, right) in [
+                (vk::VK_LSHIFT, vk::VK_RSHIFT),
+                (vk::VK_LCONTROL, vk::VK_RCONTROL),
+                (vk::VK_LMENU, vk::VK_RMENU),
+            ] {
+                let left = keyboard_input_for_key(left, true);
+                let right = keyboard_input_for_key(right, true);
+                assert_ne!(
+                    (left.vk, left.scan, left.flags),
+                    (right.vk, right.scan, right.flags),
+                    "left and right modifier records must remain distinct"
+                );
+            }
         }
 
         #[test]
@@ -5766,6 +5841,8 @@ mod windows_impl {
                 convert_keyboard_hook_event(WM_KEYDOWN, &event),
                 Some(WindowsInputEvent::Key {
                     vk: vk::VK_SPACE as u32,
+                    scan_code: 0,
+                    flags: 0,
                     down: true
                 })
             );
@@ -5773,7 +5850,30 @@ mod windows_impl {
                 convert_keyboard_hook_event(WM_SYSKEYUP, &event),
                 Some(WindowsInputEvent::Key {
                     vk: vk::VK_SPACE as u32,
+                    scan_code: 0,
+                    flags: 0,
                     down: false
+                })
+            );
+        }
+
+        #[test]
+        fn keyboard_hook_keeps_scan_code_and_extended_flag_for_keypad_enter() {
+            let event = KeyboardHookStruct {
+                vk_code: vk::VK_RETURN as u32,
+                scan_code: 0x1C,
+                flags: LLKHF_EXTENDED,
+                time: 0,
+                extra_info: 0,
+            };
+
+            assert_eq!(
+                convert_keyboard_hook_event(WM_KEYDOWN, &event),
+                Some(WindowsInputEvent::Key {
+                    vk: vk::VK_RETURN as u32,
+                    scan_code: 0x1C,
+                    flags: LLKHF_EXTENDED,
+                    down: true,
                 })
             );
         }
@@ -5810,6 +5910,8 @@ mod windows_impl {
 
             assert!(should_suppress_local_event(&WindowsInputEvent::Key {
                 vk: vk::VK_LWIN as u32,
+                scan_code: 0,
+                flags: 0,
                 down: true,
             }));
             assert!(should_suppress_local_event(
@@ -5831,6 +5933,8 @@ mod windows_impl {
             set_local_input_suppressed(false);
             assert!(!should_suppress_local_event(&WindowsInputEvent::Key {
                 vk: vk::VK_LWIN as u32,
+                scan_code: 0,
+                flags: 0,
                 down: true,
             }));
         }

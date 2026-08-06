@@ -52,6 +52,16 @@ fn local_capabilities_report_input_and_diagnostics_available_when_backends_are_h
     controls.keyboard.detected = true;
     controls.mouse.detected = true;
     controls.display.display_count = 1;
+    #[cfg(windows)]
+    {
+        controls.capture_backend.mode = Some(ResolvedInputMode::WindowsNative);
+        controls.capture_backend.active = true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        controls.capture_backend.mode = Some(ResolvedInputMode::Portable);
+        controls.capture_backend.active = true;
+    }
     controls.audio_inputs.push(LocalAudioInputDevice {
         id: "mic".to_string(),
         name: "Microphone".to_string(),
@@ -72,10 +82,28 @@ fn local_capabilities_report_input_and_diagnostics_available_when_backends_are_h
         &FeatureConfig::default(),
     );
 
+    let input = capability(&capabilities, EndpointCapabilityKind::Input);
+    #[cfg(any(windows, target_os = "macos"))]
+    assert_eq!(input.state, CapabilityState::Available);
+    #[cfg(target_os = "macos")]
     assert_eq!(
-        capability(&capabilities, EndpointCapabilityKind::Input).state,
-        CapabilityState::Available
+        input
+            .details
+            .get("shortcut_suppression")
+            .map(String::as_str),
+        Some("required")
     );
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        assert_eq!(input.state, CapabilityState::Degraded);
+        assert_eq!(
+            input
+                .details
+                .get("shortcut_suppression")
+                .map(String::as_str),
+            Some("unavailable")
+        );
+    }
     assert_eq!(
         capability(&capabilities, EndpointCapabilityKind::Diagnostics).state,
         CapabilityState::Available
@@ -87,6 +115,68 @@ fn local_capabilities_report_input_and_diagnostics_available_when_backends_are_h
     assert_eq!(
         capability(&capabilities, EndpointCapabilityKind::Audio).state,
         CapabilityState::Available
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_inactive_or_missing_portable_capture_degrades_required_shortcut_suppression() {
+    let mut backend = BackendRuntimeState::new();
+    backend.selected_mode = Some(ResolvedInputMode::Portable);
+    backend.capture_health = BackendHealth::Healthy;
+    backend.inject_health = BackendHealth::Healthy;
+    backend.update_aggregate_health();
+
+    let mut inactive_controls = LocalControlDeviceSnapshot::default();
+    inactive_controls.capture_backend.mode = Some(ResolvedInputMode::Portable);
+    let missing_controls = LocalControlDeviceSnapshot::default();
+
+    for controls in [&inactive_controls, &missing_controls] {
+        let capabilities = rshare_core::local_capability_snapshots(
+            &backend,
+            controls,
+            &NetworkTransportSnapshot::default(),
+            &FeatureConfig::default(),
+        );
+        let input = capability(&capabilities, EndpointCapabilityKind::Input);
+
+        assert_eq!(input.state, CapabilityState::Degraded);
+        assert_eq!(
+            input
+                .details
+                .get("shortcut_suppression")
+                .map(String::as_str),
+            Some("unavailable")
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn active_filter_capture_reports_shortcut_suppression_as_unavailable() {
+    let mut backend = BackendRuntimeState::new();
+    backend.selected_mode = Some(ResolvedInputMode::VirtualHid);
+    backend.update_aggregate_health();
+
+    let mut controls = LocalControlDeviceSnapshot::default();
+    controls.capture_backend.mode = Some(ResolvedInputMode::VirtualHid);
+    controls.capture_backend.active = true;
+
+    let capabilities = rshare_core::local_capability_snapshots(
+        &backend,
+        &controls,
+        &NetworkTransportSnapshot::default(),
+        &FeatureConfig::default(),
+    );
+    let input = capability(&capabilities, EndpointCapabilityKind::Input);
+
+    assert_eq!(input.state, CapabilityState::Degraded);
+    assert_eq!(
+        input
+            .details
+            .get("shortcut_suppression")
+            .map(String::as_str),
+        Some("unavailable")
     );
 }
 

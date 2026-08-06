@@ -83,7 +83,7 @@ pub use ipc::{
     default_mobile_gateway_addr, read_json_frame, read_optional_ui_state_frame,
     read_ui_state_frame, write_json_frame, write_ui_state_frame, DaemonDeviceSnapshot,
     DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot,
+    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot, PendingPeerApproval,
     RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
     UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };

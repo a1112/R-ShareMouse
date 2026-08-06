@@ -33,6 +33,45 @@ pub enum InputDispatch {
     },
 }
 
+/// Admission policy owned by the daemon configuration and platform capability.
+/// Keeping it at the runtime boundary ensures captured events cannot reach the
+/// router when automatic forwarding is disabled or unsafe to enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputForwardingPolicy {
+    pub automatic_input_forwarding: bool,
+    pub suppress_local_shortcuts_when_remote: bool,
+    pub shortcut_suppression_supported: bool,
+}
+
+impl InputForwardingPolicy {
+    pub fn admits_remote_input(self) -> bool {
+        self.automatic_input_forwarding
+            && (!self.suppress_local_shortcuts_when_remote || self.shortcut_suppression_supported)
+    }
+}
+
+impl Default for InputForwardingPolicy {
+    fn default() -> Self {
+        Self {
+            automatic_input_forwarding: true,
+            suppress_local_shortcuts_when_remote: false,
+            shortcut_suppression_supported: true,
+        }
+    }
+}
+
+/// Thread-safe platform seam for the router's suppression output.
+pub trait LocalShortcutSuppressor: Send + Sync + 'static {
+    fn set_suppressed(&self, enabled: bool);
+}
+
+#[derive(Default)]
+pub struct NoopShortcutSuppressor;
+
+impl LocalShortcutSuppressor for NoopShortcutSuppressor {
+    fn set_suppressed(&self, _enabled: bool) {}
+}
+
 /// Nonblocking output seam. Implementations must clone a generation-scoped
 /// transport handle and return without waiting for network I/O.
 pub trait InputTransport: Send + Sync + 'static {
@@ -75,6 +114,8 @@ pub struct InputRuntime<T: InputTransport = ConnectionRegistry> {
     last_dropped: u64,
     last_overflow: u64,
     active_transports: HashMap<DeviceId, T::Binding>,
+    forwarding_policy: InputForwardingPolicy,
+    shortcut_suppressor: Arc<dyn LocalShortcutSuppressor>,
 }
 
 impl<T: InputTransport> InputRuntime<T> {
@@ -101,7 +142,19 @@ impl<T: InputTransport> InputRuntime<T> {
             last_dropped: 0,
             last_overflow: 0,
             active_transports: HashMap::new(),
+            forwarding_policy: InputForwardingPolicy::default(),
+            shortcut_suppressor: Arc::new(NoopShortcutSuppressor),
         }
+    }
+
+    pub fn with_forwarding_policy(
+        mut self,
+        forwarding_policy: InputForwardingPolicy,
+        shortcut_suppressor: Arc<dyn LocalShortcutSuppressor>,
+    ) -> Self {
+        self.forwarding_policy = forwarding_policy;
+        self.shortcut_suppressor = shortcut_suppressor;
+        self
     }
 
     pub fn route_cache_generation(&self) -> u64 {
@@ -227,23 +280,33 @@ impl<T: InputTransport> InputRuntime<T> {
     fn process_ingress_event(&mut self, event: IngressEvent) {
         self.observe_ingress_stats();
         match event {
-            IngressEvent::Fault(IngressFault::ReliableOverflow) => {
-                self.injection
-                    .request_release_all(ReleaseAllReason::BackendFailure);
+            IngressEvent::Fault(fault) => {
+                match fault {
+                    IngressFault::ReliableOverflow => self
+                        .injection
+                        .request_release_all(ReleaseAllReason::BackendFailure),
+                    IngressFault::CaptureDiscontinuity => self
+                        .injection
+                        .request_release_all_sources(ReleaseAllReason::BackendFailure),
+                }
                 let outputs = self.router.handle(RouterCommand::BackendDegraded);
                 self.dispatch_outputs(outputs);
-                if let Ok(next_epoch) = self.current_epoch.next() {
-                    self.current_epoch = next_epoch;
-                    self.pressed_keys.clear();
-                    self.pressed_buttons.clear();
-                    self.state.publish_discrete(InputDiscreteProjection {
-                        session_epoch: next_epoch,
-                        pressed_keys: Vec::new(),
-                        pressed_buttons: Vec::new(),
-                    });
-                }
+                self.advance_fault_epoch();
             }
             IngressEvent::Input(input) => self.process_captured(input),
+        }
+    }
+
+    fn advance_fault_epoch(&mut self) {
+        if let Ok(next_epoch) = self.current_epoch.next() {
+            self.current_epoch = next_epoch;
+            self.pressed_keys.clear();
+            self.pressed_buttons.clear();
+            self.state.publish_discrete(InputDiscreteProjection {
+                session_epoch: next_epoch,
+                pressed_keys: Vec::new(),
+                pressed_buttons: Vec::new(),
+            });
         }
     }
 
@@ -254,6 +317,16 @@ impl<T: InputTransport> InputRuntime<T> {
         let Some(router_input) = captured_to_router_input(input) else {
             return;
         };
+        if !self.forwarding_policy.admits_remote_input() {
+            if let Some(pointer) = pointer {
+                self.state.publish_pointer(InputPointerProjection {
+                    session_epoch: self.current_epoch,
+                    x: pointer.x,
+                    y: pointer.y,
+                });
+            }
+            return;
+        }
         let outputs = self.router.handle(RouterCommand::Input(router_input));
         self.dispatch_outputs(outputs);
         if let Some(pointer) = pointer {
@@ -417,7 +490,12 @@ impl<T: InputTransport> InputRuntime<T> {
                 RouterOutput::LocalSessionChanged(session) => {
                     self.state.publish_session(session);
                 }
-                RouterOutput::SuppressLocalShortcuts(_) | RouterOutput::Metric(_) => {}
+                RouterOutput::SuppressLocalShortcuts(enabled) => {
+                    self.shortcut_suppressor.set_suppressed(
+                        enabled && self.forwarding_policy.suppress_local_shortcuts_when_remote,
+                    );
+                }
+                RouterOutput::Metric(_) => {}
             }
         }
     }
@@ -469,6 +547,12 @@ impl<T: InputTransport> InputRuntime<T> {
         self.last_replaced = stats.replaced_realtime;
         self.last_dropped = stats.dropped_realtime;
         self.last_overflow = stats.reliable_overflow;
+    }
+}
+
+impl<T: InputTransport> Drop for InputRuntime<T> {
+    fn drop(&mut self) {
+        self.shortcut_suppressor.set_suppressed(false);
     }
 }
 

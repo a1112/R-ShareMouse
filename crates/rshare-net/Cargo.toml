@@ -27,7 +27,6 @@ if-addrs = "0.13"
 futures-util = { workspace = true }
 
 # mDNS service discovery
-mdns-sd = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

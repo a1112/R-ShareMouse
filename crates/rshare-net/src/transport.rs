@@ -1261,16 +1261,19 @@ impl QuicConnection {
 
         let fingerprint = pending.fingerprint.clone();
         let decision = match pending.decision {
-            QuicTrustDecision::FirstSeen => QuicTrustStore::trust_first_seen_at(
+            QuicTrustDecision::Rejected { expected, actual } => {
+                Ok(QuicTrustDecision::Rejected { expected, actual })
+            }
+            _ => QuicTrustStore::approve_at(
                 &pending.trust_store_path,
                 pending.expected_device_id,
                 pending.fingerprint,
-            ),
-            decision => Ok(decision),
+            )
+            .map(|_| QuicTrustDecision::OperatorApproved),
         };
         match decision {
-            Ok(QuicTrustDecision::FirstSeen) | Ok(QuicTrustDecision::Trusted) => {
-                self.cert_trust_state = Some("trusted".to_string());
+            Ok(QuicTrustDecision::OperatorApproved) => {
+                self.cert_trust_state = Some("operator_approved".to_string());
                 Ok(fingerprint)
             }
             Ok(QuicTrustDecision::Rejected { expected, actual }) => {
@@ -1284,6 +1287,12 @@ impl QuicConnection {
                     actual
                 );
             }
+            Ok(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"invalid outbound trust state");
+                anyhow::bail!("outbound trust promotion did not commit operator approval")
+            }
             Err(error) => {
                 self.inner
                     .connection
@@ -1293,24 +1302,20 @@ impl QuicConnection {
         }
     }
 
-    pub fn confirm_inbound_peer_identity(
+    pub fn inspect_inbound_peer_identity(
         &mut self,
         actual_device_id: DeviceId,
-    ) -> Result<PeerCertificateFingerprint> {
+    ) -> Result<(PeerCertificateFingerprint, QuicTrustDecision)> {
         let fingerprint = self
             .peer_fingerprint
             .clone()
             .ok_or_else(|| anyhow!("peer certificate unavailable"))?;
-        let decision = QuicTrustStore::trust_first_seen_at(
-            &self.trust_store_path,
-            actual_device_id,
-            fingerprint.clone(),
-        )?;
+        let decision =
+            QuicTrustStore::load(&self.trust_store_path)?.check(actual_device_id, &fingerprint);
         match decision {
-            QuicTrustDecision::FirstSeen | QuicTrustDecision::Trusted => {
-                self.cert_trust_state = Some("trusted".to_string());
-                Ok(fingerprint)
-            }
+            QuicTrustDecision::FirstSeen
+            | QuicTrustDecision::LegacyTofu
+            | QuicTrustDecision::OperatorApproved => Ok((fingerprint, decision)),
             QuicTrustDecision::Rejected { expected, actual } => {
                 anyhow::bail!(
                     "QUIC certificate fingerprint changed for {}: expected {}, got {}",
@@ -1320,6 +1325,16 @@ impl QuicConnection {
                 )
             }
         }
+    }
+
+    pub fn commit_inbound_operator_approval(&mut self, device_id: DeviceId) -> Result<()> {
+        let fingerprint = self
+            .peer_fingerprint
+            .clone()
+            .ok_or_else(|| anyhow!("peer certificate unavailable"))?;
+        QuicTrustStore::approve_at(&self.trust_store_path, device_id, fingerprint)?;
+        self.cert_trust_state = Some("operator_approved".to_string());
+        Ok(())
     }
 
     pub(crate) async fn complete_peer_protocol_handshake(&self) -> Result<()> {
@@ -1732,7 +1747,8 @@ impl ConnectionPool {
 fn trust_state_label(decision: &QuicTrustDecision) -> &'static str {
     match decision {
         QuicTrustDecision::FirstSeen => "first_seen",
-        QuicTrustDecision::Trusted => "trusted",
+        QuicTrustDecision::LegacyTofu => "legacy_tofu",
+        QuicTrustDecision::OperatorApproved => "operator_approved",
         QuicTrustDecision::Rejected { .. } => "rejected",
     }
 }
@@ -3313,7 +3329,7 @@ async fn inspect_outbound_peer_trust(
     let decision = store.check(device_id, &fingerprint);
     match &decision {
         QuicTrustDecision::FirstSeen => {}
-        QuicTrustDecision::Trusted => {}
+        QuicTrustDecision::LegacyTofu | QuicTrustDecision::OperatorApproved => {}
         QuicTrustDecision::Rejected { expected, actual } => {
             connection.close(0u32.into(), b"certificate fingerprint mismatch");
             anyhow::bail!(
@@ -7001,7 +7017,7 @@ mod tests {
             .connection;
         client_connection.confirm_peer_identity(server_id).unwrap();
         server_connection
-            .confirm_inbound_peer_identity(client_id)
+            .inspect_inbound_peer_identity(client_id)
             .unwrap();
         assert!(
             server_state.exists(),
@@ -7168,7 +7184,7 @@ mod tests {
         assert!(client_state.exists());
         client_connection.confirm_peer_identity(server_id).unwrap();
         server_connection
-            .confirm_inbound_peer_identity(client_id)
+            .inspect_inbound_peer_identity(client_id)
             .unwrap();
 
         client_connection

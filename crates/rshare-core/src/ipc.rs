@@ -109,6 +109,12 @@ pub struct NetworkTransportSnapshot {
     /// Current certificate trust state for active peer connections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_trust_state: Option<String>,
+    /// Discovery transport actually in use. Kept additive for older IPC clients.
+    #[serde(default = "default_discovery_transport")]
+    pub discovery_transport: String,
+    /// mDNS availability. This build intentionally reports false until it has an implementation.
+    #[serde(default)]
+    pub mdns_supported: bool,
 }
 
 impl Default for NetworkTransportSnapshot {
@@ -122,7 +128,52 @@ impl Default for NetworkTransportSnapshot {
             datagram_tx_dropped: 0,
             reliable_stream_reset_count: 0,
             cert_trust_state: None,
+            discovery_transport: default_discovery_transport(),
+            mdns_supported: false,
         }
+    }
+}
+
+fn default_discovery_transport() -> String {
+    "udp_broadcast".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdns_legacy_true_reports_udp_only() {
+        let snapshot = NetworkTransportSnapshot::default();
+        assert_eq!(snapshot.discovery_transport, "udp_broadcast");
+        assert!(!snapshot.mdns_supported);
+    }
+
+    #[test]
+    fn approval_ipc_variants_round_trip_without_changing_old_request_shape() {
+        let device_id = DeviceId::new_v4();
+        let old: DaemonRequest = serde_json::from_str("\"Status\"").unwrap();
+        assert_eq!(old, DaemonRequest::Status);
+        let request = DaemonRequest::ApprovePeer {
+            approval_id: "opaque-id".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap())
+                .unwrap(),
+            request
+        );
+        let response = DaemonResponse::PendingPeerApprovals(vec![PendingPeerApproval {
+            approval_id: "opaque-id".to_string(),
+            device_id,
+            fingerprint: "full-fingerprint".to_string(),
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        }]);
+        assert_eq!(
+            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
+            response
+        );
     }
 }
 
@@ -409,6 +460,17 @@ pub struct UsbDescriptorProbeResult {
     pub descriptor_bytes: Vec<u8>,
 }
 
+/// A target-local request to approve an inbound peer certificate. `approval_id`
+/// is intentionally opaque and may be used only once before it expires.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingPeerApproval {
+    pub approval_id: String,
+    pub device_id: DeviceId,
+    pub fingerprint: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
 /// Client request over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
@@ -423,6 +485,10 @@ pub enum DaemonRequest {
     },
     Disconnect {
         device_id: DeviceId,
+    },
+    ListPendingPeerApprovals,
+    ApprovePeer {
+        approval_id: String,
     },
     GetLayout,
     SetLayout {
@@ -518,6 +584,7 @@ pub enum DaemonResponse {
     VirtualDisplays(Vec<VirtualDisplaySnapshot>),
     VirtualDisplayOperation(VirtualDisplayOperationResult),
     UsbDescriptorProbe(UsbDescriptorProbeResult),
+    PendingPeerApprovals(Vec<PendingPeerApproval>),
     Ack,
     Error(String),
 }

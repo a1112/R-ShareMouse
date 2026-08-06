@@ -11,8 +11,8 @@ use rshare_core::{
     UiSnapshot, VirtualDesktopGeometry, UI_STATE_PROTOCOL_VERSION,
 };
 use rshare_daemon::input_runtime::{
-    dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch, InputRuntime,
-    InputTransport,
+    dispatch_system_safety_event, run_authenticated_input_peers, InputDispatch,
+    InputForwardingPolicy, InputRuntime, InputTransport, LocalShortcutSuppressor,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetrics, InputStateFeeds};
 use rshare_daemon::state_aggregator::StateAggregator;
@@ -103,7 +103,7 @@ impl InjectBackend for BlockingInjectBackend {
         let should_block = matches!(
             event,
             InputEvent::Key {
-                keycode: KeyCode::Raw(0x41),
+                keycode: KeyCode::Char(b'A'),
                 state: CaptureButtonState::Pressed,
             }
         );
@@ -131,6 +131,17 @@ impl InjectBackend for BlockingInjectBackend {
 #[derive(Default)]
 struct RecordingTransport {
     events: Mutex<Vec<InputDispatch>>,
+}
+
+#[derive(Default)]
+struct RecordingSuppressor {
+    values: Mutex<Vec<bool>>,
+}
+
+impl LocalShortcutSuppressor for RecordingSuppressor {
+    fn set_suppressed(&self, enabled: bool) {
+        self.values.lock().unwrap().push(enabled);
+    }
 }
 
 #[derive(Default)]
@@ -384,6 +395,18 @@ fn runtime_with_feeds(
     )
 }
 
+fn automatic_forwarding_policy(
+    automatic_input_forwarding: bool,
+    suppress_local_shortcuts_when_remote: bool,
+    shortcut_suppression_supported: bool,
+) -> InputForwardingPolicy {
+    InputForwardingPolicy {
+        automatic_input_forwarding,
+        suppress_local_shortcuts_when_remote,
+        shortcut_suppression_supported,
+    }
+}
+
 fn origin(source: CaptureSource) -> CaptureOrigin {
     CaptureOrigin {
         source,
@@ -407,6 +430,89 @@ async fn enter_remote<T: InputTransport>(
         PushOutcome::Enqueued
     );
     assert!(runtime.process_next().await);
+}
+
+#[tokio::test]
+async fn automatic_forwarding_disabled_never_enters_remote() {
+    let (producer, runtime, transport) = runtime(8);
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(false, false, true),
+        Arc::new(RecordingSuppressor::default()),
+    );
+
+    assert_eq!(
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x: 99,
+                y: 50,
+            })),
+        )),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    assert!(transport.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn suppression_output_drives_platform_callback_and_clears_on_exit() {
+    let (producer, runtime, _transport) = runtime(8);
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    runtime.handle_command(RouterCommand::QuickReturn);
+    assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+}
+
+#[tokio::test]
+async fn unrelated_connectivity_change_does_not_clear_active_suppression() {
+    let (producer, runtime, _transport) = runtime(8);
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    runtime.handle_command(RouterCommand::ConnectivityChanged {
+        peer: DeviceId::new_v4(),
+        connected: false,
+    });
+
+    assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true]);
+}
+
+#[tokio::test]
+async fn suppression_callback_clears_on_degrade_and_shutdown() {
+    for command in [RouterCommand::BackendDegraded, RouterCommand::Shutdown] {
+        let (producer, runtime, _transport) = runtime(8);
+        let suppressor = Arc::new(RecordingSuppressor::default());
+        let mut runtime = runtime.with_forwarding_policy(
+            automatic_forwarding_policy(true, true, true),
+            suppressor.clone(),
+        );
+
+        enter_remote(&producer, &mut runtime).await;
+        runtime.handle_command(command);
+
+        assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+    }
+}
+
+#[tokio::test]
+async fn suppression_required_but_unsupported_fails_closed() {
+    let (producer, runtime, transport) = runtime(8);
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, false),
+        Arc::new(RecordingSuppressor::default()),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    assert!(transport.events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -771,6 +877,40 @@ async fn reliable_overflow_suspends_and_emits_emergency_release() {
     )));
 }
 
+#[tokio::test]
+async fn capture_discontinuity_suspends_and_resets_the_input_epoch() {
+    let (producer, mut runtime, transport, feeds) = runtime_with_feeds(8);
+    enter_remote(&producer, &mut runtime).await;
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::PortableHook),
+            InputEvent::key(KeyCode::Raw(0x41), CaptureButtonState::Pressed),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let previous_epoch = runtime.session_epoch();
+
+    producer.report_fault(rshare_input::IngressFault::CaptureDiscontinuity);
+    assert!(runtime.process_next().await);
+
+    let projection = feeds.authoritative_rx.borrow().clone();
+    assert!(matches!(
+        projection.session,
+        ControlSessionState::Suspended { .. }
+    ));
+    assert!(runtime.session_epoch().0 > previous_epoch.0);
+    assert_eq!(projection.discrete.session_epoch, runtime.session_epoch());
+    assert!(projection.discrete.pressed_keys.is_empty());
+    assert!(projection.discrete.pressed_buttons.is_empty());
+    assert!(transport.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        InputDispatch::Reliable { frame, .. }
+            if matches!(frame.event, ReliableInputEvent::ReleaseAll { reason: ReleaseAllReason::BackendFailure })
+    )));
+}
+
+#[cfg(target_os = "windows")]
 #[tokio::test]
 async fn windows_filter_overflow_status_maps_to_suspension_epoch_and_targeted_release() {
     let (producer, mut runtime, transport, feeds) = runtime_with_feeds(8);
@@ -1215,7 +1355,7 @@ async fn saturated_injection_actor_fails_closed_and_releases_active_epoch() {
             matches!(
                 event,
                 InputEvent::Key {
-                    keycode: KeyCode::Raw(0x41),
+                    keycode: KeyCode::Char(b'A'),
                     state: CaptureButtonState::Released,
                 }
             )
@@ -1233,9 +1373,9 @@ async fn saturated_injection_actor_fails_closed_and_releases_active_epoch() {
         matches!(
             event,
             InputEvent::Key {
-                keycode: KeyCode::Raw(keycode),
+                keycode: KeyCode::Char(keycode),
                 state: CaptureButtonState::Pressed,
-            } if *keycode == 0x42 || *keycode == 0x43
+            } if *keycode == b'B' || *keycode == b'C'
         )
     }));
 
@@ -1258,7 +1398,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
         .unwrap();
         injection
             .inject_trusted_local(InputEvent::key(
-                KeyCode::Raw(0x41),
+                KeyCode::Char(b'A'),
                 CaptureButtonState::Pressed,
             ))
             .await
@@ -1266,7 +1406,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
         assert!(matches!(
             gate.events().as_slice(),
             [InputEvent::Key {
-                keycode: KeyCode::Raw(0x41),
+                keycode: KeyCode::Char(b'A'),
                 state: CaptureButtonState::Pressed,
             }]
         ));
@@ -1283,7 +1423,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
             matches!(
                 captured,
                 InputEvent::Key {
-                    keycode: KeyCode::Raw(0x41),
+                    keycode: KeyCode::Char(b'A'),
                     state: CaptureButtonState::Released,
                 }
             )

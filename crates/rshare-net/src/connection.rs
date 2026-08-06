@@ -8,9 +8,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify, RwLock};
 use tokio::time::Instant;
 
-use rshare_core::{ControlConnectionId, DeviceId, Message};
+use rshare_core::{ControlConnectionId, DeviceId, Message, PendingPeerApproval};
 
-use super::handshake::{perform_outbound_handshake, receive_incoming_handshake};
+use super::encryption::{PeerCertificateFingerprint, QuicTrustDecision};
+use super::handshake::{
+    complete_incoming_handshake, perform_outbound_handshake, receive_incoming_handshake,
+};
 use super::qos::{
     BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
     TerminalReleaseEvent, TransportSendError,
@@ -411,6 +414,110 @@ pub struct ConnectionManager {
     authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
+    pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+}
+
+const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
+
+#[derive(Debug, Clone)]
+struct ApprovalExpectation {
+    approval: PendingPeerApproval,
+    approved: bool,
+}
+
+#[derive(Debug, Default)]
+struct PendingApprovalRegistry {
+    approvals: HashMap<String, ApprovalExpectation>,
+}
+
+impl PendingApprovalRegistry {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn prune(&mut self, now_ms: u64) {
+        self.approvals
+            .retain(|_, expectation| expectation.approval.expires_at_ms > now_ms);
+    }
+
+    fn list(&mut self, now_ms: u64) -> Vec<PendingPeerApproval> {
+        self.prune(now_ms);
+        let mut approvals: Vec<_> = self
+            .approvals
+            .values()
+            .filter(|expectation| !expectation.approved)
+            .map(|expectation| expectation.approval.clone())
+            .collect();
+        approvals.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
+        approvals
+    }
+
+    fn observe(
+        &mut self,
+        device_id: DeviceId,
+        fingerprint: &PeerCertificateFingerprint,
+        now_ms: u64,
+    ) {
+        self.prune(now_ms);
+        if self.approvals.values().any(|expectation| {
+            expectation.approval.device_id == device_id
+                && expectation.approval.fingerprint == fingerprint.as_str()
+        }) {
+            return;
+        }
+        let approval = PendingPeerApproval {
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            device_id,
+            fingerprint: fingerprint.to_string(),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(PENDING_APPROVAL_TTL_MS),
+        };
+        self.approvals.insert(
+            approval.approval_id.clone(),
+            ApprovalExpectation {
+                approval,
+                approved: false,
+            },
+        );
+    }
+
+    fn approve(&mut self, approval_id: &str, now_ms: u64) -> bool {
+        self.prune(now_ms);
+        let Some(expectation) = self.approvals.get_mut(approval_id) else {
+            return false;
+        };
+        if expectation.approved {
+            return false;
+        }
+        expectation.approved = true;
+        true
+    }
+
+    fn consume_matching(
+        &mut self,
+        device_id: DeviceId,
+        fingerprint: &PeerCertificateFingerprint,
+        now_ms: u64,
+    ) -> bool {
+        self.prune(now_ms);
+        let matching_id = self
+            .approvals
+            .iter()
+            .find_map(|(approval_id, expectation)| {
+                (expectation.approved
+                    && expectation.approval.device_id == device_id
+                    && expectation.approval.fingerprint == fingerprint.as_str())
+                .then(|| approval_id.clone())
+            });
+        matching_id
+            .and_then(|approval_id| self.approvals.remove(&approval_id))
+            .is_some()
+    }
 }
 
 async fn wait_for_connected_generation(
@@ -817,7 +924,22 @@ impl ConnectionManager {
             authenticated_peer_rx: Some(authenticated_peer_rx),
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
+            pending_approvals: Arc::new(StdRwLock::new(PendingApprovalRegistry::default())),
         }
+    }
+
+    pub fn pending_peer_approvals(&self) -> Vec<PendingPeerApproval> {
+        self.pending_approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .list(PendingApprovalRegistry::now_ms())
+    }
+
+    pub fn approve_peer(&self, approval_id: &str) -> bool {
+        self.pending_approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .approve(approval_id, PendingApprovalRegistry::now_ms())
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -833,6 +955,7 @@ impl ConnectionManager {
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
         let local_device_id = self.local_device_id;
+        let pending_approvals = self.pending_approvals.clone();
 
         tokio::spawn(async move {
             while let Some(mut incoming) = incoming.recv().await {
@@ -852,6 +975,62 @@ impl ConnectionManager {
                         }
                     };
                 let device_id = negotiated.auth.peer_id;
+                let fingerprint = negotiated.auth.certificate_fingerprint.clone();
+                let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
+                    Some(QuicTrustDecision::OperatorApproved) => true,
+                    Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
+                        let consumed = pending_approvals
+                            .write()
+                            .expect("pending approval registry poisoned")
+                            .consume_matching(
+                                device_id,
+                                &fingerprint,
+                                PendingApprovalRegistry::now_ms(),
+                            );
+                        if consumed {
+                            if let Err(error) = incoming
+                                .connection
+                                .commit_inbound_operator_approval(device_id)
+                            {
+                                tracing::warn!(
+                                    "Failed to persist approved inbound peer {}: {}",
+                                    device_id,
+                                    error
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            pending_approvals
+                                .write()
+                                .expect("pending approval registry poisoned")
+                                .observe(
+                                    device_id,
+                                    &fingerprint,
+                                    PendingApprovalRegistry::now_ms(),
+                                );
+                            false
+                        }
+                    }
+                    Some(QuicTrustDecision::Rejected { .. }) | None => false,
+                };
+                if !inbound_authorized {
+                    tracing::info!("Inbound peer {} requires target-local approval", device_id);
+                    incoming.connection.close().await;
+                    continue;
+                }
+                if let Err(error) =
+                    complete_incoming_handshake(&incoming.connection, local_device_id).await
+                {
+                    tracing::warn!(
+                        "Rejecting authorized inbound connection from {}: {}",
+                        incoming.address,
+                        error
+                    );
+                    incoming.connection.close().await;
+                    continue;
+                }
                 let address = incoming.address.to_string();
                 incoming.connection.set_device_id(device_id);
                 let auth = Arc::new(negotiated.auth.clone());
@@ -1458,6 +1637,39 @@ pub fn create_shared_manager(local_device_id: DeviceId) -> SharedConnectionManag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_approval_expiry_one_use_wrong_fingerprint_and_replay_fail_closed() {
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        let wrong_fingerprint = PeerCertificateFingerprint::from_der(b"cert-b");
+        let mut registry = PendingApprovalRegistry::default();
+        registry.observe(device_id, &fingerprint, 1_000);
+        let approval = registry.list(1_000).pop().unwrap();
+        assert!(registry.approve(&approval.approval_id, 1_001));
+        assert!(!registry.consume_matching(device_id, &wrong_fingerprint, 1_002));
+        assert!(registry.consume_matching(device_id, &fingerprint, 1_003));
+        assert!(!registry.consume_matching(device_id, &fingerprint, 1_004));
+        assert!(!registry.approve(&approval.approval_id, 1_004));
+
+        registry.observe(device_id, &fingerprint, 2_000);
+        let expiring = registry.list(2_000).pop().unwrap();
+        assert!(!registry.approve(&expiring.approval_id, expiring.expires_at_ms));
+        assert!(registry.list(expiring.expires_at_ms).is_empty());
+    }
+
+    #[test]
+    fn unknown_and_legacy_inbound_have_no_authority_before_matching_approval() {
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
+        let mut registry = PendingApprovalRegistry::default();
+        registry.observe(device_id, &fingerprint, 10);
+        let approval = registry.list(10).pop().unwrap();
+        // Observation only creates a local request: it cannot authorize QoS/auth publication.
+        assert!(!registry.consume_matching(device_id, &fingerprint, 11));
+        assert!(registry.approve(&approval.approval_id, 12));
+        assert!(registry.consume_matching(device_id, &fingerprint, 13));
+    }
     use crate::encryption::{Encryption, QuicIdentity, QuicTrustStore};
     use rshare_core::{hello_back_message, ScreenInfo};
 

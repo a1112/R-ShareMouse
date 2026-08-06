@@ -1,4 +1,4 @@
-//! Device discovery using mDNS/UDP broadcast
+//! Device discovery using UDP broadcast.
 
 use anyhow::Result;
 use if_addrs::{get_if_addrs, IfAddr, Interface};
@@ -34,7 +34,7 @@ pub struct DiscoveryConfig {
     pub initial_broadcast_count: usize,
     /// Device timeout (how long until a device is considered offline)
     pub device_timeout: Duration,
-    /// Enable mDNS discovery
+    /// Legacy mDNS switch. mDNS is unsupported; UDP broadcast is always used.
     pub mdns_enabled: bool,
 }
 
@@ -46,7 +46,7 @@ impl Default for DiscoveryConfig {
             broadcast_interval: Duration::from_secs(5),
             initial_broadcast_count: 6, // 3 seconds of aggressive discovery
             device_timeout: Duration::from_secs(30),
-            mdns_enabled: true,
+            mdns_enabled: false,
         }
     }
 }
@@ -210,6 +210,12 @@ impl ServiceDiscovery {
         }
 
         self.running = true;
+
+        if self.config.mdns_enabled {
+            tracing::warn!(
+                "mDNS discovery was requested by legacy configuration but is unsupported; using UDP broadcast"
+            );
+        }
 
         let bind_addr = format!("0.0.0.0:{}", self.config.port);
         let socket = UdpSocket::bind(&bind_addr).await?;
@@ -681,7 +687,7 @@ mod tests {
     fn test_discovery_config_default() {
         let config = DiscoveryConfig::default();
         assert_eq!(config.port, 27432);
-        assert!(config.mdns_enabled);
+        assert!(!config.mdns_enabled);
     }
 
     #[test]

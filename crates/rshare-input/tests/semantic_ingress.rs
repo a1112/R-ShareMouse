@@ -467,6 +467,19 @@ fn compatibility_channel_exposes_nonblocking_outcomes_and_statistics() {
 }
 
 #[test]
+fn capture_discontinuity_uses_the_reserved_fault_lane() {
+    let (producer, consumer) = SemanticInputIngress::new(2);
+
+    producer.report_fault(IngressFault::CaptureDiscontinuity);
+
+    assert_eq!(
+        consumer.try_pop_fault(),
+        Some(IngressFault::CaptureDiscontinuity)
+    );
+    assert_eq!(consumer.try_pop_fault(), None);
+}
+
+#[test]
 fn every_discrete_payload_has_an_explicit_legacy_conversion() {
     let events = vec![
         InputEvent::mouse_button(MouseButton::Left, ButtonState::Pressed),

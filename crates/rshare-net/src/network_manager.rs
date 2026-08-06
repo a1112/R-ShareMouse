@@ -4,13 +4,14 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::{
     connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
+    encryption::{QuicTrustStore, TrustProvenance},
     handshake::PeerAuthContext,
     qos::{
         BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, TelemetryFrame,
@@ -18,6 +19,7 @@ use crate::{
     },
     transport::PeerInbound,
 };
+pub use rshare_core::PendingPeerApproval;
 use rshare_core::{ControlConnectionId, DeviceId, Message};
 
 /// Network event
@@ -25,6 +27,9 @@ use rshare_core::{ControlConnectionId, DeviceId, Message};
 pub enum NetworkEvent {
     /// Device discovered
     DeviceFound(DiscoveredDevice),
+    /// Discovery expired or a peer sent Goodbye. This is not a transport
+    /// disconnect and intentionally carries no connection generation.
+    DeviceLost(DeviceId),
     /// Device connected
     DeviceConnected(PeerAuthContext),
     /// Device disconnected
@@ -65,12 +70,16 @@ pub struct NetworkManagerConfig {
     pub discovery_port: u16,
     /// Transport bind address
     pub bind_address: String,
-    /// Retained for configuration compatibility; unpaired discovery is observational only.
+    /// Enables trusted-only discovery auto-connect. Unapproved and legacy-TOFU peers
+    /// remain observational.
     pub auto_connect: bool,
     /// Discovery broadcast interval
     pub broadcast_interval: Duration,
     /// Device timeout
     pub device_timeout: Duration,
+    /// Legacy mDNS switch. It is retained solely to warn for old configurations;
+    /// discovery continues to use UDP broadcast regardless of this value.
+    pub mdns_enabled: bool,
 }
 
 impl Default for NetworkManagerConfig {
@@ -81,6 +90,7 @@ impl Default for NetworkManagerConfig {
             auto_connect: false,
             broadcast_interval: Duration::from_secs(5),
             device_timeout: Duration::from_secs(30),
+            mdns_enabled: false,
         }
     }
 }
@@ -102,8 +112,170 @@ pub struct NetworkManager {
     authenticated_peer_rx: Option<mpsc::Receiver<PeerInbound>>,
 
     discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
+    auto_connect_scheduler: Arc<TokioMutex<AutoConnectScheduler>>,
     running: bool,
     discovery_task: Option<JoinHandle<()>>,
+}
+
+// Repeated UDP discovery broadcasts are expected. These bounds keep a bad or
+// unavailable trusted peer from creating an unbounded stream of QUIC attempts.
+const AUTO_CONNECT_RETRY_BASE: Duration = Duration::from_secs(1);
+const AUTO_CONNECT_RETRY_MAX: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct AutoConnectAttempt {
+    in_flight: bool,
+    failures: u32,
+    next_allowed_attempt: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct AutoConnectScheduler {
+    attempts: HashMap<DeviceId, AutoConnectAttempt>,
+}
+
+impl AutoConnectScheduler {
+    fn start_attempt_if_disconnected(
+        &mut self,
+        device_id: DeviceId,
+        now: Instant,
+        is_connected: bool,
+    ) -> bool {
+        !is_connected && self.start_attempt(device_id, now)
+    }
+
+    fn start_attempt(&mut self, device_id: DeviceId, now: Instant) -> bool {
+        let attempt = self.attempts.entry(device_id).or_default();
+        if attempt.in_flight
+            || attempt
+                .next_allowed_attempt
+                .is_some_and(|next_allowed| now < next_allowed)
+        {
+            return false;
+        }
+        attempt.in_flight = true;
+        true
+    }
+
+    fn complete_attempt(&mut self, device_id: DeviceId, now: Instant, succeeded: bool) {
+        if succeeded {
+            self.attempts.remove(&device_id);
+            return;
+        }
+
+        let attempt = self.attempts.entry(device_id).or_default();
+        attempt.in_flight = false;
+        attempt.failures = attempt.failures.saturating_add(1);
+        attempt.next_allowed_attempt = Some(now + auto_connect_retry_delay(attempt.failures));
+    }
+
+    fn on_device_lost(&mut self, _device_id: DeviceId) {
+        // Discovery visibility is not transport authentication. Retain retry
+        // history across DeviceLost/Goodbye churn so a trusted peer cannot
+        // turn bounded backoff into repeated connection attempts.
+    }
+}
+
+fn auto_connect_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    AUTO_CONNECT_RETRY_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(AUTO_CONNECT_RETRY_MAX)
+}
+
+fn is_operator_approved_discovery(device_id: DeviceId, trust_store: &QuicTrustStore) -> bool {
+    matches!(
+        trust_store.provenance_for(&device_id),
+        Some(TrustProvenance::OperatorApproved)
+    )
+}
+
+fn auto_connect_address(
+    device: &DiscoveredDevice,
+    config: &NetworkManagerConfig,
+) -> Option<String> {
+    device.addresses.first().map(|address| {
+        normalize_discovered_connection_address(
+            &address.to_string(),
+            config.discovery_port,
+            connection_port(&config.bind_address),
+        )
+    })
+}
+
+async fn maybe_auto_connect_discovered_device(
+    device: DiscoveredDevice,
+    local_device_id: DeviceId,
+    config: &NetworkManagerConfig,
+    connection: &Arc<TokioMutex<ConnectionManager>>,
+    connection_view: &ConnectionView,
+    scheduler: &Arc<TokioMutex<AutoConnectScheduler>>,
+) {
+    if !config.auto_connect || device.id == local_device_id {
+        return;
+    }
+    if let PeerProtocolCompatibility::Incompatible { local, remote } =
+        &device.protocol_compatibility
+    {
+        tracing::debug!(
+            peer_id = %device.id,
+            local_protocol = local,
+            remote_protocol = remote,
+            "Skipping trusted discovery auto-connect for incompatible peer"
+        );
+        return;
+    }
+
+    let trust_store = match QuicTrustStore::load_default() {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                peer_id = %device.id,
+                error = %error,
+                "Cannot load QUIC trust store; refusing discovery auto-connect"
+            );
+            return;
+        }
+    };
+    if !is_operator_approved_discovery(device.id, &trust_store) {
+        tracing::debug!(
+            peer_id = %device.id,
+            "Discovery peer is not operator-approved; leaving it observational"
+        );
+        return;
+    }
+    let Some(address) = auto_connect_address(&device, config) else {
+        tracing::debug!(peer_id = %device.id, "Trusted discovery peer has no connection address");
+        return;
+    };
+    if connection_view.is_connected(&device.id).await {
+        return;
+    }
+    if !scheduler.lock().await.start_attempt_if_disconnected(
+        device.id,
+        Instant::now(),
+        connection_view.is_connected(&device.id).await,
+    ) {
+        return;
+    }
+
+    let device_id = device.id;
+    let connection = connection.clone();
+    let scheduler = scheduler.clone();
+    tokio::spawn(async move {
+        // This is the connection-manager lifecycle mutex, not the daemon's outer
+        // NetworkManager mutex. The subsequent QUIC handshake rechecks the pinned
+        // certificate and rejects any changed fingerprint without overwriting it.
+        let result = connection.lock().await.connect(device_id, &address).await;
+        let succeeded = result.is_ok();
+        scheduler
+            .lock()
+            .await
+            .complete_attempt(device_id, Instant::now(), succeeded);
+        if let Err(error) = result {
+            tracing::debug!(peer_id = %device_id, error = %error, "Trusted discovery auto-connect failed");
+        }
+    });
 }
 
 fn spawn_connection_event_forwarder(
@@ -175,21 +347,13 @@ fn record_qos_broadcast_successes(
 async fn handle_discovery_event(
     event: DiscoveryEvent,
     config: &NetworkManagerConfig,
+    local_device_id: DeviceId,
     discovered_devices: &Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
     discovery_tx: &mpsc::Sender<NetworkEvent>,
+    connection: &Arc<TokioMutex<ConnectionManager>>,
     connection_view: &ConnectionView,
+    auto_connect_scheduler: &Arc<TokioMutex<AutoConnectScheduler>>,
 ) {
-    if config.auto_connect
-        && matches!(
-            &event,
-            DiscoveryEvent::DeviceFound(_) | DiscoveryEvent::DeviceUpdated(_)
-        )
-    {
-        tracing::debug!(
-            "Ignoring legacy auto_connect=true; unpaired discovery remains observational"
-        );
-    }
-
     match event {
         DiscoveryEvent::DeviceFound(device) | DiscoveryEvent::DeviceUpdated(device) => {
             let device_id = device.id;
@@ -197,18 +361,25 @@ async fn handle_discovery_event(
                 let mut devices = discovered_devices.write().await;
                 devices.insert(device_id, device.clone());
             }
-            let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device));
+            let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device.clone()));
+            maybe_auto_connect_discovered_device(
+                device,
+                local_device_id,
+                config,
+                connection,
+                connection_view,
+                auto_connect_scheduler,
+            )
+            .await;
         }
         DiscoveryEvent::DeviceLost(id) => {
             {
                 let mut devices = discovered_devices.write().await;
                 devices.remove(&id);
             }
+            auto_connect_scheduler.lock().await.on_device_lost(id);
 
-            let transport_connected = connection_view.is_connected(&id).await;
-            if let Some(event) = discovery_lost_network_event(id, transport_connected) {
-                let _ = discovery_tx.try_send(event);
-            }
+            let _ = discovery_tx.try_send(discovery_lost_network_event(id));
         }
         DiscoveryEvent::Error(error) => {
             tracing::error!("Discovery error: {}", error);
@@ -280,6 +451,7 @@ impl NetworkManager {
             event_rx: Some(event_rx),
             authenticated_peer_rx: Some(authenticated_peer_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
+            auto_connect_scheduler: Arc::new(TokioMutex::new(AutoConnectScheduler::default())),
             running: false,
             discovery_task: None,
         }
@@ -339,6 +511,17 @@ impl NetworkManager {
     /// Get current connection information snapshots.
     pub async fn connection_infos(&self) -> Vec<ConnectionInfo> {
         self.connection_view.connection_infos().await
+    }
+
+    /// List inbound peer approvals that are waiting for this target's local operator.
+    pub async fn pending_peer_approvals(&self) -> Vec<PendingPeerApproval> {
+        self.connection.lock().await.pending_peer_approvals()
+    }
+
+    /// Mark one opaque approval ID as expected once. A matching retry still has to
+    /// prove the same device ID and full certificate fingerprint before trust is saved.
+    pub async fn approve_peer(&self, approval_id: &str) -> bool {
+        self.connection.lock().await.approve_peer(approval_id)
     }
 
     /// Takes the typed terminal-release stream used by the input-plane
@@ -454,8 +637,11 @@ impl NetworkManager {
         // Start discovery with event channel
         let discovery_tx = self.event_tx.clone();
         let discovered_devices = self.discovered_devices.clone();
-        let discovery_lost_connection = self.connection_view.clone();
         let discovery_event_config = self.config.clone();
+        let local_device_id = self.local_device_id;
+        let connection = self.connection.clone();
+        let connection_view = self.connection_view.clone();
+        let auto_connect_scheduler = self.auto_connect_scheduler.clone();
 
         let mut discovery = ServiceDiscovery::new(
             self.local_device_id,
@@ -469,7 +655,7 @@ impl NetworkManager {
             broadcast_interval: self.config.broadcast_interval,
             initial_broadcast_count: 6,
             device_timeout: self.config.device_timeout,
-            mdns_enabled: false,
+            mdns_enabled: self.config.mdns_enabled,
         };
 
         discovery = discovery.with_config(discovery_config);
@@ -489,9 +675,12 @@ impl NetworkManager {
                 handle_discovery_event(
                     event,
                     &discovery_event_config,
+                    local_device_id,
                     &discovered_devices,
                     &discovery_tx,
-                    &discovery_lost_connection,
+                    &connection,
+                    &connection_view,
+                    &auto_connect_scheduler,
                 )
                 .await;
             }
@@ -581,13 +770,8 @@ fn normalize_discovered_connection_address(
     socket_addr.to_string()
 }
 
-fn discovery_lost_network_event(
-    _device_id: DeviceId,
-    _transport_connected: bool,
-) -> Option<NetworkEvent> {
-    // Discovery expiry is not an authenticated transport generation and must
-    // not synthesize a generation-less disconnect event.
-    None
+fn discovery_lost_network_event(device_id: DeviceId) -> NetworkEvent {
+    NetworkEvent::DeviceLost(device_id)
 }
 
 // Note: NetworkManager intentionally doesn't implement Clone
@@ -705,6 +889,83 @@ mod tests {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
         assert!(!config.auto_connect);
+        assert!(!config.mdns_enabled);
+    }
+
+    #[test]
+    fn trusted_scheduler_starts_once_and_suppresses_connected_or_in_flight_duplicates() {
+        let device_id = DeviceId::new_v4();
+        let now = Instant::now();
+        let mut scheduler = AutoConnectScheduler::default();
+
+        assert!(scheduler.start_attempt_if_disconnected(device_id, now, false));
+        assert!(
+            !scheduler.start_attempt_if_disconnected(device_id, now, false),
+            "an in-flight attempt must suppress duplicate discovery"
+        );
+        scheduler.complete_attempt(device_id, now, true);
+        assert!(
+            !scheduler.start_attempt_if_disconnected(device_id, now, true),
+            "a canonical connection must suppress auto-connect"
+        );
+    }
+
+    #[test]
+    fn trusted_scheduler_failure_backoff_grows_and_caps() {
+        let device_id = DeviceId::new_v4();
+        let mut now = Instant::now();
+        let mut scheduler = AutoConnectScheduler::default();
+        let mut delays = Vec::new();
+
+        for _ in 0..8 {
+            assert!(scheduler.start_attempt(device_id, now));
+            scheduler.complete_attempt(device_id, now, false);
+            let attempt = scheduler.attempts.get(&device_id).unwrap();
+            let next_allowed_attempt = attempt.next_allowed_attempt.unwrap();
+            delays.push(next_allowed_attempt.duration_since(now));
+            assert!(
+                !scheduler.start_attempt(device_id, now),
+                "backoff must suppress repeated discovery"
+            );
+            now = next_allowed_attempt;
+        }
+
+        assert_eq!(delays[0], Duration::from_secs(1));
+        assert_eq!(delays[1], Duration::from_secs(2));
+        assert_eq!(*delays.last().unwrap(), AUTO_CONNECT_RETRY_MAX);
+    }
+
+    #[test]
+    fn trusted_scheduler_keeps_backoff_across_device_lost_and_rediscovery() {
+        let device_id = DeviceId::new_v4();
+        let now = Instant::now();
+        let mut scheduler = AutoConnectScheduler::default();
+
+        assert!(scheduler.start_attempt(device_id, now));
+        scheduler.complete_attempt(device_id, now, false);
+        scheduler.on_device_lost(device_id);
+
+        assert!(
+            !scheduler.start_attempt_if_disconnected(device_id, now, false),
+            "rediscovery during the retry window must not bypass backoff"
+        );
+        let retry_at = scheduler.attempts[&device_id].next_allowed_attempt.unwrap();
+        assert!(scheduler.start_attempt_if_disconnected(device_id, retry_at, false));
+    }
+
+    #[test]
+    fn unknown_and_legacy_pins_are_not_auto_connect_authority() {
+        let device_id = DeviceId::new_v4();
+        let fingerprint = crate::encryption::PeerCertificateFingerprint::from_der(b"cert");
+        let mut trust_store = QuicTrustStore::default();
+        assert!(!is_operator_approved_discovery(device_id, &trust_store));
+
+        trust_store.trust_first_seen(device_id, fingerprint);
+        assert!(matches!(
+            trust_store.provenance_for(&device_id),
+            Some(TrustProvenance::LegacyTofu)
+        ));
+        assert!(!is_operator_approved_discovery(device_id, &trust_store));
     }
 
     #[test]
@@ -720,17 +981,21 @@ mod tests {
     }
 
     #[test]
-    fn discovery_lost_does_not_emit_disconnect_while_transport_is_connected() {
+    fn discovery_lost_has_its_own_lifecycle_event_when_transport_is_connected() {
         let device_id = DeviceId::new_v4();
-
-        assert!(discovery_lost_network_event(device_id, true).is_none());
+        assert!(matches!(
+            discovery_lost_network_event(device_id),
+            NetworkEvent::DeviceLost(id) if id == device_id
+        ));
     }
 
     #[test]
-    fn discovery_lost_does_not_synthesize_generationless_disconnect() {
+    fn discovery_lost_has_its_own_lifecycle_event_when_transport_is_disconnected() {
         let device_id = DeviceId::new_v4();
-
-        assert!(discovery_lost_network_event(device_id, false).is_none());
+        assert!(matches!(
+            discovery_lost_network_event(device_id),
+            NetworkEvent::DeviceLost(id) if id == device_id
+        ));
     }
 
     #[test]
@@ -930,9 +1195,12 @@ mod tests {
         handle_discovery_event(
             crate::discovery::DiscoveryEvent::DeviceFound(found.clone()),
             &manager.config,
+            manager.local_device_id,
             &manager.discovered_devices,
             &manager.event_tx,
+            &manager.connection,
             &manager.connection_view,
+            &manager.auto_connect_scheduler,
         )
         .await;
         let mut updated = found;
@@ -940,9 +1208,12 @@ mod tests {
         handle_discovery_event(
             crate::discovery::DiscoveryEvent::DeviceUpdated(updated.clone()),
             &manager.config,
+            manager.local_device_id,
             &manager.discovered_devices,
             &manager.event_tx,
+            &manager.connection,
             &manager.connection_view,
+            &manager.auto_connect_scheduler,
         )
         .await;
 

@@ -870,6 +870,7 @@ fn run_worker(
                     &mut trusted_ledger,
                     ReleaseAllReason::SessionEnded,
                 );
+                update_backend_snapshot(&*backend, &backend_snapshot);
                 return;
             }
             WorkItem::Control(ControlCommand::Begin { key }) => {
@@ -879,6 +880,7 @@ fn run_worker(
                         &mut remote_ledger,
                         ReleaseAllReason::OwnershipTransfer,
                     );
+                    update_backend_snapshot(&*backend, &backend_snapshot);
                 }
                 session = Some(WorkerSession {
                     key,
@@ -890,6 +892,7 @@ fn run_worker(
             WorkItem::Control(ControlCommand::Close { key, reason }) => {
                 if session.as_ref().is_some_and(|current| current.key == key) {
                     release_held(&mut *backend, &mut remote_ledger, reason);
+                    update_backend_snapshot(&*backend, &backend_snapshot);
                     session = None;
                     gamepads.clear();
                 }
@@ -897,12 +900,14 @@ fn run_worker(
             WorkItem::ReleaseAllSources(reason) => {
                 release_held(&mut *backend, &mut remote_ledger, reason);
                 release_held(&mut *backend, &mut trusted_ledger, reason);
+                update_backend_snapshot(&*backend, &backend_snapshot);
                 session = None;
                 gamepads.clear();
             }
             WorkItem::LeaseExpired(key) => {
                 if session.as_ref().is_some_and(|current| current.key == key) {
                     release_held(&mut *backend, &mut remote_ledger, ReleaseAllReason::Timeout);
+                    update_backend_snapshot(&*backend, &backend_snapshot);
                     session = None;
                     gamepads.clear();
                 }
@@ -967,6 +972,7 @@ fn run_worker(
                 let sequence = queued.frame.sequence;
                 let started = queue.clock.now();
                 let result = inject_realtime(&mut *backend, &mut gamepads, queued.frame);
+                update_backend_snapshot(&*backend, &backend_snapshot);
                 let completed = queue.clock.now();
                 record_timing(
                     &queue,
@@ -1019,6 +1025,7 @@ fn run_worker(
                     current,
                     queued.frame.event,
                 );
+                update_backend_snapshot(&*backend, &backend_snapshot);
                 let completed = queue.clock.now();
                 record_timing(
                     &queue,
@@ -1346,11 +1353,7 @@ fn inject_reliable(
             Ok(())
         }
         ReliableInputEvent::Key { keycode, state } => {
-            let inject_state = map_key_state(state);
-            backend.inject(InputEvent::Key {
-                keycode: KeyCode::Raw(keycode),
-                state: inject_state,
-            })?;
+            backend.inject(reliable_key_input(keycode, state))?;
             ledger.record_key(keycode, state)?;
             Ok(())
         }
@@ -1419,10 +1422,7 @@ fn release_held(
     let mut complete = true;
     for event in batch.events() {
         let mapped = match event {
-            ReliableInputEvent::Key { keycode, state } => InputEvent::Key {
-                keycode: KeyCode::Raw(*keycode),
-                state: map_key_state(*state),
-            },
+            ReliableInputEvent::Key { keycode, state } => reliable_key_input(*keycode, *state),
             ReliableInputEvent::MouseButton { button, state, .. } => InputEvent::MouseButton {
                 button: map_mouse_button(*button),
                 state: map_button_state(*state),
@@ -1493,6 +1493,13 @@ fn map_key_state(state: KeyState) -> ButtonState {
     }
 }
 
+fn reliable_key_input(keycode: u32, state: KeyState) -> InputEvent {
+    InputEvent::Key {
+        keycode: KeyCode::from_wire(keycode),
+        state: map_key_state(state),
+    }
+}
+
 fn map_button_state(state: WireButtonState) -> ButtonState {
     match state {
         WireButtonState::Pressed => ButtonState::Pressed,
@@ -1534,6 +1541,157 @@ impl LocalMonotonicClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingInjectBackend {
+        events: Vec<InputEvent>,
+    }
+
+    impl InjectBackend for RecordingInjectBackend {
+        fn kind(&self) -> rshare_core::BackendKind {
+            rshare_core::BackendKind::Portable
+        }
+
+        fn health(&self) -> rshare_core::BackendHealth {
+            rshare_core::BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+            self.events.push(event);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct PermissionRevokedInjectBackend {
+        health: rshare_core::BackendHealth,
+        active: bool,
+    }
+
+    impl PermissionRevokedInjectBackend {
+        fn new() -> Self {
+            Self {
+                health: rshare_core::BackendHealth::Healthy,
+                active: true,
+            }
+        }
+    }
+
+    impl InjectBackend for PermissionRevokedInjectBackend {
+        fn kind(&self) -> rshare_core::BackendKind {
+            rshare_core::BackendKind::Portable
+        }
+
+        fn health(&self) -> rshare_core::BackendHealth {
+            self.health.clone()
+        }
+
+        fn inject(&mut self, _event: InputEvent) -> anyhow::Result<()> {
+            self.health = rshare_core::BackendHealth::Degraded {
+                reason: rshare_core::BackendFailureReason::PermissionDenied,
+            };
+            self.active = false;
+            anyhow::bail!("macOS Accessibility permission is required to post input events")
+        }
+
+        fn is_active(&self) -> bool {
+            self.active
+        }
+    }
+
+    #[test]
+    fn remote_injection_permission_failure_refreshes_the_actor_backend_snapshot() {
+        let handle = InputInjectionHandle::spawn(
+            Box::new(PermissionRevokedInjectBackend::new()),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = AuthenticatedInputOwner {
+            peer_id: rshare_core::DeviceId::nil(),
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        let epoch = SessionEpoch(1);
+        handle
+            .begin_session(owner, epoch, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            handle.submit_realtime(
+                owner,
+                RealtimeInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: epoch,
+                    sequence: 1,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                    payload: RealtimeInputPayload::AbsoluteAnchor { x: 10, y: 20 },
+                },
+            ),
+            RealtimeSubmitResult::Accepted
+        );
+        assert!(handle
+            .wait_for_timing(epoch, false, 1, Duration::from_secs(1))
+            .is_some());
+
+        let snapshot = handle.backend_snapshot();
+        assert_eq!(
+            snapshot.health,
+            rshare_core::BackendHealth::Degraded {
+                reason: rshare_core::BackendFailureReason::PermissionDenied
+            }
+        );
+        assert!(!snapshot.active);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn reliable_key_injection_restores_wire_semantics_and_keeps_raw_ledger_key() {
+        let owner = AuthenticatedInputOwner {
+            peer_id: rshare_core::DeviceId::nil(),
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        let mut session = WorkerSession {
+            key: SessionKey {
+                owner,
+                epoch: SessionEpoch(1),
+            },
+            gate: InputOwnershipGate::new(owner, SessionEpoch(1)),
+            last_realtime_applied: None,
+        };
+        let mut backend = RecordingInjectBackend::default();
+        let mut ledger = PressedStateLedger::new();
+        let mut gamepads = HashMap::new();
+        let wire_key = KeyCode::Char(b'W').to_raw();
+
+        inject_reliable(
+            &mut backend,
+            &mut ledger,
+            &mut gamepads,
+            &mut session,
+            ReliableInputEvent::Key {
+                keycode: wire_key,
+                state: KeyState::Pressed,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.events.as_slice(),
+            [InputEvent::Key {
+                keycode: KeyCode::Char(b'W'),
+                state: ButtonState::Pressed,
+            }]
+        ));
+        let pending = ledger
+            .release_all_events(ReleaseAllReason::SessionEnded)
+            .unwrap();
+        assert!(matches!(
+            pending.events(),
+            [ReliableInputEvent::Key { keycode, state: KeyState::Released }] if *keycode == wire_key
+        ));
+    }
 
     fn relative_component(sequence: u64, dx: i32, dy: i32) -> RelativeComponent {
         RelativeComponent {

@@ -627,7 +627,7 @@ impl UInputInjector {
 
     fn create_virtual_mouse() -> Result<VirtualDevice> {
         use evdev::uinput::VirtualDeviceBuilder;
-        use evdev::RelativeAxisType;
+        use evdev::{Key, RelativeAxisType};
 
         let mut rel_axes = AttributeSet::new();
         // In evdev 0.12, RelativeAxisType values are specific enum variants
@@ -637,8 +637,22 @@ impl UInputInjector {
         rel_axes.insert(RelativeAxisType::REL_WHEEL);
         rel_axes.insert(RelativeAxisType::REL_HWHEEL);
 
+        // uinput rejects reports for undeclared key capabilities. This list
+        // mirrors send_mouse_button; other codes fail closed there.
+        let mut buttons = AttributeSet::new();
+        for button in [
+            Key::BTN_LEFT,
+            Key::BTN_RIGHT,
+            Key::BTN_MIDDLE,
+            Key::BTN_SIDE,
+            Key::BTN_EXTRA,
+        ] {
+            buttons.insert(button);
+        }
+
         let device = VirtualDeviceBuilder::new()?
             .name(&"R-ShareMouse Virtual Mouse")
+            .with_keys(&buttons)?
             .with_relative_axes(&rel_axes)?
             .build()
             .context("Failed to create virtual mouse")?;
@@ -668,19 +682,16 @@ impl UInputInjector {
         Ok(())
     }
 
-    /// Send mouse move event (absolute)
-    pub fn send_mouse_move_absolute(&mut self, x: u32, y: u32) -> Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-
-        if self.mouse_device.is_some() {
-            // For absolute positioning, we need to configure the device with absolute axes
-            // This is a simplified implementation
-            tracing::debug!("Absolute mouse move to ({}, {})", x, y);
-        }
-
-        Ok(())
+    /// Send an absolute pointer anchor.
+    ///
+    /// This virtual device deliberately has only REL_* capabilities today.
+    /// Refusing anchors is safer than emitting REL_X/REL_Y with absolute
+    /// desktop coordinates. A future implementation must declare ABS_X and
+    /// ABS_Y with a documented coordinate range before enabling this path.
+    pub fn send_mouse_move_absolute(&mut self, _x: i32, _y: i32) -> Result<()> {
+        anyhow::bail!(
+            "uinput virtual mouse does not declare ABS_X/ABS_Y; absolute anchors are unsupported"
+        )
     }
 
     /// Send mouse button event
@@ -692,11 +703,11 @@ impl UInputInjector {
         if let Some(mouse) = &mut self.mouse_device {
             let key = match button {
                 1 => Key(0x110), // BTN_LEFT
-                2 => Key(0x111), // BTN_RIGHT (actually BTN_RIGHT is 0x111)
-                3 => Key(0x112), // BTN_MIDDLE
+                2 => Key(0x112), // BTN_MIDDLE
+                3 => Key(0x111), // BTN_RIGHT
                 4 => Key(0x113), // BTN_SIDE
                 5 => Key(0x114), // BTN_EXTRA
-                _ => Key(button as u16),
+                _ => anyhow::bail!("unsupported UInput mouse button code: {button}"),
             };
 
             mouse.emit_key(key, press)?;
