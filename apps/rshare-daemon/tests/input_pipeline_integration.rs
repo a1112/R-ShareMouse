@@ -103,7 +103,7 @@ impl InjectBackend for BlockingInjectBackend {
         let should_block = matches!(
             event,
             InputEvent::Key {
-                keycode: KeyCode::Raw(0x41),
+                keycode: KeyCode::Char(b'A'),
                 state: CaptureButtonState::Pressed,
             }
         );
@@ -466,6 +466,24 @@ async fn suppression_output_drives_platform_callback_and_clears_on_exit() {
     enter_remote(&producer, &mut runtime).await;
     runtime.handle_command(RouterCommand::QuickReturn);
     assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+}
+
+#[tokio::test]
+async fn unrelated_connectivity_change_does_not_clear_active_suppression() {
+    let (producer, runtime, _transport) = runtime(8);
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    runtime.handle_command(RouterCommand::ConnectivityChanged {
+        peer: DeviceId::new_v4(),
+        connected: false,
+    });
+
+    assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true]);
 }
 
 #[tokio::test]
@@ -859,6 +877,40 @@ async fn reliable_overflow_suspends_and_emits_emergency_release() {
     )));
 }
 
+#[tokio::test]
+async fn capture_discontinuity_suspends_and_resets_the_input_epoch() {
+    let (producer, mut runtime, transport, feeds) = runtime_with_feeds(8);
+    enter_remote(&producer, &mut runtime).await;
+    assert_eq!(
+        producer.try_push_event(
+            origin(CaptureSource::PortableHook),
+            InputEvent::key(KeyCode::Raw(0x41), CaptureButtonState::Pressed),
+        ),
+        PushOutcome::Enqueued
+    );
+    assert!(runtime.process_next().await);
+    let previous_epoch = runtime.session_epoch();
+
+    producer.report_fault(rshare_input::IngressFault::CaptureDiscontinuity);
+    assert!(runtime.process_next().await);
+
+    let projection = feeds.authoritative_rx.borrow().clone();
+    assert!(matches!(
+        projection.session,
+        ControlSessionState::Suspended { .. }
+    ));
+    assert!(runtime.session_epoch().0 > previous_epoch.0);
+    assert_eq!(projection.discrete.session_epoch, runtime.session_epoch());
+    assert!(projection.discrete.pressed_keys.is_empty());
+    assert!(projection.discrete.pressed_buttons.is_empty());
+    assert!(transport.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        InputDispatch::Reliable { frame, .. }
+            if matches!(frame.event, ReliableInputEvent::ReleaseAll { reason: ReleaseAllReason::BackendFailure })
+    )));
+}
+
+#[cfg(target_os = "windows")]
 #[tokio::test]
 async fn windows_filter_overflow_status_maps_to_suspension_epoch_and_targeted_release() {
     let (producer, mut runtime, transport, feeds) = runtime_with_feeds(8);
@@ -1303,7 +1355,7 @@ async fn saturated_injection_actor_fails_closed_and_releases_active_epoch() {
             matches!(
                 event,
                 InputEvent::Key {
-                    keycode: KeyCode::Raw(0x41),
+                    keycode: KeyCode::Char(b'A'),
                     state: CaptureButtonState::Released,
                 }
             )
@@ -1321,9 +1373,9 @@ async fn saturated_injection_actor_fails_closed_and_releases_active_epoch() {
         matches!(
             event,
             InputEvent::Key {
-                keycode: KeyCode::Raw(keycode),
+                keycode: KeyCode::Char(keycode),
                 state: CaptureButtonState::Pressed,
-            } if *keycode == 0x42 || *keycode == 0x43
+            } if *keycode == b'B' || *keycode == b'C'
         )
     }));
 
@@ -1346,7 +1398,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
         .unwrap();
         injection
             .inject_trusted_local(InputEvent::key(
-                KeyCode::Raw(0x41),
+                KeyCode::Char(b'A'),
                 CaptureButtonState::Pressed,
             ))
             .await
@@ -1354,7 +1406,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
         assert!(matches!(
             gate.events().as_slice(),
             [InputEvent::Key {
-                keycode: KeyCode::Raw(0x41),
+                keycode: KeyCode::Char(b'A'),
                 state: CaptureButtonState::Pressed,
             }]
         ));
@@ -1371,7 +1423,7 @@ async fn lock_and_suspend_release_even_when_ordinary_command_queue_is_full() {
             matches!(
                 captured,
                 InputEvent::Key {
-                    keycode: KeyCode::Raw(0x41),
+                    keycode: KeyCode::Char(b'A'),
                     state: CaptureButtonState::Released,
                 }
             )

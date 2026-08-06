@@ -58,13 +58,14 @@ use rshare_daemon::ui_state_server::{
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
-    InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle, PointerSample,
-    PortableCaptureBackend, PortableInjectBackend, SemanticInputIngress, SemanticInputProducer,
+    IngressFault, InjectBackend, InjectionActorConfig, InjectionBackendSnapshot, InputEvent,
+    InputInjectionHandle, PointerSample, PortableCaptureBackend, PortableInjectBackend,
+    SemanticInputIngress, SemanticInputProducer,
 };
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use rshare_input::RDevInputListener;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use rshare_input::{DefaultInputListener, InputListener};
 use rshare_net::{
     connection::{ConnectionInfo, ConnectionSnapshotReader, ConnectionState},
@@ -697,6 +698,32 @@ impl DaemonState {
         ) {
             self.session.on_backend_degraded();
         }
+    }
+
+    #[cfg(test)]
+    fn record_capture_startup_failure(&mut self, reason: BackendFailureReason, error: String) {
+        self.record_capture_failure(reason, error);
+    }
+
+    fn record_capture_runtime_failure(&mut self, error: String) {
+        self.record_capture_failure(BackendFailureReason::RuntimeError, error);
+    }
+
+    fn record_capture_failure(&mut self, reason: BackendFailureReason, error: String) {
+        let capture_health = BackendHealth::Degraded { reason };
+        self.backend_state.selected_mode = None;
+        self.backend_state.available_backends.clear();
+        self.backend_state.capture_health = capture_health.clone();
+        self.backend_state.last_error = Some(error.clone());
+        self.backend_state.update_aggregate_health();
+
+        self.local_controls.capture_backend.mode = None;
+        self.local_controls.capture_backend.kind = None;
+        self.local_controls.capture_backend.health = Some(capture_health);
+        self.local_controls.capture_backend.active = false;
+        self.local_controls.last_error = Some(error);
+
+        self.session.on_backend_degraded();
     }
 
     fn local_control_snapshot(&self) -> LocalControlDeviceSnapshot {
@@ -3045,6 +3072,214 @@ fn audio_input_name_for_endpoint(state: &DaemonState, endpoint_id: Option<&str>)
         .map(|device| device.name.clone())
 }
 
+#[cfg(target_os = "macos")]
+struct MacosStartupBackendState {
+    mode: Option<ResolvedInputMode>,
+    available_backends: Vec<BackendKind>,
+    capture_health: BackendHealth,
+    inject_health: BackendHealth,
+    ready: bool,
+    error: Option<String>,
+}
+
+/// Resolve the macOS state only after the injector has been constructed and
+/// the event tap has entered its running state. Construction may have obtained
+/// Accessibility after the startup preflight, so the earlier snapshot is not
+/// authoritative.
+#[cfg(target_os = "macos")]
+fn finalize_macos_startup_backend_state(
+    permissions: rshare_platform::MacosInputPermissionState,
+    constructed_inject_health: BackendHealth,
+    inject_active: bool,
+    capture_listener_running: bool,
+    capture_listener_faulted: bool,
+) -> MacosStartupBackendState {
+    let capture_listener_ready = capture_listener_running && !capture_listener_faulted;
+    let capture_health = if permissions.can_capture() && capture_listener_ready {
+        BackendHealth::Healthy
+    } else if permissions.can_capture() {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::Unavailable,
+        }
+    } else {
+        rshare_input::backend::macos_capture_backend_health(permissions)
+    };
+    let inject_health = if !permissions.can_inject() {
+        rshare_input::backend::macos_inject_backend_health(permissions)
+    } else if !inject_active {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::Unavailable,
+        }
+    } else {
+        constructed_inject_health
+    };
+    let ready = matches!(capture_health, BackendHealth::Healthy)
+        && matches!(inject_health, BackendHealth::Healthy);
+    let error = (!ready).then(|| {
+        permissions
+            .actionable_error()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if !capture_listener_ready {
+                    "macOS native input capture listener did not start".to_owned()
+                } else if !inject_active {
+                    "macOS input injection backend is not active".to_owned()
+                } else {
+                    "macOS input backend is degraded".to_owned()
+                }
+            })
+    });
+
+    MacosStartupBackendState {
+        mode: ready.then_some(ResolvedInputMode::Portable),
+        available_backends: ready.then_some(BackendKind::Portable).into_iter().collect(),
+        capture_health,
+        inject_health,
+        ready,
+        error,
+    }
+}
+
+/// A final healthy construction result supersedes preflight and constructor
+/// errors: the native event tap and injector are the authoritative startup
+/// boundary, not the earlier TCC snapshot.
+#[cfg(target_os = "macos")]
+fn macos_startup_backend_error(
+    final_state: &MacosStartupBackendState,
+    capture_startup_error: Option<String>,
+    initial_backend_error: Option<String>,
+) -> Option<String> {
+    if final_state.ready {
+        None
+    } else {
+        capture_startup_error
+            .or_else(|| final_state.error.clone())
+            .or(initial_backend_error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_injection_runtime_health(
+    injection_snapshot: &InjectionBackendSnapshot,
+    permissions: rshare_platform::MacosInputPermissionState,
+) -> BackendHealth {
+    if !permissions.can_inject() {
+        rshare_input::backend::macos_inject_backend_health(permissions)
+    } else if !injection_snapshot.active {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::Unavailable,
+        }
+    } else {
+        injection_snapshot.health.clone()
+    }
+}
+
+/// Refresh the daemon's macOS injector projection without touching capture
+/// state. The actor snapshot provides backend-local state while the direct TCC
+/// check detects Accessibility revocation even when no input reaches the actor.
+/// Runtime degradation is restart-latched because re-enabling TCC does not
+/// recreate the event tap, reset the router, or reactivate the session.
+#[cfg(target_os = "macos")]
+fn sync_macos_injection_runtime_state(
+    state: &mut DaemonState,
+    injection_snapshot: InjectionBackendSnapshot,
+    permissions: rshare_platform::MacosInputPermissionState,
+    runtime_degradation_latched: bool,
+) -> bool {
+    if runtime_degradation_latched {
+        return false;
+    }
+
+    let inject_health = macos_injection_runtime_health(&injection_snapshot, permissions);
+    let inject_active = permissions.can_inject()
+        && injection_snapshot.active
+        && matches!(inject_health, BackendHealth::Healthy);
+    let changed = state.backend_state.inject_health != inject_health
+        || state.local_controls.inject_backend.kind != Some(injection_snapshot.kind)
+        || state.local_controls.inject_backend.active != inject_active
+        || state.local_controls.inject_backend.health.as_ref() != Some(&inject_health)
+        || state.local_controls.inject_backend.text_commit_supported
+            != injection_snapshot.text_commit_supported;
+    if !changed {
+        return false;
+    }
+
+    state.backend_state.inject_health = inject_health.clone();
+    state.backend_state.update_aggregate_health();
+    state.local_controls.inject_backend.kind = Some(injection_snapshot.kind);
+    state.local_controls.inject_backend.health = Some(inject_health.clone());
+    state.local_controls.inject_backend.active = inject_active;
+    state.local_controls.inject_backend.text_commit_supported =
+        injection_snapshot.text_commit_supported;
+
+    if matches!(inject_health, BackendHealth::Degraded { .. }) {
+        // A capture discontinuity has a more specific existing error. Do not
+        // overwrite it while projecting an independent injector failure.
+        if matches!(state.backend_state.capture_health, BackendHealth::Healthy) {
+            let error = permissions
+                .actionable_error()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    if !injection_snapshot.active {
+                        "macOS input injection backend is not active".to_owned()
+                    } else {
+                        "macOS input injection backend is degraded".to_owned()
+                    }
+                });
+            state.backend_state.last_error = Some(error.clone());
+            state.local_controls.last_error = Some(error);
+        }
+        state.session.on_backend_degraded();
+    }
+
+    true
+}
+
+/// A listener status handle exists only after successful native startup, so a
+/// stopped or faulted status is an asynchronous capture failure rather than a
+/// normal startup error.
+#[cfg(target_os = "macos")]
+fn macos_capture_listener_has_runtime_fault(
+    listener_running: bool,
+    listener_faulted: bool,
+) -> bool {
+    !listener_running || listener_faulted
+}
+
+/// Classify asynchronous capture failures without relying solely on the
+/// listener atomics. TCC revocation can leave a previously running event tap
+/// reporting healthy until it next receives input, so Input Monitoring is the
+/// first gate and must fail closed immediately.
+#[cfg(target_os = "macos")]
+fn macos_capture_runtime_failure_reason(
+    permissions: rshare_platform::MacosInputPermissionState,
+    listener_running: bool,
+    listener_faulted: bool,
+) -> Option<BackendFailureReason> {
+    if !permissions.can_capture() {
+        Some(BackendFailureReason::PermissionDenied)
+    } else if macos_capture_listener_has_runtime_fault(listener_running, listener_faulted) {
+        Some(BackendFailureReason::Unavailable)
+    } else {
+        None
+    }
+}
+
+/// Linux evdev reports device-local relative motion only. Without a trusted
+/// desktop cursor sampler it cannot supply the absolute anchor required for
+/// edge entry and button forwarding, so automatic capture must use RDev.
+///
+/// Keep this decision pure: startup and diagnostics both consume the same
+/// result and cannot accidentally revive evdev during a fallback path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxCaptureStartup {
+    PortableRDev,
+}
+
+fn select_linux_capture_startup() -> LinuxCaptureStartup {
+    LinuxCaptureStartup::PortableRDev
+}
+
 /// Discover available backends and select the best one
 fn discover_and_select_backend() -> (
     Option<ResolvedInputMode>,
@@ -3052,18 +3287,38 @@ fn discover_and_select_backend() -> (
     BackendHealth,
     Option<String>,
 ) {
+    #[cfg(target_os = "macos")]
+    {
+        let permissions = rshare_platform::macos_input_permission_state();
+        let capture_health = rshare_input::backend::macos_capture_backend_health(permissions);
+        let inject_health = rshare_input::backend::macos_inject_backend_health(permissions);
+        let ready = matches!(capture_health, BackendHealth::Healthy)
+            && matches!(inject_health, BackendHealth::Healthy);
+
+        return (
+            ready.then_some(ResolvedInputMode::Portable),
+            ready.then_some(BackendKind::Portable).into_iter().collect(),
+            capture_health,
+            permissions.actionable_error().map(str::to_owned),
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
     let mut candidates = vec![];
 
+    #[cfg(not(target_os = "macos"))]
     let portable_capture_health = PortableCaptureBackend::new_for_test()
         .map(|backend| backend.health())
         .unwrap_or(BackendHealth::Degraded {
             reason: BackendFailureReason::InitializationFailed,
         });
+    #[cfg(not(target_os = "macos"))]
     let portable_inject_health = PortableInjectBackend::new_for_test()
         .map(|backend| backend.health())
         .unwrap_or(BackendHealth::Degraded {
             reason: BackendFailureReason::InitializationFailed,
         });
+    #[cfg(not(target_os = "macos"))]
     candidates.push(candidate_from_component_health(
         BackendKind::Portable,
         portable_capture_health,
@@ -3116,74 +3371,20 @@ fn discover_and_select_backend() -> (
 
     #[cfg(target_os = "linux")]
     {
-        use rshare_input::backend::UInputInjectBackend;
-
-        // Check Evdev capture availability WITHOUT starting it (to avoid device grab)
-        // The actual capture will be started in try_start_evdev_capture()
-        let evdev_capture_health = check_evdev_devices_available();
-
-        // Try to initialize UInput injection backend
-        let uinput_inject_health = match UInputInjectBackend::new() {
-            Ok(backend) => {
-                tracing::info!("UInput inject backend available");
-                backend.health()
-            }
-            Err(e) => {
-                tracing::warn!("UInput inject backend failed: {:?}", e);
-                BackendHealth::Degraded {
-                    reason: if e.to_string().contains("permission")
-                        || e.to_string().contains("denied")
-                        || e.to_string().contains("Permiss")
-                    {
-                        BackendFailureReason::PermissionDenied
-                    } else {
-                        BackendFailureReason::InitializationFailed
-                    },
-                }
-            }
-        };
-
-        // Add pure Evdev candidate (both capture and inject)
-        candidates.push(candidate_from_component_health(
-            BackendKind::Evdev,
-            evdev_capture_health.clone(),
-            uinput_inject_health.clone(),
-        ));
-
-        // Add hybrid candidate: Evdev capture + Portable inject
-        // This allows kernel-level input capture even when UInput is unavailable
-        let hybrid_health = match (&evdev_capture_health, &portable_inject_health) {
-            (BackendHealth::Healthy, BackendHealth::Healthy) => BackendHealth::Healthy,
-            (BackendHealth::Degraded { reason }, _) => {
-                // If Evdev capture fails, the hybrid backend is degraded
-                BackendHealth::Degraded {
-                    reason: reason.clone(),
-                }
-            }
-            (_, BackendHealth::Degraded { reason }) => {
-                // If Portable inject fails, the hybrid backend is degraded but still usable for capture
-                tracing::info!("Hybrid backend: Evdev capture with degraded injection");
-                BackendHealth::Degraded {
-                    reason: reason.clone(),
-                }
-            }
-        };
-
-        candidates.push(BackendCandidate {
-            kind: BackendKind::Portable, // Use Portable as the kind for hybrid
-            healthy: matches!(hybrid_health, BackendHealth::Healthy),
-            failure_reason: match hybrid_health {
-                BackendHealth::Healthy => None,
-                BackendHealth::Degraded { reason } => Some(reason),
-            },
-            capabilities: rshare_input::backend::BackendCapabilities::default(),
-        });
-
-        tracing::info!("Linux backend candidates: Evdev capture={:?}, UInput inject={:?}, Portable inject={:?}",
-            evdev_capture_health, uinput_inject_health, portable_inject_health);
+        // Evdev has no trustworthy global cursor sample, and the current
+        // UInput mouse cannot represent absolute anchors. Do not advertise or
+        // probe either kernel path as healthy; RDev is the only automatic
+        // capture path because it supplies desktop coordinates.
+        tracing::info!(
+            "Linux automatic input uses Portable/RDev; Evdev/UInput are disabled until absolute-anchor support exists"
+        );
+        return resolve_backend_selection(&candidates);
     }
 
-    resolve_backend_selection(&candidates)
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        resolve_backend_selection(&candidates)
+    }
 }
 
 fn candidate_from_component_health(
@@ -3329,7 +3530,12 @@ fn set_local_shortcut_suppression(enabled: bool) {
     rshare_platform::windows::set_local_input_suppressed(enabled);
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_local_shortcut_suppression(enabled: bool) {
+    rshare_platform::set_macos_local_input_suppressed(enabled);
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_local_shortcut_suppression(_enabled: bool) {}
 
 #[cfg(windows)]
@@ -3344,7 +3550,18 @@ fn local_shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -
         )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn local_shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    let permissions = rshare_platform::macos_input_permission_state();
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(ResolvedInputMode::Portable)
+        )
+        && permissions.is_ready()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn local_shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
     false
 }
@@ -3357,18 +3574,18 @@ impl LocalShortcutSuppressor for PlatformShortcutSuppressor {
     }
 }
 
-fn sync_local_shortcut_suppression(state: &DaemonState) {
-    let should_suppress = state.features.suppress_local_shortcuts_when_remote
-        && matches!(
-            state.session.state(),
-            ControlSessionState::RemoteActive { .. }
-        );
-    set_local_shortcut_suppression(should_suppress);
-}
-
 fn create_inject_backend(mode: Option<ResolvedInputMode>) -> Result<Box<dyn InjectBackend>> {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = mode;
+
+    #[cfg(target_os = "linux")]
+    if matches!(
+        mode,
+        Some(ResolvedInputMode::Evdev) | Some(ResolvedInputMode::UInput)
+    ) {
+        use rshare_input::backend::UInputInjectBackend;
+        return Ok(Box::new(UInputInjectBackend::new()?));
+    }
 
     #[cfg(target_os = "windows")]
     if matches!(mode, Some(ResolvedInputMode::VirtualHid)) {
@@ -3427,7 +3644,8 @@ fn backend_kind_for_mode(mode: Option<ResolvedInputMode>) -> BackendKind {
         #[cfg(target_os = "windows")]
         Some(ResolvedInputMode::VirtualHid) => BackendKind::VirtualHid,
         #[cfg(target_os = "linux")]
-        Some(ResolvedInputMode::Evdev) => BackendKind::Evdev,
+        // Evdev is capture-only; its paired injector is UInput.
+        Some(ResolvedInputMode::Evdev) => BackendKind::UInput,
         #[cfg(target_os = "linux")]
         Some(ResolvedInputMode::UInput) => BackendKind::UInput,
         Some(ResolvedInputMode::Portable) | None => BackendKind::Portable,
@@ -3452,6 +3670,35 @@ fn build_inject_backend(
             (backend, health, None)
         }
         Err(error) => {
+            #[cfg(target_os = "linux")]
+            if matches!(
+                mode,
+                Some(ResolvedInputMode::Evdev) | Some(ResolvedInputMode::UInput)
+            ) {
+                let uinput_error = error.to_string();
+                tracing::warn!(
+                    "Linux UInput injection unavailable; attempting portable fallback: {}",
+                    uinput_error
+                );
+                match PortableInjectBackend::new() {
+                    Ok(backend) => {
+                        let health = backend.health();
+                        return (
+                            Box::new(backend),
+                            health,
+                            Some(format!(
+                                "Linux UInput injection unavailable ({uinput_error}); portable injection fallback active"
+                            )),
+                        );
+                    }
+                    Err(portable_error) => {
+                        tracing::warn!(
+                            "Linux portable injection fallback unavailable: {}",
+                            portable_error
+                        );
+                    }
+                }
+            }
             let reason = inject_backend_failure_reason(&error);
             let health = BackendHealth::Degraded { reason };
             let error = error.to_string();
@@ -6341,7 +6588,7 @@ fn try_start_evdev_capture(producer: SemanticInputProducer) -> Result<tokio::tas
             // Log the raw evdev event for debugging
             tracing::debug!("Evdev event: {:?}", evdev_event);
 
-            let Some(input_event) = input_event_from_evdev_driver_event(evdev_event) else {
+            let Some(payload) = input_event_from_evdev_driver_event(evdev_event) else {
                 return;
             };
             let captured = producer.capture(
@@ -6350,7 +6597,7 @@ fn try_start_evdev_capture(producer: SemanticInputProducer) -> Result<tokio::tas
                     device_token: 0,
                     instance_token: 0,
                 },
-                CapturedInputPayload::from_input_event(input_event),
+                payload,
             );
             let _ = producer.try_push(captured);
         };
@@ -6389,13 +6636,22 @@ fn try_start_evdev_capture(producer: SemanticInputProducer) -> Result<tokio::tas
 #[cfg(target_os = "linux")]
 fn input_event_from_evdev_driver_event(
     event: rshare_platform::EvdevDriverEvent,
-) -> Option<InputEvent> {
-    use rshare_input::{ButtonState, KeyCode, MouseButton};
+) -> Option<CapturedInputPayload> {
+    use rshare_input::{ButtonState, MouseButton};
     use rshare_platform::EvdevDriverEvent;
 
     let (event, device_kind, _device_path) = match event {
+        // evdev REL_X/REL_Y (and touchpad deltas normalized by the platform
+        // listener) must not cross ingress as absolute InputEvent::MouseMove.
+        // No trusted desktop cursor sample exists here, so leaving observed
+        // coordinates empty prevents fabricated edge transitions.
         EvdevDriverEvent::MouseMove { x, y, device_path } => (
-            InputEvent::MouseMove { x, y },
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+                dx: x,
+                dy: y,
+                observed_x: None,
+                observed_y: None,
+            })),
             LocalInputDeviceKind::Mouse,
             device_path,
         ),
@@ -6410,10 +6666,10 @@ fn input_event_from_evdev_driver_event(
                 ButtonState::Released
             };
             (
-                InputEvent::MouseButton {
+                CapturedInputPayload::from_input_event(InputEvent::MouseButton {
                     button: MouseButton::from_code(button as u8),
                     state,
-                },
+                }),
                 LocalInputDeviceKind::Mouse,
                 device_path,
             )
@@ -6423,7 +6679,7 @@ fn input_event_from_evdev_driver_event(
             delta_y,
             device_path,
         } => (
-            InputEvent::MouseWheel { delta_x, delta_y },
+            CapturedInputPayload::from_input_event(InputEvent::MouseWheel { delta_x, delta_y }),
             LocalInputDeviceKind::Mouse,
             device_path,
         ),
@@ -6438,10 +6694,10 @@ fn input_event_from_evdev_driver_event(
                 ButtonState::Released
             };
             (
-                InputEvent::Key {
-                    keycode: KeyCode::Raw(keycode),
+                CapturedInputPayload::from_input_event(InputEvent::Key {
+                    keycode: rshare_input::linux_evdev_keycode_to_keycode(keycode)?,
                     state,
-                },
+                }),
                 LocalInputDeviceKind::Keyboard,
                 device_path,
             )
@@ -6453,6 +6709,55 @@ fn input_event_from_evdev_driver_event(
         _ => return None,
     }
     Some(event)
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn captured_input_from_evdev_driver_event(
+    event: rshare_platform::EvdevDriverEvent,
+) -> Option<CapturedInputEvent> {
+    let (device_kind, device_path) = match &event {
+        rshare_platform::EvdevDriverEvent::MouseMove { device_path, .. }
+        | rshare_platform::EvdevDriverEvent::MouseButton { device_path, .. }
+        | rshare_platform::EvdevDriverEvent::MouseWheel { device_path, .. } => {
+            (LocalInputDeviceKind::Mouse, device_path.as_str())
+        }
+        rshare_platform::EvdevDriverEvent::Key { device_path, .. } => {
+            (LocalInputDeviceKind::Keyboard, device_path.as_str())
+        }
+    };
+    let payload = input_event_from_evdev_driver_event(event)?;
+    let event = match payload {
+        CapturedInputPayload::Discrete(event) => event,
+        CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+            x,
+            y,
+        })) => InputEvent::mouse_move(x, y),
+        // Relative evdev motion has no trusted absolute position and is not a
+        // diagnostic InputEvent by itself. The production path keeps it as a
+        // relative payload; this helper is only for discrete metadata tests.
+        CapturedInputPayload::Continuous(_) => return None,
+    };
+    let device_instance_id = Path::new(device_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    let device_name = match device_kind {
+        LocalInputDeviceKind::Keyboard => "keyboard",
+        LocalInputDeviceKind::Mouse => "mouse",
+        _ => return None,
+    };
+    let instance = device_instance_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    Some(CapturedInputEvent {
+        event,
+        metadata: Some(LocalInputDeviceMetadata {
+            device_id: format!("linux-evdev-{device_name}-{instance}"),
+            device_instance_id,
+            capture_path: Some(device_path.to_owned()),
+        }),
+    })
 }
 
 fn flatten_daemon_task_result(
@@ -6628,6 +6933,8 @@ async fn main() -> Result<()> {
     // Discover and select backend
     let (input_mode, available_backends, backend_health, backend_error) =
         discover_and_select_backend();
+    #[cfg(target_os = "macos")]
+    let _ = (&available_backends, &backend_health);
 
     tracing::info!(
         "Backend selected: {:?} (available: {:?})",
@@ -6655,24 +6962,45 @@ async fn main() -> Result<()> {
     let state = Arc::new(RwLock::new(daemon_state));
 
     let (inject_backend, inject_health, inject_error) = build_inject_backend(input_mode);
+    #[cfg(target_os = "macos")]
+    let _ = &inject_health;
+    #[cfg(not(target_os = "macos"))]
     let inject_kind = inject_backend.kind();
+    #[cfg(not(target_os = "macos"))]
     let text_commit_supported = inject_backend.supports_text_commit();
-    let last_backend_error = inject_error.or(backend_error);
+    let initial_backend_error = inject_error.or(backend_error);
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     let input_backend_healthy = matches!(backend_health, BackendHealth::Healthy)
         && matches!(inject_health, BackendHealth::Healthy);
+    #[cfg(target_os = "linux")]
+    let mut input_backend_healthy = false;
+    #[cfg(target_os = "macos")]
+    let input_backend_healthy;
 
-    // Initialize backend state
+    // Non-macOS selection does not acquire TCC permissions during injector
+    // construction, so the discovery result remains authoritative.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     {
         let mut s = state.write().await;
         s.update_backend_state(
             input_mode,
-            available_backends,
+            available_backends.clone(),
             backend_health.clone(), // capture health
             inject_kind,
-            inject_health,
+            inject_health.clone(),
             text_commit_supported,
-            last_backend_error,
+            initial_backend_error.clone(),
         );
+        #[cfg(target_os = "linux")]
+        {
+            // The selected Linux mode describes capture. Reflect the actual
+            // constructed injector independently for truthful UI diagnostics.
+            s.local_controls.inject_backend.mode = Some(match inject_kind {
+                BackendKind::UInput => ResolvedInputMode::UInput,
+                BackendKind::Portable => ResolvedInputMode::Portable,
+                _ => ResolvedInputMode::Portable,
+            });
+        }
     }
     let injection = InputInjectionHandle::spawn(inject_backend, InjectionActorConfig::default())?;
     let inject_backend = injection.clone();
@@ -6687,7 +7015,7 @@ async fn main() -> Result<()> {
     ));
 
     let (capture_producer, input_consumer) = SemanticInputIngress::new(256);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     let portable_origin = CaptureOrigin {
         source: CaptureSource::PortableHook,
         device_token: 0,
@@ -6696,22 +7024,9 @@ async fn main() -> Result<()> {
 
     // Every capture backend publishes into the same bounded semantic ingress.
     #[cfg(target_os = "linux")]
-    let mut input_channel = {
-        match try_start_evdev_capture(capture_producer.clone()) {
-            Ok(_evdev_task) => {
-                tracing::info!("Using Evdev backend for input capture (kernel-level)");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Evdev capture unavailable: {:?}, using RDev (Portable) backend",
-                    e
-                );
-                Some(RDevInputListener::from_producer(
-                    capture_producer.clone(),
-                    portable_origin,
-                ))
-            }
+    let input_channel = match select_linux_capture_startup() {
+        LinuxCaptureStartup::PortableRDev => {
+            RDevInputListener::from_producer(capture_producer.clone(), portable_origin)
         }
     };
 
@@ -6774,11 +7089,74 @@ async fn main() -> Result<()> {
         }
     };
 
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
-    let mut input_channel = Some(RDevInputListener::from_producer(
-        capture_producer.clone(),
-        portable_origin,
-    ));
+    #[cfg(target_os = "macos")]
+    let (_input_listener, macos_capture_startup_error) = {
+        let native_origin = CaptureOrigin {
+            source: CaptureSource::PortableHook,
+            device_token: 0,
+            instance_token: 0,
+        };
+        set_local_shortcut_suppression(false);
+        let producer = capture_producer.clone();
+        let fault_producer = capture_producer.clone();
+        let fault_callback: Arc<dyn Fn(IngressFault) + Send + Sync> = Arc::new(move |fault| {
+            fault_producer.report_fault(fault);
+        });
+        let mut listener = DefaultInputListener::new();
+        match listener.start_with_fault(
+            Box::new(move |event| {
+                let _ = producer.try_push_event(native_origin, event);
+            }),
+            fault_callback,
+        ) {
+            Ok(()) => {
+                tracing::info!("Using native macOS CGEventTap input capture");
+                (Some(listener), None)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                tracing::warn!("macOS native input capture unavailable: {error}");
+                (None, Some(error))
+            }
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let macos_capture_listener_status = _input_listener
+        .as_ref()
+        .and_then(DefaultInputListener::macos_status_handle);
+
+    #[cfg(target_os = "macos")]
+    {
+        let injection_snapshot = injection.backend_snapshot();
+        let final_state = finalize_macos_startup_backend_state(
+            rshare_platform::macos_input_permission_state(),
+            injection_snapshot.health,
+            injection_snapshot.active,
+            macos_capture_listener_status
+                .as_ref()
+                .is_some_and(|status| status.is_running()),
+            macos_capture_listener_status
+                .as_ref()
+                .is_some_and(|status| status.has_capture_fault()),
+        );
+        input_backend_healthy = final_state.ready;
+        let last_backend_error = macos_startup_backend_error(
+            &final_state,
+            macos_capture_startup_error,
+            initial_backend_error,
+        );
+        let mut s = state.write().await;
+        s.update_backend_state(
+            final_state.mode,
+            final_state.available_backends,
+            final_state.capture_health,
+            injection_snapshot.kind,
+            final_state.inject_health,
+            injection_snapshot.text_commit_supported,
+            last_backend_error,
+        );
+    }
 
     let mut gamepad_listener_config = GamepadListenerConfig::from(&config.gamepad);
     gamepad_listener_config.enabled = true;
@@ -6793,16 +7171,36 @@ async fn main() -> Result<()> {
     );
     gamepad_listener.start()?;
 
-    // Start RDev listener if we're using it
+    // Start the only Linux capture path. Its state is published only after
+    // this startup path has succeeded, rather than retaining a discovery-time
+    // kernel-mode projection.
     #[cfg(target_os = "linux")]
-    if let Some(ref listener) = input_channel {
-        listener.start().await?;
-        tracing::info!("Using RDev fallback input capture on Linux");
-    }
-
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
-    if let Some(ref listener) = input_channel {
-        listener.start().await?;
+    match input_channel.start().await {
+        Ok(()) => {
+            let injection_snapshot = injection.backend_snapshot();
+            let capture_health = BackendHealth::Healthy;
+            input_backend_healthy = matches!(injection_snapshot.health, BackendHealth::Healthy)
+                && injection_snapshot.active;
+            let mut s = state.write().await;
+            s.update_backend_state(
+                Some(ResolvedInputMode::Portable),
+                vec![BackendKind::Portable],
+                capture_health,
+                injection_snapshot.kind,
+                injection_snapshot.health,
+                injection_snapshot.text_commit_supported,
+                initial_backend_error.clone(),
+            );
+            tracing::info!("Using Portable/RDev input capture on Linux");
+        }
+        Err(error) => {
+            let message = error.to_string();
+            state
+                .write()
+                .await
+                .record_capture_failure(BackendFailureReason::InitializationFailed, message);
+            return Err(error);
+        }
     }
 
     tracing::info!("Daemon started as device {} ({})", device_name, device_id);
@@ -6838,6 +7236,102 @@ async fn main() -> Result<()> {
         diagnostics_samples,
         ui_network_changes,
     )?;
+
+    #[cfg(target_os = "macos")]
+    let _injection_status_sync_task = {
+        let state = state.clone();
+        let injection = injection.clone();
+        let ui_state = ui_state.clone();
+        let input_command_tx = input_command_tx.clone();
+        let macos_capture_listener_status = macos_capture_listener_status.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // TCC restoration alone cannot safely recreate a capture session.
+            // Keep the first runtime fault latched until daemon restart rather
+            // than advertising a recovered backend while the router/session
+            // remains suspended.
+            let mut runtime_degradation_latched = false;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let snapshot = injection.backend_snapshot();
+                        let permissions = rshare_platform::macos_input_permission_state();
+                        let capture_failure_reason = macos_capture_listener_status.as_ref().and_then(|status| {
+                            macos_capture_runtime_failure_reason(
+                                permissions,
+                                status.is_running(),
+                                status.has_capture_fault(),
+                            )
+                        });
+                        let injection_failure_detected = matches!(
+                            macos_injection_runtime_health(&snapshot, permissions),
+                            BackendHealth::Degraded { .. }
+                        );
+                        let runtime_failure_detected = capture_failure_reason.is_some()
+                            || injection_failure_detected;
+                        let newly_latched = runtime_failure_detected
+                            && !runtime_degradation_latched;
+                        if newly_latched {
+                            set_local_shortcut_suppression(false);
+                            // The platform fault bridge can itself panic. This
+                            // independent status lane still releases remote
+                            // input and suspends forwarding in that case.
+                            injection.request_release_all_sources(
+                                rshare_core::ReleaseAllReason::BackendFailure,
+                            );
+                        }
+                        let (changed, became_degraded) = {
+                            let mut state = state.write().await;
+                            let was_healthy = matches!(state.backend_state.aggregate_health, BackendHealth::Healthy);
+                            if newly_latched {
+                                if let Some(reason) = capture_failure_reason {
+                                let error = if matches!(reason, BackendFailureReason::PermissionDenied) {
+                                    "macOS Input Monitoring permission was revoked".to_string()
+                                } else {
+                                    "macOS native input capture listener stopped or faulted".to_string()
+                                };
+                                state.record_capture_failure(reason, error);
+                                }
+                            }
+                            let injection_changed = sync_macos_injection_runtime_state(
+                                &mut state,
+                                snapshot,
+                                permissions,
+                                runtime_degradation_latched,
+                            );
+                            let changed = newly_latched || injection_changed;
+                            let became_degraded = (newly_latched
+                                || (injection_changed && was_healthy))
+                                && matches!(state.backend_state.aggregate_health, BackendHealth::Degraded { .. });
+                            (changed, became_degraded)
+                        };
+                        if newly_latched {
+                            runtime_degradation_latched = true;
+                        }
+                        if became_degraded
+                            && enqueue_router_command(
+                                &input_command_tx,
+                                RouterCommand::BackendDegraded,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if changed {
+                            if let Err(error) = ui_state.reconcile_from_projection().await {
+                                tracing::warn!("Failed to reconcile UI state after macOS injection health refresh: {error:#}");
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        })
+    };
 
     let ipc_task = tokio::spawn(run_ipc_server(
         ipc_listener,
@@ -7136,7 +7630,6 @@ async fn main() -> Result<()> {
                             "USB probe target disconnected.",
                         );
                         state.mark_disconnected(&id);
-                        sync_local_shortcut_suppression(&state);
                     }
                     NetworkEvent::DeviceLost(id) => {
                         let mut state = state.write().await;
@@ -7205,7 +7698,6 @@ async fn main() -> Result<()> {
                                 "USB probe target connection failed.",
                             );
                             state.mark_disconnected(&device_id);
-                            sync_local_shortcut_suppression(&state);
                         }
                     }
                 }
@@ -7741,7 +8233,6 @@ async fn dispatch_ipc_request(
                     let mut state = state.write().await;
                     state.session.on_target_disconnect(device_id);
                     state.mark_disconnected(&device_id);
-                    sync_local_shortcut_suppression(&state);
                     DaemonResponse::Ack
                 }
                 Err(err) => DaemonResponse::Error(err.to_string()),
@@ -8524,7 +9015,7 @@ mod tests {
             Some(ResolvedInputMode::Portable),
             vec![BackendKind::Portable],
             BackendHealth::Healthy,
-            BackendKind::WindowsNative,
+            BackendKind::Portable,
             BackendHealth::Healthy,
             true,
             None,
@@ -8536,9 +9027,423 @@ mod tests {
         );
         assert_eq!(
             state.local_controls.inject_backend.kind,
-            Some(BackendKind::WindowsNative)
+            Some(BackendKind::Portable)
         );
         assert!(state.local_controls.inject_backend.text_commit_supported);
+    }
+
+    #[test]
+    fn linux_evdev_motion_is_never_selected_without_a_global_cursor_anchor() {
+        // This remains executable on non-Linux hosts while asserting the
+        // Linux-only production branches that cannot be device-tested here.
+        let source = include_str!("main.rs");
+        let converter_start = source
+            .find("fn input_event_from_evdev_driver_event")
+            .expect("missing evdev ingress converter");
+        let converter_end = source[converter_start..]
+            .find("fn flatten_daemon_task_result")
+            .map(|offset| converter_start + offset)
+            .expect("missing end of evdev ingress converter");
+        let converter = &source[converter_start..converter_end];
+        let move_end = converter
+            .find("EvdevDriverEvent::MouseButton")
+            .expect("missing evdev mouse-button branch");
+        let move_branch = &converter[..move_end];
+        assert!(converter.contains(") -> Option<CapturedInputPayload>"));
+        assert!(move_branch.contains("PointerSample::Relative"));
+        assert!(move_branch.contains("observed_x: None"));
+        assert!(move_branch.contains("observed_y: None"));
+        assert!(
+            !move_branch.contains("CapturedInputPayload::from_input_event(InputEvent::MouseMove")
+        );
+
+        assert_eq!(
+            select_linux_capture_startup(),
+            LinuxCaptureStartup::PortableRDev
+        );
+
+        let startup_start = source
+            .find("let input_channel = match select_linux_capture_startup()")
+            .expect("missing Linux capture startup selection");
+        let startup_end = source[startup_start..]
+            .find("#[cfg(windows)]")
+            .map(|offset| startup_start + offset)
+            .expect("missing end of Linux capture startup selection");
+        let startup = &source[startup_start..startup_end];
+        assert!(startup.contains("RDevInputListener::from_producer"));
+        assert!(!startup.contains("try_start_evdev_capture"));
+
+        let discovery_marker = source
+            .find("Linux automatic input uses Portable/RDev")
+            .expect("missing Linux discovery explanation");
+        let discovery_start = source[..discovery_marker]
+            .rfind("#[cfg(target_os = \"linux\")]\n    {")
+            .expect("missing Linux discovery branch");
+        let discovery_end = source[discovery_marker..]
+            .find("#[cfg(all(not(target_os = \"macos\"), not(target_os = \"linux\")))]")
+            .map(|offset| discovery_marker + offset)
+            .expect("missing end of Linux discovery branch");
+        let discovery = &source[discovery_start..discovery_end];
+        assert!(discovery.contains("Evdev/UInput are disabled"));
+        assert!(!discovery.contains("UInputInjectBackend::new()"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_startup_recheck_promotes_portable_after_permission_was_granted_during_construction() {
+        let final_state = finalize_macos_startup_backend_state(
+            rshare_platform::MacosInputPermissionState::from_preflight(true, true),
+            BackendHealth::Healthy,
+            true,
+            true,
+            false,
+        );
+
+        assert!(final_state.ready);
+        assert_eq!(final_state.mode, Some(ResolvedInputMode::Portable));
+        assert_eq!(final_state.available_backends, vec![BackendKind::Portable]);
+        assert_eq!(final_state.capture_health, BackendHealth::Healthy);
+        assert_eq!(final_state.inject_health, BackendHealth::Healthy);
+        assert_eq!(final_state.error, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_healthy_startup_clears_superseded_preflight_errors() {
+        let final_state = finalize_macos_startup_backend_state(
+            rshare_platform::MacosInputPermissionState::from_preflight(true, true),
+            BackendHealth::Healthy,
+            true,
+            true,
+            false,
+        );
+
+        assert_eq!(
+            macos_startup_backend_error(
+                &final_state,
+                Some("macOS Input Monitoring permission is required".to_string()),
+                Some("macOS Accessibility permission is required".to_string()),
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_startup_recheck_fails_closed_when_event_tap_did_not_start() {
+        let final_state = finalize_macos_startup_backend_state(
+            rshare_platform::MacosInputPermissionState::from_preflight(true, true),
+            BackendHealth::Healthy,
+            true,
+            false,
+            false,
+        );
+
+        assert!(!final_state.ready);
+        assert_eq!(final_state.mode, None);
+        assert!(final_state.available_backends.is_empty());
+        assert_eq!(
+            final_state.capture_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::Unavailable
+            }
+        );
+        assert_eq!(
+            final_state.error.as_deref(),
+            Some("macOS native input capture listener did not start")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_startup_recheck_fails_closed_after_listener_reports_a_fault() {
+        let final_state = finalize_macos_startup_backend_state(
+            rshare_platform::MacosInputPermissionState::from_preflight(true, true),
+            BackendHealth::Healthy,
+            true,
+            true,
+            true,
+        );
+
+        assert!(!final_state.ready);
+        assert_eq!(final_state.mode, None);
+        assert!(final_state.available_backends.is_empty());
+        assert!(matches!(
+            final_state.capture_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::Unavailable
+            }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_injection_health_sync_projects_revocation_without_actor_input() {
+        let mut state = test_daemon_state();
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::Portable,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+
+        assert!(sync_macos_injection_runtime_state(
+            &mut state,
+            InjectionBackendSnapshot {
+                kind: BackendKind::Portable,
+                health: BackendHealth::Healthy,
+                active: true,
+                text_commit_supported: true,
+            },
+            rshare_platform::MacosInputPermissionState::from_preflight(true, false),
+            false,
+        ));
+        assert!(matches!(
+            state.backend_state.inject_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(matches!(
+            state.backend_state.aggregate_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(!state.local_controls.inject_backend.active);
+        assert!(matches!(
+            state.local_controls.inject_backend.health,
+            Some(BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            })
+        ));
+        assert!(matches!(
+            state
+                .capability_registry_snapshot(&NetworkTransportSnapshot::default(), None)
+                .devices[0]
+                .capabilities
+                .iter()
+                .find(|capability| capability.kind == EndpointCapabilityKind::Input)
+                .map(|capability| capability.state.clone()),
+            Some(CapabilityState::Degraded)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_runtime_permission_restoration_stays_latched_until_restart() {
+        let mut state = test_daemon_state();
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::Portable,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+        let snapshot = InjectionBackendSnapshot {
+            kind: BackendKind::Portable,
+            health: BackendHealth::Healthy,
+            active: true,
+            text_commit_supported: true,
+        };
+
+        assert!(sync_macos_injection_runtime_state(
+            &mut state,
+            snapshot.clone(),
+            rshare_platform::MacosInputPermissionState::from_preflight(true, false),
+            false,
+        ));
+        assert!(!sync_macos_injection_runtime_state(
+            &mut state,
+            snapshot,
+            rshare_platform::MacosInputPermissionState::from_preflight(true, true),
+            true,
+        ));
+
+        assert!(matches!(
+            state.backend_state.inject_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(matches!(
+            state.backend_state.aggregate_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(!state.local_controls.inject_backend.active);
+        assert!(matches!(
+            state.session.state(),
+            ControlSessionState::Suspended {
+                reason: rshare_core::SuspendReason::BackendDegraded
+            }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listener_status_transition_only_faults_after_successful_startup() {
+        assert!(!macos_capture_listener_has_runtime_fault(true, false));
+        assert!(macos_capture_listener_has_runtime_fault(false, false));
+        assert!(macos_capture_listener_has_runtime_fault(true, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_input_monitoring_revocation_fails_closed_while_listener_still_runs() {
+        let reason = macos_capture_runtime_failure_reason(
+            rshare_platform::MacosInputPermissionState::from_preflight(false, true),
+            true,
+            false,
+        );
+
+        assert_eq!(reason, Some(BackendFailureReason::PermissionDenied));
+
+        let mut state = test_daemon_state();
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::Portable,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+        state.record_capture_failure(
+            reason.expect("Input Monitoring revocation must be a capture failure"),
+            "macOS Input Monitoring permission was revoked".to_string(),
+        );
+
+        assert_eq!(state.backend_state.selected_mode, None);
+        assert!(state.backend_state.available_backends.is_empty());
+        assert!(matches!(
+            state.backend_state.capture_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(!state.local_controls.capture_backend.active);
+        assert!(matches!(
+            state.session.state(),
+            ControlSessionState::Suspended { .. }
+        ));
+    }
+
+    #[test]
+    fn capture_startup_failure_clears_end_to_end_capture_without_losing_injection_diagnostics() {
+        let mut state = test_daemon_state();
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::Portable,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+
+        state.record_capture_startup_failure(
+            BackendFailureReason::PermissionDenied,
+            "macOS event tap startup failed".to_string(),
+        );
+
+        assert_eq!(state.backend_state.selected_mode, None);
+        assert!(state.backend_state.available_backends.is_empty());
+        assert!(matches!(
+            state.backend_state.capture_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert!(matches!(
+            state.backend_state.aggregate_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        ));
+        assert_eq!(
+            state.backend_state.last_error.as_deref(),
+            Some("macOS event tap startup failed")
+        );
+        assert_eq!(state.local_controls.capture_backend.mode, None);
+        assert_eq!(state.local_controls.capture_backend.kind, None);
+        assert!(!state.local_controls.capture_backend.active);
+        assert!(matches!(
+            state.local_controls.capture_backend.health,
+            Some(BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            })
+        ));
+        assert_eq!(
+            state.local_controls.inject_backend.mode,
+            Some(ResolvedInputMode::Portable)
+        );
+        assert_eq!(
+            state.local_controls.inject_backend.kind,
+            Some(BackendKind::Portable)
+        );
+        assert!(state.local_controls.inject_backend.active);
+        assert!(matches!(
+            state.local_controls.inject_backend.health,
+            Some(BackendHealth::Healthy)
+        ));
+        assert!(matches!(
+            state.session.state(),
+            ControlSessionState::Suspended {
+                reason: rshare_core::SuspendReason::BackendDegraded
+            }
+        ));
+    }
+
+    #[test]
+    fn capture_runtime_failure_keeps_injection_usable_but_suspends_forwarding() {
+        let mut state = test_daemon_state();
+        state.update_backend_state(
+            Some(ResolvedInputMode::Portable),
+            vec![BackendKind::Portable],
+            BackendHealth::Healthy,
+            BackendKind::Portable,
+            BackendHealth::Healthy,
+            true,
+            None,
+        );
+
+        state.record_capture_runtime_failure("macOS CGEventTap capture discontinuity".to_string());
+
+        assert_eq!(state.backend_state.selected_mode, None);
+        assert!(state.backend_state.available_backends.is_empty());
+        assert!(matches!(
+            state.backend_state.capture_health,
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::RuntimeError
+            }
+        ));
+        assert_eq!(
+            state.backend_state.last_error.as_deref(),
+            Some("macOS CGEventTap capture discontinuity")
+        );
+        assert!(!state.local_controls.capture_backend.active);
+        assert_eq!(
+            state.local_controls.inject_backend.mode,
+            Some(ResolvedInputMode::Portable)
+        );
+        assert_eq!(
+            state.local_controls.inject_backend.kind,
+            Some(BackendKind::Portable)
+        );
+        assert!(state.local_controls.inject_backend.active);
+        assert!(matches!(
+            state.session.state(),
+            ControlSessionState::Suspended {
+                reason: rshare_core::SuspendReason::BackendDegraded
+            }
+        ));
     }
 
     fn connected_connection_info(device_id: DeviceId, rtt_ms: Option<u64>) -> ConnectionInfo {
@@ -10596,6 +11501,7 @@ mod tests {
         assert_eq!(state.read().await.local_controls.recent_events.len(), 1);
     }
 
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn virtual_hid_mouse_test_uses_absolute_round_trip_coordinates() {
         let injected = Arc::new(std::sync::Mutex::new(Vec::new()));

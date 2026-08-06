@@ -314,7 +314,16 @@ fn shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool
         )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -> bool {
+    controls.capture_backend.active
+        && matches!(
+            controls.capture_backend.mode,
+            Some(crate::ResolvedInputMode::Portable)
+        )
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
     false
 }

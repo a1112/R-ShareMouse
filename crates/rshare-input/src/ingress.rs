@@ -239,6 +239,8 @@ pub enum PushOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressFault {
     ReliableOverflow,
+    /// Native capture stopped or lost continuity and may have missed releases.
+    CaptureDiscontinuity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +268,7 @@ struct IngressState {
     dropped_realtime: u64,
     reliable_overflow: u64,
     reliable_overflow_latched: bool,
+    capture_discontinuity_latched: bool,
     closed: bool,
 }
 
@@ -292,7 +295,10 @@ impl IngressState {
     }
 
     fn pop_fault(&mut self) -> Option<IngressFault> {
-        if self.reliable_overflow_latched {
+        if self.capture_discontinuity_latched {
+            self.capture_discontinuity_latched = false;
+            Some(IngressFault::CaptureDiscontinuity)
+        } else if self.reliable_overflow_latched {
             self.reliable_overflow_latched = false;
             Some(IngressFault::ReliableOverflow)
         } else {
@@ -430,6 +436,7 @@ impl SemanticInputIngress {
                 dropped_realtime: 0,
                 reliable_overflow: 0,
                 reliable_overflow_latched: false,
+                capture_discontinuity_latched: false,
                 closed: false,
             }),
             ready: Notify::new(),
@@ -539,6 +546,9 @@ impl SemanticInputProducer {
             IngressFault::ReliableOverflow => {
                 state.reliable_overflow = checked_increment(state.reliable_overflow);
                 state.reliable_overflow_latched = true;
+            }
+            IngressFault::CaptureDiscontinuity => {
+                state.capture_discontinuity_latched = true;
             }
         }
         drop(state);

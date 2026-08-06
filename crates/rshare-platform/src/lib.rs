@@ -195,7 +195,7 @@ mod platform_source_contract_tests {
         assert!(send_text.contains("if text.is_empty()"));
         assert!(send_text.contains("CGEvent::new_keyboard_event"));
         assert!(send_text.contains("event.set_string(text);"));
-        assert!(send_text.contains("event.post(CGEventTapLocation::HID);"));
+        assert!(send_text.contains("post_rshare_injected_event(&event)?;"));
     }
 
     #[test]
@@ -214,6 +214,42 @@ mod platform_source_contract_tests {
         assert!(relative.contains("position.x + dx as f64"));
         assert!(relative.contains("position.y + dy as f64"));
         assert!(relative.contains("CGEventType::MouseMoved"));
+    }
+
+    #[test]
+    fn linux_uinput_mouse_declares_every_button_it_can_emit() {
+        let source = include_str!("linux_evdev.rs");
+        let start = source
+            .find("fn create_virtual_mouse()")
+            .expect("missing Linux UInput mouse builder");
+        let end = source[start..]
+            .find("/// Send mouse move event")
+            .map(|offset| start + offset)
+            .expect("missing end of Linux UInput mouse builder");
+        let builder = &source[start..end];
+
+        for button in [
+            "Key::BTN_LEFT",
+            "Key::BTN_RIGHT",
+            "Key::BTN_MIDDLE",
+            "Key::BTN_SIDE",
+            "Key::BTN_EXTRA",
+        ] {
+            assert!(builder.contains(button), "missing {button} capability");
+        }
+        assert!(builder.contains(".with_keys(&buttons)?"));
+
+        let sender_start = source
+            .find("pub fn send_mouse_button")
+            .expect("missing Linux UInput button sender");
+        let sender_end = source[sender_start..]
+            .find("/// Send mouse wheel event")
+            .map(|offset| sender_start + offset)
+            .expect("missing end of Linux UInput button sender");
+        let sender = &source[sender_start..sender_end];
+        assert!(sender.contains("2 => Key(0x112)"));
+        assert!(sender.contains("3 => Key(0x111)"));
+        assert!(sender.contains("unsupported UInput mouse button code"));
     }
 }
 

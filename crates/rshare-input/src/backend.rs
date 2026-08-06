@@ -9,12 +9,44 @@ use crate::listener::RDevInputListener;
 use anyhow::Result;
 use std::fmt::{self, Debug};
 
+#[cfg(target_os = "windows")]
 pub fn ingress_fault_from_raw_capture_status(
     status: rshare_platform::windows::RawCaptureStatus,
 ) -> crate::IngressFault {
     match status {
         rshare_platform::windows::RawCaptureStatus::ReliableOverflow => {
             crate::IngressFault::ReliableOverflow
+        }
+    }
+}
+
+/// Derive native macOS capture health from non-interactive permission preflight.
+///
+/// The daemon uses this before starting the event tap so it never reports a
+/// test-only portable backend as available on macOS.
+#[cfg(target_os = "macos")]
+pub fn macos_capture_backend_health(
+    permissions: rshare_platform::MacosInputPermissionState,
+) -> BackendHealth {
+    if permissions.can_capture() {
+        BackendHealth::Healthy
+    } else {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::PermissionDenied,
+        }
+    }
+}
+
+/// Derive native macOS injection health from non-interactive permission preflight.
+#[cfg(target_os = "macos")]
+pub fn macos_inject_backend_health(
+    permissions: rshare_platform::MacosInputPermissionState,
+) -> BackendHealth {
+    if permissions.can_inject() {
+        BackendHealth::Healthy
+    } else {
+        BackendHealth::Degraded {
+            reason: BackendFailureReason::PermissionDenied,
         }
     }
 }
@@ -308,6 +340,31 @@ impl PortableInjectBackend {
         self.emulator.deactivate()?;
         Ok(())
     }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_macos_injection_ready(&mut self) -> Result<()> {
+        if rshare_platform::macos_input_permission_state().can_inject() {
+            return Ok(());
+        }
+
+        let _ = self.emulator.deactivate();
+        self.health = BackendHealth::Degraded {
+            reason: BackendFailureReason::PermissionDenied,
+        };
+        anyhow::bail!("macOS Accessibility permission is required to post input events")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_macos_injection_result(&mut self, result: &Result<()>) {
+        if result.is_err() && !rshare_platform::macos_input_permission_state().can_inject() {
+            // CoreGraphics checks this non-interactively immediately before it
+            // posts. Once TCC is revoked, stop advertising an active backend.
+            let _ = self.emulator.deactivate();
+            self.health = BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied,
+            };
+        }
+    }
 }
 
 impl Debug for PortableInjectBackend {
@@ -331,22 +388,46 @@ impl InjectBackend for PortableInjectBackend {
     }
 
     fn health(&self) -> BackendHealth {
+        #[cfg(target_os = "macos")]
+        if !rshare_platform::macos_input_permission_state().can_inject() {
+            return BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied,
+            };
+        }
+
         self.health.clone()
     }
 
     fn inject(&mut self, event: InputEvent) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        self.ensure_macos_injection_ready()?;
+
         if !self.emulator.is_active() {
             anyhow::bail!("Portable inject backend is not active");
         }
 
-        self.emulator.emulate(event)
+        let result = self.emulator.emulate(event);
+        #[cfg(target_os = "macos")]
+        self.record_macos_injection_result(&result);
+        result
     }
 
     fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> Result<()> {
-        self.emulator.move_mouse_relative(dx, dy)
+        #[cfg(target_os = "macos")]
+        self.ensure_macos_injection_ready()?;
+
+        let result = self.emulator.move_mouse_relative(dx, dy);
+        #[cfg(target_os = "macos")]
+        self.record_macos_injection_result(&result);
+        result
     }
 
     fn is_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if !rshare_platform::macos_input_permission_state().can_inject() {
+            return false;
+        }
+
         self.emulator.is_active()
     }
 
@@ -1183,13 +1264,14 @@ pub struct UInputInjectBackend {
 impl UInputInjectBackend {
     /// Create a new uinput injection backend.
     pub fn new() -> Result<Self> {
-        let mut injector = rshare_platform::UInputInjector::new()?;
-        injector.activate()?;
-
-        Ok(Self {
-            injector,
-            health: BackendHealth::Healthy,
-        })
+        // The current virtual mouse only declares REL_* axes. Remote Enter
+        // and AbsoluteAnchor carry desktop coordinates, so activating this
+        // backend would silently reinterpret absolute positions as deltas.
+        // Keep the kernel path unavailable until its device exposes a defined
+        // ABS_X/ABS_Y range and emits those axes atomically.
+        anyhow::bail!(
+            "Linux UInput injection is disabled: the virtual mouse has no ABS_X/ABS_Y anchor capability"
+        )
     }
 
     /// Create a new uinput injection backend for testing.
@@ -1222,13 +1304,6 @@ impl Debug for UInputInjectBackend {
 }
 
 #[cfg(target_os = "linux")]
-impl Default for UInputInjectBackend {
-    fn default() -> Self {
-        Self::new().expect("Failed to create UInputInjectBackend")
-    }
-}
-
-#[cfg(target_os = "linux")]
 impl InjectBackend for UInputInjectBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::UInput
@@ -1245,7 +1320,7 @@ impl InjectBackend for UInputInjectBackend {
 
         match event {
             InputEvent::MouseMove { x, y } => {
-                self.injector.send_mouse_move(x, y)?;
+                self.injector.send_mouse_move_absolute(x, y)?;
             }
             InputEvent::MouseButton { button, state } => {
                 self.injector
@@ -1255,12 +1330,18 @@ impl InjectBackend for UInputInjectBackend {
                 self.injector.send_mouse_wheel(delta_x, delta_y)?;
             }
             InputEvent::Key { keycode, state } => {
-                self.injector
-                    .send_key(keycode.to_raw(), state.is_pressed())?;
+                let evdev_keycode = crate::events::keycode_to_linux_evdev_keycode(keycode)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported canonical key for Linux uinput: {keycode:?}")
+                    })?;
+                self.injector.send_key(evdev_keycode, state.is_pressed())?;
             }
             InputEvent::KeyExtended { keycode, state, .. } => {
-                self.injector
-                    .send_key(keycode.to_raw(), state.is_pressed())?;
+                let evdev_keycode = crate::events::keycode_to_linux_evdev_keycode(keycode)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported canonical key for Linux uinput: {keycode:?}")
+                    })?;
+                self.injector.send_key(evdev_keycode, state.is_pressed())?;
             }
             _ => anyhow::bail!("UInput injection does not support {}", event.event_type()),
         }
@@ -1282,6 +1363,50 @@ impl InjectBackend for UInputInjectBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_filter_adapter_is_cfg_gated_for_non_windows_builds() {
+        let source = include_str!("backend.rs");
+        assert!(source.contains(
+            "#[cfg(target_os = \"windows\")]\npub fn ingress_fault_from_raw_capture_status"
+        ));
+        let enum_start = source
+            .find("pub enum WindowsFilterCaptureOutput")
+            .expect("missing Windows filter capture output");
+        assert!(source[..enum_start].ends_with(
+            "#[cfg(target_os = \"windows\")]\n#[derive(Debug, Clone, PartialEq, Eq)]\n"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_permission_preflight_maps_capture_and_injection_health_independently() {
+        let missing_capture =
+            rshare_platform::MacosInputPermissionState::from_preflight(false, true);
+        let missing_inject =
+            rshare_platform::MacosInputPermissionState::from_preflight(true, false);
+
+        assert_eq!(
+            macos_capture_backend_health(missing_capture),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        );
+        assert_eq!(
+            macos_inject_backend_health(missing_capture),
+            BackendHealth::Healthy
+        );
+        assert_eq!(
+            macos_capture_backend_health(missing_inject),
+            BackendHealth::Healthy
+        );
+        assert_eq!(
+            macos_inject_backend_health(missing_inject),
+            BackendHealth::Degraded {
+                reason: BackendFailureReason::PermissionDenied
+            }
+        );
+    }
 
     #[derive(Debug)]
     struct CapabilityDefaultInjectBackend;

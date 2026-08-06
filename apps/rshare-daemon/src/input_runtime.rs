@@ -280,23 +280,33 @@ impl<T: InputTransport> InputRuntime<T> {
     fn process_ingress_event(&mut self, event: IngressEvent) {
         self.observe_ingress_stats();
         match event {
-            IngressEvent::Fault(IngressFault::ReliableOverflow) => {
-                self.injection
-                    .request_release_all(ReleaseAllReason::BackendFailure);
+            IngressEvent::Fault(fault) => {
+                match fault {
+                    IngressFault::ReliableOverflow => self
+                        .injection
+                        .request_release_all(ReleaseAllReason::BackendFailure),
+                    IngressFault::CaptureDiscontinuity => self
+                        .injection
+                        .request_release_all_sources(ReleaseAllReason::BackendFailure),
+                }
                 let outputs = self.router.handle(RouterCommand::BackendDegraded);
                 self.dispatch_outputs(outputs);
-                if let Ok(next_epoch) = self.current_epoch.next() {
-                    self.current_epoch = next_epoch;
-                    self.pressed_keys.clear();
-                    self.pressed_buttons.clear();
-                    self.state.publish_discrete(InputDiscreteProjection {
-                        session_epoch: next_epoch,
-                        pressed_keys: Vec::new(),
-                        pressed_buttons: Vec::new(),
-                    });
-                }
+                self.advance_fault_epoch();
             }
             IngressEvent::Input(input) => self.process_captured(input),
+        }
+    }
+
+    fn advance_fault_epoch(&mut self) {
+        if let Ok(next_epoch) = self.current_epoch.next() {
+            self.current_epoch = next_epoch;
+            self.pressed_keys.clear();
+            self.pressed_buttons.clear();
+            self.state.publish_discrete(InputDiscreteProjection {
+                session_epoch: next_epoch,
+                pressed_keys: Vec::new(),
+                pressed_buttons: Vec::new(),
+            });
         }
     }
 
