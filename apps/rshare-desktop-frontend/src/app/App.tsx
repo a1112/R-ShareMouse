@@ -155,6 +155,10 @@ import {
   getDesktopTheme,
 } from "./desktop-theme.mjs";
 import {
+  getDesktopShellState,
+  getTitlebarDragRegionAttributes,
+} from "./window-platform.mjs";
+import {
   BUILTIN_HARDWARE_ASSET_MANIFESTS,
   buildGamepadAnalogFeedback,
   buildHardwareAssetChoices,
@@ -788,6 +792,7 @@ const WEB_NOOP_COMMANDS = new Set([
 ]);
 
 const PAGE_LABELS: Array<{ key: DesktopPage; label: string }> = getPageLabels();
+const TITLEBAR_DRAG_REGIONS = getTitlebarDragRegionAttributes();
 
 function getInvoke(): TauriInvoke | null {
   const tauriWindow = window as Window & {
@@ -2179,6 +2184,7 @@ function DesktopApp() {
   const chrome = buildPageChrome(page, theme);
   const footerStatus = buildFooterStatus(model);
   const headerMetrics = getHeaderMetrics();
+  const desktopShell = getDesktopShellState();
   const endpointIds = [
     typeof payload.status === "object" &&
     payload.status &&
@@ -2760,33 +2766,64 @@ function DesktopApp() {
   return (
     <HardwareAssetContext.Provider value={hardwareAssetContext}>
       <div
-        className="flex h-full min-h-0 flex-col overflow-hidden"
+        className={`rshare-desktop-shell ${desktopShell.rootClassName} flex h-full min-h-0 flex-col overflow-hidden`}
+        data-desktop-platform={desktopShell.dataDesktopPlatform}
+        data-macos-frameless={desktopShell.dataMacosFrameless}
         style={{
+          "--rshare-titlebar-height": `${headerMetrics.headerHeight}px`,
           background: theme.frame,
           color: theme.text,
         }}
       >
       <header
-        className="flex shrink-0 items-center"
+        className="rshare-titlebar flex shrink-0 items-center"
         style={{
-          height: headerMetrics.headerHeight,
           borderBottom: `1px solid ${theme.border}`,
           background: theme.toolbar,
           paddingLeft: headerMetrics.headerPaddingX,
           paddingRight: headerMetrics.headerPaddingX,
         }}
-        data-tauri-drag-region="true"
+        data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.root}
       >
+        {desktopShell.isMacOS ? (
+          <div
+            className="rshare-macos-window-controls"
+            data-tauri-drag-region="false"
+          >
+            <MacOSWindowButton
+              onClick={() => handleWindow("close_window")}
+              title="关闭"
+              tone="close"
+            >
+              <X size={9} strokeWidth={3} />
+            </MacOSWindowButton>
+            <MacOSWindowButton
+              onClick={() => handleWindow("minimize_window")}
+              title="最小化"
+              tone="minimize"
+            >
+              <Minus size={9} strokeWidth={3} />
+            </MacOSWindowButton>
+            <MacOSWindowButton
+              onClick={() => handleWindow("toggle_maximize_window")}
+              title="最大化"
+              tone="maximize"
+            >
+              <Maximize2 size={8} strokeWidth={3} />
+            </MacOSWindowButton>
+          </div>
+        ) : null}
         <div
           className="flex shrink-0 items-center"
           style={{ gap: headerMetrics.navGap }}
-          data-tauri-drag-region="false"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
         >
           {PAGE_LABELS.map((item) => (
             <button
               key={item.key}
               type="button"
               className="rounded-md text-sm transition"
+              data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
               style={{
                 background: page === item.key ? theme.accentSoft : "transparent",
                 color:
@@ -2813,16 +2850,20 @@ function DesktopApp() {
           ))}
         </div>
 
-        <div className="min-w-6 flex-1 self-stretch" data-tauri-drag-region="true" />
+        <div
+          className="rshare-titlebar-drag-region min-w-6 flex-1 self-stretch"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.blank}
+        />
 
         <div
           className="flex shrink-0 items-center"
           style={{ gap: headerMetrics.actionGap }}
-          data-tauri-drag-region="false"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
         >
           <button
             type="button"
             className="rounded-md text-sm transition"
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
             style={{
               border: `1px solid ${theme.border}`,
               background: theme.sidebar,
@@ -2843,6 +2884,7 @@ function DesktopApp() {
           <button
             type="button"
             className="rounded-md text-sm transition"
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
             style={{
               background: model.service.online
                 ? "rgba(197, 48, 48, 0.08)"
@@ -2870,42 +2912,44 @@ function DesktopApp() {
           </button>
         </div>
 
-        <div
-          className="ml-2 flex h-full shrink-0 items-center"
-          style={{ gap: headerMetrics.windowGap }}
-          data-tauri-drag-region="false"
-        >
-          <WindowButton
-            onClick={() => handleWindow("minimize_window")}
-            title="最小化"
-            tone="minimize"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
+        {!desktopShell.isMacOS ? (
+          <div
+            className="ml-2 flex h-full shrink-0 items-center"
+            style={{ gap: headerMetrics.windowGap }}
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
           >
-            <Minus size={12} strokeWidth={2} />
-          </WindowButton>
-          <WindowButton
-            onClick={() => handleWindow("toggle_maximize_window")}
-            title="最大化"
-            tone="maximize"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
-          >
-            <Maximize2 size={10} strokeWidth={2} />
-          </WindowButton>
-          <WindowButton
-            onClick={() => handleWindow("close_window")}
-            title="鍏抽棴"
-            tone="close"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
-          >
-            <X size={13} strokeWidth={2} />
-          </WindowButton>
-        </div>
+            <WindowButton
+              onClick={() => handleWindow("minimize_window")}
+              title="最小化"
+              tone="minimize"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <Minus size={12} strokeWidth={2} />
+            </WindowButton>
+            <WindowButton
+              onClick={() => handleWindow("toggle_maximize_window")}
+              title="最大化"
+              tone="maximize"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <Maximize2 size={10} strokeWidth={2} />
+            </WindowButton>
+            <WindowButton
+              onClick={() => handleWindow("close_window")}
+              title="关闭"
+              tone="close"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <X size={13} strokeWidth={2} />
+            </WindowButton>
+          </div>
+        ) : null}
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -10342,6 +10386,7 @@ function WindowButton({
     <button
       type="button"
       className="flex items-center justify-center transition"
+      data-tauri-drag-region="false"
       onClick={onClick}
       title={title}
       style={{
@@ -10367,6 +10412,33 @@ function WindowButton({
           height: size,
         }}
       >
+        {children}
+      </span>
+    </button>
+  );
+}
+
+function MacOSWindowButton({
+  children,
+  onClick,
+  title,
+  tone,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  title: string;
+  tone: "close" | "minimize" | "maximize";
+}) {
+  return (
+    <button
+      type="button"
+      className={`rshare-macos-window-control rshare-macos-window-control--${tone}`}
+      data-tauri-drag-region="false"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+    >
+      <span className="rshare-macos-window-control-icon" aria-hidden="true">
         {children}
       </span>
     </button>

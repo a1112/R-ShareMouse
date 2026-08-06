@@ -208,6 +208,50 @@ test("getHeaderMetrics tightens titlebar padding and button density", () => {
   });
 });
 
+test("desktop titlebar delegates macOS drag and double-click maximize to Tauri", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const styles = fs.readFileSync(new URL("../styles/index.css", import.meta.url), "utf8");
+  const titlebar = source.slice(source.indexOf("<header"), source.indexOf("</header>"));
+
+  assert.match(source, /getDesktopShellState\(\)/);
+  assert.match(source, /data-desktop-platform=\{desktopShell\.dataDesktopPlatform\}/);
+  assert.match(source, /data-macos-frameless=\{desktopShell\.dataMacosFrameless\}/);
+  assert.match(titlebar, /data-tauri-drag-region=\{TITLEBAR_DRAG_REGIONS\.root\}/);
+  assert.match(titlebar, /data-tauri-drag-region=\{TITLEBAR_DRAG_REGIONS\.blank\}/);
+  assert.match(titlebar, /data-tauri-drag-region=\{TITLEBAR_DRAG_REGIONS\.interactive\}/);
+  assert.doesNotMatch(titlebar, /onDoubleClick=/);
+  assert.doesNotMatch(titlebar, /start_drag_window/);
+  assert.match(
+    source.slice(source.indexOf("function WindowButton")),
+    /data-tauri-drag-region="false"/,
+  );
+  assert.match(source, /title="关闭"/);
+  assert.match(styles, /\.rshare-desktop-shell\[data-macos-frameless="true"\]/);
+  assert.match(styles, /--rshare-frameless-titlebar-height/);
+  assert.match(titlebar, /\{desktopShell\.isMacOS \? \(/);
+  assert.match(titlebar, /className="rshare-macos-window-controls"/);
+  assert.match(
+    titlebar,
+    /className="rshare-macos-window-controls"\s*data-tauri-drag-region="false"/,
+  );
+  assert.match(
+    titlebar,
+    /!desktopShell\.isMacOS \? \([\s\S]*className="ml-2 flex h-full shrink-0 items-center"/,
+  );
+  assert.match(
+    source.slice(source.indexOf("function MacOSWindowButton")),
+    /data-tauri-drag-region="false"/,
+  );
+  assert.match(
+    source.slice(source.indexOf("function MacOSWindowButton")),
+    /aria-label=\{title\}/,
+  );
+  assert.match(styles, /#ff5f57/);
+  assert.match(styles, /#febc2e/);
+  assert.match(styles, /#28c840/);
+  assert.match(styles, /:focus-visible \.rshare-macos-window-control-icon/);
+});
+
 test("display settings refreshes system topology after virtual display operations", () => {
   const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
 
