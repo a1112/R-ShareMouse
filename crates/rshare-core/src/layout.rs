@@ -724,6 +724,24 @@ impl LayoutGraph {
         }
     }
 
+    /// Rebind the graph owner without rewriting any node IDs.
+    ///
+    /// A layout received from another authenticated device is a shared global
+    /// topology. Each daemon must route from its own node while preserving the
+    /// coordinates and IDs of every peer in that topology.
+    pub fn rebind_local_device(&mut self, current_local: Uuid) {
+        self.local_device = current_local;
+        if self.get_node(current_local).is_none() {
+            self.add_node(LayoutNode::new(
+                current_local,
+                0,
+                0,
+                DEFAULT_DISPLAY_WIDTH,
+                DEFAULT_DISPLAY_HEIGHT,
+            ));
+        }
+    }
+
     fn rightmost_node(&self) -> Option<&LayoutNode> {
         self.nodes.iter().max_by(|left, right| {
             let left_bounds = node_display_bounds(left);
@@ -863,6 +881,28 @@ mod tests {
             .links
             .iter()
             .any(|link| link.from_device == current_local && link.to_device == remote_id));
+    }
+
+    #[test]
+    fn rebind_local_device_preserves_shared_node_ids_and_geometry() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(first);
+        graph.add_node(LayoutNode::new(first, 0, 0, 2560, 1440));
+        graph.add_node(LayoutNode::new(second, 2560, 0, 1920, 1080));
+
+        graph.rebind_local_device(second);
+
+        assert_eq!(graph.local_device, second);
+        assert_eq!(
+            graph.get_node(first).unwrap().primary_display().unwrap().x,
+            0
+        );
+        assert_eq!(
+            graph.get_node(second).unwrap().primary_display().unwrap().x,
+            2560
+        );
+        assert_eq!(graph.nodes.len(), 2);
     }
 
     #[test]

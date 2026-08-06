@@ -9,6 +9,8 @@ import {
   type ReactNode,
 } from "react";
 import {
+  AlertTriangle,
+  Check,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -150,10 +152,20 @@ import {
   preventBrowserNavigationEvent,
 } from "./desktop-shell.mjs";
 import {
+  MACOS_PERMISSION_ITEMS,
+  macosInputPermissionSummary,
+  missingMacosInputPermissions,
+  normalizeMacosInputPermissions,
+} from "./macos-permissions.mjs";
+import {
   buildPageChrome,
   FIGMA_DESKTOP_THEME,
   getDesktopTheme,
 } from "./desktop-theme.mjs";
+import {
+  getDesktopShellState,
+  getTitlebarDragRegionAttributes,
+} from "./window-platform.mjs";
 import {
   BUILTIN_HARDWARE_ASSET_MANIFESTS,
   buildGamepadAnalogFeedback,
@@ -301,6 +313,13 @@ type CapabilityOverview = {
       reason?: string | null;
     }>;
   }>;
+};
+
+type MacosInputPermissions = {
+  supported: boolean;
+  input_monitoring: boolean;
+  accessibility: boolean;
+  ready: boolean;
 };
 
 type LocalControlEvent = {
@@ -788,6 +807,7 @@ const WEB_NOOP_COMMANDS = new Set([
 ]);
 
 const PAGE_LABELS: Array<{ key: DesktopPage; label: string }> = getPageLabels();
+const TITLEBAR_DRAG_REGIONS = getTitlebarDragRegionAttributes();
 
 function getInvoke(): TauriInvoke | null {
   const tauriWindow = window as Window & {
@@ -2142,6 +2162,13 @@ function DesktopApp() {
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [systemPrefersDark, setSystemPrefersDark] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [macosPermissions, setMacosPermissions] =
+    useState<MacosInputPermissions | null>(null);
+  const [macosPermissionDialogOpen, setMacosPermissionDialogOpen] = useState(false);
+  const [macosPermissionRestartRequired, setMacosPermissionRestartRequired] =
+    useState(false);
+  const [macosPermissionAction, setMacosPermissionAction] = useState<string | null>(null);
+  const [macosPermissionError, setMacosPermissionError] = useState<string | null>(null);
   const [localControls, setLocalControls] = useState<LocalControlsSnapshot | null>(null);
   const [localControlsError, setLocalControlsError] = useState<string | null>(null);
   const [mobileAccess, setMobileAccess] = useState<MobileAccessSnapshot | null>(null);
@@ -2179,6 +2206,7 @@ function DesktopApp() {
   const chrome = buildPageChrome(page, theme);
   const footerStatus = buildFooterStatus(model);
   const headerMetrics = getHeaderMetrics();
+  const desktopShell = getDesktopShellState();
   const endpointIds = [
     typeof payload.status === "object" &&
     payload.status &&
@@ -2188,6 +2216,88 @@ function DesktopApp() {
     ...safeArray(payload.devices).map((device) => device.id),
   ].filter((id, index, values) => id && values.indexOf(id) === index);
   const endpointPollKey = endpointIds.join("|");
+
+  async function refreshMacosPermissions() {
+    if (!desktopShell.isMacOS || !getInvoke()) {
+      setMacosPermissions(null);
+      setMacosPermissionError(null);
+      return null;
+    }
+
+    try {
+      const snapshot = await invokeCommand<unknown>("macos_input_permissions");
+      const normalized = normalizeMacosInputPermissions(snapshot);
+      setMacosPermissions(normalized);
+      setMacosPermissionError(null);
+      return normalized;
+    } catch (permissionError) {
+      setMacosPermissions(null);
+      setMacosPermissionError(errorMessage(permissionError));
+      return null;
+    }
+  }
+
+  async function requestMacosPermissions() {
+    if (!desktopShell.isMacOS || !getInvoke()) {
+      return;
+    }
+
+    setMacosPermissionAction("request");
+    setMacosPermissionError(null);
+    try {
+      const snapshot = await invokeCommand<unknown>("request_macos_input_permissions");
+      const normalized = normalizeMacosInputPermissions(snapshot);
+      setMacosPermissions(normalized);
+      if (normalized?.ready) {
+        setMacosPermissionRestartRequired(true);
+      }
+    } catch (permissionError) {
+      setMacosPermissionError(errorMessage(permissionError));
+    } finally {
+      setMacosPermissionAction(null);
+    }
+  }
+
+  async function openMacosPermissionSettings(permission: string) {
+    if (!desktopShell.isMacOS || !getInvoke()) {
+      return;
+    }
+
+    setMacosPermissionAction(permission);
+    setMacosPermissionError(null);
+    try {
+      await invokeCommand("open_macos_permission_settings", { permission });
+    } catch (permissionError) {
+      setMacosPermissionError(errorMessage(permissionError));
+    } finally {
+      setMacosPermissionAction(null);
+    }
+  }
+
+  async function restartMacosService() {
+    setMacosPermissionAction("restart");
+    setMacosPermissionError(null);
+    try {
+      if (model.service.online) {
+        await invokeCommand("stop_service");
+      }
+      await invokeCommand("start_service");
+      await refreshDashboard();
+      await refreshMacosPermissions();
+      setMacosPermissionRestartRequired(false);
+      setMacosPermissionDialogOpen(false);
+    } catch (serviceError) {
+      setMacosPermissionError(errorMessage(serviceError));
+    } finally {
+      setMacosPermissionAction(null);
+    }
+  }
+
+  function openMacosPermissionDialog() {
+    setMacosPermissionError(null);
+    setMacosPermissionRestartRequired(Boolean(macosPermissions && !macosPermissions.ready));
+    setMacosPermissionDialogOpen(true);
+  }
 
   async function refreshDashboard(expectedUiVersion?: number) {
     const expectedVersion =
@@ -2251,6 +2361,7 @@ function DesktopApp() {
   async function refreshAll() {
     await refreshDashboard();
     setRefreshTick((value) => value + 1);
+    void refreshMacosPermissions();
     void refreshLocalControls();
     void refreshMobileAccess();
     void refreshHardwareAssets();
@@ -2352,6 +2463,19 @@ function DesktopApp() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!desktopShell.isMacOS || typeof window === "undefined") {
+      return;
+    }
+
+    void refreshMacosPermissions();
+    const refreshOnFocus = () => {
+      void refreshMacosPermissions();
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    return () => window.removeEventListener("focus", refreshOnFocus);
+  }, [desktopShell.isMacOS]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2760,33 +2884,64 @@ function DesktopApp() {
   return (
     <HardwareAssetContext.Provider value={hardwareAssetContext}>
       <div
-        className="flex h-full min-h-0 flex-col overflow-hidden"
+        className={`rshare-desktop-shell ${desktopShell.rootClassName} flex h-full min-h-0 flex-col overflow-hidden`}
+        data-desktop-platform={desktopShell.dataDesktopPlatform}
+        data-macos-frameless={desktopShell.dataMacosFrameless}
         style={{
+          "--rshare-titlebar-height": `${headerMetrics.headerHeight}px`,
           background: theme.frame,
           color: theme.text,
         }}
       >
       <header
-        className="flex shrink-0 items-center"
+        className="rshare-titlebar flex shrink-0 items-center"
         style={{
-          height: headerMetrics.headerHeight,
           borderBottom: `1px solid ${theme.border}`,
           background: theme.toolbar,
           paddingLeft: headerMetrics.headerPaddingX,
           paddingRight: headerMetrics.headerPaddingX,
         }}
-        data-tauri-drag-region="true"
+        data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.root}
       >
+        {desktopShell.isMacOS ? (
+          <div
+            className="rshare-macos-window-controls"
+            data-tauri-drag-region="false"
+          >
+            <MacOSWindowButton
+              onClick={() => handleWindow("close_window")}
+              title="关闭"
+              tone="close"
+            >
+              <X size={9} strokeWidth={3} />
+            </MacOSWindowButton>
+            <MacOSWindowButton
+              onClick={() => handleWindow("minimize_window")}
+              title="最小化"
+              tone="minimize"
+            >
+              <Minus size={9} strokeWidth={3} />
+            </MacOSWindowButton>
+            <MacOSWindowButton
+              onClick={() => handleWindow("toggle_maximize_window")}
+              title="最大化"
+              tone="maximize"
+            >
+              <Maximize2 size={8} strokeWidth={3} />
+            </MacOSWindowButton>
+          </div>
+        ) : null}
         <div
           className="flex shrink-0 items-center"
           style={{ gap: headerMetrics.navGap }}
-          data-tauri-drag-region="false"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
         >
           {PAGE_LABELS.map((item) => (
             <button
               key={item.key}
               type="button"
               className="rounded-md text-sm transition"
+              data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
               style={{
                 background: page === item.key ? theme.accentSoft : "transparent",
                 color:
@@ -2813,16 +2968,20 @@ function DesktopApp() {
           ))}
         </div>
 
-        <div className="min-w-6 flex-1 self-stretch" data-tauri-drag-region="true" />
+        <div
+          className="rshare-titlebar-drag-region min-w-6 flex-1 self-stretch"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.blank}
+        />
 
         <div
           className="flex shrink-0 items-center"
           style={{ gap: headerMetrics.actionGap }}
-          data-tauri-drag-region="false"
+          data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
         >
           <button
             type="button"
             className="rounded-md text-sm transition"
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
             style={{
               border: `1px solid ${theme.border}`,
               background: theme.sidebar,
@@ -2840,9 +2999,31 @@ function DesktopApp() {
               刷新
             </span>
           </button>
+          {desktopShell.isMacOS && macosPermissions && !macosPermissions.ready ? (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md text-sm transition"
+              data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
+              style={{
+                border: "1px solid rgba(214, 166, 75, 0.72)",
+                background: "rgba(214, 166, 75, 0.14)",
+                color: "#f0ca7a",
+                paddingLeft: headerMetrics.actionButtonPaddingX,
+                paddingRight: headerMetrics.actionButtonPaddingX,
+                paddingTop: headerMetrics.actionButtonPaddingY,
+                paddingBottom: headerMetrics.actionButtonPaddingY,
+              }}
+              onClick={openMacosPermissionDialog}
+              title={`权限不足⚠️：${macosInputPermissionSummary(macosPermissions)}`}
+            >
+              <AlertTriangle size={14} />
+              权限不足⚠️
+            </button>
+          ) : null}
           <button
             type="button"
             className="rounded-md text-sm transition"
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
             style={{
               background: model.service.online
                 ? "rgba(197, 48, 48, 0.08)"
@@ -2870,42 +3051,44 @@ function DesktopApp() {
           </button>
         </div>
 
-        <div
-          className="ml-2 flex h-full shrink-0 items-center"
-          style={{ gap: headerMetrics.windowGap }}
-          data-tauri-drag-region="false"
-        >
-          <WindowButton
-            onClick={() => handleWindow("minimize_window")}
-            title="最小化"
-            tone="minimize"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
+        {!desktopShell.isMacOS ? (
+          <div
+            className="ml-2 flex h-full shrink-0 items-center"
+            style={{ gap: headerMetrics.windowGap }}
+            data-tauri-drag-region={TITLEBAR_DRAG_REGIONS.interactive}
           >
-            <Minus size={12} strokeWidth={2} />
-          </WindowButton>
-          <WindowButton
-            onClick={() => handleWindow("toggle_maximize_window")}
-            title="最大化"
-            tone="maximize"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
-          >
-            <Maximize2 size={10} strokeWidth={2} />
-          </WindowButton>
-          <WindowButton
-            onClick={() => handleWindow("close_window")}
-            title="鍏抽棴"
-            tone="close"
-            theme={theme}
-            size={headerMetrics.windowButtonSize}
-            hitSize={headerMetrics.windowButtonHitSize}
-          >
-            <X size={13} strokeWidth={2} />
-          </WindowButton>
-        </div>
+            <WindowButton
+              onClick={() => handleWindow("minimize_window")}
+              title="最小化"
+              tone="minimize"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <Minus size={12} strokeWidth={2} />
+            </WindowButton>
+            <WindowButton
+              onClick={() => handleWindow("toggle_maximize_window")}
+              title="最大化"
+              tone="maximize"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <Maximize2 size={10} strokeWidth={2} />
+            </WindowButton>
+            <WindowButton
+              onClick={() => handleWindow("close_window")}
+              title="关闭"
+              tone="close"
+              theme={theme}
+              size={headerMetrics.windowButtonSize}
+              hitSize={headerMetrics.windowButtonHitSize}
+            >
+              <X size={13} strokeWidth={2} />
+            </WindowButton>
+          </div>
+        ) : null}
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -2986,6 +3169,8 @@ function DesktopApp() {
               localDevice={model.settings.localDevice}
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
+              macosPermissions={macosPermissions}
+              onOpenMacosPermissions={openMacosPermissionDialog}
               mobileAccess={mobileAccess}
               mobileAccessError={mobileAccessError}
               service={model.service}
@@ -3025,6 +3210,20 @@ function DesktopApp() {
           </div>
         </footer>
       </main>
+      {desktopShell.isMacOS && macosPermissionDialogOpen ? (
+        <MacosPermissionDialog
+          permissions={macosPermissions}
+          restartRequired={macosPermissionRestartRequired}
+          busyAction={macosPermissionAction}
+          error={macosPermissionError}
+          theme={theme}
+          onClose={() => setMacosPermissionDialogOpen(false)}
+          onRequest={requestMacosPermissions}
+          onOpenSettings={openMacosPermissionSettings}
+          onRestartService={restartMacosService}
+          onRefresh={refreshMacosPermissions}
+        />
+      ) : null}
       </div>
     </HardwareAssetContext.Provider>
   );
@@ -9774,11 +9973,233 @@ function hardwareAssetKindLabel(kind: string) {
   return kind;
 }
 
+function MacosPermissionDialog({
+  permissions,
+  restartRequired,
+  busyAction,
+  error,
+  theme,
+  onClose,
+  onRequest,
+  onOpenSettings,
+  onRestartService,
+  onRefresh,
+}: {
+  permissions: MacosInputPermissions | null;
+  restartRequired: boolean;
+  busyAction: string | null;
+  error: string | null;
+  theme: typeof FIGMA_DESKTOP_THEME;
+  onClose: () => void;
+  onRequest: () => void;
+  onOpenSettings: (permission: string) => void;
+  onRestartService: () => void;
+  onRefresh: () => void;
+}) {
+  const missing = missingMacosInputPermissions(permissions);
+  const supported = permissions?.supported === true;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(0, 0, 0, 0.58)" }}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rshare-macos-permission-title"
+        className="w-full max-w-[560px] rounded-xl p-5 shadow-2xl"
+        style={{
+          border: `1px solid ${theme.border}`,
+          background: theme.sidebar,
+          color: theme.text,
+        }}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start gap-3">
+          <div
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+            style={{
+              background: supported && permissions?.ready ? "rgba(73, 179, 92, 0.16)" : "rgba(214, 166, 75, 0.16)",
+              color: supported && permissions?.ready ? theme.success : "#f0ca7a",
+            }}
+          >
+            {supported && permissions?.ready ? <Check size={20} /> : <AlertTriangle size={20} />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 id="rshare-macos-permission-title" className="text-lg font-semibold">
+              macOS 输入权限
+            </h2>
+            <p className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
+              本机作为控制端需要输入监控权限；接收远端控制还需要辅助功能权限。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="rounded-md p-1.5 transition"
+            style={{ color: theme.textMuted }}
+            aria-label="关闭权限提示"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="mt-5 space-y-3">
+          {MACOS_PERMISSION_ITEMS.map((item) => {
+            const enabled = supported && Boolean(permissions?.[item.key as keyof MacosInputPermissions]);
+            return (
+              <div
+                key={item.key}
+                className="flex items-center gap-3 rounded-lg px-3 py-3"
+                style={{
+                  border: `1px solid ${enabled ? "rgba(73, 179, 92, 0.42)" : theme.border}`,
+                  background: enabled ? "rgba(73, 179, 92, 0.08)" : theme.frame,
+                }}
+              >
+                <div
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full"
+                  style={{
+                    background: enabled ? "rgba(73, 179, 92, 0.16)" : "rgba(214, 166, 75, 0.14)",
+                    color: enabled ? theme.success : "#f0ca7a",
+                  }}
+                >
+                  {enabled ? <Check size={16} /> : <AlertTriangle size={16} />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <span>{item.label}</span>
+                    <span className="text-xs" style={{ color: enabled ? theme.success : "#f0ca7a" }}>
+                      {enabled ? "已开启" : "未开启"}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
+                    {item.description}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-2 text-xs transition"
+                  style={{
+                    border: `1px solid ${enabled ? theme.border : theme.accent}`,
+                    background: enabled ? theme.frame : theme.accentSoft,
+                    color: enabled ? theme.textMuted : theme.text,
+                    opacity: busyAction ? 0.65 : 1,
+                  }}
+                  disabled={Boolean(busyAction)}
+                  onClick={() => onOpenSettings(item.key)}
+                >
+                  <ExternalLink size={13} />
+                  {item.settingsLabel}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        {!supported ? (
+          <div
+            className="mt-4 rounded-md px-3 py-2 text-sm"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+              color: theme.textMuted,
+            }}
+          >
+            当前无法读取 macOS 权限状态，请先重新检测。
+          </div>
+        ) : null}
+
+        {error ? (
+          <div
+            className="mt-4 rounded-md px-3 py-2 text-sm"
+            style={{
+              border: "1px solid rgba(197, 48, 48, 0.45)",
+              background: "rgba(94, 24, 34, 0.55)",
+              color: "#ffb8c1",
+            }}
+          >
+            {error}
+          </div>
+        ) : null}
+
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm transition"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+              color: theme.textSub,
+              opacity: busyAction ? 0.65 : 1,
+            }}
+            disabled={Boolean(busyAction)}
+            onClick={onRefresh}
+          >
+            重新检测
+          </button>
+          {supported && missing.length ? (
+            <button
+              type="button"
+              className="rounded-md px-3 py-2 text-sm transition"
+              style={{
+                border: `1px solid ${theme.accent}`,
+                background: theme.accentSoft,
+                color: theme.text,
+                opacity: busyAction ? 0.65 : 1,
+              }}
+              disabled={Boolean(busyAction)}
+              onClick={onRequest}
+            >
+              请求系统权限
+            </button>
+          ) : null}
+          {supported && permissions?.ready && restartRequired ? (
+            <button
+              type="button"
+              className="rounded-md px-3 py-2 text-sm transition"
+              style={{
+                border: `1px solid ${theme.accent}`,
+                background: theme.accentSoft,
+                color: theme.text,
+                opacity: busyAction ? 0.65 : 1,
+              }}
+              disabled={Boolean(busyAction)}
+              onClick={onRestartService}
+            >
+              重启服务并应用
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="rounded-md px-3 py-2 text-sm transition"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+              color: theme.textSub,
+            }}
+            onClick={onClose}
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsPage({
   acceptance,
   localDevice,
   inputMode,
   privilegeState,
+  macosPermissions,
+  onOpenMacosPermissions,
   mobileAccess,
   mobileAccessError,
   service,
@@ -9824,6 +10245,8 @@ function SettingsPage({
     reason: string | null;
   };
   privilegeState: string;
+  macosPermissions: MacosInputPermissions | null;
+  onOpenMacosPermissions: () => void;
   mobileAccess: MobileAccessSnapshot | null;
   mobileAccessError: string | null;
   service: {
@@ -10168,6 +10591,27 @@ function SettingsPage({
           <InfoRow label="守护进程 PID" value={localDevice.pid == null ? "不可用" : String(localDevice.pid)} theme={theme} />
           <InfoRow label="权限状态" value={privilegeState} theme={theme} />
         </div>
+        {macosPermissions?.supported ? (
+          <button
+            type="button"
+            className="mt-4 flex w-full items-center gap-3 rounded-md px-4 py-3 text-left transition"
+            style={{
+              border: `1px solid ${macosPermissions.ready ? "rgba(73, 179, 92, 0.48)" : "rgba(214, 166, 75, 0.72)"}`,
+              background: macosPermissions.ready ? "rgba(73, 179, 92, 0.10)" : "rgba(214, 166, 75, 0.12)",
+              color: theme.text,
+            }}
+            onClick={onOpenMacosPermissions}
+          >
+            {macosPermissions.ready ? <Check size={17} style={{ color: theme.success }} /> : <AlertTriangle size={17} style={{ color: "#f0ca7a" }} />}
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium">macOS 输入权限</span>
+              <span className="mt-1 block text-xs" style={{ color: theme.textMuted }}>
+                {macosInputPermissionSummary(macosPermissions)} · 点击查看并开启对应权限
+              </span>
+            </span>
+            <ChevronRight size={16} style={{ color: theme.textMuted }} />
+          </button>
+        ) : null}
       </section>
     );
   }
@@ -10342,6 +10786,7 @@ function WindowButton({
     <button
       type="button"
       className="flex items-center justify-center transition"
+      data-tauri-drag-region="false"
       onClick={onClick}
       title={title}
       style={{
@@ -10367,6 +10812,33 @@ function WindowButton({
           height: size,
         }}
       >
+        {children}
+      </span>
+    </button>
+  );
+}
+
+function MacOSWindowButton({
+  children,
+  onClick,
+  title,
+  tone,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  title: string;
+  tone: "close" | "minimize" | "maximize";
+}) {
+  return (
+    <button
+      type="button"
+      className={`rshare-macos-window-control rshare-macos-window-control--${tone}`}
+      data-tauri-drag-region="false"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+    >
+      <span className="rshare-macos-window-control-icon" aria-hidden="true">
         {children}
       </span>
     </button>

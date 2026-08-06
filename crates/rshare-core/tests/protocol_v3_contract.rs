@@ -5,8 +5,8 @@ use rshare_core::{
 use uuid::Uuid;
 
 #[test]
-fn protocol_v3_is_the_only_accepted_peer_version() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+fn protocol_v4_is_the_only_accepted_peer_version() {
+    assert_eq!(PROTOCOL_VERSION, 4);
     let hello = hello_message(Uuid::new_v4(), "node".into(), "host".into());
     assert!(hello.advertises_required_v3_transport_capabilities());
 }
@@ -55,7 +55,7 @@ fn rejection_reason_and_control_connection_id_round_trip() {
         decoded,
         Message::HelloRejected {
             reason: HandshakeRejectReason::ProtocolMismatch {
-                required: 3,
+                required: 4,
                 received: 2
             },
             ..

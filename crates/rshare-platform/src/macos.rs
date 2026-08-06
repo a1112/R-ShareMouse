@@ -60,7 +60,7 @@ cfg_if::cfg_if! {
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use super::{macos_text_operation_plan, MacosTextOperation};
-    use anyhow::{anyhow, bail, Result};
+    use anyhow::{anyhow, bail, Context, Result};
     use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardItem, NSURLPboardType};
     use cocoa::base::{id, nil};
     use cocoa::foundation::{NSArray, NSString};
@@ -76,6 +76,7 @@ mod macos_impl {
     use std::collections::BTreeSet;
     use std::ffi::CStr;
     use std::panic::{self, AssertUnwindSafe};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
@@ -99,6 +100,26 @@ mod macos_impl {
     pub struct MacosInputPermissionState {
         input_monitoring: bool,
         accessibility: bool,
+    }
+
+    /// The macOS privacy pane that grants one of the input permissions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MacosInputPermissionKind {
+        Accessibility,
+        InputMonitoring,
+    }
+
+    impl MacosInputPermissionKind {
+        fn settings_url(self) -> &'static str {
+            match self {
+                Self::Accessibility => {
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                }
+                Self::InputMonitoring => {
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+                }
+            }
+        }
     }
 
     impl MacosInputPermissionState {
@@ -147,6 +168,37 @@ mod macos_impl {
             permissions::can_listen_events(),
             permissions::can_post_events(),
         )
+    }
+
+    /// Ask CoreGraphics to request any missing TCC permissions, then return a
+    /// fresh non-interactive snapshot. The caller can follow up by opening the
+    /// exact System Settings pane when macOS still requires a manual toggle.
+    pub fn request_macos_input_permissions() -> MacosInputPermissionState {
+        let current = macos_input_permission_state();
+        if !current.can_capture() {
+            let _ = permissions::request_listen_events();
+        }
+        if !current.can_inject() {
+            let _ = permissions::request_post_events();
+        }
+        macos_input_permission_state()
+    }
+
+    /// Open the exact macOS Privacy & Security pane for the requested input
+    /// permission. The app remains responsible for refreshing the snapshot
+    /// after the user enables the permission.
+    pub fn open_macos_input_permission_settings(
+        permission: MacosInputPermissionKind,
+    ) -> Result<()> {
+        let url = permission.settings_url();
+        let status = Command::new("open")
+            .arg(url)
+            .status()
+            .with_context(|| format!("failed to open macOS permission settings: {url}"))?;
+        if !status.success() {
+            bail!("macOS permission settings exited with status {status}");
+        }
+        Ok(())
     }
 
     /// Toggle delivery of physical events to the local macOS session while a
@@ -1540,6 +1592,16 @@ mod macos_impl {
                 missing_inject.actionable_error(),
                 Some("macOS Accessibility permission is required to post input events")
             );
+        }
+
+        #[test]
+        fn permission_kinds_target_the_matching_system_settings_panes() {
+            assert!(MacosInputPermissionKind::Accessibility
+                .settings_url()
+                .ends_with("Privacy_Accessibility"));
+            assert!(MacosInputPermissionKind::InputMonitoring
+                .settings_url()
+                .ends_with("Privacy_ListenEvent"));
         }
 
         #[test]

@@ -358,6 +358,10 @@ struct DaemonState {
     devices: HashMap<DeviceId, TrackedDevice>,
     // Layout and routing state
     layout: LayoutGraph,
+    /// Monotonic generation for the last local or received shared layout.
+    layout_revision: u64,
+    /// Authenticated device that produced the current layout revision.
+    layout_source_device: DeviceId,
     session: CaptureSessionStateMachine,
     // Backend state with separate capture/inject health
     backend_state: BackendRuntimeState,
@@ -414,6 +418,8 @@ impl DaemonState {
             status,
             devices: HashMap::new(),
             layout,
+            layout_revision: 1,
+            layout_source_device: local_id,
             session: CaptureSessionStateMachine::new(),
             backend_state,
             features,
@@ -430,6 +436,35 @@ impl DaemonState {
             virtual_displays: VirtualDisplayManager::default(),
             mobile_access,
         }
+    }
+
+    fn local_layout_revision(&mut self) -> u64 {
+        self.layout_revision = self.layout_revision.saturating_add(1);
+        self.layout_source_device = self.status.device_id;
+        self.layout_revision
+    }
+
+    fn remote_layout_is_newer(&self, revision: u64, source_device: DeviceId) -> bool {
+        (revision, source_device) > (self.layout_revision, self.layout_source_device)
+    }
+
+    fn accept_remote_layout(
+        &mut self,
+        mut layout: LayoutGraph,
+        revision: u64,
+        source_device: DeviceId,
+    ) -> Option<LayoutGraph> {
+        if !self.remote_layout_is_newer(revision, source_device)
+            || layout.get_node(self.status.device_id).is_none()
+        {
+            return None;
+        }
+
+        layout.rebind_local_device(self.status.device_id);
+        self.layout = layout.clone();
+        self.layout_revision = revision;
+        self.layout_source_device = source_device;
+        Some(layout)
     }
 
     fn upsert_discovered(&mut self, device: DiscoveredDevice) -> bool {
@@ -4557,11 +4592,63 @@ async fn handle_network_message(
     local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: &broadcast::Sender<EndpointEvent>,
     diagnostics: &DiagnosticsHandle,
+    layout_path: &Path,
+    layout_update_lock: &Arc<Mutex<()>>,
+    input_command_tx: &tokio::sync::mpsc::Sender<RouterCommand>,
     from: DeviceId,
     control_connection_id: ControlConnectionId,
     message: Message,
 ) {
     match message {
+        Message::LayoutSync { layout, revision } => {
+            let _layout_guard = layout_update_lock.lock().await;
+            let candidate = {
+                let state = state.read().await;
+                if !state.remote_layout_is_newer(revision, from) {
+                    tracing::debug!(
+                        peer_id = %from,
+                        revision,
+                        current_revision = state.layout_revision,
+                        "Ignoring stale shared layout update"
+                    );
+                    return;
+                }
+                if layout.get_node(state.status.device_id).is_none() {
+                    tracing::warn!(
+                        peer_id = %from,
+                        "Ignoring shared layout that does not contain the local device"
+                    );
+                    return;
+                }
+                let mut candidate = layout;
+                candidate.rebind_local_device(state.status.device_id);
+                candidate
+            };
+
+            if let Err(error) =
+                persist_and_publish_layout(&candidate, layout_path, input_command_tx).await
+            {
+                tracing::warn!(
+                    peer_id = %from,
+                    revision,
+                    error = %error,
+                    "Failed to apply shared layout update"
+                );
+                return;
+            }
+
+            let mut state = state.write().await;
+            if state
+                .accept_remote_layout(candidate, revision, from)
+                .is_some()
+            {
+                tracing::info!(
+                    peer_id = %from,
+                    revision,
+                    "Applied shared layout update"
+                );
+            }
+        }
         Message::InputDiagnostic { event, .. } => {
             let endpoint_event = {
                 let mut event = EndpointEvent::from_local_diagnostic(from, event.clone());
@@ -6817,6 +6904,55 @@ async fn persist_and_publish_layout(
     .await
 }
 
+fn layout_sync_message(layout: &LayoutGraph, revision: u64) -> Message {
+    Message::LayoutSync {
+        layout: layout.clone(),
+        revision,
+    }
+}
+
+async fn broadcast_layout_sync(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    layout: &LayoutGraph,
+    revision: u64,
+) {
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .broadcast(layout_sync_message(layout, revision))
+            .await
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            revision,
+            error = %error,
+            "Failed to synchronize shared layout with connected peers"
+        );
+    }
+}
+
+async fn send_layout_sync_to(
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    target: &DeviceId,
+    layout: &LayoutGraph,
+    revision: u64,
+) {
+    let result = {
+        let mut manager = network_manager.lock().await;
+        manager
+            .send_to(target, layout_sync_message(layout, revision))
+            .await
+    };
+    if let Err(error) = result {
+        tracing::debug!(
+            peer_id = %target,
+            revision,
+            error = %error,
+            "Failed to send the current shared layout to a connected peer"
+        );
+    }
+}
+
 async fn persist_and_publish_connected_peer(
     layout: &LayoutGraph,
     layout_path: &Path,
@@ -7209,6 +7345,7 @@ async fn main() -> Result<()> {
     tracing::info!("Local IPC listening on {}", default_ipc_addr());
 
     let layout_path = Arc::new(layout_path);
+    let layout_update_lock = Arc::new(Mutex::new(()));
     let (input_command_tx, input_command_rx) = tokio::sync::mpsc::channel(64);
     let (input_state, input_feeds) = input_state_channel(32);
     let input_metrics = Arc::new(ControlMetrics::default());
@@ -7345,6 +7482,7 @@ async fn main() -> Result<()> {
         local_events_tx.clone(),
         endpoint_events_tx.clone(),
         layout_path.clone(),
+        layout_update_lock.clone(),
         shutdown_tx.clone(),
     ));
     let local_controls_snapshot_state = state.clone();
@@ -7485,6 +7623,7 @@ async fn main() -> Result<()> {
         let local_events_tx = local_events_tx.clone();
         let endpoint_events_tx = endpoint_events_tx.clone();
         let layout_path = layout_path.clone();
+        let layout_update_lock = layout_update_lock.clone();
         let input_command_tx = input_command_tx.clone();
         let injection = injection.clone();
         let diagnostics = diagnostics.clone();
@@ -7505,6 +7644,9 @@ async fn main() -> Result<()> {
                             &local_events_tx,
                             &endpoint_events_tx,
                             &diagnostics,
+                            layout_path.as_ref(),
+                            &layout_update_lock,
+                            &input_command_tx,
                             from,
                             control_connection_id,
                             message,
@@ -7522,13 +7664,15 @@ async fn main() -> Result<()> {
                 };
                 match event {
                     NetworkEvent::DeviceFound(device) => {
+                        let _layout_guard = layout_update_lock.lock().await;
                         let layout_to_publish = {
                             let mut state = state.write().await;
-                            state
-                                .upsert_discovered(device)
-                                .then(|| state.layout.clone())
+                            state.upsert_discovered(device).then(|| {
+                                let revision = state.local_layout_revision();
+                                (state.layout.clone(), revision)
+                            })
                         };
-                        if let Some(layout) = layout_to_publish {
+                        if let Some((layout, revision)) = layout_to_publish {
                             if let Err(err) = persist_and_publish_layout(
                                 &layout,
                                 layout_path.as_ref(),
@@ -7537,10 +7681,13 @@ async fn main() -> Result<()> {
                             .await
                             {
                                 tracing::warn!("Failed to publish discovered-device layout: {err}");
+                            } else {
+                                broadcast_layout_sync(&network_manager, &layout, revision).await;
                             }
                         }
                     }
                     NetworkEvent::DeviceConnected(auth) => {
+                        let _layout_guard = layout_update_lock.lock().await;
                         let id = auth.peer_id;
                         diagnostics.activate_generation(DiagnosticSubscriberId {
                             peer_id: id,
@@ -7550,12 +7697,18 @@ async fn main() -> Result<()> {
                             .write()
                             .expect("input generation registry poisoned")
                             .insert(id, auth.control_connection_id);
-                        let (should_advertise_usb, layout) = {
+                        let (should_advertise_usb, layout, revision) = {
                             let mut state = state.write().await;
-                            state.mark_connected(&id, true);
+                            let layout_changed = state.mark_connected(&id, true);
+                            let revision = if layout_changed {
+                                state.local_layout_revision()
+                            } else {
+                                state.layout_revision
+                            };
                             (
                                 state.features.usb_advertising_enabled(),
                                 state.layout.clone(),
+                                revision,
                             )
                         };
                         if let Err(error) = persist_and_publish_connected_peer(
@@ -7574,6 +7727,7 @@ async fn main() -> Result<()> {
                             );
                             break;
                         }
+                        send_layout_sync_to(&network_manager, &id, &layout, revision).await;
                         if should_advertise_usb {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
@@ -7799,6 +7953,7 @@ async fn run_ipc_server(
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
     layout_path: Arc<PathBuf>,
+    layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     loop {
@@ -7813,6 +7968,7 @@ async fn run_ipc_server(
         let local_events_tx = local_events_tx.clone();
         let endpoint_events_tx = endpoint_events_tx.clone();
         let layout_path = layout_path.clone();
+        let layout_update_lock = layout_update_lock.clone();
         let shutdown_tx = shutdown_tx.clone();
 
         tokio::spawn(async move {
@@ -7828,6 +7984,7 @@ async fn run_ipc_server(
                 local_events_tx,
                 endpoint_events_tx,
                 layout_path,
+                layout_update_lock,
                 shutdown_tx,
             )
             .await
@@ -7850,6 +8007,7 @@ async fn handle_ipc_client(
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
     layout_path: Arc<PathBuf>,
+    layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     let Some(request) = read_json_request(&mut stream).await? else {
@@ -7956,6 +8114,7 @@ async fn handle_ipc_client(
         let usb_runtime = Arc::clone(&usb_runtime);
         let local_events_tx = local_events_tx.clone();
         let layout_path = Arc::clone(&layout_path);
+        let layout_update_lock = Arc::clone(&layout_update_lock);
         let shutdown_tx = shutdown_tx.clone();
         async move {
             let reconcile = request_may_mutate_ui(&request);
@@ -7969,6 +8128,7 @@ async fn handle_ipc_client(
                 usb_runtime,
                 local_events_tx,
                 layout_path,
+                layout_update_lock,
                 shutdown_tx,
             )
             .await?;
@@ -8008,7 +8168,8 @@ fn network_message_may_mutate_ui(message: &Message) -> bool {
         | Message::UsbDeviceRelease { .. }
         | Message::UsbDeviceReset { .. }
         | Message::UsbTransferCancel { .. }
-        | Message::ScreenUpdate { .. } => true,
+        | Message::ScreenUpdate { .. }
+        | Message::LayoutSync { .. } => true,
         Message::InputDiagnostic { .. }
         | Message::EndpointEventSubscribe { .. }
         | Message::EndpointInjectRequest { .. }
@@ -8152,6 +8313,7 @@ async fn dispatch_ipc_request(
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     layout_path: Arc<PathBuf>,
+    layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<DaemonResponse> {
     let response = match request {
@@ -8195,24 +8357,32 @@ async fn dispatch_ipc_request(
 
                     match result {
                         Ok(_) => {
-                            let layout_to_publish = {
+                            let _layout_guard = layout_update_lock.lock().await;
+                            let (layout, revision) = {
                                 let mut state = state.write().await;
-                                state
-                                    .mark_connected(&device_id, true)
-                                    .then(|| state.layout.clone())
-                            };
-                            if let Some(layout) = layout_to_publish {
-                                if let Err(err) = persist_and_publish_layout(
-                                    &layout,
-                                    layout_path.as_ref(),
-                                    &input_command_tx,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        "Failed to publish connected-device layout: {err}"
-                                    );
+                                if state.mark_connected(&device_id, true) {
+                                    let revision = state.local_layout_revision();
+                                    (state.layout.clone(), revision)
+                                } else {
+                                    (state.layout.clone(), state.layout_revision)
                                 }
+                            };
+                            if let Err(err) = persist_and_publish_layout(
+                                &layout,
+                                layout_path.as_ref(),
+                                &input_command_tx,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to publish connected-device layout: {err}");
+                            } else {
+                                send_layout_sync_to(
+                                    &network_manager,
+                                    &device_id,
+                                    &layout,
+                                    revision,
+                                )
+                                .await;
                             }
                             DaemonResponse::Ack
                         }
@@ -8255,12 +8425,17 @@ async fn dispatch_ipc_request(
             DaemonResponse::Layout(state.layout.clone())
         }
         DaemonRequest::SetLayout { layout } => {
+            let _layout_guard = layout_update_lock.lock().await;
             let mut canonical_layout = layout;
             let (local_device_id, previous_layout) = {
                 let state = state.read().await;
                 (state.status.device_id, state.layout.clone())
             };
-            canonical_layout.canonicalize_local_device(local_device_id);
+            if canonical_layout.get_node(local_device_id).is_some() {
+                canonical_layout.rebind_local_device(local_device_id);
+            } else {
+                canonical_layout.canonicalize_local_device(local_device_id);
+            }
 
             match persist_and_publish_layout(
                 &canonical_layout,
@@ -8270,7 +8445,12 @@ async fn dispatch_ipc_request(
             .await
             {
                 Ok(()) => {
-                    state.write().await.layout = canonical_layout;
+                    let revision = {
+                        let mut state = state.write().await;
+                        state.layout = canonical_layout.clone();
+                        state.local_layout_revision()
+                    };
+                    broadcast_layout_sync(&network_manager, &canonical_layout, revision).await;
                     DaemonResponse::Ack
                 }
                 Err(error) => {
@@ -12771,6 +12951,35 @@ mod tests {
             .links
             .iter()
             .any(|link| link.from_device == current_local && link.to_device == remote_id));
+    }
+
+    #[test]
+    fn shared_layout_revision_accepts_newer_update_without_rewriting_peer_nodes() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(test_status(local_id));
+        let mut layout = LayoutGraph::new(remote_id);
+        layout.add_node(LayoutNode::new(local_id, 0, 0, 2560, 1440));
+        layout.add_node(LayoutNode::new(remote_id, 2560, 0, 1920, 1080));
+
+        assert!(state.accept_remote_layout(layout, 2, remote_id).is_some());
+        assert_eq!(state.layout.local_device, local_id);
+        assert_eq!(state.layout_revision, 2);
+        assert_eq!(state.layout_source_device, remote_id);
+        assert_eq!(state.layout.nodes.len(), 2);
+        assert_eq!(
+            state
+                .layout
+                .get_node(remote_id)
+                .unwrap()
+                .primary_display()
+                .unwrap()
+                .x,
+            2560
+        );
+
+        let stale = LayoutGraph::new(remote_id);
+        assert!(state.accept_remote_layout(stale, 1, remote_id).is_none());
     }
 
     fn test_status(local_id: DeviceId) -> ServiceStatusSnapshot {

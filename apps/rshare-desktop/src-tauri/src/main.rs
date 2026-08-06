@@ -90,6 +90,14 @@ struct DesktopAcceptancePayload {
     next_step: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MacosInputPermissionsPayload {
+    supported: bool,
+    input_monitoring: bool,
+    accessibility: bool,
+    ready: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DesktopDaemonStatus {
     status: ServiceStatusSnapshot,
@@ -149,6 +157,76 @@ async fn dashboard_state() -> Result<DashboardStatePayload, String> {
         |layout| Box::pin(async move { daemon_client::request_set_layout(layout).await }),
     )
     .await
+}
+
+#[tauri::command]
+fn macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = rshare_platform::macos_input_permission_state();
+        return Ok(MacosInputPermissionsPayload {
+            supported: true,
+            input_monitoring: state.can_capture(),
+            accessibility: state.can_inject(),
+            ready: state.is_ready(),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(MacosInputPermissionsPayload {
+            supported: false,
+            input_monitoring: true,
+            accessibility: true,
+            ready: true,
+        })
+    }
+}
+
+#[tauri::command]
+fn request_macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = rshare_platform::request_macos_input_permissions();
+        return Ok(MacosInputPermissionsPayload {
+            supported: true,
+            input_monitoring: state.can_capture(),
+            accessibility: state.can_inject(),
+            ready: state.is_ready(),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(MacosInputPermissionsPayload {
+            supported: false,
+            input_monitoring: true,
+            accessibility: true,
+            ready: true,
+        })
+    }
+}
+
+#[tauri::command]
+fn open_macos_permission_settings(permission: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let kind = match permission.as_str() {
+            "accessibility" => rshare_platform::MacosInputPermissionKind::Accessibility,
+            "input_monitoring" | "input-monitoring" => {
+                rshare_platform::MacosInputPermissionKind::InputMonitoring
+            }
+            _ => return Err(format!("unknown macOS input permission: {permission}")),
+        };
+        return rshare_platform::open_macos_input_permission_settings(kind)
+            .map_err(|error| error.to_string());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = permission;
+        Err("macOS input permissions are not supported on this platform".to_owned())
+    }
 }
 
 #[tauri::command]
@@ -896,6 +974,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             dashboard_state,
+            macos_input_permissions,
+            request_macos_input_permissions,
+            open_macos_permission_settings,
             start_service,
             stop_service,
             capabilities_state,

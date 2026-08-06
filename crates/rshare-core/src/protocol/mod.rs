@@ -10,6 +10,7 @@ use crate::{
     endpoint_events::{
         EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
     },
+    layout::LayoutGraph,
     local_controls::LocalInputDiagnosticEvent,
 };
 
@@ -784,6 +785,16 @@ pub enum Message {
     // === Screen Control ===
     /// Screen configuration update
     ScreenUpdate { screen_info: ScreenInfo },
+    /// Authoritative shared layout update for authenticated peers.
+    ///
+    /// The sender identity is taken from the authenticated transport peer. The
+    /// revision is a daemon-local monotonic generation used to reject stale
+    /// concurrent updates deterministically.
+    LayoutSync {
+        layout: LayoutGraph,
+        #[serde(default)]
+        revision: u64,
+    },
 
     // === Synchronization ===
     /// Heartbeat / keepalive
@@ -829,7 +840,8 @@ impl Message {
             | Message::UsbDeviceReset { .. }
             | Message::UsbTransferCancel { .. }
             | Message::UsbFlowControl { .. }
-            | Message::ScreenUpdate { .. } => Priority::Normal,
+            | Message::ScreenUpdate { .. }
+            | Message::LayoutSync { .. } => Priority::Normal,
 
             // Low: background operations
             Message::ClipboardData { .. }
@@ -850,6 +862,7 @@ impl Message {
                 | Message::HelloBack { .. }
                 | Message::HelloRejected { .. }
                 | Message::ScreenUpdate { .. }
+                | Message::LayoutSync { .. }
                 | Message::ClipboardRequest
                 | Message::ClipboardResponse { .. }
                 | Message::UsbDeviceAttached { .. }
@@ -998,6 +1011,22 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn shared_layout_message_round_trips_with_revision() {
+        let local = Uuid::new_v4();
+        let msg = Message::LayoutSync {
+            layout: LayoutGraph::new(local),
+            revision: 7,
+        };
+        let serialized = serde_json::to_string(&msg).unwrap();
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+
+        assert!(matches!(
+            deserialized,
+            Message::LayoutSync { revision: 7, .. }
+        ));
     }
 
     #[test]

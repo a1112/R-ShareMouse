@@ -14,6 +14,83 @@ body {
   background: #101114;
 }
 
+.rshare-desktop-shell {
+  --rshare-titlebar-height: 40px;
+  --rshare-macos-titlebar-safe-area-top: 0px;
+  --rshare-frameless-titlebar-height: var(--rshare-titlebar-height);
+}
+
+.rshare-desktop-shell[data-macos-frameless="true"] {
+  --rshare-macos-titlebar-safe-area-top: env(safe-area-inset-top, 0px);
+  --rshare-frameless-titlebar-height: calc(
+    var(--rshare-titlebar-height) + var(--rshare-macos-titlebar-safe-area-top)
+  );
+}
+
+.rshare-titlebar {
+  box-sizing: border-box;
+  height: var(--rshare-frameless-titlebar-height);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.rshare-titlebar-drag-region {
+  min-width: 1.5rem;
+}
+
+.rshare-desktop-shell--macos .rshare-titlebar-drag-region {
+  -webkit-user-select: none;
+}
+
+.rshare-macos-window-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin-right: 12px;
+}
+
+.rshare-macos-window-control {
+  display: inline-flex;
+  width: 12px;
+  height: 12px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: rgba(0, 0, 0, 0.62);
+  border: 0;
+  border-radius: 9999px;
+  cursor: default;
+  outline-offset: 3px;
+}
+
+.rshare-macos-window-control--close {
+  background: #ff5f57;
+}
+
+.rshare-macos-window-control--minimize {
+  background: #febc2e;
+}
+
+.rshare-macos-window-control--maximize {
+  background: #28c840;
+}
+
+.rshare-macos-window-control-icon {
+  display: inline-flex;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.rshare-macos-window-control:hover .rshare-macos-window-control-icon,
+.rshare-macos-window-control:focus-visible .rshare-macos-window-control-icon {
+  opacity: 1;
+}
+
+.rshare-macos-window-control:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.86);
+}
+
 button,
 input,
 textarea,

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The peer protocol version supported by this build.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Versions and lane support advertised during the compatibility bootstrap.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
