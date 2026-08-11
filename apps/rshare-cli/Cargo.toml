@@ -26,7 +26,7 @@ toml = { workspace = true }
 
 # CLI utilities
 clap = { workspace = true }
-colored = "2.1"
+colored = "3.1"
 atty = "0.2"
 uuid = { workspace = true }
 hostname = { workspace = true }
