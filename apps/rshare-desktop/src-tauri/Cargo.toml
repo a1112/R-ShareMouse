@@ -28,7 +28,7 @@ futures-util = { workspace = true }
 uuid = { workspace = true }
 tauri = { version = "2.2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
-dirs = "5.0"
+dirs = "6.0"
 regex = "1.10"
 zip = "2"
 
