@@ -11,6 +11,7 @@ use tokio_tungstenite::{
     connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
+use crate::ipc::MacosInputPermissionsSnapshot;
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_frame, read_optional_ui_state_frame,
     write_json_frame, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest,
@@ -25,9 +26,13 @@ use crate::{
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = TcpStream::connect(default_ipc_addr())
+    send_request_at(default_ipc_addr(), request).await
+}
+
+async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
+    let mut stream = TcpStream::connect(address)
         .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
 
     write_json_frame(&mut stream, &request).await?;
     read_json_frame(&mut stream).await
@@ -36,6 +41,39 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
 pub async fn request_status() -> Result<ServiceStatusSnapshot> {
     match send_request(DaemonRequest::Status).await? {
         DaemonResponse::Status(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+/// Query macOS input permissions from the daemon process that owns capture
+/// and injection. This deliberately does not fall back to the desktop
+/// process, because macOS TCC authorization is process/code-identity scoped.
+pub async fn request_macos_input_permissions_state() -> Result<MacosInputPermissionsSnapshot> {
+    request_macos_input_permissions_state_at(default_ipc_addr()).await
+}
+
+async fn request_macos_input_permissions_state_at(
+    address: SocketAddr,
+) -> Result<MacosInputPermissionsSnapshot> {
+    match send_request_at(address, DaemonRequest::GetMacosInputPermissions).await? {
+        DaemonResponse::MacosInputPermissions(snapshot) => Ok(snapshot),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+/// Ask the daemon process to request any missing macOS input permissions and
+/// return its fresh permission snapshot.
+pub async fn request_macos_input_permissions() -> Result<MacosInputPermissionsSnapshot> {
+    request_macos_input_permissions_at(default_ipc_addr()).await
+}
+
+async fn request_macos_input_permissions_at(
+    address: SocketAddr,
+) -> Result<MacosInputPermissionsSnapshot> {
+    match send_request_at(address, DaemonRequest::RequestMacosInputPermissions).await? {
+        DaemonResponse::MacosInputPermissions(snapshot) => Ok(snapshot),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }
@@ -563,6 +601,54 @@ mod tests {
             Some(UiEnvelope::Heartbeat { sent_at_ms: 20, .. })
         ));
         assert_eq!(subscription.recv().await.unwrap(), None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn macos_permission_client_uses_daemon_owned_ipc_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let query: DaemonRequest = read_json_frame(&mut stream).await.unwrap();
+            assert_eq!(query, DaemonRequest::GetMacosInputPermissions);
+            write_json_frame(
+                &mut stream,
+                &DaemonResponse::MacosInputPermissions(MacosInputPermissionsSnapshot {
+                    supported: true,
+                    input_monitoring: true,
+                    accessibility: false,
+                    ready: false,
+                }),
+            )
+            .await
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: DaemonRequest = read_json_frame(&mut stream).await.unwrap();
+            assert_eq!(request, DaemonRequest::RequestMacosInputPermissions);
+            write_json_frame(
+                &mut stream,
+                &DaemonResponse::MacosInputPermissions(MacosInputPermissionsSnapshot {
+                    supported: true,
+                    input_monitoring: true,
+                    accessibility: true,
+                    ready: true,
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let current = request_macos_input_permissions_state_at(address)
+            .await
+            .unwrap();
+        assert!(current.input_monitoring);
+        assert!(!current.accessibility);
+        assert!(!current.ready);
+
+        let requested = request_macos_input_permissions_at(address).await.unwrap();
+        assert!(requested.ready);
         server.await.unwrap();
     }
 }

@@ -159,51 +159,60 @@ async fn dashboard_state() -> Result<DashboardStatePayload, String> {
     .await
 }
 
-#[tauri::command]
-fn macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let state = rshare_platform::macos_input_permission_state();
-        return Ok(MacosInputPermissionsPayload {
-            supported: true,
-            input_monitoring: state.can_capture(),
-            accessibility: state.can_inject(),
-            ready: state.is_ready(),
-        });
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(MacosInputPermissionsPayload {
-            supported: false,
-            input_monitoring: true,
-            accessibility: true,
-            ready: true,
-        })
+fn macos_input_permissions_payload(
+    snapshot: rshare_core::ipc::MacosInputPermissionsSnapshot,
+) -> MacosInputPermissionsPayload {
+    MacosInputPermissionsPayload {
+        supported: snapshot.supported,
+        input_monitoring: snapshot.input_monitoring,
+        accessibility: snapshot.accessibility,
+        ready: snapshot.ready,
     }
 }
 
 #[tauri::command]
-fn request_macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
+async fn macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
     #[cfg(target_os = "macos")]
     {
-        let state = rshare_platform::request_macos_input_permissions();
-        return Ok(MacosInputPermissionsPayload {
-            supported: true,
-            input_monitoring: state.can_capture(),
-            accessibility: state.can_inject(),
-            ready: state.is_ready(),
-        });
+        let snapshot = daemon_client::request_macos_input_permissions_state()
+            .await
+            .map_err(|error| format!("daemon macOS input permission query failed: {error}"))?;
+        return Ok(macos_input_permissions_payload(snapshot));
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(MacosInputPermissionsPayload {
-            supported: false,
-            input_monitoring: true,
-            accessibility: true,
-            ready: true,
-        })
+        Ok(macos_input_permissions_payload(
+            rshare_core::ipc::MacosInputPermissionsSnapshot {
+                supported: false,
+                input_monitoring: true,
+                accessibility: true,
+                ready: true,
+            },
+        ))
+    }
+}
+
+#[tauri::command]
+async fn request_macos_input_permissions() -> Result<MacosInputPermissionsPayload, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let snapshot = daemon_client::request_macos_input_permissions()
+            .await
+            .map_err(|error| format!("daemon macOS input permission request failed: {error}"))?;
+        return Ok(macos_input_permissions_payload(snapshot));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(macos_input_permissions_payload(
+            rshare_core::ipc::MacosInputPermissionsSnapshot {
+                supported: false,
+                input_monitoring: true,
+                accessibility: true,
+                ready: true,
+            },
+        ))
     }
 }
 
@@ -1543,6 +1552,22 @@ mod tests {
             button,
             button_state,
         }
+    }
+
+    #[test]
+    fn macos_permission_payload_preserves_daemon_observed_state() {
+        let payload =
+            macos_input_permissions_payload(rshare_core::ipc::MacosInputPermissionsSnapshot {
+                supported: true,
+                input_monitoring: true,
+                accessibility: false,
+                ready: false,
+            });
+
+        assert!(payload.supported);
+        assert!(payload.input_monitoring);
+        assert!(!payload.accessibility);
+        assert!(!payload.ready);
     }
 
     #[test]

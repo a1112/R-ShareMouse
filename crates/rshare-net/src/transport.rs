@@ -6983,6 +6983,7 @@ mod tests {
         let client_id = DeviceId::new_v4();
         let mut server = QuicTransport::isolated_for_test(server_id);
         let server_state = server.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(&server_state).unwrap();
         server.start_server("127.0.0.1:0").await.unwrap();
         let first_addr = server.local_addr().unwrap();
         let first_task_id = server.server_task.as_ref().unwrap().id();
@@ -7006,6 +7007,7 @@ mod tests {
 
         let mut client = QuicTransport::isolated_for_test(client_id);
         let client_state = client.state_lifetime.as_ref().unwrap().state_dir.clone();
+        fs::create_dir_all(&client_state).unwrap();
         let mut client_connection = client
             .connect(&first_addr.to_string(), server_id)
             .await

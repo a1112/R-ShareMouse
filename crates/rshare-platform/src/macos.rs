@@ -64,7 +64,9 @@ mod macos_impl {
     use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardItem, NSURLPboardType};
     use cocoa::base::{id, nil};
     use cocoa::foundation::{NSArray, NSString};
-    use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+    use core_foundation::base::TCFType;
+    use core_foundation::runloop::CFRunLoop;
+    use core_foundation::string::CFString;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::{
         CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -88,11 +90,20 @@ mod macos_impl {
     /// source-class filter: accessibility tools and other legitimate synthetic
     /// events must still be observed by the capture path.
     const RSHARE_EVENT_SOURCE_MARKER: i64 = 0x5253_4841_5245;
+    const MACOS_INPUT_EVENT_TAP_RUN_LOOP_MODE_NAME: &str = "com.rshare.input-event-tap";
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
     fn macos_input_event_tap_location() -> CGEventTapLocation {
         CGEventTapLocation::Session
+    }
+
+    fn macos_input_event_tap_run_loop_mode() -> CFString {
+        // `kCFRunLoopCommonModes` is a pseudo-mode used when registering
+        // sources, not a mode that can be passed to `CFRunLoopRunInMode`.
+        // Running that pseudo-mode returns `Finished` immediately, which
+        // makes the listener appear to start and then stop synchronously.
+        CFString::from_static_string(MACOS_INPUT_EVENT_TAP_RUN_LOOP_MODE_NAME)
     }
 
     /// Non-interactive snapshot of the permissions needed for the native input loop.
@@ -418,8 +429,9 @@ mod macos_impl {
                         }
                     };
 
-                    let run_loop_mode = unsafe { kCFRunLoopCommonModes };
-                    current_loop.add_source(&source, run_loop_mode);
+                    let run_loop_mode = macos_input_event_tap_run_loop_mode();
+                    let run_loop_mode_ref = run_loop_mode.as_concrete_TypeRef();
+                    current_loop.add_source(&source, run_loop_mode_ref);
                     tap.enable();
                     tracing::info!("macOS input listener started");
                     capture_started.store(true, Ordering::Release);
@@ -432,7 +444,7 @@ mod macos_impl {
                             tap.enable();
                         }
                         let result = CFRunLoop::run_in_mode(
-                            run_loop_mode,
+                            run_loop_mode_ref,
                             Duration::from_millis(100),
                             false,
                         );
@@ -447,7 +459,7 @@ mod macos_impl {
                         }
                     }
 
-                    current_loop.remove_source(&source, run_loop_mode);
+                    current_loop.remove_source(&source, run_loop_mode_ref);
                     tracing::info!("macOS input listener stopped");
                 }) {
                 Ok(worker) => worker,
@@ -1639,6 +1651,14 @@ mod macos_impl {
                 macos_input_event_tap_location(),
                 CGEventTapLocation::Session
             ));
+        }
+
+        #[test]
+        fn event_tap_uses_a_concrete_run_loop_mode() {
+            assert_eq!(
+                macos_input_event_tap_run_loop_mode().to_string(),
+                MACOS_INPUT_EVENT_TAP_RUN_LOOP_MODE_NAME
+            );
         }
 
         #[test]

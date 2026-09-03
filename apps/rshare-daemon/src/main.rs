@@ -10,6 +10,7 @@ mod static_capture;
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::future::BoxFuture;
+use rshare_core::ipc::MacosInputPermissionsSnapshot;
 use rshare_core::{
     default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
     local_capability_snapshots, remote_capability_snapshots, AudioFormat, BackendFailureReason,
@@ -3599,6 +3600,41 @@ fn local_shortcut_suppression_supported(controls: &LocalControlDeviceSnapshot) -
 #[cfg(not(any(windows, target_os = "macos")))]
 fn local_shortcut_suppression_supported(_controls: &LocalControlDeviceSnapshot) -> bool {
     false
+}
+
+fn macos_input_permissions_snapshot_from_flags(
+    supported: bool,
+    input_monitoring: bool,
+    accessibility: bool,
+) -> MacosInputPermissionsSnapshot {
+    MacosInputPermissionsSnapshot {
+        supported,
+        input_monitoring,
+        accessibility,
+        ready: input_monitoring && accessibility,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_macos_input_permissions() -> MacosInputPermissionsSnapshot {
+    let state = rshare_platform::macos_input_permission_state();
+    macos_input_permissions_snapshot_from_flags(true, state.can_capture(), state.can_inject())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn daemon_macos_input_permissions() -> MacosInputPermissionsSnapshot {
+    macos_input_permissions_snapshot_from_flags(false, true, true)
+}
+
+#[cfg(target_os = "macos")]
+fn request_daemon_macos_input_permissions() -> MacosInputPermissionsSnapshot {
+    let state = rshare_platform::request_macos_input_permissions();
+    macos_input_permissions_snapshot_from_flags(true, state.can_capture(), state.can_inject())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_daemon_macos_input_permissions() -> MacosInputPermissionsSnapshot {
+    daemon_macos_input_permissions()
 }
 
 struct PlatformShortcutSuppressor;
@@ -8326,6 +8362,12 @@ async fn dispatch_ipc_request(
             let state = state.read().await;
             DaemonResponse::Status(state.status_snapshot_for_connections(&connection_infos))
         }
+        DaemonRequest::GetMacosInputPermissions => {
+            DaemonResponse::MacosInputPermissions(daemon_macos_input_permissions())
+        }
+        DaemonRequest::RequestMacosInputPermissions => {
+            DaemonResponse::MacosInputPermissions(request_daemon_macos_input_permissions())
+        }
         DaemonRequest::Devices => {
             let state = state.read().await;
             DaemonResponse::Devices(state.device_snapshots())
@@ -8955,6 +8997,25 @@ mod tests {
         }));
         assert!(request_may_mutate_ui(&DaemonRequest::LocalControls));
         assert!(request_may_mutate_ui(&DaemonRequest::ListVirtualDisplays));
+        assert!(!request_may_mutate_ui(
+            &DaemonRequest::GetMacosInputPermissions
+        ));
+        assert!(!request_may_mutate_ui(
+            &DaemonRequest::RequestMacosInputPermissions
+        ));
+    }
+
+    #[test]
+    fn macos_permission_snapshot_keeps_capture_and_injection_states_independent() {
+        let snapshot = macos_input_permissions_snapshot_from_flags(true, true, false);
+        assert!(snapshot.supported);
+        assert!(snapshot.input_monitoring);
+        assert!(!snapshot.accessibility);
+        assert!(!snapshot.ready);
+
+        let unsupported = macos_input_permissions_snapshot_from_flags(false, true, true);
+        assert!(!unsupported.supported);
+        assert!(unsupported.ready);
     }
 
     #[tokio::test]

@@ -25,6 +25,18 @@ pub const DEFAULT_IPC_PORT: u16 = 27435;
 pub const DEFAULT_LOCAL_CONTROLS_WS_PORT: u16 = 27436;
 pub const DEFAULT_MOBILE_GATEWAY_PORT: u16 = 27437;
 
+/// macOS input permissions as observed by the daemon process.
+///
+/// The snapshot intentionally keeps the same JSON field names as the desktop
+/// command payload so existing clients can consume it without a migration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MacosInputPermissionsSnapshot {
+    pub supported: bool,
+    pub input_monitoring: bool,
+    pub accessibility: bool,
+    pub ready: bool,
+}
+
 /// Current daemon status snapshot returned to local clients.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceStatusSnapshot {
@@ -172,6 +184,38 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap())
                 .unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn macos_permission_ipc_variants_round_trip_with_stable_payload_shape() {
+        let query = DaemonRequest::GetMacosInputPermissions;
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&query).unwrap()).unwrap(),
+            query
+        );
+
+        let request = DaemonRequest::RequestMacosInputPermissions;
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap())
+                .unwrap(),
+            request
+        );
+
+        let response = DaemonResponse::MacosInputPermissions(MacosInputPermissionsSnapshot {
+            supported: true,
+            input_monitoring: true,
+            accessibility: false,
+            ready: false,
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded["MacosInputPermissions"]["input_monitoring"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            serde_json::from_value::<DaemonResponse>(encoded).unwrap(),
             response
         );
     }
@@ -475,6 +519,8 @@ pub struct PendingPeerApproval {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
     Status,
+    GetMacosInputPermissions,
+    RequestMacosInputPermissions,
     Devices,
     Capabilities {
         #[serde(default)]
@@ -566,6 +612,7 @@ pub enum DaemonRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonResponse {
     Status(ServiceStatusSnapshot),
+    MacosInputPermissions(MacosInputPermissionsSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),
     Capabilities(CapabilityRegistrySnapshot),
     UsbDevices(Vec<UsbDeviceDescriptor>),
