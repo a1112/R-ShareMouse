@@ -22,22 +22,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: npm
-          cache-dependency-path: apps/rshare-desktop-frontend/package-lock.json
-
-      - name: Install frontend dependencies from lockfile
-        run: npm ci --prefix apps/rshare-desktop-frontend
+      - name: Prepare Linux workspace build
+        uses: ./.github/actions/prepare-linux-build
 
       - name: Install Playwright Chromium
         working-directory: apps/rshare-desktop-frontend
         run: npx playwright install --with-deps chromium
-
-      - name: Build frontend
-        run: npm --prefix apps/rshare-desktop-frontend run build
 
       - name: Run functional UI stream scenarios
         run: npm --prefix apps/rshare-desktop-frontend run test:perf -- --grep-invert @fixed-runner

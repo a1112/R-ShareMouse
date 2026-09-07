@@ -45,6 +45,7 @@ const SNAPSHOT = {
 };
 
 function daemonResponse(request) {
+  if (request === "FileTransfers") return { FileTransfers: [] };
   if (request === "Status") return { Status: SNAPSHOT.status };
   if (request === "Devices") return { Devices: SNAPSHOT.devices };
   if (request === "GetLayout") return { Layout: SNAPSHOT.layout };
@@ -695,4 +696,73 @@ test("1000 Hz pointer flood and discrete transitions meet the UI gate @fixed-run
   expect(report.topology_status_p99_ms).toBeLessThanOrEqual(100);
   expect(report.long_tasks_over_50ms).toBe(0);
   expect(report.dashboard_or_endpoint_polls_while_healthy).toBe(0);
+});
+
+test("native file drop targets connected cards and exposes daemon progress and cancellation", async ({ page }, testInfo) => {
+  const peerId = "00000000-0000-0000-0000-000000000123";
+  const transfer = {
+    id: "00000000-0000-0000-0000-000000000456", peer_id: peerId, incoming: false,
+    status: "Transferring", entries: [{ path: "报告.txt" }], entry_count: 1,
+    total_bytes: 120, transferred_bytes: 120, destination: null, error: null,
+  };
+  let visible = false;
+  let cancelled = null;
+  await page.addInitScript(() => {
+    const listeners = new Map();
+    window.__rshareFileListeners = listeners;
+    window.__TAURI__ = { event: { listen: async (name, callback) => {
+      listeners.set(name, callback);
+      return () => listeners.delete(name);
+    } } };
+  });
+  await installHarness(page);
+  await page.route("**/__rshare/ipc", async (route) => {
+    const request = JSON.parse(route.request().postData() ?? "null");
+    if (request === "FileTransfers") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ FileTransfers: visible ? [transfer] : [] }) });
+    } else if (request?.CancelFileTransfer) {
+      cancelled = request.CancelFileTransfer.transfer_id;
+      transfer.status = "Cancelled";
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify("Ack") });
+    } else await route.fallback();
+  });
+  await page.evaluate(({ snapshot, peerId, transfer }) => {
+    window.__rshareFileCommands = [];
+    window.__TAURI__.core = { invoke: async (command, args) => {
+      window.__rshareFileCommands.push({ command, args });
+      if (command === "send_files") return transfer;
+      if (command === "open_received_files") return null;
+      throw new Error(`unexpected native command: ${command}`);
+    } };
+    window.__rsharePerfEmit({ type: "snapshot", payload: { ...snapshot, revision: 1,
+      devices: [{ id: peerId, name: "测试工作站", hostname: "test-peer", addresses: ["127.0.0.1:27431"], connected: true, last_seen_secs: 0 }],
+    } });
+  }, { snapshot: SNAPSHOT, peerId, transfer });
+  const target = page.locator(`[data-file-drop-peer="${peerId}"]`);
+  await expect(target).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__rshareFileListeners.has("tauri://drag-drop"))).toBeTruthy();
+  const bounds = await target.boundingBox();
+  visible = true;
+  await page.evaluate(({ bounds }) => {
+    const payload = { paths: ["/tmp/报告.txt"], position: { x: (bounds.x + 10) * devicePixelRatio, y: (bounds.y + 10) * devicePixelRatio } };
+    window.__rshareFileListeners.get("tauri://drag-enter")({ payload });
+    window.__rshareFileListeners.get("tauri://drag-drop")({ payload });
+  }, { bounds });
+  await expect(page.getByText("传输中 · 99%", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.__rshareFileCommands.filter((c) => c.command === "send_files")))
+    .toEqual([{ command: "send_files", args: { deviceId: peerId, paths: ["/tmp/报告.txt"] } }]);
+  await page.screenshot({ path: testInfo.outputPath("file-transfer-progress.png") });
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect.poll(() => cancelled).toBe(transfer.id);
+  await expect(page.getByText("已取消 · 99%", { exact: true })).toBeVisible();
+  transfer.status = "Completed"; transfer.incoming = true;
+  transfer.destination = "/tmp/R-ShareMouse/received-test";
+  await expect(page.getByText("已完成 · 100%", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "打开文件夹" })).toBeVisible();
+  transfer.status = "Failed";
+  transfer.error = "目标文件夹投放失败；已完成的项目保留，请检查目标文件夹";
+  await expect(page.getByText(transfer.error, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "打开文件夹" }).click();
+  expect(await page.evaluate(() => window.__rshareFileCommands.filter((c) => c.command === "open_received_files")))
+    .toEqual([{ command: "open_received_files", args: { transferId: transfer.id } }]);
 });

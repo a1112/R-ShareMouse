@@ -869,13 +869,32 @@ mod tests {
             output: output.clone(),
         };
 
-        run_quic_with_duration(args, Some(Duration::from_secs(1)))
-            .expect("CLI must complete its five-run QUIC measurement");
+        let result = run_quic_with_duration(args, Some(Duration::from_secs(1)));
 
         let bytes = fs::read(&output).expect("CLI must write its primary artifact");
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../perf/baselines/schema.json")).unwrap();
         let report = parse_and_validate_report(&bytes, &schema).unwrap();
+        // Shared CI and developer machines cannot promise stable timings.
+        // Both outcomes must produce complete evidence; the CLI must still
+        // fail its performance gate when the one allowed retry is unstable.
+        if report.verdict == VerdictStatus::Unstable {
+            let error = result.expect_err("unstable measurement must fail the CLI gate");
+            assert!(error
+                .to_string()
+                .contains("unstable_after_one_complete_retry"));
+            assert!(report
+                .errors
+                .iter()
+                .any(|error| error == "unstable_after_one_complete_retry"));
+            assert_eq!(report.batch_artifacts.len(), 2);
+            assert!(report
+                .batch_artifacts
+                .iter()
+                .all(|batch| batch.verdict == VerdictStatus::Unstable));
+        } else {
+            result.expect("CLI must complete its five-run QUIC measurement");
+        }
         assert!(matches!(report.availability, Availability::Available));
         assert_eq!(report.runs.len(), 5);
         assert!(report.runs.iter().all(|run| run.process_exit_success));

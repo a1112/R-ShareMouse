@@ -19,6 +19,8 @@ import {
   buildRemoteLatencySummary,
   buildVirtualDisplayViewModel,
   endpointEventToLocalControlEvent,
+  mergeLocalControlEventHistory,
+  remoteEndpointEventsToLocalControlEvents,
   updateRememberedLayoutFromVisibleMonitors,
 } from "./desktop-model.mjs";
 
@@ -574,11 +576,118 @@ test("endpointEventToLocalControlEvent preserves remote endpoint and physical de
   assert.equal(event.payload.device_display_name, "Remote Mechanical Keyboard");
 });
 
+test("remote endpoint monitoring ignores the local endpoint without dropping remote events", () => {
+  const endpointEvent = (endpointId, sequence) => ({
+    event_id: sequence,
+    sequence,
+    timestamp_ms: 1234 + sequence,
+    endpoint_id: endpointId,
+    origin_endpoint_id: endpointId,
+    device: {
+      device_id: `${endpointId}-mouse`,
+      instance_id: null,
+      display_name: `${endpointId} mouse`,
+      kind: "Mouse",
+      attribution: "Exact",
+    },
+    direction: "Observed",
+    source: "Hardware",
+    kind: "Mouse",
+    payload: { kind: "MouseMove", data: { x: sequence, y: sequence } },
+    correlation_id: null,
+  });
+
+  const events = remoteEndpointEventsToLocalControlEvents(
+    [
+      endpointEvent("local-1", 8),
+      endpointEvent("remote-1", 8),
+      endpointEvent("stale-remote", 8),
+    ],
+    new Set(["remote-1"]),
+    "local-1",
+  );
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].device_id, "remote-1");
+  assert.equal(events[0].sequence, 8);
+});
+
+test("remote endpoint monitoring filters backend telemetry before merging input history", () => {
+  const endpointEvent = (kind, source, sequence) => ({
+    event_id: sequence,
+    sequence,
+    timestamp_ms: 2000 + sequence,
+    endpoint_id: "remote-1",
+    origin_endpoint_id: "remote-1",
+    device: {
+      device_id: `${kind.toLowerCase()}-${sequence}`,
+      instance_id: null,
+      display_name: `remote ${kind}`,
+      kind,
+      attribution: "Exact",
+    },
+    direction: source === "InjectedLoopback" ? "InjectedLoopback" : "Observed",
+    source,
+    kind,
+    payload:
+      kind === "Keyboard"
+        ? { kind: "Keyboard", data: { key: "A", state: "Pressed" } }
+        : kind === "Mouse"
+          ? { kind: "MouseMove", data: { x: 10, y: 20 } }
+          : { kind: "Backend", data: { captured: String(sequence) } },
+    correlation_id: null,
+  });
+
+  const endpointEvents = [
+    ...Array.from({ length: 64 }, (_, index) =>
+      endpointEvent("Backend", "System", index + 1),
+    ),
+    endpointEvent("Keyboard", "Hardware", 100),
+    endpointEvent("Mouse", "InjectedLoopback", 101),
+  ];
+  const events = remoteEndpointEventsToLocalControlEvents(
+    endpointEvents,
+    new Set(["remote-1"]),
+    "local-1",
+  );
+  const history = mergeLocalControlEventHistory([], events);
+
+  assert.deepEqual(events.map((event) => event.device_kind), ["Keyboard", "Mouse"]);
+  assert.deepEqual(history.map((event) => event.device_kind), ["Keyboard", "Mouse"]);
+  assert.equal(history[1].source, "InjectedLoopback");
+});
+
+test("local and remote endpoint histories retain events with the same sequence", () => {
+  const event = (endpointId, summary) => ({
+    sequence: 8,
+    timestamp_ms: 1234,
+    device_kind: "Keyboard",
+    event_kind: "key",
+    summary,
+    device_id: endpointId === "local" ? "local-keyboard" : endpointId,
+    source: "Hardware",
+    payload:
+      endpointId === "local"
+        ? { key: "A", state: "Pressed" }
+        : { key: "B", state: "Pressed", remote_device_id: endpointId },
+  });
+
+  const history = mergeLocalControlEventHistory(
+    [event("local", "local A")],
+    [event("remote-1", "remote B")],
+  );
+
+  assert.deepEqual(
+    history.map((item) => item.summary).sort(),
+    ["local A", "remote B"],
+  );
+});
+
 test("buildEndpointAcceptance reports dual-machine event mirror and inject readiness", () => {
   const acceptance = buildEndpointAcceptance(
     {
-      capture_backend: { active: true },
-      inject_backend: { active: true },
+      capture_backend: { active: true, health: "Healthy" },
+      inject_backend: { active: true, health: "Healthy" },
       recent_events: [
         {
           sequence: 1,
@@ -614,7 +723,7 @@ test("buildEndpointAcceptance reports dual-machine event mirror and inject readi
   );
 
   assert.equal(acceptance.ready, true);
-  assert.equal(acceptance.remoteEventCount, 2);
+  assert.equal(acceptance.remoteEventCount, 1);
   assert.equal(acceptance.remoteInjectedEventCount, 1);
   assert.deepEqual(
     acceptance.checks.map((check) => [check.key, check.state]),
@@ -627,11 +736,53 @@ test("buildEndpointAcceptance reports dual-machine event mirror and inject readi
   );
 });
 
+test("buildEndpointAcceptance never counts remote backend telemetry as physical input", () => {
+  const acceptance = buildEndpointAcceptance(
+    {
+      capture_backend: { active: true, health: "Healthy" },
+      inject_backend: { active: true, health: "Healthy" },
+      recent_events: [
+        {
+          sequence: 1,
+          device_kind: "System",
+          event_kind: "metrics",
+          device_id: "remote-1",
+          source: "Hardware",
+          payload: { remote_device_id: "remote-1" },
+        },
+        {
+          sequence: 2,
+          device_kind: "Keyboard",
+          event_kind: "key",
+          device_id: "remote-1",
+          source: "InjectedLoopback",
+          payload: { remote_device_id: "remote-1" },
+        },
+      ],
+    },
+    [{ id: "remote-1", name: "Remote", connected: true }],
+    { status: "Success", message: "ok" },
+  );
+
+  assert.equal(acceptance.ready, false);
+  assert.equal(acceptance.remoteEventCount, 0);
+  assert.equal(acceptance.remoteInjectedEventCount, 1);
+  assert.deepEqual(
+    acceptance.checks.map((check) => [check.key, check.state]),
+    [
+      ["local-events", "warn"],
+      ["remote-mirror", "warn"],
+      ["remote-inject", "pass"],
+      ["endpoint-backend", "pass"],
+    ],
+  );
+});
+
 test("buildEndpointAcceptance keeps remote inject pending until a test or loopback event exists", () => {
   const acceptance = buildEndpointAcceptance(
     {
-      capture_backend: { active: true },
-      inject_backend: { active: true },
+      capture_backend: { active: true, health: "Healthy" },
+      inject_backend: { active: true, health: "Healthy" },
       recent_events: [],
     },
     [{ id: "remote-1", name: "Remote", connected: true }],
@@ -648,6 +799,38 @@ test("buildEndpointAcceptance keeps remote inject pending until a test or loopba
       ["endpoint-backend", "pass"],
     ],
   );
+});
+
+test("endpoint acceptance never promotes local or disconnected test results to remote success", () => {
+  const snapshot = { capture_backend: { active: true }, inject_backend: { active: true }, recent_events: [] };
+  const remote = [{ id: "remote-1", connected: true }];
+  const check = (acceptance, key) => acceptance.checks.find((item) => item.key === key).state;
+  for (const targetId of [null, "local", "remote-other"]) {
+    assert.equal(check(buildEndpointAcceptance(snapshot, remote, { status: "Success", targetId }), "remote-inject"), "warn");
+  }
+  assert.equal(check(buildEndpointAcceptance(snapshot, remote, { status: "Success", targetId: "remote-1" }), "remote-inject"), "pass");
+  const history = { ...snapshot, recent_events: [
+    { device_id: "remote-1", device_kind: "Keyboard", source: "Hardware" },
+    { device_id: "remote-1", device_kind: "Keyboard", source: "InjectedLoopback" },
+  ] };
+  const disconnected = buildEndpointAcceptance(history, [{ id: "remote-1", connected: false }], { status: "Success", targetId: "remote-1" });
+  assert.equal(check(disconnected, "remote-inject"), "block");
+  assert.equal(check(disconnected, "remote-mirror"), "block");
+  const failed = buildEndpointAcceptance(history, remote, { status: "Failed", targetId: "remote-1", message: "injection failed" });
+  assert.equal(check(failed, "remote-inject"), "block");
+});
+
+test("endpoint acceptance follows daemon capability health instead of stale active flags", () => {
+  const snapshot = {
+    capture_backend: { active: true, health: { Degraded: { reason: "PermissionDenied" } } },
+    inject_backend: { active: true, health: "Healthy" }, recent_events: [],
+  };
+  const backend = (result) => result.checks.find((item) => item.key === "endpoint-backend");
+  assert.notEqual(backend(buildEndpointAcceptance(snapshot)).state, "pass");
+  const capability = (state) => ({ localDeviceId: "local", devices: [{ id: "local", capabilities: [{ kind: "Input", state }] }] });
+  assert.equal(backend(buildEndpointAcceptance(snapshot, [], null, capability("Available"))).state, "pass");
+  snapshot.capture_backend.health = "Healthy";
+  assert.notEqual(backend(buildEndpointAcceptance(snapshot, [], null, capability("Degraded"))).state, "pass");
 });
 
 test("buildEndpointInjectSummary reports scoped latency for the selected device page", () => {
@@ -1827,6 +2010,7 @@ test("buildRemoteControlSnapshot synthesizes remote hardware from capabilities l
           device_kind: "Keyboard",
           event_kind: "key",
           device_id: "remote-1",
+          source: "Hardware",
           summary: "Remote key A Pressed",
           payload: { remote_device_id: "remote-1", key: "A", state: "Pressed" },
         },
@@ -1883,15 +2067,78 @@ test("buildRemoteControlSnapshot synthesizes remote hardware from capabilities l
 
   assert.equal(snapshot.keyboard.detected, true);
   assert.equal(snapshot.keyboard.event_count, 1);
-  assert.equal(snapshot.mouse.detected, true);
+  assert.equal(snapshot.mouse.detected, false);
   assert.equal(snapshot.mouse.event_count, 0);
   assert.equal(snapshot.keyboard_devices[0].name, "Remote Workstation 键盘");
-  assert.equal(snapshot.mouse_devices[0].source, "remote capability");
+  assert.equal(snapshot.mouse_devices.length, 0);
   assert.equal(snapshot.gamepads[0].connected, true);
   assert.equal(snapshot.audio_outputs[0].name, "Remote Workstation 音频");
   assert.equal(snapshot.display.display_count, 2);
   assert.equal(snapshot.display.displays[1].display_id, "left");
   assert.deepEqual(snapshot.recent_events.map((event) => event.sequence), [1]);
+});
+
+test("buildRemoteControlSnapshot ignores telemetry and injected events for input activity", () => {
+  const snapshot = buildRemoteControlSnapshot({
+    baseSnapshot: {
+      recent_events: [
+        {
+          sequence: 1,
+          device_kind: "Backend",
+          event_kind: "health",
+          device_id: "remote-1",
+          source: "System",
+          summary: "Remote backend healthy",
+          payload: { remote_device_id: "remote-1" },
+        },
+        {
+          sequence: 2,
+          device_kind: "Keyboard",
+          event_kind: "key",
+          device_id: "remote-1",
+          source: "InjectedLoopback",
+          summary: "Injected key A Pressed",
+          payload: { remote_device_id: "remote-1", key: "A", state: "Pressed" },
+        },
+        {
+          sequence: 3,
+          device_kind: "Mouse",
+          event_kind: "move",
+          device_id: "remote-1",
+          source: "Injected",
+          summary: "Injected mouse move",
+          payload: { remote_device_id: "remote-1", x: 100, y: 200 },
+        },
+        {
+          sequence: 4,
+          device_kind: "Gamepad",
+          event_kind: "button",
+          device_id: "remote-1",
+          source: "System",
+          summary: "Remote gamepad telemetry",
+          payload: { remote_device_id: "remote-1", button: "A", state: "Pressed" },
+        },
+      ],
+    },
+    device: { id: "remote-1", name: "Remote Workstation", connected: true },
+    capabilities: {
+      devices: [
+        {
+          id: "remote-1",
+          connected: true,
+          capabilities: [{ kind: "Input", state: "Available" }],
+        },
+      ],
+    },
+  });
+
+  assert.equal(snapshot.keyboard.detected, false);
+  assert.equal(snapshot.keyboard.event_count, 0);
+  assert.equal(snapshot.mouse.detected, false);
+  assert.equal(snapshot.mouse.event_count, 0);
+  assert.equal(snapshot.capture_backend.active, false);
+  assert.equal(snapshot.capture_backend.health, "Unavailable");
+  assert.equal(snapshot.recent_events.length, 4);
 });
 
 test("buildDesktopViewModel preserves connection status consistently across pages", () => {

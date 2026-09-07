@@ -126,6 +126,101 @@ test("desktop app routes revisioned state through the selector store without fas
   );
 });
 
+test("remote endpoint event monitoring stays active with a healthy UI-state stream", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const endpointEffectStart = source.indexOf("useEffect(() => {\n    if (!endpointIds.length)");
+  const endpointEffectEnd = source.indexOf("\n  useEffect(", endpointEffectStart + 1);
+  const endpointEffect = source.slice(endpointEffectStart, endpointEffectEnd);
+
+  assert.notEqual(endpointEffectStart, -1);
+  assert.notEqual(endpointEffectEnd, -1);
+  assert.doesNotMatch(endpointEffect, /uiStreamHealthy/);
+  assert.match(endpointEffect, /endpointEventsStreamCoordinator\.acquire\(\)/);
+  assert.match(endpointEffect, /applyEndpointEvents/);
+});
+
+test("remote endpoint event stream excludes backend telemetry", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const coordinatorStart = source.indexOf(
+    "const endpointEventsStreamCoordinator = createOwnerlessStreamCoordinator",
+  );
+  const coordinatorEnd = source.indexOf("\n});", coordinatorStart) + 4;
+  const coordinator = source.slice(coordinatorStart, coordinatorEnd);
+
+  assert.notEqual(coordinatorStart, -1);
+  assert.match(coordinator, /monitoredInputEndpointEventFilter\(null\)/);
+  assert.match(
+    source,
+    /kinds:\s*\["Keyboard",\s*"Mouse",\s*"Gamepad"\]/,
+  );
+});
+
+test("remote endpoint event monitoring restarts when peer connectivity changes", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const keyStart = source.indexOf("const endpointPollKey = [");
+  const keyEnd = source.indexOf("].join(\"|\");", keyStart);
+  const endpointKey = source.slice(keyStart, keyEnd);
+
+  assert.notEqual(keyStart, -1);
+  assert.notEqual(keyEnd, -1);
+  assert.match(endpointKey, /device\.connected/);
+  assert.match(endpointKey, /connected/);
+  assert.match(endpointKey, /offline/);
+});
+
+test("remote latency probe uses the Tauri camelCase device argument", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const invocationStart = source.indexOf(
+    'invokeCommand<LocalInputTestResult>("run_remote_latency_test"',
+  );
+  const invocation = source.slice(invocationStart, invocationStart + 260);
+
+  assert.notEqual(invocationStart, -1);
+  assert.match(invocation, /deviceId(?::\s*deviceId)?\s*,/);
+  assert.doesNotMatch(invocation, /device_id:\s*deviceId/);
+});
+
+test("remote injection confirmation exposes the required second click", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /再次点击执行远端 Shift 测试/);
+  assert.match(source, /再次点击执行远端移动测试/);
+  assert.match(source, /inputTestConfirmationKey\(kind, remoteDeviceId\)/);
+  assert.match(source, /INPUT_TEST_CONFIRMATION_TIMEOUT_MS/);
+  assert.match(source, /if \(busy\) \{\s*return;/);
+});
+
+test("devices page forwards the local-controls refresh callback to remote tabs", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const desktopAppStart = source.indexOf("function DesktopApp()");
+  const devicesPageStart = source.indexOf("function DevicesPage({");
+  const controlledPageStart = source.indexOf("function DevicesPageWithLocalControls({");
+  const devicesPageCallStart = source.indexOf("<DevicesPage\n", desktopAppStart);
+  const devicesPageCallEnd = source.indexOf("/>", devicesPageCallStart);
+
+  assert.notEqual(desktopAppStart, -1);
+  assert.notEqual(devicesPageStart, -1);
+  assert.notEqual(controlledPageStart, -1);
+  assert.notEqual(devicesPageCallStart, -1);
+  assert.notEqual(devicesPageCallEnd, -1);
+
+  const devicesPageCall = source.slice(devicesPageCallStart, devicesPageCallEnd);
+  const devicesPage = source.slice(devicesPageStart, controlledPageStart);
+  const controlledPage = source.slice(controlledPageStart);
+
+  assert.match(devicesPageCall, /onRefreshLocalControls=\{refreshLocalControls\}/);
+  assert.match(devicesPage, /onRefreshLocalControls=\{onRefreshLocalControls\}/);
+  assert.match(controlledPage, /onRefreshLocalControls=\{onRefreshLocalControls\}/);
+  assert.doesNotMatch(controlledPage, /onRefreshLocalControls=\{refreshLocalControls\}/);
+});
+
+test("simulated mouse renders the wheel delta label without mojibake", () => {
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /滚轮 Δ \{wheelDeltaX\}, \{wheelDeltaY\}/);
+  assert.doesNotMatch(source, /婊氳疆 螖/);
+});
+
 test("formatNetworkGatewayError hides raw browser fetch failures", () => {
   assert.equal(
     formatNetworkGatewayError(new TypeError("Failed to fetch"), "本机输入"),

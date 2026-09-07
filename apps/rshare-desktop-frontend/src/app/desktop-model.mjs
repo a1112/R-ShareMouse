@@ -1156,15 +1156,22 @@ export function buildRemoteControlSnapshot({
   const deviceId = device?.id ?? device?.device_id ?? "";
   const remoteEvents = eventsForRemote(baseSnapshot, deviceId);
   const capabilityDevice = capabilityDeviceFor(capabilities, deviceId);
-  const inputCapability = capabilityFor(capabilityDevice, "Input");
   const gamepadCapability = capabilityFor(capabilityDevice, "Gamepad");
   const audioCapability = capabilityFor(capabilityDevice, "Audio");
   const displayCapability = capabilityFor(capabilityDevice, "DisplayTopology");
-  const inputDetected = capabilityUsable(inputCapability) || remoteEvents.length > 0;
-  const keyboardEvents = remoteEvents.filter((event) => event.device_kind === "Keyboard");
-  const mouseEvents = remoteEvents.filter((event) => event.device_kind === "Mouse");
-  const latestKeyboard = latestEventPayload(remoteEvents, "Keyboard");
-  const latestMouse = latestEventPayload(remoteEvents, "Mouse");
+  const keyboardEvents = remoteEvents.filter(
+    (event) => event.device_kind === "Keyboard" && eventIsPhysicalInput(event),
+  );
+  const mouseEvents = remoteEvents.filter(
+    (event) => event.device_kind === "Mouse" && eventIsPhysicalInput(event),
+  );
+  const gamepadEvents = remoteEvents.filter(
+    (event) => event.device_kind === "Gamepad" && eventIsPhysicalInput(event),
+  );
+  const inputDetected =
+    keyboardEvents.length > 0 || mouseEvents.length > 0 || gamepadEvents.length > 0;
+  const latestKeyboard = latestEventPayload(keyboardEvents, "Keyboard");
+  const latestMouse = latestEventPayload(mouseEvents, "Mouse");
   const display = displayStateFromNode(visibleLayoutNodeFor(visibleLayout, deviceId));
   const gamepadAvailable = capabilityUsable(gamepadCapability);
   const audioAvailable = capabilityUsable(audioCapability);
@@ -1172,14 +1179,14 @@ export function buildRemoteControlSnapshot({
   return {
     sequence: Number(baseSnapshot?.sequence ?? 0),
     keyboard: {
-      detected: inputDetected,
+      detected: keyboardEvents.length > 0,
       pressed_keys: latestKeyboard.state === "Pressed" && latestKeyboard.key ? [latestKeyboard.key] : [],
       last_key: latestKeyboard.key ?? null,
       event_count: keyboardEvents.length,
       capture_source: "remote endpoint",
     },
     mouse: {
-      detected: inputDetected,
+      detected: mouseEvents.length > 0,
       x: Number(latestMouse.x ?? 0),
       y: Number(latestMouse.y ?? 0),
       pressed_buttons:
@@ -1197,10 +1204,10 @@ export function buildRemoteControlSnapshot({
       current_display_id: latestMouse.display_id ?? null,
       current_display_index: latestMouse.display_index == null ? null : Number(latestMouse.display_index),
     },
-    keyboard_devices: inputDetected
+    keyboard_devices: keyboardEvents.length > 0
       ? [remoteInputDevice(device, "keyboard", Boolean(device?.connected), keyboardEvents.length)]
       : [],
-    mouse_devices: inputDetected
+    mouse_devices: mouseEvents.length > 0
       ? [remoteInputDevice(device, "mouse", Boolean(device?.connected), mouseEvents.length)]
       : [],
     gamepads: gamepadAvailable
@@ -1209,7 +1216,7 @@ export function buildRemoteControlSnapshot({
             gamepad_id: 0,
             name: `${device?.name ?? "远端设备"} 手柄`,
             connected: true,
-            event_count: remoteEvents.filter((event) => event.device_kind === "Gamepad").length,
+            event_count: gamepadEvents.length,
             pressed_buttons: [],
           },
         ]
@@ -1372,6 +1379,92 @@ export function endpointEventToLocalControlEvent(event) {
   };
 }
 
+/**
+ * Convert only remote endpoint events for the shared diagnostics history.
+ * Local endpoint events already arrive through the canonical local-controls
+ * stream; replaying them here would double-count the local keyboard/mouse.
+ *
+ * The preferred call shape is `(events, knownRemoteEndpointIds, localEndpointId)`.
+ * The legacy `(events, localEndpointId)` shape remains accepted while callers
+ * migrate; a known-ID set is required to reject stale endpoint events.
+ */
+function normalizeEndpointIdSet(value) {
+  if (value instanceof Set || Array.isArray(value)) {
+    return new Set(Array.from(value, (id) => String(id)));
+  }
+  return null;
+}
+
+function endpointEventIsInput(event) {
+  return ["Keyboard", "Mouse", "Gamepad"].includes(
+    event?.kind ?? event?.device?.kind,
+  );
+}
+
+export function remoteEndpointEventsToLocalControlEvents(
+  endpointEvents,
+  knownRemoteEndpointIdsOrLocalEndpointId,
+  localEndpointIdOrKnownRemoteEndpointIds = null,
+) {
+  const secondIds = normalizeEndpointIdSet(knownRemoteEndpointIdsOrLocalEndpointId);
+  const thirdIds = normalizeEndpointIdSet(localEndpointIdOrKnownRemoteEndpointIds);
+  const knownRemoteEndpointIds = secondIds ?? thirdIds;
+  const localEndpointId = secondIds
+    ? typeof localEndpointIdOrKnownRemoteEndpointIds === "string"
+      ? localEndpointIdOrKnownRemoteEndpointIds
+      : null
+    : knownRemoteEndpointIdsOrLocalEndpointId;
+
+  return (Array.isArray(endpointEvents) ? endpointEvents : [])
+    .filter((event) => {
+      const endpointId = String(event?.endpoint_id ?? "");
+      if (!endpointId || (localEndpointId && endpointId === String(localEndpointId))) {
+        return false;
+      }
+      return !knownRemoteEndpointIds || knownRemoteEndpointIds.has(endpointId);
+    })
+    .filter(endpointEventIsInput)
+    .map(endpointEventToLocalControlEvent);
+}
+
+function localControlEventIdentity(event) {
+  const endpointId =
+    event?.payload?.origin_endpoint_id ??
+    event?.payload?.remote_device_id ??
+    event?.payload?.endpoint_id ??
+    "local";
+  return `${endpointId}:${Number(event?.sequence ?? 0)}`;
+}
+
+/** Merge local and remote histories without treating per-endpoint sequences as global. */
+export function mergeLocalControlEventHistory(existing, incoming) {
+  const byIdentity = new Map();
+  for (const event of [
+    ...(Array.isArray(existing) ? existing : []),
+    ...(Array.isArray(incoming) ? incoming : []),
+  ]) {
+    byIdentity.set(localControlEventIdentity(event), event);
+  }
+
+  const compareEvents = (left, right) =>
+    Number(left?.timestamp_ms ?? 0) - Number(right?.timestamp_ms ?? 0) ||
+    Number(left?.sequence ?? 0) - Number(right?.sequence ?? 0) ||
+    localControlEventIdentity(left).localeCompare(localControlEventIdentity(right));
+  const sorted = Array.from(byIdentity.values()).sort(compareEvents);
+  const tail = sorted.slice(-64);
+  const keyboardTail = sorted
+    .filter((event) => event?.device_kind === "Keyboard")
+    .slice(-24);
+  const gamepadTail = sorted
+    .filter((event) => event?.device_kind === "Gamepad")
+    .slice(-12);
+  const retained = new Map();
+  for (const event of [...tail, ...keyboardTail, ...gamepadTail]) {
+    retained.set(localControlEventIdentity(event), event);
+  }
+  return Array.from(retained.values()).sort(compareEvents).slice(-96);
+}
+
 function localControlEventDeviceId(event) {
   return event?.device_id ?? event?.payload?.remote_device_id ?? null;
 }
@@ -1380,24 +1473,48 @@ function eventIsInjected(event) {
   return ["Injected", "InjectedLoopback", "VirtualDevice"].includes(event?.source);
 }
 
-export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestResult = null) {
+function eventIsPhysicalInput(event) {
+  return (
+    ["Keyboard", "Mouse", "Gamepad"].includes(event?.device_kind) &&
+    event?.source === "Hardware"
+  );
+}
+
+export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestResult = null, capabilities = null) {
   const remoteIds = new Set((remoteDevices ?? []).map((device) => device.id));
   const connectedRemoteDevices = (remoteDevices ?? []).filter((device) => device.connected);
+  const connectedRemoteIds = new Set(connectedRemoteDevices.map((device) => device.id));
   const events = snapshot?.recent_events ?? [];
   const localEvents = events.filter((event) => {
     const sourceDeviceId = localControlEventDeviceId(event);
-    return !sourceDeviceId || !remoteIds.has(sourceDeviceId);
+    return (
+      !event?.payload?.remote_device_id &&
+      (!sourceDeviceId || !remoteIds.has(sourceDeviceId)) &&
+      eventIsPhysicalInput(event)
+    );
   });
-  const remoteEvents = events.filter((event) => remoteIds.has(localControlEventDeviceId(event)));
-  const remoteInjectedEvents = remoteEvents.filter(eventIsInjected);
-  const remoteInjectSucceeded =
-    inputTestResult?.status === "Success" || remoteInjectedEvents.length > 0;
+  const allRemoteEvents = events.filter((event) =>
+    connectedRemoteIds.has(localControlEventDeviceId(event)),
+  );
+  const remoteEvents = allRemoteEvents.filter(eventIsPhysicalInput);
+  const remoteInjectedEvents = allRemoteEvents.filter(eventIsInjected);
+  const remoteTestResult = connectedRemoteIds.has(inputTestResult?.targetId)
+    ? inputTestResult : null;
   const remoteInjectFailed =
-    inputTestResult &&
-    inputTestResult.status &&
-    inputTestResult.status !== "Success";
+    remoteTestResult?.status && remoteTestResult.status !== "Success";
+  const remoteInjectSucceeded = !remoteInjectFailed &&
+    (remoteTestResult?.status === "Success" || remoteInjectedEvents.length > 0);
   const captureActive = Boolean(snapshot?.capture_backend?.active);
   const injectActive = Boolean(snapshot?.inject_backend?.active);
+  const localInput = capabilityFor(capabilityDeviceFor(capabilities,
+    capabilities?.localDeviceId ?? capabilities?.local_device_id), "Input");
+  // The pushed capability registry is current daemon truth; fallback control
+  // snapshots may predate a permission change while the UI stream is healthy.
+  const backendReady = localInput
+    ? localInput.state === "Available"
+    : captureActive && injectActive &&
+      parseBackendHealth(snapshot?.capture_backend?.health).health === "Healthy" &&
+      parseBackendHealth(snapshot?.inject_backend?.health).health === "Healthy";
 
   const checks = [
     {
@@ -1433,7 +1550,7 @@ export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestR
       detail: remoteInjectSucceeded
         ? "远端注入已返回成功或已观察到 loopback 事件"
         : remoteInjectFailed
-          ? inputTestResult.message
+          ? remoteTestResult.message ?? "远端注入失败"
           : connectedRemoteDevices.length
             ? "点击远端键盘或鼠标测试完成注入闭环"
             : "没有可注入的已连接远端",
@@ -1441,13 +1558,15 @@ export function buildEndpointAcceptance(snapshot, remoteDevices = [], inputTestR
     {
       key: "endpoint-backend",
       label: "端侧后端",
-      state: statusCheck(captureActive && injectActive, Boolean(snapshot)),
+      state: statusCheck(backendReady, Boolean(snapshot) || Boolean(localInput)),
       detail:
-        captureActive && injectActive
-          ? "捕获与注入后端均处于 active"
-          : snapshot
-            ? `capture=${captureActive ? "active" : "inactive"} / inject=${injectActive ? "active" : "inactive"}`
-            : "后端状态不可用",
+        backendReady
+          ? "本机输入后端已就绪"
+          : localInput
+            ? localInput.reason ?? localInput.health_reason ?? "本机输入能力未就绪"
+            : snapshot
+              ? `capture=${captureActive ? "active" : "inactive"} / inject=${injectActive ? "active" : "inactive"}，等待后端健康确认`
+              : "后端状态不可用",
     },
   ];
 

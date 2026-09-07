@@ -12,7 +12,16 @@ use rshare_core::{
     VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
@@ -25,6 +34,53 @@ use ui_state_bridge::{
 
 mod hardware_assets;
 mod ui_state_bridge;
+
+#[tauri::command]
+async fn send_files(
+    device_id: String,
+    paths: Vec<String>,
+) -> Result<rshare_core::file_transfer::FileTransferSnapshot, String> {
+    let device_id = device_id.parse::<DeviceId>().map_err(|e| e.to_string())?;
+    daemon_client::request_send_files(device_id, paths)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn file_transfers() -> Result<Vec<rshare_core::file_transfer::FileTransferSnapshot>, String> {
+    daemon_client::request_file_transfers()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_file_transfer(transfer_id: String) -> Result<(), String> {
+    let transfer_id = transfer_id.parse::<DeviceId>().map_err(|e| e.to_string())?;
+    daemon_client::request_cancel_file_transfer(transfer_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_received_files(transfer_id: String) -> Result<(), String> {
+    let id = transfer_id.parse::<DeviceId>().map_err(|e| e.to_string())?;
+    let transfers = daemon_client::request_file_transfers()
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = transfers
+        .into_iter()
+        .find(|s| s.id == id && s.incoming && s.status.is_terminal())
+        .and_then(|s| s.destination)
+        .ok_or_else(|| "没有可打开的接收目录或记录已过期".to_string())?;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(path).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 const UNKNOWN_BUILD_VALUE: &str = "unknown";
 const RSHARE_BUILD_INFO_PREFIX: &str = "rshare-build:";
@@ -60,6 +116,8 @@ const TRAY_MENU_DISPLAY_SETTINGS_ID: &str = "tray-display-settings";
 const TRAY_MENU_OPEN_CONFIG_DIR_ID: &str = "tray-open-config-dir";
 const TRAY_MENU_OPEN_LOG_ID: &str = "tray-open-log";
 const TRAY_MENU_QUIT_ID: &str = "tray-quit";
+const ENDPOINT_EVENT_RECONNECT_INITIAL_MS: u64 = 250;
+const ENDPOINT_EVENT_RECONNECT_MAX_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Serialize)]
 struct DashboardStatePayload {
@@ -135,9 +193,53 @@ struct LocalControlStreamState {
     task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
-#[derive(Default)]
 struct EndpointEventStreamState {
     task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    generation: AtomicU64,
+    generation_gate: std::sync::Mutex<()>,
+}
+
+impl Default for EndpointEventStreamState {
+    fn default() -> Self {
+        Self {
+            task: std::sync::Mutex::new(None),
+            generation: AtomicU64::new(0),
+            generation_gate: std::sync::Mutex::new(()),
+        }
+    }
+}
+
+impl EndpointEventStreamState {
+    fn next_generation(&self) -> u64 {
+        let _guard = self
+            .generation_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = self.generation.load(Ordering::Relaxed).wrapping_add(1);
+        self.generation.store(next, Ordering::Release);
+        next
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == generation
+    }
+
+    fn emit_if_current<T: Serialize + Clone>(
+        &self,
+        app: &AppHandle,
+        generation: u64,
+        payload: T,
+    ) -> bool {
+        let _guard = self
+            .generation_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.is_current(generation) {
+            return false;
+        }
+        let _ = app.emit("endpoint-event", payload);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +558,65 @@ async fn run_remote_latency_test(device_id: String) -> Result<LocalInputTestResu
         .map_err(|err| err.to_string())
 }
 
+fn endpoint_event_reconnect_delay(failure_count: u32) -> Duration {
+    let shift = failure_count.saturating_sub(1).min(5);
+    let multiplier = 1_u64 << shift;
+    Duration::from_millis(
+        ENDPOINT_EVENT_RECONNECT_INITIAL_MS
+            .saturating_mul(multiplier)
+            .min(ENDPOINT_EVENT_RECONNECT_MAX_MS),
+    )
+}
+
+async fn run_endpoint_events_stream(app: AppHandle, filter: EndpointEventFilter, generation: u64) {
+    let state = app.state::<EndpointEventStreamState>();
+    let mut failure_count = 0_u32;
+
+    loop {
+        if !state.is_current(generation) {
+            return;
+        }
+
+        let mut stream = match daemon_client::subscribe_endpoint_events(filter.clone()).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                if !state.emit_if_current(&app, generation, format!("error:{err}")) {
+                    return;
+                }
+                failure_count = failure_count.saturating_add(1);
+                tokio::time::sleep(endpoint_event_reconnect_delay(failure_count)).await;
+                continue;
+            }
+        };
+
+        loop {
+            if !state.is_current(generation) {
+                return;
+            }
+
+            match daemon_client::read_local_control_event(&mut stream).await {
+                Ok(response @ DaemonResponse::EndpointEvents(_))
+                | Ok(response @ DaemonResponse::EndpointEvent(_))
+                | Ok(response @ DaemonResponse::EndpointInjectResult(_)) => {
+                    if !state.emit_if_current(&app, generation, response) {
+                        return;
+                    }
+                    failure_count = 0;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if !state.emit_if_current(&app, generation, format!("error:{err}")) {
+                        return;
+                    }
+                    failure_count = failure_count.saturating_add(1);
+                    tokio::time::sleep(endpoint_event_reconnect_delay(failure_count)).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
     let state = app.state::<LocalControlStreamState>();
@@ -523,43 +684,24 @@ async fn start_endpoint_events_stream(
     filter: EndpointEventFilter,
 ) -> Result<(), String> {
     let state = app.state::<EndpointEventStreamState>();
-    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+    let mut task_slot = state.task.lock().map_err(|err| err.to_string())?;
+    let generation = state.next_generation();
+    if let Some(task) = task_slot.take() {
         task.abort();
     }
 
-    let app_for_task = app.clone();
-    let task = tauri::async_runtime::spawn(async move {
-        let mut stream = match daemon_client::subscribe_endpoint_events(filter).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                let _ = app_for_task.emit("endpoint-event", format!("error:{err}"));
-                return;
-            }
-        };
-
-        loop {
-            match daemon_client::read_local_control_event(&mut stream).await {
-                Ok(response @ DaemonResponse::EndpointEvents(_))
-                | Ok(response @ DaemonResponse::EndpointEvent(_))
-                | Ok(response @ DaemonResponse::EndpointInjectResult(_)) => {
-                    let _ = app_for_task.emit("endpoint-event", response);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    let _ = app_for_task.emit("endpoint-event", format!("error:{err}"));
-                    break;
-                }
-            }
-        }
-    });
-    *state.task.lock().map_err(|err| err.to_string())? = Some(task);
+    let task =
+        tauri::async_runtime::spawn(run_endpoint_events_stream(app.clone(), filter, generation));
+    *task_slot = Some(task);
     Ok(())
 }
 
 #[tauri::command]
 async fn stop_endpoint_events_stream(app: AppHandle) -> Result<(), String> {
     let state = app.state::<EndpointEventStreamState>();
-    if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
+    let mut task_slot = state.task.lock().map_err(|err| err.to_string())?;
+    state.next_generation();
+    if let Some(task) = task_slot.take() {
         task.abort();
     }
     Ok(())
@@ -982,6 +1124,10 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            send_files,
+            file_transfers,
+            cancel_file_transfer,
+            open_received_files,
             dashboard_state,
             macos_input_permissions,
             request_macos_input_permissions,
@@ -1589,6 +1735,42 @@ mod tests {
             LocalInputTestKind::MouseMove
         );
         assert!(local_input_test_kind_from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn endpoint_event_reconnect_delay_is_exponential_and_bounded() {
+        assert_eq!(
+            endpoint_event_reconnect_delay(1),
+            Duration::from_millis(ENDPOINT_EVENT_RECONNECT_INITIAL_MS)
+        );
+        assert_eq!(
+            endpoint_event_reconnect_delay(2),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            endpoint_event_reconnect_delay(5),
+            Duration::from_millis(4_000)
+        );
+        assert_eq!(
+            endpoint_event_reconnect_delay(6),
+            Duration::from_millis(ENDPOINT_EVENT_RECONNECT_MAX_MS)
+        );
+        assert_eq!(
+            endpoint_event_reconnect_delay(u32::MAX),
+            Duration::from_millis(ENDPOINT_EVENT_RECONNECT_MAX_MS)
+        );
+    }
+
+    #[test]
+    fn endpoint_event_stream_generation_invalidates_previous_workers() {
+        let state = EndpointEventStreamState::default();
+        let first = state.next_generation();
+        assert!(state.is_current(first));
+
+        let second = state.next_generation();
+        assert_ne!(first, second);
+        assert!(!state.is_current(first));
+        assert!(state.is_current(second));
     }
 
     #[test]

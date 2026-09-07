@@ -606,6 +606,14 @@ pub enum DaemonRequest {
     CreateVirtualDisplay(VirtualDisplayCreateRequest),
     RemoveVirtualDisplay(VirtualDisplayRemoveRequest),
     Shutdown,
+    SendFiles {
+        device_id: DeviceId,
+        paths: Vec<String>,
+    },
+    FileTransfers,
+    CancelFileTransfer {
+        transfer_id: DeviceId,
+    },
 }
 
 /// Daemon response over localhost IPC.
@@ -634,6 +642,8 @@ pub enum DaemonResponse {
     PendingPeerApprovals(Vec<PendingPeerApproval>),
     Ack,
     Error(String),
+    FileTransfer(crate::file_transfer::FileTransferSnapshot),
+    FileTransfers(Vec<crate::file_transfer::FileTransferSnapshot>),
 }
 
 /// Get the default localhost IPC socket address.

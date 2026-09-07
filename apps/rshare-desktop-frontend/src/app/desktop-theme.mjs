@@ -11,6 +11,9 @@ export const FIGMA_DESKTOP_THEME = {
   accentSoft: "rgba(91, 139, 214, 0.18)",
   success: "#49b35c",
   danger: "#c53030",
+  statusSuccessText: "#8de29d",
+  statusWarningText: "#e5c37a",
+  statusDangerText: "#ffb5c0",
   gridDot: "rgba(255,255,255,0.08)",
   panelShadow: "0 18px 50px rgba(0,0,0,0.22)",
 };
@@ -28,6 +31,9 @@ export const FIGMA_DESKTOP_LIGHT_THEME = {
   accentSoft: "rgba(77, 126, 214, 0.14)",
   success: "#2f9a48",
   danger: "#c53030",
+  statusSuccessText: "#17652b",
+  statusWarningText: "#765000",
+  statusDangerText: "#9b1c31",
   gridDot: "rgba(0,0,0,0.08)",
   panelShadow: "0 14px 34px rgba(0,0,0,0.08)",
 };

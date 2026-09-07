@@ -22,6 +22,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Prepare Linux workspace build
+      uses: ./.github/actions/prepare-linux-build
+
     # 使用 cargo-audit 检查已知漏洞
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
@@ -97,7 +100,7 @@ jobs:
     - name: Run cargo-deny
       uses: EmbarkStudios/cargo-deny-action@v2
       with:
-        rust-version: "1.85.0"
+        rust-version: "1.94.1"
         command: check
         arguments: --all-features
 
@@ -119,6 +122,9 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Prepare Linux workspace build
+      uses: ./.github/actions/prepare-linux-build
 
     - name: Run Clippy
       run: |

@@ -6,7 +6,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 R-ShareMouse is a cross-platform mouse and keyboard sharing software written in Rust. It allows using one mouse and keyboard across multiple computers with low-latency encrypted communication (QUIC/TLS).
 
-**Current Stage:** Alpha-2 (see `docs/roadmap.md`). The core runtime model is validated via automated tests. Manual dual-machine validation and desktop UI integration are pending.
+**Current Stage:** Alpha-2 (see `docs/roadmap.md`). The core runtime model is validated via automated tests. The Tauri desktop UI consumes daemon snapshots; manual dual-machine acceptance is still pending.
 
 ## Common Commands
 
@@ -14,12 +14,14 @@ R-ShareMouse is a cross-platform mouse and keyboard sharing software written in 
 
 ```bash
 # Build entire workspace
-cargo build --release
+npm ci --prefix apps/rshare-desktop-frontend
+npm run build --prefix apps/rshare-desktop-frontend
+cargo build --workspace --release --locked
 
 # Build specific crate/app
 cargo build -p rshare-daemon
 cargo build -p rshare-cli
-cargo build -p rshare-gui
+cargo build -p rshare-desktop --bin rshare-gui
 
 # Development build (faster)
 cargo build
@@ -52,8 +54,8 @@ cargo run -p rshare-cli -- status
 cargo run -p rshare-cli -- devices
 cargo run -p rshare-cli -- discover
 
-# GUI (egui-based)
-cargo run -p rshare-gui
+# GUI (Tauri-based; build the frontend first)
+cargo run -p rshare-desktop --bin rshare-gui
 ```
 
 ## Architecture
@@ -66,8 +68,8 @@ The project follows a layered architecture with clear separation between core bu
 apps/
   ├── rshare-cli/          # Command-line interface
   ├── rshare-daemon/       # Background daemon service (owns runtime state)
-  ├── rshare-desktop/      # Tauri desktop app
-  └── rshare-gui/          # egui-based GUI
+  ├── rshare-desktop/      # Tauri desktop app (rshare-gui binary)
+  └── rshare-desktop-frontend/ # React/Vite desktop frontend
 
 crates/
   ├── rshare-common/       # Shared types (Direction, ScreenInfo, ButtonState)
@@ -133,7 +135,7 @@ Backend health is tracked separately for capture and injection. Both must be hea
 
 ### IPC Protocol
 
-Local clients (GUI, CLI) communicate with the daemon via newline-delimited JSON over TCP (localhost:27435). See `rshare-core/src/ipc.rs` for the full protocol.
+Local clients (GUI, CLI) communicate over loopback TCP (port 27435) using bounded frames: a 4-byte big-endian payload length, a 1-byte envelope kind, then the payload. JSON is kind 1; binary, UI-state and heartbeat frames have separate kinds. See `crates/rshare-core/src/ipc_frame.rs` and `ipc.rs`. UI state also streams over the loopback WebSocket service on port 27436.
 
 ## Development Guidelines
 
@@ -179,7 +181,7 @@ Per `docs/plans/2026-04-19-alpha-2-full-input-loop-implementation-plan.md`:
 - Core runtime model is complete and tested
 - Daemon uses layout-driven routing
 - Backend health is tracked truthfully
-- Pending: Manual dual-machine validation, desktop UI integration
+- Desktop UI consumes daemon-owned state; pending: manual dual-machine validation
 
 ## Relevant Files
 

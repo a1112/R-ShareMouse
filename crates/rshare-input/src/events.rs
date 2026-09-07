@@ -468,7 +468,9 @@ impl InputEvent {
     #[cfg(target_os = "macos")]
     pub fn from_macos_event(event: rshare_platform::MacosInputEvent) -> Option<Self> {
         match event {
-            rshare_platform::MacosInputEvent::MouseMove { x, y } => Some(Self::mouse_move(x, y)),
+            rshare_platform::MacosInputEvent::MouseMove { x, y, .. } => {
+                Some(Self::mouse_move(x, y))
+            }
             rshare_platform::MacosInputEvent::MouseButton { button, down } => {
                 let state = if down {
                     ButtonState::Pressed

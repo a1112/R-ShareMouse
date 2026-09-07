@@ -19,7 +19,7 @@ use rshare_daemon::state_aggregator::StateAggregator;
 use rshare_input::{
     ButtonState as CaptureButtonState, CaptureOrigin, CaptureSource, CapturedInputPayload,
     ContinuousInput, InjectBackend, InjectionActorConfig, InputEvent, InputInjectionHandle,
-    KeyCode, MouseButton as CaptureMouseButton, PointerSample, PushOutcome, SemanticInputIngress,
+    KeyCode, PointerSample, PushOutcome, SemanticInputIngress,
 };
 use rshare_net::{
     encryption::PeerCertificateFingerprint, handshake::PeerAuthContext, LatestRealtimeReceiver,
@@ -466,6 +466,51 @@ async fn suppression_output_drives_platform_callback_and_clears_on_exit() {
     enter_remote(&producer, &mut runtime).await;
     runtime.handle_command(RouterCommand::QuickReturn);
     assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+}
+
+#[tokio::test]
+async fn physical_relative_return_releases_remote_and_restores_local_input() {
+    let (producer, runtime, transport) = runtime(8);
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = runtime.with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    for (dx, observed_x) in [(20, 99), (-21, 99)] {
+        assert_eq!(
+            producer.try_push(producer.capture(
+                origin(CaptureSource::PortableHook),
+                CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                    PointerSample::Relative {
+                        dx,
+                        dy: 0,
+                        observed_x: Some(observed_x),
+                        observed_y: Some(50),
+                    },
+                )),
+            )),
+            PushOutcome::Enqueued
+        );
+        assert!(runtime.process_next().await);
+    }
+
+    assert_eq!(suppressor.values.lock().unwrap().as_slice(), &[true, false]);
+    assert!(transport.events.lock().unwrap().iter().any(|dispatch| {
+        matches!(
+            dispatch,
+            InputDispatch::Reliable {
+                frame: ReliableInputFrame {
+                    event: ReliableInputEvent::ReleaseAll {
+                        reason: ReleaseAllReason::OwnershipTransfer
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
 }
 
 #[tokio::test]
@@ -926,7 +971,7 @@ async fn windows_filter_overflow_status_maps_to_suspension_epoch_and_targeted_re
     assert_eq!(
         producer.try_push_event(
             origin(CaptureSource::WindowsFilter),
-            InputEvent::mouse_button(CaptureMouseButton::Left, CaptureButtonState::Pressed,),
+            InputEvent::mouse_button(rshare_input::MouseButton::Left, CaptureButtonState::Pressed),
         ),
         PushOutcome::Enqueued
     );
@@ -1508,6 +1553,107 @@ async fn unrelated_peer_disconnect_does_not_close_active_owner() {
 
     shutdown_tx.send(()).unwrap();
     worker.await.unwrap();
+}
+
+#[test]
+fn routed_click_uses_remote_position_even_when_motion_datagrams_are_lost() {
+    #[derive(Debug, Default)]
+    struct PointerState {
+        position: (i32, i32),
+        clicks: Vec<(i32, i32)>,
+    }
+    #[derive(Debug)]
+    struct PointerBackend(Arc<Mutex<PointerState>>);
+    impl InjectBackend for PointerBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+        fn health(&self) -> BackendHealth {
+            BackendHealth::Healthy
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            match event {
+                InputEvent::MouseMove { x, y } => state.position = (x, y),
+                InputEvent::MouseButton {
+                    state: CaptureButtonState::Pressed,
+                    ..
+                } => {
+                    let position = state.position;
+                    state.clicks.push(position);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn inject_relative_pointer(&mut self, dx: i32, dy: i32) -> anyhow::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.position.0 += dx;
+            state.position.1 += dy;
+            Ok(())
+        }
+    }
+
+    for drop_datagrams in [false, true] {
+        let (local, _, mut router) = linked_router();
+        let mut outputs = Vec::new();
+        for input in [
+            rshare_core::RouterInput::absolute_move(99, 40, stamp(1)),
+            rshare_core::RouterInput::relative_move(25, 10, stamp(2)),
+            rshare_core::RouterInput::mouse_button(
+                rshare_core::MouseButton::Left,
+                rshare_core::ButtonState::Pressed,
+                99,
+                40,
+                stamp(3),
+            ),
+        ] {
+            outputs.extend(router.handle(RouterCommand::Input(input)));
+        }
+        let state = Arc::new(Mutex::new(PointerState::default()));
+        let injection = InputInjectionHandle::spawn(
+            Box::new(PointerBackend(state.clone())),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = rshare_core::AuthenticatedInputOwner {
+            peer_id: local,
+            control_connection_id: ControlConnectionId::new(),
+        };
+        injection
+            .begin_session(owner, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        for output in outputs {
+            let (epoch, reliable, sequence) = match output {
+                rshare_core::RouterOutput::SendReliable { frame, .. } => {
+                    let stamp = (frame.session_epoch, true, frame.sequence);
+                    injection.try_submit_reliable(owner, frame).unwrap();
+                    stamp
+                }
+                rshare_core::RouterOutput::SendRealtime { frame, .. } if !drop_datagrams => {
+                    let stamp = (frame.session_epoch, false, frame.sequence);
+                    assert_eq!(
+                        injection.submit_realtime(owner, frame),
+                        rshare_input::RealtimeSubmitResult::Accepted
+                    );
+                    stamp
+                }
+                _ => continue,
+            };
+            assert!(injection
+                .wait_for_timing(epoch, reliable, sequence, Duration::from_secs(1))
+                .is_some());
+        }
+        assert_eq!(
+            state.lock().unwrap().clicks,
+            [(25, 50)],
+            "drop_datagrams={drop_datagrams}"
+        );
+        injection.shutdown().unwrap();
+    }
 }
 
 #[test]

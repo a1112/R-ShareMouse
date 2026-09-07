@@ -10,6 +10,7 @@ pub mod daemon_client;
 pub mod device;
 pub mod endpoint_events;
 pub mod engine;
+pub mod file_transfer;
 pub mod hardware_assets;
 pub mod input;
 pub mod input_mode;

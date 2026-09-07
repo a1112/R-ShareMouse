@@ -1,0 +1,25 @@
+name: Prepare Linux workspace build
+description: Install native input/audio/Tauri libraries and build the embedded frontend.
+runs:
+  using: composite
+  steps:
+    - name: Install Linux native dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+          libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+          libxtst-dev libxrandr-dev libxi-dev libudev-dev libasound2-dev
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .node-version
+        cache: npm
+        cache-dependency-path: apps/rshare-desktop-frontend/package-lock.json
+    - name: Install locked frontend dependencies
+      shell: bash
+      run: npm ci --prefix apps/rshare-desktop-frontend
+    - name: Build embedded frontend
+      shell: bash
+      run: npm --prefix apps/rshare-desktop-frontend run build

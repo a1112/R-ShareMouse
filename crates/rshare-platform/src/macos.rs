@@ -219,13 +219,35 @@ mod macos_impl {
         LOCAL_INPUT_SUPPRESSED.store(enabled, Ordering::Release);
     }
 
+    /// Report whether physical local events are currently suppressed because
+    /// a remote control session owns the pointer. The native listener uses
+    /// this to preserve CoreGraphics' raw mouse deltas while the OS cursor is
+    /// clamped at the local screen edge.
+    pub fn macos_local_input_suppressed() -> bool {
+        LOCAL_INPUT_SUPPRESSED.load(Ordering::Acquire)
+    }
+
     /// Input event captured by the native macOS listener.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum MacosInputEvent {
-        MouseMove { x: i32, y: i32 },
-        MouseButton { button: u8, down: bool },
-        MouseWheel { delta_x: i32, delta_y: i32 },
-        Key { keycode: u32, down: bool },
+        MouseMove {
+            x: i32,
+            y: i32,
+            delta_x: i32,
+            delta_y: i32,
+        },
+        MouseButton {
+            button: u8,
+            down: bool,
+        },
+        MouseWheel {
+            delta_x: i32,
+            delta_y: i32,
+        },
+        Key {
+            keycode: u32,
+            down: bool,
+        },
     }
 
     /// Read-only status for a running macOS input listener.
@@ -811,8 +833,20 @@ mod macos_impl {
             | CGEventType::OtherMouseDragged => {
                 let pos = event.location();
                 Some(MacosInputEvent::MouseMove {
-                    x: pos.x.round() as i32,
-                    y: pos.y.round() as i32,
+                    // CoreGraphics display bounds are half-open CGFloat
+                    // rectangles. Flooring preserves that contract near the
+                    // maximum edge; rounding could turn 1727.6 into the
+                    // out-of-range coordinate 1728 and miss edge routing.
+                    x: quantize_cg_coordinate(pos.x),
+                    y: quantize_cg_coordinate(pos.y),
+                    delta_x: event
+                        .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X)
+                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                        as i32,
+                    delta_y: event
+                        .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y)
+                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                        as i32,
                 })
             }
             CGEventType::LeftMouseDown => Some(MacosInputEvent::MouseButton {
@@ -871,6 +905,12 @@ mod macos_impl {
             }),
             _ => None,
         }
+    }
+
+    fn quantize_cg_coordinate(value: f64) -> i32 {
+        value
+            .floor()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
     }
 
     fn modifier_flags_changed_down(keycode: u32, flags: u64, state: &mut ModifierState) -> bool {
@@ -1303,19 +1343,15 @@ mod macos_impl {
 
     pub fn screen_info_from_bounds(
         bounds: CGRect,
-        pixels_wide: u64,
-        pixels_high: u64,
+        _pixels_wide: u64,
+        _pixels_high: u64,
     ) -> ScreenInfo {
-        let width = if pixels_wide > 0 {
-            pixels_wide as u32
-        } else {
-            bounds.size.width.round().max(0.0) as u32
-        };
-        let height = if pixels_high > 0 {
-            pixels_high as u32
-        } else {
-            bounds.size.height.round().max(0.0) as u32
-        };
+        // CGDisplay bounds and CGEvent locations are both expressed in the
+        // logical point coordinate space. `pixels_wide`/`pixels_high` are
+        // backing-pixel dimensions (for example, 3456x2234 on a Retina Mac)
+        // and must not be used for pointer routing geometry.
+        let width = bounds.size.width.round().max(0.0) as u32;
+        let height = bounds.size.height.round().max(0.0) as u32;
 
         ScreenInfo::new(
             bounds.origin.x.round() as i32,
@@ -1563,13 +1599,53 @@ mod macos_impl {
         }
 
         #[test]
-        fn converts_display_bounds_to_screen_info() {
+        fn screen_info_uses_logical_event_coordinate_bounds_not_retina_pixels() {
             let bounds = CGRect::new(&CGPoint::new(-1440.0, 0.0), &CGSize::new(1440.0, 900.0));
             let screen = screen_info_from_bounds(bounds, 2880, 1800);
             assert_eq!(screen.x, -1440);
             assert_eq!(screen.y, 0);
-            assert_eq!(screen.width, 2880);
-            assert_eq!(screen.height, 1800);
+            // CGEvent locations are expressed in logical points. Retina pixel
+            // dimensions must not widen the routing geometry beyond the event
+            // coordinate domain.
+            assert_eq!(screen.width, 1440);
+            assert_eq!(screen.height, 900);
+        }
+
+        #[test]
+        fn cg_event_coordinate_quantization_stays_inside_half_open_display_edge() {
+            assert_eq!(quantize_cg_coordinate(1727.999), 1727);
+            assert_eq!(quantize_cg_coordinate(-0.001), -1);
+            assert_eq!(quantize_cg_coordinate(500.75), 500);
+        }
+
+        #[test]
+        fn mouse_capture_preserves_core_graphics_relative_delta() {
+            let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+            let event = CGEvent::new_mouse_event(
+                source,
+                CGEventType::MouseMoved,
+                CGPoint::new(1727.0, 500.0),
+                CGMouseButton::Left,
+            )
+            .unwrap();
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 23);
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, -4);
+
+            let converted = convert_cg_event(
+                CGEventType::MouseMoved,
+                &event,
+                &mut ModifierState::default(),
+            );
+
+            assert_eq!(
+                converted,
+                Some(MacosInputEvent::MouseMove {
+                    x: 1727,
+                    y: 500,
+                    delta_x: 23,
+                    delta_y: -4,
+                })
+            );
         }
 
         #[test]

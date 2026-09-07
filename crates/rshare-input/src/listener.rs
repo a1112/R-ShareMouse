@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 use crate::events::{ButtonState, InputEvent, KeyCode, MouseButton};
 use crate::ingress::{
     CaptureOrigin, CaptureSource, CapturedInputPayload, ContinuousInput, IngressFault,
-    IngressStats, PushOutcome, SemanticInputConsumer, SemanticInputIngress, SemanticInputProducer,
+    IngressStats, PointerSample, PushOutcome, SemanticInputConsumer, SemanticInputIngress,
+    SemanticInputProducer,
 };
 
 const DEFAULT_INPUT_INGRESS_CAPACITY: usize = 128;
@@ -632,8 +633,77 @@ impl Default for DefaultInputListener {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn captured_payload_from_macos_event(
+    event: rshare_platform::MacosInputEvent,
+) -> Option<CapturedInputPayload> {
+    captured_payload_from_macos_event_with_suppression(
+        event,
+        rshare_platform::macos_local_input_suppressed(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn captured_payload_from_macos_event_with_suppression(
+    event: rshare_platform::MacosInputEvent,
+    suppressed: bool,
+) -> Option<CapturedInputPayload> {
+    match event {
+        rshare_platform::MacosInputEvent::MouseMove {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } if suppressed => Some(CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+            PointerSample::Relative {
+                dx: delta_x,
+                dy: delta_y,
+                observed_x: Some(x),
+                observed_y: Some(y),
+            },
+        ))),
+        rshare_platform::MacosInputEvent::MouseMove { x, y, .. } => {
+            Some(CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                PointerSample::Absolute { x, y },
+            )))
+        }
+        event => InputEvent::from_macos_event(event).map(CapturedInputPayload::from_input_event),
+    }
+}
+
 #[cfg(all(target_os = "macos", not(test)))]
 impl DefaultInputListener {
+    /// Start the native listener while retaining CoreGraphics' raw mouse
+    /// deltas for the remote-active, edge-clamped state.
+    pub fn start_with_captured_input_and_fault(
+        &mut self,
+        callback: Box<dyn Fn(CapturedInputPayload) + Send>,
+        fault_callback: Arc<dyn Fn(IngressFault) + Send + Sync>,
+    ) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+
+        use std::sync::Mutex as StdMutex;
+
+        tracing::info!("Input listener starting (using native macOS CGEventTap)");
+        let callback = Arc::new(StdMutex::new(callback));
+        let mut listener = rshare_platform::MacosInputListener::new();
+        listener.start_with_callback_and_fault(
+            move |event| {
+                if let Some(payload) = captured_payload_from_macos_event(event) {
+                    if let Ok(callback) = callback.lock() {
+                        callback(payload);
+                    }
+                }
+            },
+            move || fault_callback(IngressFault::CaptureDiscontinuity),
+        )?;
+        self.macos_listener = Some(listener);
+        self.running = true;
+        Ok(())
+    }
+
     /// Start the native macOS listener and surface tap discontinuities through
     /// the semantic ingress fault lane.
     pub fn start_with_fault(
@@ -885,6 +955,48 @@ mod tests {
         let callback = Box::new(|_event| {});
         let result = listener.start(callback);
         assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_remote_capture_keeps_raw_delta_when_location_is_clamped() {
+        let local = captured_payload_from_macos_event_with_suppression(
+            rshare_platform::MacosInputEvent::MouseMove {
+                x: 1727,
+                y: 500,
+                delta_x: 0,
+                delta_y: 0,
+            },
+            false,
+        )
+        .expect("local macOS move should be captured");
+        assert!(matches!(
+            local,
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x: 1727,
+                y: 500
+            }))
+        ));
+
+        let remote = captured_payload_from_macos_event_with_suppression(
+            rshare_platform::MacosInputEvent::MouseMove {
+                x: 1727,
+                y: 500,
+                delta_x: 23,
+                delta_y: -4,
+            },
+            true,
+        )
+        .expect("remote macOS move should be captured");
+        assert!(matches!(
+            remote,
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+                dx: 23,
+                dy: -4,
+                observed_x: Some(1727),
+                observed_y: Some(500),
+            }))
+        ));
     }
 
     #[cfg(target_os = "windows")]

@@ -2,6 +2,15 @@
 
 This package is the macOS driver-side counterpart to `rshare_platform::virtual_display`.
 
+Workspace integration status (reviewed 2026-09-05): the C++ driver source passes
+the SDK syntax and static analysis checks, but the Rust macOS user-client bridge
+and CLI `display virtual driver-status` command are not implemented in this
+checkout. The public Rust create/remove operations return `Unsupported` on
+macOS. The integration contract test remains failing and records this gap.
+The daemon/CLI validation steps below describe the intended integration; they
+are not currently executable acceptance instructions. Driver signing, loading
+and a real display-topology test are separate outstanding gates.
+
 The current implementation targets the public IOGraphics kernel API:
 
 - `RShareMacVirtualDisplay` subclasses `IOFramebuffer` so the service can become part of the macOS display topology.

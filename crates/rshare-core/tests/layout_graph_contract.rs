@@ -531,7 +531,7 @@ fn route_cache_indexes_four_connected_directional_targets() {
 }
 
 #[test]
-fn route_cache_preserves_target_monitor_offsets_relative_to_node_bounds() {
+fn route_cache_preserves_target_monitor_offsets_relative_to_primary_display() {
     let local = Uuid::new_v4();
     let target = Uuid::new_v4();
     let mut graph = LayoutGraph::new(local);
@@ -563,5 +563,8 @@ fn route_cache_preserves_target_monitor_offsets_relative_to_node_bounds() {
     let cache = RouteCache::build(&graph, local, &HashSet::from([target]), 1);
     let route = cache.route(Direction::Right).unwrap();
 
-    assert_eq!(route.display, PixelRect::new(1920, 0, 2560, 1440));
+    // Target injection backends use the OS virtual-desktop coordinate domain,
+    // where the primary display is anchored at (0, 0) and a display to its
+    // left has negative X. Shared/global placement must not shift that domain.
+    assert_eq!(route.display, PixelRect::new(0, 0, 2560, 1440));
 }

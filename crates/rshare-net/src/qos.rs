@@ -139,6 +139,7 @@ impl TryFrom<Message> for ClassifiedMessage {
             | Message::UsbTransferCancel { .. }
             | Message::UsbFlowControl { .. }
             | Message::ClipboardData { .. }
+            | Message::FileTransfer(_)
             | Message::ClipboardResponse { .. }) => Self::Bulk(BulkFrame { message }),
             Message::Hello { .. } | Message::HelloBack { .. } | Message::HelloRejected { .. } => {
                 Self::Unsupported
@@ -1007,6 +1008,11 @@ impl ControlFrame {
 }
 
 impl BulkFrame {
+    pub fn file_transfer(packet: rshare_core::file_transfer::FileTransferPacket) -> Self {
+        Self {
+            message: Message::FileTransfer(packet),
+        }
+    }
     pub fn audio_stream_stop(stream_id: uuid::Uuid, reason: String) -> Self {
         Self {
             message: Message::AudioStreamStop { stream_id, reason },
@@ -1560,6 +1566,8 @@ async fn send_awaited<T>(
 
 #[derive(Clone)]
 pub struct RegisteredPeer {
+    pub folder_drop_version: u16,
+    pub file_transfer_version: u16,
     pub auth: Arc<PeerAuthContext>,
     pub transport: PeerTransportHandle,
 }
@@ -1877,6 +1885,8 @@ fn registered_peer_fixture(
 ) -> RegisteredPeer {
     let (transport, _probe, _releases) = fixture_handle(1);
     RegisteredPeer {
+        folder_drop_version: 0,
+        file_transfer_version: 0,
         auth: fixture_auth(peer_id, connection_id),
         transport,
     }
@@ -1964,6 +1974,8 @@ fn fixture_registry_with_slow_and_fast_peers() -> (
     registry.insert(
         slow_id,
         RegisteredPeer {
+            folder_drop_version: 0,
+            file_transfer_version: 0,
             auth: slow.auth(),
             transport: slow.clone(),
         },
@@ -1971,6 +1983,8 @@ fn fixture_registry_with_slow_and_fast_peers() -> (
     registry.insert(
         fast_id,
         RegisteredPeer {
+            folder_drop_version: 0,
+            file_transfer_version: 0,
             auth: fast.auth(),
             transport: fast.clone(),
         },

@@ -314,12 +314,9 @@ async fn stream_ui_state(
 async fn next_ui_state_client_message(
     websocket: &mut WebSocketStream<TcpStream>,
 ) -> Result<UiStateClientMessage> {
-    loop {
-        match decode_ui_state_client_message(websocket.next().await).await? {
-            Some(message) => return Ok(message),
-            None => bail!("websocket closed before UI subscription"),
-        }
-    }
+    decode_ui_state_client_message(websocket.next().await)
+        .await?
+        .context("websocket closed before UI subscription")
 }
 
 async fn decode_ui_state_client_message(

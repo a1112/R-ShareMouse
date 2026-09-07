@@ -436,6 +436,8 @@ async fn run_loopback_once_started(
     registry.insert(
         fast_id,
         RegisteredPeer {
+            folder_drop_version: 0,
+            file_transfer_version: 0,
             auth: fast_sender_auth,
             transport: fast_transport.clone(),
         },
@@ -492,6 +494,8 @@ async fn run_loopback_once_started(
         registry.insert(
             id,
             RegisteredPeer {
+                folder_drop_version: 0,
+                file_transfer_version: 0,
                 auth: slow_sender_auth,
                 transport: slow_transport.clone(),
             },

@@ -6,6 +6,7 @@ import net from 'node:net'
 import { spawn } from 'node:child_process'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
+import { daemonBridgeGuard } from './src/app/dev-bridge-security.mjs'
 import {
   IPC_ENVELOPE_KIND,
   IpcFrameDecoder,
@@ -342,6 +343,7 @@ function rshareDaemonBridge() {
   return {
     name: 'rshare-daemon-bridge',
     configureServer(server: import('vite').ViteDevServer) {
+      server.middlewares.use('/__rshare', daemonBridgeGuard)
       server.middlewares.use('/__rshare/ipc', async (request, response, next) => {
         if (request.method !== 'POST') {
           next()

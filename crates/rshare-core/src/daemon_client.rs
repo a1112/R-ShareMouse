@@ -87,6 +87,33 @@ pub async fn request_devices() -> Result<Vec<DaemonDeviceSnapshot>> {
     }
 }
 
+pub async fn request_send_files(
+    device_id: crate::DeviceId,
+    paths: Vec<String>,
+) -> Result<crate::file_transfer::FileTransferSnapshot> {
+    match send_request(DaemonRequest::SendFiles { device_id, paths }).await? {
+        DaemonResponse::FileTransfer(value) => Ok(value),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_file_transfers() -> Result<Vec<crate::file_transfer::FileTransferSnapshot>> {
+    match send_request(DaemonRequest::FileTransfers).await? {
+        DaemonResponse::FileTransfers(value) => Ok(value),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_cancel_file_transfer(transfer_id: crate::DeviceId) -> Result<()> {
+    match send_request(DaemonRequest::CancelFileTransfer { transfer_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
 pub async fn request_capabilities(
     device_id: Option<DeviceId>,
 ) -> Result<CapabilityRegistrySnapshot> {

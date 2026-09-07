@@ -1110,6 +1110,12 @@ impl ConnectionManager {
                         qos_registry.insert(
                             device_id,
                             RegisteredPeer {
+                                folder_drop_version: negotiated
+                                    .transport_capabilities
+                                    .folder_drop_version,
+                                file_transfer_version: negotiated
+                                    .transport_capabilities
+                                    .file_transfer_version,
                                 auth: auth.clone(),
                                 transport: qos_transport,
                             },
@@ -1325,6 +1331,10 @@ impl ConnectionManager {
                 self.qos_registry.insert(
                     device_id,
                     RegisteredPeer {
+                        folder_drop_version: negotiated.transport_capabilities.folder_drop_version,
+                        file_transfer_version: negotiated
+                            .transport_capabilities
+                            .file_transfer_version,
                         auth: auth.clone(),
                         transport: qos_transport,
                     },
@@ -1880,6 +1890,8 @@ mod tests {
         manager.qos_registry.insert(
             peer_id,
             RegisteredPeer {
+                folder_drop_version: 0,
+                file_transfer_version: 0,
                 auth: client_auth,
                 transport: old_transport.clone(),
             },
@@ -1939,6 +1951,8 @@ mod tests {
         registry.insert(
             peer_id,
             RegisteredPeer {
+                folder_drop_version: 0,
+                file_transfer_version: 0,
                 auth: Arc::new(crate::handshake::PeerAuthContext {
                     peer_id,
                     certificate_fingerprint:

@@ -287,10 +287,11 @@ impl DiagnosticsHandle {
         self.subscribers.clear_generation(id)
     }
 
-    /// Enqueues a low-frequency discrete diagnostic without awaiting a sink.
+    /// Enqueues a low-frequency or already-sampled diagnostic without awaiting
+    /// a sink. The capture bridge coalesces continuous input before it reaches
+    /// this queue; reliable input events remain discrete.
     ///
-    /// The oldest pending item is discarded on saturation. Input events never
-    /// use this queue; their metrics stay in `ControlMetrics`.
+    /// The oldest pending item is discarded on saturation.
     pub fn record_discrete(&self, event: LocalInputDiagnosticEvent) -> bool {
         let mut discrete = self
             .discrete

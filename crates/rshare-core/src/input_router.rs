@@ -5,7 +5,7 @@ use smallvec::{smallvec, SmallVec};
 use crate::{
     ButtonState, CaptureSessionStateMachine, ControlSessionState, DeviceId, Direction,
     GamepadButton, GamepadDeviceInfo, KeyState, LayoutGraph, MonotonicStamp, MouseButton,
-    PendingReleaseBatch, PressedStateLedger, RealtimeInputFrame, RealtimeInputPayload,
+    PendingReleaseBatch, PixelRect, PressedStateLedger, RealtimeInputFrame, RealtimeInputPayload,
     ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, RouteCache, SessionEpoch,
     VirtualDesktopGeometry, INPUT_PROTOCOL_VERSION,
 };
@@ -245,11 +245,21 @@ pub struct InputRouter {
     pending_release: Option<PendingReleaseBatch>,
     last_captured_at: MonotonicStamp,
     last_absolute: Option<(i32, i32)>,
+    remote_pointer: Option<RemotePointerState>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct EmergencyReleaseStatus {
     ledger_fault: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemotePointerState {
+    target: DeviceId,
+    display: PixelRect,
+    entry_edge: Direction,
+    x: i32,
+    y: i32,
 }
 
 impl InputRouter {
@@ -277,6 +287,7 @@ impl InputRouter {
             pending_release: None,
             last_captured_at: MonotonicStamp::new(crate::ClockDomainId(0), 0),
             last_absolute: None,
+            remote_pointer: None,
         }
     }
 
@@ -328,7 +339,7 @@ impl InputRouter {
                 dx,
                 dy,
                 captured_at,
-            } => self.send_relative(dx, dy, captured_at),
+            } => self.handle_relative_move(dx, dy, captured_at),
             RouterInput::Key {
                 keycode,
                 state,
@@ -356,6 +367,13 @@ impl InputRouter {
                 let Some(target) = self.session.active_target() else {
                     return SmallVec::new();
                 };
+                // Capture coordinates belong to the source desktop, whose
+                // cursor may be clamped at an edge while sharing. The reliable
+                // fallback must carry the target desktop's tracked position.
+                let (x, y) = self
+                    .remote_pointer
+                    .filter(|pointer| pointer.target == target)
+                    .map_or((x, y), |pointer| (pointer.x, pointer.y));
                 if self
                     .pressed
                     .record_mouse_button(button, state, x, y, self.latest_anchor_sequence)
@@ -476,7 +494,7 @@ impl InputRouter {
         if self.session.is_remote_active() {
             let previous = self.last_absolute.replace((x, y));
             return previous.map_or_else(SmallVec::new, |(previous_x, previous_y)| {
-                self.send_relative(
+                self.handle_relative_move(
                     x.saturating_sub(previous_x),
                     y.saturating_sub(previous_y),
                     captured_at,
@@ -543,6 +561,13 @@ impl InputRouter {
             return self.handle_counter_exhausted(target);
         };
         self.latest_anchor_sequence = anchor_sequence;
+        self.remote_pointer = Some(RemotePointerState {
+            target,
+            display,
+            entry_edge,
+            x: target_x,
+            y: target_y,
+        });
         let anchor = RealtimeInputFrame {
             protocol_version: INPUT_PROTOCOL_VERSION,
             session_epoch: self.epoch,
@@ -565,6 +590,66 @@ impl InputRouter {
             RouterOutput::LocalSessionChanged(self.session.state()),
             RouterOutput::SuppressLocalShortcuts(true),
         ]
+    }
+
+    fn handle_relative_move(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        captured_at: MonotonicStamp,
+    ) -> SmallVec<[RouterOutput; 4]> {
+        let Some(target) = self.session.active_target() else {
+            return SmallVec::new();
+        };
+        let Some(pointer) = self
+            .remote_pointer
+            .filter(|pointer| pointer.target == target)
+        else {
+            return self.send_relative(dx, dy, captured_at);
+        };
+
+        let candidate_x = i64::from(pointer.x) + i64::from(dx);
+        let candidate_y = i64::from(pointer.y) + i64::from(dy);
+        let crossed_return_edge = match pointer.entry_edge {
+            Direction::Left => candidate_x < i64::from(pointer.display.x),
+            Direction::Right => candidate_x > i64::from(pointer.display.last_x()),
+            Direction::Top => candidate_y < i64::from(pointer.display.y),
+            Direction::Bottom => candidate_y > i64::from(pointer.display.last_y()),
+        };
+        let next_x = candidate_x
+            .clamp(
+                i64::from(pointer.display.x),
+                i64::from(pointer.display.last_x()),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let next_y = candidate_y
+            .clamp(
+                i64::from(pointer.display.y),
+                i64::from(pointer.display.last_y()),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let bounded_dx = next_x.saturating_sub(pointer.x);
+        let bounded_dy = next_y.saturating_sub(pointer.y);
+        self.remote_pointer = Some(RemotePointerState {
+            x: next_x,
+            y: next_y,
+            ..pointer
+        });
+
+        if !crossed_return_edge {
+            // The target injector owns ordinary desktop-bound clamping. Keep the
+            // tracked position bounded for return-edge detection, but preserve
+            // the captured raw delta so movement parallel to (or away from) a
+            // non-return edge is never discarded.
+            return self.send_relative(dx, dy, captured_at);
+        }
+
+        let mut outputs = SmallVec::new();
+        if bounded_dx != 0 || bounded_dy != 0 {
+            outputs.extend(self.send_relative(bounded_dx, bounded_dy, captured_at));
+        }
+        outputs.extend(self.return_to_local(ReleaseAllReason::OwnershipTransfer));
+        outputs
     }
 
     fn send_relative(
@@ -592,6 +677,13 @@ impl InputRouter {
         let Some(sequence) = self.take_realtime_sequence() else {
             return self.handle_counter_exhausted(target);
         };
+        if matches!(
+            payload,
+            RealtimeInputPayload::RelativeMouse { .. }
+                | RealtimeInputPayload::AbsoluteAnchor { .. }
+        ) {
+            self.latest_anchor_sequence = sequence;
+        }
         smallvec![RouterOutput::SendRealtime {
             target,
             frame: RealtimeInputFrame {
@@ -652,9 +744,18 @@ impl InputRouter {
             .route(entered_via)
             .is_some_and(|route| route.device_id == target)
         {
+            if let Some(route) = self.routes.route(entered_via) {
+                if let Some(pointer) = self.remote_pointer.as_mut() {
+                    pointer.display = route.display;
+                    pointer.entry_edge = route.entry_edge;
+                    pointer.x = pointer.x.clamp(route.display.x, route.display.last_x());
+                    pointer.y = pointer.y.clamp(route.display.y, route.display.last_y());
+                }
+            }
             return rebuilt;
         }
 
+        self.remote_pointer = None;
         let mut outputs = SmallVec::new();
         let release =
             self.push_emergency_release(&mut outputs, target, ReleaseAllReason::Suspended);
@@ -687,6 +788,7 @@ impl InputRouter {
         let mut outputs = SmallVec::new();
         let mut ledger_fault = false;
         if !connected && active_target == Some(peer) {
+            self.remote_pointer = None;
             ledger_fault = self
                 .push_emergency_release(&mut outputs, peer, ReleaseAllReason::Suspended)
                 .ledger_fault;
@@ -705,6 +807,7 @@ impl InputRouter {
 
     fn handle_backend_degraded(&mut self) -> SmallVec<[RouterOutput; 4]> {
         let active_target = self.session.active_target();
+        self.remote_pointer = None;
         let mut outputs = SmallVec::new();
         let mut ledger_fault = false;
         if let Some(target) = active_target {
@@ -725,6 +828,7 @@ impl InputRouter {
         let Some(target) = self.session.active_target() else {
             return SmallVec::new();
         };
+        self.remote_pointer = None;
         let return_edge = match self.session.state() {
             ControlSessionState::RemoteActive { entered_via, .. } => entered_via.opposite(),
             _ => return SmallVec::new(),
@@ -785,6 +889,7 @@ impl InputRouter {
     }
 
     fn handle_pressed_ledger_fault(&mut self, target: DeviceId) -> SmallVec<[RouterOutput; 4]> {
+        self.remote_pointer = None;
         let mut outputs = SmallVec::new();
         self.push_emergency_release(&mut outputs, target, ReleaseAllReason::Suspended);
         self.session.on_backend_degraded();
@@ -814,6 +919,7 @@ impl InputRouter {
     }
 
     fn handle_counter_exhausted(&mut self, target: DeviceId) -> SmallVec<[RouterOutput; 4]> {
+        self.remote_pointer = None;
         let mut outputs = SmallVec::new();
         self.push_emergency_release(&mut outputs, target, ReleaseAllReason::Suspended);
         self.session.on_backend_degraded();
@@ -959,6 +1065,41 @@ mod tests {
                     },
                 }) if *actual_target == target && (*x, *y) == projected
             ));
+        }
+    }
+
+    #[test]
+    fn half_open_right_and_bottom_coordinates_still_enter_remote_session() {
+        let cases = [
+            (Direction::Right, Direction::Left, (1920, 540)),
+            (Direction::Bottom, Direction::Top, (960, 1080)),
+        ];
+
+        for (from_edge, target_edge, point) in cases {
+            let (mut router, _, target) = linked_router(
+                PixelRect::new(0, 0, 1920, 1080),
+                from_edge,
+                target_edge,
+                PixelRect::new(0, 0, 2560, 1440),
+            );
+
+            let outputs = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+                point.0,
+                point.1,
+                stamp(10),
+            )));
+
+            assert!(matches!(
+                outputs.first(),
+                Some(RouterOutput::SendReliable {
+                    target: actual_target,
+                    frame: ReliableInputFrame {
+                        event: ReliableInputEvent::Enter { .. },
+                        ..
+                    },
+                }) if *actual_target == target
+            ));
+            assert!(router.session.is_remote_active());
         }
     }
 
@@ -1118,6 +1259,124 @@ mod tests {
     }
 
     #[test]
+    fn raw_relative_motion_continues_after_the_source_cursor_is_clamped() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 2560, 1440),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            700,
+            stamp(10),
+        )));
+
+        for sequence in 11..=13 {
+            let moved = router.handle(RouterCommand::Input(RouterInput::relative_move(
+                8,
+                0,
+                stamp(sequence),
+            )));
+            assert!(matches!(
+                moved.as_slice(),
+                [RouterOutput::SendRealtime {
+                    target: actual_target,
+                    frame: RealtimeInputFrame {
+                        payload: RealtimeInputPayload::RelativeMouse { dx: 8, dy: 0 },
+                        ..
+                    },
+                }] if *actual_target == target
+            ));
+        }
+    }
+
+    #[test]
+    fn crossing_back_through_remote_entry_edge_returns_physical_ownership() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 2560, 1440),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            700,
+            stamp(10),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            100,
+            0,
+            stamp(11),
+        )));
+        let _ = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -99,
+            0,
+            stamp(12),
+        )));
+
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -2,
+            0,
+            stamp(13),
+        )));
+
+        assert!(matches!(
+            returned.as_slice(),
+            [
+                RouterOutput::SendRealtime {
+                    target: move_target,
+                    frame: RealtimeInputFrame {
+                        payload: RealtimeInputPayload::RelativeMouse { dx: -1, dy: 0 },
+                        ..
+                    },
+                },
+                RouterOutput::EmergencyReleaseAll {
+                    target: release_target,
+                    ..
+                },
+                RouterOutput::LocalSessionChanged(ControlSessionState::LocalReady),
+                RouterOutput::SuppressLocalShortcuts(false),
+            ] if *move_target == target && *release_target == target
+        ));
+        assert!(router.session.is_local_ready());
+        assert!(router.remote_pointer.is_none());
+    }
+
+    #[test]
+    fn remote_pointer_tracks_non_return_edge_without_clamping_forwarded_delta() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 2560, 1440),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            700,
+            stamp(10),
+        )));
+
+        let moved = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            3000,
+            0,
+            stamp(11),
+        )));
+
+        assert!(matches!(
+            moved.as_slice(),
+            [RouterOutput::SendRealtime {
+                target: actual_target,
+                frame: RealtimeInputFrame {
+                    payload: RealtimeInputPayload::RelativeMouse { dx: 3000, dy: 0 },
+                    ..
+                },
+            }] if *actual_target == target
+        ));
+        assert!(router.session.is_remote_active());
+    }
+
+    #[test]
     fn quick_return_emits_release_all_before_local_ownership_and_keeps_ledger_pending() {
         let (mut router, _, target) = linked_router(
             PixelRect::new(0, 0, 1920, 1080),
@@ -1271,6 +1530,93 @@ mod tests {
     }
 
     #[test]
+    fn remote_click_uses_target_position_and_latest_pointer_sequence() {
+        let (mut router, _, _) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(-1280, -200, 1280, 1080),
+        );
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        router.handle(RouterCommand::Input(RouterInput::relative_move(
+            120,
+            25,
+            stamp(2),
+        )));
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let outputs = router.handle(RouterCommand::Input(RouterInput::mouse_button(
+                MouseButton::Left,
+                state,
+                1919,
+                500,
+                stamp(3),
+            )));
+            assert!(
+                matches!(
+                    outputs.as_slice(),
+                    [RouterOutput::SendReliable {
+                        frame: ReliableInputFrame {
+                            event: ReliableInputEvent::MouseButton {
+                                x: 120,
+                                y: 525,
+                                realtime_anchor_sequence: 1,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }]
+                ),
+                "click must use the remote cursor and movement anchor: {outputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_click_at_entry_uses_target_position_even_without_motion() {
+        let (mut router, _, _) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let outputs = router.handle(RouterCommand::Input(RouterInput::mouse_button(
+            MouseButton::Left,
+            ButtonState::Pressed,
+            1919,
+            500,
+            stamp(2),
+        )));
+        assert!(
+            matches!(
+                outputs.as_slice(),
+                [RouterOutput::SendReliable {
+                    frame: ReliableInputFrame {
+                        event: ReliableInputEvent::MouseButton {
+                            x: 0,
+                            y: 500,
+                            realtime_anchor_sequence: 0,
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }]
+            ),
+            "a lost entry datagram must not move the click to the local edge: {outputs:?}"
+        );
+    }
+
+    #[test]
     fn normal_motion_never_rebuilds_routes_and_duplicate_updates_are_noops() {
         let (mut router, _, target) = linked_router(
             PixelRect::new(0, 0, 1920, 1080),
@@ -1335,6 +1681,43 @@ mod tests {
                     event: ReliableInputEvent::Enter { x: 0, .. },
                     ..
                 },
+            }) if *actual_target == target
+        ));
+    }
+
+    #[test]
+    fn layout_change_keeps_local_capture_bounds_when_shared_node_is_offset() {
+        let local = crate::DeviceId::new_v4();
+        let target = crate::DeviceId::new_v4();
+        let mut shared = LayoutGraph::new(local);
+        shared.add_node(LayoutNode::new(local, 3642, 180, 1728, 1117));
+        shared.add_node(LayoutNode::new(target, 5370, 180, 1920, 1080));
+        shared.add_link(LayoutLink::new(
+            local,
+            Direction::Right,
+            target,
+            Direction::Left,
+        ));
+
+        let mut router = InputRouter::new(
+            local,
+            shared.clone(),
+            VirtualDesktopGeometry::new(PixelRect::new(0, 0, 1728, 1117)),
+            [target],
+        );
+        router.handle(RouterCommand::LayoutChanged(shared));
+
+        assert_eq!(router.geometry.bounds(), PixelRect::new(0, 0, 1728, 1117));
+        let outputs = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1727,
+            500,
+            stamp(1),
+        )));
+        assert!(matches!(
+            outputs.first(),
+            Some(RouterOutput::SendReliable {
+                target: actual_target,
+                ..
             }) if *actual_target == target
         ));
     }

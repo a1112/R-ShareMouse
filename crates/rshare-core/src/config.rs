@@ -271,9 +271,13 @@ impl Config {
 
     /// Get the bind address for the server
     pub fn bind_address(&self) -> Result<SocketAddr> {
-        format!("{}:{}", self.network.bind_address, self.network.port)
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))
+        let host = self.network.bind_address.as_str();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let ip = host.parse().context("Invalid bind IP address")?;
+        Ok(SocketAddr::new(ip, self.network.port))
     }
 
     /// Check if a device is trusted
@@ -484,6 +488,21 @@ mod tests {
         let addr = config.bind_address().unwrap();
         assert_eq!(addr.port(), 27431);
         assert_eq!(addr.ip().to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn bind_address_accepts_ipv6_without_requiring_manual_brackets() {
+        let mut config = Config::default();
+        for host in ["::1", "[::1]", "::"] {
+            config.network.bind_address = host.to_string();
+            let address = config.bind_address().unwrap();
+            assert!(address.is_ipv6());
+            assert_eq!(address.port(), config.network.port);
+        }
+        for host in ["[::1", "::1]", "127.0.0.1:1234", "example.com"] {
+            config.network.bind_address = host.to_string();
+            assert!(config.bind_address().is_err(), "invalid bind host: {host}");
+        }
     }
 
     #[test]

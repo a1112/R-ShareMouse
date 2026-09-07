@@ -665,7 +665,10 @@ pub enum Message {
         reason: HandshakeRejectReason,
     },
     /// Device is leaving
-    Goodbye { device_id: DeviceId, reason: String },
+    Goodbye {
+        device_id: DeviceId,
+        reason: String,
+    },
 
     // === Input-adjacent control and diagnostics ===
     /// Diagnostic-only local input event broadcast to connected peers.
@@ -674,15 +677,25 @@ pub enum Message {
         event: LocalInputDiagnosticEvent,
     },
     /// Request endpoint event snapshots and future deltas from a peer.
-    EndpointEventSubscribe { filter: EndpointEventFilter },
+    EndpointEventSubscribe {
+        filter: EndpointEventFilter,
+    },
     /// Snapshot response for endpoint event subscription.
-    EndpointEventSnapshot { events: Vec<EndpointEvent> },
+    EndpointEventSnapshot {
+        events: Vec<EndpointEvent>,
+    },
     /// Single endpoint event delta broadcast by a peer.
-    EndpointEventDelta { event: EndpointEvent },
+    EndpointEventDelta {
+        event: EndpointEvent,
+    },
     /// Request a peer to inject an endpoint event on its local machine.
-    EndpointInjectRequest { request: EndpointInjectRequest },
+    EndpointInjectRequest {
+        request: EndpointInjectRequest,
+    },
     /// Response for a peer endpoint injection request.
-    EndpointInjectResult { result: EndpointInjectResult },
+    EndpointInjectResult {
+        result: EndpointInjectResult,
+    },
     /// Diagnostic latency probe. Receivers answer with LatencyProbeAck.
     LatencyProbe {
         sequence: u64,
@@ -711,19 +724,34 @@ pub enum Message {
         format: AudioFormat,
     },
     /// Single PCM audio frame.
-    AudioFrame { frame: AudioFramePayload },
+    AudioFrame {
+        frame: AudioFramePayload,
+    },
     /// Stop an active PCM audio stream.
-    AudioStreamStop { stream_id: Uuid, reason: String },
+    AudioStreamStop {
+        stream_id: Uuid,
+        reason: String,
+    },
     /// Report a non-fatal audio stream error.
-    AudioStreamError { stream_id: Uuid, message: String },
+    AudioStreamError {
+        stream_id: Uuid,
+        message: String,
+    },
 
     // === Experimental USB Forwarding ===
     /// USB device metadata advertised by a forwarding host.
-    UsbDeviceAttached { device: UsbDeviceDescriptor },
+    UsbDeviceAttached {
+        device: UsbDeviceDescriptor,
+    },
     /// USB device no longer available for forwarding.
-    UsbDeviceDetached { bus_id: String, reason: String },
+    UsbDeviceDetached {
+        bus_id: String,
+        reason: String,
+    },
     /// USB transfer request between a host and virtual USB endpoint.
-    UsbTransfer { transfer: UsbTransferPayload },
+    UsbTransfer {
+        transfer: UsbTransferPayload,
+    },
     /// Completion for an experimental USB transfer.
     UsbTransferComplete {
         transfer_id: u64,
@@ -747,9 +775,13 @@ pub enum Message {
         message: String,
     },
     /// Request exclusive or shared access to a forwarded USB device.
-    UsbDeviceClaimRequest { request: UsbDeviceClaimRequest },
+    UsbDeviceClaimRequest {
+        request: UsbDeviceClaimRequest,
+    },
     /// Response to a USB device claim request.
-    UsbDeviceClaimResponse { response: UsbDeviceClaimResponse },
+    UsbDeviceClaimResponse {
+        response: UsbDeviceClaimResponse,
+    },
     /// Release a previously claimed USB device.
     UsbDeviceRelease {
         session_id: Uuid,
@@ -769,11 +801,16 @@ pub enum Message {
         reason: String,
     },
     /// Advertise receiver-side transfer capacity.
-    UsbFlowControl { flow: UsbFlowControl },
+    UsbFlowControl {
+        flow: UsbFlowControl,
+    },
 
     // === Clipboard ===
     /// Clipboard data (text only for now)
-    ClipboardData { mime_type: String, data: Vec<u8> },
+    ClipboardData {
+        mime_type: String,
+        data: Vec<u8>,
+    },
     /// Request clipboard data
     ClipboardRequest,
     /// Clipboard data response
@@ -784,7 +821,9 @@ pub enum Message {
 
     // === Screen Control ===
     /// Screen configuration update
-    ScreenUpdate { screen_info: ScreenInfo },
+    ScreenUpdate {
+        screen_info: ScreenInfo,
+    },
     /// Authoritative shared layout update for authenticated peers.
     ///
     /// The sender identity is taken from the authenticated transport peer. The
@@ -798,11 +837,21 @@ pub enum Message {
 
     // === Synchronization ===
     /// Heartbeat / keepalive
-    Heartbeat { sequence: u64, timestamp: u64 },
+    Heartbeat {
+        sequence: u64,
+        timestamp: u64,
+    },
     /// Acknowledgment for reliable delivery
-    Ack { sequence: u64 },
+    Ack {
+        sequence: u64,
+    },
     /// Error message
-    Error { code: u32, message: String },
+    Error {
+        code: u32,
+        message: String,
+    },
+    // Append new variants to preserve existing binary discriminants.
+    FileTransfer(crate::file_transfer::FileTransferPacket),
 }
 
 impl Message {
@@ -845,6 +894,7 @@ impl Message {
 
             // Low: background operations
             Message::ClipboardData { .. }
+            | Message::FileTransfer(_)
             | Message::ClipboardRequest
             | Message::ClipboardResponse { .. }
             | Message::Heartbeat { .. }

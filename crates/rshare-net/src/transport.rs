@@ -37,8 +37,8 @@ use super::qos::{
     QOS_LANE_MAGIC, TERMINAL_CANCEL_RESET_CODE,
 };
 use rshare_core::{
-    ControlConnectionId, DeviceId, Message, RealtimeInputFrame, ReliableInputEvent,
-    ReliableInputFrame, SessionEpoch,
+    ControlConnectionId, DeviceId, Message, RealtimeInputFrame, RealtimeInputPayload,
+    ReliableInputEvent, ReliableInputFrame, SessionEpoch,
 };
 use tracing::info;
 
@@ -195,42 +195,53 @@ struct InstalledInboundReceivers {
 pub struct LatestRealtimeSender {
     latest_tx: watch::Sender<Option<(u64, RealtimeInputFrame)>>,
     generation: Arc<AtomicU64>,
-    pending_generation: Arc<AtomicU64>,
+    pending: Arc<StdMutex<Option<(u64, RealtimeInputFrame)>>>,
     probe: Arc<InboundQueueProbe>,
 }
 
 /// A bounded newest-value receiver for one realtime input lane.
+///
+/// Consecutive relative-mouse values are accumulated before the newest-value
+/// replacement is observed, because dropping an intermediate relative delta
+/// changes the physical pointer distance. Other realtime payloads retain
+/// newest-value semantics.
 pub struct LatestRealtimeReceiver {
     latest_rx: watch::Receiver<Option<(u64, RealtimeInputFrame)>>,
-    pending_generation: Arc<AtomicU64>,
+    pending: Arc<StdMutex<Option<(u64, RealtimeInputFrame)>>>,
 }
 
 impl LatestRealtimeSender {
     fn new(probe: Arc<InboundQueueProbe>) -> (Self, LatestRealtimeReceiver) {
         let (latest_tx, latest_rx) = watch::channel(None::<(u64, RealtimeInputFrame)>);
         let generation = Arc::new(AtomicU64::new(0));
-        let pending_generation = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(StdMutex::new(None));
         (
             Self {
                 latest_tx,
                 generation,
-                pending_generation: pending_generation.clone(),
+                pending: pending.clone(),
                 probe,
             },
-            LatestRealtimeReceiver {
-                latest_rx,
-                pending_generation,
-            },
+            LatestRealtimeReceiver { latest_rx, pending },
         )
     }
 
-    pub fn send(&self, frame: RealtimeInputFrame) {
+    pub fn send(&self, mut frame: RealtimeInputFrame) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.pending_generation.swap(generation, Ordering::AcqRel) != 0 {
+        let mut pending = self.pending.lock().expect("realtime mailbox poisoned");
+        let had_pending = pending.is_some();
+        if let Some((_, previous)) = pending.as_ref() {
+            if let Some(merged) = merge_relative_frames(previous, &frame) {
+                frame = merged;
+            }
+        }
+        *pending = Some((generation, frame.clone()));
+        self.latest_tx.send_replace(Some((generation, frame)));
+        drop(pending);
+        if had_pending {
             self.probe.overwrites.fetch_add(1, Ordering::Relaxed);
         }
         self.probe.high_watermark.fetch_max(1, Ordering::Relaxed);
-        self.latest_tx.send_replace(Some((generation, frame)));
     }
 }
 
@@ -242,13 +253,14 @@ impl LatestRealtimeReceiver {
     }
 
     fn take_current(&mut self) -> Option<RealtimeInputFrame> {
+        let mut pending = self.pending.lock().expect("realtime mailbox poisoned");
         let (generation, frame) = self.latest_rx.borrow_and_update().clone()?;
-        let _ = self.pending_generation.compare_exchange(
-            generation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        if pending
+            .as_ref()
+            .is_some_and(|(pending_generation, _)| *pending_generation == generation)
+        {
+            *pending = None;
+        }
         Some(frame)
     }
 
@@ -268,11 +280,52 @@ impl LatestRealtimeReceiver {
     pub fn drain_latest(&mut self, mut latest: RealtimeInputFrame) -> (RealtimeInputFrame, u64) {
         let mut filtered = 0_u64;
         while let Some(newer) = self.try_recv() {
-            latest = newer;
-            filtered += 1;
+            if let Some(merged) = merge_relative_frames(&latest, &newer) {
+                latest = merged;
+            } else {
+                latest = newer;
+                filtered += 1;
+            }
         }
         (latest, filtered)
     }
+}
+
+/// Merge adjacent relative pointer frames while retaining the newest ordering
+/// metadata. Relative motion is additive, so replacing an undelivered frame
+/// with the newest frame would silently lose physical distance. The receiver's
+/// ownership gate accepts sequence gaps; carrying the newest sequence keeps the
+/// merged frame valid for the existing protocol and injection actor.
+fn merge_relative_frames(
+    previous: &RealtimeInputFrame,
+    incoming: &RealtimeInputFrame,
+) -> Option<RealtimeInputFrame> {
+    if previous.protocol_version != incoming.protocol_version
+        || previous.session_epoch != incoming.session_epoch
+        || incoming.sequence <= previous.sequence
+    {
+        return None;
+    }
+    let (
+        RealtimeInputPayload::RelativeMouse { dx, dy },
+        RealtimeInputPayload::RelativeMouse {
+            dx: incoming_dx,
+            dy: incoming_dy,
+        },
+    ) = (&previous.payload, &incoming.payload)
+    else {
+        return None;
+    };
+    Some(RealtimeInputFrame {
+        protocol_version: incoming.protocol_version,
+        session_epoch: incoming.session_epoch,
+        sequence: incoming.sequence,
+        captured_at: incoming.captured_at,
+        payload: RealtimeInputPayload::RelativeMouse {
+            dx: dx.checked_add(*incoming_dx)?,
+            dy: dy.checked_add(*incoming_dy)?,
+        },
+    })
 }
 
 pub struct QuicTransport {
@@ -3500,15 +3553,16 @@ mod tests {
     }
 
     fn realtime_frame(epoch: u64, sequence: u64) -> RealtimeInputFrame {
+        realtime_relative_frame(epoch, sequence, sequence as i32, 0)
+    }
+
+    fn realtime_relative_frame(epoch: u64, sequence: u64, dx: i32, dy: i32) -> RealtimeInputFrame {
         RealtimeInputFrame {
             protocol_version: INPUT_PROTOCOL_VERSION,
             session_epoch: SessionEpoch(epoch),
             sequence,
             captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
-            payload: RealtimeInputPayload::RelativeMouse {
-                dx: sequence as i32,
-                dy: 0,
-            },
+            payload: RealtimeInputPayload::RelativeMouse { dx, dy },
         }
     }
 
@@ -4475,6 +4529,53 @@ mod tests {
 
         drop(emitter);
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_relative_receiver_preserves_the_full_motion_burst() {
+        let probe = Arc::new(InboundQueueProbe::default());
+        let (emitter, mut receiver) = LatestRealtimeSender::new(probe.clone());
+
+        for sequence in 1..=10_000 {
+            emitter.send(realtime_relative_frame(7, sequence, 1, -2));
+        }
+
+        let latest = receiver.recv().await.unwrap();
+        assert_eq!(latest.sequence, 10_000);
+        assert_eq!(
+            latest.payload,
+            RealtimeInputPayload::RelativeMouse {
+                dx: 10_000,
+                dy: -20_000,
+            }
+        );
+        assert_eq!(
+            probe.snapshot_capacity(1).overwrites,
+            9_999,
+            "the burst remains a single bounded mailbox while its deltas are accumulated"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_latest_accumulates_relative_frames_published_after_first_delivery() {
+        let (emitter, mut receiver) = LatestRealtimeReceiver::channel();
+
+        emitter.send(realtime_relative_frame(7, 1, 4, -3));
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(first.sequence, 1);
+
+        emitter.send(realtime_relative_frame(7, 2, 5, 6));
+        let second = receiver.recv().await.unwrap();
+        emitter.send(realtime_relative_frame(7, 3, -2, 1));
+        emitter.send(realtime_relative_frame(7, 4, 8, -4));
+
+        let (latest, filtered) = receiver.drain_latest(second);
+        assert_eq!(latest.sequence, 4);
+        assert_eq!(
+            latest.payload,
+            RealtimeInputPayload::RelativeMouse { dx: 11, dy: 3 }
+        );
+        assert_eq!(filtered, 0, "coalesced relative values are not discarded");
     }
 
     #[tokio::test]

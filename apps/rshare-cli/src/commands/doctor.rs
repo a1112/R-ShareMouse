@@ -7,7 +7,8 @@ use rshare_core::{
     DaemonDeviceSnapshot, DeviceId, EndpointCapabilityKind, EndpointEvent, EndpointEventDirection,
     EndpointEventFilter, EndpointEventKind, EndpointEventPayload, EndpointInjectMode,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalControlDeviceSnapshot, ServiceStatusSnapshot,
+    LocalControlDeviceSnapshot, LocalInputDeviceKind, LocalInputDiagnosticEvent,
+    LocalInputEventSource, ServiceStatusSnapshot,
 };
 
 use crate::output::{header, kv};
@@ -242,12 +243,13 @@ fn build_doctor_checks(
     let remote_ids: Vec<DeviceId> = devices.iter().map(|device| device.id).collect();
     let remote_event_count = endpoint_events
         .iter()
-        .filter(|event| remote_ids.contains(&event.endpoint_id))
+        .filter(|event| is_physical_remote_event(event, &remote_ids))
         .count();
     let injected_remote_event_count = endpoint_events
         .iter()
         .filter(|event| {
             remote_ids.contains(&event.endpoint_id)
+                && is_real_input_kind(event.kind)
                 && matches!(
                     event.direction,
                     EndpointEventDirection::Injected | EndpointEventDirection::InjectedLoopback
@@ -299,12 +301,14 @@ fn build_doctor_checks(
             CheckState::Block
         }
     });
-    let local_capture_ready = local_controls.map_or(false, |snapshot| {
-        snapshot.keyboard.detected
-            || snapshot.mouse.detected
-            || snapshot.gamepads.iter().any(|gamepad| gamepad.connected)
-            || !snapshot.recent_events.is_empty()
+    let local_physical_event_count = local_controls.map_or(0, |snapshot| {
+        snapshot
+            .recent_events
+            .iter()
+            .filter(|event| is_physical_local_event(event))
+            .count()
     });
+    let local_capture_ready = local_physical_event_count > 0;
     let layout_nodes = layout.map_or(0, |layout| layout.nodes.len());
     let capability_registry_ready = capabilities.is_some();
     let local_capabilities = capabilities.and_then(|registry| {
@@ -464,9 +468,10 @@ fn build_doctor_checks(
             detail: local_controls
                 .map(|snapshot| {
                     format!(
-                        "keyboard={} mouse={} recent_events={}",
+                        "keyboard={} mouse={} physical_events={} recent_events={}",
                         snapshot.keyboard.detected,
                         snapshot.mouse.detected,
+                        local_physical_event_count,
                         snapshot.recent_events.len()
                     )
                 })
@@ -514,6 +519,30 @@ fn build_doctor_checks(
             detail: inject_detail,
         },
     ]
+}
+
+fn is_real_input_kind(kind: EndpointEventKind) -> bool {
+    matches!(
+        kind,
+        EndpointEventKind::Keyboard | EndpointEventKind::Mouse | EndpointEventKind::Gamepad
+    )
+}
+
+fn is_physical_remote_event(event: &EndpointEvent, remote_ids: &[DeviceId]) -> bool {
+    remote_ids.contains(&event.endpoint_id)
+        && is_real_input_kind(event.kind)
+        && matches!(event.direction, EndpointEventDirection::Observed)
+}
+
+fn is_physical_local_event(event: &LocalInputDiagnosticEvent) -> bool {
+    matches!(
+        event.device_kind,
+        LocalInputDeviceKind::Keyboard
+            | LocalInputDeviceKind::Mouse
+            | LocalInputDeviceKind::Gamepad
+    ) && matches!(event.source, LocalInputEventSource::Hardware)
+        && !event.payload.contains_key("remote_device_id")
+        && event.capture_path.as_deref() != Some("remote-daemon")
 }
 
 fn inject_latency_summary(results: &[EndpointInjectResult]) -> Option<(u64, u64)> {
@@ -607,6 +636,50 @@ mod tests {
         }
     }
 
+    fn local_input_event(
+        device_kind: LocalInputDeviceKind,
+        source: LocalInputEventSource,
+        capture_path: Option<&str>,
+    ) -> LocalInputDiagnosticEvent {
+        LocalInputDiagnosticEvent {
+            sequence: 1,
+            timestamp_ms: 1,
+            device_kind,
+            event_kind: "input".to_string(),
+            summary: "input event".to_string(),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: capture_path.map(str::to_string),
+            source,
+            payload: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn backend_endpoint_event(endpoint_id: DeviceId) -> EndpointEvent {
+        EndpointEvent {
+            event_id: 2,
+            sequence: 2,
+            timestamp_ms: 2,
+            endpoint_id,
+            origin_endpoint_id: endpoint_id,
+            device: EndpointDeviceRef {
+                device_id: "backend".to_string(),
+                instance_id: None,
+                display_name: "Backend".to_string(),
+                kind: EndpointEventKind::Backend,
+                attribution: rshare_core::DeviceAttribution::Aggregate,
+            },
+            direction: EndpointEventDirection::System,
+            source: EndpointEventSource::System,
+            kind: EndpointEventKind::Backend,
+            payload: EndpointEventPayload::Generic {
+                summary: "control metrics".to_string(),
+                fields: std::collections::BTreeMap::new(),
+            },
+            correlation_id: None,
+        }
+    }
+
     fn endpoint_inject_result(target: DeviceId, elapsed_ms: u64) -> EndpointInjectResult {
         EndpointInjectResult {
             correlation_id: format!("test-{elapsed_ms}"),
@@ -660,6 +733,11 @@ mod tests {
         layout.add_node(rshare_core::LayoutNode::new(remote, 1920, 0, 1920, 1080));
         let mut controls = LocalControlDeviceSnapshot::default();
         controls.keyboard.detected = true;
+        controls.recent_events.push(local_input_event(
+            LocalInputDeviceKind::Keyboard,
+            LocalInputEventSource::Hardware,
+            Some("keyboard-hook"),
+        ));
 
         let checks = build_doctor_checks(
             Some(&status(local)),
@@ -692,6 +770,84 @@ mod tests {
                 ("remote-events", CheckState::Pass),
                 ("remote-inject", CheckState::Pass),
             ],
+        );
+    }
+
+    #[test]
+    fn doctor_checks_do_not_count_backend_metrics_as_physical_input() {
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let mut controls = LocalControlDeviceSnapshot::default();
+        controls.keyboard.detected = true;
+        controls.mouse.detected = true;
+        controls.recent_events.push(local_input_event(
+            LocalInputDeviceKind::Backend,
+            LocalInputEventSource::System,
+            Some("diagnostics-runtime"),
+        ));
+
+        let checks = build_doctor_checks(
+            Some(&status(local)),
+            None,
+            &[device(remote, true)],
+            None,
+            Some(&controls),
+            Some(&capabilities(local)),
+            &[backend_endpoint_event(remote)],
+            false,
+            &[],
+        );
+
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|check| matches!(check.key, "local-capture" | "remote-events"))
+                .map(|check| check.state)
+                .collect::<Vec<_>>(),
+            vec![CheckState::Warn, CheckState::Warn],
+        );
+        assert!(checks
+            .iter()
+            .find(|check| check.key == "local-capture")
+            .is_some_and(|check| check.detail.contains("physical_events=0")));
+    }
+
+    #[test]
+    fn doctor_checks_keep_injected_input_separate_from_physical_capture() {
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let mut controls = LocalControlDeviceSnapshot::default();
+        controls.recent_events.push(local_input_event(
+            LocalInputDeviceKind::Keyboard,
+            LocalInputEventSource::InjectedLoopback,
+            Some("daemon-endpoint-inject"),
+        ));
+
+        let checks = build_doctor_checks(
+            Some(&status(local)),
+            None,
+            &[device(remote, true)],
+            None,
+            Some(&controls),
+            Some(&capabilities(local)),
+            &[endpoint_event(
+                remote,
+                EndpointEventDirection::InjectedLoopback,
+            )],
+            false,
+            &[],
+        );
+
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|check| matches!(
+                    check.key,
+                    "local-capture" | "remote-events" | "remote-inject"
+                ))
+                .map(|check| check.state)
+                .collect::<Vec<_>>(),
+            vec![CheckState::Warn, CheckState::Warn, CheckState::Pass],
         );
     }
 

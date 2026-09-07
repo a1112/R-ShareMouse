@@ -72,6 +72,29 @@ impl LocalShortcutSuppressor for NoopShortcutSuppressor {
     fn set_suppressed(&self, _enabled: bool) {}
 }
 
+/// Nonblocking observation seam for physical input that has already passed
+/// through the bounded semantic ingress. Production observers must return
+/// immediately so diagnostics can never add latency to input routing.
+pub trait CapturedInputObserver: Send + Sync + 'static {
+    fn observe(&self, input: &CapturedInput);
+}
+
+/// Only low-frequency gesture boundaries; implementations must never block.
+pub trait FileDragObserver: Send + Sync + 'static {
+    fn captured(&self, input: &CapturedInput, remote: bool);
+    fn sent(&self, target: DeviceId, frame: &ReliableInputFrame);
+    fn cancel(&self);
+}
+
+impl<F> CapturedInputObserver for F
+where
+    F: Fn(&CapturedInput) + Send + Sync + 'static,
+{
+    fn observe(&self, input: &CapturedInput) {
+        self(input);
+    }
+}
+
 /// Nonblocking output seam. Implementations must clone a generation-scoped
 /// transport handle and return without waiting for network I/O.
 pub trait InputTransport: Send + Sync + 'static {
@@ -116,6 +139,8 @@ pub struct InputRuntime<T: InputTransport = ConnectionRegistry> {
     active_transports: HashMap<DeviceId, T::Binding>,
     forwarding_policy: InputForwardingPolicy,
     shortcut_suppressor: Arc<dyn LocalShortcutSuppressor>,
+    capture_observer: Option<Arc<dyn CapturedInputObserver>>,
+    file_drag_observer: Option<Arc<dyn FileDragObserver>>,
 }
 
 impl<T: InputTransport> InputRuntime<T> {
@@ -144,6 +169,8 @@ impl<T: InputTransport> InputRuntime<T> {
             active_transports: HashMap::new(),
             forwarding_policy: InputForwardingPolicy::default(),
             shortcut_suppressor: Arc::new(NoopShortcutSuppressor),
+            capture_observer: None,
+            file_drag_observer: None,
         }
     }
 
@@ -157,8 +184,21 @@ impl<T: InputTransport> InputRuntime<T> {
         self
     }
 
+    pub fn with_capture_observer(
+        mut self,
+        capture_observer: Arc<dyn CapturedInputObserver>,
+    ) -> Self {
+        self.capture_observer = Some(capture_observer);
+        self
+    }
+
     pub fn route_cache_generation(&self) -> u64 {
         self.router.route_cache_generation()
+    }
+
+    pub fn with_file_drag_observer(mut self, observer: Arc<dyn FileDragObserver>) -> Self {
+        self.file_drag_observer = Some(observer);
+        self
     }
 
     pub fn session_epoch(&self) -> SessionEpoch {
@@ -312,6 +352,14 @@ impl<T: InputTransport> InputRuntime<T> {
 
     fn process_captured(&mut self, input: CapturedInput) {
         self.metrics.record_captured();
+        if let Some(observer) = &self.capture_observer {
+            observer.observe(&input);
+        }
+        if self.forwarding_policy.admits_remote_input() {
+            if let Some(observer) = &self.file_drag_observer {
+                observer.captured(&input, !self.active_transports.is_empty());
+            }
+        }
         let pointer = input.pointer;
         self.observe_gamepad_projection(&input.payload);
         let Some(router_input) = captured_to_router_input(input) else {
@@ -461,6 +509,9 @@ impl<T: InputTransport> InputRuntime<T> {
                     if success {
                         self.metrics.record_routed();
                         self.apply_reliable_projection(&frame);
+                        if let Some(observer) = &self.file_drag_observer {
+                            observer.sent(target, &frame);
+                        }
                     } else {
                         let failure = self.router.handle(RouterCommand::BackendDegraded);
                         self.dispatch_outputs(failure);
@@ -471,6 +522,9 @@ impl<T: InputTransport> InputRuntime<T> {
                     frame,
                     release_token,
                 } => {
+                    if let Some(observer) = &self.file_drag_observer {
+                        observer.cancel();
+                    }
                     self.current_epoch = frame.session_epoch;
                     let success = self.active_transports.get(&target).is_some_and(|binding| {
                         self.transports.try_send_reliable(binding, frame.clone())
@@ -488,6 +542,15 @@ impl<T: InputTransport> InputRuntime<T> {
                     }
                 }
                 RouterOutput::LocalSessionChanged(session) => {
+                    if matches!(
+                        session,
+                        rshare_core::ControlSessionState::LocalReady
+                            | rshare_core::ControlSessionState::Suspended { .. }
+                    ) {
+                        if let Some(observer) = &self.file_drag_observer {
+                            observer.cancel();
+                        }
+                    }
                     self.state.publish_session(session);
                 }
                 RouterOutput::SuppressLocalShortcuts(enabled) => {

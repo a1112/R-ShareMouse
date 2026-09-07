@@ -406,6 +406,7 @@ impl MessageCodec {
             Message::UsbDeviceReset { .. } => 58,
             Message::UsbTransferCancel { .. } => 59,
             Message::UsbFlowControl { .. } => 60,
+            Message::FileTransfer(_) => 70,
         }
     }
 

@@ -42,10 +42,11 @@ use rshare_core::{Direction, UiChange, UiEnvelope};
 use rshare_daemon::diagnostics_runtime::{
     DiagnosticPayload, DiagnosticPublicationItem, DiagnosticSubscriberId, DiagnosticsHandle,
     DiagnosticsRuntime, DiagnosticsSubscription, DIAGNOSTICS_HISTORY_CAPACITY,
+    DIAGNOSTICS_SAMPLE_PERIOD,
 };
 use rshare_daemon::input_runtime::{
-    dispatch_system_safety_event, run_authenticated_input_peers, InputForwardingPolicy,
-    InputRuntime, LocalShortcutSuppressor,
+    dispatch_system_safety_event, run_authenticated_input_peers, CapturedInputObserver,
+    InputForwardingPolicy, InputRuntime, LocalShortcutSuppressor,
 };
 use rshare_daemon::input_state::{input_state_channel, ControlMetricSnapshot, ControlMetrics};
 use rshare_daemon::ipc_server::{
@@ -57,7 +58,7 @@ use rshare_daemon::ui_state_server::{
     run_ui_state_server, LocalControlsFeed, LocalControlsSnapshotFuture,
 };
 use rshare_input::{
-    BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource,
+    BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource, CapturedInput,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
     IngressFault, InjectBackend, InjectionActorConfig, InjectionBackendSnapshot, InputEvent,
     InputInjectionHandle, PointerSample, PortableCaptureBackend, PortableInjectBackend,
@@ -78,7 +79,7 @@ use tracing_subscriber::prelude::*;
 #[cfg(windows)]
 use rshare_platform::firewall;
 use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -379,6 +380,7 @@ struct DaemonState {
     pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
     virtual_displays: VirtualDisplayManager,
     mobile_access: mobile_gateway::MobileGatewayAccess,
+    file_transfers: Option<Arc<rshare_net::file_transfer::FileTransferService>>,
 }
 
 impl DaemonState {
@@ -436,6 +438,7 @@ impl DaemonState {
             pending_endpoint_injects: HashMap::new(),
             virtual_displays: VirtualDisplayManager::default(),
             mobile_access,
+            file_transfers: None,
         }
     }
 
@@ -462,10 +465,59 @@ impl DaemonState {
         }
 
         layout.rebind_local_device(self.status.device_id);
+        self.restore_local_layout_geometry(&mut layout);
         self.layout = layout.clone();
         self.layout_revision = revision;
         self.layout_source_device = source_device;
         Some(layout)
+    }
+
+    /// Shared layouts describe topology and peer geometry, but the local
+    /// display node is also the coordinate domain used by the platform input
+    /// backend. Keep that node authoritative from the local display snapshot
+    /// instead of trusting a peer's (possibly pixel-scaled or stale) copy.
+    fn restore_local_layout_geometry(&self, layout: &mut LayoutGraph) -> bool {
+        let runtime_displays = display_nodes_from_local_display_state(&self.local_controls.display);
+        let Some(node) = layout
+            .nodes
+            .iter_mut()
+            .find(|node| node.device_id == self.status.device_id)
+        else {
+            layout.add_node(LayoutNode {
+                device_id: self.status.device_id,
+                displays: runtime_displays,
+            });
+            return true;
+        };
+
+        if node.displays.is_empty() {
+            node.displays = runtime_displays;
+            return true;
+        }
+
+        let previous = node.displays.clone();
+        let mut updated = Vec::with_capacity(runtime_displays.len().max(previous.len()));
+        for (index, mut runtime_display) in runtime_displays.into_iter().enumerate() {
+            // x/y are operator-owned global layout placement. Only copy the
+            // platform-owned size/scale/DPI into the matching remembered
+            // display, falling back to the same display slot when IDs changed.
+            if let Some(remembered) = previous
+                .iter()
+                .find(|display| display.display_id == runtime_display.display_id)
+                .or_else(|| previous.get(index))
+            {
+                runtime_display.display_id = remembered.display_id.clone();
+                runtime_display.x = remembered.x;
+                runtime_display.y = remembered.y;
+            }
+            updated.push(runtime_display);
+        }
+
+        if updated == previous {
+            return false;
+        }
+        node.displays = updated;
+        true
     }
 
     fn upsert_discovered(&mut self, device: DiscoveredDevice) -> bool {
@@ -694,8 +746,12 @@ impl DaemonState {
     }
 
     fn reconcile_local_layout_geometry(&mut self) -> bool {
-        let displays = display_nodes_from_local_display_state(&self.local_controls.display);
-        upsert_layout_node_displays(&mut self.layout, self.status.device_id, displays)
+        let mut layout = self.layout.clone();
+        let changed = self.restore_local_layout_geometry(&mut layout);
+        if changed {
+            self.layout = layout;
+        }
+        changed
     }
 
     fn update_backend_state(
@@ -1003,6 +1059,11 @@ impl DaemonState {
             .recent_events
             .iter()
             .filter(|event| event.sequence > last_sequence)
+            // Remote diagnostics are already inserted into the endpoint store
+            // by `mirror_remote_endpoint_event`. Re-projecting their
+            // normalized local-controls copy would create a second event with
+            // this daemon as the endpoint owner.
+            .filter(|event| !is_remote_diagnostic_event(event))
             .cloned()
         {
             self.endpoint_events
@@ -1117,6 +1178,56 @@ impl DaemonState {
     #[cfg(test)]
     fn record_local_input_event(&mut self, event: &InputEvent) -> LocalInputDiagnosticEvent {
         self.record_local_input_event_with_metadata(event, None)
+    }
+
+    fn record_captured_input_event(
+        &mut self,
+        captured: &CapturedInput,
+    ) -> LocalInputDiagnosticEvent {
+        let event = match &captured.payload {
+            CapturedInputPayload::Discrete(event) => event.clone(),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                PointerSample::Absolute { x, y },
+            )) => InputEvent::mouse_move(*x, *y),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                PointerSample::Relative {
+                    dx,
+                    dy,
+                    observed_x,
+                    observed_y,
+                },
+            )) => {
+                let (x, y) = match (*observed_x, *observed_y) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => {
+                        let display = &self.local_controls.display;
+                        let min_x = i64::from(display.virtual_x);
+                        let min_y = i64::from(display.virtual_y);
+                        let max_x = min_x
+                            .saturating_add(i64::from(display.layout_width.max(1)))
+                            .saturating_sub(1);
+                        let max_y = min_y
+                            .saturating_add(i64::from(display.layout_height.max(1)))
+                            .saturating_sub(1);
+                        (
+                            (i64::from(self.local_controls.mouse.x) + i64::from(*dx))
+                                .clamp(min_x, max_x)
+                                .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                                as i32,
+                            (i64::from(self.local_controls.mouse.y) + i64::from(*dy))
+                                .clamp(min_y, max_y)
+                                .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                                as i32,
+                        )
+                    }
+                };
+                InputEvent::mouse_move(x, y)
+            }
+            CapturedInputPayload::Continuous(ContinuousInput::GamepadAxes(axes)) => {
+                InputEvent::gamepad_state(axes.clone().into())
+            }
+        };
+        self.record_local_input_event_with_metadata(&event, None)
     }
 
     fn record_local_input_event_with_metadata(
@@ -1407,6 +1518,94 @@ impl DaemonState {
         update_local_input_device_feedback(&mut self.local_controls, &mut event);
         push_recent_local_event(&mut self.local_controls, event.clone());
         event
+    }
+}
+
+const CAPTURE_DIAGNOSTIC_DISCRETE_CAPACITY: usize = 256;
+
+#[derive(Clone)]
+struct CaptureDiagnosticObserver {
+    discrete_tx: tokio::sync::mpsc::Sender<CapturedInput>,
+    latest_continuous_tx: watch::Sender<Option<CapturedInput>>,
+}
+
+impl CapturedInputObserver for CaptureDiagnosticObserver {
+    fn observe(&self, input: &CapturedInput) {
+        match &input.payload {
+            CapturedInputPayload::Continuous(_) => {
+                self.latest_continuous_tx.send_replace(Some(input.clone()));
+            }
+            CapturedInputPayload::Discrete(_) => {
+                let _ = self.discrete_tx.try_send(input.clone());
+            }
+        }
+    }
+}
+
+async fn publish_captured_input_diagnostic(
+    state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    diagnostics: &DiagnosticsHandle,
+    captured: &CapturedInput,
+) {
+    let event = {
+        let mut state = state.write().await;
+        state.record_captured_input_event(captured)
+    };
+    let _ = local_events_tx.send(event.clone());
+    diagnostics.record_discrete(event);
+}
+
+async fn run_capture_diagnostics(
+    state: Arc<RwLock<DaemonState>>,
+    local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    diagnostics: DiagnosticsHandle,
+    mut discrete_rx: tokio::sync::mpsc::Receiver<CapturedInput>,
+    mut latest_continuous_rx: watch::Receiver<Option<CapturedInput>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(DIAGNOSTICS_SAMPLE_PERIOD);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut discrete_open = true;
+    let mut continuous_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => break,
+            input = discrete_rx.recv(), if discrete_open => {
+                match input {
+                    Some(input) => {
+                        publish_captured_input_diagnostic(
+                            &state,
+                            &local_events_tx,
+                            &diagnostics,
+                            &input,
+                        ).await;
+                    }
+                    None => discrete_open = false,
+                }
+            }
+            _ = interval.tick(), if continuous_open => {
+                match latest_continuous_rx.has_changed() {
+                    Ok(true) => {
+                        let input = latest_continuous_rx.borrow_and_update().clone();
+                        if let Some(input) = input {
+                            publish_captured_input_diagnostic(
+                                &state,
+                                &local_events_tx,
+                                &diagnostics,
+                                &input,
+                            ).await;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => continuous_open = false,
+                }
+            }
+        }
+        if !discrete_open && !continuous_open {
+            break;
+        }
     }
 }
 
@@ -1743,36 +1942,6 @@ fn display_nodes_from_local_display_state(display: &LocalDisplayState) -> Vec<Di
             dpi_y: display.dpi_y,
         })
         .collect()
-}
-
-fn upsert_layout_node_displays(
-    layout: &mut LayoutGraph,
-    local_device_id: DeviceId,
-    displays: Vec<DisplayNode>,
-) -> bool {
-    let displays = if displays.is_empty() {
-        vec![DisplayNode::primary(0, 0, 1920, 1080)]
-    } else {
-        displays
-    };
-
-    if let Some(node) = layout
-        .nodes
-        .iter_mut()
-        .find(|node| node.device_id == local_device_id)
-    {
-        if node.displays == displays {
-            return false;
-        }
-        node.displays = displays;
-        return true;
-    }
-
-    layout.add_node(LayoutNode {
-        device_id: local_device_id,
-        displays,
-    });
-    true
 }
 
 fn push_recent_local_event(
@@ -2520,41 +2689,60 @@ async fn request_remote_endpoint_events(
     state: &Arc<RwLock<DaemonState>>,
     filter: &EndpointEventFilter,
 ) {
-    let Some(endpoint_id) = filter.endpoint_id else {
-        return;
-    };
-    let local_device_id = {
+    let targets = {
         let state = state.read().await;
-        state.status.device_id
+        endpoint_event_subscription_targets(&state, filter)
     };
-    if endpoint_id == local_device_id {
+    if targets.is_empty() {
         return;
     }
-    let connected = {
-        let state = state.read().await;
-        is_device_connected(&state, endpoint_id)
-    };
-    if !connected {
-        return;
-    }
-    let result = {
-        let mut manager = network_manager.lock().await;
-        manager
+
+    let mut manager = network_manager.lock().await;
+    for endpoint_id in targets {
+        // A filter without an endpoint is the desktop monitor's aggregate
+        // subscription. Remote peers still need a scoped filter so their
+        // response can be routed back through the local endpoint mirror.
+        let mut remote_filter = filter.clone();
+        remote_filter.endpoint_id = Some(endpoint_id);
+        if let Err(error) = manager
             .send_to(
                 &endpoint_id,
                 Message::EndpointEventSubscribe {
-                    filter: filter.clone(),
+                    filter: remote_filter,
                 },
             )
             .await
-    };
-    if let Err(error) = result {
-        tracing::debug!(
-            "Failed to request endpoint events from {}: {}",
-            endpoint_id,
-            error
-        );
+        {
+            tracing::debug!(
+                "Failed to request endpoint events from {}: {}",
+                endpoint_id,
+                error
+            );
+        }
     }
+}
+
+fn endpoint_event_subscription_targets(
+    state: &DaemonState,
+    filter: &EndpointEventFilter,
+) -> Vec<DeviceId> {
+    let mut targets = match filter.endpoint_id {
+        Some(endpoint_id)
+            if endpoint_id != state.status.device_id && is_device_connected(state, endpoint_id) =>
+        {
+            vec![endpoint_id]
+        }
+        Some(_) => Vec::new(),
+        None => state
+            .devices
+            .values()
+            .filter(|device| device.id != state.status.device_id && device.connected)
+            .map(|device| device.id)
+            .collect(),
+    };
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 fn normalize_remote_diagnostic_event(
@@ -2579,6 +2767,11 @@ fn normalize_remote_diagnostic_event(
     event
 }
 
+fn is_remote_diagnostic_event(event: &LocalInputDiagnosticEvent) -> bool {
+    event.payload.contains_key("remote_device_id")
+        || event.capture_path.as_deref() == Some("remote-daemon")
+}
+
 fn record_remote_diagnostic_event(
     state: &mut DaemonState,
     from: DeviceId,
@@ -2593,6 +2786,24 @@ fn record_remote_diagnostic_event(
     event.sequence = sequence;
     push_recent_local_event(&mut state.local_controls, event.clone());
     event
+}
+
+fn record_incoming_remote_diagnostic(
+    state: &mut DaemonState,
+    from: DeviceId,
+    event: LocalInputDiagnosticEvent,
+) -> (Option<LocalInputDiagnosticEvent>, EndpointEvent) {
+    // Remote events have their own endpoint store. Only latency ACKs also
+    // belong in local-controls because that snapshot owns the latency feedback
+    // contract; periodic control metrics would otherwise evict real keyboard
+    // and mouse history every few seconds.
+    let retain_for_local_feedback = is_latency_ack_event(&event);
+    let mut endpoint_event = EndpointEvent::from_local_diagnostic(from, event.clone());
+    endpoint_event.source = rshare_core::EndpointEventSource::RemoteMirror;
+    let mirrored = state.mirror_remote_endpoint_event(from, endpoint_event);
+    let local_event =
+        retain_for_local_feedback.then(|| record_remote_diagnostic_event(state, from, event));
+    (local_event, mirrored)
 }
 
 fn record_latency_diagnostic_event(
@@ -4636,6 +4847,11 @@ async fn handle_network_message(
     message: Message,
 ) {
     match message {
+        Message::FileTransfer(packet) => {
+            if let Some(service) = state.read().await.file_transfers.clone() {
+                service.receive(from, control_connection_id, packet);
+            }
+        }
         Message::LayoutSync { layout, revision } => {
             let _layout_guard = layout_update_lock.lock().await;
             let candidate = {
@@ -4658,6 +4874,7 @@ async fn handle_network_message(
                 }
                 let mut candidate = layout;
                 candidate.rebind_local_device(state.status.device_id);
+                state.restore_local_layout_geometry(&mut candidate);
                 candidate
             };
 
@@ -4686,20 +4903,16 @@ async fn handle_network_message(
             }
         }
         Message::InputDiagnostic { event, .. } => {
-            let endpoint_event = {
-                let mut event = EndpointEvent::from_local_diagnostic(from, event.clone());
-                event.source = rshare_core::EndpointEventSource::RemoteMirror;
-                event
-            };
             let (event, mirrored) = {
                 let mut state = state.write().await;
-                let mirrored = state.mirror_remote_endpoint_event(from, endpoint_event);
-                (
-                    record_remote_diagnostic_event(&mut state, from, event),
-                    mirrored,
-                )
+                record_incoming_remote_diagnostic(&mut state, from, event)
             };
-            let _ = local_events_tx.send(event);
+            // Physical input diagnostics belong to the endpoint mirror only;
+            // forwarding them through the generic local stream would make the
+            // local-controls view appear to have received the remote event.
+            if let Some(event) = event {
+                let _ = local_events_tx.send(event);
+            }
             let _ = endpoint_events_tx.send(mirrored);
         }
         Message::EndpointEventSubscribe { filter } => {
@@ -7070,7 +7283,7 @@ async fn main() -> Result<()> {
         .to_string();
     let device_id = rshare_core::service::load_or_create_local_device_id()?;
     let device_name = format!("{}-R-ShareMouse", hostname);
-    let bind_address = format!("{}:{}", config.network.bind_address, config.network.port);
+    let bind_address = config.bind_address()?.to_string();
     let layout_path = rshare_core::service::layout_graph_path()?;
 
     let mut network_manager = NetworkManager::new(device_id, device_name.clone(), hostname.clone())
@@ -7127,6 +7340,9 @@ async fn main() -> Result<()> {
         RuntimeFeatureConfig::from_config(&config),
     );
     daemon_state.refresh_local_controls_platform();
+    let download_dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+        .context("无法定位文件接收目录")?;
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
     let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
     if should_save_runtime_layout {
@@ -7177,6 +7393,18 @@ async fn main() -> Result<()> {
     }
     let injection = InputInjectionHandle::spawn(inject_backend, InjectionActorConfig::default())?;
     let inject_backend = injection.clone();
+    let file_transfers = rshare_net::file_transfer::FileTransferService::with_folder_resolver(
+        input_registry.clone(),
+        download_dir.join("R-ShareMouse"),
+        Some(Arc::new(
+            rshare_daemon::folder_drag_runtime::NativeFolderResolver(injection.clone()),
+        )),
+    );
+    state.write().await.file_transfers = Some(file_transfers.clone());
+    let folder_drag_observer = rshare_daemon::folder_drag_runtime::FolderDragRuntime::start(
+        input_registry.clone(),
+        file_transfers,
+    );
 
     let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
@@ -7276,9 +7504,10 @@ async fn main() -> Result<()> {
             fault_producer.report_fault(fault);
         });
         let mut listener = DefaultInputListener::new();
-        match listener.start_with_fault(
-            Box::new(move |event| {
-                let _ = producer.try_push_event(native_origin, event);
+        match listener.start_with_captured_input_and_fault(
+            Box::new(move |payload| {
+                let captured = producer.capture(native_origin, payload);
+                let _ = producer.try_push(captured);
             }),
             fault_callback,
         ) {
@@ -7602,6 +7831,21 @@ async fn main() -> Result<()> {
             "automatic input forwarding is unavailable: local shortcut suppression is required but unsupported"
         );
     }
+    let (capture_diagnostic_discrete_tx, capture_diagnostic_discrete_rx) =
+        tokio::sync::mpsc::channel(CAPTURE_DIAGNOSTIC_DISCRETE_CAPACITY);
+    let (capture_diagnostic_continuous_tx, capture_diagnostic_continuous_rx) = watch::channel(None);
+    let capture_diagnostic_observer = CaptureDiagnosticObserver {
+        discrete_tx: capture_diagnostic_discrete_tx,
+        latest_continuous_tx: capture_diagnostic_continuous_tx,
+    };
+    let _capture_diagnostic_task = tokio::spawn(run_capture_diagnostics(
+        state.clone(),
+        local_events_tx.clone(),
+        diagnostics.clone(),
+        capture_diagnostic_discrete_rx,
+        capture_diagnostic_continuous_rx,
+        shutdown_tx.subscribe(),
+    ));
     let input_runtime = InputRuntime::new(
         input_consumer,
         input_router,
@@ -7610,7 +7854,9 @@ async fn main() -> Result<()> {
         input_metrics.clone(),
         injection.clone(),
     )
-    .with_forwarding_policy(forwarding_policy, Arc::new(PlatformShortcutSuppressor));
+    .with_forwarding_policy(forwarding_policy, Arc::new(PlatformShortcutSuppressor))
+    .with_capture_observer(Arc::new(capture_diagnostic_observer))
+    .with_file_drag_observer(folder_drag_observer);
     let (system_safety_tx, system_safety_rx) = tokio::sync::mpsc::unbounded_channel();
     let system_safety_injection = injection.clone();
     let system_safety_watcher = rshare_platform::SystemSafetyWatcher::start(move |event| {
@@ -7814,6 +8060,9 @@ async fn main() -> Result<()> {
                         }
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
+                        if let Some(service) = &state.file_transfers {
+                            service.disconnect(id, control_connection_id);
+                        }
                         state.session.on_target_disconnect(id);
                         fail_pending_usb_for_device(
                             &mut state,
@@ -8072,19 +8321,37 @@ async fn handle_ipc_client(
     }
 
     if let DaemonRequest::SubscribeEndpointEvents { filter } = &request {
+        // Subscribe before taking the snapshot so events produced during the
+        // remote request/snapshot round trip remain buffered. Snapshot IDs
+        // suppress the corresponding buffered duplicates below.
+        let mut local_events = local_events_tx.subscribe();
+        let mut endpoint_events = endpoint_events_tx.subscribe();
         request_remote_endpoint_events(&network_manager, &state, filter).await;
         let events = {
             let mut state = state.write().await;
             state.endpoint_events(filter, None, Some(128))
         };
+        let local_device_id = state.read().await.status.device_id;
+        let mut snapshot_event_ids = events
+            .iter()
+            .map(|event| (event.endpoint_id, event.event_id))
+            .collect::<HashSet<_>>();
         write_json_response(&mut stream, &DaemonResponse::EndpointEvents(events)).await?;
-        let mut local_events = local_events_tx.subscribe();
-        let mut endpoint_events = endpoint_events_tx.subscribe();
         loop {
             tokio::select! {
                 event = local_events.recv() => {
                     match event {
                         Ok(event) => {
+                            if snapshot_event_ids.remove(&(local_device_id, event.sequence)) {
+                                continue;
+                            }
+                            // A remote diagnostic is already represented by
+                            // the endpoint mirror channel. Do not re-wrap the
+                            // normalized local-controls copy as a local
+                            // endpoint event.
+                            if is_remote_diagnostic_event(&event) {
+                                continue;
+                            }
                             let endpoint_event = {
                                 let mut state = state.write().await;
                                 state.endpoint_event_from_local(event)
@@ -8104,6 +8371,11 @@ async fn handle_ipc_client(
                 event = endpoint_events.recv() => {
                     match event {
                         Ok(endpoint_event) => {
+                            if snapshot_event_ids
+                                .remove(&(endpoint_event.endpoint_id, endpoint_event.event_id))
+                            {
+                                continue;
+                            }
                             if filter.matches(&endpoint_event) {
                                 write_json_response(
                                     &mut stream,
@@ -8216,6 +8488,7 @@ fn network_message_may_mutate_ui(message: &Message) -> bool {
         | Message::UsbTransferComplete { .. }
         | Message::UsbFlowControl { .. }
         | Message::ClipboardData { .. }
+        | Message::FileTransfer(_)
         | Message::ClipboardRequest
         | Message::ClipboardResponse { .. }
         | Message::Heartbeat { .. }
@@ -8354,6 +8627,34 @@ async fn dispatch_ipc_request(
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<DaemonResponse> {
     let response = match request {
+        DaemonRequest::SendFiles { device_id, paths } => {
+            let service = state
+                .read()
+                .await
+                .file_transfers
+                .clone()
+                .context("文件传输服务未启动")?;
+            DaemonResponse::FileTransfer(service.send_files(device_id, paths)?)
+        }
+        DaemonRequest::FileTransfers => {
+            let service = state
+                .read()
+                .await
+                .file_transfers
+                .clone()
+                .context("文件传输服务未启动")?;
+            DaemonResponse::FileTransfers(service.snapshots())
+        }
+        DaemonRequest::CancelFileTransfer { transfer_id } => {
+            let service = state
+                .read()
+                .await
+                .file_transfers
+                .clone()
+                .context("文件传输服务未启动")?;
+            service.cancel(transfer_id)?;
+            DaemonResponse::Ack
+        }
         DaemonRequest::Status => {
             let connection_infos = {
                 let manager = network_manager.lock().await;
@@ -8478,6 +8779,11 @@ async fn dispatch_ipc_request(
                 canonical_layout.rebind_local_device(local_device_id);
             } else {
                 canonical_layout.canonicalize_local_device(local_device_id);
+            }
+
+            {
+                let state = state.read().await;
+                state.restore_local_layout_geometry(&mut canonical_layout);
             }
 
             match persist_and_publish_layout(
@@ -10978,6 +11284,140 @@ mod tests {
     }
 
     #[test]
+    fn captured_relative_pointer_updates_physical_mouse_diagnostics() {
+        let mut state = test_daemon_state();
+        state.local_controls.display = fallback_display_state(1920, 1080);
+        state.local_controls.mouse.x = 100;
+        state.local_controls.mouse.y = 200;
+        let stamp = rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(7), 1);
+        let captured = CapturedInput {
+            captured_at: stamp,
+            ingress_enqueued_at: stamp,
+            origin: CaptureOrigin {
+                source: CaptureSource::WindowsFilter,
+                device_token: 1,
+                instance_token: 2,
+            },
+            pointer: None,
+            payload: CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                PointerSample::Relative {
+                    dx: 15,
+                    dy: -20,
+                    observed_x: None,
+                    observed_y: None,
+                },
+            )),
+        };
+
+        let diagnostic = state.record_captured_input_event(&captured);
+
+        assert_eq!(diagnostic.device_kind, LocalInputDeviceKind::Mouse);
+        assert_eq!(diagnostic.event_kind, "move");
+        assert_eq!(diagnostic.source, LocalInputEventSource::Hardware);
+        assert_eq!(diagnostic.payload.get("x").map(String::as_str), Some("115"));
+        assert_eq!(diagnostic.payload.get("y").map(String::as_str), Some("180"));
+        assert_eq!(state.local_controls.mouse.move_count, 1);
+        assert_eq!(state.local_controls.recent_events, vec![diagnostic]);
+    }
+
+    #[tokio::test]
+    async fn capture_diagnostic_observer_separates_latest_motion_from_discrete_input() {
+        let (discrete_tx, mut discrete_rx) =
+            tokio::sync::mpsc::channel(CAPTURE_DIAGNOSTIC_DISCRETE_CAPACITY);
+        let (latest_continuous_tx, mut latest_continuous_rx) = watch::channel(None);
+        let observer = CaptureDiagnosticObserver {
+            discrete_tx,
+            latest_continuous_tx,
+        };
+        let stamp = rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(8), 1);
+        let pointer = |x| CapturedInput {
+            captured_at: stamp,
+            ingress_enqueued_at: stamp,
+            origin: CaptureOrigin::default(),
+            pointer: Some(rshare_input::PointerPosition { x, y: 20 }),
+            payload: CapturedInputPayload::Continuous(ContinuousInput::Pointer(
+                PointerSample::Absolute { x, y: 20 },
+            )),
+        };
+        let key = CapturedInput {
+            captured_at: stamp,
+            ingress_enqueued_at: stamp,
+            origin: CaptureOrigin::default(),
+            pointer: None,
+            payload: CapturedInputPayload::from_input_event(InputEvent::key(
+                rshare_input::KeyCode::ShiftLeft,
+                rshare_input::ButtonState::Pressed,
+            )),
+        };
+
+        observer.observe(&pointer(10));
+        observer.observe(&pointer(30));
+        observer.observe(&key);
+
+        assert!(latest_continuous_rx.has_changed().unwrap());
+        let latest = latest_continuous_rx
+            .borrow_and_update()
+            .clone()
+            .expect("latest pointer sample");
+        assert!(matches!(
+            latest.payload,
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x: 30,
+                y: 20
+            }))
+        ));
+        assert!(matches!(
+            discrete_rx.try_recv().unwrap().payload,
+            CapturedInputPayload::Discrete(InputEvent::Key { .. })
+        ));
+        assert!(discrete_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn capture_diagnostics_bridge_publishes_real_input_to_event_stream() {
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let (local_events_tx, mut local_events_rx) = broadcast::channel(8);
+        let diagnostics = DiagnosticsRuntime::new(Arc::new(ControlMetrics::default()), 8).handle();
+        let (discrete_tx, discrete_rx) = tokio::sync::mpsc::channel(8);
+        let (latest_continuous_tx, latest_continuous_rx) = watch::channel(None);
+        let observer = CaptureDiagnosticObserver {
+            discrete_tx,
+            latest_continuous_tx,
+        };
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let bridge = tokio::spawn(run_capture_diagnostics(
+            state.clone(),
+            local_events_tx,
+            diagnostics,
+            discrete_rx,
+            latest_continuous_rx,
+            shutdown_rx,
+        ));
+        let stamp = rshare_core::MonotonicStamp::new(rshare_core::ClockDomainId(9), 1);
+        observer.observe(&CapturedInput {
+            captured_at: stamp,
+            ingress_enqueued_at: stamp,
+            origin: CaptureOrigin::default(),
+            pointer: None,
+            payload: CapturedInputPayload::from_input_event(InputEvent::key(
+                rshare_input::KeyCode::ShiftLeft,
+                rshare_input::ButtonState::Pressed,
+            )),
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(1), local_events_rx.recv())
+            .await
+            .expect("capture diagnostics event timed out")
+            .expect("capture diagnostics stream closed");
+        assert_eq!(event.device_kind, LocalInputDeviceKind::Keyboard);
+        assert_eq!(event.source, LocalInputEventSource::Hardware);
+        assert_eq!(state.read().await.local_controls.recent_events, vec![event]);
+
+        let _ = shutdown_tx.send(());
+        bridge.await.unwrap();
+    }
+
+    #[test]
     fn local_input_event_updates_diagnostic_snapshot() {
         let mut state = test_daemon_state();
 
@@ -11393,6 +11833,51 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_endpoint_event_subscription_targets_all_connected_peers() {
+        let mut state = test_daemon_state();
+        let connected_peer = DeviceId::new_v4();
+        let disconnected_peer = DeviceId::new_v4();
+        let local_device_id = state.status.device_id;
+        state.mark_connected(&local_device_id, true);
+        state.mark_connected(&connected_peer, true);
+        state.mark_connected(&disconnected_peer, false);
+
+        let targets = endpoint_event_subscription_targets(
+            &state,
+            &EndpointEventFilter {
+                include_loopback: true,
+                ..EndpointEventFilter::default()
+            },
+        );
+
+        assert_eq!(targets, vec![connected_peer]);
+    }
+
+    #[test]
+    fn endpoint_event_subscription_keeps_explicit_local_or_disconnected_filters_local() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        state.mark_connected(&remote, false);
+
+        assert!(endpoint_event_subscription_targets(
+            &state,
+            &EndpointEventFilter {
+                endpoint_id: Some(state.status.device_id),
+                ..EndpointEventFilter::default()
+            },
+        )
+        .is_empty());
+        assert!(endpoint_event_subscription_targets(
+            &state,
+            &EndpointEventFilter {
+                endpoint_id: Some(remote),
+                ..EndpointEventFilter::default()
+            },
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn remote_endpoint_delta_is_mirrored_under_remote_endpoint() {
         let mut state = test_daemon_state();
         let remote = DeviceId::new_v4();
@@ -11431,6 +11916,118 @@ mod tests {
             &EndpointEventFilter {
                 endpoint_id: Some(remote),
                 kinds: vec![rshare_core::EndpointEventKind::Keyboard],
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        assert_eq!(events, vec![mirrored]);
+    }
+
+    #[test]
+    fn remote_input_diagnostic_stays_out_of_local_controls_and_endpoint_store_deduplicates() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        let event = LocalInputDiagnosticEvent {
+            sequence: 7,
+            timestamp_ms: 42,
+            device_kind: LocalInputDeviceKind::Mouse,
+            event_kind: "move".to_string(),
+            summary: "Remote mouse move".to_string(),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: Some("windows-filter".to_string()),
+            source: LocalInputEventSource::Hardware,
+            payload: BTreeMap::from([
+                ("x".to_string(), "20".to_string()),
+                ("y".to_string(), "30".to_string()),
+            ]),
+        };
+
+        let (local_event, mirrored) = record_incoming_remote_diagnostic(&mut state, remote, event);
+
+        assert!(local_event.is_none());
+        assert!(state.local_controls.recent_events.is_empty());
+        assert_eq!(state.local_controls.mouse.event_count, 0);
+        assert_eq!(mirrored.endpoint_id, remote);
+
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                endpoint_id: Some(remote),
+                kinds: vec![rshare_core::EndpointEventKind::Mouse],
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        assert_eq!(events, vec![mirrored]);
+    }
+
+    #[test]
+    fn remote_backend_diagnostic_keeps_latency_contract_without_endpoint_duplicate() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        let event = LocalInputDiagnosticEvent {
+            sequence: 11,
+            timestamp_ms: 100,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "latency_probe_ack".to_string(),
+            summary: "Remote latency sample".to_string(),
+            device_id: Some(remote.to_string()),
+            device_instance_id: None,
+            capture_path: Some("rshare-net".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([("network_round_trip_ms".to_string(), "4".to_string())]),
+        };
+
+        let (local_event, mirrored) = record_incoming_remote_diagnostic(&mut state, remote, event);
+
+        let local_event = local_event.expect("latency diagnostics remain in local feedback state");
+        assert!(is_remote_diagnostic_event(&local_event));
+        assert_eq!(state.local_controls.recent_events, vec![local_event]);
+
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                endpoint_id: Some(remote),
+                kinds: vec![rshare_core::EndpointEventKind::Backend],
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+        assert_eq!(events, vec![mirrored]);
+    }
+
+    #[test]
+    fn periodic_remote_control_metrics_do_not_evict_local_input_history() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        let local_input = state.record_local_input_event(&InputEvent::key(
+            rshare_input::KeyCode::Char(b'A'),
+            rshare_input::ButtonState::Pressed,
+        ));
+        let metrics = LocalInputDiagnosticEvent {
+            sequence: 99,
+            timestamp_ms: 100,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "control_metrics_sample".to_string(),
+            summary: "Sampled control-path metrics".to_string(),
+            device_id: Some(remote.to_string()),
+            device_instance_id: None,
+            capture_path: Some("diagnostics-runtime".to_string()),
+            source: LocalInputEventSource::System,
+            payload: BTreeMap::from([("captured".to_string(), "500".to_string())]),
+        };
+
+        let (local_event, mirrored) =
+            record_incoming_remote_diagnostic(&mut state, remote, metrics);
+
+        assert!(local_event.is_none());
+        assert_eq!(state.local_controls.recent_events, vec![local_input]);
+        let events = state.endpoint_events(
+            &EndpointEventFilter {
+                endpoint_id: Some(remote),
+                kinds: vec![rshare_core::EndpointEventKind::Backend],
                 ..EndpointEventFilter::default()
             },
             None,
@@ -13020,9 +13617,10 @@ mod tests {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
         let mut state = DaemonState::new(test_status(local_id));
+        state.local_controls.display = fallback_display_state(1728, 1117);
         let mut layout = LayoutGraph::new(remote_id);
-        layout.add_node(LayoutNode::new(local_id, 0, 0, 2560, 1440));
-        layout.add_node(LayoutNode::new(remote_id, 2560, 0, 1920, 1080));
+        layout.add_node(LayoutNode::new(local_id, 3642, 180, 2560, 1440));
+        layout.add_node(LayoutNode::new(remote_id, 6202, 180, 1920, 1080));
 
         assert!(state.accept_remote_layout(layout, 2, remote_id).is_some());
         assert_eq!(state.layout.local_device, local_id);
@@ -13032,12 +13630,52 @@ mod tests {
         assert_eq!(
             state
                 .layout
+                .get_node(local_id)
+                .unwrap()
+                .primary_display()
+                .unwrap()
+                .width,
+            1728
+        );
+        assert_eq!(
+            state
+                .layout
+                .get_node(local_id)
+                .unwrap()
+                .primary_display()
+                .unwrap()
+                .height,
+            1117
+        );
+        assert_eq!(
+            state
+                .layout
+                .get_node(local_id)
+                .unwrap()
+                .primary_display()
+                .unwrap()
+                .x,
+            3642
+        );
+        assert_eq!(
+            state
+                .layout
+                .get_node(local_id)
+                .unwrap()
+                .primary_display()
+                .unwrap()
+                .y,
+            180
+        );
+        assert_eq!(
+            state
+                .layout
                 .get_node(remote_id)
                 .unwrap()
                 .primary_display()
                 .unwrap()
                 .x,
-            2560
+            6202
         );
 
         let stale = LayoutGraph::new(remote_id);

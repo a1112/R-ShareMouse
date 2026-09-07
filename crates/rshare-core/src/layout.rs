@@ -96,11 +96,15 @@ impl PixelRect {
         }
         if x == self.x && self.contains_y(y) {
             Some(Direction::Left)
-        } else if x == self.last_x() && self.contains_y(y) {
+        } else if (x == self.last_x() || i64::from(x) == extent_end_exclusive(self.x, self.width))
+            && self.contains_y(y)
+        {
             Some(Direction::Right)
         } else if y == self.y && self.contains_x(x) {
             Some(Direction::Top)
-        } else if y == self.last_y() && self.contains_x(x) {
+        } else if (y == self.last_y() || i64::from(y) == extent_end_exclusive(self.y, self.height))
+            && self.contains_x(x)
+        {
             Some(Direction::Bottom)
         } else {
             None
@@ -136,6 +140,10 @@ fn extent_end(origin: i32, extent: u32) -> i32 {
     (i64::from(origin) + span).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+fn extent_end_exclusive(origin: i32, extent: u32) -> i64 {
+    i64::from(origin) + i64::from(extent)
+}
+
 fn project_axis(
     value: i32,
     source_origin: i32,
@@ -169,21 +177,32 @@ impl VirtualDesktopGeometry {
     }
 
     /// Build the capture geometry from a local layout node's display union.
+    ///
+    /// Layout display positions are shared, operator-owned coordinates. A
+    /// local input backend, however, reports positions in the local device's
+    /// virtual desktop space. Anchor the node at its primary display so a
+    /// peer's global placement (for example, x=3642) cannot move the local
+    /// edge detector away from physical event coordinates.
     pub fn from_layout_node(node: &LayoutNode) -> Option<Self> {
+        let anchor = node.primary_display().or_else(|| node.displays.first())?;
+        let anchor_x = i64::from(anchor.x);
+        let anchor_y = i64::from(anchor.y);
         let mut displays = node
             .displays
             .iter()
             .filter(|display| display.width > 0 && display.height > 0);
         let first = displays.next()?;
-        let mut min_x = i64::from(first.x);
-        let mut min_y = i64::from(first.y);
-        let mut max_x = i64::from(first.x) + i64::from(first.width);
-        let mut max_y = i64::from(first.y) + i64::from(first.height);
+        let mut min_x = i64::from(first.x) - anchor_x;
+        let mut min_y = i64::from(first.y) - anchor_y;
+        let mut max_x = i64::from(first.x) - anchor_x + i64::from(first.width);
+        let mut max_y = i64::from(first.y) - anchor_y + i64::from(first.height);
         for display in displays {
-            min_x = min_x.min(i64::from(display.x));
-            min_y = min_y.min(i64::from(display.y));
-            max_x = max_x.max(i64::from(display.x) + i64::from(display.width));
-            max_y = max_y.max(i64::from(display.y) + i64::from(display.height));
+            let display_x = i64::from(display.x) - anchor_x;
+            let display_y = i64::from(display.y) - anchor_y;
+            min_x = min_x.min(display_x);
+            min_y = min_y.min(display_y);
+            max_x = max_x.max(display_x + i64::from(display.width));
+            max_y = max_y.max(display_y + i64::from(display.height));
         }
         Some(Self::new(PixelRect::new(
             min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
@@ -296,23 +315,14 @@ impl RouteCache {
 }
 
 fn node_local_display_rect(node: &LayoutNode, display: &DisplayNode) -> PixelRect {
-    let origin_x = node
-        .displays
-        .iter()
-        .filter(|candidate| candidate.width > 0 && candidate.height > 0)
-        .map(|candidate| candidate.x)
-        .min()
-        .unwrap_or(display.x);
-    let origin_y = node
-        .displays
-        .iter()
-        .filter(|candidate| candidate.width > 0 && candidate.height > 0)
-        .map(|candidate| candidate.y)
-        .min()
-        .unwrap_or(display.y);
-    let local_x = (i64::from(display.x) - i64::from(origin_x))
+    // Platform pointer coordinates use the primary display as (0, 0), while
+    // shared layout coordinates include the device's global placement. Use
+    // the same primary-display anchor as `VirtualDesktopGeometry` so entry
+    // anchors are directly injectable by the target platform.
+    let anchor = node.primary_display().unwrap_or(display);
+    let local_x = (i64::from(display.x) - i64::from(anchor.x))
         .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-    let local_y = (i64::from(display.y) - i64::from(origin_y))
+    let local_y = (i64::from(display.y) - i64::from(anchor.y))
         .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
     PixelRect::new(local_x, local_y, display.width, display.height)
 }
@@ -806,6 +816,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pixel_rect_accepts_half_open_maximum_as_right_or_bottom_edge() {
+        let rect = PixelRect::new(0, 0, 1728, 1117);
+
+        assert_eq!(rect.edge_at(1727, 500), Some(Direction::Right));
+        assert_eq!(rect.edge_at(1728, 500), Some(Direction::Right));
+        assert_eq!(rect.edge_at(500, 1116), Some(Direction::Bottom));
+        assert_eq!(rect.edge_at(500, 1117), Some(Direction::Bottom));
+        assert_eq!(rect.edge_at(1729, 500), None);
+        assert_eq!(rect.edge_at(500, 1118), None);
+    }
+
+    #[test]
     fn test_display_node_primary() {
         let display = DisplayNode::primary(0, 0, 1920, 1080);
         assert!(display.primary);
@@ -819,6 +841,48 @@ mod tests {
         assert_eq!(node.device_id, id);
         assert_eq!(node.displays.len(), 1);
         assert!(node.displays[0].primary);
+    }
+
+    #[test]
+    fn layout_node_capture_geometry_ignores_shared_global_offset() {
+        let id = Uuid::new_v4();
+        let node = LayoutNode {
+            device_id: id,
+            displays: vec![
+                DisplayNode::primary(3642, 180, 1728, 1117),
+                DisplayNode::secondary("left".to_string(), 1722, 180, 1920, 1080),
+            ],
+        };
+
+        let geometry = VirtualDesktopGeometry::from_layout_node(&node).unwrap();
+
+        assert_eq!(geometry.bounds(), PixelRect::new(-1920, 0, 3648, 1117));
+    }
+
+    #[test]
+    fn route_target_uses_primary_display_coordinate_anchor() {
+        let local = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(local);
+        graph.add_node(LayoutNode::new(local, 0, 0, 1728, 1117));
+        graph.add_node(LayoutNode {
+            device_id: target,
+            displays: vec![
+                DisplayNode::primary(3642, 180, 1920, 1080),
+                DisplayNode::secondary("left".to_string(), 2362, 180, 1280, 1024),
+            ],
+        });
+        graph.add_link(LayoutLink::new(
+            local,
+            Direction::Right,
+            target,
+            Direction::Left,
+        ));
+
+        let routes = RouteCache::build(&graph, local, &HashSet::from([target]), 1);
+        let route = routes.route(Direction::Right).expect("connected route");
+
+        assert_eq!(route.display, PixelRect::new(0, 0, 1920, 1080));
     }
 
     #[test]

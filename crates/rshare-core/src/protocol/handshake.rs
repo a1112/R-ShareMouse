@@ -12,6 +12,11 @@ pub struct PeerTransportCapabilities {
     pub qos_lanes: bool,
     /// Optional capability. Zero means media is disabled or unsupported.
     pub separate_media_quic_version: u16,
+    /// Optional bulk file-drop protocol. Missing on older compatible peers.
+    #[serde(default)]
+    pub file_transfer_version: u16,
+    #[serde(default)]
+    pub folder_drop_version: u16,
 }
 
 impl PeerTransportCapabilities {
@@ -24,6 +29,12 @@ impl PeerTransportCapabilities {
             reliable_input_version: Self::RELIABLE_INPUT_VERSION,
             qos_lanes: true,
             separate_media_quic_version: 0,
+            file_transfer_version: 1,
+            folder_drop_version: if cfg!(any(windows, target_os = "macos")) {
+                1
+            } else {
+                0
+            },
         }
     }
 

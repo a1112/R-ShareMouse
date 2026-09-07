@@ -10,6 +10,8 @@ use crate::{
 
 pub const DEFAULT_ENDPOINT_EVENT_LIMIT: usize = 512;
 
+const SAMPLED_CONTROL_METRICS_SUMMARY: &str = "Sampled control-path metrics";
+
 pub type EndpointEventId = u64;
 pub type EventCorrelationId = String;
 
@@ -382,6 +384,30 @@ impl EndpointEventStore {
         {
             return;
         }
+
+        if is_sampled_control_metrics(&event) {
+            if let Some(existing) = self.recent.back_mut().filter(|existing| {
+                existing.endpoint_id == event.endpoint_id && is_sampled_control_metrics(existing)
+            }) {
+                // Metrics are a latest-state sample, not a discrete event. Keep
+                // the newest sample in the same slot so a 20 Hz metrics stream
+                // cannot consume the history budget needed by real input.
+                *existing = event;
+                return;
+            }
+
+            if self.recent.len() >= self.limit {
+                // Prefer dropping an older sampled metric over a real endpoint
+                // event. If the store is entirely discrete, drop this optional
+                // sample instead of evicting keyboard/mouse/gamepad history.
+                if let Some(index) = self.recent.iter().position(is_sampled_control_metrics) {
+                    self.recent.remove(index);
+                } else {
+                    return;
+                }
+            }
+        }
+
         self.recent.push_back(event);
         while self.recent.len() > self.limit {
             self.recent.pop_front();
@@ -417,6 +443,24 @@ impl Default for EndpointEventStore {
     fn default() -> Self {
         Self::new(DEFAULT_ENDPOINT_EVENT_LIMIT)
     }
+}
+
+/// `EndpointEvent` intentionally does not retain the source diagnostic's
+/// `event_kind`. The metrics publication has a stable summary and payload
+/// marker, which lets the store distinguish a replaceable sample from a
+/// discrete backend diagnostic such as a latency acknowledgement.
+fn is_sampled_control_metrics(event: &EndpointEvent) -> bool {
+    if event.kind != EndpointEventKind::Backend {
+        return false;
+    }
+
+    let EndpointEventPayload::Backend { summary, fields } = &event.payload else {
+        return false;
+    };
+
+    summary == SAMPLED_CONTROL_METRICS_SUMMARY
+        || fields.contains_key("snapshot_json")
+        || (fields.contains_key("captured") && fields.contains_key("routed"))
 }
 
 fn aggregate_device_id(kind: EndpointEventKind) -> String {
@@ -464,6 +508,48 @@ fn payload_i32(payload: &BTreeMap<String, String>, key: &str) -> i32 {
 mod tests {
     use super::*;
 
+    fn local_diagnostic_event(
+        endpoint_id: DeviceId,
+        sequence: u64,
+        device_kind: LocalInputDeviceKind,
+        event_kind: &str,
+        summary: &str,
+        source: LocalInputEventSource,
+        payload: BTreeMap<String, String>,
+    ) -> EndpointEvent {
+        EndpointEvent::from_local_diagnostic(
+            endpoint_id,
+            LocalInputDiagnosticEvent {
+                sequence,
+                timestamp_ms: 100 + sequence,
+                device_kind,
+                event_kind: event_kind.to_string(),
+                summary: summary.to_string(),
+                device_id: None,
+                device_instance_id: None,
+                capture_path: None,
+                source,
+                payload,
+            },
+        )
+    }
+
+    fn sampled_metrics_event(endpoint_id: DeviceId, sequence: u64) -> EndpointEvent {
+        local_diagnostic_event(
+            endpoint_id,
+            sequence,
+            LocalInputDeviceKind::Backend,
+            "control_metrics_sample",
+            SAMPLED_CONTROL_METRICS_SUMMARY,
+            LocalInputEventSource::System,
+            BTreeMap::from([
+                ("snapshot_json".to_string(), "{}".to_string()),
+                ("captured".to_string(), sequence.to_string()),
+                ("routed".to_string(), "0".to_string()),
+            ]),
+        )
+    }
+
     fn keyboard_event(sequence: u64) -> EndpointEvent {
         let mut payload = BTreeMap::new();
         payload.insert("key".to_string(), "ShiftLeft".to_string());
@@ -483,6 +569,129 @@ mod tests {
                 payload,
             },
         )
+    }
+
+    #[test]
+    fn endpoint_event_store_replaces_contiguous_metrics_for_same_endpoint() {
+        let endpoint_id = DeviceId::new_v4();
+        let mut store = EndpointEventStore::new(8);
+
+        store.push(sampled_metrics_event(endpoint_id, 1));
+        store.push(sampled_metrics_event(endpoint_id, 2));
+        store.push(sampled_metrics_event(endpoint_id, 3));
+
+        let events = store.query(
+            &EndpointEventFilter {
+                endpoint_id: Some(endpoint_id),
+                kinds: vec![EndpointEventKind::Backend],
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 3);
+        assert_eq!(store.last_sequence(), Some(3));
+    }
+
+    #[test]
+    fn endpoint_event_store_does_not_merge_metrics_across_endpoints() {
+        let first_endpoint = DeviceId::new_v4();
+        let second_endpoint = DeviceId::new_v4();
+        let mut store = EndpointEventStore::new(8);
+
+        store.push(sampled_metrics_event(first_endpoint, 1));
+        store.push(sampled_metrics_event(second_endpoint, 2));
+        store.push(sampled_metrics_event(first_endpoint, 3));
+
+        let events = store.query(&EndpointEventFilter::default(), None, Some(8));
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].endpoint_id, first_endpoint);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].endpoint_id, second_endpoint);
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[2].endpoint_id, first_endpoint);
+        assert_eq!(events[2].sequence, 3);
+    }
+
+    #[test]
+    fn endpoint_event_store_preserves_real_input_when_metrics_fill_the_limit() {
+        let endpoint_id = DeviceId::new_v4();
+        let mut store = EndpointEventStore::new(4);
+
+        for sequence in 1..=100 {
+            store.push(sampled_metrics_event(endpoint_id, sequence));
+        }
+
+        let mut keyboard_payload = BTreeMap::new();
+        keyboard_payload.insert("key".to_string(), "ShiftLeft".to_string());
+        keyboard_payload.insert("state".to_string(), "Pressed".to_string());
+        store.push(local_diagnostic_event(
+            endpoint_id,
+            101,
+            LocalInputDeviceKind::Keyboard,
+            "key",
+            "Key ShiftLeft Pressed",
+            LocalInputEventSource::Hardware,
+            keyboard_payload,
+        ));
+
+        store.push(local_diagnostic_event(
+            endpoint_id,
+            102,
+            LocalInputDeviceKind::Mouse,
+            "move",
+            "Mouse moved",
+            LocalInputEventSource::Hardware,
+            BTreeMap::from([
+                ("x".to_string(), "10".to_string()),
+                ("y".to_string(), "20".to_string()),
+            ]),
+        ));
+
+        store.push(local_diagnostic_event(
+            endpoint_id,
+            103,
+            LocalInputDeviceKind::Gamepad,
+            "state",
+            "Gamepad state",
+            LocalInputEventSource::Hardware,
+            BTreeMap::new(),
+        ));
+
+        for sequence in 104..=200 {
+            store.push(sampled_metrics_event(endpoint_id, sequence));
+        }
+
+        let events = store.query(
+            &EndpointEventFilter {
+                endpoint_id: Some(endpoint_id),
+                ..EndpointEventFilter::default()
+            },
+            None,
+            Some(8),
+        );
+
+        assert_eq!(events.len(), 4);
+        assert!(events
+            .iter()
+            .any(|event| { event.sequence == 101 && event.kind == EndpointEventKind::Keyboard }));
+        assert!(events
+            .iter()
+            .any(|event| { event.sequence == 102 && event.kind == EndpointEventKind::Mouse }));
+        assert!(events
+            .iter()
+            .any(|event| { event.sequence == 103 && event.kind == EndpointEventKind::Gamepad }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| is_sampled_control_metrics(event))
+                .count(),
+            1
+        );
+        assert_eq!(events.last().map(|event| event.sequence), Some(200));
     }
 
     #[test]

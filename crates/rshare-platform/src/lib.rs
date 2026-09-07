@@ -27,6 +27,7 @@ pub mod linux_evdev;
 
 // Cross-platform modules
 pub mod file_drop;
+pub mod folder_drop;
 
 // Clipboard listener module
 pub mod clipboard;

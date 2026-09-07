@@ -163,6 +163,9 @@ impl InputInjectionHandle {
             timing_changed: Condvar::new(),
             clock,
             realtime_coalesce_window: config.realtime_coalesce_window,
+            folder_drop_receipts: Mutex::new(
+                rshare_core::file_transfer::FolderDropReceipts::default(),
+            ),
         });
         let worker_queue = Arc::clone(&queue);
         let worker_backend_snapshot = backend_snapshot.clone();
@@ -182,6 +185,18 @@ impl InputInjectionHandle {
 
     pub fn backend_snapshot(&self) -> InjectionBackendSnapshot {
         self.inner.backend.lock().unwrap().clone()
+    }
+
+    pub fn take_folder_drop_receipt(
+        &self,
+        owner: AuthenticatedInputOwner,
+        point: &rshare_core::file_transfer::FolderDropPoint,
+    ) -> bool {
+        self.inner.queue.folder_drop_receipts.lock().unwrap().take(
+            owner,
+            point,
+            self.inner.queue.clock.now().value_us / 1000,
+        )
     }
 
     pub async fn inject_trusted_local(
@@ -543,6 +558,7 @@ fn reject_trusted_local(state: &mut QueueState) {
 }
 
 struct InjectionQueue {
+    folder_drop_receipts: Mutex<rshare_core::file_transfer::FolderDropReceipts>,
     state: Mutex<QueueState>,
     changed: Condvar,
     timing: Mutex<TimingState>,
@@ -1023,8 +1039,29 @@ fn run_worker(
                     &mut remote_ledger,
                     &mut gamepads,
                     current,
-                    queued.frame.event,
+                    queued.frame.event.clone(),
                 );
+                if result.is_ok() {
+                    if let ReliableInputEvent::MouseButton {
+                        button: WireMouseButton::Left,
+                        state: WireButtonState::Released,
+                        x,
+                        y,
+                        ..
+                    } = queued.frame.event
+                    {
+                        queue.folder_drop_receipts.lock().unwrap().record(
+                            current.key.owner,
+                            rshare_core::file_transfer::FolderDropPoint {
+                                x,
+                                y,
+                                session_epoch: current.key.epoch.0,
+                                release_sequence: sequence,
+                            },
+                            queue.clock.now().value_us / 1000,
+                        );
+                    }
+                }
                 update_backend_snapshot(&*backend, &backend_snapshot);
                 let completed = queue.clock.now();
                 record_timing(
@@ -1541,6 +1578,58 @@ impl LocalMonotonicClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_drop_receipt_requires_successful_remote_release_injection() {
+        for failing in [false, true] {
+            let backend: Box<dyn InjectBackend> = if failing {
+                Box::new(PermissionRevokedInjectBackend::new())
+            } else {
+                Box::<RecordingInjectBackend>::default()
+            };
+            let handle =
+                InputInjectionHandle::spawn(backend, InjectionActorConfig::default()).unwrap();
+            let owner = AuthenticatedInputOwner {
+                peer_id: rshare_core::DeviceId::new_v4(),
+                control_connection_id: rshare_core::ControlConnectionId::new(),
+            };
+            let epoch = SessionEpoch(5);
+            let point = rshare_core::file_transfer::FolderDropPoint {
+                x: 450,
+                y: 300,
+                session_epoch: 5,
+                release_sequence: 1,
+            };
+            handle
+                .begin_session(owner, epoch, Duration::from_secs(2))
+                .unwrap();
+            assert!(!handle.take_folder_drop_receipt(owner, &point));
+            handle
+                .try_submit_reliable(
+                    owner,
+                    ReliableInputFrame {
+                        protocol_version: INPUT_PROTOCOL_VERSION,
+                        session_epoch: epoch,
+                        sequence: 1,
+                        captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                        event: ReliableInputEvent::MouseButton {
+                            button: WireMouseButton::Left,
+                            state: WireButtonState::Released,
+                            x: point.x,
+                            y: point.y,
+                            realtime_anchor_sequence: 0,
+                        },
+                    },
+                )
+                .unwrap();
+            assert!(handle
+                .wait_for_timing(epoch, true, 1, Duration::from_secs(1))
+                .is_some());
+            assert_eq!(handle.take_folder_drop_receipt(owner, &point), !failing);
+            assert!(!handle.take_folder_drop_receipt(owner, &point));
+            handle.shutdown().unwrap();
+        }
+    }
 
     #[derive(Debug, Default)]
     struct RecordingInjectBackend {

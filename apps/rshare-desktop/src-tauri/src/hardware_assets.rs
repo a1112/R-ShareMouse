@@ -5,6 +5,35 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ArchiveLimits {
+    entries: usize,
+    file_bytes: u64,
+    total_bytes: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            entries: 1024,
+            file_bytes: 64 * 1024 * 1024,
+            total_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+fn valid_storage_id(id: &str) -> bool {
+    validate_asset_relative_path(id)
+        && id == id.trim()
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !id.contains(['/', '\\'])
+        && !id.chars().any(char::is_control)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledHardwareAsset {
@@ -24,13 +53,16 @@ pub fn import_hardware_asset_package(
     app_data_dir: &Path,
     package_bytes: &[u8],
 ) -> Result<InstalledHardwareAsset> {
+    if package_bytes.len() > MAX_PACKAGE_BYTES {
+        return Err(anyhow!("hardware asset package exceeds 64 MiB"));
+    }
     let root = hardware_asset_root(app_data_dir);
     fs::create_dir_all(&root)?;
     let staging = root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&staging)?;
 
     let result = extract_and_validate(&staging, package_bytes).and_then(|manifest| {
-        if !validate_asset_relative_path(&manifest.id) {
+        if !valid_storage_id(&manifest.id) {
             return Err(anyhow!("hardware asset id is not safe for storage"));
         }
         let target = root.join(&manifest.id);
@@ -74,7 +106,7 @@ pub fn list_installed_hardware_assets(app_data_dir: &Path) -> Result<Vec<Install
 }
 
 pub fn export_hardware_asset_package(app_data_dir: &Path, asset_id: &str) -> Result<Vec<u8>> {
-    if !validate_asset_relative_path(asset_id) {
+    if !valid_storage_id(asset_id) {
         return Err(anyhow!("hardware asset id is not safe for storage"));
     }
 
@@ -105,9 +137,24 @@ pub fn export_hardware_asset_package(app_data_dir: &Path, asset_id: &str) -> Res
 }
 
 fn extract_and_validate(target: &Path, package_bytes: &[u8]) -> Result<HardwareAssetManifest> {
+    extract_with_limits(target, package_bytes, ArchiveLimits::default())
+}
+
+fn extract_with_limits(
+    target: &Path,
+    package_bytes: &[u8],
+    limits: ArchiveLimits,
+) -> Result<HardwareAssetManifest> {
     let mut archive = zip::ZipArchive::new(Cursor::new(package_bytes))?;
+    if archive.len() > limits.entries {
+        return Err(anyhow!("hardware asset archive contains too many entries"));
+    }
+    let mut total_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
+        if file.is_symlink() {
+            return Err(anyhow!("hardware asset archive contains a symbolic link"));
+        }
         let enclosed = file
             .enclosed_name()
             .ok_or_else(|| anyhow!("archive contains unsafe path"))?
@@ -117,12 +164,28 @@ fn extract_and_validate(target: &Path, package_bytes: &[u8]) -> Result<HardwareA
             fs::create_dir_all(&output)?;
             continue;
         }
+        let mut limit = limits.file_bytes.min(limits.total_bytes - total_bytes);
+        if output == target.join("manifest.json") {
+            limit = limit.min(MAX_MANIFEST_BYTES);
+        }
+        if file.size() > limit {
+            return Err(anyhow!(
+                "hardware asset archive exceeds extraction size limits"
+            ));
+        }
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        fs::write(output, bytes)?;
+        // Bound actual decompressed bytes too: ZIP metadata is untrusted.
+        // Stream to disk so a compressed asset cannot allocate its full size.
+        let mut output = fs::File::create(output)?;
+        let written = std::io::copy(&mut (&mut file).take(limit + 1), &mut output)?;
+        if written > limit {
+            return Err(anyhow!(
+                "hardware asset archive exceeds extraction size limits"
+            ));
+        }
+        total_bytes += written;
     }
 
     let manifest_path = target.join("manifest.json");
@@ -200,6 +263,82 @@ mod tests {
         writer.start_file("base.png", options).unwrap();
         writer.write_all(b"png-bytes").unwrap();
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extraction_rejects_file_total_and_entry_limits() {
+        let bytes = sample_package_bytes();
+        let archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let largest = archive.decompressed_size().unwrap() as u64 - b"png-bytes".len() as u64;
+        for limits in [
+            ArchiveLimits {
+                entries: 1,
+                file_bytes: u64::MAX - 1,
+                total_bytes: u64::MAX - 1,
+            },
+            ArchiveLimits {
+                entries: 10,
+                file_bytes: largest - 1,
+                total_bytes: 4096,
+            },
+            ArchiveLimits {
+                entries: 10,
+                file_bytes: 4096,
+                total_bytes: largest,
+            },
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            assert!(extract_with_limits(temp.path(), &bytes, limits).is_err());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        assert!(extract_with_limits(
+            temp.path(),
+            &bytes,
+            ArchiveLimits {
+                entries: 2,
+                file_bytes: largest,
+                total_bytes: largest + b"png-bytes".len() as u64,
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn storage_ids_cannot_target_nested_or_staging_directories() {
+        for id in [
+            "parent/child",
+            "parent\\child",
+            ".staging-private",
+            "..",
+            "asset.",
+            " asset",
+            "asset\n",
+        ] {
+            assert!(!valid_storage_id(id), "unsafe storage id: {id:?}");
+        }
+        assert!(valid_storage_id("user.keyboard.sample"));
+    }
+
+    #[test]
+    fn rejected_import_preserves_existing_asset_and_removes_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed =
+            import_hardware_asset_package(temp.path(), &sample_package_bytes()).unwrap();
+        let original = fs::read(&installed.manifest_path).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&original).unwrap();
+        let invalid = writer.finish().unwrap().into_inner();
+        assert!(import_hardware_asset_package(temp.path(), &invalid).is_err());
+        assert_eq!(fs::read(&installed.manifest_path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(hardware_asset_root(temp.path()))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
