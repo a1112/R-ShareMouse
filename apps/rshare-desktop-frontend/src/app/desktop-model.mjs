@@ -465,6 +465,13 @@ function localNodeDisplays(node, localDisplayInfo) {
   const visibleById = new Map(
     (node.displays ?? []).map((display) => [display.display_id ?? "primary", display]),
   );
+  // Hardware coordinates are device-local. Translate the physical display
+  // group to its daemon-owned shared placement before drawing it on the canvas.
+  const actualAnchor = actualDisplays.find((display) => display.primary) ?? actualDisplays[0];
+  const visibleAnchor = visibleById.get(actualAnchor.display_id ?? "primary")
+    ?? primaryDisplay(node);
+  const offsetX = visibleAnchor ? Number(visibleAnchor.x ?? 0) - Number(actualAnchor.x ?? 0) : 0;
+  const offsetY = visibleAnchor ? Number(visibleAnchor.y ?? 0) - Number(actualAnchor.y ?? 0) : 0;
   const actualIds = new Set();
   const mergedDisplays = actualDisplays.map((actualDisplay, index) => {
     const displayId = actualDisplay.display_id ?? (index === 0 ? "primary" : `display-${index + 1}`);
@@ -474,8 +481,8 @@ function localNodeDisplays(node, localDisplayInfo) {
       ...visibleDisplay,
       ...actualDisplay,
       display_id: displayId,
-      x: Number(actualDisplay.x ?? visibleDisplay.x ?? 0),
-      y: Number(actualDisplay.y ?? visibleDisplay.y ?? 0),
+      x: actualDisplay.x == null ? Number(visibleDisplay.x ?? 0) : Number(actualDisplay.x) + offsetX,
+      y: actualDisplay.y == null ? Number(visibleDisplay.y ?? 0) : Number(actualDisplay.y) + offsetY,
       width: Number(actualDisplay.width ?? visibleDisplay.width ?? 1920),
       height: Number(actualDisplay.height ?? visibleDisplay.height ?? 1080),
       primary: Boolean(actualDisplay.primary ?? visibleDisplay.primary),

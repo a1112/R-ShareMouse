@@ -7470,16 +7470,23 @@ async fn main() -> Result<()> {
                 listener,
                 filter_error,
             } => {
-                if let Some(error) = filter_error {
-                    tracing::warn!(
-                        "Windows filter capture failed; using low-level hook fallback: {error}"
-                    );
+                // The hook is the actual capture backend whenever the filter
+                // path is not selected, including the normal Portable-input
+                // fallback. Keep capture truth separate from the injection
+                // mode so shortcut suppression can be admitted safely.
+                {
                     let mut state = state.write().await;
                     state.local_controls.capture_backend.mode =
                         Some(ResolvedInputMode::WindowsNative);
                     state.local_controls.capture_backend.kind = Some(BackendKind::WindowsNative);
                     state.local_controls.capture_backend.health = Some(BackendHealth::Healthy);
                     state.local_controls.capture_backend.active = true;
+                }
+                if let Some(error) = filter_error {
+                    tracing::warn!(
+                        "Windows filter capture failed; using low-level hook fallback: {error}"
+                    );
+                    let mut state = state.write().await;
                     state.local_controls.last_error =
                         Some(format!("Filter capture fallback: {error}"));
                 } else {
@@ -9584,7 +9591,7 @@ mod tests {
     fn linux_evdev_motion_is_never_selected_without_a_global_cursor_anchor() {
         // This remains executable on non-Linux hosts while asserting the
         // Linux-only production branches that cannot be device-tested here.
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let converter_start = source
             .find("fn input_event_from_evdev_driver_event")
             .expect("missing evdev ingress converter");

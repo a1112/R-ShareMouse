@@ -2371,6 +2371,28 @@ test("buildDesktopViewModel uses authoritative UI display inventory without loca
   assert.equal(model.layout.monitors[0].w, 307);
 });
 
+test("buildDesktopViewModel preserves shared placement when local hardware starts at zero", () => {
+  const primary = { display_id: "primary", x: 1920, y: -400, width: 2560, height: 1440, primary: true };
+  const model = buildDesktopViewModel({
+    status: { device_id: "local-1", device_name: "PC", hostname: "pc", healthy: true },
+    devices: [{ id: "remote-1", name: "Mac", connected: true, addresses: [] }],
+    visible_layout: {
+      version: 1, local_device: "local-1", links: [],
+      nodes: [
+        { device_id: "remote-1", displays: [{ ...primary, x: 0, width: 1920 }] },
+        { device_id: "local-1", displays: [primary] },
+      ],
+    },
+  }, {
+    display: { displays: [{ ...primary, x: 0, y: 0, raw_dpi_x: 96, raw_dpi_y: 96 }] },
+  });
+  const local = model.layout.monitors.find((monitor) => monitor.deviceId === "local-1");
+  const remote = model.layout.monitors.find((monitor) => monitor.deviceId === "remote-1");
+  assert.equal(local.visibleX, 1920);
+  assert.equal(local.visibleY, -400);
+  assert.ok(local.x >= remote.x + remote.w - 1, "local hardware origin must not overlap the remote display");
+});
+
 test("buildDesktopViewModel draws local displays from physical DPI while preserving bottom alignment", () => {
   const model = buildDesktopViewModel(
     {

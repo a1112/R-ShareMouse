@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn windows_filter_adapter_is_cfg_gated_for_non_windows_builds() {
-        let source = include_str!("backend.rs");
+        let source = include_str!("backend.rs").replace("\r\n", "\n");
         assert!(source.contains(
             "#[cfg(target_os = \"windows\")]\npub fn ingress_fault_from_raw_capture_status"
         ));

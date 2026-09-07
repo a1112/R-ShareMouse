@@ -83,10 +83,9 @@ async fn follow_logs(log_file: &std::path::Path) -> Result<()> {
 
 /// Get the log file path
 fn get_log_file() -> Result<std::path::PathBuf> {
-    let config_dir = directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rshare");
+    let config_dir = directories::BaseDirs::new()
+        .map(|d| d.config_dir().join("rshare"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".rshare"));
 
-    Ok(config_dir.join("rshare.log"))
+    Ok(config_dir.join("rshare-daemon.log"))
 }

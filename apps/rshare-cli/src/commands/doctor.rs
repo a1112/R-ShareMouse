@@ -375,18 +375,45 @@ fn build_doctor_checks(
         } else if inject_results.is_empty() {
             "远端注入探测未返回结果".to_string()
         } else {
+            let failure_detail = inject_results
+                .iter()
+                .filter(|result| !result.accepted)
+                .map(|result| {
+                    let error = result
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    let backend = result
+                        .backend_kind
+                        .map(|backend| format!("{backend:?}"))
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    format!(
+                        "失败 error={error} backend={backend} health={:?}",
+                        result.health
+                    )
+                })
+                .collect::<Vec<_>>();
+            let failure_suffix = if failure_detail.is_empty() {
+                String::new()
+            } else {
+                format!("；{}", failure_detail.join("；"))
+            };
+
             match inject_latency_summary(inject_results) {
                 Some((average_ms, max_ms)) => format!(
-                    "注入结果 {}/{} 成功，平均 {} ms，最大 {} ms",
+                    "注入结果 {}/{} 成功，平均 {} ms，最大 {} ms{}",
                     inject_success_count,
                     inject_results.len(),
                     average_ms,
-                    max_ms
+                    max_ms,
+                    failure_suffix
                 ),
                 None => format!(
-                    "注入结果 {}/{} 成功",
+                    "注入结果 {}/{} 成功{}",
                     inject_success_count,
-                    inject_results.len()
+                    inject_results.len(),
+                    failure_suffix
                 ),
             }
         }
@@ -693,6 +720,24 @@ mod tests {
         }
     }
 
+    fn rejected_endpoint_inject_result(
+        target: DeviceId,
+        error: rshare_core::EndpointInjectError,
+    ) -> EndpointInjectResult {
+        EndpointInjectResult {
+            correlation_id: "rejected-test".to_string(),
+            target: EndpointInjectTarget::Remote(target),
+            accepted: false,
+            backend_kind: Some(rshare_core::BackendKind::Portable),
+            health: BackendHealth::Degraded {
+                reason: rshare_core::BackendFailureReason::PermissionDenied,
+            },
+            elapsed_ms: 7,
+            loopback_event_id: None,
+            error: Some(error),
+        }
+    }
+
     fn capabilities(local: DeviceId) -> CapabilityRegistrySnapshot {
         CapabilityRegistrySnapshot {
             local_device_id: local,
@@ -927,5 +972,34 @@ mod tests {
             .expect("remote inject check");
         assert_eq!(remote_inject.state, CheckState::Block);
         assert_eq!(remote_inject.detail, "未发现已连接远端，未执行注入探测");
+    }
+
+    #[test]
+    fn doctor_checks_include_remote_inject_failure_details() {
+        let local = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let checks = build_doctor_checks(
+            Some(&status(local)),
+            None,
+            &[device(remote, true)],
+            None,
+            Some(&LocalControlDeviceSnapshot::default()),
+            Some(&capabilities(local)),
+            &[],
+            true,
+            &[rejected_endpoint_inject_result(
+                remote,
+                rshare_core::EndpointInjectError::PermissionDenied,
+            )],
+        );
+
+        let remote_inject = checks
+            .iter()
+            .find(|check| check.key == "remote-inject")
+            .expect("remote inject check");
+        assert_eq!(remote_inject.state, CheckState::Block);
+        assert!(remote_inject.detail.contains("error=PermissionDenied"));
+        assert!(remote_inject.detail.contains("backend=Portable"));
+        assert!(remote_inject.detail.contains("PermissionDenied"));
     }
 }

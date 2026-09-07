@@ -127,7 +127,7 @@ test("desktop app routes revisioned state through the selector store without fas
 });
 
 test("remote endpoint event monitoring stays active with a healthy UI-state stream", () => {
-  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8").replaceAll("\r\n", "\n");
   const endpointEffectStart = source.indexOf("useEffect(() => {\n    if (!endpointIds.length)");
   const endpointEffectEnd = source.indexOf("\n  useEffect(", endpointEffectStart + 1);
   const endpointEffect = source.slice(endpointEffectStart, endpointEffectEnd);
@@ -191,7 +191,7 @@ test("remote injection confirmation exposes the required second click", () => {
 });
 
 test("devices page forwards the local-controls refresh callback to remote tabs", () => {
-  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8").replaceAll("\r\n", "\n");
   const desktopAppStart = source.indexOf("function DesktopApp()");
   const devicesPageStart = source.indexOf("function DevicesPage({");
   const controlledPageStart = source.indexOf("function DevicesPageWithLocalControls({");
