@@ -1,3 +1,4 @@
+import { NetworkAudioPanel } from "./NetworkAudioPanel";
 import {
   createContext,
   memo,
@@ -720,6 +721,7 @@ type AudioStreamState = {
   underruns?: number;
   overruns?: number;
   latency_ms?: number | null;
+  buffer_depth_ms?: number | null;
   last_error?: string | null;
 };
 type LocalDeviceSelectItem = {
@@ -8328,6 +8330,7 @@ function AudioDetail({ snapshot, audioOutputs, theme }: { snapshot: LocalControl
   return (
     <div className="grid h-full min-h-0 grid-cols-1 gap-3 overflow-hidden xl:grid-cols-[minmax(0,1fr)_340px]">
       <div className="rshare-scroll min-h-0 overflow-y-auto pr-1">
+        <NetworkAudioPanel invoke={invokeCommand} />
         <AudioEndpointSection title="音频输入 / 回环" meta={capture?.status ?? "Idle"} columns="2xl:grid-cols-2" theme={theme}>
           {inputs.length ? (
             inputs.map((device) => {
@@ -8386,7 +8389,7 @@ function AudioDetail({ snapshot, audioOutputs, theme }: { snapshot: LocalControl
         </AudioEndpointSection>
       </div>
       <aside className="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-3 overflow-hidden">
-        <section className="p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 text-sm font-semibold">远端音频</div><div className="grid grid-cols-2 gap-2 text-xs"><InfoRow label="目标" value={stream?.target_device_id?.slice(0, 8) ?? "无"} theme={theme} /><InfoRow label="状态" value={stream?.active ? "转发中" : (capture?.status ?? "Idle")} theme={theme} /><InfoRow label="延迟" value={stream?.latency_ms ? `${stream.latency_ms} ms` : "-"} theme={theme} /><InfoRow label="帧" value={String(stream?.frames_sent ?? 0)} theme={theme} /></div><div className="mt-3 flex gap-2"><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={secondaryButtonStyle(theme)} onClick={startForwarding}>开始转发</button><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={dangerButtonStyle(theme)} onClick={() => void invokeCommand("stop_audio_forwarding")}>停止</button></div></section>
+        <section className="p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 text-sm font-semibold">远端音频</div><div className="grid grid-cols-2 gap-2 text-xs"><InfoRow label="目标" value={stream?.target_device_id?.slice(0, 8) ?? "无"} theme={theme} /><InfoRow label="状态" value={stream?.active ? "转发中" : (capture?.status ?? "Idle")} theme={theme} /><InfoRow label="播放缓冲" value={stream?.buffer_depth_ms != null ? `${stream.buffer_depth_ms} ms` : "-"} theme={theme} /><InfoRow label="实测延迟" value={stream?.latency_ms != null ? `${stream.latency_ms} ms` : "未测量"} theme={theme} /><InfoRow label="帧" value={String(stream?.frames_sent ?? 0)} theme={theme} /></div><div className="mt-3 flex gap-2"><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={secondaryButtonStyle(theme)} onClick={startForwarding}>开始转发</button><button type="button" className="flex-1 rounded-md px-3 py-2 text-xs" style={dangerButtonStyle(theme)} onClick={() => void invokeCommand("stop_audio_forwarding")}>停止</button></div></section>
         <section className="p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 text-sm font-semibold">当前端点</div><InfoRow label="输入" value={selectedInput?.name ?? "无"} theme={theme} /><InfoRow label="输出" value={selectedOutput?.name ?? "无"} theme={theme} /></section>
         <section className="min-h-0 overflow-hidden p-4" style={{ border: `1px solid ${theme.border}`, background: "rgba(255,255,255,0.02)" }}><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold">音频记录</h3><span className="text-xs" style={{ color: theme.textMuted }}>最近 {audioEvents.length} 条</span></div><div className="rshare-scroll h-full overflow-auto text-xs">{audioEvents.length ? audioEvents.map((event) => <div key={event.sequence} className="mb-2 grid grid-cols-[78px_minmax(0,1fr)] gap-2"><span style={{ color: theme.textMuted }}>{formatEventTime(event.timestamp_ms)}</span><span className="truncate">{event.summary}</span></div>) : <div style={{ color: theme.textMuted }}>等待音频事件</div>}</div></section>
       </aside>

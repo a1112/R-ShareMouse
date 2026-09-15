@@ -43,3 +43,4 @@ mod public_api_tests {
         assert_send::<BulkFrame>();
     }
 }
+pub mod media_transport;

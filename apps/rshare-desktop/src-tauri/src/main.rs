@@ -1124,6 +1124,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            network_audio,
             send_files,
             file_transfers,
             cancel_file_transfer,
@@ -2759,4 +2760,9 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_eq!(force_stop_count.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tauri::command]
+async fn network_audio(command: rshare_core::network_audio::AudioCommand) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
+    daemon_client::request_network_audio(command).await.map_err(|e| e.to_string())
 }

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rshare-common",
+    "crates/rshare-audio",
     "crates/rshare-core",
     "crates/rshare-net",
     "crates/rshare-input",

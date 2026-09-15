@@ -39,6 +39,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+rshare-audio = { path = "../rshare-audio" }
 tokio-test = "0.4"
 criterion = { workspace = true }
 

@@ -4617,6 +4617,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rshare-audio"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "rshare-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "rshare-cli"
 version = "0.1.0"
 dependencies = [
@@ -4684,12 +4698,14 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "hostname",
+ "rshare-audio",
  "rshare-core",
  "rshare-input",
  "rshare-net",
  "rshare-platform",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -4754,6 +4770,7 @@ dependencies = [
  "libc",
  "quinn",
  "rcgen",
+ "rshare-audio",
  "rshare-core",
  "rustls",
  "serde",

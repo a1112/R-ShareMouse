@@ -518,6 +518,7 @@ pub struct PendingPeerApproval {
 /// Client request over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
+    NetworkAudio(crate::network_audio::AudioCommand),
     Status,
     GetMacosInputPermissions,
     RequestMacosInputPermissions,
@@ -617,8 +618,9 @@ pub enum DaemonRequest {
 }
 
 /// Daemon response over localhost IPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DaemonResponse {
+    NetworkAudio(crate::network_audio::AudioSnapshot),
     Status(ServiceStatusSnapshot),
     MacosInputPermissions(MacosInputPermissionsSnapshot),
     Devices(Vec<DaemonDeviceSnapshot>),

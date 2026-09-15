@@ -3,6 +3,7 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
+mod network_audio;
 mod endpoint_runtime;
 mod mobile_gateway;
 mod static_capture;
@@ -356,6 +357,7 @@ impl Default for RuntimeFeatureConfig {
 }
 
 struct DaemonState {
+    network_audio: Arc<std::sync::Mutex<network_audio::Manager>>,
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
     // Layout and routing state
@@ -436,6 +438,7 @@ impl DaemonState {
             pending_usb_claims: HashMap::new(),
             pending_usb_transfers: HashMap::new(),
             pending_endpoint_injects: HashMap::new(),
+            network_audio: Arc::new(std::sync::Mutex::new(network_audio::Manager::default())),
             virtual_displays: VirtualDisplayManager::default(),
             mobile_access,
             file_transfers: None,
@@ -5186,7 +5189,7 @@ async fn handle_network_message(
                             stats.frames_received;
                         state.local_controls.audio_stream_state.underruns = stats.underruns;
                         state.local_controls.audio_stream_state.overruns = stats.overruns;
-                        state.local_controls.audio_stream_state.latency_ms =
+                        state.local_controls.audio_stream_state.buffer_depth_ms =
                             Some(stats.buffer_depth_ms);
                         state.local_controls.audio_stream_state.last_error = None;
                         let mut payload = BTreeMap::new();
@@ -5244,7 +5247,7 @@ async fn handle_network_message(
                             stats.frames_received;
                         state.local_controls.audio_stream_state.underruns = stats.underruns;
                         state.local_controls.audio_stream_state.overruns = stats.overruns;
-                        state.local_controls.audio_stream_state.latency_ms =
+                        state.local_controls.audio_stream_state.buffer_depth_ms =
                             Some(stats.buffer_depth_ms);
                         state.local_controls.audio_stream_state.last_error = None;
 
@@ -6393,7 +6396,8 @@ async fn start_audio_forwarding(
         state.local_controls.audio_stream_state.target_device_id = Some(target.to_string());
         state.local_controls.audio_stream_state.stream_id = Some(stream_id.to_string());
         state.local_controls.audio_stream_state.frames_sent = 0;
-        state.local_controls.audio_stream_state.latency_ms = Some(0);
+        state.local_controls.audio_stream_state.latency_ms = None;
+        state.local_controls.audio_stream_state.buffer_depth_ms = None;
         state.local_controls.audio_stream_state.last_error = None;
         let mut payload = BTreeMap::new();
         payload.insert("source".to_string(), audio_source_label(source).to_string());
@@ -7339,6 +7343,7 @@ async fn main() -> Result<()> {
         ),
         RuntimeFeatureConfig::from_config(&config),
     );
+    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(layout_path.with_file_name("network-audio.json"))));
     daemon_state.refresh_local_controls_platform();
     let download_dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
@@ -8634,6 +8639,24 @@ async fn dispatch_ipc_request(
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<DaemonResponse> {
     let response = match request {
+        DaemonRequest::NetworkAudio(command) => {
+            let audio = state.read().await.network_audio.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<_> {
+                let trusted = match &command {
+                    rshare_core::network_audio::AudioCommand::Grant(grant) => {
+                        let store = rshare_net::encryption::QuicTrustStore::load_default()?;
+                        store.fingerprint_for(&grant.peer).is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
+                    }
+                    _ => false,
+                };
+                audio.lock().map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?.command(command, trusted)
+            }).await?;
+            match result {
+                Ok(snapshot) => DaemonResponse::NetworkAudio(snapshot),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+
         DaemonRequest::SendFiles { device_id, paths } => {
             let service = state
                 .read()

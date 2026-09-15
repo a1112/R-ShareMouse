@@ -326,6 +326,9 @@ pub struct LocalAudioStreamState {
     pub overruns: u64,
     #[serde(default)]
     pub latency_ms: Option<u32>,
+    /// Queue depth, not end-to-end latency.
+    #[serde(default)]
+    pub buffer_depth_ms: Option<u32>,
     #[serde(default)]
     pub last_error: Option<String>,
 }
@@ -341,6 +344,7 @@ impl Default for LocalAudioStreamState {
             underruns: 0,
             overruns: 0,
             latency_ms: None,
+            buffer_depth_ms: None,
             last_error: None,
         }
     }
