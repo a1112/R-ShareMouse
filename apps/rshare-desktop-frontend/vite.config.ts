@@ -485,6 +485,7 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
   },
+  preview: { port: 17036, strictPort: true },
   server: {
     port: 5176,
     strictPort: true,
