@@ -16,6 +16,7 @@ path = "src/main.rs"
 tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
+monitor-sysinfo = { package = "sysinfo", version = "0.33", default-features = false, features = ["system"] }
 rshare-core = { path = "../../../crates/rshare-core" }
 rshare-platform = { path = "../../../crates/rshare-platform" }
 serde = { workspace = true }

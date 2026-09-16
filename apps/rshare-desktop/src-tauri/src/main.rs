@@ -1100,6 +1100,7 @@ fn build_acceptance(
 fn main() {
     eprintln!("{}", build_metadata());
     tauri::Builder::default()
+        .plugin(project_resource_monitor::init())
         .plugin(init(|app, _args, _cwd| {
             // Focus the existing window when a second instance is launched
             let _ = show_main_window(app);
@@ -1124,6 +1125,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            project_resource_monitor::project_resource_snapshot,
             send_files,
             file_transfers,
             cancel_file_transfer,
@@ -2760,3 +2762,5 @@ mod tests {
         assert_eq!(force_stop_count.load(Ordering::SeqCst), 1);
     }
 }
+
+mod project_resource_monitor;
