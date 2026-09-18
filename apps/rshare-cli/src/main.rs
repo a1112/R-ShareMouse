@@ -58,6 +58,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Network audio endpoints and permissions
+    Audio { #[command(subcommand)] command: commands::audio::AudioCommandLine },
     /// Start the R-ShareMouse service
     Start {
         /// Run in background (daemon mode)
@@ -223,6 +225,7 @@ async fn main() -> Result<()> {
         Commands::Status { detailed } => {
             commands::status::execute(detailed).await?;
         }
+        Commands::Audio { command } => commands::audio::execute(command).await?,
         Commands::Display { display_cmd } => {
             display::execute(display_cmd).await?;
         }

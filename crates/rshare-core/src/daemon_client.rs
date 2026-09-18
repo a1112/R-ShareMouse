@@ -679,3 +679,12 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+/// Query/configure daemon-owned network audio state.
+pub async fn request_network_audio(command: crate::network_audio::AudioCommand) -> Result<crate::network_audio::AudioSnapshot> {
+    match send_request(DaemonRequest::NetworkAudio(command)).await? {
+        DaemonResponse::NetworkAudio(snapshot) => Ok(snapshot),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected network audio response: {:?}", other),
+    }
+}

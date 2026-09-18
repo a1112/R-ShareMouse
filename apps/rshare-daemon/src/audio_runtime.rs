@@ -13,12 +13,23 @@ use tokio::sync::mpsc;
 
 const DEFAULT_FRAME_MS: u16 = 20;
 const MAX_RENDER_BUFFER_MS: u32 = 300;
+const CAPTURE_QUEUE_FRAMES: usize = 5;
 
 #[derive(Debug)]
 pub struct CapturedAudioFrame {
+    pub captured_at: std::time::Instant,
     pub frame: AudioFramePayload,
     pub level_peak: u8,
     pub level_rms: u8,
+}
+
+impl CapturedAudioFrame {
+    pub fn is_stale(&self) -> bool {
+        self.captured_at.elapsed()
+            > std::time::Duration::from_millis(
+                CAPTURE_QUEUE_FRAMES as u64 * u64::from(DEFAULT_FRAME_MS),
+            )
+    }
 }
 
 #[derive(Clone)]
@@ -28,7 +39,7 @@ pub struct AudioRuntimeHandle {
 
 pub struct StartedAudioCapture {
     pub format: AudioFormat,
-    pub rx: mpsc::UnboundedReceiver<CapturedAudioFrame>,
+    pub rx: mpsc::Receiver<CapturedAudioFrame>,
 }
 
 enum AudioRuntimeCommand {
@@ -183,26 +194,31 @@ impl AudioCaptureSession {
         source: LocalAudioCaptureSource,
         endpoint_name: Option<&str>,
         stream_id: DeviceId,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<CapturedAudioFrame>)> {
-        if source == LocalAudioCaptureSource::Loopback {
-            anyhow::bail!(
-                "System audio loopback capture is not implemented in the CPAL backend yet"
-            );
+    ) -> Result<(Self, mpsc::Receiver<CapturedAudioFrame>)> {
+        if source == LocalAudioCaptureSource::Loopback && !cfg!(windows) {
+            anyhow::bail!("System audio loopback capture is currently supported only on Windows");
         }
 
         let host = cpal::default_host();
-        let device = select_input_device(&host, endpoint_name)?;
-        let supported_config = device
-            .default_input_config()
-            .context("Default audio input config is unavailable")?;
+        let device = select_capture_device(&host, source, endpoint_name)?;
+        // CPAL 0.15 WASAPI enables AUDCLNT_STREAMFLAGS_LOOPBACK when an
+        // output endpoint is used to build an input stream.
+        let supported_config = if source == LocalAudioCaptureSource::Loopback {
+            device.default_output_config()
+        } else {
+            device.default_input_config()
+        }
+        .context("Default audio capture config is unavailable")?;
         let format = AudioFormat {
             sample_rate: supported_config.sample_rate().0,
-            channels: supported_config.channels() as u8,
+            channels: u8::try_from(supported_config.channels())
+                .context("Too many capture channels")?,
             sample_format: AudioSampleFormat::PcmI16Le,
             frame_ms: DEFAULT_FRAME_MS,
         };
+        validate_audio_format(&format)?;
         let config: cpal::StreamConfig = supported_config.clone().into();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
         let pending_samples = Arc::new(Mutex::new(Vec::<i16>::new()));
         let sequence = Arc::new(AtomicU64::new(0));
 
@@ -268,6 +284,7 @@ impl AudioRenderRuntime {
     }
 
     pub fn push_frame(&mut self, frame: &AudioFramePayload) -> Result<AudioRenderStats> {
+        validate_audio_frame(frame, &frame.format)?;
         if self
             .active
             .as_ref()
@@ -302,6 +319,7 @@ struct AudioRenderSession {
 
 impl AudioRenderSession {
     fn start(stream_id: DeviceId, format: AudioFormat) -> Result<Self> {
+        validate_audio_format(&format)?;
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -360,9 +378,7 @@ impl AudioRenderSession {
     }
 
     fn push_frame(&mut self, frame: &AudioFramePayload) -> Result<()> {
-        if frame.format.sample_format != AudioSampleFormat::PcmI16Le {
-            anyhow::bail!("Unsupported audio frame format: {:?}", frame.format);
-        }
+        validate_audio_frame(frame, &self.format)?;
 
         let mut samples = Vec::with_capacity(frame.data.len() / 2);
         for chunk in frame.data.chunks_exact(2) {
@@ -416,7 +432,7 @@ fn build_input_stream<T>(
     format: AudioFormat,
     pending_samples: Arc<Mutex<Vec<i16>>>,
     sequence: Arc<AtomicU64>,
-    tx: mpsc::UnboundedSender<CapturedAudioFrame>,
+    tx: mpsc::Sender<CapturedAudioFrame>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::SizedSample,
@@ -453,14 +469,15 @@ where
                     format: format.clone(),
                     data,
                 };
-                if tx
-                    .send(CapturedAudioFrame {
+                if !try_queue_capture(
+                    &tx,
+                    CapturedAudioFrame {
+                        captured_at: std::time::Instant::now(),
                         frame,
                         level_peak,
                         level_rms,
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     break;
                 }
             }
@@ -470,39 +487,90 @@ where
     )?)
 }
 
-fn select_input_device(host: &cpal::Host, endpoint_name: Option<&str>) -> Result<cpal::Device> {
-    if let Some(endpoint_name) = endpoint_name.filter(|name| !name.trim().is_empty()) {
-        let wanted = endpoint_name.trim().to_lowercase();
-        match host.input_devices() {
-            Ok(devices) => {
-                for device in devices {
-                    let Ok(name) = device.name() else {
-                        continue;
-                    };
-                    let candidate = name.trim().to_lowercase();
-                    if candidate == wanted
-                        || candidate.contains(&wanted)
-                        || wanted.contains(&candidate)
-                    {
-                        return Ok(device);
-                    }
-                }
-                tracing::warn!(
-                    "Requested audio input endpoint '{endpoint_name}' was not exposed by CPAL; falling back to default input"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "Failed to enumerate CPAL input devices for requested endpoint '{endpoint_name}': {error}"
-                );
-            }
-        }
-    }
-
-    host.default_input_device()
-        .ok_or_else(|| anyhow!("No default audio input device is available"))
+// Full queues drop the new frame; capture callbacks must never wait for the network.
+fn try_queue_capture(tx: &mpsc::Sender<CapturedAudioFrame>, frame: CapturedAudioFrame) -> bool {
+    !matches!(
+        tx.try_send(frame),
+        Err(mpsc::error::TrySendError::Closed(_))
+    )
 }
 
+fn capture_endpoint_name(source: LocalAudioCaptureSource, name: &str) -> &str {
+    let name = name.trim();
+    if source == LocalAudioCaptureSource::Loopback {
+        name.strip_prefix("系统声音 (")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+fn capture_device_index(names: &[&str], wanted: &str) -> Result<usize> {
+    let wanted = wanted.trim().to_lowercase();
+    let mut matches = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.trim().to_lowercase() == wanted);
+    let (index, _) = matches
+        .next()
+        .context("Requested audio capture endpoint is unavailable")?;
+    if matches.next().is_some() {
+        anyhow::bail!("Requested audio capture endpoint name is ambiguous");
+    }
+    Ok(index)
+}
+
+fn select_capture_device(
+    host: &cpal::Host,
+    source: LocalAudioCaptureSource,
+    endpoint_name: Option<&str>,
+) -> Result<cpal::Device> {
+    let loopback = source == LocalAudioCaptureSource::Loopback;
+    if let Some(name) = endpoint_name {
+        let devices: Vec<_> = if loopback {
+            host.output_devices()?
+        } else {
+            host.input_devices()?
+        }
+        .collect();
+        let names: Vec<_> = devices
+            .iter()
+            .map(|d| d.name().unwrap_or_default())
+            .collect();
+        let names: Vec<_> = names.iter().map(String::as_str).collect();
+        let index = capture_device_index(&names, capture_endpoint_name(source, name))?;
+        return devices
+            .into_iter()
+            .nth(index)
+            .context("Audio capture endpoint disappeared");
+    }
+    if loopback {
+        host.default_output_device()
+    } else {
+        host.default_input_device()
+    }
+    .context("No default audio capture endpoint is available")
+}
+
+fn validate_audio_format(format: &AudioFormat) -> Result<()> {
+    if !(8000..=192000).contains(&format.sample_rate)
+        || !(1..=8).contains(&format.channels)
+        || !(1..=100).contains(&format.frame_ms)
+        || (u64::from(format.sample_rate) * u64::from(format.frame_ms)) % 1000 != 0
+    {
+        anyhow::bail!("Unsupported audio format: {format:?}");
+    }
+    Ok(())
+}
+
+fn validate_audio_frame(frame: &AudioFramePayload, expected: &AudioFormat) -> Result<()> {
+    validate_audio_format(&frame.format)?;
+    if frame.format != *expected || frame.data.len() != samples_per_frame(expected) * 2 {
+        anyhow::bail!("Audio frame format or payload length does not match the stream");
+    }
+    Ok(())
+}
 fn output_config_for_format(
     device: &cpal::Device,
     format: &AudioFormat,
@@ -516,13 +584,19 @@ fn output_config_for_format(
         if config.channels() == wanted_channels
             && config.min_sample_rate() <= wanted_rate
             && config.max_sample_rate() >= wanted_rate
+            && matches!(
+                config.sample_format(),
+                cpal::SampleFormat::I16 | cpal::SampleFormat::U16 | cpal::SampleFormat::F32
+            )
         {
             return Ok(config.with_sample_rate(wanted_rate));
         }
     }
-    device
-        .default_output_config()
-        .context("Default audio output config is unavailable")
+    anyhow::bail!(
+        "Output device does not support {} Hz / {} channels; audio resampling is required",
+        format.sample_rate,
+        format.channels
+    )
 }
 
 fn fill_output_buffer<T>(
@@ -634,6 +708,16 @@ mod tests {
         assert!(rms > 60);
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an active Windows audio render endpoint"]
+    fn windows_loopback_capture_opens_default_render_endpoint() {
+        let (capture, _rx) =
+            AudioCaptureSession::start(LocalAudioCaptureSource::Loopback, None, DeviceId::new_v4())
+                .unwrap();
+        validate_audio_format(&capture.format).unwrap();
+    }
+
     #[test]
     fn frame_sample_count_uses_format_duration() {
         let format = AudioFormat::pcm_i16_48k_stereo_20ms();
@@ -644,5 +728,111 @@ mod tests {
     fn sample_conversion_centers_unsigned_audio() {
         assert_eq!(i16::from_sample_value(32768u16), 0);
         assert_eq!(u16::from_sample_value(0i16), 32768);
+    }
+
+    #[test]
+    fn loopback_selects_render_endpoint_and_unwraps_display_label() {
+        assert_eq!(
+            capture_endpoint_name(
+                LocalAudioCaptureSource::Loopback,
+                "系统声音 (Speakers (USB Audio))"
+            ),
+            "Speakers (USB Audio)"
+        );
+        assert_eq!(
+            capture_endpoint_name(LocalAudioCaptureSource::Microphone, "系统声音 (Mic)"),
+            "系统声音 (Mic)"
+        );
+    }
+
+    #[test]
+    fn named_capture_requires_one_exact_device() {
+        let names = ["USB Mic", "USB Mic Pro"];
+        assert_eq!(capture_device_index(&names, " usb mic ").unwrap(), 0);
+        assert!(capture_device_index(&names, "USB").is_err());
+        assert!(capture_device_index(&["Mic", "Mic"], "Mic").is_err());
+    }
+
+    #[test]
+    fn stalled_capture_expires_using_monotonic_time() {
+        let mut captured = CapturedAudioFrame {
+            captured_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            frame: AudioFramePayload {
+                stream_id: DeviceId::nil(),
+                sequence: 1,
+                timestamp_ms: u64::MAX,
+                format: AudioFormat::pcm_i16_48k_stereo_20ms(),
+                data: vec![],
+            },
+            level_peak: 0,
+            level_rms: 0,
+        };
+        assert!(captured.is_stale());
+        captured.captured_at = std::time::Instant::now();
+        assert!(!captured.is_stale());
+    }
+
+    #[test]
+    fn malformed_audio_is_rejected_before_rendering() {
+        let format = AudioFormat::pcm_i16_48k_stereo_20ms();
+        let mut frame = AudioFramePayload {
+            stream_id: DeviceId::new_v4(),
+            sequence: 1,
+            timestamp_ms: 0,
+            format: format.clone(),
+            data: vec![0; 3840],
+        };
+        assert!(validate_audio_frame(&frame, &format).is_ok());
+        frame.data.pop();
+        assert!(validate_audio_frame(&frame, &format).is_err());
+        frame.data.push(0);
+        frame.format.sample_rate = 44100;
+        assert!(validate_audio_frame(&frame, &format).is_err());
+        frame.format.channels = 0;
+        assert!(validate_audio_format(&frame.format).is_err());
+    }
+
+    #[test]
+    fn capture_queue_drops_without_blocking_when_consumer_stalls() {
+        let (tx, mut rx) = mpsc::channel(2);
+        for sequence in 1..=3 {
+            assert_eq!(
+                try_queue_capture(
+                    &tx,
+                    CapturedAudioFrame {
+                        captured_at: std::time::Instant::now(),
+                        frame: AudioFramePayload {
+                            stream_id: DeviceId::nil(),
+                            sequence,
+                            timestamp_ms: 0,
+                            format: AudioFormat::pcm_i16_48k_stereo_20ms(),
+                            data: vec![]
+                        },
+                        level_peak: 0,
+                        level_rms: 0,
+                    }
+                ),
+                true
+            );
+        }
+        assert_eq!(rx.try_recv().unwrap().frame.sequence, 1);
+        assert_eq!(rx.try_recv().unwrap().frame.sequence, 2);
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(!try_queue_capture(
+            &tx,
+            CapturedAudioFrame {
+                captured_at: std::time::Instant::now(),
+                frame: AudioFramePayload {
+                    stream_id: DeviceId::nil(),
+                    sequence: 4,
+                    timestamp_ms: 0,
+                    format: AudioFormat::pcm_i16_48k_stereo_20ms(),
+                    data: vec![]
+                },
+                level_peak: 0,
+                level_rms: 0,
+            }
+        ));
     }
 }

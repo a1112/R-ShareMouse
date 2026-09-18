@@ -1099,7 +1099,7 @@ fn build_acceptance(
 
 fn main() {
     eprintln!("{}", build_metadata());
-    tauri::Builder::default()
+    tauri::Builder::default().plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .plugin(init(|app, _args, _cwd| {
             // Focus the existing window when a second instance is launched
@@ -1126,6 +1126,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             project_resource_monitor::project_resource_snapshot,
+            network_audio,
             send_files,
             file_transfers,
             cancel_file_transfer,
@@ -2764,3 +2765,9 @@ mod tests {
 }
 
 mod project_resource_monitor;
+#[tauri::command]
+async fn network_audio(command: rshare_core::network_audio::AudioCommand) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
+    daemon_client::request_network_audio(command).await.map_err(|e| e.to_string())
+}
+
+mod project_window_chrome;

@@ -11,6 +11,8 @@ name = "rshare-daemon"
 path = "src/main.rs"
 
 [dependencies]
+rshare-audio = { path = "../../crates/rshare-audio" }
+tempfile = "3"
 rshare-core = { path = "../../crates/rshare-core" }
 rshare-net = { path = "../../crates/rshare-net" }
 rshare-input = { path = "../../crates/rshare-input" }

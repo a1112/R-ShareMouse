@@ -5,6 +5,7 @@
 mod audio_runtime;
 mod endpoint_runtime;
 mod mobile_gateway;
+mod network_audio;
 mod static_capture;
 
 use anyhow::{Context, Result};
@@ -356,6 +357,7 @@ impl Default for RuntimeFeatureConfig {
 }
 
 struct DaemonState {
+    network_audio: Arc<std::sync::Mutex<network_audio::Manager>>,
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
     // Layout and routing state
@@ -436,6 +438,7 @@ impl DaemonState {
             pending_usb_claims: HashMap::new(),
             pending_usb_transfers: HashMap::new(),
             pending_endpoint_injects: HashMap::new(),
+            network_audio: Arc::new(std::sync::Mutex::new(network_audio::Manager::default())),
             virtual_displays: VirtualDisplayManager::default(),
             mobile_access,
             file_transfers: None,
@@ -3309,14 +3312,25 @@ fn audio_format_label(format: &AudioFormat) -> String {
     )
 }
 
-fn audio_input_name_for_endpoint(state: &DaemonState, endpoint_id: Option<&str>) -> Option<String> {
-    let endpoint_id = endpoint_id?;
-    state
+fn audio_input_name_for_endpoint(
+    state: &DaemonState,
+    endpoint_id: Option<&str>,
+    source: LocalAudioCaptureSource,
+) -> Result<Option<String>> {
+    let Some(endpoint_id) = endpoint_id else {
+        return Ok(None);
+    };
+    let device = state
         .local_controls
         .audio_inputs
         .iter()
         .find(|device| device.endpoint_id.as_deref() == Some(endpoint_id))
-        .map(|device| device.name.clone())
+        .context("Requested audio capture endpoint is unavailable")?;
+    let is_loopback = device.kind == rshare_core::LocalAudioInputKind::Loopback;
+    if !device.connected || is_loopback != (source == LocalAudioCaptureSource::Loopback) {
+        anyhow::bail!("Requested audio endpoint is disconnected or has the wrong capture source");
+    }
+    Ok(Some(device.name.clone()))
 }
 
 #[cfg(target_os = "macos")]
@@ -5186,7 +5200,7 @@ async fn handle_network_message(
                             stats.frames_received;
                         state.local_controls.audio_stream_state.underruns = stats.underruns;
                         state.local_controls.audio_stream_state.overruns = stats.overruns;
-                        state.local_controls.audio_stream_state.latency_ms =
+                        state.local_controls.audio_stream_state.buffer_depth_ms =
                             Some(stats.buffer_depth_ms);
                         state.local_controls.audio_stream_state.last_error = None;
                         let mut payload = BTreeMap::new();
@@ -5244,7 +5258,7 @@ async fn handle_network_message(
                             stats.frames_received;
                         state.local_controls.audio_stream_state.underruns = stats.underruns;
                         state.local_controls.audio_stream_state.overruns = stats.overruns;
-                        state.local_controls.audio_stream_state.latency_ms =
+                        state.local_controls.audio_stream_state.buffer_depth_ms =
                             Some(stats.buffer_depth_ms);
                         state.local_controls.audio_stream_state.last_error = None;
 
@@ -6020,7 +6034,7 @@ async fn set_default_audio_output(
 }
 
 async fn run_local_audio_capture_status_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<audio_runtime::CapturedAudioFrame>,
+    mut rx: tokio::sync::mpsc::Receiver<audio_runtime::CapturedAudioFrame>,
     state: Arc<RwLock<DaemonState>>,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     source: LocalAudioCaptureSource,
@@ -6029,6 +6043,9 @@ async fn run_local_audio_capture_status_loop(
     let mut last_event_ms = 0;
     let mut frames_seen = 0u64;
     while let Some(captured) = rx.recv().await {
+        if captured.is_stale() {
+            continue;
+        }
         frames_seen = frames_seen.saturating_add(1);
         let now = timestamp_ms_now();
         let event = {
@@ -6074,7 +6091,7 @@ async fn run_local_audio_capture_status_loop(
 }
 
 async fn run_audio_forwarding_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<audio_runtime::CapturedAudioFrame>,
+    mut rx: tokio::sync::mpsc::Receiver<audio_runtime::CapturedAudioFrame>,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
@@ -6083,10 +6100,13 @@ async fn run_audio_forwarding_loop(
     endpoint_id: Option<String>,
 ) {
     let mut last_event_ms = 0;
+    let mut frames_sent = 0u64;
     while let Some(captured) = rx.recv().await {
-        let frame_sequence = captured.frame.sequence;
         let send_result = {
             let mut manager = network_manager.lock().await;
+            if captured.is_stale() {
+                continue;
+            }
             manager
                 .send_to(
                     &target,
@@ -6097,6 +6117,9 @@ async fn run_audio_forwarding_loop(
                 .await
         };
 
+        if send_result.is_ok() {
+            frames_sent = frames_sent.saturating_add(1);
+        }
         let now = timestamp_ms_now();
         let event = {
             let mut state = state.write().await;
@@ -6106,7 +6129,7 @@ async fn run_audio_forwarding_loop(
                 Some(captured.frame.format.sample_rate);
             state.local_controls.audio_capture_state.channel_count =
                 Some(captured.frame.format.channels as u32);
-            state.local_controls.audio_stream_state.frames_sent = frame_sequence;
+            state.local_controls.audio_stream_state.frames_sent = frames_sent;
 
             if let Err(error) = send_result {
                 state.local_controls.audio_stream_state.last_error = Some(error.to_string());
@@ -6124,7 +6147,7 @@ async fn run_audio_forwarding_loop(
                 let mut payload = BTreeMap::new();
                 payload.insert("source".to_string(), audio_source_label(source).to_string());
                 payload.insert("target_device_id".to_string(), target.to_string());
-                payload.insert("frames_sent".to_string(), frame_sequence.to_string());
+                payload.insert("frames_sent".to_string(), frames_sent.to_string());
                 payload.insert("level_peak".to_string(), captured.level_peak.to_string());
                 payload.insert("level_rms".to_string(), captured.level_rms.to_string());
                 payload.insert(
@@ -6139,7 +6162,7 @@ async fn run_audio_forwarding_loop(
                     "forwarding_level",
                     format!(
                         "Audio forwarding {} frames to {}",
-                        frame_sequence,
+                        frames_sent,
                         short_device_id(target)
                     ),
                     payload,
@@ -6173,9 +6196,10 @@ async fn start_audio_capture(
     let stream_id = DeviceId::new_v4();
     let endpoint_name = {
         let state = state.read().await;
-        audio_input_name_for_endpoint(&state, endpoint_id.as_deref())
+        audio_input_name_for_endpoint(&state, endpoint_id.as_deref(), source)
     };
-    let capture = audio_runtime.start_capture(source, endpoint_name.as_deref(), stream_id);
+    let capture = endpoint_name
+        .and_then(|name| audio_runtime.start_capture(source, name.as_deref(), stream_id));
     let started = match capture {
         Ok(capture) => capture,
         Err(error) => {
@@ -6305,9 +6329,10 @@ async fn start_audio_forwarding(
     let stream_id = DeviceId::new_v4();
     let endpoint_name = {
         let state = state.read().await;
-        audio_input_name_for_endpoint(&state, endpoint_id.as_deref())
+        audio_input_name_for_endpoint(&state, endpoint_id.as_deref(), source)
     };
-    let capture = audio_runtime.start_capture(source, endpoint_name.as_deref(), stream_id);
+    let capture = endpoint_name
+        .and_then(|name| audio_runtime.start_capture(source, name.as_deref(), stream_id));
     let started = match capture {
         Ok(capture) => capture,
         Err(error) => {
@@ -6393,7 +6418,8 @@ async fn start_audio_forwarding(
         state.local_controls.audio_stream_state.target_device_id = Some(target.to_string());
         state.local_controls.audio_stream_state.stream_id = Some(stream_id.to_string());
         state.local_controls.audio_stream_state.frames_sent = 0;
-        state.local_controls.audio_stream_state.latency_ms = Some(0);
+        state.local_controls.audio_stream_state.latency_ms = None;
+        state.local_controls.audio_stream_state.buffer_depth_ms = None;
         state.local_controls.audio_stream_state.last_error = None;
         let mut payload = BTreeMap::new();
         payload.insert("source".to_string(), audio_source_label(source).to_string());
@@ -7339,6 +7365,9 @@ async fn main() -> Result<()> {
         ),
         RuntimeFeatureConfig::from_config(&config),
     );
+    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(
+        layout_path.with_file_name("network-audio.json"),
+    )));
     daemon_state.refresh_local_controls_platform();
     let download_dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
@@ -8634,6 +8663,30 @@ async fn dispatch_ipc_request(
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<DaemonResponse> {
     let response = match request {
+        DaemonRequest::NetworkAudio(command) => {
+            let audio = state.read().await.network_audio.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<_> {
+                let trusted = match &command {
+                    rshare_core::network_audio::AudioCommand::Grant(grant) => {
+                        let store = rshare_net::encryption::QuicTrustStore::load_default()?;
+                        store
+                            .fingerprint_for(&grant.peer)
+                            .is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
+                    }
+                    _ => false,
+                };
+                audio
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?
+                    .command(command, trusted)
+            })
+            .await?;
+            match result {
+                Ok(snapshot) => DaemonResponse::NetworkAudio(snapshot),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+
         DaemonRequest::SendFiles { device_id, paths } => {
             let service = state
                 .read()
@@ -9278,6 +9331,36 @@ mod tests {
             27432,
             42,
         ))
+    }
+
+    #[test]
+    fn audio_capture_endpoint_requires_matching_connected_source() {
+        let mut state = test_daemon_state();
+        state.local_controls.audio_inputs = vec![rshare_core::LocalAudioInputDevice {
+            endpoint_id: Some("speaker-id".into()),
+            name: "系统声音 (Speakers)".into(),
+            kind: rshare_core::LocalAudioInputKind::Loopback,
+            connected: true,
+            ..Default::default()
+        }];
+        let loopback = LocalAudioCaptureSource::Loopback;
+        assert_eq!(
+            audio_input_name_for_endpoint(&state, None, loopback).unwrap(),
+            None
+        );
+        assert_eq!(
+            audio_input_name_for_endpoint(&state, Some("speaker-id"), loopback).unwrap(),
+            Some("系统声音 (Speakers)".into())
+        );
+        assert!(audio_input_name_for_endpoint(&state, Some("missing"), loopback).is_err());
+        assert!(audio_input_name_for_endpoint(
+            &state,
+            Some("speaker-id"),
+            LocalAudioCaptureSource::Microphone
+        )
+        .is_err());
+        state.local_controls.audio_inputs[0].connected = false;
+        assert!(audio_input_name_for_endpoint(&state, Some("speaker-id"), loopback).is_err());
     }
 
     fn test_injection_handle(backend: impl InjectBackend + 'static) -> InputInjectionHandle {
