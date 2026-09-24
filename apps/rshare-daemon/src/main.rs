@@ -3,6 +3,7 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
+mod network_audio;
 mod endpoint_runtime;
 mod mobile_gateway;
 mod network_audio;
