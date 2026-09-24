@@ -156,6 +156,7 @@ import {
 } from "./desktop-shell.mjs";
 import {
   MACOS_PERMISSION_ITEMS,
+  buildMacosInputWarning,
   macosInputPermissionSummary,
   missingMacosInputPermissions,
   normalizeMacosInputPermissions,
@@ -2190,6 +2191,7 @@ function DesktopApp() {
   const [error, setError] = useState<string | null>(null);
   const [macosPermissions, setMacosPermissions] =
     useState<MacosInputPermissions | null>(null);
+  const [macosPermissionsChecked, setMacosPermissionsChecked] = useState(false);
   const [macosPermissionDialogOpen, setMacosPermissionDialogOpen] = useState(false);
   const [macosPermissionRestartRequired, setMacosPermissionRestartRequired] =
     useState(false);
@@ -2244,6 +2246,13 @@ function DesktopApp() {
   const footerStatus = buildFooterStatus(model);
   const headerMetrics = getHeaderMetrics();
   const desktopShell = getDesktopShellState();
+  const macosInputWarning = desktopShell.isMacOS
+    ? buildMacosInputWarning(macosPermissions, {
+        permissionCheckFailed: macosPermissionsChecked && !macosPermissions,
+        runtimeDegraded: model.service.online && !model.acceptance.inputReady,
+        runtimeReason: model.service.error ?? model.inputMode.reason,
+      })
+    : null;
   const localEndpointId =
     typeof payload.status === "object" &&
     payload.status &&
@@ -2267,6 +2276,7 @@ function DesktopApp() {
   async function refreshMacosPermissions() {
     if (!desktopShell.isMacOS || !getInvoke()) {
       setMacosPermissions(null);
+      setMacosPermissionsChecked(false);
       setMacosPermissionError(null);
       return null;
     }
@@ -2275,10 +2285,12 @@ function DesktopApp() {
       const snapshot = await invokeCommand<unknown>("macos_input_permissions");
       const normalized = normalizeMacosInputPermissions(snapshot);
       setMacosPermissions(normalized);
+      setMacosPermissionsChecked(true);
       setMacosPermissionError(null);
       return normalized;
     } catch (permissionError) {
       setMacosPermissions(null);
+      setMacosPermissionsChecked(true);
       setMacosPermissionError(errorMessage(permissionError));
       return null;
     }
@@ -2295,6 +2307,7 @@ function DesktopApp() {
       const snapshot = await invokeCommand<unknown>("request_macos_input_permissions");
       const normalized = normalizeMacosInputPermissions(snapshot);
       setMacosPermissions(normalized);
+      setMacosPermissionsChecked(true);
       if (normalized?.ready) {
         setMacosPermissionRestartRequired(true);
       }
@@ -2342,7 +2355,7 @@ function DesktopApp() {
 
   function openMacosPermissionDialog() {
     setMacosPermissionError(null);
-    setMacosPermissionRestartRequired(Boolean(macosPermissions && !macosPermissions.ready));
+    setMacosPermissionRestartRequired(Boolean(macosInputWarning));
     setMacosPermissionDialogOpen(true);
   }
 
@@ -3054,7 +3067,7 @@ function DesktopApp() {
               刷新
             </span>
           </button>
-          {desktopShell.isMacOS && macosPermissions && !macosPermissions.ready ? (
+          {macosInputWarning ? (
             <button
               type="button"
               className="inline-flex items-center gap-1.5 rounded-md text-sm transition"
@@ -3069,10 +3082,10 @@ function DesktopApp() {
                 paddingBottom: headerMetrics.actionButtonPaddingY,
               }}
               onClick={openMacosPermissionDialog}
-              title={`权限不足⚠️：${macosInputPermissionSummary(macosPermissions)}`}
+              title={`${macosInputWarning.label}：${macosInputWarning.summary}`}
             >
               <AlertTriangle size={14} />
-              权限不足⚠️
+              {macosInputWarning.label}
             </button>
           ) : null}
           <button
@@ -3226,6 +3239,7 @@ function DesktopApp() {
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
               macosPermissions={macosPermissions}
+              macosRuntimeIssue={macosInputWarning?.runtimeIssue ?? null}
               onOpenMacosPermissions={openMacosPermissionDialog}
               mobileAccess={mobileAccess}
               mobileAccessError={mobileAccessError}
@@ -3270,6 +3284,7 @@ function DesktopApp() {
         <MacosPermissionDialog
           permissions={macosPermissions}
           restartRequired={macosPermissionRestartRequired}
+          runtimeIssue={macosInputWarning?.runtimeIssue ?? null}
           busyAction={macosPermissionAction}
           error={macosPermissionError}
           theme={theme}
@@ -10045,6 +10060,7 @@ function hardwareAssetKindLabel(kind: string) {
 function MacosPermissionDialog({
   permissions,
   restartRequired,
+  runtimeIssue,
   busyAction,
   error,
   theme,
@@ -10056,6 +10072,7 @@ function MacosPermissionDialog({
 }: {
   permissions: MacosInputPermissions | null;
   restartRequired: boolean;
+  runtimeIssue: string | null;
   busyAction: string | null;
   error: string | null;
   theme: typeof FIGMA_DESKTOP_THEME;
@@ -10067,6 +10084,7 @@ function MacosPermissionDialog({
 }) {
   const missing = missingMacosInputPermissions(permissions);
   const supported = permissions?.supported === true;
+  const ready = supported && permissions?.ready && !runtimeIssue;
 
   return (
     <div
@@ -10094,11 +10112,11 @@ function MacosPermissionDialog({
           <div
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
             style={{
-              background: supported && permissions?.ready ? "rgba(73, 179, 92, 0.16)" : "rgba(214, 166, 75, 0.16)",
-              color: supported && permissions?.ready ? theme.success : "#f0ca7a",
+              background: ready ? "rgba(73, 179, 92, 0.16)" : "rgba(214, 166, 75, 0.16)",
+              color: ready ? theme.success : "#f0ca7a",
             }}
           >
-            {supported && permissions?.ready ? <Check size={20} /> : <AlertTriangle size={20} />}
+            {ready ? <Check size={20} /> : <AlertTriangle size={20} />}
           </div>
           <div className="min-w-0 flex-1">
             <h2 id="rshare-macos-permission-title" className="text-lg font-semibold">
@@ -10120,6 +10138,23 @@ function MacosPermissionDialog({
         </div>
 
         <div className="mt-5 space-y-3">
+          {runtimeIssue ? (
+            <div
+              className="flex items-start gap-3 rounded-lg px-3 py-3"
+              style={{
+                border: "1px solid rgba(214, 166, 75, 0.62)",
+                background: "rgba(214, 166, 75, 0.10)",
+              }}
+            >
+              <AlertTriangle size={17} className="mt-0.5 shrink-0" style={{ color: "#f0ca7a" }} />
+              <div className="min-w-0">
+                <div className="text-sm font-medium">守护进程输入后端未就绪</div>
+                <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
+                  {runtimeIssue}。请确认权限后重启服务。
+                </div>
+              </div>
+            </div>
+          ) : null}
           {MACOS_PERMISSION_ITEMS.map((item) => {
             const enabled = supported && Boolean(permissions?.[item.key as keyof MacosInputPermissions]);
             return (
@@ -10268,6 +10303,7 @@ function SettingsPage({
   inputMode,
   privilegeState,
   macosPermissions,
+  macosRuntimeIssue,
   onOpenMacosPermissions,
   mobileAccess,
   mobileAccessError,
@@ -10315,6 +10351,7 @@ function SettingsPage({
   };
   privilegeState: string;
   macosPermissions: MacosInputPermissions | null;
+  macosRuntimeIssue: string | null;
   onOpenMacosPermissions: () => void;
   mobileAccess: MobileAccessSnapshot | null;
   mobileAccessError: string | null;
@@ -10660,22 +10697,22 @@ function SettingsPage({
           <InfoRow label="守护进程 PID" value={localDevice.pid == null ? "不可用" : String(localDevice.pid)} theme={theme} />
           <InfoRow label="权限状态" value={privilegeState} theme={theme} />
         </div>
-        {macosPermissions?.supported ? (
+        {macosPermissions?.supported || macosRuntimeIssue ? (
           <button
             type="button"
             className="mt-4 flex w-full items-center gap-3 rounded-md px-4 py-3 text-left transition"
             style={{
-              border: `1px solid ${macosPermissions.ready ? "rgba(73, 179, 92, 0.48)" : "rgba(214, 166, 75, 0.72)"}`,
-              background: macosPermissions.ready ? "rgba(73, 179, 92, 0.10)" : "rgba(214, 166, 75, 0.12)",
+              border: `1px solid ${macosPermissions?.ready && !macosRuntimeIssue ? "rgba(73, 179, 92, 0.48)" : "rgba(214, 166, 75, 0.72)"}`,
+              background: macosPermissions?.ready && !macosRuntimeIssue ? "rgba(73, 179, 92, 0.10)" : "rgba(214, 166, 75, 0.12)",
               color: theme.text,
             }}
             onClick={onOpenMacosPermissions}
           >
-            {macosPermissions.ready ? <Check size={17} style={{ color: theme.success }} /> : <AlertTriangle size={17} style={{ color: "#f0ca7a" }} />}
+            {macosPermissions?.ready && !macosRuntimeIssue ? <Check size={17} style={{ color: theme.success }} /> : <AlertTriangle size={17} style={{ color: "#f0ca7a" }} />}
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-medium">macOS 输入权限</span>
+              <span className="block text-sm font-medium">macOS 输入权限与后端</span>
               <span className="mt-1 block text-xs" style={{ color: theme.textMuted }}>
-                {macosInputPermissionSummary(macosPermissions)} · 点击查看并开启对应权限
+                {macosRuntimeIssue ?? `${macosInputPermissionSummary(macosPermissions)} · 点击查看并开启对应权限`}
               </span>
             </span>
             <ChevronRight size={16} style={{ color: theme.textMuted }} />

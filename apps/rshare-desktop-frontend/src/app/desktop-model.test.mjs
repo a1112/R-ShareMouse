@@ -2570,6 +2570,73 @@ test("buildDesktopViewModel snaps visible layout monitor groups before rendering
   assert.equal(remoteMonitor.x, 80 + 5120 * 0.12);
 });
 
+test("buildDesktopViewModel separates overlapping visible device groups before rendering", () => {
+  const model = buildDesktopViewModel({
+    status: {
+      device_id: "local-1",
+      device_name: "Local Mac",
+      hostname: "local",
+      bind_address: "127.0.0.1",
+      discovery_port: 4242,
+      pid: 999,
+      discovered_devices: 2,
+      connected_devices: 2,
+      healthy: true,
+    },
+    devices: [
+      {
+        id: "remote-1",
+        name: "Remote One",
+        hostname: "remote-one",
+        addresses: ["192.168.1.30"],
+        connected: true,
+        last_seen_secs: 2,
+      },
+      {
+        id: "remote-2",
+        name: "Remote Two",
+        hostname: "remote-two",
+        addresses: ["192.168.1.31"],
+        connected: true,
+        last_seen_secs: 2,
+      },
+    ],
+    layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [],
+      links: [],
+    },
+    visible_layout: {
+      version: 1,
+      local_device: "local-1",
+      nodes: [
+        {
+          device_id: "local-1",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+        {
+          device_id: "remote-1",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+        {
+          device_id: "remote-2",
+          displays: [{ display_id: "primary", x: 0, y: 0, width: 1920, height: 1080, primary: true }],
+        },
+      ],
+      links: [],
+    },
+  });
+
+  const monitors = model.layout.monitors.sort((left, right) => left.x - right.x);
+  assert.deepEqual(
+    monitors.map((monitor) => Math.round(monitor.x)),
+    [80, 310, 541],
+  );
+  assert.ok(monitors[0].x + monitors[0].w <= monitors[1].x);
+  assert.ok(monitors[1].x + monitors[1].w <= monitors[2].x);
+});
+
 test("updateRememberedLayoutFromVisibleMonitors saves visible monitor geometry and preserves offline nodes", () => {
   const remembered = {
     version: 1,
