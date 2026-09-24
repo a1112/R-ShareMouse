@@ -869,10 +869,15 @@ function snapVisibleDeviceGroupsEdgeToEdge(nodes, visibleDeviceIds) {
       right.bounds.bottom,
     );
 
-    if (
-      Math.abs(horizontalGap) <= LAYOUT_COMMIT_SNAP_DISTANCE &&
-      verticallyAligned
-    ) {
+    const deviceGroupsOverlap = horizontalGap < 0 && verticallyAligned;
+    const closeEnoughToSnap =
+      Math.abs(horizontalGap) <= LAYOUT_COMMIT_SNAP_DISTANCE && verticallyAligned;
+
+    // The daemon repairs persisted layout geometry, but a desktop may briefly
+    // receive a stale peer snapshot while reconnecting. Never render two
+    // device groups on top of each other in that window; a close non-overlap
+    // still keeps the familiar edge-to-edge snapping behavior.
+    if (deviceGroupsOverlap || closeEnoughToSnap) {
       const dx = -horizontalGap;
       offsets.set(right.node.device_id, {
         dx: (offsets.get(right.node.device_id)?.dx ?? 0) + dx,

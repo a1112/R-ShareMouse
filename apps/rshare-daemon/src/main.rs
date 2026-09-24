@@ -470,6 +470,7 @@ impl DaemonState {
 
         layout.rebind_local_device(self.status.device_id);
         self.restore_local_layout_geometry(&mut layout);
+        layout.repair_overlapping_device_groups();
         self.layout = layout.clone();
         self.layout_revision = revision;
         self.layout_source_device = source_device;
@@ -4890,6 +4891,7 @@ async fn handle_network_message(
                 let mut candidate = layout;
                 candidate.rebind_local_device(state.status.device_id);
                 state.restore_local_layout_geometry(&mut candidate);
+                candidate.repair_overlapping_device_groups();
                 candidate
             };
 
@@ -7374,7 +7376,9 @@ async fn main() -> Result<()> {
         .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
         .context("无法定位文件接收目录")?;
     daemon_state.layout = load_layout_from_path(device_id, &layout_path)?;
-    let should_save_runtime_layout = daemon_state.reconcile_local_layout_geometry();
+    let local_layout_changed = daemon_state.reconcile_local_layout_geometry();
+    let overlap_repaired = daemon_state.layout.repair_overlapping_device_groups();
+    let should_save_runtime_layout = local_layout_changed || overlap_repaired;
     if should_save_runtime_layout {
         save_layout_to_path(&daemon_state.layout, &layout_path)?;
     }
@@ -8846,6 +8850,7 @@ async fn dispatch_ipc_request(
                 let state = state.read().await;
                 state.restore_local_layout_geometry(&mut canonical_layout);
             }
+            canonical_layout.repair_overlapping_device_groups();
 
             match persist_and_publish_layout(
                 &canonical_layout,
@@ -13771,6 +13776,49 @@ mod tests {
 
         let stale = LayoutGraph::new(remote_id);
         assert!(state.accept_remote_layout(stale, 1, remote_id).is_none());
+    }
+
+    #[test]
+    fn shared_layout_revision_repairs_colliding_groups_without_rewriting_links() {
+        use rshare_core::LayoutLink;
+
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut state = DaemonState::new(test_status(local_id));
+        let mut layout = LayoutGraph::new(remote_id);
+        layout.add_node(LayoutNode::new(local_id, 0, 0, 1920, 1080));
+        layout.add_node(LayoutNode::new(remote_id, 0, 0, 1920, 1080));
+        layout.add_link(LayoutLink::new(
+            local_id,
+            Direction::Right,
+            remote_id,
+            Direction::Left,
+        ));
+
+        assert!(state.accept_remote_layout(layout, 2, remote_id).is_some());
+        let local = state.layout.get_node(local_id).unwrap();
+        assert_eq!(local.primary_display().unwrap().x, 0);
+        let local_right = local
+            .displays
+            .iter()
+            .map(|display| display.x + display.width as i32)
+            .max()
+            .unwrap();
+        assert_eq!(
+            state
+                .layout
+                .get_node(remote_id)
+                .and_then(LayoutNode::primary_display)
+                .unwrap()
+                .x,
+            local_right
+        );
+        assert!(state.layout.links.iter().any(|link| {
+            link.from_device == local_id
+                && link.from_edge == Direction::Right
+                && link.to_device == remote_id
+                && link.to_edge == Direction::Left
+        }));
     }
 
     fn test_status(local_id: DeviceId) -> ServiceStatusSnapshot {

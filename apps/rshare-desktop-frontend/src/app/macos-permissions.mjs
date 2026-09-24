@@ -49,3 +49,40 @@ export function macosInputPermissionSummary(value) {
   const missing = missingMacosInputPermissions(permissions);
   return `缺少${missing.map((item) => item.label).join("、")}`;
 }
+
+/**
+ * Build the single macOS input warning shown by desktop UI.
+ *
+ * TCC preflight runs in the desktop process, while the daemon owns the
+ * actual event tap. Both signals are needed: a green GUI preflight must not
+ * hide a daemon capture fault.
+ */
+export function buildMacosInputWarning(value, {
+  permissionCheckFailed = false,
+  runtimeDegraded = false,
+  runtimeReason = null,
+} = {}) {
+  const permissions = normalizeMacosInputPermissions(value);
+  const permissionMissing = Boolean(permissions && !permissions.ready);
+  const permissionIssue = permissionMissing
+    ? macosInputPermissionSummary(permissions)
+    : permissionCheckFailed
+      ? "无法读取权限状态"
+      : null;
+  const runtimeIssue = runtimeDegraded
+    ? runtimeReason || "未报告具体原因"
+    : null;
+  const runtimeSummary = runtimeIssue
+    ? `守护进程输入后端未就绪：${runtimeIssue}`
+    : null;
+
+  if (!permissionIssue && !runtimeSummary) {
+    return null;
+  }
+
+  return {
+    label: permissionIssue ? "权限不足⚠️" : "输入异常⚠️",
+    summary: [permissionIssue, runtimeSummary].filter(Boolean).join("；"),
+    runtimeIssue,
+  };
+}

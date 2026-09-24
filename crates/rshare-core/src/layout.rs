@@ -504,7 +504,7 @@ impl LayoutGraph {
         )
     }
 
-    /// Merge discovered peers into the remembered graph while honoring runtime screen geometry.
+    /// Merge discovered peers into the remembered graph using screen hints for new nodes.
     pub fn merge_discovered_peers_to_right_with_screens<I>(&mut self, discovered_peers: I) -> bool
     where
         I: IntoIterator<Item = (Uuid, Option<ScreenInfo>)>,
@@ -528,14 +528,9 @@ impl LayoutGraph {
         peers.sort_by_key(|(peer_id, _)| *peer_id);
 
         for (peer_id, screen_info) in peers {
-            if let Some(screen_info) = screen_info.as_ref() {
-                changed |= self.update_primary_display_geometry(
-                    peer_id,
-                    screen_info.width,
-                    screen_info.height,
-                );
-            }
-
+            // Discovery can advertise fallback dimensions that disagree with
+            // the peer's shared layout. Existing node geometry comes from the
+            // layout, so repeated announcements must not rewrite it.
             if self.get_node(peer_id).is_some() {
                 continue;
             }
@@ -556,6 +551,78 @@ impl LayoutGraph {
             self.add_node(LayoutNode::new(peer_id, x, y, width, height));
             self.add_bidirectional_neighbor_link(neighbor_id, peer_id);
             changed = true;
+        }
+
+        // A remembered layout may have been produced by an older client or a
+        // peer that reported every primary display at the origin. Keep the
+        // graph usable for routing and rendering by repairing only true
+        // cross-device collisions; individual displays inside one device are
+        // deliberately left untouched.
+        changed |= self.repair_overlapping_device_groups();
+        changed
+    }
+
+    /// Move colliding device display groups to the right until no two devices
+    /// occupy the same global rectangle.
+    ///
+    /// The local device is kept fixed as the layout anchor. Devices that were
+    /// already separated vertically are not changed, and all displays of a
+    /// moved device retain their relative geometry. This makes a malformed or
+    /// stale persisted layout safe to use without making the desktop UI a
+    /// second owner of layout truth.
+    pub fn repair_overlapping_device_groups(&mut self) -> bool {
+        if self.nodes.len() < 2 {
+            return false;
+        }
+
+        let mut order: Vec<usize> = (0..self.nodes.len()).collect();
+        order.sort_by(|left_index, right_index| {
+            let left = &self.nodes[*left_index];
+            let right = &self.nodes[*right_index];
+            let left_is_local = left.device_id == self.local_device;
+            let right_is_local = right.device_id == self.local_device;
+            right_is_local
+                .cmp(&left_is_local)
+                .then_with(|| {
+                    let left_bounds = node_display_bounds(left);
+                    let right_bounds = node_display_bounds(right);
+                    left_bounds.0.cmp(&right_bounds.0)
+                })
+                .then_with(|| {
+                    let left_bounds = node_display_bounds(left);
+                    let right_bounds = node_display_bounds(right);
+                    left_bounds.1.cmp(&right_bounds.1)
+                })
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+
+        let mut placed_bounds = Vec::with_capacity(order.len());
+        let mut changed = false;
+        for node_index in order {
+            let node = &mut self.nodes[node_index];
+            let mut bounds = node_display_bounds(node);
+
+            while let Some(required_shift) = placed_bounds
+                .iter()
+                .filter(|placed| node_bounds_overlap(bounds, **placed))
+                .map(|placed| i64::from(placed.2) - i64::from(bounds.0))
+                .max()
+            {
+                let shift = required_shift.clamp(1, i64::from(i32::MAX)) as i32;
+                let previous_left = bounds.0;
+                for display in &mut node.displays {
+                    display.x = display.x.saturating_add(shift);
+                }
+                bounds = node_display_bounds(node);
+                if bounds.0 == previous_left {
+                    // Coordinates are saturated. Avoid a non-terminating
+                    // repair loop on malformed extreme geometry.
+                    break;
+                }
+                changed = true;
+            }
+
+            placed_bounds.push(bounds);
         }
 
         changed
@@ -797,6 +864,10 @@ fn node_display_bounds(node: &LayoutNode) -> (i32, i32, i32, i32) {
     (left, top, right, bottom)
 }
 
+fn node_bounds_overlap(left: (i32, i32, i32, i32), right: (i32, i32, i32, i32)) -> bool {
+    left.0 < right.2 && left.2 > right.0 && left.1 < right.3 && left.3 > right.1
+}
+
 fn layout_origin(nodes: &[LayoutNode]) -> (i32, i32) {
     nodes
         .iter()
@@ -970,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_discovered_peers_updates_existing_peer_geometry_when_runtime_size_changes() {
+    fn merge_discovered_peers_preserves_existing_geometry_over_discovery_hint() {
         let local_id = Uuid::new_v4();
         let remote_id = Uuid::new_v4();
         let mut graph = LayoutGraph::new(local_id);
@@ -982,12 +1053,64 @@ mod tests {
             Some(ScreenInfo::new(0, 0, 3840, 2160)),
         )]);
 
-        assert!(changed);
+        assert!(!changed);
         let remote = graph.get_node(remote_id).unwrap();
         let primary = remote.primary_display().unwrap();
-        assert_eq!(primary.width, 3840);
-        assert_eq!(primary.height, 2160);
+        assert_eq!(primary.width, 1920);
+        assert_eq!(primary.height, 1080);
         assert_eq!(primary.x, 2560);
+    }
+
+    #[test]
+    fn merge_discovered_peers_uses_screen_hint_for_new_peer() {
+        let local_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(local_id);
+        graph.add_node(LayoutNode::new(local_id, 0, 0, 2560, 1440));
+
+        assert!(graph.merge_discovered_peers_to_right_with_screens([(
+            remote_id,
+            Some(ScreenInfo::new(0, 0, 3840, 2160)),
+        )]));
+        let remote = graph.get_node(remote_id).unwrap();
+        let primary = remote.primary_display().unwrap();
+        assert_eq!(
+            (primary.x, primary.width, primary.height),
+            (2560, 3840, 2160)
+        );
+    }
+
+    #[test]
+    fn repair_overlapping_device_groups_keeps_local_anchor_and_group_geometry() {
+        let local_id = Uuid::new_v4();
+        let first_remote = Uuid::new_v4();
+        let second_remote = Uuid::new_v4();
+        let mut graph = LayoutGraph::new(local_id);
+        graph.add_node(LayoutNode::new(local_id, 0, 0, 1920, 1080));
+
+        let mut first = LayoutNode::new(first_remote, 0, 0, 1920, 1080);
+        first.displays.push(DisplayNode::secondary(
+            "secondary".to_string(),
+            1920,
+            0,
+            1920,
+            1080,
+        ));
+        graph.add_node(first);
+        graph.add_node(LayoutNode::new(second_remote, 1000, 0, 1920, 1080));
+
+        assert!(graph.repair_overlapping_device_groups());
+
+        let local = graph.get_node(local_id).unwrap();
+        assert_eq!(local.primary_display().unwrap().x, 0);
+
+        let first = graph.get_node(first_remote).unwrap();
+        assert_eq!(first.primary_display().unwrap().x, 1920);
+        assert_eq!(first.displays[1].x, 3840);
+
+        let second = graph.get_node(second_remote).unwrap();
+        assert_eq!(second.primary_display().unwrap().x, 5760);
+        assert!(!graph.repair_overlapping_device_groups());
     }
 
     #[test]

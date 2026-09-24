@@ -256,7 +256,6 @@ async fn dashboard_state() -> Result<DashboardStatePayload, String> {
         || Box::pin(async { daemon_client::request_devices().await }),
         || Box::pin(async { daemon_client::request_capabilities(None).await }),
         || Box::pin(async { daemon_client::request_layout().await }),
-        |layout| Box::pin(async move { daemon_client::request_set_layout(layout).await }),
     )
     .await
 }
@@ -973,48 +972,29 @@ where
     }
 }
 
-async fn dashboard_state_with<Ensure, Devices, Capabilities, Layout, SaveLayout>(
+async fn dashboard_state_with<Ensure, Devices, Capabilities, Layout>(
     mut ensure_status: Ensure,
     mut request_devices: Devices,
     mut request_capabilities: Capabilities,
     mut request_layout: Layout,
-    mut save_layout: SaveLayout,
 ) -> Result<DashboardStatePayload, String>
 where
     Ensure: FnMut() -> BoxFutureResult<'static, DesktopDaemonStatus>,
     Devices: FnMut() -> BoxFutureResult<'static, Vec<DaemonDeviceSnapshot>>,
     Capabilities: FnMut() -> BoxFutureResult<'static, CapabilityRegistrySnapshot>,
     Layout: FnMut() -> BoxFutureResult<'static, LayoutGraph>,
-    SaveLayout: FnMut(LayoutGraph) -> BoxFutureResult<'static, ()>,
 {
     let daemon = ensure_status().await.map_err(|err| err.to_string())?;
     let mut status = daemon.status;
     status.started_by_desktop = daemon.auto_started;
     let devices = request_devices().await.unwrap_or_default();
     let capabilities = request_capabilities().await.ok();
-    let mut layout_error = None;
-    let mut layout = match request_layout().await {
-        Ok(layout) => {
-            let original_layout = layout.clone();
-            let mut remembered = layout;
-            let changed =
-                remembered.merge_discovered_peers_to_right(devices.iter().map(|device| device.id));
-            if changed {
-                match save_layout(remembered.clone()).await {
-                    Ok(()) => Some(remembered),
-                    Err(err) => {
-                        layout_error = Some(err.to_string());
-                        Some(original_layout)
-                    }
-                }
-            } else {
-                Some(remembered)
-            }
-        }
-        Err(err) => {
-            layout_error = Some(err.to_string());
-            None
-        }
+    // The daemon owns both topology mutation and persistence. Dashboard
+    // refreshes intentionally consume its snapshot without synthesizing or
+    // saving missing peers from the desktop process.
+    let (layout, layout_error) = match request_layout().await {
+        Ok(layout) => (Some(layout), None),
+        Err(err) => (None, Some(err.to_string())),
     };
 
     let visible_layout = layout.as_ref().map(|remembered| {
@@ -1033,7 +1013,7 @@ where
         status: Some(status),
         devices,
         capabilities,
-        layout: layout.take(),
+        layout,
         visible_layout,
         layout_error,
         acceptance,
@@ -1624,7 +1604,7 @@ mod tests {
     use anyhow::anyhow;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     };
     use std::time::Duration;
 
@@ -2269,7 +2249,6 @@ mod tests {
             || Box::pin(async { Ok(Vec::new()) }),
             empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
-            |_| Box::pin(async { Ok(()) }),
         )
         .await
         .expect("dashboard should annotate desktop auto-start");
@@ -2310,7 +2289,6 @@ mod tests {
                 })
             },
             move || Box::pin(async move { Ok(sample_layout(local_id)) }),
-            |_| Box::pin(async { Ok(()) }),
         )
         .await
         .expect("dashboard should include capability registry");
@@ -2353,8 +2331,11 @@ mod tests {
                 })
             },
             empty_capabilities,
-            move || Box::pin(async move { Ok(sample_layout(local_id)) }),
-            |_| Box::pin(async { Ok(()) }),
+            move || {
+                let mut layout = sample_layout(local_id);
+                layout.add_node(rshare_core::LayoutNode::new(remote_id, 1920, 0, 1920, 1080));
+                Box::pin(async move { Ok(layout) })
+            },
         )
         .await
         .expect("dashboard should expose acceptance readiness");
@@ -2391,7 +2372,6 @@ mod tests {
             || Box::pin(async { Ok(Vec::new()) }),
             empty_capabilities,
             move || Box::pin(async move { Ok(sample_multi_display_layout(local_id)) }),
-            |_| Box::pin(async { Ok(()) }),
         )
         .await
         .expect("dashboard should expose local acceptance");
@@ -2452,7 +2432,6 @@ mod tests {
             || Box::pin(async { Ok(Vec::new()) }),
             empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
-            |_| Box::pin(async { Ok(()) }),
         )
         .await;
 
@@ -2482,7 +2461,6 @@ mod tests {
             || Box::pin(async { Ok(Vec::new()) }),
             empty_capabilities,
             || Box::pin(async { Ok(sample_layout(DeviceId::nil())) }),
-            |_| Box::pin(async { Ok(()) }),
         )
         .await;
 
@@ -2491,10 +2469,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_state_merges_discovered_devices_into_remembered_layout() {
+    async fn dashboard_state_does_not_mutate_layout_from_discovered_devices() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let saved_layout = Arc::new(Mutex::new(None::<LayoutGraph>));
 
         let result = dashboard_state_with(
             move || {
@@ -2523,33 +2500,22 @@ mod tests {
             },
             empty_capabilities,
             move || Box::pin(async move { Ok(sample_layout(local_id)) }),
-            {
-                let saved_layout = Arc::clone(&saved_layout);
-                move |layout| {
-                    let saved_layout = Arc::clone(&saved_layout);
-                    Box::pin(async move {
-                        *saved_layout.lock().unwrap() = Some(layout);
-                        Ok(())
-                    })
-                }
-            },
         )
         .await
-        .expect("dashboard state should merge layout");
+        .expect("dashboard state should consume daemon layout");
 
         assert!(result
             .layout
             .as_ref()
             .unwrap()
             .get_node(remote_id)
-            .is_some());
+            .is_none());
         assert!(result
             .visible_layout
             .as_ref()
             .unwrap()
             .get_node(remote_id)
-            .is_some());
-        assert!(saved_layout.lock().unwrap().is_some());
+            .is_none());
     }
 
     #[tokio::test]
@@ -2593,7 +2559,6 @@ mod tests {
                 let remembered = remembered.clone();
                 Box::pin(async move { Ok(remembered) })
             },
-            |_| Box::pin(async { Ok(()) }),
         )
         .await
         .expect("dashboard state should build visible layout");
@@ -2625,9 +2590,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_state_reports_layout_save_failure() {
+    async fn dashboard_state_reports_layout_fetch_failure() {
         let local_id = DeviceId::new_v4();
-        let remote_id = DeviceId::new_v4();
 
         let result = dashboard_state_with(
             move || {
@@ -2642,39 +2606,16 @@ mod tests {
                     }
                 })
             },
-            move || {
-                Box::pin(async move {
-                    Ok(vec![DaemonDeviceSnapshot {
-                        id: remote_id,
-                        name: "Remote".to_string(),
-                        hostname: "remote-host".to_string(),
-                        addresses: vec!["192.168.1.20".to_string()],
-                        connected: false,
-                        last_seen_secs: Some(1),
-                    }])
-                })
-            },
+            || Box::pin(async { Ok(Vec::new()) }),
             empty_capabilities,
-            move || Box::pin(async move { Ok(sample_layout(local_id)) }),
-            |_| Box::pin(async { Err(anyhow!("layout save failed")) }),
+            || Box::pin(async { Err(anyhow!("layout unavailable")) }),
         )
         .await
         .expect("dashboard should still return status");
 
-        assert_eq!(result.layout_error.as_deref(), Some("layout save failed"));
-        assert!(result.layout.as_ref().unwrap().get_node(local_id).is_some());
-        assert!(result
-            .layout
-            .as_ref()
-            .unwrap()
-            .get_node(remote_id)
-            .is_none());
-        assert!(result
-            .visible_layout
-            .as_ref()
-            .unwrap()
-            .get_node(remote_id)
-            .is_none());
+        assert_eq!(result.layout_error.as_deref(), Some("layout unavailable"));
+        assert!(result.layout.is_none());
+        assert!(result.visible_layout.is_none());
     }
 
     #[tokio::test]
