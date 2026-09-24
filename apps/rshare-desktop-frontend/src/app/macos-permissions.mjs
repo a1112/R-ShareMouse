@@ -3,13 +3,13 @@ export const MACOS_PERMISSION_ITEMS = Object.freeze([
     key: "input_monitoring",
     label: "输入监控",
     description: "允许 R-ShareMouse 读取本机键盘和鼠标事件，用本机控制另一台电脑。",
-    settingsLabel: "开启输入监控",
+    settingsLabel: "检查输入监控",
   },
   {
     key: "accessibility",
     label: "辅助功能",
     description: "允许 R-ShareMouse 将远端键盘和鼠标事件注入本机。",
-    settingsLabel: "开启辅助功能",
+    settingsLabel: "检查辅助功能",
   },
 ]);
 
@@ -51,15 +51,14 @@ export function macosInputPermissionSummary(value) {
   }
 
   const missing = missingMacosInputPermissions(permissions);
-  return `缺少${missing.map((item) => item.label).join("、")}`;
+  return `当前版本未获得${missing.map((item) => item.label).join("、")}`;
 }
 
 /**
  * Build the single macOS input warning shown by desktop UI.
  *
- * TCC preflight runs in the desktop process, while the daemon owns the
- * actual event tap. Both signals are needed: a green GUI preflight must not
- * hide a daemon capture fault.
+ * TCC preflight runs in the daemon that owns the actual event tap. Keep its
+ * permission snapshot separate from input-backend health.
  */
 export function buildMacosInputWarning(value, {
   permissionCheckFailed = false,

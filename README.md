@@ -49,6 +49,23 @@ cargo build --workspace --release --locked
 # - target/release/rshare-daemon
 ```
 
+### macOS desktop app with persistent input permissions
+
+Use the same Apple signing identity for every update. This builds and signs the
+app and its bundled daemon, then installs it at a stable path after the app has
+been quit:
+
+```bash
+APPLE_SIGNING_IDENTITY='Apple Development: YOUR NAME (TEAMID)' \
+  bash scripts/package-macos-desktop.sh --install
+open R-ShareMouse.app
+```
+
+Grant Input Monitoring and Accessibility to the installed app once. See the
+[macOS permission guide](docs/guides/macos-input-permissions.md) for checks and
+recovery steps. Each Mac may use its own signing certificate, but updates on
+that Mac must keep the same certificate identity, bundle ID, and install path.
+
 ## Usage
 
 ### CLI

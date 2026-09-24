@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.rsharemouse.desktop",
   "build": {
-    "beforeBuildCommand": "cargo build -p rshare-daemon --release && npm run build --prefix ../rshare-desktop-frontend",
+    "beforeBuildCommand": "cargo build -p rshare-daemon --release --locked && npm run build --prefix ../rshare-desktop-frontend",
     "frontendDist": "../../rshare-desktop-frontend/dist",
     "beforeDevCommand": "cargo build -p rshare-daemon && npm run dev --prefix ../rshare-desktop-frontend"
   },

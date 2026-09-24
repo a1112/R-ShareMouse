@@ -48,7 +48,7 @@ test("reports exactly the missing macOS permission panes", () => {
     missingMacosInputPermissions(snapshot).map((item) => item.key),
     ["input_monitoring"],
   );
-  assert.equal(macosInputPermissionSummary(snapshot), "缺少输入监控");
+  assert.equal(macosInputPermissionSummary(snapshot), "当前版本未获得输入监控");
 });
 
 test("does not show a macOS warning for unsupported runtimes", () => {
@@ -81,5 +81,5 @@ test("combines a missing permission and daemon health warning", () => {
   );
 
   assert.equal(warning.label, "权限不足⚠️");
-  assert.equal(warning.summary, "缺少输入监控；守护进程输入后端未就绪：Unavailable");
+  assert.equal(warning.summary, "当前版本未获得输入监控；守护进程输入后端未就绪：Unavailable");
 });

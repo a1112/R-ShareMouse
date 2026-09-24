@@ -2252,7 +2252,7 @@ function DesktopApp() {
     ? buildMacosInputWarning(macosPermissions, {
         permissionCheckFailed: macosPermissionsChecked && !macosPermissions,
         runtimeDegraded: model.service.online && !model.acceptance.inputReady,
-        runtimeReason: model.service.error ?? model.inputMode.reason,
+        runtimeReason: model.service.error ?? model.settings.inputMode.reason,
       })
     : null;
   const localEndpointId =
@@ -2276,7 +2276,7 @@ function DesktopApp() {
   ].join("|");
 
   async function refreshMacosPermissions() {
-    if (!desktopShell.isMacOS || !getInvoke()) {
+    if (!desktopShell.isMacOS || !model.service.online || !getInvoke()) {
       setMacosPermissions(null);
       setMacosPermissionsChecked(false);
       setMacosPermissionError(null);
@@ -2537,18 +2537,19 @@ function DesktopApp() {
     };
     window.addEventListener("focus", refreshOnFocus);
     return () => window.removeEventListener("focus", refreshOnFocus);
-  }, [desktopShell.isMacOS]);
+  }, [desktopShell.isMacOS, model.service.online]);
 
   useEffect(() => {
     if (
       desktopShell.isMacOS &&
+      model.service.online &&
       !macosPermissionPromptShownRef.current &&
       shouldPromptForMacosInputPermissions(macosPermissionsChecked, macosPermissions)
     ) {
       macosPermissionPromptShownRef.current = true;
       setMacosPermissionDialogOpen(true);
     }
-  }, [desktopShell.isMacOS, macosPermissionsChecked, macosPermissions]);
+  }, [desktopShell.isMacOS, model.service.online, macosPermissionsChecked, macosPermissions]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -10192,7 +10193,7 @@ function MacosPermissionDialog({
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <span>{item.label}</span>
                     <span className="text-xs" style={{ color: enabled ? theme.success : "#f0ca7a" }}>
-                      {enabled ? "已开启" : "未开启"}
+                      {enabled ? "当前版本可用" : "当前版本未生效"}
                     </span>
                   </div>
                   <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
@@ -10218,6 +10219,13 @@ function MacosPermissionDialog({
             );
           })}
         </div>
+
+        {supported && missing.length ? (
+          <p className="mt-4 text-xs leading-5" style={{ color: theme.textMuted }}>
+            若系统设置中的开关已经打开，但这里仍显示未生效，请确认授权的是当前 R-ShareMouse.app。
+            若签名身份或安装位置已改变，请在对应设置中移除旧记录、重新添加当前应用，然后完全退出并重启应用。
+          </p>
+        ) : null}
 
         {!supported ? (
           <div
@@ -10725,7 +10733,7 @@ function SettingsPage({
             <span className="min-w-0 flex-1">
               <span className="block text-sm font-medium">macOS 输入权限与后端</span>
               <span className="mt-1 block text-xs" style={{ color: theme.textMuted }}>
-                {macosRuntimeIssue ?? `${macosInputPermissionSummary(macosPermissions)} · 点击查看并开启对应权限`}
+                {macosRuntimeIssue ?? `${macosInputPermissionSummary(macosPermissions)} · 点击查看权限状态`}
               </span>
             </span>
             <ChevronRight size={16} style={{ color: theme.textMuted }} />
