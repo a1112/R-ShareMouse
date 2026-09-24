@@ -490,7 +490,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     RtlInitUnicodeString(&deviceName, RSHARE_NT_DEVICE_NAME);
-    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)");
     controlInit = WdfControlDeviceInitAllocate(driver, &sddl);
     if (controlInit == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;

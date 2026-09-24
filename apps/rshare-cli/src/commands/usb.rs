@@ -10,19 +10,38 @@ use crate::output::{header, kv, table_header, table_row, warning};
 pub enum UsbCommands {
     /// List local and remotely advertised USB devices
     List,
+    /// Authorize one explicitly chosen local experimental USB device for a peer (not persisted)
+    Authorize {
+        peer: Uuid,
+        device_key: String,
+        #[arg(long, default_value_t = 300)]
+        lifetime_secs: u32,
+    },
+    /// Revoke the grant and close its native lease
+    Revoke { peer: Uuid, device_key: String },
 
     /// Run a remote USB device-descriptor control transfer probe
     Probe {
         /// Target R-ShareMouse device id
         device_id: Uuid,
 
-        /// Remote USB bus id/path printed by `rshare usb list`
+        /// Remote USB export key printed by `rshare usb list`
         bus_id: String,
     },
 }
 
 pub async fn execute(command: UsbCommands) -> Result<()> {
     match command {
+        UsbCommands::Authorize {
+            peer,
+            device_key,
+            lifetime_secs,
+        } => {
+            rshare_core::daemon_client::authorize_usb_device(peer, device_key, lifetime_secs).await
+        }
+        UsbCommands::Revoke { peer, device_key } => {
+            rshare_core::daemon_client::revoke_usb_device(peer, device_key).await
+        }
         UsbCommands::List => list_usb_devices().await,
         UsbCommands::Probe { device_id, bus_id } => {
             probe_remote_descriptor(device_id, bus_id).await
@@ -33,12 +52,13 @@ pub async fn execute(command: UsbCommands) -> Result<()> {
 async fn list_usb_devices() -> Result<()> {
     let snapshot = rshare_core::daemon_client::request_local_controls().await?;
 
-    header("Local USB Devices");
-    if snapshot.usb_devices.is_empty() {
+    let local = rshare_core::daemon_client::request_usb_devices().await?;
+    header("Local USB Devices (opaque export keys)");
+    if local.is_empty() {
         warning("No local WinUSB-compatible USB device interfaces reported");
     } else {
         table_header(&["VID:PID", "CFG", "EP", "BUS ID"]);
-        for device in &snapshot.usb_devices {
+        for device in &local {
             table_row(&[
                 &format_usb_vid_pid(device),
                 &device.configurations.len().to_string(),

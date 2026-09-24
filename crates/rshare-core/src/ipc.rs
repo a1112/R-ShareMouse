@@ -542,6 +542,16 @@ pub enum DaemonRequest {
         layout: LayoutGraph,
     },
     ListUsbDevices,
+    /// Ephemeral, per-peer authorization through authenticated local IPC.
+    AuthorizeUsbDevice {
+        peer: DeviceId,
+        device_key: String,
+        lifetime_secs: u32,
+    },
+    RevokeUsbDevice {
+        peer: DeviceId,
+        device_key: String,
+    },
     LocalControls,
     SubscribeLocalControls,
     SubscribeUiState {

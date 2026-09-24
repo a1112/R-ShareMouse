@@ -1,5 +1,6 @@
 //! Local daemon control helpers shared by CLI and GUI.
 
+use crate::local_transport::{self, LocalStream};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::net::SocketAddr;
@@ -30,7 +31,7 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
 }
 
 async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = TcpStream::connect(address)
+    let mut stream = connect_at(address)
         .await
         .with_context(|| format!("Failed to connect to daemon at {address}"))?;
 
@@ -270,7 +271,7 @@ pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
 pub async fn request_display_capture(
     request: DisplayCaptureRequest,
 ) -> Result<DisplayCaptureResult> {
-    let mut stream = TcpStream::connect(default_ipc_addr())
+    let mut stream = local_transport::connect()
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
     write_json_frame(&mut stream, &DaemonRequest::CaptureDisplay(request)).await?;
@@ -430,16 +431,16 @@ pub async fn request_remote_usb_descriptor_probe(
     }
 }
 
-pub async fn subscribe_local_controls() -> Result<TcpStream> {
-    let mut stream = TcpStream::connect(default_ipc_addr())
+pub async fn subscribe_local_controls() -> Result<LocalStream> {
+    let mut stream = local_transport::connect()
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
     Ok(stream)
 }
 
-pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<TcpStream> {
-    let mut stream = TcpStream::connect(default_ipc_addr())
+pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<LocalStream> {
+    let mut stream = local_transport::connect()
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
     write_json_frame(
@@ -451,7 +452,7 @@ pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<Tc
 }
 
 pub struct UiStateSubscription {
-    stream: TcpStream,
+    stream: LocalStream,
 }
 
 impl UiStateSubscription {
@@ -468,14 +469,14 @@ pub async fn subscribe_ui_state_at(
     address: SocketAddr,
     cursor: Option<UiCursor>,
 ) -> Result<UiStateSubscription> {
-    let mut stream = TcpStream::connect(address)
+    let mut stream = connect_at(address)
         .await
         .with_context(|| format!("Failed to connect to daemon at {address}"))?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeUiState { cursor }).await?;
     Ok(UiStateSubscription { stream })
 }
 
-pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonResponse> {
+pub async fn read_local_control_event(stream: &mut LocalStream) -> Result<DaemonResponse> {
     let response: DaemonResponse = read_json_frame(stream).await?;
     match response {
         DaemonResponse::LocalControls(_)
@@ -681,10 +682,45 @@ mod tests {
 }
 
 /// Query/configure daemon-owned network audio state.
-pub async fn request_network_audio(command: crate::network_audio::AudioCommand) -> Result<crate::network_audio::AudioSnapshot> {
+pub async fn request_network_audio(
+    command: crate::network_audio::AudioCommand,
+) -> Result<crate::network_audio::AudioSnapshot> {
     match send_request(DaemonRequest::NetworkAudio(command)).await? {
         DaemonResponse::NetworkAudio(snapshot) => Ok(snapshot),
         DaemonResponse::Error(error) => anyhow::bail!(error),
         other => anyhow::bail!("Unexpected network audio response: {:?}", other),
+    }
+}
+
+async fn connect_at(address: SocketAddr) -> Result<LocalStream> {
+    if address == default_ipc_addr() {
+        Ok(local_transport::connect().await?)
+    } else {
+        Ok(Box::new(TcpStream::connect(address).await?))
+    }
+}
+
+pub async fn authorize_usb_device(
+    peer: DeviceId,
+    device_key: String,
+    lifetime_secs: u32,
+) -> Result<()> {
+    match send_request(DaemonRequest::AuthorizeUsbDevice {
+        peer,
+        device_key,
+        lifetime_secs,
+    })
+    .await?
+    {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(e) => anyhow::bail!(e),
+        other => anyhow::bail!("Unexpected USB authorization response: {other:?}"),
+    }
+}
+pub async fn revoke_usb_device(peer: DeviceId, device_key: String) -> Result<()> {
+    match send_request(DaemonRequest::RevokeUsbDevice { peer, device_key }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(e) => anyhow::bail!(e),
+        other => anyhow::bail!("Unexpected USB revoke response: {other:?}"),
     }
 }

@@ -625,23 +625,6 @@ async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
 
     let app_for_task = app.clone();
     let task = tauri::async_runtime::spawn(async move {
-        if let Ok(mut websocket) = daemon_client::subscribe_local_controls_ws().await {
-            loop {
-                match daemon_client::read_local_control_ws_event(&mut websocket).await {
-                    Ok(response @ DaemonResponse::LocalControls(_))
-                    | Ok(response @ DaemonResponse::LocalControlEvent(_)) => {
-                        let _ = app_for_task.emit("local-control-event", response);
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        let _ = app_for_task.emit("local-control-event", format!("error:{err}"));
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-
         let mut stream = match daemon_client::subscribe_local_controls().await {
             Ok(stream) => stream,
             Err(err) => {

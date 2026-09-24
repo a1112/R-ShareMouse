@@ -589,11 +589,11 @@ fn windows_hid_drivers_cover_keyboard_mouse_capture_and_injection_package() {
     assert!(filter.contains("RSHARE_EVENT_MOUSE_WHEEL"));
 
     assert!(vhid.contains("g_RShareKeyboardModifiers"));
-    assert!(vhid.contains("g_RShareKeyboardKeys[6]"));
-    assert!(vhid.contains("RShareAddKeyboardUsage"));
-    assert!(vhid.contains("RShareRemoveKeyboardUsage"));
+    assert!(vhid.contains("RSHARE_KEY_STATE g_RShareKeyboardState"));
+    assert!(vhid.contains("RShareKeySet(&g_RShareKeyboardState, usage, 1)"));
+    assert!(vhid.contains("RShareKeySet(&g_RShareKeyboardState, usage, 0)"));
     assert!(vhid.contains("report[1] = g_RShareKeyboardModifiers"));
-    assert!(vhid.contains("RtlCopyMemory(&report[3], g_RShareKeyboardKeys"));
+    assert!(vhid.contains("RShareKeyReport(&g_RShareKeyboardState, &report[3])"));
     assert!(vhid.contains("case 0x70:"));
     assert!(vhid.contains("return 0x3A"));
     assert!(vhid.contains("case 0x25:"));

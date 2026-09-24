@@ -1,4 +1,6 @@
-//! Read-only application process-tree monitoring. No additional listener is opened.
+#[path = "private_working_set.rs"]
+mod private_working_set;
+// Read-only application process-tree monitoring. No additional listener is opened.
 use monitor_sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -9,6 +11,7 @@ use std::time::Instant;
 pub struct Snapshot {
     cpu_percent: Option<f64>,
     memory_bytes: u64,
+    pub private_working_set_bytes: Option<u64>,
     read_bytes_per_second: Option<f64>,
     write_bytes_per_second: Option<f64>,
     process_count: usize,
@@ -76,6 +79,7 @@ impl Sampler {
             .collect();
         let included = descendants(root.as_u32(), &parents);
         let mut current = HashMap::new();
+        let mut private_memory = Some(0_u64);
         let (mut cpu, mut memory, mut reads, mut writes, mut count) =
             (0.0_f64, 0_u64, 0_u64, 0_u64, 0_usize);
         for (pid, process) in self.system.processes() {
@@ -85,6 +89,9 @@ impl Sampler {
             count += 1;
             cpu += f64::from(process.cpu_usage());
             memory = memory.saturating_add(process.memory());
+            private_memory = private_memory.and_then(|total| {
+                private_working_set::bytes(pid.as_u32()).and_then(|value| total.checked_add(value))
+            });
             let disk = process.disk_usage();
             let identity = (pid.as_u32(), process.start_time());
             if let Some(&(read, written)) = self.previous.get(&identity) {
@@ -99,6 +106,7 @@ impl Sampler {
         let snapshot = Snapshot {
             cpu_percent: elapsed.map(|_| (cpu / processors).clamp(0.0, 100.0)),
             memory_bytes: memory,
+            private_working_set_bytes: private_memory,
             read_bytes_per_second: elapsed.map(|seconds| reads as f64 / seconds),
             write_bytes_per_second: elapsed.map(|seconds| writes as f64 / seconds),
             process_count: count,

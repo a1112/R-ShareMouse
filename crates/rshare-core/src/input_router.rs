@@ -7,7 +7,7 @@ use crate::{
     GamepadButton, GamepadDeviceInfo, KeyState, LayoutGraph, MonotonicStamp, MouseButton,
     PendingReleaseBatch, PixelRect, PressedStateLedger, RealtimeInputFrame, RealtimeInputPayload,
     ReleaseAllReason, ReliableInputEvent, ReliableInputFrame, RouteCache, SessionEpoch,
-    VirtualDesktopGeometry, INPUT_PROTOCOL_VERSION,
+    SuspendReason, VirtualDesktopGeometry, INPUT_PROTOCOL_VERSION,
 };
 
 /// Semantic input accepted by the pure router.
@@ -239,6 +239,7 @@ pub struct InputRouter {
     emergency_max_sequence_consumed: bool,
     latest_anchor_sequence: u64,
     session: CaptureSessionStateMachine,
+    suspended_target: Option<DeviceId>,
     routes: RouteCache,
     geometry: VirtualDesktopGeometry,
     pressed: PressedStateLedger,
@@ -281,6 +282,7 @@ impl InputRouter {
             emergency_max_sequence_consumed: false,
             latest_anchor_sequence: 0,
             session: CaptureSessionStateMachine::new(),
+            suspended_target: None,
             routes,
             geometry,
             pressed: PressedStateLedger::new(),
@@ -760,6 +762,7 @@ impl InputRouter {
         let release =
             self.push_emergency_release(&mut outputs, target, ReleaseAllReason::Suspended);
         self.session.on_target_disconnect(target);
+        self.suspended_target = Some(target);
         outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
         outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         if release.ledger_fault {
@@ -793,6 +796,7 @@ impl InputRouter {
                 .push_emergency_release(&mut outputs, peer, ReleaseAllReason::Suspended)
                 .ledger_fault;
             self.session.on_target_disconnect(peer);
+            self.suspended_target = Some(peer);
             outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
             outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         }
@@ -802,7 +806,37 @@ impl InputRouter {
         } else {
             outputs.extend(rebuilt);
         }
+        if connected && self.suspended_target == Some(peer) {
+            if self.pending_release.is_some() {
+                let release =
+                    self.push_emergency_release(&mut outputs, peer, ReleaseAllReason::Suspended);
+                if release.ledger_fault {
+                    outputs.push(RouterOutput::Metric(RouterMetric::PressedStateLedgerFault));
+                }
+            } else {
+                outputs.extend(self.recover_unavailable_target());
+            }
+        }
         outputs
+    }
+
+    fn recover_unavailable_target(&mut self) -> SmallVec<[RouterOutput; 4]> {
+        if self
+            .suspended_target
+            .is_none_or(|target| !self.connected_peers.contains(&target))
+            || self.pending_release.is_some()
+            || !matches!(
+                self.session.state(),
+                ControlSessionState::Suspended {
+                    reason: SuspendReason::TargetUnavailable
+                }
+            )
+        {
+            return SmallVec::new();
+        }
+        self.suspended_target = None;
+        self.session.reset();
+        smallvec![RouterOutput::LocalSessionChanged(self.session.state())]
     }
 
     fn handle_backend_degraded(&mut self) -> SmallVec<[RouterOutput; 4]> {
@@ -816,6 +850,7 @@ impl InputRouter {
                 .ledger_fault;
         }
         self.session.on_backend_degraded();
+        self.suspended_target = None;
         outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
         outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         if ledger_fault {
@@ -915,7 +950,7 @@ impl InputRouter {
         if let Some(batch) = self.pending_release.take() {
             self.pressed.confirm_release_all(&batch);
         }
-        SmallVec::new()
+        self.recover_unavailable_target()
     }
 
     fn handle_counter_exhausted(&mut self, target: DeviceId) -> SmallVec<[RouterOutput; 4]> {
@@ -1489,6 +1524,106 @@ mod tests {
             ))
         ));
         assert_eq!(router.route_cache_generation(), before + 1);
+    }
+
+    #[test]
+    fn reconnect_recovers_target_unavailable_after_release_confirmation() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let disconnected = router.handle(RouterCommand::ConnectivityChanged {
+            peer: target,
+            connected: false,
+        });
+        let token = disconnected
+            .iter()
+            .find_map(|output| match output {
+                RouterOutput::EmergencyReleaseAll { release_token, .. } => *release_token,
+                _ => None,
+            })
+            .expect("disconnect must request release confirmation");
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+
+        let reconnected = router.handle(RouterCommand::ConnectivityChanged {
+            peer: target,
+            connected: true,
+        });
+        assert!(reconnected.iter().any(|output| matches!(
+            output,
+            RouterOutput::LocalSessionChanged(crate::ControlSessionState::LocalReady)
+        )));
+        assert!(router.session.is_local_ready());
+        assert!(router
+            .handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                500,
+                stamp(2),
+            )))
+            .iter()
+            .any(|output| matches!(output, RouterOutput::SendReliable { .. })));
+    }
+
+    #[test]
+    fn reconnect_retries_failed_release_before_reopening_edge_routing() {
+        let (mut router, _, target) = linked_router(
+            PixelRect::new(0, 0, 1920, 1080),
+            Direction::Right,
+            Direction::Left,
+            PixelRect::new(0, 0, 1920, 1080),
+        );
+        let _ = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            500,
+            stamp(1),
+        )));
+        let disconnected = router.handle(RouterCommand::ConnectivityChanged {
+            peer: target,
+            connected: false,
+        });
+        let token = disconnected
+            .iter()
+            .find_map(|output| match output {
+                RouterOutput::EmergencyReleaseAll { release_token, .. } => *release_token,
+                _ => None,
+            })
+            .expect("disconnect must request release confirmation");
+        let _ = router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: false,
+        });
+
+        let reconnected = router.handle(RouterCommand::ConnectivityChanged {
+            peer: target,
+            connected: true,
+        });
+        assert!(reconnected.iter().any(|output| matches!(
+            output,
+            RouterOutput::EmergencyReleaseAll {
+                target: actual_target,
+                release_token: Some(actual_token),
+                ..
+            } if *actual_target == target && *actual_token == token
+        )));
+        assert!(router.session.is_suspended());
+        let completed = router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+        assert!(completed.iter().any(|output| matches!(
+            output,
+            RouterOutput::LocalSessionChanged(crate::ControlSessionState::LocalReady)
+        )));
     }
 
     #[test]

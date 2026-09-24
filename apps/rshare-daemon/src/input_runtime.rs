@@ -526,6 +526,11 @@ impl<T: InputTransport> InputRuntime<T> {
                         observer.cancel();
                     }
                     self.current_epoch = frame.session_epoch;
+                    if !self.active_transports.contains_key(&target) {
+                        if let Some(binding) = self.transports.bind(target) {
+                            self.active_transports.insert(target, binding);
+                        }
+                    }
                     let success = self.active_transports.get(&target).is_some_and(|binding| {
                         self.transports.try_send_reliable(binding, frame.clone())
                     });

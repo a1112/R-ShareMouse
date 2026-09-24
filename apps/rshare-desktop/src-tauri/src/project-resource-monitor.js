@@ -16,10 +16,10 @@
       section{background:#182334;border:1px solid #64748b;border-radius:9px;padding:12px;margin-bottom:6px;width:250px;box-shadow:0 4px 20px #0004}
       section[hidden]{display:none}h2{font-size:13px;margin:0 0 8px}dl{margin:0;display:grid;grid-template-columns:1fr auto;gap:5px 12px}dd{margin:0;font-variant-numeric:tabular-nums}p{color:#cbd5e1;font-size:11px;margin:8px 0 0}footer{text-align:right}
     </style><section id="details" hidden><h2>应用资源消耗</h2><dl>
-      <dt>CPU</dt><dd data-value="cpu">采样中</dd><dt>内存（RSS）</dt><dd data-value="memory">采样中</dd>
+      <dt>CPU</dt><dd data-value="cpu">采样中</dd><dt>私有工作集合计</dt><dd data-value="memory">采样中</dd>
       <dt>磁盘读取</dt><dd data-value="read">采样中</dd><dt>磁盘写入</dt><dd data-value="write">采样中</dd>
-      <dt>进程数</dt><dd data-value="count">—</dd><dt>GPU</dt><dd>不可用</dd></dl>
-      <p>范围：本应用及当前子进程。CPU 按整机容量计；内存为各进程 RSS 之和，可能含共享页。GPU 尚无可靠采样源。</p><p id="status" role="status">正在采样…</p>
+      <dt>RSS（含共享页）</dt><dd data-value="rss">不可用</dd><dt>进程数</dt><dd data-value="count">—</dd><dt>GPU</dt><dd>不可用</dd></dl>
+      <p>范围：本应用及当前子进程。CPU 按整机容量计；默认内存为私有工作集合计；RSS 仅供参考，含共享页且可能重复计入。私有指标读取失败时显示不可用。GPU 尚无可靠采样源。</p><p id="status" role="status">正在采样…</p>
     </section><footer><button type="button" aria-expanded="false" aria-controls="details">资源监控</button></footer>`;
     document.body.append(host);
     const button = root.querySelector('button');
@@ -49,13 +49,13 @@
         const data = await window.__TAURI_INTERNALS__.invoke('project_resource_snapshot');
         if (stopped || document.hidden) return;
         const cpu = Number.isFinite(data.cpuPercent) ? `${data.cpuPercent.toFixed(1)}%` : '采样中';
-        write('cpu', cpu); write('memory', bytes(data.memoryBytes));
+        write('cpu', cpu); write('memory', bytes(data.privateWorkingSetBytes)); write('rss', bytes(data.memoryBytes));
         write('read', data.readBytesPerSecond == null ? '采样中' : `${bytes(data.readBytesPerSecond)}/s`);
         write('write', data.writeBytesPerSecond == null ? '采样中' : `${bytes(data.writeBytesPerSecond)}/s`);
         write('count', String(data.processCount));
         lastSuccess = new Date().toLocaleTimeString();
         status.textContent = `更新于 ${lastSuccess} · 每 2 秒采样`;
-        button.textContent = `CPU ${cpu} · ${bytes(data.memoryBytes)}`;
+        button.textContent = `CPU ${cpu} · 私有工作集合计 ${bytes(data.privateWorkingSetBytes)}`;
       } catch (_) {
         status.textContent = lastSuccess ? `采样失败，保留 ${lastSuccess} 的数据` : '资源监控暂不可用';
         button.textContent = '资源监控 · 暂不可用';

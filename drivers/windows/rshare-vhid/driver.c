@@ -2,6 +2,7 @@
 #include <wdf.h>
 #include <wdmsec.h>
 #include <vhf.h>
+#include "report_state.h"
 
 #include "..\rshare-common\rshare_ioctls.h"
 
@@ -9,11 +10,12 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD RShareVhidEvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP RShareVhidEvtCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RShareVhidEvtControlIoDeviceControl;
+EVT_WDF_FILE_CLEANUP RShareVhidEvtFileCleanup;
 
 static FAST_MUTEX g_RShareVhidLock;
 static VHFHANDLE g_RShareVhidHandle;
 static UCHAR g_RShareKeyboardModifiers;
-static UCHAR g_RShareKeyboardKeys[6];
+static RSHARE_KEY_STATE g_RShareKeyboardState;
 static UCHAR g_RShareMouseButtons;
 
 static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
@@ -28,7 +30,8 @@ static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
     0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05,
     0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03,
     0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
-    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
+    0x09, 0x38, 0x17, 0x00, 0x00, 0x00, 0x80,
+    0x27, 0xFF, 0xFF, 0xFF, 0x7F, 0x75, 0x20,
     0x95, 0x03, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38,
     0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0
 };
@@ -38,17 +41,6 @@ typedef struct _RSHARE_VHID_CONTEXT {
 } RSHARE_VHID_CONTEXT, *PRSHARE_VHID_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RSHARE_VHID_CONTEXT, RShareVhidGetContext)
-
-static LONG RShareClampMouseDelta(LONG value)
-{
-    if (value > 127) {
-        return 127;
-    }
-    if (value < -127) {
-        return -127;
-    }
-    return value;
-}
 
 static UCHAR RShareMouseButtonMask(LONG button)
 {
@@ -231,45 +223,6 @@ static UCHAR RShareVkToHidUsage(LONG vk)
     }
 }
 
-static VOID RShareAddKeyboardUsage(UCHAR usage)
-{
-    ULONG index;
-
-    for (index = 0; index < ARRAYSIZE(g_RShareKeyboardKeys); index++) {
-        if (g_RShareKeyboardKeys[index] == usage) {
-            return;
-        }
-    }
-
-    for (index = 0; index < ARRAYSIZE(g_RShareKeyboardKeys); index++) {
-        if (g_RShareKeyboardKeys[index] == 0) {
-            g_RShareKeyboardKeys[index] = usage;
-            return;
-        }
-    }
-
-    RtlMoveMemory(
-        &g_RShareKeyboardKeys[0],
-        &g_RShareKeyboardKeys[1],
-        ARRAYSIZE(g_RShareKeyboardKeys) - 1);
-    g_RShareKeyboardKeys[ARRAYSIZE(g_RShareKeyboardKeys) - 1] = usage;
-}
-
-static VOID RShareRemoveKeyboardUsage(UCHAR usage)
-{
-    ULONG readIndex;
-    ULONG writeIndex = 0;
-    UCHAR compacted[ARRAYSIZE(g_RShareKeyboardKeys)] = {0};
-
-    for (readIndex = 0; readIndex < ARRAYSIZE(g_RShareKeyboardKeys); readIndex++) {
-        if (g_RShareKeyboardKeys[readIndex] != 0 && g_RShareKeyboardKeys[readIndex] != usage) {
-            compacted[writeIndex++] = g_RShareKeyboardKeys[readIndex];
-        }
-    }
-
-    RtlCopyMemory(g_RShareKeyboardKeys, compacted, sizeof(g_RShareKeyboardKeys));
-}
-
 static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pressed)
 {
     UCHAR report[9] = {0};
@@ -286,16 +239,16 @@ static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pr
         }
     } else if (usage != 0) {
         if (pressed) {
-            RShareAddKeyboardUsage(usage);
+            RShareKeySet(&g_RShareKeyboardState, usage, 1);
         } else {
-            RShareRemoveKeyboardUsage(usage);
+            RShareKeySet(&g_RShareKeyboardState, usage, 0);
         }
     } else if (usage == 0) {
         return STATUS_NOT_SUPPORTED;
     }
 
     report[1] = g_RShareKeyboardModifiers;
-    RtlCopyMemory(&report[3], g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
+    RShareKeyReport(&g_RShareKeyboardState, &report[3]);
 
     RtlZeroMemory(&packet, sizeof(packet));
     packet.reportBuffer = report;
@@ -306,15 +259,10 @@ static NTSTATUS RShareSubmitKeyboardReport(VHFHANDLE handle, LONG vk, BOOLEAN pr
 
 static NTSTATUS RShareSubmitMouseReport(VHFHANDLE handle, UCHAR buttons, LONG dx, LONG dy, LONG wheel, LONG horizontalWheel)
 {
-    UCHAR report[6] = {0};
+    UCHAR report[18] = {0};
     HID_XFER_PACKET packet;
 
-    report[0] = 0x02;
-    report[1] = buttons & 0x1F;
-    report[2] = (UCHAR)(CHAR)RShareClampMouseDelta(dx);
-    report[3] = (UCHAR)(CHAR)RShareClampMouseDelta(dy);
-    report[4] = (UCHAR)(CHAR)RShareClampMouseDelta(wheel);
-    report[5] = (UCHAR)(CHAR)RShareClampMouseDelta(horizontalWheel);
+    RShareMouseReport(report, buttons, dx, dy, wheel, horizontalWheel);
 
     RtlZeroMemory(&packet, sizeof(packet));
     packet.reportBuffer = report;
@@ -328,6 +276,9 @@ static NTSTATUS RShareSubmitInjectReport(PRSHARE_INJECT_REPORT report)
     NTSTATUS status;
     UCHAR buttonMask;
 
+    if (report->Flags != 0 || report->Value2 != 0 ||
+        ((report->ReportKind == RSHARE_REPORT_KEYBOARD || report->ReportKind == RSHARE_REPORT_MOUSE_BUTTON) &&
+         report->Value1 != 0 && report->Value1 != 1)) return STATUS_INVALID_PARAMETER;
     ExAcquireFastMutex(&g_RShareVhidLock);
     if (g_RShareVhidHandle == NULL) {
         status = STATUS_DEVICE_NOT_READY;
@@ -361,6 +312,7 @@ static NTSTATUS RShareVhidCreateControlDevice(WDFDRIVER driver)
 {
     WDFDEVICE device;
     WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_FILEOBJECT_CONFIG fileConfig;
     WDF_OBJECT_ATTRIBUTES attributes;
     PWDFDEVICE_INIT deviceInit;
     UNICODE_STRING deviceName;
@@ -368,12 +320,15 @@ static NTSTATUS RShareVhidCreateControlDevice(WDFDRIVER driver)
     UNICODE_STRING sddl;
     NTSTATUS status;
 
-    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)");
     deviceInit = WdfControlDeviceInitAllocate(driver, &sddl);
     if (deviceInit == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    WdfDeviceInitSetExclusive(deviceInit, TRUE);
+    WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, RShareVhidEvtFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(deviceInit, &fileConfig, WDF_NO_OBJECT_ATTRIBUTES);
     RtlInitUnicodeString(&deviceName, RSHARE_VHID_NT_DEVICE_NAME);
     status = WdfDeviceInitAssignName(deviceInit, &deviceName);
     if (!NT_SUCCESS(status)) {
@@ -382,6 +337,7 @@ static NTSTATUS RShareVhidCreateControlDevice(WDFDRIVER driver)
     }
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ExecutionLevel = WdfExecutionLevelPassive;
     status = WdfDeviceCreate(&deviceInit, &attributes, &device);
     if (!NT_SUCCESS(status)) {
         WdfDeviceInitFree(deviceInit);
@@ -414,7 +370,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     ExInitializeFastMutex(&g_RShareVhidLock);
     g_RShareKeyboardModifiers = 0;
-    RtlZeroMemory(g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
+    RtlZeroMemory(&g_RShareKeyboardState, sizeof(g_RShareKeyboardState));
     g_RShareMouseButtons = 0;
     WDF_DRIVER_CONFIG_INIT(&config, RShareVhidEvtDeviceAdd);
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
@@ -438,6 +394,7 @@ NTSTATUS RShareVhidEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, RSHARE_VHID_CONTEXT);
     attributes.EvtCleanupCallback = RShareVhidEvtCleanup;
+    attributes.ExecutionLevel = WdfExecutionLevelPassive;
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -473,7 +430,7 @@ VOID RShareVhidEvtCleanup(WDFOBJECT DeviceObject)
         if (g_RShareVhidHandle == context->VhfHandle) {
             g_RShareVhidHandle = NULL;
             g_RShareKeyboardModifiers = 0;
-            RtlZeroMemory(g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
+            RtlZeroMemory(&g_RShareKeyboardState, sizeof(g_RShareKeyboardState));
             g_RShareMouseButtons = 0;
         }
         ExReleaseFastMutex(&g_RShareVhidLock);
@@ -522,6 +479,7 @@ VOID RShareVhidEvtControlIoDeviceControl(
         {
             PRSHARE_INJECT_REPORT report;
             status = WdfRequestRetrieveInputBuffer(Request, sizeof(*report), (PVOID*)&report, NULL);
+            if (NT_SUCCESS(status) && InputBufferLength != sizeof(*report)) status = STATUS_INFO_LENGTH_MISMATCH;
             if (NT_SUCCESS(status)) {
                 status = RShareSubmitInjectReport(report);
             }
@@ -536,4 +494,25 @@ VOID RShareVhidEvtControlIoDeviceControl(
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
     WdfRequestCompleteWithInformation(Request, status, bytes);
+}
+
+VOID RShareVhidEvtFileCleanup(WDFFILEOBJECT FileObject)
+{
+    UCHAR report[9] = {1, 0, 0, 0, 0, 0, 0, 0, 0};
+    HID_XFER_PACKET packet;
+    UNREFERENCED_PARAMETER(FileObject);
+    // The control device is exclusive: this file owns every held usage.
+    ExAcquireFastMutex(&g_RShareVhidLock);
+    g_RShareKeyboardModifiers = 0;
+    RtlZeroMemory(&g_RShareKeyboardState, sizeof(g_RShareKeyboardState));
+    g_RShareMouseButtons = 0;
+    if (g_RShareVhidHandle != NULL) {
+        RtlZeroMemory(&packet, sizeof(packet));
+        packet.reportBuffer = report;
+        packet.reportBufferLen = sizeof(report);
+        packet.reportId = 1;
+        (void)VhfReadReportSubmit(g_RShareVhidHandle, &packet);
+        (void)RShareSubmitMouseReport(g_RShareVhidHandle, 0, 0, 0, 0, 0);
+    }
+    ExReleaseFastMutex(&g_RShareVhidLock);
 }

@@ -30,6 +30,7 @@ pub struct IpcPerfReport {
 #[derive(Debug, Serialize)]
 pub struct IpcImplementationContract {
     pub handler: &'static str,
+    pub transport: &'static str,
     pub header_bytes: usize,
     pub read_strategy: &'static str,
     pub connection_strategy: &'static str,
@@ -70,6 +71,7 @@ pub async fn run_matrix(requests: usize, concurrency: &[usize]) -> Result<IpcPer
         ephemeral_port: all_ephemeral,
         implementation_contract: IpcImplementationContract {
             handler: "rshare_daemon::ipc_server::handle_persistent_json_connection",
+            transport: "ephemeral TCP harness; production uses authenticated local IPC",
             header_bytes: IPC_FRAME_HEADER_LEN,
             read_strategy: "read-exact-header-bounded-payload",
             connection_strategy: "persistent-framed-requests",

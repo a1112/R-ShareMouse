@@ -160,6 +160,7 @@ import {
   macosInputPermissionSummary,
   missingMacosInputPermissions,
   normalizeMacosInputPermissions,
+  shouldPromptForMacosInputPermissions,
 } from "./macos-permissions.mjs";
 import {
   buildPageChrome,
@@ -2222,6 +2223,7 @@ function DesktopApp() {
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
   const endpointSequencesRef = useRef<Record<string, number>>({});
   const uiStreamHealthyRef = useRef(false);
+  const macosPermissionPromptShownRef = useRef(false);
 
   useEffect(() => {
     if (!confirmingInputTest) {
@@ -2536,6 +2538,17 @@ function DesktopApp() {
     window.addEventListener("focus", refreshOnFocus);
     return () => window.removeEventListener("focus", refreshOnFocus);
   }, [desktopShell.isMacOS]);
+
+  useEffect(() => {
+    if (
+      desktopShell.isMacOS &&
+      !macosPermissionPromptShownRef.current &&
+      shouldPromptForMacosInputPermissions(macosPermissionsChecked, macosPermissions)
+    ) {
+      macosPermissionPromptShownRef.current = true;
+      setMacosPermissionDialogOpen(true);
+    }
+  }, [desktopShell.isMacOS, macosPermissionsChecked, macosPermissions]);
 
   useEffect(() => {
     if (typeof window === "undefined") {

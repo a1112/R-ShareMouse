@@ -61,6 +61,34 @@ mod windows_impl {
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
     static PROCESS_DPI_AWARENESS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+    static RELATIVE_MOUSE_STATE: OnceLock<Mutex<RelativeMouseState>> = OnceLock::new();
+
+    #[derive(Default)]
+    struct RelativeMouseState {
+        last_absolute: Option<(i32, i32)>,
+        virtual_position: Option<(i32, i32)>,
+    }
+
+    impl RelativeMouseState {
+        fn set_remote_active(&mut self, active: bool) {
+            self.virtual_position = active.then_some(self.last_absolute).flatten();
+        }
+
+        fn physical_absolute(&mut self, x: i32, y: i32) {
+            self.last_absolute = Some((x, y));
+        }
+
+        fn physical_delta(&mut self, dx: i32, dy: i32) -> Option<(i32, i32)> {
+            let (x, y) = self.virtual_position?;
+            let position = (x.saturating_add(dx), y.saturating_add(dy));
+            self.virtual_position = Some(position);
+            Some(position)
+        }
+    }
+
+    fn relative_mouse_state() -> &'static Mutex<RelativeMouseState> {
+        RELATIVE_MOUSE_STATE.get_or_init(|| Mutex::new(RelativeMouseState::default()))
+    }
 
     const PKEY_AUDIO_ENDPOINT_FORM_FACTOR: PROPERTYKEY = PROPERTYKEY {
         fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
@@ -76,6 +104,9 @@ mod windows_impl {
     /// When enabled, non-injected keyboard events and mouse button/wheel events are
     /// captured for forwarding but not delivered to the local desktop.
     pub fn set_local_input_suppressed(suppressed: bool) {
+        if let Ok(mut state) = relative_mouse_state().lock() {
+            state.set_remote_active(suppressed);
+        }
         LOCAL_INPUT_SUPPRESSED.store(suppressed, Ordering::SeqCst);
     }
 
@@ -1601,12 +1632,53 @@ mod windows_impl {
             let mut message = Message::default();
             PeekMessageW(&mut message as *mut Message, 0, 0, 0, PM_NOREMOVE);
 
+            let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let raw_window = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                class_name.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                0,
+                0,
+                std::ptr::null_mut(),
+            );
+            if raw_window == 0 {
+                let _ = tx.send(Err(format!(
+                    "CreateWindowExW(raw mouse) failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+                clear_hook_callback();
+                return;
+            }
+            let raw_device = RawInputDevice {
+                usage_page: 0x01,
+                usage: 0x02,
+                flags: RIDEV_INPUTSINK,
+                target: raw_window,
+            };
+            if RegisterRawInputDevices(&raw_device, 1, size_of::<RawInputDevice>() as u32) == 0 {
+                let error = std::io::Error::last_os_error();
+                DestroyWindow(raw_window);
+                let _ = tx.send(Err(format!(
+                    "RegisterRawInputDevices(mouse) failed: {error}"
+                )));
+                clear_hook_callback();
+                return;
+            }
+
             let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), 0, 0);
             if mouse_hook == 0 {
                 let _ = tx.send(Err(format!(
                     "SetWindowsHookExW(WH_MOUSE_LL) failed: {}",
                     std::io::Error::last_os_error()
                 )));
+                unregister_raw_mouse();
+                DestroyWindow(raw_window);
                 clear_hook_callback();
                 return;
             }
@@ -1615,6 +1687,8 @@ mod windows_impl {
             if keyboard_hook == 0 {
                 let error = std::io::Error::last_os_error();
                 UnhookWindowsHookEx(mouse_hook);
+                unregister_raw_mouse();
+                DestroyWindow(raw_window);
                 let _ = tx.send(Err(format!(
                     "SetWindowsHookExW(WH_KEYBOARD_LL) failed: {error}"
                 )));
@@ -1624,18 +1698,50 @@ mod windows_impl {
 
             let _ = tx.send(Ok((mouse_hook, keyboard_hook, thread_id)));
 
-            while GetMessageW(&mut message as *mut Message, 0, 0, 0) > 0 {}
+            while GetMessageW(&mut message as *mut Message, 0, 0, 0) > 0 {
+                if message.message == WM_INPUT && message.hwnd == raw_window {
+                    dispatch_raw_mouse_move(message.l_param);
+                    DefWindowProcW(
+                        message.hwnd,
+                        message.message,
+                        message.w_param,
+                        message.l_param,
+                    );
+                }
+            }
 
             UnhookWindowsHookEx(mouse_hook);
             UnhookWindowsHookEx(keyboard_hook);
+            unregister_raw_mouse();
+            DestroyWindow(raw_window);
         }
 
         clear_hook_callback();
     }
 
+    unsafe fn unregister_raw_mouse() {
+        let remove = RawInputDevice {
+            usage_page: 0x01,
+            usage: 0x02,
+            flags: RIDEV_REMOVE,
+            target: 0,
+        };
+        RegisterRawInputDevices(&remove, 1, size_of::<RawInputDevice>() as u32);
+    }
+
     unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: usize, l_param: isize) -> isize {
         if code == HC_ACTION {
             if let Some(event) = unsafe { mouse_event_from_hook(w_param, l_param) } {
+                if let WindowsInputEvent::MouseMove { x, y } = event {
+                    if local_input_suppressed() {
+                        // Raw Input continues reporting physical deltas while the
+                        // desktop cursor is pinned at the source display edge.
+                        return CallNextHookEx(0, code, w_param, l_param);
+                    }
+                    if let Ok(mut state) = relative_mouse_state().lock() {
+                        state.physical_absolute(x, y);
+                    }
+                }
                 let suppress = should_suppress_local_event(&event);
                 dispatch_hook_event(event);
                 if suppress {
@@ -1645,6 +1751,57 @@ mod windows_impl {
         }
 
         CallNextHookEx(0, code, w_param, l_param)
+    }
+
+    unsafe fn dispatch_raw_mouse_move(handle: isize) {
+        if !local_input_suppressed() {
+            return;
+        }
+        let mut size = 0u32;
+        if GetRawInputData(
+            handle,
+            RID_INPUT,
+            std::ptr::null_mut(),
+            &mut size,
+            size_of::<RawInputHeader>() as u32,
+        ) != 0
+            || size < (size_of::<RawInputHeader>() + size_of::<RawMouse>()) as u32
+        {
+            return;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        let read = GetRawInputData(
+            handle,
+            RID_INPUT,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            size_of::<RawInputHeader>() as u32,
+        );
+        if read == u32::MAX
+            || (read as usize) < size_of::<RawInputHeader>() + size_of::<RawMouse>()
+        {
+            return;
+        }
+        let header = std::ptr::read_unaligned(bytes.as_ptr().cast::<RawInputHeader>());
+        if header.kind != RIM_TYPEMOUSE {
+            return;
+        }
+        let mouse = std::ptr::read_unaligned(
+            bytes
+                .as_ptr()
+                .add(size_of::<RawInputHeader>())
+                .cast::<RawMouse>(),
+        );
+        if mouse.flags & MOUSE_MOVE_ABSOLUTE != 0 || (mouse.last_x == 0 && mouse.last_y == 0) {
+            return;
+        }
+        let position = relative_mouse_state()
+            .lock()
+            .ok()
+            .and_then(|mut state| state.physical_delta(mouse.last_x, mouse.last_y));
+        if let Some((x, y)) = position {
+            dispatch_hook_event(WindowsInputEvent::MouseMove { x, y });
+        }
     }
 
     unsafe extern "system" fn keyboard_hook_proc(
@@ -2178,6 +2335,12 @@ mod windows_impl {
     const LLKHF_LOWER_IL_INJECTED: u32 = 0x00000002;
     const LLKHF_INJECTED: u32 = 0x00000010;
     const WM_QUIT: u32 = 0x0012;
+    const WM_INPUT: u32 = 0x00FF;
+    const RID_INPUT: u32 = 0x10000003;
+    const RIDEV_INPUTSINK: u32 = 0x00000100;
+    const RIDEV_REMOVE: u32 = 0x00000001;
+    const MOUSE_MOVE_ABSOLUTE: u16 = 0x0001;
+    const HWND_MESSAGE: isize = -3;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -3043,6 +3206,34 @@ mod windows_impl {
     }
 
     #[repr(C)]
+    struct RawInputDevice {
+        usage_page: u16,
+        usage: u16,
+        flags: u32,
+        target: isize,
+    }
+
+    #[repr(C)]
+    struct RawInputHeader {
+        kind: u32,
+        size: u32,
+        device: isize,
+        w_param: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawMouse {
+        flags: u16,
+        padding: u16,
+        buttons: u32,
+        raw_buttons: u32,
+        last_x: i32,
+        last_y: i32,
+        extra_information: u32,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy)]
     struct KeyboardHookStruct {
         vk_code: u32,
@@ -3138,6 +3329,15 @@ mod windows_impl {
             p_data: *mut std::ffi::c_void,
             pcb_size: *mut u32,
         ) -> u32;
+        fn RegisterRawInputDevices(devices: *const RawInputDevice, count: u32, size: u32) -> i32;
+        fn GetRawInputData(
+            handle: isize,
+            command: u32,
+            data: *mut std::ffi::c_void,
+            size: *mut u32,
+            header_size: u32,
+        ) -> u32;
+        fn DefWindowProcW(hwnd: isize, message: u32, w_param: usize, l_param: isize) -> isize;
         fn EnumDisplayMonitors(
             hdc: isize,
             lprc_clip: *const Rect,
@@ -5937,6 +6137,17 @@ mod windows_impl {
                 flags: 0,
                 down: true,
             }));
+        }
+
+        #[test]
+        fn raw_mouse_deltas_continue_past_the_clamped_desktop_edge() {
+            let mut state = RelativeMouseState::default();
+            state.physical_absolute(0, 410);
+            state.set_remote_active(true);
+            assert_eq!(state.physical_delta(-12, 3), Some((-12, 413)));
+            assert_eq!(state.physical_delta(-8, 0), Some((-20, 413)));
+            state.set_remote_active(false);
+            assert_eq!(state.physical_delta(-2, 0), None);
         }
 
         #[derive(Default)]

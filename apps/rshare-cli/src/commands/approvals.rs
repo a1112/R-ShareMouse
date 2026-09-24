@@ -4,10 +4,9 @@ use anyhow::{Context, Result};
 use rshare_core::{
     default_ipc_addr, read_json_frame, write_json_frame, DaemonRequest, DaemonResponse,
 };
-use tokio::net::TcpStream;
 
 async fn request(request: DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = TcpStream::connect(default_ipc_addr())
+    let mut stream = rshare_core::local_transport::connect()
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
     write_json_frame(&mut stream, &request).await?;

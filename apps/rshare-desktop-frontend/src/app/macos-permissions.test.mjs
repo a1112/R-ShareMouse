@@ -6,7 +6,19 @@ import {
   macosInputPermissionSummary,
   missingMacosInputPermissions,
   normalizeMacosInputPermissions,
+  shouldPromptForMacosInputPermissions,
 } from "./macos-permissions.mjs";
+
+test("prompts once the macOS permission check finds a missing grant or fails", () => {
+  assert.equal(shouldPromptForMacosInputPermissions(false, null), false);
+  assert.equal(shouldPromptForMacosInputPermissions(true, null), true);
+  assert.equal(shouldPromptForMacosInputPermissions(true, {
+    supported: true, input_monitoring: false, accessibility: true,
+  }), true);
+  assert.equal(shouldPromptForMacosInputPermissions(true, {
+    supported: true, input_monitoring: true, accessibility: true,
+  }), false);
+});
 
 test("normalizes a complete macOS input permission snapshot", () => {
   assert.deepEqual(

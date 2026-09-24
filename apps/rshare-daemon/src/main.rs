@@ -3,29 +3,28 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
-mod network_audio;
 mod endpoint_runtime;
 mod mobile_gateway;
 mod network_audio;
 mod static_capture;
+mod usb_service;
 
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::future::BoxFuture;
 use rshare_core::ipc::MacosInputPermissionsSnapshot;
 use rshare_core::{
-    default_ipc_addr, default_local_controls_ws_addr, default_mobile_gateway_addr,
-    local_capability_snapshots, remote_capability_snapshots, AudioFormat, BackendFailureReason,
-    BackendHealth, BackendKind, BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState,
-    CaptureSessionStateMachine, Config, ControlConnectionId, ControlSessionState,
-    DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
-    DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult, DisplayIdentifyResult, DisplayNode,
-    DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
-    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
-    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    FeatureConfig, InputRouter, IpcEnvelopeKind, IpcFrame, IpcFrameCodec, LatencyFeedbackSnapshot,
-    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    default_ipc_addr, default_mobile_gateway_addr, local_capability_snapshots,
+    remote_capability_snapshots, AudioFormat, BackendFailureReason, BackendHealth, BackendKind,
+    BackendRuntimeState, CapabilityRegistrySnapshot, CapabilityState, CaptureSessionStateMachine,
+    Config, ControlConnectionId, ControlSessionState, DaemonDeviceSnapshot, DaemonRequest,
+    DaemonResponse, DeviceCapabilities, DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult,
+    DisplayIdentifyResult, DisplayNode, DisplayOperationStatus, DisplaySettingsUpdateResult,
+    EndpointCapabilityKind, EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter,
+    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, FeatureConfig, InputRouter, IpcEnvelopeKind, IpcFrame, IpcFrameCodec,
+    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph, LayoutNode,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
@@ -56,9 +55,6 @@ use rshare_daemon::ipc_server::{
     ui_state_subscriber_for_request, write_json_response,
 };
 use rshare_daemon::state_aggregator::{StateAggregator, StateAggregatorHandle, UiProjectionSource};
-use rshare_daemon::ui_state_server::{
-    run_ui_state_server, LocalControlsFeed, LocalControlsSnapshotFuture,
-};
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource, CapturedInput,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
@@ -78,6 +74,7 @@ use rshare_net::{
 };
 use tracing_subscriber::prelude::*;
 
+use rshare_core::local_transport::{LocalListener, LocalStream};
 #[cfg(windows)]
 use rshare_platform::firewall;
 use std::collections::HashMap;
@@ -86,7 +83,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
@@ -120,6 +116,7 @@ enum PendingLatencyProbeRole {
 }
 
 struct PendingUsbClaim {
+    connection: ControlConnectionId,
     target: DeviceId,
     bus_id: String,
     request_id: u64,
@@ -129,6 +126,7 @@ struct PendingUsbClaim {
 }
 
 struct PendingUsbTransfer {
+    connection: ControlConnectionId,
     target: DeviceId,
     bus_id: String,
     request_id: u64,
@@ -136,6 +134,29 @@ struct PendingUsbTransfer {
     session_id: DeviceId,
     started_at_ms: u64,
     result_tx: oneshot::Sender<UsbDescriptorProbeResult>,
+}
+
+fn take_usb_completion(
+    pending: &mut HashMap<u64, PendingUsbTransfer>,
+    peer: DeviceId,
+    connection: ControlConnectionId,
+    transfer_id: u64,
+    key: &str,
+    data_length: usize,
+    actual_length: Option<u32>,
+) -> Option<PendingUsbTransfer> {
+    let valid = pending.get(&transfer_id).is_some_and(|p| {
+        p.target == peer
+            && p.connection == connection
+            && p.bus_id == key
+            && data_length <= 18
+            && actual_length.is_none_or(|n| n as usize == data_length)
+    });
+    if valid {
+        pending.remove(&transfer_id)
+    } else {
+        None
+    }
 }
 
 struct PendingEndpointInject {
@@ -4539,6 +4560,26 @@ async fn run_remote_usb_descriptor_probe(
             None,
         );
     }
+    let connection = network_manager
+        .lock()
+        .await
+        .input_registry()
+        .peer(&device_id)
+        .map(|p| p.auth.control_connection_id);
+    let Some(connection) = connection else {
+        return usb_probe_result(
+            UsbDescriptorProbeStatus::DeviceUnavailable,
+            "No authenticated USB peer".into(),
+            device_id,
+            bus_id,
+            0,
+            0,
+            None,
+            started_at_ms,
+            vec![],
+            None,
+        );
+    };
     let (request_id, transfer_id, result_rx, event) = {
         let mut state = state.write().await;
         if !is_device_connected(&state, device_id) {
@@ -4563,6 +4604,7 @@ async fn run_remote_usb_descriptor_probe(
         state.pending_usb_claims.insert(
             request_id,
             PendingUsbClaim {
+                connection,
                 target: device_id,
                 bus_id: bus_id.clone(),
                 request_id,
@@ -4593,7 +4635,7 @@ async fn run_remote_usb_descriptor_probe(
     let claim_request = UsbDeviceClaimRequest {
         request_id,
         bus_id: bus_id.clone(),
-        exclusive: false,
+        exclusive: true,
         configuration_value: None,
         interface_numbers: Vec::new(),
     };
@@ -4862,6 +4904,101 @@ async fn handle_network_message(
     control_connection_id: ControlConnectionId,
     message: Message,
 ) {
+    if usb_service::is_usb_message(&message)
+        && !input_registry
+            .peer(&from)
+            .is_some_and(|peer| peer.auth.control_connection_id == control_connection_id)
+    {
+        return;
+    }
+    if usb_service::is_host_request(&message) {
+        static USB_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+        if !state.read().await.features.usb_forwarding_experimental
+            || !usb_service::bounded(&message)
+        {
+            send_usb_error(
+                network_manager,
+                from,
+                None,
+                "USB disabled or request exceeds limits".into(),
+            )
+            .await;
+            return;
+        }
+        let Ok(permit) = USB_WORKERS.try_acquire() else {
+            send_usb_error(
+                network_manager,
+                from,
+                None,
+                "USB worker budget exhausted".into(),
+            )
+            .await;
+            return;
+        };
+        static USB_BUDGET: std::sync::OnceLock<Arc<rshare_core::usb_budget::UsbBudget>> =
+            std::sync::OnceLock::new();
+        let (lease, capacity) = match &message {
+            Message::UsbTransfer { transfer } => (
+                transfer.session_id.unwrap_or_default(),
+                transfer
+                    .data
+                    .len()
+                    .max(transfer.expected_length.unwrap_or(0) as usize),
+            ),
+            _ => (DeviceId::nil(), 0),
+        };
+        let owner = rshare_core::usb_authority::UsbOwner {
+            peer: from,
+            connection: control_connection_id,
+        };
+        let reservation = match USB_BUDGET
+            .get_or_init(Default::default)
+            .reserve(owner, lease, capacity)
+        {
+            Ok(reservation) => reservation,
+            Err(e) => {
+                send_usb_error(network_manager, from, None, e.to_string()).await;
+                return;
+            }
+        };
+        let runtime = usb_runtime.clone();
+        let manager = network_manager.clone();
+        let registry = input_registry.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut runtime = runtime.blocking_lock();
+                // Recheck after waiting for native I/O: disconnect may have won.
+                if !registry
+                    .peer(&from)
+                    .is_some_and(|p| p.auth.control_connection_id == control_connection_id)
+                {
+                    return (permit, reservation, None);
+                }
+                let response = usb_service::execute(
+                    &mut runtime,
+                    rshare_core::usb_authority::UsbOwner {
+                        peer: from,
+                        connection: control_connection_id,
+                    },
+                    message,
+                );
+                (permit, reservation, response)
+            })
+            .await;
+            if let Ok((_permit, _reservation, Some(response))) = result {
+                // Never send an old-generation native completion to a replacement connection.
+                let mut manager = manager.lock().await;
+                if manager
+                    .input_registry()
+                    .peer(&from)
+                    .is_some_and(|p| p.auth.control_connection_id == control_connection_id)
+                {
+                    let _ = manager.send_to(&from, response).await;
+                }
+            }
+        });
+        return;
+    }
     match message {
         Message::FileTransfer(packet) => {
             if let Some(service) = state.read().await.file_transfers.clone() {
@@ -5369,57 +5506,6 @@ async fn handle_network_message(
             };
             let _ = local_events_tx.send(event);
         }
-        Message::UsbTransfer { transfer } => {
-            let usb_enabled = {
-                let state = state.read().await;
-                state.features.usb_forwarding_experimental
-            };
-            if !usb_enabled {
-                send_usb_error(
-                    network_manager,
-                    from,
-                    Some(transfer.bus_id),
-                    "Experimental USB forwarding is disabled in settings.".to_string(),
-                )
-                .await;
-                return;
-            }
-            let result = {
-                let mut runtime = usb_runtime.lock().await;
-                runtime.submit_transfer(&transfer)
-            };
-            match result {
-                Ok(completion) => {
-                    let message = Message::UsbTransferComplete {
-                        transfer_id: completion.transfer_id,
-                        bus_id: completion.bus_id,
-                        status: completion.status,
-                        transfer_status: completion.transfer_status,
-                        endpoint_address: completion.endpoint_address,
-                        transfer_kind: completion.transfer_kind,
-                        actual_length: completion.actual_length,
-                        data: completion.data,
-                        iso_packets: Vec::new(),
-                    };
-                    if let Err(error) = network_manager.lock().await.send_to(&from, message).await {
-                        tracing::warn!(
-                            "Failed to send USB transfer completion to {}: {}",
-                            from,
-                            error
-                        );
-                    }
-                }
-                Err(error) => {
-                    send_usb_error(
-                        network_manager,
-                        from,
-                        Some(transfer.bus_id),
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            }
-        }
         Message::UsbTransferComplete {
             transfer_id,
             bus_id,
@@ -5431,7 +5517,15 @@ async fn handle_network_message(
         } => {
             let pending = {
                 let mut state = state.write().await;
-                state.pending_usb_transfers.remove(&transfer_id)
+                take_usb_completion(
+                    &mut state.pending_usb_transfers,
+                    from,
+                    control_connection_id,
+                    transfer_id,
+                    &bus_id,
+                    data.len(),
+                    actual_length,
+                )
             };
             if let Some(pending) = pending {
                 if pending.target == from {
@@ -5482,62 +5576,22 @@ async fn handle_network_message(
         Message::UsbForwardingError { bus_id, message } => {
             complete_pending_usb_error(state, local_events_tx, from, bus_id, message).await;
         }
-        Message::UsbDeviceClaimRequest { request } => {
-            let usb_enabled = {
-                let state = state.read().await;
-                state.features.usb_forwarding_experimental
-            };
-            if !usb_enabled {
-                send_usb_error(
-                    network_manager,
-                    from,
-                    Some(request.bus_id),
-                    "Experimental USB forwarding is disabled in settings.".to_string(),
-                )
-                .await;
-                return;
-            }
-            let response = {
-                let mut runtime = usb_runtime.lock().await;
-                runtime.claim_device(request)
-            };
-            let flow = if response.accepted {
-                let runtime = usb_runtime.lock().await;
-                Some(runtime.flow_control(response.bus_id.clone(), response.session_id))
-            } else {
-                None
-            };
-            let accepted = response.accepted;
-            let bus_id = response.bus_id.clone();
-            if let Err(error) = network_manager
-                .lock()
-                .await
-                .send_to(&from, Message::UsbDeviceClaimResponse { response })
-                .await
-            {
-                tracing::warn!("Failed to send USB claim response to {}: {}", from, error);
-            }
-            if let Some(flow) = flow {
-                if let Err(error) = network_manager
-                    .lock()
-                    .await
-                    .send_to(&from, Message::UsbFlowControl { flow })
-                    .await
-                {
-                    tracing::warn!("Failed to send USB flow control to {}: {}", from, error);
-                }
-            }
-            tracing::debug!(
-                "Processed experimental USB claim request from {} for {} accepted={}",
-                from,
-                bus_id,
-                accepted
-            );
-        }
         Message::UsbDeviceClaimResponse { response } => {
             let action = {
                 let mut state = state.write().await;
-                let pending = state.pending_usb_claims.remove(&response.request_id);
+                let valid = state
+                    .pending_usb_claims
+                    .get(&response.request_id)
+                    .is_some_and(|p| {
+                        p.target == from
+                            && p.connection == control_connection_id
+                            && p.bus_id == response.bus_id
+                    });
+                let pending = if valid {
+                    state.pending_usb_claims.remove(&response.request_id)
+                } else {
+                    None
+                };
                 match pending {
                     Some(pending) if pending.target == from => {
                         if response.accepted {
@@ -5551,6 +5605,7 @@ async fn handle_network_message(
                                     state.pending_usb_transfers.insert(
                                         pending.transfer_id,
                                         PendingUsbTransfer {
+                                            connection: pending.connection,
                                             target: pending.target,
                                             bus_id: pending.bus_id,
                                             request_id: pending.request_id,
@@ -5635,105 +5690,6 @@ async fn handle_network_message(
                 }
             }
         }
-        Message::UsbDeviceRelease {
-            session_id,
-            bus_id,
-            reason,
-        } => {
-            let usb_enabled = {
-                let state = state.read().await;
-                state.features.usb_forwarding_experimental
-            };
-            if !usb_enabled {
-                send_usb_error(
-                    network_manager,
-                    from,
-                    Some(bus_id),
-                    "Experimental USB forwarding is disabled in settings.".to_string(),
-                )
-                .await;
-                return;
-            }
-            let result = {
-                let mut runtime = usb_runtime.lock().await;
-                runtime.release_device(session_id)
-            };
-            match result {
-                Ok(()) => tracing::debug!(
-                    "Released experimental USB session {} for {} from {}: {}",
-                    session_id,
-                    bus_id,
-                    from,
-                    reason
-                ),
-                Err(error) => {
-                    send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
-                }
-            }
-        }
-        Message::UsbDeviceReset {
-            session_id,
-            bus_id,
-            reset_kind,
-        } => {
-            let usb_enabled = {
-                let state = state.read().await;
-                state.features.usb_forwarding_experimental
-            };
-            if !usb_enabled {
-                send_usb_error(
-                    network_manager,
-                    from,
-                    Some(bus_id),
-                    "Experimental USB forwarding is disabled in settings.".to_string(),
-                )
-                .await;
-                return;
-            }
-            let result = {
-                let mut runtime = usb_runtime.lock().await;
-                runtime.reset_device(session_id, &bus_id, reset_kind)
-            };
-            if let Err(error) = result {
-                send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
-            }
-        }
-        Message::UsbTransferCancel {
-            transfer_id,
-            bus_id,
-            reason,
-        } => {
-            let usb_enabled = {
-                let state = state.read().await;
-                state.features.usb_forwarding_experimental
-            };
-            if !usb_enabled {
-                send_usb_error(
-                    network_manager,
-                    from,
-                    Some(bus_id),
-                    "Experimental USB forwarding is disabled in settings.".to_string(),
-                )
-                .await;
-                return;
-            }
-            let result = {
-                let mut runtime = usb_runtime.lock().await;
-                runtime.cancel_transfer(transfer_id, &bus_id)
-            };
-            match result {
-                Ok(()) => tracing::debug!(
-                    "Cancelled experimental USB transfer {} from {} for {}: {}",
-                    transfer_id,
-                    from,
-                    bus_id,
-                    reason
-                ),
-                Err(error) => {
-                    send_usb_error(network_manager, from, Some(bus_id), error.to_string()).await;
-                }
-            }
-        }
         Message::UsbFlowControl { flow } => {
             tracing::debug!(
                 "Received experimental USB flow control from {} for {}: {} bytes, {} transfers",
@@ -5778,8 +5734,10 @@ async fn advertise_usb_devices_to(
     target: DeviceId,
 ) {
     let devices = {
-        let runtime = usb_runtime.lock().await;
-        runtime.enumerate_devices()
+        let runtime = usb_runtime.clone();
+        tokio::task::spawn_blocking(move || runtime.blocking_lock().devices_for_peer(target))
+            .await
+            .unwrap_or_else(|e| Err(e.into()))
     };
     let devices = match devices {
         Ok(devices) => devices,
@@ -7084,10 +7042,10 @@ fn captured_input_from_evdev_driver_event(
         rshare_platform::EvdevDriverEvent::MouseMove { device_path, .. }
         | rshare_platform::EvdevDriverEvent::MouseButton { device_path, .. }
         | rshare_platform::EvdevDriverEvent::MouseWheel { device_path, .. } => {
-            (LocalInputDeviceKind::Mouse, device_path.as_str())
+            (LocalInputDeviceKind::Mouse, device_path.clone())
         }
         rshare_platform::EvdevDriverEvent::Key { device_path, .. } => {
-            (LocalInputDeviceKind::Keyboard, device_path.as_str())
+            (LocalInputDeviceKind::Keyboard, device_path.clone())
         }
     };
     let payload = input_event_from_evdev_driver_event(event)?;
@@ -7102,7 +7060,7 @@ fn captured_input_from_evdev_driver_event(
         // relative payload; this helper is only for discrete metadata tests.
         CapturedInputPayload::Continuous(_) => return None,
     };
-    let device_instance_id = Path::new(device_path)
+    let device_instance_id = Path::new(&device_path)
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned);
@@ -7440,7 +7398,7 @@ async fn main() -> Result<()> {
         file_transfers,
     );
 
-    let ipc_listener = TcpListener::bind(default_ipc_addr()).await?;
+    let ipc_listener = LocalListener::bind()?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
     let (local_events_tx, _) = broadcast::channel::<LocalInputDiagnosticEvent>(256);
     let (endpoint_events_tx, _) = broadcast::channel::<EndpointEvent>(256);
@@ -7792,22 +7750,21 @@ async fn main() -> Result<()> {
         layout_update_lock.clone(),
         shutdown_tx.clone(),
     ));
-    let local_controls_snapshot_state = state.clone();
-    let local_controls_snapshot_ui_state = ui_state.clone();
-    let local_controls_feed = LocalControlsFeed::new(
-        Arc::new(move || -> LocalControlsSnapshotFuture {
-            let state = local_controls_snapshot_state.clone();
-            let ui_state = local_controls_snapshot_ui_state.clone();
-            Box::pin(async move { local_controls_fallback_snapshot(&state, &ui_state).await })
-        }),
-        local_events_tx.clone(),
-    );
-    let ui_state_ws_task = tokio::spawn(run_ui_state_server(
-        default_local_controls_ws_addr(),
-        ui_state.clone(),
-        local_controls_feed,
-        shutdown_tx.subscribe(),
-    ));
+    // UI snapshots and diagnostics use authenticated local IPC.
+    let usb_maintenance_runtime = usb_runtime.clone();
+    let mut usb_maintenance_shutdown = shutdown_tx.subscribe();
+    let usb_maintenance = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = usb_maintenance_shutdown.recv() => break,
+                _ = interval.tick() => {
+                    let runtime = usb_maintenance_runtime.clone();
+                    if tokio::task::spawn_blocking(move || runtime.blocking_lock().expire()).await.is_err() { break; }
+                }
+            }
+        }
+    });
     let (mobile_gateway_enabled, mobile_access) = {
         let state = state.read().await;
         (
@@ -8068,6 +8025,17 @@ async fn main() -> Result<()> {
                         {
                             continue;
                         }
+                        {
+                            let runtime = usb_runtime.clone();
+                            tokio::task::spawn_blocking(move || {
+                                runtime.blocking_lock().disconnect(
+                                    rshare_core::usb_authority::UsbOwner {
+                                        peer: id,
+                                        connection: control_connection_id,
+                                    },
+                                )
+                            });
+                        }
                         diagnostics.clear_generation(DiagnosticSubscriberId {
                             peer_id: id,
                             control_connection_id,
@@ -8142,6 +8110,17 @@ async fn main() -> Result<()> {
                             else {
                                 continue;
                             };
+                            {
+                                let runtime = usb_runtime.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    runtime.blocking_lock().disconnect(
+                                        rshare_core::usb_authority::UsbOwner {
+                                            peer: device_id,
+                                            connection: control_connection_id,
+                                        },
+                                    )
+                                });
+                            }
                             diagnostics.clear_generation(DiagnosticSubscriberId {
                                 peer_id: device_id,
                                 control_connection_id,
@@ -8209,10 +8188,6 @@ async fn main() -> Result<()> {
             tracing::info!("IPC task completed");
             flatten_daemon_task_result(result)
         }
-        result = ui_state_ws_task => {
-            tracing::info!("UI state websocket task completed");
-            flatten_daemon_task_result(result)
-        }
         result = &mut mobile_gateway_task => {
             tracing::info!("Mobile gateway task completed");
             mobile_gateway_finished = true;
@@ -8247,6 +8222,7 @@ async fn main() -> Result<()> {
     let _ = enqueue_router_command(&input_command_tx, RouterCommand::Shutdown).await;
     injection.request_release_all_sources(rshare_core::ReleaseAllReason::SessionEnded);
     set_local_shortcut_suppression(false);
+    usb_maintenance.abort();
     audio_runtime.stop_capture();
     audio_runtime.stop_render();
     audio_runtime.shutdown();
@@ -8269,7 +8245,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_ipc_server(
-    listener: TcpListener,
+    mut listener: LocalListener,
     ui_state: StateAggregatorHandle,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
@@ -8283,8 +8259,12 @@ async fn run_ipc_server(
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
+    let clients = Arc::new(tokio::sync::Semaphore::new(32));
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = listener.accept().await?;
+        let Ok(permit) = clients.clone().try_acquire_owned() else {
+            continue;
+        };
         let ui_state = ui_state.clone();
         let state = state.clone();
         let network_manager = network_manager.clone();
@@ -8299,6 +8279,7 @@ async fn run_ipc_server(
         let shutdown_tx = shutdown_tx.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_ipc_client(
                 stream,
                 ui_state,
@@ -8323,7 +8304,7 @@ async fn run_ipc_server(
 }
 
 async fn handle_ipc_client(
-    mut stream: TcpStream,
+    mut stream: LocalStream,
     ui_state: StateAggregatorHandle,
     state: Arc<RwLock<DaemonState>>,
     network_manager: Arc<Mutex<NetworkManager>>,
@@ -8337,7 +8318,9 @@ async fn handle_ipc_client(
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
-    let Some(request) = read_json_request(&mut stream).await? else {
+    let Some(request) =
+        tokio::time::timeout(Duration::from_secs(5), read_json_request(&mut stream)).await??
+    else {
         return Ok(());
     };
 
@@ -8882,6 +8865,64 @@ async fn dispatch_ipc_request(
                 }
             }
         }
+        DaemonRequest::AuthorizeUsbDevice {
+            peer,
+            device_key,
+            lifetime_secs,
+        } => {
+            if !state.read().await.features.usb_forwarding_experimental {
+                return Ok(DaemonResponse::Error(
+                    "Experimental USB forwarding is disabled".into(),
+                ));
+            }
+            let runtime = usb_runtime.clone();
+            match tokio::task::spawn_blocking(move || -> Result<()> {
+                let store = rshare_net::encryption::QuicTrustStore::load_default()?;
+                if !store
+                    .fingerprint_for(&peer)
+                    .is_some_and(|pin| store.is_operator_approved_exact(peer, pin))
+                {
+                    anyhow::bail!("USB target must have an operator-approved certificate");
+                }
+                runtime
+                    .blocking_lock()
+                    .authorize_device(peer, &device_key, lifetime_secs)
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    advertise_usb_devices_to(&network_manager, &usb_runtime, peer).await;
+                    DaemonResponse::Ack
+                }
+                Ok(Err(e)) => DaemonResponse::Error(e.to_string()),
+                Err(e) => DaemonResponse::Error(e.to_string()),
+            }
+        }
+        DaemonRequest::RevokeUsbDevice { peer, device_key } => {
+            let runtime = usb_runtime.clone();
+            let key = device_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                runtime.blocking_lock().revoke_device(peer, &key)
+            })
+            .await
+            {
+                Ok(()) => {
+                    let _ = network_manager
+                        .lock()
+                        .await
+                        .send_to(
+                            &peer,
+                            Message::UsbDeviceDetached {
+                                bus_id: device_key,
+                                reason: "authorization_revoked".into(),
+                            },
+                        )
+                        .await;
+                    DaemonResponse::Ack
+                }
+                Err(e) => DaemonResponse::Error(e.to_string()),
+            }
+        }
         DaemonRequest::ListUsbDevices => {
             let usb_enabled = {
                 let state = state.read().await;
@@ -8892,7 +8933,12 @@ async fn dispatch_ipc_request(
                     "Experimental USB forwarding is disabled in settings.".to_string(),
                 )
             } else {
-                match usb_runtime.lock().await.enumerate_devices() {
+                match {
+                    let runtime = usb_runtime.clone();
+                    tokio::task::spawn_blocking(move || runtime.blocking_lock().enumerate_devices())
+                        .await
+                        .unwrap_or_else(|e| Err(e.into()))
+                } {
                     Ok(devices) => DaemonResponse::UsbDevices(devices),
                     Err(error) => DaemonResponse::Error(error.to_string()),
                 }
@@ -9326,6 +9372,99 @@ mod tests {
             realtime_dropped: 0,
             reliable_overflow: 0,
         }
+    }
+
+    #[test]
+    fn usb_completion_checks_owner_before_removing_pending() {
+        let peer = DeviceId::new_v4();
+        let connection = ControlConnectionId::new();
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert(
+            7,
+            PendingUsbTransfer {
+                target: peer,
+                connection,
+                bus_id: "export-key".into(),
+                request_id: 6,
+                transfer_id: 7,
+                session_id: DeviceId::new_v4(),
+                started_at_ms: 0,
+                result_tx: tx,
+            },
+        );
+        assert!(take_usb_completion(
+            &mut pending,
+            DeviceId::new_v4(),
+            connection,
+            7,
+            "export-key",
+            18,
+            Some(18)
+        )
+        .is_none());
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            ControlConnectionId::new(),
+            7,
+            "export-key",
+            18,
+            Some(18)
+        )
+        .is_none());
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            connection,
+            7,
+            "wrong-device",
+            18,
+            Some(18)
+        )
+        .is_none());
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            connection,
+            7,
+            "export-key",
+            19,
+            Some(19)
+        )
+        .is_none());
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            connection,
+            7,
+            "export-key",
+            18,
+            Some(17)
+        )
+        .is_none());
+        assert_eq!(pending.len(), 1);
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            connection,
+            7,
+            "export-key",
+            18,
+            Some(18)
+        )
+        .is_some());
+        assert!(pending.is_empty());
+        assert!(take_usb_completion(
+            &mut pending,
+            peer,
+            connection,
+            7,
+            "export-key",
+            18,
+            Some(18)
+        )
+        .is_none());
     }
 
     fn test_daemon_state() -> DaemonState {

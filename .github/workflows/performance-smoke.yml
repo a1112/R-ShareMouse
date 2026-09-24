@@ -22,26 +22,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Initialize evidence
+        run: node scripts/ci/evidence.mjs start artifacts/hosted-smoke
+
       - name: Prepare Linux workspace build
+        id: prepare
         uses: ./.github/actions/prepare-linux-build
 
       - name: Install Playwright Chromium
+        id: browser
         working-directory: apps/rshare-desktop-frontend
         run: npx playwright install --with-deps chromium
 
       - name: Run functional UI stream scenarios
+        id: ui
         run: npm --prefix apps/rshare-desktop-frontend run test:perf -- --grep-invert @fixed-runner
 
-      - name: Run Rust workspace tests from lockfile
-        run: cargo test --workspace --locked
-
       - name: Run frontend Node tests
+        id: frontend
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: npm --prefix apps/rshare-desktop-frontend test
 
       - name: Compile every benchmark from lockfile
+        id: bench
         run: cargo bench --workspace --no-run --locked
 
       - name: Check 100k CPU path catastrophe ceiling
+        id: cpu
         shell: bash
         run: |
           mkdir -p artifacts/hosted-smoke
@@ -57,6 +64,7 @@ jobs:
           fi
 
       - name: Check framed IPC catastrophe ceilings
+        id: ipc
         shell: bash
         run: |
           cargo run --release --locked -p rshare-perf -- \
@@ -81,6 +89,7 @@ jobs:
           NODE
 
       - name: Check QUIC loopback catastrophe ceilings
+        id: quic
         shell: bash
         run: |
           cargo run --release --locked -p rshare-perf -- \
@@ -171,6 +180,12 @@ jobs:
           }
           NODE
 
+      - name: Finalize evidence
+        if: always()
+        env:
+          EVIDENCE_STEPS: ${{ toJSON(steps) }}
+        run: node scripts/ci/evidence.mjs finish artifacts/hosted-smoke
+
       - name: Upload catastrophe-smoke evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -179,3 +194,36 @@ jobs:
           path: artifacts/hosted-smoke
           if-no-files-found: error
           retention-days: 14
+
+  linux-workspace-tests:
+    name: Linux workspace tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize evidence
+        run: node scripts/ci/evidence.mjs start artifacts/workspace-tests
+      - name: Prepare Linux workspace build
+        id: prepare
+        uses: ./.github/actions/prepare-linux-build
+      - name: Test workspace
+        id: tests
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Test HID report behavior
+        id: hid_reports
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror drivers/windows/rshare-vhid/tests/report_state_tests.c -o /tmp/rshare-vhid-reports
+          /tmp/rshare-vhid-reports
+      - name: Finalize evidence
+        if: always()
+        env:
+          EVIDENCE_STEPS: ${{ toJSON(steps) }}
+        run: node scripts/ci/evidence.mjs finish artifacts/workspace-tests
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-workspace-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/workspace-tests
+          if-no-files-found: error

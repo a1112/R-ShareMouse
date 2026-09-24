@@ -28,6 +28,10 @@ export function normalizeMacosInputPermissions(value) {
   };
 }
 
+export function shouldPromptForMacosInputPermissions(checked, value) {
+  return checked && !normalizeMacosInputPermissions(value)?.ready;
+}
+
 export function missingMacosInputPermissions(value) {
   const permissions = normalizeMacosInputPermissions(value) ?? value;
   if (!permissions || permissions.supported !== true) {
