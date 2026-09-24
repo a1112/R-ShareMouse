@@ -35,7 +35,7 @@ mod windows_impl {
     use std::mem::size_of;
     use std::os::windows::process::CommandExt;
     use std::sync::{
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     };
     use std::thread::{self, JoinHandle};
@@ -62,6 +62,12 @@ mod windows_impl {
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
     static PROCESS_DPI_AWARENESS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
     static RELATIVE_MOUSE_STATE: OnceLock<Mutex<RelativeMouseState>> = OnceLock::new();
+    static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+    struct LocalCursorLease {
+        previous_clip: Option<Rect>,
+        overlay: isize,
+    }
 
     #[derive(Default)]
     struct RelativeMouseState {
@@ -101,13 +107,27 @@ mod windows_impl {
 
     /// Enable or disable local input suppression for low-level Windows hooks.
     ///
-    /// When enabled, non-injected keyboard events and mouse button/wheel events are
-    /// captured for forwarding but not delivered to the local desktop.
+    /// When enabled, physical keyboard and mouse events are captured for
+    /// forwarding but not delivered to the local desktop.
     pub fn set_local_input_suppressed(suppressed: bool) {
+        if LOCAL_INPUT_SUPPRESSED.load(Ordering::SeqCst) == suppressed {
+            return;
+        }
         if let Ok(mut state) = relative_mouse_state().lock() {
             state.set_remote_active(suppressed);
         }
         LOCAL_INPUT_SUPPRESSED.store(suppressed, Ordering::SeqCst);
+        let hook_thread = HOOK_THREAD_ID.load(Ordering::SeqCst);
+        if hook_thread != 0 {
+            let message = if suppressed {
+                WM_REMOTE_CURSOR_ON
+            } else {
+                WM_REMOTE_CURSOR_OFF
+            };
+            if unsafe { PostThreadMessageW(hook_thread, message, 0, 0) } == 0 {
+                tracing::warn!("Windows: unable to update local cursor ownership");
+            }
+        }
     }
 
     pub fn local_input_suppressed() -> bool {
@@ -1469,6 +1489,7 @@ mod windows_impl {
 
         /// Stop listening and cleanup hooks
         pub fn stop(&mut self) -> Result<()> {
+            set_local_input_suppressed(false);
             if let Some(runtime) = self.runtime.take() {
                 runtime.stop()?;
                 tracing::info!("Windows input listener stopped");
@@ -1696,20 +1717,47 @@ mod windows_impl {
                 return;
             }
 
+            HOOK_THREAD_ID.store(thread_id, Ordering::SeqCst);
             let _ = tx.send(Ok((mouse_hook, keyboard_hook, thread_id)));
 
+            let mut cursor_lease = None;
+
             while GetMessageW(&mut message as *mut Message, 0, 0, 0) > 0 {
-                if message.message == WM_INPUT && message.hwnd == raw_window {
-                    dispatch_raw_mouse_move(message.l_param);
-                    DefWindowProcW(
-                        message.hwnd,
-                        message.message,
-                        message.w_param,
-                        message.l_param,
-                    );
+                match message.message {
+                    WM_INPUT if message.hwnd == raw_window => {
+                        dispatch_raw_mouse_move(message.l_param);
+                        DefWindowProcW(
+                            message.hwnd,
+                            message.message,
+                            message.w_param,
+                            message.l_param,
+                        );
+                    }
+                    WM_REMOTE_CURSOR_ON if local_input_suppressed() => {
+                        if cursor_lease.is_none() {
+                            match capture_local_cursor() {
+                                Ok(lease) => cursor_lease = Some(lease),
+                                Err(error) => tracing::warn!(
+                                    "Windows: unable to hide local cursor during remote control: {error}"
+                                ),
+                            }
+                        }
+                    }
+                    WM_REMOTE_CURSOR_OFF => {
+                        if let Some(lease) = cursor_lease.take() {
+                            release_local_cursor(lease);
+                        }
+                    }
+                    _ => {
+                        DispatchMessageW(&message);
+                    }
                 }
             }
 
+            HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+            if let Some(lease) = cursor_lease.take() {
+                release_local_cursor(lease);
+            }
             UnhookWindowsHookEx(mouse_hook);
             UnhookWindowsHookEx(keyboard_hook);
             unregister_raw_mouse();
@@ -1717,6 +1765,102 @@ mod windows_impl {
         }
 
         clear_hook_callback();
+    }
+
+    unsafe extern "system" fn cursor_overlay_proc(
+        hwnd: isize,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize {
+        match message {
+            WM_SETCURSOR => {
+                SetCursor(0);
+                1
+            }
+            WM_ERASEBKGND => 1,
+            _ => DefWindowProcW(hwnd, message, w_param, l_param),
+        }
+    }
+
+    unsafe fn capture_local_cursor() -> Result<LocalCursorLease> {
+        let mut position = Point::default();
+        if GetCursorPos(&mut position) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let class_name: Vec<u16> = "RShareMouseCursorOwner\0".encode_utf16().collect();
+        let window_class = WindowClassW {
+            style: 0,
+            window_proc: Some(cursor_overlay_proc),
+            class_extra: 0,
+            window_extra: 0,
+            instance: 0,
+            icon: 0,
+            cursor: 0,
+            background: 0,
+            menu_name: std::ptr::null(),
+            class_name: class_name.as_ptr(),
+        };
+        if RegisterClassW(&window_class) == 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(1410)
+        {
+            return Err(anyhow::anyhow!(
+                "RegisterClassW(cursor owner): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let overlay = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            WS_POPUP,
+            position.x.saturating_sub(1),
+            position.y.saturating_sub(1),
+            3,
+            3,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+        );
+        if overlay == 0 {
+            return Err(anyhow::anyhow!(
+                "CreateWindowExW(cursor owner): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut previous_clip = Rect::default();
+        let previous_clip = (GetClipCursor(&mut previous_clip) != 0).then_some(previous_clip);
+        ShowWindow(overlay, SW_SHOWNOACTIVATE);
+        let anchor = Rect {
+            left: position.x,
+            top: position.y,
+            right: position.x.saturating_add(1),
+            bottom: position.y.saturating_add(1),
+        };
+        if ClipCursor(&anchor) == 0 {
+            let error = std::io::Error::last_os_error();
+            DestroyWindow(overlay);
+            return Err(anyhow::anyhow!("ClipCursor(cursor owner): {error}"));
+        }
+        SetCursorPos(position.x, position.y);
+        SetCursor(0);
+        Ok(LocalCursorLease {
+            previous_clip,
+            overlay,
+        })
+    }
+
+    unsafe fn release_local_cursor(lease: LocalCursorLease) {
+        if let Some(rect) = lease.previous_clip {
+            ClipCursor(&rect);
+        } else {
+            ClipCursor(std::ptr::null());
+        }
+        DestroyWindow(lease.overlay);
     }
 
     unsafe fn unregister_raw_mouse() {
@@ -1736,7 +1880,7 @@ mod windows_impl {
                     if local_input_suppressed() {
                         // Raw Input continues reporting physical deltas while the
                         // desktop cursor is pinned at the source display edge.
-                        return CallNextHookEx(0, code, w_param, l_param);
+                        return 1;
                     }
                     if let Ok(mut state) = relative_mouse_state().lock() {
                         state.physical_absolute(x, y);
@@ -1777,8 +1921,7 @@ mod windows_impl {
             &mut size,
             size_of::<RawInputHeader>() as u32,
         );
-        if read == u32::MAX
-            || (read as usize) < size_of::<RawInputHeader>() + size_of::<RawMouse>()
+        if read == u32::MAX || (read as usize) < size_of::<RawInputHeader>() + size_of::<RawMouse>()
         {
             return;
         }
@@ -1830,6 +1973,7 @@ mod windows_impl {
         matches!(
             event,
             WindowsInputEvent::Key { .. }
+                | WindowsInputEvent::MouseMove { .. }
                 | WindowsInputEvent::MouseButton { .. }
                 | WindowsInputEvent::MouseWheel { .. }
         )
@@ -2335,7 +2479,11 @@ mod windows_impl {
     const LLKHF_LOWER_IL_INJECTED: u32 = 0x00000002;
     const LLKHF_INJECTED: u32 = 0x00000010;
     const WM_QUIT: u32 = 0x0012;
+    const WM_ERASEBKGND: u32 = 0x0014;
+    const WM_SETCURSOR: u32 = 0x0020;
     const WM_INPUT: u32 = 0x00FF;
+    const WM_REMOTE_CURSOR_ON: u32 = 0x8001;
+    const WM_REMOTE_CURSOR_OFF: u32 = 0x8002;
     const RID_INPUT: u32 = 0x10000003;
     const RIDEV_INPUTSINK: u32 = 0x00000100;
     const RIDEV_REMOVE: u32 = 0x00000001;
@@ -3214,6 +3362,20 @@ mod windows_impl {
     }
 
     #[repr(C)]
+    struct WindowClassW {
+        style: u32,
+        window_proc: Option<unsafe extern "system" fn(isize, u32, usize, isize) -> isize>,
+        class_extra: i32,
+        window_extra: i32,
+        instance: isize,
+        icon: isize,
+        cursor: isize,
+        background: isize,
+        menu_name: *const u16,
+        class_name: *const u16,
+    }
+
+    #[repr(C)]
     struct RawInputHeader {
         kind: u32,
         size: u32,
@@ -3288,6 +3450,12 @@ mod windows_impl {
         fn GetMessageW(message: *mut Message, hwnd: isize, min_filter: u32, max_filter: u32)
             -> i32;
         fn GetCursorPos(lp_point: *mut Point) -> i32;
+        fn GetClipCursor(rect: *mut Rect) -> i32;
+        fn ClipCursor(rect: *const Rect) -> i32;
+        fn SetCursor(cursor: isize) -> isize;
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+        fn RegisterClassW(class: *const WindowClassW) -> u16;
+        fn DispatchMessageW(message: *const Message) -> isize;
         fn PeekMessageW(
             message: *mut Message,
             hwnd: isize,
@@ -6105,7 +6273,7 @@ mod windows_impl {
         }
 
         #[test]
-        fn suppresses_keyboard_and_clicks_but_not_mouse_move() {
+        fn suppresses_keyboard_and_all_local_mouse_events() {
             set_local_input_suppressed(true);
 
             assert!(should_suppress_local_event(&WindowsInputEvent::Key {
@@ -6126,9 +6294,10 @@ mod windows_impl {
                     delta_y: 1,
                 }
             ));
-            assert!(!should_suppress_local_event(
-                &WindowsInputEvent::MouseMove { x: 1, y: 2 }
-            ));
+            assert!(should_suppress_local_event(&WindowsInputEvent::MouseMove {
+                x: 1,
+                y: 2
+            }));
 
             set_local_input_suppressed(false);
             assert!(!should_suppress_local_event(&WindowsInputEvent::Key {
