@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod service;
 pub mod session;
 pub mod ui_state;
+pub mod wake;
 
 // Re-exports from protocol
 pub use protocol::{
@@ -95,6 +96,9 @@ pub use ipc_binary::{
 pub use ipc_frame::{
     IpcEnvelopeKind, IpcFrame, IpcFrameCodec, IpcFrameLimits, DEFAULT_MAX_BINARY_FRAME_BYTES,
     DEFAULT_MAX_JSON_FRAME_BYTES, IPC_FRAME_HEADER_LEN,
+};
+pub use wake::{
+    WakeAttemptSnapshot, WakeAttemptStatus, WakeTarget, WakeTargetInput, WakeTargetKind,
 };
 
 // Re-exports from endpoint event observation/injection diagnostics

@@ -518,6 +518,20 @@ pub struct PendingPeerApproval {
 /// Client request over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
+    ListWakeTargets,
+    ListWakeAttempts,
+    SaveWakeTarget {
+        target: crate::wake::WakeTargetInput,
+    },
+    DeleteWakeTarget {
+        target_id: DeviceId,
+    },
+    WakeTarget {
+        target_id: DeviceId,
+    },
+    GetWakeAttempt {
+        attempt_id: DeviceId,
+    },
     NetworkAudio(crate::network_audio::AudioCommand),
     Status,
     GetMacosInputPermissions,
@@ -620,6 +634,10 @@ pub enum DaemonRequest {
 /// Daemon response over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DaemonResponse {
+    WakeTargets(Vec<crate::wake::WakeTarget>),
+    WakeAttempts(Vec<crate::wake::WakeAttemptSnapshot>),
+    WakeTarget(crate::wake::WakeTarget),
+    WakeAttempt(crate::wake::WakeAttemptSnapshot),
     NetworkAudio(crate::network_audio::AudioSnapshot),
     Status(ServiceStatusSnapshot),
     MacosInputPermissions(MacosInputPermissionsSnapshot),

@@ -625,7 +625,7 @@ fn interface_broadcast_address(interface: &Interface) -> Option<Ipv4Addr> {
     }
 }
 
-fn is_candidate_interface(interface: &Interface) -> bool {
+pub(crate) fn is_candidate_interface(interface: &Interface) -> bool {
     if interface.is_loopback() {
         return false;
     }

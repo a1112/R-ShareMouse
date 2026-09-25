@@ -11,5 +11,6 @@ pub mod start;
 pub mod status;
 pub mod stop;
 pub mod usb;
+pub mod wake;
 
 pub mod audio;

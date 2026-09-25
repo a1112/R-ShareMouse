@@ -401,6 +401,50 @@ async fn disconnect_device(device_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn wake_targets() -> Result<Vec<rshare_core::WakeTarget>, String> {
+    daemon_client::request_wake_targets()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn wake_attempts() -> Result<Vec<rshare_core::WakeAttemptSnapshot>, String> {
+    daemon_client::request_wake_attempts()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn save_wake_target(
+    target: rshare_core::WakeTargetInput,
+) -> Result<rshare_core::WakeTarget, String> {
+    daemon_client::request_save_wake_target(target)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_wake_target(target_id: String) -> Result<(), String> {
+    daemon_client::request_delete_wake_target(parse_device_id(&target_id)?)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn wake_target(target_id: String) -> Result<rshare_core::WakeAttemptSnapshot, String> {
+    daemon_client::request_wake_target(parse_device_id(&target_id)?)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn wake_attempt(attempt_id: String) -> Result<rshare_core::WakeAttemptSnapshot, String> {
+    daemon_client::request_wake_attempt(parse_device_id(&attempt_id)?)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn local_controls_state() -> Result<LocalControlDeviceSnapshot, String> {
     local_controls_state_with(
         || Box::pin(async { daemon_client::request_local_controls().await }),
@@ -1118,6 +1162,12 @@ fn main() {
             capabilities_state,
             connect_device,
             disconnect_device,
+            wake_targets,
+            wake_attempts,
+            save_wake_target,
+            delete_wake_target,
+            wake_target,
+            wake_attempt,
             local_controls_state,
             mobile_access,
             capture_display_binary,

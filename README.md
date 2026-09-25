@@ -97,6 +97,31 @@ are unsupported. The remote pointer does not display a native file-drag thumbnai
 See the [file-drop guide](docs/guides/cross-device-file-drop.md) for limits,
 failure handling and validation details.
 
+### Wake-on-LAN
+
+On the **设备** page, save the Ethernet MAC address of a discovered R-ShareMouse
+peer, or add a standalone LAN device with a name, MAC address, and IPv4 address.
+Saved targets remain available after they disappear from discovery. The local
+daemon must be running.
+
+```bash
+rshare wake add --name "Office PC" --mac 02:11:22:33:44:55 --ip 192.168.1.50
+rshare wake add --name "Peer PC" --mac 02:11:22:33:44:66 --peer-id <device-uuid>
+rshare wake list
+rshare wake send <wake-target-uuid>
+rshare wake edit <wake-target-uuid> --ip 192.168.1.51
+rshare wake remove <wake-target-uuid>
+```
+
+The daemon broadcasts the magic packet within the local subnet, then waits up
+to 90 seconds for the peer to reappear or for a standalone device to answer
+ping. A successful send confirms only that the packet left this computer.
+`wake send` exits with 0 for a confirmed response, 2 when power-on could not
+be confirmed, and 1 for a send error. The target's firmware, operating system,
+and network adapter must support and enable Wake-on-LAN, including wake from
+the intended power state; standalone IPv4 addresses should be stable and allow
+ICMP echo if confirmation is desired.
+
 ## Validation
 
 ```bash

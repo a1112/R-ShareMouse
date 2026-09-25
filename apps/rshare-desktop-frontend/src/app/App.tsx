@@ -1,4 +1,5 @@
 import { NetworkAudioPanel } from "./NetworkAudioPanel";
+import { WakePanel } from "./WakePanel";
 import {
   createContext,
   memo,
@@ -780,6 +781,12 @@ const NETWORK_COMMANDS = new Set([
   "clear_logs",
   "connect_device",
   "disconnect_device",
+  "wake_targets",
+  "wake_attempts",
+  "save_wake_target",
+  "delete_wake_target",
+  "wake_target",
+  "wake_attempt",
   "get_layout",
   "set_layout",
   "local_controls_state",
@@ -1265,6 +1272,30 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonRequestValue<T>(
         { Disconnect: { device_id: args?.device_id ?? args?.deviceId } },
         "Ack",
+      );
+    case "wake_targets":
+      return await daemonRequestValue<T>("ListWakeTargets", "WakeTargets");
+    case "wake_attempts":
+      return await daemonRequestValue<T>("ListWakeAttempts", "WakeAttempts");
+    case "save_wake_target":
+      return await daemonRequestValue<T>(
+        { SaveWakeTarget: { target: args?.target } },
+        "WakeTarget",
+      );
+    case "delete_wake_target":
+      return await daemonRequestValue<T>(
+        { DeleteWakeTarget: { target_id: args?.target_id ?? args?.targetId } },
+        "Ack",
+      );
+    case "wake_target":
+      return await daemonRequestValue<T>(
+        { WakeTarget: { target_id: args?.target_id ?? args?.targetId } },
+        "WakeAttempt",
+      );
+    case "wake_attempt":
+      return await daemonRequestValue<T>(
+        { GetWakeAttempt: { attempt_id: args?.attempt_id ?? args?.attemptId } },
+        "WakeAttempt",
       );
     case "get_layout":
       return await daemonRequestValue<T>("GetLayout", "Layout");
@@ -3364,26 +3395,31 @@ function DevicesPage({
   ) as LocalControlsSnapshot;
 
   return (
-    <DevicesPageWithLocalControls
-      devices={devices}
-      capabilities={capabilities}
-      visibleLayout={visibleLayout}
-      localDevice={localDevice}
-      latencyFeedback={liveDiagnostics ?? latencyFeedback}
-      localControls={effectiveLocalControls}
-      localControlsError={localControlsError}
-      localInputTestResult={localInputTestResult}
-      remoteLatencyTestResult={remoteLatencyTestResult}
-      confirmingInputTest={confirmingInputTest}
-      onRunLocalInputTest={onRunLocalInputTest}
-      onRunRemoteEndpointInputTest={onRunRemoteEndpointInputTest}
-      onRunRemoteLatencyTest={onRunRemoteLatencyTest}
-      onRefreshLocalControls={onRefreshLocalControls}
-      onConnect={onConnect}
-      onDisconnect={onDisconnect}
-      busy={busy}
-      theme={theme}
-    />
+    <div className="flex h-full min-h-0 flex-col">
+      <WakePanel devices={devices} command={invokeCommand} theme={theme} />
+      <div className="min-h-0 flex-1">
+        <DevicesPageWithLocalControls
+          devices={devices}
+          capabilities={capabilities}
+          visibleLayout={visibleLayout}
+          localDevice={localDevice}
+          latencyFeedback={liveDiagnostics ?? latencyFeedback}
+          localControls={effectiveLocalControls}
+          localControlsError={localControlsError}
+          localInputTestResult={localInputTestResult}
+          remoteLatencyTestResult={remoteLatencyTestResult}
+          confirmingInputTest={confirmingInputTest}
+          onRunLocalInputTest={onRunLocalInputTest}
+          onRunRemoteEndpointInputTest={onRunRemoteEndpointInputTest}
+          onRunRemoteLatencyTest={onRunRemoteLatencyTest}
+          onRefreshLocalControls={onRefreshLocalControls}
+          onConnect={onConnect}
+          onDisconnect={onDisconnect}
+          busy={busy}
+          theme={theme}
+        />
+      </div>
+    </div>
   );
 
   if (!devices.length) {

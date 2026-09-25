@@ -87,6 +87,54 @@ pub async fn request_devices() -> Result<Vec<DaemonDeviceSnapshot>> {
     }
 }
 
+pub async fn request_wake_targets() -> Result<Vec<crate::WakeTarget>> {
+    match send_request(DaemonRequest::ListWakeTargets).await? {
+        DaemonResponse::WakeTargets(targets) => Ok(targets),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_wake_attempts() -> Result<Vec<crate::WakeAttemptSnapshot>> {
+    match send_request(DaemonRequest::ListWakeAttempts).await? {
+        DaemonResponse::WakeAttempts(attempts) => Ok(attempts),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_save_wake_target(target: crate::WakeTargetInput) -> Result<crate::WakeTarget> {
+    match send_request(DaemonRequest::SaveWakeTarget { target }).await? {
+        DaemonResponse::WakeTarget(target) => Ok(target),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_delete_wake_target(target_id: DeviceId) -> Result<()> {
+    match send_request(DaemonRequest::DeleteWakeTarget { target_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_wake_target(target_id: DeviceId) -> Result<crate::WakeAttemptSnapshot> {
+    match send_request(DaemonRequest::WakeTarget { target_id }).await? {
+        DaemonResponse::WakeAttempt(attempt) => Ok(attempt),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+pub async fn request_wake_attempt(attempt_id: DeviceId) -> Result<crate::WakeAttemptSnapshot> {
+    match send_request(DaemonRequest::GetWakeAttempt { attempt_id }).await? {
+        DaemonResponse::WakeAttempt(attempt) => Ok(attempt),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
 pub async fn request_send_files(
     device_id: crate::DeviceId,
     paths: Vec<String>,

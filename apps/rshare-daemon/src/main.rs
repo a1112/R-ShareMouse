@@ -35,7 +35,7 @@ use rshare_core::{
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot, VirtualDisplayStatus, WakeAttemptStatus,
     UI_STATE_PROTOCOL_VERSION,
 };
 #[cfg(test)]
@@ -58,6 +58,7 @@ use rshare_daemon::state_aggregator::{StateAggregator, StateAggregatorHandle, Ui
 use rshare_daemon::ui_state_server::{
     run_ui_state_server, LocalControlsFeed, LocalControlsSnapshotFuture,
 };
+use rshare_daemon::wake::{ping_ipv4, wait_for_confirmation, ProbeResult, WakeManager};
 use rshare_input::{
     BackendCandidate, BackendSelector, CaptureBackend, CaptureOrigin, CaptureSource, CapturedInput,
     CapturedInputPayload, ContinuousInput, GamepadListenerConfig, GilrsGamepadListener,
@@ -357,6 +358,7 @@ impl Default for RuntimeFeatureConfig {
 }
 
 struct DaemonState {
+    wake: Arc<Mutex<WakeManager>>,
     network_audio: Arc<std::sync::Mutex<network_audio::Manager>>,
     status: ServiceStatusSnapshot,
     devices: HashMap<DeviceId, TrackedDevice>,
@@ -420,6 +422,7 @@ impl DaemonState {
         };
 
         Self {
+            wake: Arc::new(Mutex::new(WakeManager::empty())),
             status,
             devices: HashMap::new(),
             layout,
@@ -568,7 +571,9 @@ impl DaemonState {
     fn mark_connected(&mut self, id: &DeviceId, connected: bool) -> bool {
         if let Some(device) = self.devices.get_mut(id) {
             device.connected = connected;
-            device.last_seen_at = Instant::now();
+            if connected {
+                device.last_seen_at = Instant::now();
+            }
         } else if connected {
             self.devices.insert(
                 *id,
@@ -7346,6 +7351,14 @@ async fn main() -> Result<()> {
         RuntimeFeatureConfig::from_config(&config),
     );
     daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(layout_path.with_file_name("network-audio.json"))));
+    let wake_path = layout_path.with_file_name("wake-targets.json");
+    daemon_state.wake = Arc::new(Mutex::new(match WakeManager::load(wake_path.clone()) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::warn!(%error, "Wake target store is unavailable");
+            WakeManager::unavailable(wake_path, error.to_string())
+        }
+    }));
     daemon_state.refresh_local_controls_platform();
     let download_dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
@@ -8605,6 +8618,9 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
     matches!(
         request,
         DaemonRequest::Capabilities { .. }
+            | DaemonRequest::SaveWakeTarget { .. }
+            | DaemonRequest::DeleteWakeTarget { .. }
+            | DaemonRequest::WakeTarget { .. }
             | DaemonRequest::LocalControls
             | DaemonRequest::Connect { .. }
             | DaemonRequest::Disconnect { .. }
@@ -8629,6 +8645,88 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
     )
 }
 
+async fn handle_wake_target(
+    target_id: DeviceId,
+    state: Arc<RwLock<DaemonState>>,
+) -> DaemonResponse {
+    let wake = state.read().await.wake.clone();
+    let (target, attempt, is_new) = match wake.lock().await.begin(target_id) {
+        Ok(begun) => begun,
+        Err(error) => return DaemonResponse::Error(error.to_string()),
+    };
+    if !is_new {
+        return DaemonResponse::WakeAttempt(attempt);
+    }
+    let sent_after = Instant::now();
+    match rshare_net::wake::send_magic_packet(&target.mac, target.ipv4).await {
+        Err(error) => {
+            let mut manager = wake.lock().await;
+            manager.finish(
+                attempt.id,
+                WakeAttemptStatus::Failed,
+                format!("Wake packet send failed: {error}"),
+            );
+            DaemonResponse::WakeAttempt(manager.attempt(attempt.id).expect("new wake attempt"))
+        }
+        Ok(interfaces) => {
+            wake.lock().await.set_waiting_message(
+                attempt.id,
+                format!("Wake packet sent on {interfaces} interface(s); waiting for response"),
+            );
+            let response = wake
+                .lock()
+                .await
+                .attempt(attempt.id)
+                .expect("new wake attempt");
+            let wake_for_task = wake.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    wait_for_confirmation(Duration::from_secs(90), Duration::from_secs(2), || {
+                        let target = target.clone();
+                        let state = state.clone();
+                        async move {
+                            if let Some(peer_id) = target.peer_id {
+                                let state = state.read().await;
+                                if state.devices.get(&peer_id).is_some_and(|device| {
+                                    (device.connected || device.discovered)
+                                        && device.last_seen_at >= sent_after
+                                }) {
+                                    ProbeResult::Responded
+                                } else {
+                                    ProbeResult::NoReply
+                                }
+                            } else if let Some(ip) = target.ipv4 {
+                                ping_ipv4(ip).await
+                            } else {
+                                ProbeResult::Unavailable("Target has no IPv4 address".into())
+                            }
+                        }
+                    })
+                    .await;
+                let message = if outcome.status == WakeAttemptStatus::Confirmed {
+                    if target.peer_id.is_some() {
+                        "R-ShareMouse peer appeared on the LAN".to_string()
+                    } else {
+                        format!(
+                            "{} responded to ping",
+                            target.ipv4.expect("standalone IPv4")
+                        )
+                    }
+                } else if target.peer_id.is_none() && outcome.message.starts_with("No response") {
+                    format!("{}; ping/ICMP echo may be blocked", outcome.message)
+                } else {
+                    outcome.message
+                };
+                wake_for_task
+                    .lock()
+                    .await
+                    .finish(attempt.id, outcome.status, message);
+            });
+            DaemonResponse::WakeAttempt(response)
+        }
+    }
+}
+
 async fn dispatch_ipc_request(
     request: DaemonRequest,
     state: Arc<RwLock<DaemonState>>,
@@ -8643,6 +8741,46 @@ async fn dispatch_ipc_request(
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<DaemonResponse> {
     let response = match request {
+        DaemonRequest::ListWakeTargets => {
+            let wake = state.read().await.wake.clone();
+            let targets = wake.lock().await.targets();
+            match targets {
+                Ok(targets) => DaemonResponse::WakeTargets(targets),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::ListWakeAttempts => {
+            let wake = state.read().await.wake.clone();
+            let attempts = wake.lock().await.attempts();
+            DaemonResponse::WakeAttempts(attempts)
+        }
+        DaemonRequest::SaveWakeTarget { target } => {
+            let wake = state.read().await.wake.clone();
+            let result = wake.lock().await.save_target(target);
+            match result {
+                Ok(target) => DaemonResponse::WakeTarget(target),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::DeleteWakeTarget { target_id } => {
+            let wake = state.read().await.wake.clone();
+            let result = wake.lock().await.delete_target(target_id);
+            match result {
+                Ok(()) => DaemonResponse::Ack,
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::GetWakeAttempt { attempt_id } => {
+            let wake = state.read().await.wake.clone();
+            let attempt = wake.lock().await.attempt(attempt_id);
+            match attempt {
+                Some(attempt) => DaemonResponse::WakeAttempt(attempt),
+                None => DaemonResponse::Error("Wake attempt not found".into()),
+            }
+        }
+        DaemonRequest::WakeTarget { target_id } => {
+            handle_wake_target(target_id, state.clone()).await
+        }
         DaemonRequest::NetworkAudio(command) => {
             let audio = state.read().await.network_audio.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -13820,12 +13958,14 @@ mod tests {
         let mut state = DaemonState::new(test_status(local_id));
         state.upsert_discovered(discovered_device_for_test(remote_id));
         state.mark_connected(&remote_id, true);
+        let last_seen_at = state.devices.get(&remote_id).unwrap().last_seen_at;
 
         state.mark_disconnected(&remote_id);
 
         let device = state.devices.get(&remote_id).unwrap();
         assert!(!device.connected);
         assert!(device.discovered);
+        assert_eq!(device.last_seen_at, last_seen_at);
     }
 
     #[tokio::test]

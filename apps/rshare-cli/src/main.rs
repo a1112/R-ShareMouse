@@ -31,7 +31,7 @@ fn build_metadata() -> String {
     )
 }
 
-use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, usb};
+use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, usb, wake};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -58,6 +58,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Wake a saved device on the local network
+    Wake {
+        #[command(subcommand)]
+        command: wake::WakeCommandLine,
+    },
     /// Network audio endpoints and permissions
     Audio { #[command(subcommand)] command: commands::audio::AudioCommandLine },
     /// Start the R-ShareMouse service
@@ -204,6 +209,12 @@ async fn main() -> Result<()> {
 
     // Run command
     match cli.command {
+        Commands::Wake { command } => {
+            let exit_code = wake::execute(command).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
         Commands::Start {
             daemon,
             log_file,
@@ -285,5 +296,41 @@ mod tests {
                 approval_cmd: ApprovalCommands::Approve { approval_id }
             } if approval_id == "opaque-id"
         ));
+    }
+
+    #[test]
+    fn parses_wake_add_and_send_commands() {
+        let add = Cli::try_parse_from([
+            "rshare",
+            "wake",
+            "add",
+            "--name",
+            "Desk",
+            "--mac",
+            "02:11:22:33:44:55",
+            "--ip",
+            "192.168.1.50",
+        ])
+        .unwrap();
+        assert!(matches!(add.command, Commands::Wake { .. }));
+        let send = Cli::try_parse_from([
+            "rshare",
+            "wake",
+            "send",
+            "f8f12499-410f-42e5-9442-38c52d7a55fe",
+        ])
+        .unwrap();
+        assert!(matches!(send.command, Commands::Wake { .. }));
+        let edit = Cli::try_parse_from([
+            "rshare",
+            "wake",
+            "edit",
+            "f8f12499-410f-42e5-9442-38c52d7a55fe",
+            "--standalone",
+            "--ip",
+            "192.168.1.51",
+        ])
+        .unwrap();
+        assert!(matches!(edit.command, Commands::Wake { .. }));
     }
 }
