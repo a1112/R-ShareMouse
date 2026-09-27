@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>R-ShareMouse 扩展显示器</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101615;color:#e8f0ec;font:15px system-ui,sans-serif}main{display:flex;flex-direction:column;min-height:100dvh;padding:16px;gap:12px}h1{font-size:20px;margin:0}p{margin:6px 0;line-height:1.6}.muted{color:#a4b7af;font-size:13px}button{border:1px solid #486458;background:#243c31;color:#e8f0ec;padding:10px 16px;border-radius:8px;cursor:pointer}button:disabled{opacity:.4;cursor:default}section{padding:12px;background:#18231e;border-radius:10px}video{display:block;width:100%;height:calc(100dvh - 340px);min-height:240px;object-fit:contain;background:#000;touch-action:none;user-select:none}video:fullscreen{height:100%;width:100%}label{display:block;margin-top:12px}[hidden]{display:none!important}#status{color:#8fe2b3}#stats{overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}
+</style>
+<style>
+#viewer{position:relative}#leave-fullscreen{display:none}.immersive #viewer{position:fixed;inset:0;z-index:20;background:#000}.immersive #viewer video{width:100%;height:100dvh;min-height:0}.immersive #leave-fullscreen{display:block;position:absolute;right:max(12px,env(safe-area-inset-right));top:max(12px,env(safe-area-inset-top));z-index:21;opacity:.8}#viewer:fullscreen{width:100%;height:100%}#viewer:fullscreen video{height:100%}
+</style>
+</head>
+<body><main>
+<h1 id="title">扩展显示器</h1>
+<div id="status" role="status">正在连接…</div><div id="screen" class="muted"></div>
+<section id="host-controls" hidden>
+<div class="actions"><button id="create">1. 创建 1080p 扩展屏</button><button id="share" disabled>2. 选择扩展屏并分享</button></div>
+<label><input id="touch" type="checkbox" disabled> 我已确认分享的是上方扩展屏，启用 Windows 多点触摸</label>
+<p class="muted">在屏幕选择器中选择新建的完整显示器。保持此页面运行；停止分享或关闭主机页面会移除本次创建的扩展屏。</p>
+</section>
+<div id="viewer"><video id="video" autoplay muted playsinline disablepictureinpicture></video><button id="leave-fullscreen">退出全屏</button></div>
+<div id="receiver-controls" hidden><button id="play">播放 / 全屏</button></div>
+<div id="touch-status" class="muted">触摸未启用</div><div id="stats" class="muted">视频直连 · 无公共中继 · 实际性能以统计为准</div>
+<div><button id="stop">断开</button></div>
+<details class="muted"><summary>USB / 有线连接</summary><p>可使用已建立的 USB 网络共享或 USB 以太网。通过该网卡的主机 IP 打开接收链接，并核对上方实际连接地址；必要时关闭 Wi‑Fi，确保视频走有线连接。RTT 是网络往返时间，不是屏幕显示延迟。</p><p>iPad 普通数据线直连尚不支持。USB 热点依赖蜂窝版 iPad、运营商支持及 Windows Apple 驱动；Wi‑Fi 版 iPad 可使用兼容的以太网适配器接入局域网。</p><p>当前入口复用实验性移动网关的 HTTP 配对，仅用于受信任局域网；WebRTC 视频本身加密。画面触摸使用 Windows 原生触摸注入，不会注册硬件触摸屏。</p></details>
+</main><script type="module">import { startPage } from '/display/client.mjs'; startPage();</script></body></html>

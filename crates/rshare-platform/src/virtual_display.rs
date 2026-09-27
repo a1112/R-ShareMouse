@@ -60,6 +60,7 @@ pub fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
 pub fn create_virtual_display(
     request: &VirtualDisplayCreateRequest,
 ) -> Result<VirtualDisplayOperationResult> {
+    let _session_guard = reserve_virtual_display()?;
     if !is_valid_mode(request.width, request.height, request.refresh_rate_millihz) {
         return Ok(VirtualDisplayOperationResult {
             status: VirtualDisplayOperationStatus::InvalidMode,
@@ -101,6 +102,7 @@ pub fn create_virtual_display(
 pub fn remove_virtual_display(
     request: &VirtualDisplayRemoveRequest,
 ) -> Result<VirtualDisplayOperationResult> {
+    let _session_guard = reserve_virtual_display()?;
     #[cfg(windows)]
     {
         windows_remove_virtual_display(request)
@@ -119,6 +121,25 @@ pub fn remove_virtual_display(
 fn is_valid_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
     is_positive_mode(width, height, refresh_rate_millihz)
         && is_supported_mode(width, height, refresh_rate_millihz)
+}
+
+/// Hold on one OS thread for a streaming session. Normal create/remove calls
+/// acquire the same recursive Windows mutex briefly, so another daemon/client
+/// cannot replace or remove the sole IDD monitor during that session.
+pub struct VirtualDisplayLease {
+    #[cfg(windows)]
+    _guard: WindowsVirtualDisplayOperationGuard,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn reserve_virtual_display() -> Result<VirtualDisplayLease> {
+    Ok(VirtualDisplayLease {
+        #[cfg(windows)]
+        _guard: WindowsVirtualDisplayOperationGuard::acquire_named(
+            "Global\\RShareMouseExtendedDisplaySession", 0,
+        )?,
+        _thread_bound: std::marker::PhantomData,
+    })
 }
 
 fn is_positive_mode(width: u32, height: u32, refresh_rate_millihz: Option<u32>) -> bool {
@@ -554,7 +575,11 @@ struct WindowsVirtualDisplayOperationGuard {
 #[cfg(windows)]
 impl WindowsVirtualDisplayOperationGuard {
     fn acquire() -> Result<Self> {
-        let name = wide_null(RSHARE_VDISPLAY_OPERATION_MUTEX_NAME);
+        Self::acquire_named(RSHARE_VDISPLAY_OPERATION_MUTEX_NAME, INFINITE)
+    }
+
+    fn acquire_named(name: &str, timeout: u32) -> Result<Self> {
+        let name = wide_null(name);
         let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
         if handle == 0 {
             anyhow::bail!(
@@ -563,13 +588,13 @@ impl WindowsVirtualDisplayOperationGuard {
             );
         }
 
-        let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        let wait_result = unsafe { WaitForSingleObject(handle, timeout) };
         if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
             let error = std::io::Error::last_os_error();
             unsafe {
                 CloseHandle(handle);
             }
-            anyhow::bail!("failed to acquire virtual display operation mutex: {error}");
+            anyhow::bail!("virtual display is in use by another session, or lock failed: {error}");
         }
 
         Ok(Self { handle })

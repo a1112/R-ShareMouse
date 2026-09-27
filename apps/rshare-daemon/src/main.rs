@@ -6,6 +6,7 @@ mod audio_runtime;
 mod network_audio;
 mod endpoint_runtime;
 mod mobile_gateway;
+mod extended_display;
 mod static_capture;
 
 use anyhow::{Context, Result};
