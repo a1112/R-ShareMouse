@@ -13,6 +13,7 @@ pub mod handshake;
 pub mod network_manager;
 pub mod qos;
 pub mod transport;
+pub mod wake;
 
 #[cfg(test)]
 pub mod discovery_test;
