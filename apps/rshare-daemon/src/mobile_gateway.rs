@@ -414,6 +414,7 @@ pub(crate) struct MobileGatewayAccess {
     token: String,
     advertise_host: String,
     activity: Arc<StdMutex<MobileGatewayActivity>>,
+    display_hub: crate::extended_display::DisplayHub,
 }
 
 #[derive(Debug, Default)]
@@ -431,6 +432,7 @@ impl MobileGatewayAccess {
             token,
             advertise_host,
             activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
+            display_hub: crate::extended_display::DisplayHub::default(),
         }
     }
 
@@ -441,6 +443,7 @@ impl MobileGatewayAccess {
             token: String::new(),
             advertise_host: String::new(),
             activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
+            display_hub: crate::extended_display::DisplayHub::default(),
         }
     }
 
@@ -533,7 +536,7 @@ impl MobileHttpRequest {
         }
     }
 
-    fn header(&self, key: &str) -> Option<&str> {
+    pub(crate) fn header(&self, key: &str) -> Option<&str> {
         self.headers
             .get(&key.to_ascii_lowercase())
             .map(String::as_str)
@@ -543,6 +546,9 @@ impl MobileHttpRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobileGatewayRoute {
     Page,
+    DisplayPage,
+    DisplayScript,
+    DisplaySocket,
     LocalControls,
     Inject,
     NotFound,
@@ -556,6 +562,9 @@ pub(crate) fn route_mobile_http_request(method: &str, target: &str) -> MobileGat
         .trim_end_matches('/');
     match (method.to_ascii_uppercase().as_str(), path) {
         ("GET", "" | "/mobile") => MobileGatewayRoute::Page,
+        ("GET", "/display") => MobileGatewayRoute::DisplayPage,
+        ("GET", "/display/client.mjs") => MobileGatewayRoute::DisplayScript,
+        ("GET", "/api/display/socket") => MobileGatewayRoute::DisplaySocket,
         ("GET", "/api/local-controls") => MobileGatewayRoute::LocalControls,
         ("POST", "/api/inject") => MobileGatewayRoute::Inject,
         _ => MobileGatewayRoute::NotFound,
@@ -742,6 +751,9 @@ async fn run_mobile_gateway_server_on_listener(
 
     client_tasks.abort_all();
     while client_tasks.join_next().await.is_some() {}
+    if let Err(error) = access.display_hub.shutdown().await {
+        tracing::warn!("Extended display cleanup during gateway shutdown failed: {error}");
+    }
     reaper_task.abort();
     let _ = reaper_task.await;
     sessions
@@ -801,6 +813,11 @@ async fn handle_mobile_gateway_client_with_context(
         .await;
     }
 
+    if route == MobileGatewayRoute::DisplayScript {
+        return write_mobile_response_with_deadline(&mut stream, 200,
+            "text/javascript; charset=utf-8", crate::extended_display::CLIENT.as_bytes().to_vec(), limits.write_deadline).await;
+    }
+
     if !is_authorized_mobile_request(&request, access.token()) {
         return write_mobile_response_with_deadline(
             &mut stream,
@@ -814,6 +831,24 @@ async fn handle_mobile_gateway_client_with_context(
     access.record_client(peer_addr);
 
     match route {
+        MobileGatewayRoute::DisplayPage => {
+            let local_sender = mobile_query_value(&request.target, "role").as_deref() == Some("host");
+            if local_sender && !peer_addr.ip().is_loopback() {
+                return write_mobile_response_with_deadline(&mut stream, 401, "text/plain; charset=utf-8",
+                    "请在主机浏览器中通过 localhost 打开发送页面".as_bytes().to_vec(), limits.write_deadline).await;
+            }
+            write_mobile_response_with_deadline(&mut stream, 200, "text/html; charset=utf-8",
+                crate::extended_display::PAGE.as_bytes().to_vec(), limits.write_deadline).await
+        }
+        MobileGatewayRoute::DisplaySocket => {
+            let role = match mobile_query_value(&request.target, "role").as_deref() {
+                Some("host") => crate::extended_display::Role::Host,
+                Some("receiver") => crate::extended_display::Role::Receiver,
+                _ => bail!("invalid display role"),
+            };
+            crate::extended_display::serve(stream, peer_addr, &request, role, access.display_hub.clone(), state).await
+        }
+        MobileGatewayRoute::DisplayScript => unreachable!(),
         MobileGatewayRoute::Page => {
             write_mobile_response_with_deadline(
                 &mut stream,
@@ -2102,6 +2137,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     input, textarea { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #edf2ef; font-size: 16px; }
     textarea { min-height: 56px; resize: none; line-height: 1.35; }
     .send { width: 58px; background: #47c27a; color: #07110b; border-color: #47c27a; }
+    body.android-host #extendedDisplayLink { display: none; }
   </style>
 </head>
 <body>
@@ -2114,6 +2150,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
     </div>
     <div class="status" id="status">连接中</div>
   </header>
+  <a id="extendedDisplayLink" style="color:#8fe2b3;padding:8px 0">用作扩展显示器</a>
   <section id="pad"><div class="dot"></div></section>
   <section class="rangeRow">
     <label for="sensitivity">灵敏度</label>
@@ -2173,6 +2210,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
 </main>
 <script>
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
+document.getElementById("extendedDisplayLink").href = "/display?t=" + encodeURIComponent(token);
 function newMobileClientId() {
   return crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -3377,6 +3415,61 @@ mod tests {
             InputInjectionHandle::spawn(backend, InjectionActorConfig::default()).unwrap();
         let (local_events_tx, _) = broadcast::channel(32);
         (state, network_manager, inject_backend, local_events_tx)
+    }
+
+    #[tokio::test]
+    async fn extended_display_routes_enforce_authentication_and_local_sender() {
+        for (target, remote, expected) in [
+            ("/display", false, "401 Unauthorized"),
+            ("/api/display/socket?role=receiver", false, "401 Unauthorized"),
+            ("/display?t=test", false, "200 OK"),
+            ("/display?role=host&t=test", true, "401 Unauthorized"),
+            ("/display/client.mjs", false, "200 OK"),
+        ] {
+            let (mut client, server) = connected_tcp_pair().await;
+            let peer = if remote { "192.168.1.10:42".parse().unwrap() } else { client.local_addr().unwrap() };
+            let (state, network, injection, events) = test_mobile_runtime(Box::new(NoopInjectBackend));
+            let access = MobileGatewayAccess::new("127.0.0.1:27437".parse().unwrap(), "test".into(), "127.0.0.1".into());
+            client.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).await.unwrap();
+            let task = tokio::spawn(handle_mobile_gateway_client(server, peer, access, state, network, injection, events));
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(2), client.read_to_end(&mut response)).await.unwrap().unwrap();
+            task.await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&response).contains(expected), "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_display_real_websocket_relay_and_role_violation_cleanup() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, Message}};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access = MobileGatewayAccess::new(addr, "socket-test".into(), "127.0.0.1".into());
+        let (state, network, injection, events) = test_mobile_runtime(Box::new(NoopInjectBackend));
+        let (shutdown, shutdown_rx) = broadcast::channel(1);
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(listener, access, state,
+            network, injection, events, shutdown_rx, MobileGatewayLimits::default()));
+        let request = |role| {
+            let mut request = format!("ws://{addr}/api/display/socket?role={role}&t=socket-test").into_client_request().unwrap();
+            request.headers_mut().insert("origin", format!("http://{addr}").parse().unwrap());
+            request
+        };
+        let (mut host, _) = connect_async(request("host")).await.unwrap();
+        assert!(host.next().await.unwrap().unwrap().into_text().unwrap().contains("hello"));
+        let (mut receiver, _) = connect_async(request("receiver")).await.unwrap();
+        assert!(receiver.next().await.unwrap().unwrap().into_text().unwrap().contains("hello"));
+        assert!(host.next().await.unwrap().unwrap().into_text().unwrap().contains("receiver_ready"));
+        host.send(Message::Text(r#"{"type":"offer","sdp":"integration-offer"}"#.into())).await.unwrap();
+        let offer = timeout(Duration::from_secs(2), receiver.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        assert!(offer.contains("integration-offer"));
+        receiver.send(Message::Text(r#"{"type":"create","width":1920,"height":1080}"#.into())).await.unwrap();
+        let error = timeout(Duration::from_secs(2), receiver.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        assert!(error.contains("error"));
+        let revoked = timeout(Duration::from_secs(2), host.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        assert!(revoked.contains("receiver_left"));
+        let _ = shutdown.send(());
+        timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
     }
 
     fn keyboard_envelope(

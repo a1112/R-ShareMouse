@@ -6,6 +6,7 @@ mod audio_runtime;
 mod endpoint_runtime;
 mod mobile_gateway;
 mod network_audio;
+mod extended_display;
 mod static_capture;
 mod usb_service;
 

@@ -10570,6 +10570,22 @@ function SettingsPage({
           </div>
         </div>
 
+        {mobileAccessView.available && (
+          <div className="mt-4 space-y-2 rounded-md p-3 text-sm" style={{ border: `1px solid ${theme.border}` }}>
+            <strong>扩展显示器 · 实验功能</strong>
+            <p style={{ color: theme.textMuted }}>主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。其他电脑或 iPad 打开接收链接；主机确认后可启用 Windows 多点触摸。</p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
+                void navigator.clipboard?.writeText(`http://localhost:${mobileAccessView.port}/display?role=host&t=${encodeURIComponent(mobileAccessView.token)}`);
+              }}>复制本机发送链接</button>
+              <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
+                const url = new URL(mobileAccessView.url); url.pathname = "/display";
+                void navigator.clipboard?.writeText(url.toString());
+              }}>复制接收链接</button>
+            </div>
+            <p style={{ color: theme.textMuted }}>有线模式可使用 USB 网络共享或 USB 以太网，并改用对应网卡的 IP。iPad 普通数据线直连尚不支持。</p>
+          </div>
+        )}
         <div className="mt-4 flex flex-wrap gap-2">
           <button
             type="button"

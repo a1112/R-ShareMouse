@@ -44,6 +44,7 @@ pub mod system_events;
 // Cross-platform display settings helpers
 pub mod display;
 pub mod display_capture;
+pub mod remote_touch;
 
 // Cross-platform virtual display control helpers
 pub mod virtual_display;
