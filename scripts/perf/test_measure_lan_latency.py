@@ -4,6 +4,7 @@ import socket
 import struct
 import time
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "lan_latency", Path(__file__).with_name("measure-lan-latency.py")
@@ -13,6 +14,25 @@ spec.loader.exec_module(latency)
 
 
 class LanLatencyTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix daemon transport")
+    def test_connect_uses_same_user_daemon_socket(self):
+        with patch.object(latency, "daemon_socket_path", return_value=Path("/tmp/daemon.sock")), \
+                patch.object(socket, "socket") as make_socket:
+            deadline = time.monotonic() + 1
+            stream = latency.connect(deadline)
+            make_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_STREAM)
+            stream.connect.assert_called_once_with("/tmp/daemon.sock")
+            self.assertGreater(stream.settimeout.call_args.args[0], 0)
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix daemon transport")
+    def test_failed_connect_closes_socket(self):
+        with patch.object(latency, "daemon_socket_path", return_value=Path("/tmp/daemon.sock")), \
+                patch.object(socket, "socket") as make_socket:
+            make_socket.return_value.connect.side_effect = ConnectionRefusedError()
+            with self.assertRaises(ConnectionRefusedError):
+                latency.connect(time.monotonic() + 1)
+            make_socket.return_value.close.assert_called_once()
+
     def test_failed_samples_cannot_be_hidden_by_fast_successes(self):
         summary = latency.summarize([{"rtt_us": 1}, {"error": "timeout"}], 2, 5000)
         self.assertFalse(summary["pass"])

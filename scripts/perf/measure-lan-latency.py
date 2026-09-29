@@ -2,15 +2,18 @@
 """Measure authenticated daemon-to-peer RTT; never injects keyboard/mouse input.
 
 Requires a daemon exposing probe_sequence and monotonic raw_round_trip_us.
+Run on macOS/Linux using the daemon's same-user Unix socket.
 The default gate is P95 < 5 ms with zero failed samples, not a one-way estimate.
 """
 
 import argparse
 import json
 import math
+import os
 import socket
 import statistics
 import struct
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -44,10 +47,38 @@ def receive(sock, deadline):
     return value
 
 
+def daemon_socket_path():
+    if os.name != "posix":
+        raise RuntimeError("Run this probe on macOS/Linux; Windows uses named-pipe IPC")
+    uid = os.geteuid()
+    directory = Path("/tmp") / f"rshare-ipc-{uid}"
+    metadata = directory.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or metadata.st_mode & 0o077:
+        raise PermissionError("unsafe local IPC directory")
+    path = directory / "daemon-27435.sock"
+    metadata = path.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != uid:
+        raise PermissionError("unsafe local IPC socket")
+    return path
+
+
+def connect(deadline):
+    path = daemon_socket_path()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("IPC connection deadline exceeded")
+    stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        stream.settimeout(remaining)
+        stream.connect(str(path))
+        return stream
+    except BaseException:
+        stream.close()
+        raise
+
+
 def request(value, deadline):
-    with socket.create_connection(
-        ("127.0.0.1", 27435), timeout=max(0.001, deadline - time.monotonic())
-    ) as sock:
+    with connect(deadline) as sock:
         send(sock, value)
         return receive(sock, deadline)
 
@@ -110,7 +141,7 @@ def run(args):
             rows.append(row)
             try:
                 # A fresh subscription per sample bounds stale queued telemetry.
-                with socket.create_connection(("127.0.0.1", 27435), timeout=5) as stream:
+                with connect(deadline) as stream:
                     send(stream, "SubscribeLocalControls")
                     receive(stream, deadline)
                     result = request(

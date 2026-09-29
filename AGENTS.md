@@ -135,7 +135,7 @@ Backend health is tracked separately for capture and injection. Both must be hea
 
 ### IPC Protocol
 
-Local clients (GUI, CLI) communicate over loopback TCP (port 27435) using bounded frames: a 4-byte big-endian payload length, a 1-byte envelope kind, then the payload. JSON is kind 1; binary, UI-state and heartbeat frames have separate kinds. See `crates/rshare-core/src/ipc_frame.rs` and `ipc.rs`. UI state also streams over the loopback WebSocket service on port 27436.
+Local clients (GUI, CLI) use same-user authenticated IPC: a Unix socket at `/tmp/rshare-ipc-<uid>/daemon-27435.sock` on macOS/Linux, and a per-user/session named pipe on Windows. Port 27435 remains the endpoint identifier; it is not a production TCP listener. Frames contain a 4-byte big-endian payload length, a 1-byte envelope kind, then the payload. JSON is kind 1; binary, UI-state and heartbeat frames have separate kinds. See `crates/rshare-core/src/local_transport.rs`, `ipc_frame.rs`, and `ipc.rs`. UI state also streams over the loopback WebSocket service on port 27436.
 
 ## Development Guidelines
 

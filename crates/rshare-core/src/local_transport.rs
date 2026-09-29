@@ -35,7 +35,10 @@ mod platform {
     }
 
     pub async fn connect() -> io::Result<LocalStream> {
-        let stream = UnixStream::connect(socket_path()?).await?;
+        connect_at(&socket_path()?).await
+    }
+    pub(super) async fn connect_at(path: &std::path::Path) -> io::Result<LocalStream> {
+        let stream = UnixStream::connect(path).await?;
         if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
@@ -50,9 +53,9 @@ mod platform {
     }
     impl LocalListener {
         pub fn bind() -> io::Result<Self> {
-            Self::bind_path(socket_path()?)
+            Self::bind_at(socket_path()?)
         }
-        fn bind_path(path: PathBuf) -> io::Result<Self> {
+        pub(super) fn bind_at(path: PathBuf) -> io::Result<Self> {
             let lock = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -123,15 +126,15 @@ mod platform {
             let path = directory.join("daemon.sock");
             // A process crash closes the descriptor but leaves the socket name.
             drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-            let live = LocalListener::bind_path(path.clone()).unwrap();
-            assert!(LocalListener::bind_path(path.clone()).is_err());
+            let live = LocalListener::bind_at(path.clone()).unwrap();
+            assert!(LocalListener::bind_at(path.clone()).is_err());
             assert!(path.exists());
             drop(live);
             assert!(!path.exists());
             let target = directory.join("unrelated");
             std::fs::write(&target, b"keep").unwrap();
             std::os::unix::fs::symlink(&target, &path).unwrap();
-            assert!(LocalListener::bind_path(path.clone()).is_err());
+            assert!(LocalListener::bind_at(path.clone()).is_err());
             assert_eq!(std::fs::read(&target).unwrap(), b"keep");
             std::fs::remove_file(&path).unwrap();
             std::fs::remove_file(&target).unwrap();
@@ -267,7 +270,9 @@ mod platform {
         ))
     }
     pub async fn connect() -> io::Result<LocalStream> {
-        let name = pipe_name()?;
+        connect_at(&pipe_name()?).await
+    }
+    pub(super) async fn connect_at(name: &str) -> io::Result<LocalStream> {
         for _ in 0..100 {
             match ClientOptions::new().open(&name) {
                 Ok(stream) => {
@@ -320,7 +325,9 @@ mod platform {
     }
     impl LocalListener {
         pub fn bind() -> io::Result<Self> {
-            let name = pipe_name()?;
+            Self::bind_at(pipe_name()?)
+        }
+        pub(super) fn bind_at(name: String) -> io::Result<Self> {
             Ok(Self {
                 next: create(&name, true)?,
                 name,
@@ -345,8 +352,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[tokio::test]
     async fn local_transport_round_trip_and_single_listener() {
-        let mut listener = LocalListener::bind().unwrap();
-        assert!(LocalListener::bind().is_err());
+        // Never bind the live daemon endpoint: tests also run while the desktop
+        // service is online, and parallel test processes must remain isolated.
+        #[cfg(unix)]
+        let endpoint = std::path::PathBuf::from("/tmp")
+            .join(format!("rshare-round-trip-{}.sock", uuid::Uuid::new_v4()));
+        #[cfg(windows)]
+        let endpoint = format!(r"\\.\pipe\RShareMouse-test-{}", uuid::Uuid::new_v4());
+        let mut listener = LocalListener::bind_at(endpoint.clone()).unwrap();
+        assert!(LocalListener::bind_at(endpoint.clone()).is_err());
         let server = tokio::spawn(async move {
             let mut client = listener.accept().await.unwrap();
             let value = client.read_u32().await.unwrap();
@@ -354,10 +368,12 @@ mod tests {
             // Keep the pipe alive until the client consumes the response.
             assert_eq!(client.read_u8().await.unwrap(), 1);
         });
-        let mut client = connect().await.unwrap();
+        let mut client = platform::connect_at(&endpoint).await.unwrap();
         client.write_u32(41).await.unwrap();
         assert_eq!(client.read_u32().await.unwrap(), 42);
         client.write_u8(1).await.unwrap();
         server.await.unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(endpoint.with_extension("lock")).unwrap();
     }
 }

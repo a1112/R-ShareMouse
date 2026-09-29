@@ -64,7 +64,10 @@ enum Commands {
         command: wake::WakeCommandLine,
     },
     /// Network audio endpoints and permissions
-    Audio { #[command(subcommand)] command: commands::audio::AudioCommandLine },
+    Audio {
+        #[command(subcommand)]
+        command: commands::audio::AudioCommandLine,
+    },
     /// Start the R-ShareMouse service
     Start {
         /// Run in background (daemon mode)

@@ -19,13 +19,17 @@ jobs:
     runs-on: [self-hosted, Windows, X64, rshare-perf]
     timeout-minutes: 120
     env:
-      OUTPUT_DIRECTORY: ${{ runner.temp }}\rshare-phase1-${{ github.run_id }}-${{ github.run_attempt }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}\rshare-target-${{ github.run_id }}-${{ github.run_attempt }}
       GH_TOKEN: ${{ secrets.PERF_BASELINE_GH_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.PERF_BASELINE_GH_TOKEN }}
       RSHARE_PERF_AFFINITY_MASK: ${{ vars.RSHARE_PERF_AFFINITY_MASK }}
 
     steps:
+      - name: Initialize runner paths
+        shell: pwsh
+        run: |
+          "OUTPUT_DIRECTORY=$env:RUNNER_TEMP\rshare-phase1-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP\rshare-target-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
+
       - name: Require canonical LF baseline blobs
         shell: pwsh
         run: git config --global core.autocrlf false

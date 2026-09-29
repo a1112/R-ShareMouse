@@ -136,7 +136,8 @@ pub fn reserve_virtual_display() -> Result<VirtualDisplayLease> {
     Ok(VirtualDisplayLease {
         #[cfg(windows)]
         _guard: WindowsVirtualDisplayOperationGuard::acquire_named(
-            "Global\\RShareMouseExtendedDisplaySession", 0,
+            "Global\\RShareMouseExtendedDisplaySession",
+            0,
         )?,
         _thread_bound: std::marker::PhantomData,
     })

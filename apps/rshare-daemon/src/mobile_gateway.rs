@@ -814,8 +814,14 @@ async fn handle_mobile_gateway_client_with_context(
     }
 
     if route == MobileGatewayRoute::DisplayScript {
-        return write_mobile_response_with_deadline(&mut stream, 200,
-            "text/javascript; charset=utf-8", crate::extended_display::CLIENT.as_bytes().to_vec(), limits.write_deadline).await;
+        return write_mobile_response_with_deadline(
+            &mut stream,
+            200,
+            "text/javascript; charset=utf-8",
+            crate::extended_display::CLIENT.as_bytes().to_vec(),
+            limits.write_deadline,
+        )
+        .await;
     }
 
     if !is_authorized_mobile_request(&request, access.token()) {
@@ -832,13 +838,28 @@ async fn handle_mobile_gateway_client_with_context(
 
     match route {
         MobileGatewayRoute::DisplayPage => {
-            let local_sender = mobile_query_value(&request.target, "role").as_deref() == Some("host");
+            let local_sender =
+                mobile_query_value(&request.target, "role").as_deref() == Some("host");
             if local_sender && !peer_addr.ip().is_loopback() {
-                return write_mobile_response_with_deadline(&mut stream, 401, "text/plain; charset=utf-8",
-                    "请在主机浏览器中通过 localhost 打开发送页面".as_bytes().to_vec(), limits.write_deadline).await;
+                return write_mobile_response_with_deadline(
+                    &mut stream,
+                    401,
+                    "text/plain; charset=utf-8",
+                    "请在主机浏览器中通过 localhost 打开发送页面"
+                        .as_bytes()
+                        .to_vec(),
+                    limits.write_deadline,
+                )
+                .await;
             }
-            write_mobile_response_with_deadline(&mut stream, 200, "text/html; charset=utf-8",
-                crate::extended_display::PAGE.as_bytes().to_vec(), limits.write_deadline).await
+            write_mobile_response_with_deadline(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                crate::extended_display::PAGE.as_bytes().to_vec(),
+                limits.write_deadline,
+            )
+            .await
         }
         MobileGatewayRoute::DisplaySocket => {
             let role = match mobile_query_value(&request.target, "role").as_deref() {
@@ -846,7 +867,15 @@ async fn handle_mobile_gateway_client_with_context(
                 Some("receiver") => crate::extended_display::Role::Receiver,
                 _ => bail!("invalid display role"),
             };
-            crate::extended_display::serve(stream, peer_addr, &request, role, access.display_hub.clone(), state).await
+            crate::extended_display::serve(
+                stream,
+                peer_addr,
+                &request,
+                role,
+                access.display_hub.clone(),
+                state,
+            )
+            .await
         }
         MobileGatewayRoute::DisplayScript => unreachable!(),
         MobileGatewayRoute::Page => {
@@ -3421,55 +3450,146 @@ mod tests {
     async fn extended_display_routes_enforce_authentication_and_local_sender() {
         for (target, remote, expected) in [
             ("/display", false, "401 Unauthorized"),
-            ("/api/display/socket?role=receiver", false, "401 Unauthorized"),
+            (
+                "/api/display/socket?role=receiver",
+                false,
+                "401 Unauthorized",
+            ),
             ("/display?t=test", false, "200 OK"),
             ("/display?role=host&t=test", true, "401 Unauthorized"),
             ("/display/client.mjs", false, "200 OK"),
         ] {
             let (mut client, server) = connected_tcp_pair().await;
-            let peer = if remote { "192.168.1.10:42".parse().unwrap() } else { client.local_addr().unwrap() };
-            let (state, network, injection, events) = test_mobile_runtime(Box::new(NoopInjectBackend));
-            let access = MobileGatewayAccess::new("127.0.0.1:27437".parse().unwrap(), "test".into(), "127.0.0.1".into());
-            client.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).await.unwrap();
-            let task = tokio::spawn(handle_mobile_gateway_client(server, peer, access, state, network, injection, events));
+            let peer = if remote {
+                "192.168.1.10:42".parse().unwrap()
+            } else {
+                client.local_addr().unwrap()
+            };
+            let (state, network, injection, events) =
+                test_mobile_runtime(Box::new(NoopInjectBackend));
+            let access = MobileGatewayAccess::new(
+                "127.0.0.1:27437".parse().unwrap(),
+                "test".into(),
+                "127.0.0.1".into(),
+            );
+            client
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let task = tokio::spawn(handle_mobile_gateway_client(
+                server, peer, access, state, network, injection, events,
+            ));
             let mut response = Vec::new();
-            timeout(Duration::from_secs(2), client.read_to_end(&mut response)).await.unwrap().unwrap();
+            timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
             task.await.unwrap().unwrap();
-            assert!(String::from_utf8_lossy(&response).contains(expected), "{target}");
+            assert!(
+                String::from_utf8_lossy(&response).contains(expected),
+                "{target}"
+            );
         }
     }
 
     #[tokio::test]
     async fn extended_display_real_websocket_relay_and_role_violation_cleanup() {
         use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, Message}};
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{client::IntoClientRequest, Message},
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let access = MobileGatewayAccess::new(addr, "socket-test".into(), "127.0.0.1".into());
         let (state, network, injection, events) = test_mobile_runtime(Box::new(NoopInjectBackend));
         let (shutdown, shutdown_rx) = broadcast::channel(1);
-        let server = tokio::spawn(run_mobile_gateway_server_on_listener(listener, access, state,
-            network, injection, events, shutdown_rx, MobileGatewayLimits::default()));
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(
+            listener,
+            access,
+            state,
+            network,
+            injection,
+            events,
+            shutdown_rx,
+            MobileGatewayLimits::default(),
+        ));
         let request = |role| {
-            let mut request = format!("ws://{addr}/api/display/socket?role={role}&t=socket-test").into_client_request().unwrap();
-            request.headers_mut().insert("origin", format!("http://{addr}").parse().unwrap());
+            let mut request = format!("ws://{addr}/api/display/socket?role={role}&t=socket-test")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("origin", format!("http://{addr}").parse().unwrap());
             request
         };
         let (mut host, _) = connect_async(request("host")).await.unwrap();
-        assert!(host.next().await.unwrap().unwrap().into_text().unwrap().contains("hello"));
+        assert!(host
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .contains("hello"));
         let (mut receiver, _) = connect_async(request("receiver")).await.unwrap();
-        assert!(receiver.next().await.unwrap().unwrap().into_text().unwrap().contains("hello"));
-        assert!(host.next().await.unwrap().unwrap().into_text().unwrap().contains("receiver_ready"));
-        host.send(Message::Text(r#"{"type":"offer","sdp":"integration-offer"}"#.into())).await.unwrap();
-        let offer = timeout(Duration::from_secs(2), receiver.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        assert!(receiver
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .contains("hello"));
+        assert!(host
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .contains("receiver_ready"));
+        host.send(Message::Text(
+            r#"{"type":"offer","sdp":"integration-offer"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let offer = timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert!(offer.contains("integration-offer"));
-        receiver.send(Message::Text(r#"{"type":"create","width":1920,"height":1080}"#.into())).await.unwrap();
-        let error = timeout(Duration::from_secs(2), receiver.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        receiver
+            .send(Message::Text(
+                r#"{"type":"create","width":1920,"height":1080}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert!(error.contains("error"));
-        let revoked = timeout(Duration::from_secs(2), host.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let revoked = timeout(Duration::from_secs(2), host.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert!(revoked.contains("receiver_left"));
         let _ = shutdown.send(());
-        timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     fn keyboard_envelope(
