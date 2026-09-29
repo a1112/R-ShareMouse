@@ -1,5 +1,6 @@
 # Rust
 /target
+**/target/
 **/*.rs.bk
 *.pdb
 
@@ -19,6 +20,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Python validation helpers
+__pycache__/
+
 # Configuration
 config/
 
@@ -34,3 +38,4 @@ dist/
 
 # macOS build output
 /R-ShareMouse.app/
+/apps/rshare-desktop/src-tauri/gen/schemas/macOS-schema.json

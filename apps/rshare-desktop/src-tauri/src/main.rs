@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -118,6 +118,35 @@ const TRAY_MENU_OPEN_LOG_ID: &str = "tray-open-log";
 const TRAY_MENU_QUIT_ID: &str = "tray-quit";
 const ENDPOINT_EVENT_RECONNECT_INITIAL_MS: u64 = 250;
 const ENDPOINT_EVENT_RECONNECT_MAX_MS: u64 = 5_000;
+const DAEMON_RESTART_RETRY_MS: u64 = 10_000;
+
+#[derive(Default)]
+struct DaemonLifecycle {
+    control: tokio::sync::Mutex<DaemonLifecycleControl>,
+}
+
+struct DaemonLifecycleControl {
+    desired_running: bool,
+    retry_after: Option<Instant>,
+}
+
+impl Default for DaemonLifecycleControl {
+    fn default() -> Self {
+        Self {
+            desired_running: true,
+            retry_after: None,
+        }
+    }
+}
+
+impl DaemonLifecycleControl {
+    fn should_restart(&self, now: Instant) -> bool {
+        self.desired_running
+            && self
+                .retry_after
+                .is_none_or(|retry_after| now >= retry_after)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct DashboardStatePayload {
@@ -250,14 +279,53 @@ struct TrayStatusView {
 }
 
 #[tauri::command]
-async fn dashboard_state() -> Result<DashboardStatePayload, String> {
+async fn dashboard_state(app: AppHandle) -> Result<DashboardStatePayload, String> {
+    let manually_stopped = !app
+        .state::<DaemonLifecycle>()
+        .control
+        .lock()
+        .await
+        .desired_running;
+    if manually_stopped && daemon_client::request_status().await.is_err() {
+        return Ok(offline_dashboard_state());
+    }
     dashboard_state_with(
-        || Box::pin(async { ensure_daemon_status().await }),
+        move || {
+            let app = app.clone();
+            Box::pin(async move { ensure_daemon_status(&app).await })
+        },
         || Box::pin(async { daemon_client::request_devices().await }),
         || Box::pin(async { daemon_client::request_capabilities(None).await }),
         || Box::pin(async { daemon_client::request_layout().await }),
     )
     .await
+}
+
+fn offline_dashboard_state() -> DashboardStatePayload {
+    DashboardStatePayload {
+        status: None,
+        devices: Vec::new(),
+        capabilities: None,
+        layout: None,
+        visible_layout: None,
+        layout_error: None,
+        acceptance: DesktopAcceptancePayload {
+            daemon_online: false,
+            background_ready: false,
+            tray_owned_by_daemon: false,
+            tray_state: "Unavailable".to_string(),
+            local_endpoint: String::new(),
+            discovered_devices: 0,
+            connected_devices: 0,
+            visible_layout_devices: 0,
+            local_display_count: 0,
+            local_ready: false,
+            input_ready: false,
+            dual_machine_ready: false,
+            next_step: "后台服务已停止，可点击启动服务".to_string(),
+        },
+        auto_started: false,
+    }
 }
 
 fn macos_input_permissions_payload(
@@ -341,22 +409,39 @@ fn open_macos_permission_settings(permission: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn start_service(app: AppHandle) -> Result<ServiceStatusSnapshot, String> {
-    let config = rshare_core::Config::load().unwrap_or_default();
-    let status = daemon_client::spawn_daemon(
-        Some(config.network.port),
-        Some(&config.network.bind_address),
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    {
+        let lifecycle = app.state::<DaemonLifecycle>();
+        let mut control = lifecycle.control.lock().await;
+        control.desired_running = true;
+        control.retry_after = None;
+    }
+    let status = ensure_daemon_status(&app)
+        .await
+        .map_err(|err| err.to_string())?
+        .status;
     refresh_tray_status_once(&app).await;
     Ok(status)
 }
 
 #[tauri::command]
 async fn stop_service(app: AppHandle) -> Result<(), String> {
-    daemon_client::request_shutdown()
-        .await
-        .map_err(|err| err.to_string())?;
+    {
+        let lifecycle = app.state::<DaemonLifecycle>();
+        let mut control = lifecycle.control.lock().await;
+        control.desired_running = false;
+        control.retry_after = None;
+        if let Err(err) = daemon_client::request_shutdown().await {
+            if !is_ipc_unavailable(&err) {
+                return Err(err.to_string());
+            }
+        }
+        for _ in 0..20 {
+            if daemon_client::request_status().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     refresh_tray_status_once(&app).await;
     Ok(())
 }
@@ -817,7 +902,12 @@ fn is_ipc_unavailable(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .map(|io_err| io_err.kind() == std::io::ErrorKind::ConnectionRefused)
+            .map(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                )
+            })
             .unwrap_or(false)
     })
 }
@@ -959,11 +1049,21 @@ where
     }
 }
 
-async fn ensure_daemon_status() -> AnyhowResult<DesktopDaemonStatus> {
+async fn ensure_daemon_status(app: &AppHandle) -> AnyhowResult<DesktopDaemonStatus> {
+    let lifecycle = app.state::<DaemonLifecycle>();
+    let mut control = lifecycle.control.lock().await;
+    if !control.should_restart(Instant::now()) {
+        return daemon_client::request_status()
+            .await
+            .map(|status| DesktopDaemonStatus {
+                status,
+                auto_started: false,
+            });
+    }
     let config = Config::load().unwrap_or_default();
     let port = config.network.port;
     let bind_address = config.network.bind_address.clone();
-    ensure_daemon_status_with(
+    let result = ensure_daemon_status_with(
         || Box::pin(async { daemon_client::request_status().await }),
         move || {
             let bind_address = bind_address.clone();
@@ -972,7 +1072,11 @@ async fn ensure_daemon_status() -> AnyhowResult<DesktopDaemonStatus> {
             )
         },
     )
-    .await
+    .await;
+    control.retry_after = result
+        .is_err()
+        .then(|| Instant::now() + Duration::from_millis(DAEMON_RESTART_RETRY_MS));
+    result
 }
 
 async fn ensure_daemon_status_with<Probe, Spawn>(
@@ -1106,7 +1210,8 @@ fn build_acceptance(
 
 fn main() {
     eprintln!("{}", build_metadata());
-    tauri::Builder::default().plugin(project_window_chrome::init())
+    tauri::Builder::default()
+        .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .plugin(init(|app, _args, _cwd| {
             // Focus the existing window when a second instance is launched
@@ -1115,6 +1220,7 @@ fn main() {
         .manage(LocalControlStreamState::default())
         .manage(EndpointEventStreamState::default())
         .manage(UiStateStreamState::default())
+        .manage(DaemonLifecycle::default())
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_event(&event) {
                 if let Err(err) = apply_tray_action(app, action) {
@@ -1306,32 +1412,29 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
 fn start_daemon_from_tray(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let config = Config::load().unwrap_or_default();
-        if let Err(err) = daemon_client::spawn_daemon(
-            Some(config.network.port),
-            Some(&config.network.bind_address),
-        )
-        .await
-        {
+        if let Err(err) = start_service(app.clone()).await {
             eprintln!("tray failed to start daemon: {err}");
         }
-        refresh_tray_status_once(&app).await;
     });
 }
 
 fn stop_daemon_from_tray(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(err) = daemon_client::request_shutdown().await {
+        if let Err(err) = stop_service(app.clone()).await {
             eprintln!("tray failed to stop daemon: {err}");
         }
-        refresh_tray_status_once(&app).await;
     });
 }
 
 fn shutdown_daemon_and_exit(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        app.state::<DaemonLifecycle>()
+            .control
+            .lock()
+            .await
+            .desired_running = false;
         if let Err(err) = shutdown_daemon_for_exit().await {
             eprintln!("daemon shutdown before desktop exit failed: {err}");
         }
@@ -1487,7 +1590,10 @@ fn start_tray_status_refresh(app: AppHandle) {
 }
 
 async fn refresh_tray_status_once(app: &AppHandle) {
-    let status = daemon_client::request_status().await.ok();
+    let status = match ensure_daemon_status(app).await {
+        Ok(daemon) => Some(daemon.status),
+        Err(_) => None,
+    };
     apply_tray_status_view(app, tray_status_view(status.as_ref()));
 }
 
@@ -1667,6 +1773,30 @@ mod tests {
             network: rshare_core::NetworkTransportSnapshot::default(),
             latency_feedback: rshare_core::LatencyFeedbackSnapshot::default(),
         }
+    }
+
+    #[test]
+    fn manual_stop_suppresses_watchdog_restart_until_started_again() {
+        let now = Instant::now();
+        let mut control = DaemonLifecycleControl::default();
+        assert!(control.should_restart(now));
+        control.desired_running = false;
+        assert!(!control.should_restart(now));
+        control.desired_running = true;
+        control.retry_after = Some(now + Duration::from_secs(10));
+        assert!(!control.should_restart(now));
+        assert!(control.should_restart(now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn manual_stop_has_an_offline_dashboard_snapshot() {
+        let snapshot = offline_dashboard_state();
+        assert!(snapshot.status.is_none());
+        assert!(!snapshot.acceptance.daemon_online);
+        assert_eq!(
+            snapshot.acceptance.next_step,
+            "后台服务已停止，可点击启动服务"
+        );
     }
 
     fn sample_layout(local_id: DeviceId) -> LayoutGraph {
@@ -2266,6 +2396,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_unix_socket_triggers_daemon_restart() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = ensure_daemon_status_with(
+            || {
+                Box::pin(async {
+                    Err(anyhow!(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "daemon socket removed",
+                    )))
+                })
+            },
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(sample_status())
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(result.expect("daemon should restart").auto_started);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn dashboard_state_marks_status_when_desktop_auto_started_daemon() {
         let result = dashboard_state_with(
             || {
@@ -2446,10 +2605,15 @@ mod tests {
     }
 
     #[test]
-    fn only_connection_refused_counts_as_ipc_unavailable() {
+    fn missing_or_refused_local_ipc_counts_as_unavailable() {
         assert!(is_ipc_unavailable(&anyhow!(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "daemon offline",
+        ))));
+
+        assert!(is_ipc_unavailable(&anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "daemon socket missing",
         ))));
 
         assert!(!is_ipc_unavailable(&anyhow!(std::io::Error::new(
@@ -2740,8 +2904,12 @@ mod tests {
 
 mod project_resource_monitor;
 #[tauri::command]
-async fn network_audio(command: rshare_core::network_audio::AudioCommand) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
-    daemon_client::request_network_audio(command).await.map_err(|e| e.to_string())
+async fn network_audio(
+    command: rshare_core::network_audio::AudioCommand,
+) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
+    daemon_client::request_network_audio(command)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 mod project_window_chrome;

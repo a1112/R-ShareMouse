@@ -963,6 +963,9 @@ pub enum LocalInputTestKind {
 pub struct LocalInputTestResult {
     pub status: LocalInputTestStatus,
     pub message: String,
+    /// Correlates a latency request with its asynchronous diagnostic ACK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,6 +1022,7 @@ impl LocalInputTestResult {
         Self {
             status: LocalInputTestStatus::Success,
             message: message.into(),
+            probe_sequence: None,
         }
     }
 
@@ -1026,6 +1030,7 @@ impl LocalInputTestResult {
         Self {
             status,
             message: message.into(),
+            probe_sequence: None,
         }
     }
 }
@@ -1070,6 +1075,18 @@ fn default_virtual_gamepad_detail() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_sequence_is_additive_to_legacy_input_test_results() {
+        let legacy = r#"{"status":"Success","message":"sent"}"#;
+        let mut result: LocalInputTestResult = serde_json::from_str(legacy).unwrap();
+        assert_eq!(result.probe_sequence, None);
+        assert_eq!(serde_json::to_string(&result).unwrap(), legacy);
+        result.probe_sequence = Some(42);
+        let decoded: LocalInputTestResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(decoded.probe_sequence, Some(42));
+    }
 
     #[test]
     fn driver_diagnostic_defaults_include_filter_attachment_stats() {

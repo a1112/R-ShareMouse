@@ -36,7 +36,8 @@ pub struct ListenerConfig {
     pub capture_mouse: bool,
     /// Whether to capture keyboard input
     pub capture_keyboard: bool,
-    /// Debounce delay for mouse events (reduces event frequency)
+    /// Optional lossy mouse throttle. Zero preserves short gestures and edges;
+    /// the bounded semantic ingress coalesces continuous input under load.
     pub mouse_debounce: Duration,
     /// Edge detection threshold in pixels
     pub edge_threshold: u32,
@@ -47,10 +48,18 @@ impl Default for ListenerConfig {
         Self {
             capture_mouse: true,
             capture_keyboard: true,
-            mouse_debounce: Duration::from_millis(5),
+            mouse_debounce: Duration::ZERO,
             edge_threshold: 5, // pixels
         }
     }
+}
+
+fn admit_pointer_sample(last: &mut Instant, now: Instant, interval: Duration) -> bool {
+    if now.saturating_duration_since(*last) < interval {
+        return false;
+    }
+    *last = now;
+    true
 }
 
 /// Input event channel for async processing
@@ -247,13 +256,7 @@ impl RDevInputListener {
                             let now = Instant::now();
                             let should_send = {
                                 let mut last_time = last_mouse_time.blocking_lock();
-                                let elapsed = now.saturating_duration_since(*last_time);
-                                if elapsed >= config.mouse_debounce {
-                                    *last_time = now;
-                                    true
-                                } else {
-                                    false
-                                }
+                                admit_pointer_sample(&mut last_time, now, config.mouse_debounce)
                             };
 
                             if should_send {
@@ -353,13 +356,7 @@ impl RDevInputListener {
                                 let now = Instant::now();
                                 let should_send = {
                                     let mut last_time = last_mouse_time.blocking_lock();
-                                    let elapsed = now.saturating_duration_since(*last_time);
-                                    if elapsed >= config.mouse_debounce {
-                                        *last_time = now;
-                                        true
-                                    } else {
-                                        false
-                                    }
+                                    admit_pointer_sample(&mut last_time, now, config.mouse_debounce)
                                 };
 
                                 if should_send {
@@ -920,6 +917,36 @@ mod tests {
         let config = ListenerConfig::default();
         assert!(config.capture_mouse);
         assert!(config.capture_keyboard);
+    }
+
+    #[test]
+    fn default_capture_keeps_first_and_final_sub_5ms_pointer_samples() {
+        let start = Instant::now();
+        let mut last = start;
+        let interval = ListenerConfig::default().mouse_debounce;
+        // A short gesture can finish before the old 5 ms gate ever opened.
+        for offset in [0, 1_000, 2_000, 2_500] {
+            assert!(admit_pointer_sample(
+                &mut last,
+                start + Duration::from_micros(offset),
+                interval,
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_pointer_throttle_keeps_its_requested_interval() {
+        let start = Instant::now();
+        let mut last = start;
+        let interval = Duration::from_millis(5);
+        assert!(!admit_pointer_sample(
+            &mut last,
+            start + Duration::from_millis(1),
+            interval
+        ));
+        assert_eq!(last, start);
+        assert!(admit_pointer_sample(&mut last, start + interval, interval));
+        assert_eq!(last, start + interval);
     }
 
     #[test]

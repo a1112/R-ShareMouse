@@ -33,7 +33,7 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
 async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = connect_at(address)
         .await
-        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+        .with_context(|| daemon_connect_context(address))?;
 
     write_json_frame(&mut stream, &request).await?;
     read_json_frame(&mut stream).await
@@ -321,7 +321,7 @@ pub async fn request_display_capture(
 ) -> Result<DisplayCaptureResult> {
     let mut stream = local_transport::connect()
         .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+        .with_context(|| daemon_connect_context(default_ipc_addr()))?;
     write_json_frame(&mut stream, &DaemonRequest::CaptureDisplay(request)).await?;
     match read_json_frame(&mut stream).await? {
         DaemonResponse::DisplayCapture(mut result) => {
@@ -482,7 +482,7 @@ pub async fn request_remote_usb_descriptor_probe(
 pub async fn subscribe_local_controls() -> Result<LocalStream> {
     let mut stream = local_transport::connect()
         .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+        .with_context(|| daemon_connect_context(default_ipc_addr()))?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
     Ok(stream)
 }
@@ -490,7 +490,7 @@ pub async fn subscribe_local_controls() -> Result<LocalStream> {
 pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<LocalStream> {
     let mut stream = local_transport::connect()
         .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+        .with_context(|| daemon_connect_context(default_ipc_addr()))?;
     write_json_frame(
         &mut stream,
         &DaemonRequest::SubscribeEndpointEvents { filter },
@@ -519,7 +519,7 @@ pub async fn subscribe_ui_state_at(
 ) -> Result<UiStateSubscription> {
     let mut stream = connect_at(address)
         .await
-        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+        .with_context(|| daemon_connect_context(address))?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeUiState { cursor }).await?;
     Ok(UiStateSubscription { stream })
 }
@@ -746,6 +746,14 @@ async fn connect_at(address: SocketAddr) -> Result<LocalStream> {
     } else {
         Ok(Box::new(TcpStream::connect(address).await?))
     }
+}
+
+fn daemon_connect_context(address: SocketAddr) -> String {
+    #[cfg(unix)]
+    if address == default_ipc_addr() {
+        return "Failed to connect to local daemon IPC".to_string();
+    }
+    format!("Failed to connect to daemon at {address}")
 }
 
 pub async fn authorize_usb_device(

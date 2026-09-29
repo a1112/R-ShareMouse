@@ -107,7 +107,17 @@ struct TrackedDevice {
 struct PendingLatencyProbe {
     target: DeviceId,
     sent_at_ms: u64,
+    sent_at: Instant,
     role: PendingLatencyProbeRole,
+}
+
+impl PendingLatencyProbe {
+    fn round_trip_us(&self, received_at: Instant) -> u64 {
+        received_at
+            .saturating_duration_since(self.sent_at)
+            .as_micros()
+            .min(u64::MAX as u128) as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4459,6 +4469,7 @@ async fn run_remote_latency_test(
             PendingLatencyProbe {
                 target: device_id,
                 sent_at_ms: now,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -4512,7 +4523,7 @@ async fn run_remote_latency_test(
             .await
     };
 
-    match result {
+    let mut result = match result {
         Ok(()) if endpoint_switch => LocalInputTestResult::success(format!(
             "Dual-end latency probe sent to {}.",
             short_device_id(device_id)
@@ -4525,7 +4536,11 @@ async fn run_remote_latency_test(
             state.write().await.pending_latency_probes.remove(&sequence);
             LocalInputTestResult::failed(LocalInputTestStatus::Failed, error.to_string())
         }
+    };
+    if result.status == LocalInputTestStatus::Success {
+        result.probe_sequence = Some(sequence);
     }
+    result
 }
 
 async fn run_remote_usb_descriptor_probe(
@@ -4811,6 +4826,7 @@ async fn start_endpoint_switch_latency_probe(
                 PendingLatencyProbe {
                     target,
                     sent_at_ms: now,
+                    sent_at: Instant::now(),
                     role: PendingLatencyProbeRole::EndpointSwitchReport {
                         origin_device_id: target,
                         origin_sequence,
@@ -5224,6 +5240,7 @@ async fn handle_network_message(
             ack_timestamp_ms,
             origin_sequence,
         } => {
+            let received_at = Instant::now();
             let now = timestamp_ms_now();
             let (event, should_broadcast) = {
                 let mut state = state.write().await;
@@ -5234,6 +5251,12 @@ async fn handle_network_message(
                     .map(|probe| probe.sent_at_ms)
                     .unwrap_or(sent_timestamp_ms);
                 let mut payload = BTreeMap::new();
+                if let Some(probe) = pending.as_ref().filter(|probe| probe.target == from) {
+                    payload.insert(
+                        "raw_round_trip_us".to_string(),
+                        probe.round_trip_us(received_at).to_string(),
+                    );
+                }
                 payload.insert("probe_sequence".to_string(), sequence.to_string());
                 if let Some(origin_sequence) = origin_sequence {
                     payload.insert(
@@ -8345,8 +8368,10 @@ async fn handle_ipc_client(
     }
 
     if matches!(request, DaemonRequest::SubscribeLocalControls) {
-        write_local_controls_fallback_snapshot(&mut stream, &state, &ui_state).await?;
+        // A client may issue a probe as soon as it receives this snapshot.
+        // Subscribe first so its ACK cannot fall into a registration gap.
         let mut events = local_events_tx.subscribe();
+        write_local_controls_fallback_snapshot(&mut stream, &state, &ui_state).await?;
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -9442,6 +9467,21 @@ fn load_config_or_fail_closed(load: impl FnOnce() -> Result<Config>) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_probe_keeps_microseconds_despite_wall_clock_changes() {
+        let sent_at = Instant::now();
+        let mut probe = PendingLatencyProbe {
+            target: DeviceId::new_v4(),
+            sent_at_ms: 1000,
+            sent_at,
+            role: PendingLatencyProbeRole::LocalRequested,
+        };
+        let received_at = sent_at + Duration::from_micros(4999);
+        assert_eq!(probe.round_trip_us(received_at), 4999);
+        probe.sent_at_ms = u64::MAX;
+        assert_eq!(probe.round_trip_us(received_at), 4999);
+    }
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11126,6 +11166,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -11171,6 +11212,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -11213,6 +11255,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -11257,6 +11300,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -11301,6 +11345,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1125,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::EndpointSwitchReport {
                     origin_device_id: remote_id,
                     origin_sequence: 1001,
@@ -11348,6 +11393,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1125,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::EndpointSwitchReport {
                     origin_device_id: remote_id,
                     origin_sequence: 1001,
@@ -11484,6 +11530,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
@@ -11506,6 +11553,7 @@ mod tests {
             PendingLatencyProbe {
                 target: remote_id,
                 sent_at_ms: 1000,
+                sent_at: Instant::now(),
                 role: PendingLatencyProbeRole::LocalRequested,
             },
         );
