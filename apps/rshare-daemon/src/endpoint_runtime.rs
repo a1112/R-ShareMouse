@@ -94,6 +94,7 @@ pub(crate) async fn inject_endpoint_event(
                 health,
                 elapsed_ms: started_at.elapsed().as_millis() as u64,
                 loopback_event_id: Some(event.event_id),
+                observed_event: Some(event),
                 error: None,
             }
         }

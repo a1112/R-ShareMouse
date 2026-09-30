@@ -1437,6 +1437,7 @@ mod tests {
             health: crate::BackendHealth::Healthy,
             elapsed_ms: 4,
             loopback_event_id: Some(9),
+            observed_event: None,
             error: None,
         };
 

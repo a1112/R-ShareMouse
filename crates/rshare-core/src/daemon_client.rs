@@ -12,18 +12,18 @@ use tokio_tungstenite::{
     connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::ipc::MacosInputPermissionsSnapshot;
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_frame, read_optional_ui_state_frame,
-    write_json_frame, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, DisplayCaptureBlob, DisplayCaptureRequest, DisplayCaptureResult,
-    DisplayIdentifyRequest, DisplayIdentifyResult, DisplaySettingsUpdateRequest,
-    DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter, EndpointInjectRequest,
-    EndpointInjectResult, EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, MobileAccessSnapshot,
-    ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult, UsbDeviceDescriptor,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot,
+    write_json_frame, CapabilityRegistrySnapshot, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestStatusSnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
+    DisplayCaptureBlob, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
+    DisplayIdentifyResult, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
+    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph, LocalControlDeviceSnapshot,
+    LocalInputTestRequest, LocalInputTestResult, MacosInputPermissionsSnapshot,
+    MobileAccessSnapshot, ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult,
+    UsbDeviceDescriptor, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -463,6 +463,42 @@ pub async fn request_remote_latency_test(
 ) -> Result<LocalInputTestResult> {
     match send_request(DaemonRequest::RunRemoteLatencyTest { device_id }).await? {
         DaemonResponse::LocalInputTest(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_cross_device_test(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestReport> {
+    match send_request(DaemonRequest::RunCrossDeviceTest { request }).await? {
+        DaemonResponse::CrossDeviceTest(report) => Ok(report),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn start_cross_device_stress(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::StartCrossDeviceStress { request }).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn stop_cross_device_stress() -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::StopCrossDeviceStress).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_cross_device_test_status() -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::CrossDeviceTestStatus).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

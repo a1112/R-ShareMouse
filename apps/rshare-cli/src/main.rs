@@ -31,7 +31,7 @@ fn build_metadata() -> String {
     )
 }
 
-use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, usb, wake};
+use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, test, usb, wake};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -144,6 +144,12 @@ enum Commands {
         strict: bool,
     },
 
+    /// Automatically verify and stress-test remote input forwarding.
+    Test {
+        #[command(subcommand)]
+        test_cmd: test::TestCommands,
+    },
+
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -250,6 +256,9 @@ async fn main() -> Result<()> {
             strict,
         } => {
             doctor::execute(connect, inject, endpoint_events, strict).await?;
+        }
+        Commands::Test { test_cmd } => {
+            test::execute(test_cmd).await?;
         }
         Commands::Config { config_cmd } => {
             config_cmd::execute(config_cmd).await?;

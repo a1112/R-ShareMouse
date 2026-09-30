@@ -1321,6 +1321,7 @@ fn accepted_mobile_noop(
         health,
         elapsed_ms: 0,
         loopback_event_id: None,
+        observed_event: None,
         error: None,
     }
 }

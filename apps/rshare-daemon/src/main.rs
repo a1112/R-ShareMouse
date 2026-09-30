@@ -3,6 +3,7 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
+mod cross_device_test;
 mod endpoint_runtime;
 mod extended_display;
 mod mobile_gateway;
@@ -13,7 +14,6 @@ mod usb_service;
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::future::BoxFuture;
-use rshare_core::ipc::MacosInputPermissionsSnapshot;
 use rshare_core::{
     default_ipc_addr, default_mobile_gateway_addr, local_capability_snapshots,
     remote_capability_snapshots, AudioFormat, BackendFailureReason, BackendHealth, BackendKind,
@@ -28,11 +28,11 @@ use rshare_core::{
     LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState, UiSnapshot,
-    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus,
+    MacosInputPermissionsSnapshot, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
+    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
+    ServiceStatusSnapshot, TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState,
+    UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
@@ -4100,6 +4100,7 @@ fn endpoint_inject_failure_result(
         health,
         elapsed_ms,
         loopback_event_id: None,
+        observed_event: None,
         error: Some(error),
     }
 }
@@ -7442,6 +7443,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
     let (local_events_tx, _) = broadcast::channel::<LocalInputDiagnosticEvent>(256);
     let (endpoint_events_tx, _) = broadcast::channel::<EndpointEvent>(256);
+    let cross_device_test = cross_device_test::CrossDeviceTestRuntime::default();
     let audio_runtime = audio_runtime::AudioRuntimeHandle::start()?;
     let usb_runtime = Arc::new(Mutex::new(
         rshare_platform::ExperimentalUsbHostRuntime::new(),
@@ -7786,6 +7788,7 @@ async fn main() -> Result<()> {
         usb_runtime.clone(),
         local_events_tx.clone(),
         endpoint_events_tx.clone(),
+        cross_device_test.clone(),
         layout_path.clone(),
         layout_update_lock.clone(),
         shutdown_tx.clone(),
@@ -8259,6 +8262,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("tokio::select! exited, cleaning up");
     let _ = diagnostics_shutdown_tx.try_send(());
+    let _ = cross_device_test.stop().await;
     let _ = enqueue_router_command(&input_command_tx, RouterCommand::Shutdown).await;
     injection.request_release_all_sources(rshare_core::ReleaseAllReason::SessionEnded);
     set_local_shortcut_suppression(false);
@@ -8271,7 +8275,13 @@ async fn main() -> Result<()> {
     if let Some(capture) = windows_driver_capture.as_mut() {
         capture.stop();
     }
-    // Input listener cleanup is handled automatically by task drops
+    // Keep the native listener alive for the whole daemon lifetime. The
+    // listener status handle above only borrows/clones its atomics; without an
+    // explicit final use Rust may drop the listener after startup, which stops
+    // the CGEventTap immediately while the daemon still reports a healthy TCC
+    // permission state.
+    #[cfg(any(windows, target_os = "macos"))]
+    drop(_input_listener);
     let network_stop_result = network_manager.lock().await.stop().await;
     let injection_stop_result = tokio::task::spawn_blocking(move || injection.shutdown()).await?;
 
@@ -8295,6 +8305,7 @@ async fn run_ipc_server(
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -8314,6 +8325,7 @@ async fn run_ipc_server(
         let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
         let endpoint_events_tx = endpoint_events_tx.clone();
+        let cross_device_test = cross_device_test.clone();
         let layout_path = layout_path.clone();
         let layout_update_lock = layout_update_lock.clone();
         let shutdown_tx = shutdown_tx.clone();
@@ -8331,6 +8343,7 @@ async fn run_ipc_server(
                 usb_runtime,
                 local_events_tx,
                 endpoint_events_tx,
+                cross_device_test,
                 layout_path,
                 layout_update_lock,
                 shutdown_tx,
@@ -8354,6 +8367,7 @@ async fn handle_ipc_client(
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -8488,6 +8502,7 @@ async fn handle_ipc_client(
         let audio_runtime = audio_runtime.clone();
         let usb_runtime = Arc::clone(&usb_runtime);
         let local_events_tx = local_events_tx.clone();
+        let cross_device_test = cross_device_test.clone();
         let layout_path = Arc::clone(&layout_path);
         let layout_update_lock = Arc::clone(&layout_update_lock);
         let shutdown_tx = shutdown_tx.clone();
@@ -8502,6 +8517,7 @@ async fn handle_ipc_client(
                 audio_runtime,
                 usb_runtime,
                 local_events_tx,
+                cross_device_test,
                 layout_path,
                 layout_update_lock,
                 shutdown_tx,
@@ -8666,6 +8682,9 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
             | DaemonRequest::InjectEndpointEvent { .. }
             | DaemonRequest::RunLocalInputTest { .. }
             | DaemonRequest::RunRemoteLatencyTest { .. }
+            | DaemonRequest::RunCrossDeviceTest { .. }
+            | DaemonRequest::StartCrossDeviceStress { .. }
+            | DaemonRequest::StopCrossDeviceStress
             | DaemonRequest::RunRemoteUsbDescriptorProbe { .. }
             | DaemonRequest::SetAudioDefaultOutput { .. }
             | DaemonRequest::SetAudioOutputVolume { .. }
@@ -8773,6 +8792,7 @@ async fn dispatch_ipc_request(
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -9152,6 +9172,32 @@ async fn dispatch_ipc_request(
                 run_remote_latency_test(&network_manager, &state, &local_events_tx, device_id)
                     .await;
             DaemonResponse::LocalInputTest(result)
+        }
+        DaemonRequest::RunCrossDeviceTest { request } => {
+            let context = cross_device_test::RunContext {
+                network_manager: network_manager.clone(),
+                injection: inject_backend.clone(),
+                state: state.clone(),
+                local_events_tx: local_events_tx.clone(),
+            };
+            let report = cross_device_test.run_once(context, request).await?;
+            DaemonResponse::CrossDeviceTest(report)
+        }
+        DaemonRequest::StartCrossDeviceStress { request } => {
+            let context = cross_device_test::RunContext {
+                network_manager: network_manager.clone(),
+                injection: inject_backend.clone(),
+                state: state.clone(),
+                local_events_tx: local_events_tx.clone(),
+            };
+            let status = cross_device_test.start_stress(context, request).await?;
+            DaemonResponse::CrossDeviceTestStatus(status)
+        }
+        DaemonRequest::StopCrossDeviceStress => {
+            DaemonResponse::CrossDeviceTestStatus(cross_device_test.stop().await)
+        }
+        DaemonRequest::CrossDeviceTestStatus => {
+            DaemonResponse::CrossDeviceTestStatus(cross_device_test.status().await)
         }
         DaemonRequest::RunRemoteUsbDescriptorProbe { device_id, bus_id } => {
             let result = run_remote_usb_descriptor_probe(
@@ -13183,6 +13229,7 @@ mod tests {
                 health: BackendHealth::Healthy,
                 elapsed_ms: 1,
                 loopback_event_id: Some(9),
+                observed_event: None,
                 error: None,
             },
         ));

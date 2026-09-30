@@ -3,13 +3,15 @@
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode,
-    CapabilityRegistrySnapshot, Config, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
+    CapabilityRegistrySnapshot, Config, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestStatusSnapshot, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalDisplayState, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, MobileAccessSnapshot, ServiceStatusSnapshot, VirtualDisplayCreateRequest,
-    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    LocalInputTestResult, MobileAccessSnapshot,
+    ServiceStatusSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
+    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
 use std::{
@@ -746,6 +748,38 @@ async fn run_endpoint_events_stream(app: AppHandle, filter: EndpointEventFilter,
 }
 
 #[tauri::command]
+async fn run_cross_device_test(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestReport, String> {
+    daemon_client::request_cross_device_test(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn start_cross_device_stress(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::start_cross_device_stress(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn stop_cross_device_stress() -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::stop_cross_device_stress()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn cross_device_test_status() -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::request_cross_device_test_status()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn start_local_controls_stream(app: AppHandle) -> Result<(), String> {
     let state = app.state::<LocalControlStreamState>();
     if let Some(task) = state.task.lock().map_err(|err| err.to_string())?.take() {
@@ -1279,6 +1313,10 @@ fn main() {
             stop_endpoint_events_stream,
             run_local_input_test,
             run_remote_latency_test,
+            run_cross_device_test,
+            start_cross_device_stress,
+            stop_cross_device_stress,
+            cross_device_test_status,
             minimize_window,
             toggle_maximize_window,
             close_window,

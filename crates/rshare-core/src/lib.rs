@@ -6,6 +6,7 @@
 pub mod capabilities;
 pub mod clipboard;
 pub mod config;
+pub mod cross_device_test;
 pub mod daemon_client;
 pub mod device;
 pub mod endpoint_events;
@@ -85,9 +86,10 @@ pub use ipc::{
     default_mobile_gateway_addr, read_json_frame, read_optional_ui_state_frame,
     read_ui_state_frame, write_json_frame, write_ui_state_frame, DaemonDeviceSnapshot,
     DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot, PendingPeerApproval,
-    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    LocalInputFeedback, MacosInputPermissionsSnapshot, MobileAccessSnapshot,
+    NetworkTransportSnapshot, PendingPeerApproval, RemoteDeviceLatencyFeedback,
+    RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback, UsbDescriptorProbeResult,
+    UsbDescriptorProbeStatus,
 };
 pub use ipc_binary::{
     decode_display_capture_binary, encode_display_capture_binary, encode_display_capture_response,
@@ -108,6 +110,13 @@ pub use endpoint_events::{
     EndpointEventSource, EndpointEventStore, EndpointInjectError, EndpointInjectMode,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, EventCorrelationId,
     DEFAULT_ENDPOINT_EVENT_LIMIT,
+};
+
+pub use cross_device_test::{
+    CrossDeviceTestKind, CrossDeviceTestMetrics, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestRunState, CrossDeviceTestSample, CrossDeviceTestStatusSnapshot,
+    CROSS_DEVICE_MAX_DURATION_MS, CROSS_DEVICE_MAX_INTERVAL_MS, CROSS_DEVICE_MAX_SAMPLES,
+    CROSS_DEVICE_MAX_TIMEOUT_MS, CROSS_DEVICE_REPORT_SAMPLE_LIMIT,
 };
 
 // Re-exports from local control diagnostics

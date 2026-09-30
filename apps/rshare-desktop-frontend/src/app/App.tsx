@@ -663,7 +663,57 @@ type EndpointInjectResult = {
   health: unknown;
   elapsed_ms: number;
   loopback_event_id?: number | null;
+  observed_event?: EndpointEvent | null;
   error?: string | null;
+};
+
+type CrossDeviceTestSample = {
+  index: number;
+  correlation_id: string;
+  event_kind: string;
+  position_x?: number | null;
+  position_y?: number | null;
+  display_id?: string | null;
+  sent_timestamp_ms: number;
+  response_timestamp_ms?: number | null;
+  remote_event_timestamp_ms?: number | null;
+  elapsed_us?: number | null;
+  accepted: boolean;
+  observed: boolean;
+  remote_event_id?: number | null;
+  event?: EndpointEvent | null;
+  error?: string | null;
+};
+
+type CrossDeviceTestReport = {
+  test_id: string;
+  target_device_id?: string | null;
+  kind: "MouseMove" | "KeyboardShift" | string;
+  state: "Idle" | "Running" | "Completed" | "Stopped" | "Failed" | string;
+  started_timestamp_ms: number;
+  finished_timestamp_ms?: number | null;
+  duration_ms: number;
+  metrics: {
+    requested: number;
+    sent: number;
+    accepted: number;
+    observed: number;
+    failed: number;
+    timed_out: number;
+    cancelled: number;
+    p50_us?: number | null;
+    p95_us?: number | null;
+    p99_us?: number | null;
+    max_us?: number | null;
+    throughput_per_second_milli?: number | null;
+  };
+  samples: CrossDeviceTestSample[];
+  error?: string | null;
+};
+
+type CrossDeviceTestStatus = {
+  active: boolean;
+  report?: CrossDeviceTestReport | null;
 };
 
 type LogEntry = {
@@ -800,6 +850,10 @@ const NETWORK_COMMANDS = new Set([
   "stop_endpoint_events_stream",
   "run_local_input_test",
   "run_remote_latency_test",
+  "run_cross_device_test",
+  "start_cross_device_stress",
+  "stop_cross_device_stress",
+  "cross_device_test_status",
   "set_audio_default_output",
   "set_audio_output_volume",
   "set_audio_output_mute",
@@ -826,6 +880,9 @@ const TITLEBAR_DRAG_REGIONS = getTitlebarDragRegionAttributes();
 
 function getInvoke(): TauriInvoke | null {
   const tauriWindow = window as Window & {
+    __TAURI_INTERNALS__?: {
+      invoke?: TauriInvoke;
+    };
     __TAURI__?: {
       core?: {
         invoke?: TauriInvoke;
@@ -833,6 +890,11 @@ function getInvoke(): TauriInvoke | null {
       };
     };
   };
+
+  const internalInvoke = tauriWindow.__TAURI_INTERNALS__?.invoke;
+  if (typeof internalInvoke === "function") {
+    return (command, args) => internalInvoke(command, args);
+  }
 
   return tauriWindow.__TAURI__?.core?.invoke ?? null;
 }
@@ -1344,6 +1406,31 @@ async function invokeNetworkCommand<T = unknown>(
           },
         },
         "LocalInputTest",
+      );
+    case "run_cross_device_test":
+      return await daemonRequestValue<T>(
+        {
+          RunCrossDeviceTest: {
+            request: args?.request ?? args,
+          },
+        },
+        "CrossDeviceTest",
+      );
+    case "start_cross_device_stress":
+      return await daemonRequestValue<T>(
+        {
+          StartCrossDeviceStress: {
+            request: args?.request ?? args,
+          },
+        },
+        "CrossDeviceTestStatus",
+      );
+    case "stop_cross_device_stress":
+      return await daemonRequestValue<T>("StopCrossDeviceStress", "CrossDeviceTestStatus");
+    case "cross_device_test_status":
+      return await daemonRequestValue<T>(
+        "CrossDeviceTestStatus",
+        "CrossDeviceTestStatus",
       );
     case "set_audio_default_output":
       return await daemonRequestValue<T>(
@@ -2237,6 +2324,8 @@ function DesktopApp() {
     useState<LocalInputTestResult | null>(null);
   const [remoteLatencyTestResult, setRemoteLatencyTestResult] =
     useState<LocalInputTestResult | null>(null);
+  const [crossDeviceTestStatus, setCrossDeviceTestStatus] =
+    useState<CrossDeviceTestStatus | null>(null);
   const [confirmingInputTest, setConfirmingInputTest] = useState<string | null>(null);
   const [uiStreamHealthy, setUiStreamHealthy] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -2307,10 +2396,16 @@ function DesktopApp() {
   ].join("|");
 
   async function refreshMacosPermissions() {
-    if (!desktopShell.isMacOS || !model.service.online || !getInvoke()) {
+    if (!desktopShell.isMacOS || !model.service.online) {
       setMacosPermissions(null);
       setMacosPermissionsChecked(false);
       setMacosPermissionError(null);
+      return null;
+    }
+
+    if (!getInvoke()) {
+      setMacosPermissions(null);
+      setMacosPermissionError("当前桌面权限桥不可用，请通过 Tauri 应用启动后重试。");
       return null;
     }
 
@@ -2330,7 +2425,12 @@ function DesktopApp() {
   }
 
   async function requestMacosPermissions() {
-    if (!desktopShell.isMacOS || !getInvoke()) {
+    if (!desktopShell.isMacOS) {
+      return;
+    }
+
+    if (!getInvoke()) {
+      setMacosPermissionError("当前桌面权限桥不可用，请通过 Tauri 应用启动后重试。");
       return;
     }
 
@@ -2352,7 +2452,12 @@ function DesktopApp() {
   }
 
   async function openMacosPermissionSettings(permission: string) {
-    if (!desktopShell.isMacOS || !getInvoke()) {
+    if (!desktopShell.isMacOS) {
+      return;
+    }
+
+    if (!getInvoke()) {
+      setMacosPermissionError("当前桌面权限桥不可用，请通过 Tauri 应用启动后重试。");
       return;
     }
 
@@ -2817,6 +2922,26 @@ function DesktopApp() {
     saveHiddenMonitorIds(hiddenMonitorIds);
   }, [hiddenMonitorIds]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const status = await invokeCommand<CrossDeviceTestStatus>("cross_device_test_status");
+        if (!cancelled) {
+          setCrossDeviceTestStatus(status);
+        }
+      } catch {
+        // The daemon may be restarting; the dashboard will surface its own status.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, crossDeviceTestStatus?.active ? 500 : 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [crossDeviceTestStatus?.active]);
+
   async function runServiceAction(action: "start" | "stop") {
     setBusy(true);
     try {
@@ -2928,6 +3053,64 @@ function DesktopApp() {
         message: errorMessage(latencyError),
         targetId: deviceId,
       });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function crossDeviceTestRequest(deviceId?: string | null, durationMs = 0) {
+    const mouse = localControls?.mouse;
+    return {
+      device_id: deviceId ?? null,
+      kind: "MouseMove",
+      sample_count: durationMs > 0 ? 0 : 20,
+      duration_ms: durationMs,
+      interval_ms: 10,
+      timeout_ms: 1000,
+      start_x: mouse?.x ?? 0,
+      start_y: mouse?.y ?? 0,
+      step_x: 1,
+      step_y: 1,
+    };
+  }
+
+  async function runCrossDeviceTest(deviceId?: string | null) {
+    setBusy(true);
+    try {
+      const report = await invokeCommand<CrossDeviceTestReport>("run_cross_device_test", {
+        request: crossDeviceTestRequest(deviceId),
+      });
+      setCrossDeviceTestStatus({ active: false, report });
+      setError(null);
+    } catch (testError) {
+      setError("自动跨设备测试失败：" + errorMessage(testError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startCrossDeviceStress(deviceId?: string | null) {
+    setBusy(true);
+    try {
+      const status = await invokeCommand<CrossDeviceTestStatus>("start_cross_device_stress", {
+        request: crossDeviceTestRequest(deviceId, 10_000),
+      });
+      setCrossDeviceTestStatus(status);
+      setError(null);
+    } catch (testError) {
+      setError("连续发送压力测试失败：" + errorMessage(testError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stopCrossDeviceStress() {
+    setBusy(true);
+    try {
+      const status = await invokeCommand<CrossDeviceTestStatus>("stop_cross_device_stress");
+      setCrossDeviceTestStatus(status);
+    } catch (stopError) {
+      setError("停止压力测试失败：" + errorMessage(stopError));
     } finally {
       setBusy(false);
     }
@@ -3262,11 +3445,15 @@ function DesktopApp() {
               localControlsError={localControlsError}
               localInputTestResult={localInputTestResult}
               remoteLatencyTestResult={remoteLatencyTestResult}
+              crossDeviceTestStatus={crossDeviceTestStatus}
               confirmingInputTest={confirmingInputTest}
               onRunLocalInputTest={runEndpointInputTest}
               onRunRemoteEndpointInputTest={runRemoteEndpointInputTest}
               onRunRemoteLatencyTest={runRemoteLatencyProbe}
               onRefreshLocalControls={refreshLocalControls}
+              onRunCrossDeviceTest={runCrossDeviceTest}
+              onStartCrossDeviceStress={startCrossDeviceStress}
+              onStopCrossDeviceStress={stopCrossDeviceStress}
               onConnect={connectDevice}
               onDisconnect={disconnectDevice}
               theme={theme}
@@ -3328,6 +3515,8 @@ function DesktopApp() {
       {desktopShell.isMacOS && macosPermissionDialogOpen ? (
         <MacosPermissionDialog
           permissions={macosPermissions}
+          daemonInputReady={model.acceptance.inputReady}
+          daemonInputReason={model.settings.inputMode.reason}
           restartRequired={macosPermissionRestartRequired}
           runtimeIssue={macosInputWarning?.runtimeIssue ?? null}
           busyAction={macosPermissionAction}
@@ -3355,11 +3544,15 @@ function DevicesPage({
   localControlsError,
   localInputTestResult,
   remoteLatencyTestResult,
+  crossDeviceTestStatus,
   confirmingInputTest,
   onRunLocalInputTest,
   onRunRemoteEndpointInputTest,
   onRunRemoteLatencyTest,
   onRefreshLocalControls,
+  onRunCrossDeviceTest,
+  onStartCrossDeviceStress,
+  onStopCrossDeviceStress,
   onConnect,
   onDisconnect,
   busy,
@@ -3387,11 +3580,15 @@ function DevicesPage({
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
   remoteLatencyTestResult: LocalInputTestResult | null;
+  crossDeviceTestStatus: CrossDeviceTestStatus | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
   onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
   onRunRemoteLatencyTest: (deviceId: string) => void;
   onRefreshLocalControls: () => Promise<void>;
+  onRunCrossDeviceTest: (deviceId?: string | null) => void;
+  onStartCrossDeviceStress: (deviceId?: string | null) => void;
+  onStopCrossDeviceStress: () => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -3422,11 +3619,15 @@ function DevicesPage({
           localControlsError={localControlsError}
           localInputTestResult={localInputTestResult}
           remoteLatencyTestResult={remoteLatencyTestResult}
+          crossDeviceTestStatus={crossDeviceTestStatus}
           confirmingInputTest={confirmingInputTest}
           onRunLocalInputTest={onRunLocalInputTest}
           onRunRemoteEndpointInputTest={onRunRemoteEndpointInputTest}
           onRunRemoteLatencyTest={onRunRemoteLatencyTest}
           onRefreshLocalControls={onRefreshLocalControls}
+          onRunCrossDeviceTest={onRunCrossDeviceTest}
+          onStartCrossDeviceStress={onStartCrossDeviceStress}
+          onStopCrossDeviceStress={onStopCrossDeviceStress}
           onConnect={onConnect}
           onDisconnect={onDisconnect}
           busy={busy}
@@ -3639,6 +3840,133 @@ function DeviceTreeNodeButton({
   );
 }
 
+function CrossDeviceTestPanel({
+  devices,
+  targetDeviceId,
+  status,
+  busy,
+  onRun,
+  onStartStress,
+  onStop,
+  theme,
+}: {
+  devices: Array<{ id: string; name: string; connected: boolean }>;
+  targetDeviceId: string | null;
+  status: CrossDeviceTestStatus | null;
+  busy: boolean;
+  onRun: (deviceId?: string | null) => void;
+  onStartStress: (deviceId?: string | null) => void;
+  onStop: () => void;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const target =
+    devices.find((device) => device.id === targetDeviceId && device.connected) ??
+    devices.find((device) => device.connected) ??
+    null;
+  const report = status?.report ?? null;
+  const metrics = report?.metrics;
+  const lastSample = report?.samples?.[report.samples.length - 1] ?? null;
+  const throughput = metrics?.throughput_per_second_milli
+    ? (metrics.throughput_per_second_milli / 1000).toFixed(1)
+    : "-";
+
+  return (
+    <section
+      className="mx-3 my-2 shrink-0 rounded-lg px-3 py-2"
+      style={{
+        border: "1px solid " + theme.border,
+        background: "rgba(255,255,255,0.025)",
+      }}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="mr-auto min-w-0">
+          <div className="flex items-center gap-2 text-xs font-semibold">
+            <span>自动跨设备测试</span>
+            <span
+              className="rounded px-1.5 py-0.5 text-[10px]"
+              style={{
+                color: status?.active ? theme.accent : theme.textMuted,
+                background: status?.active ? theme.accentSoft : "rgba(255,255,255,0.05)",
+              }}
+            >
+              {status?.active ? "运行中" : report ? report.state : "待测试"}
+            </span>
+          </div>
+          <div className="mt-0.5 truncate text-[10px]" style={{ color: theme.textMuted }}>
+            目标：{target?.name ?? "未连接对端"} · {report?.kind === "KeyboardShift" ? "Shift 事件" : "鼠标位置"}
+          </div>
+        </div>
+        {status?.active ? (
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px]"
+            style={{ border: "1px solid " + theme.danger, color: theme.danger }}
+            disabled={busy}
+            onClick={onStop}
+          >
+            <Square size={11} />
+            停止
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px]"
+              style={{
+                border: "1px solid " + (target ? theme.accent : theme.border),
+                color: target ? theme.accent : theme.textMuted,
+              }}
+              disabled={busy || !target}
+              onClick={() => onRun(target?.id ?? null)}
+            >
+              <Play size={11} />
+              自动验证
+            </button>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px]"
+              style={{
+                border: "1px solid " + (target ? theme.accent : theme.border),
+                color: target ? theme.accent : theme.textMuted,
+              }}
+              disabled={busy || !target}
+              onClick={() => onStartStress(target?.id ?? null)}
+            >
+              <Play size={11} />
+              连续压力
+            </button>
+          </>
+        )}
+      </div>
+      {metrics ? (
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px]" style={{ color: theme.textSub }}>
+          <span>请求 {metrics.requested}</span>
+          <span>接受 {metrics.accepted}</span>
+          <span style={{ color: metrics.observed === metrics.accepted ? theme.success : theme.textSub }}>
+            远端观察 {metrics.observed}
+          </span>
+          <span>失败 {metrics.failed}</span>
+          <span>p50 {metrics.p50_us ?? "-"}μs</span>
+          <span>p95 {metrics.p95_us ?? "-"}μs</span>
+          <span>p99 {metrics.p99_us ?? "-"}μs</span>
+          <span>吞吐 {throughput}/s</span>
+        </div>
+      ) : null}
+      {lastSample ? (
+        <div className="mt-1 truncate text-[10px]" style={{ color: theme.textMuted }}>
+          最近事件：{lastSample.event_kind} · 位置
+          {lastSample.position_x == null
+            ? "-"
+            : "(" + lastSample.position_x + "," + lastSample.position_y + ")"}
+          {" · "}发送 {lastSample.sent_timestamp_ms} · 远端{" "}
+          {lastSample.remote_event_timestamp_ms ?? "-"} ·
+          {lastSample.observed ? "已观察" : lastSample.accepted ? "已接受未观察" : "失败"}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function DevicesPageWithLocalControls({
   devices,
   capabilities,
@@ -3649,11 +3977,15 @@ function DevicesPageWithLocalControls({
   localControlsError,
   localInputTestResult,
   remoteLatencyTestResult,
+  crossDeviceTestStatus,
   confirmingInputTest,
   onRunLocalInputTest,
   onRunRemoteEndpointInputTest,
   onRunRemoteLatencyTest,
   onRefreshLocalControls,
+  onRunCrossDeviceTest,
+  onStartCrossDeviceStress,
+  onStopCrossDeviceStress,
   onConnect,
   onDisconnect,
   busy,
@@ -3681,11 +4013,15 @@ function DevicesPageWithLocalControls({
   localControlsError: string | null;
   localInputTestResult: LocalInputTestResult | null;
   remoteLatencyTestResult: LocalInputTestResult | null;
+  crossDeviceTestStatus: CrossDeviceTestStatus | null;
   confirmingInputTest: string | null;
   onRunLocalInputTest: (kind: string) => void;
   onRunRemoteEndpointInputTest: (deviceId: string, kind: string) => void;
   onRunRemoteLatencyTest: (deviceId: string) => void;
   onRefreshLocalControls: () => Promise<void>;
+  onRunCrossDeviceTest: (deviceId?: string | null) => void;
+  onStartCrossDeviceStress: (deviceId?: string | null) => void;
+  onStopCrossDeviceStress: () => void;
   onConnect: (deviceId: string) => void;
   onDisconnect: (deviceId: string) => void;
   busy: boolean;
@@ -4118,6 +4454,16 @@ function DevicesPageWithLocalControls({
             theme={theme}
           />
         ) : null}
+        <CrossDeviceTestPanel
+          devices={safeDevices}
+          targetDeviceId={selectedRemoteDevice?.id ?? null}
+          status={crossDeviceTestStatus}
+          busy={busy}
+          onRun={onRunCrossDeviceTest}
+          onStartStress={onStartCrossDeviceStress}
+          onStop={onStopCrossDeviceStress}
+          theme={theme}
+        />
         <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
           {selectedPage === "overview" ? (
             <AllDevicesOverview
@@ -10109,6 +10455,8 @@ function hardwareAssetKindLabel(kind: string) {
 
 function MacosPermissionDialog({
   permissions,
+  daemonInputReady,
+  daemonInputReason,
   restartRequired,
   runtimeIssue,
   busyAction,
@@ -10121,6 +10469,8 @@ function MacosPermissionDialog({
   onRefresh,
 }: {
   permissions: MacosInputPermissions | null;
+  daemonInputReady: boolean;
+  daemonInputReason: string | null;
   restartRequired: boolean;
   runtimeIssue: string | null;
   busyAction: string | null;
@@ -10135,6 +10485,9 @@ function MacosPermissionDialog({
   const missing = missingMacosInputPermissions(permissions);
   const supported = permissions?.supported === true;
   const ready = supported && permissions?.ready && !runtimeIssue;
+  const canRequest = permissions === null || supported;
+  const daemonNeedsAttention = !daemonInputReady;
+  const requestLabel = missing.length || permissions === null ? "请求系统权限" : "重新检测输入后端";
 
   return (
     <div
@@ -10175,6 +10528,12 @@ function MacosPermissionDialog({
             <p className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
               本机作为控制端需要输入监控权限；接收远端控制还需要辅助功能权限。
             </p>
+            {daemonNeedsAttention ? (
+              <p className="mt-2 text-xs leading-5" style={{ color: "#f0ca7a" }}>
+                后台 daemon 输入后端尚未就绪
+                {daemonInputReason ? `：${daemonInputReason}` : "，授予权限后请重启服务"}。
+              </p>
+            ) : null}
           </div>
           <button
             type="button"
@@ -10272,7 +10631,7 @@ function MacosPermissionDialog({
               color: theme.textMuted,
             }}
           >
-            当前无法读取 macOS 权限状态，请先重新检测。
+            {error ?? "当前无法读取 macOS 权限状态，请先重新检测。"}
           </div>
         ) : null}
 
@@ -10304,7 +10663,7 @@ function MacosPermissionDialog({
           >
             重新检测
           </button>
-          {supported && missing.length ? (
+          {canRequest && (missing.length || permissions === null || daemonNeedsAttention) ? (
             <button
               type="button"
               className="rounded-md px-3 py-2 text-sm transition"
@@ -10317,7 +10676,7 @@ function MacosPermissionDialog({
               disabled={Boolean(busyAction)}
               onClick={onRequest}
             >
-              请求系统权限
+              {requestLabel}
             </button>
           ) : null}
           {supported && permissions?.ready && restartRequired ? (

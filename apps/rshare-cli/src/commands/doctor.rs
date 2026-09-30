@@ -716,6 +716,7 @@ mod tests {
             health: BackendHealth::Healthy,
             elapsed_ms,
             loopback_event_id: Some(elapsed_ms),
+            observed_event: None,
             error: None,
         }
     }
@@ -734,6 +735,7 @@ mod tests {
             },
             elapsed_ms: 7,
             loopback_event_id: None,
+            observed_event: None,
             error: Some(error),
         }
     }
