@@ -668,13 +668,21 @@ pub enum DaemonResponse {
 
 /// Get the default localhost IPC socket address.
 pub fn default_ipc_addr() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_IPC_PORT)
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        env_port("RSHARE_IPC_PORT", DEFAULT_IPC_PORT),
+    )
+}
+
+fn env_port(name: &str, default: u16) -> u16 {
+    crate::preview_profile::port_value(std::env::var(name).ok().as_deref(), default)
+        .unwrap_or_else(|error| panic!("Invalid {name}: {error}"))
 }
 
 pub fn default_local_controls_ws_addr() -> SocketAddr {
     SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
-        DEFAULT_LOCAL_CONTROLS_WS_PORT,
+        env_port("RSHARE_WS_PORT", DEFAULT_LOCAL_CONTROLS_WS_PORT),
     )
 }
 
@@ -685,7 +693,7 @@ pub fn default_local_controls_ws_url() -> String {
 pub fn default_mobile_gateway_addr() -> SocketAddr {
     SocketAddr::new(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        DEFAULT_MOBILE_GATEWAY_PORT,
+        env_port("RSHARE_MOBILE_PORT", DEFAULT_MOBILE_GATEWAY_PORT),
     )
 }
 

@@ -3,10 +3,10 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
-mod network_audio;
 mod endpoint_runtime;
-mod mobile_gateway;
 mod extended_display;
+mod mobile_gateway;
+mod network_audio;
 mod static_capture;
 
 use anyhow::{Context, Result};
@@ -6826,7 +6826,10 @@ impl Drop for WindowsDriverCapture {
 }
 
 fn get_log_file_path() -> PathBuf {
-    if let Some(config_dir) = dirs::config_dir().map(|path| path.join("rshare")) {
+    if let Some(config_dir) = rshare_core::config::default_config_path()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+    {
         if fs::create_dir_all(&config_dir).is_ok() {
             let log_path = config_dir.join("rshare-daemon.log");
             if fs::OpenOptions::new()
@@ -7274,17 +7277,19 @@ async fn main() -> Result<()> {
     // Configure firewall on Windows to allow discovery and service ports
     #[cfg(windows)]
     {
-        match firewall::configure_firewall(config.features.mobile_gateway_enabled) {
-            Ok(result) => {
-                if result.is_success() {
-                    tracing::info!("Firewall configured successfully for R-ShareMouse");
-                } else {
-                    tracing::warn!("Firewall configuration incomplete: {:?}", result);
+        if !rshare_core::desktop_runtime::enabled() {
+            match firewall::configure_firewall(config.features.mobile_gateway_enabled) {
+                Ok(result) => {
+                    if result.is_success() {
+                        tracing::info!("Firewall configured successfully for R-ShareMouse");
+                    } else {
+                        tracing::warn!("Firewall configuration incomplete: {:?}", result);
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to configure firewall: {}", e);
-                tracing::warn!("Device discovery may not work. Please run as administrator or add firewall rules manually.");
+                Err(e) => {
+                    tracing::warn!("Failed to configure firewall: {}", e);
+                    tracing::warn!("Device discovery may not work. Please run as administrator or add firewall rules manually.");
+                }
             }
         }
     }
@@ -7351,7 +7356,9 @@ async fn main() -> Result<()> {
         ),
         RuntimeFeatureConfig::from_config(&config),
     );
-    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(layout_path.with_file_name("network-audio.json"))));
+    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(
+        layout_path.with_file_name("network-audio.json"),
+    )));
     let wake_path = layout_path.with_file_name("wake-targets.json");
     daemon_state.wake = Arc::new(Mutex::new(match WakeManager::load(wake_path.clone()) {
         Ok(manager) => manager,
@@ -8254,6 +8261,8 @@ async fn main() -> Result<()> {
     injection_stop_result?;
 
     tracing::info!("R-ShareMouse daemon stopped");
+    // process::exit skips ServiceHandle::drop; release our own PID bookkeeping.
+    drop(_service_handle);
     std::process::exit(0);
 }
 
@@ -8788,12 +8797,18 @@ async fn dispatch_ipc_request(
                 let trusted = match &command {
                     rshare_core::network_audio::AudioCommand::Grant(grant) => {
                         let store = rshare_net::encryption::QuicTrustStore::load_default()?;
-                        store.fingerprint_for(&grant.peer).is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
+                        store
+                            .fingerprint_for(&grant.peer)
+                            .is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
                     }
                     _ => false,
                 };
-                audio.lock().map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?.command(command, trusted)
-            }).await?;
+                audio
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?
+                    .command(command, trusted)
+            })
+            .await?;
             match result {
                 Ok(snapshot) => DaemonResponse::NetworkAudio(snapshot),
                 Err(error) => DaemonResponse::Error(error.to_string()),

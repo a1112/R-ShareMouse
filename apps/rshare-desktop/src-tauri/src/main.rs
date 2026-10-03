@@ -354,9 +354,7 @@ async fn start_service(app: AppHandle) -> Result<ServiceStatusSnapshot, String> 
 
 #[tauri::command]
 async fn stop_service(app: AppHandle) -> Result<(), String> {
-    daemon_client::request_shutdown()
-        .await
-        .map_err(|err| err.to_string())?;
+    stop_desktop_daemon().await.map_err(|err| err.to_string())?;
     refresh_tray_status_once(&app).await;
     Ok(())
 }
@@ -980,6 +978,13 @@ async fn ensure_daemon_status() -> AnyhowResult<DesktopDaemonStatus> {
     let config = Config::load().unwrap_or_default();
     let port = config.network.port;
     let bind_address = config.network.bind_address.clone();
+    #[cfg(windows)]
+    if rshare_core::desktop_runtime::enabled() {
+        return Ok(DesktopDaemonStatus {
+            status: daemon_client::spawn_daemon(Some(port), Some(&bind_address)).await?,
+            auto_started: true,
+        });
+    }
     ensure_daemon_status_with(
         || Box::pin(async { daemon_client::request_status().await }),
         move || {
@@ -1122,6 +1127,8 @@ fn build_acceptance(
 }
 
 fn main() {
+    #[cfg(windows)]
+    rshare_core::desktop_runtime::initialize().expect("Cannot initialize isolated preview runtime");
     eprintln!("{}", build_metadata());
     tauri::Builder::default()
         .plugin(init(|app, _args, _cwd| {
@@ -1205,6 +1212,19 @@ fn main() {
             clear_logs
         ])
         .setup(|app| {
+            #[cfg(windows)]
+            rshare_core::desktop_runtime::write_runtime_report()?;
+            if let Some(timeout) = std::env::var("RBOX_PREVIEW_EXIT_AFTER_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| (1000..=120000).contains(v))
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(timeout)).await;
+                    shutdown_daemon_and_exit(&handle);
+                });
+            }
             // Setup system tray
             setup_system_tray(app.handle())?;
             start_tray_status_refresh(app.handle().clone());
@@ -1337,11 +1357,19 @@ fn start_daemon_from_tray(app: &AppHandle) {
 fn stop_daemon_from_tray(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(err) = daemon_client::request_shutdown().await {
+        if let Err(err) = stop_desktop_daemon().await {
             eprintln!("tray failed to stop daemon: {err}");
         }
         refresh_tray_status_once(&app).await;
     });
+}
+
+async fn stop_desktop_daemon() -> AnyhowResult<()> {
+    #[cfg(windows)]
+    if rshare_core::desktop_runtime::enabled() {
+        return rshare_core::desktop_runtime::shutdown_owned().await;
+    }
+    daemon_client::request_shutdown().await
 }
 
 fn shutdown_daemon_and_exit(app: &AppHandle) {
@@ -1355,6 +1383,10 @@ fn shutdown_daemon_and_exit(app: &AppHandle) {
 }
 
 async fn shutdown_daemon_for_exit() -> AnyhowResult<()> {
+    #[cfg(windows)]
+    if rshare_core::desktop_runtime::enabled() {
+        return rshare_core::desktop_runtime::shutdown_owned().await;
+    }
     let manager = Arc::new(rshare_core::service::ServiceManager::new()?);
     shutdown_daemon_for_exit_with(
         {
@@ -2754,6 +2786,10 @@ mod tests {
 }
 
 #[tauri::command]
-async fn network_audio(command: rshare_core::network_audio::AudioCommand) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
-    daemon_client::request_network_audio(command).await.map_err(|e| e.to_string())
+async fn network_audio(
+    command: rshare_core::network_audio::AudioCommand,
+) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
+    daemon_client::request_network_audio(command)
+        .await
+        .map_err(|e| e.to_string())
 }

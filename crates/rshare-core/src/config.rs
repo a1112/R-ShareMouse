@@ -310,6 +310,13 @@ impl Config {
 
 /// Get the default configuration file path.
 pub fn default_config_path() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("RSHARE_USER_ROOT") {
+        return Ok(crate::preview_profile::profile_root(
+            Some(PathBuf::from(root).as_path()),
+            None,
+        )?
+        .join("config.toml"));
+    }
     let base_dir = if cfg!(target_os = "macos") {
         dirs::home_dir().map(|p| p.join("Library").join("Application Support"))
     } else if cfg!(target_os = "windows") {

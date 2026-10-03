@@ -7,6 +7,8 @@ pub mod capabilities;
 pub mod clipboard;
 pub mod config;
 pub mod daemon_client;
+#[cfg(windows)]
+pub mod desktop_runtime;
 pub mod device;
 pub mod endpoint_events;
 pub mod engine;
@@ -21,6 +23,7 @@ pub mod ipc_frame;
 pub mod layout;
 pub mod local_controls;
 pub mod perf;
+pub mod preview_profile;
 pub mod protocol;
 pub mod runtime;
 pub mod service;

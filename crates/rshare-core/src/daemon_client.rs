@@ -30,6 +30,24 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
 }
 
 async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
+    require_request_owner(address).await?;
+    send_request_at_raw(address, request).await
+}
+
+async fn require_request_owner(address: SocketAddr) -> Result<()> {
+    #[cfg(windows)]
+    if crate::desktop_runtime::enabled() && address == default_ipc_addr() {
+        crate::desktop_runtime::check_owner().await?;
+    }
+    #[cfg(not(windows))]
+    let _ = address;
+    Ok(())
+}
+
+async fn send_request_at_raw(
+    address: SocketAddr,
+    request: DaemonRequest,
+) -> Result<DaemonResponse> {
     let mut stream = TcpStream::connect(address)
         .await
         .with_context(|| format!("Failed to connect to daemon at {address}"))?;
@@ -43,6 +61,22 @@ pub async fn request_status() -> Result<ServiceStatusSnapshot> {
         DaemonResponse::Status(status) => Ok(status),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn request_status_raw() -> Result<ServiceStatusSnapshot> {
+    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Status).await? {
+        DaemonResponse::Status(status) => Ok(status),
+        other => anyhow::bail!("Unexpected owned daemon status: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn request_shutdown_raw() -> Result<()> {
+    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Shutdown).await? {
+        DaemonResponse::Ack => Ok(()),
+        other => anyhow::bail!("Unexpected owned daemon shutdown: {other:?}"),
     }
 }
 
@@ -211,6 +245,10 @@ pub async fn wait_until_ready(timeout: Duration) -> Result<ServiceStatusSnapshot
 }
 
 pub async fn spawn_daemon(port: Option<u16>, bind: Option<&str>) -> Result<ServiceStatusSnapshot> {
+    #[cfg(windows)]
+    if crate::desktop_runtime::enabled() {
+        return crate::desktop_runtime::spawn_owned(port, bind).await;
+    }
     let daemon_binary = find_daemon_binary()?;
 
     let mut command = tokio::process::Command::new(&daemon_binary);
@@ -318,6 +356,7 @@ pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
 pub async fn request_display_capture(
     request: DisplayCaptureRequest,
 ) -> Result<DisplayCaptureResult> {
+    require_request_owner(default_ipc_addr()).await?;
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
@@ -479,6 +518,7 @@ pub async fn request_remote_usb_descriptor_probe(
 }
 
 pub async fn subscribe_local_controls() -> Result<TcpStream> {
+    require_request_owner(default_ipc_addr()).await?;
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
@@ -487,6 +527,7 @@ pub async fn subscribe_local_controls() -> Result<TcpStream> {
 }
 
 pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<TcpStream> {
+    require_request_owner(default_ipc_addr()).await?;
     let mut stream = TcpStream::connect(default_ipc_addr())
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
@@ -516,6 +557,7 @@ pub async fn subscribe_ui_state_at(
     address: SocketAddr,
     cursor: Option<UiCursor>,
 ) -> Result<UiStateSubscription> {
+    require_request_owner(address).await?;
     let mut stream = TcpStream::connect(address)
         .await
         .with_context(|| format!("Failed to connect to daemon at {address}"))?;
@@ -539,6 +581,7 @@ pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonRe
 pub type LocalControlsWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub async fn subscribe_local_controls_ws() -> Result<LocalControlsWsStream> {
+    require_request_owner(default_ipc_addr()).await?;
     let url = default_local_controls_ws_url();
     let (stream, _) = connect_async(url.as_str())
         .await
@@ -729,7 +772,9 @@ mod tests {
 }
 
 /// Query/configure daemon-owned network audio state.
-pub async fn request_network_audio(command: crate::network_audio::AudioCommand) -> Result<crate::network_audio::AudioSnapshot> {
+pub async fn request_network_audio(
+    command: crate::network_audio::AudioCommand,
+) -> Result<crate::network_audio::AudioSnapshot> {
     match send_request(DaemonRequest::NetworkAudio(command)).await? {
         DaemonResponse::NetworkAudio(snapshot) => Ok(snapshot),
         DaemonResponse::Error(error) => anyhow::bail!(error),

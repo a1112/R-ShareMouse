@@ -308,6 +308,15 @@ impl Drop for ServiceHandle {
 
 /// Get the state directory for R-ShareMouse
 fn get_state_dir() -> Result<PathBuf> {
+    if std::env::var_os("RSHARE_USER_ROOT").is_some() {
+        let config = crate::config::default_config_path()?;
+        let root = config
+            .parent()
+            .context("Configuration has no parent directory")?
+            .to_path_buf();
+        fs::create_dir_all(&root)?;
+        return Ok(root);
+    }
     let base_dir = if cfg!(target_os = "windows") {
         dirs::config_dir()
     } else if cfg!(target_os = "macos") {
