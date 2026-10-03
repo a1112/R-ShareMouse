@@ -178,7 +178,7 @@ pub async fn spawn_owned(port: Option<u16>, bind: Option<&str>) -> Result<Servic
     let expected = child.id();
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Ok(status) = daemon_client::request_status_raw().await {
+            if let Ok(status) = daemon_client::request_status_raw(expected).await {
                 preview_profile::require_owned_pid(expected, status.pid)?;
                 break Ok(status);
             }
@@ -204,14 +204,16 @@ pub async fn shutdown_owned() -> Result<()> {
     let mut owned = CHILD.lock().await;
     if let Some(child) = owned.as_mut() {
         if child.try_wait()?.is_none() {
-            if let Ok(Ok(status)) =
-                tokio::time::timeout(Duration::from_secs(2), daemon_client::request_status_raw())
-                    .await
+            if let Ok(Ok(status)) = tokio::time::timeout(
+                Duration::from_secs(2),
+                daemon_client::request_status_raw(child.id()),
+            )
+            .await
             {
                 if preview_profile::require_owned_pid(child.id(), status.pid).is_ok() {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(2),
-                        daemon_client::request_shutdown_raw(),
+                        daemon_client::request_shutdown_raw(child.id()),
                     )
                     .await;
                 }
@@ -230,13 +232,19 @@ pub async fn shutdown_owned() -> Result<()> {
     Ok(())
 }
 
-pub async fn check_owner() -> Result<()> {
+pub(crate) struct ConnectionOwner {
+    pub pid: u32,
+    _handle: std::os::windows::io::OwnedHandle,
+}
+
+pub(crate) async fn connection_owner() -> Result<ConnectionOwner> {
     let mut owned = CHILD.lock().await;
     let child = owned.as_mut().context("Bundled daemon is not running")?;
     anyhow::ensure!(child.try_wait()?.is_none(), "Bundled daemon has exited");
-    let status = tokio::time::timeout(Duration::from_secs(2), daemon_client::request_status_raw())
-        .await
-        .context("Bundled daemon identity check timed out")??;
-    preview_profile::require_owned_pid(child.id(), status.pid)?;
-    Ok(())
+    use std::os::windows::io::AsHandle;
+    let handle = child.as_handle().try_clone_to_owned()?;
+    Ok(ConnectionOwner {
+        pid: child.id(),
+        _handle: handle,
+    })
 }

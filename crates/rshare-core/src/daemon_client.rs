@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+    client_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
 use crate::ipc::MacosInputPermissionsSnapshot;
@@ -30,27 +30,44 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
 }
 
 async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
-    require_request_owner(address).await?;
-    send_request_at_raw(address, request).await
+    send_request_at_raw(address, request, None).await
 }
 
-async fn require_request_owner(address: SocketAddr) -> Result<()> {
+async fn checked_connection(address: SocketAddr, expected_pid: Option<u32>) -> Result<TcpStream> {
     #[cfg(windows)]
-    if crate::desktop_runtime::enabled() && address == default_ipc_addr() {
-        crate::desktop_runtime::check_owner().await?;
+    let owner = if expected_pid.is_none()
+        && crate::desktop_runtime::enabled()
+        && [default_ipc_addr(), crate::default_local_controls_ws_addr()].contains(&address)
+    {
+        Some(crate::desktop_runtime::connection_owner().await?)
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let expected_pid = expected_pid.or_else(|| owner.as_ref().map(|owner| owner.pid));
+    let stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+    #[cfg(windows)]
+    if let Some(expected) = expected_pid {
+        crate::tcp_owner::require_connection_owner(
+            stream.local_addr()?,
+            stream.peer_addr()?,
+            expected,
+        )
+        .context("Connected daemon IPC belongs to another process")?;
     }
     #[cfg(not(windows))]
-    let _ = address;
-    Ok(())
+    let _ = expected_pid;
+    Ok(stream)
 }
 
 async fn send_request_at_raw(
     address: SocketAddr,
     request: DaemonRequest,
+    expected_pid: Option<u32>,
 ) -> Result<DaemonResponse> {
-    let mut stream = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+    let mut stream = checked_connection(address, expected_pid).await?;
 
     write_json_frame(&mut stream, &request).await?;
     read_json_frame(&mut stream).await
@@ -65,16 +82,16 @@ pub async fn request_status() -> Result<ServiceStatusSnapshot> {
 }
 
 #[cfg(windows)]
-pub(crate) async fn request_status_raw() -> Result<ServiceStatusSnapshot> {
-    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Status).await? {
+pub(crate) async fn request_status_raw(expected: u32) -> Result<ServiceStatusSnapshot> {
+    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Status, Some(expected)).await? {
         DaemonResponse::Status(status) => Ok(status),
         other => anyhow::bail!("Unexpected owned daemon status: {other:?}"),
     }
 }
 
 #[cfg(windows)]
-pub(crate) async fn request_shutdown_raw() -> Result<()> {
-    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Shutdown).await? {
+pub(crate) async fn request_shutdown_raw(expected: u32) -> Result<()> {
+    match send_request_at_raw(default_ipc_addr(), DaemonRequest::Shutdown, Some(expected)).await? {
         DaemonResponse::Ack => Ok(()),
         other => anyhow::bail!("Unexpected owned daemon shutdown: {other:?}"),
     }
@@ -356,10 +373,7 @@ pub async fn request_local_controls() -> Result<LocalControlDeviceSnapshot> {
 pub async fn request_display_capture(
     request: DisplayCaptureRequest,
 ) -> Result<DisplayCaptureResult> {
-    require_request_owner(default_ipc_addr()).await?;
-    let mut stream = TcpStream::connect(default_ipc_addr())
-        .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    let mut stream = checked_connection(default_ipc_addr(), None).await?;
     write_json_frame(&mut stream, &DaemonRequest::CaptureDisplay(request)).await?;
     match read_json_frame(&mut stream).await? {
         DaemonResponse::DisplayCapture(mut result) => {
@@ -518,19 +532,13 @@ pub async fn request_remote_usb_descriptor_probe(
 }
 
 pub async fn subscribe_local_controls() -> Result<TcpStream> {
-    require_request_owner(default_ipc_addr()).await?;
-    let mut stream = TcpStream::connect(default_ipc_addr())
-        .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    let mut stream = checked_connection(default_ipc_addr(), None).await?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeLocalControls).await?;
     Ok(stream)
 }
 
 pub async fn subscribe_endpoint_events(filter: EndpointEventFilter) -> Result<TcpStream> {
-    require_request_owner(default_ipc_addr()).await?;
-    let mut stream = TcpStream::connect(default_ipc_addr())
-        .await
-        .with_context(|| format!("Failed to connect to daemon at {}", default_ipc_addr()))?;
+    let mut stream = checked_connection(default_ipc_addr(), None).await?;
     write_json_frame(
         &mut stream,
         &DaemonRequest::SubscribeEndpointEvents { filter },
@@ -557,10 +565,7 @@ pub async fn subscribe_ui_state_at(
     address: SocketAddr,
     cursor: Option<UiCursor>,
 ) -> Result<UiStateSubscription> {
-    require_request_owner(address).await?;
-    let mut stream = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("Failed to connect to daemon at {address}"))?;
+    let mut stream = checked_connection(address, None).await?;
     write_json_frame(&mut stream, &DaemonRequest::SubscribeUiState { cursor }).await?;
     Ok(UiStateSubscription { stream })
 }
@@ -581,9 +586,9 @@ pub async fn read_local_control_event(stream: &mut TcpStream) -> Result<DaemonRe
 pub type LocalControlsWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub async fn subscribe_local_controls_ws() -> Result<LocalControlsWsStream> {
-    require_request_owner(default_ipc_addr()).await?;
     let url = default_local_controls_ws_url();
-    let (stream, _) = connect_async(url.as_str())
+    let tcp = checked_connection(crate::default_local_controls_ws_addr(), None).await?;
+    let (stream, _) = client_async(url.as_str(), MaybeTlsStream::Plain(tcp))
         .await
         .with_context(|| format!("Failed to connect to {url}"))?;
     Ok(stream)
@@ -620,6 +625,34 @@ mod tests {
     use std::fs::{self, File};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn foreign_socket_owner_receives_no_shutdown_frame() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let result = send_request_at_raw(
+            address,
+            DaemonRequest::Shutdown,
+            Some(std::process::id() + 1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            server.await.unwrap(),
+            0,
+            "No protocol byte may reach the foreign process"
+        );
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let unique = SystemTime::now()

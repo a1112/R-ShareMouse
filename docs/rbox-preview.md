@@ -16,7 +16,8 @@ compatibility; an occupied port produces an explicit startup error. IPC, local
 WebSocket and mobile ports are allocated separately for each desktop instance.
 
 The desktop keeps its profile exclusively open, tracks a real daemon Child,
-checks its status PID for local requests, and owns its descendants through a
+checks the server PID of each actual connected TCP socket before sending local
+IPC or WebSocket bytes, and owns its descendants through a
 Windows process Job. Normal Quit waits for that child; forced desktop exit kills
 only its inherited process tree. A stale PID file is removed only while the
 profile is exclusively held, the old child is gone, and the IPC port is empty.
@@ -34,6 +35,8 @@ absolute dedicated test profile. `RBOX_PREVIEW_EXIT_AFTER_MS` (1000–120000 ms)
 requests the same shutdown function as normal Quit for a controlled native test.
 The core example `preview_ownership_check` rejects occupied IPC and missing
 bundled daemon resources, and verifies that no Shutdown is sent without an owned
-child. R-Box's `accept-sharemouse.ps1` observes a real window and records normal,
+child. Native `tcp_owner` tests check the Windows TCP table against a real
+loopback connection, its full endpoint pair and a rejected foreign PID. R-Box's
+`accept-sharemouse.ps1` observes a real window and records normal,
 forced, and stale-PID startup/exit evidence; those are distinct from full pairing
 or clean-OS acceptance.

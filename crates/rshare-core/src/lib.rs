@@ -28,6 +28,8 @@ pub mod protocol;
 pub mod runtime;
 pub mod service;
 pub mod session;
+#[cfg(windows)]
+pub mod tcp_owner;
 pub mod ui_state;
 pub mod wake;
 

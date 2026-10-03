@@ -8,6 +8,20 @@ fn main() {
 }
 
 fn emit_build_metadata() {
+    // Worktree HEAD lives outside this package; Tauri's config watches alone
+    // cannot invalidate a cached source identity after the release commit.
+    for name in [
+        Some("HEAD".to_string()),
+        git_output(&["symbolic-ref", "-q", "HEAD"]),
+        Some("index".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(path) = git_output(&["rev-parse", "--git-path", &name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     println!(
         "cargo:rustc-env=RSHARE_BUILD_TIMESTAMP={}",
         unix_timestamp()
@@ -33,11 +47,7 @@ fn git_output(args: &[&str]) -> Option<String> {
     }
 
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    Some(value)
 }
 
 fn git_exe() -> Option<&'static str> {
