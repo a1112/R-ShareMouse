@@ -21,6 +21,7 @@ const EMPTY_INPUT = Object.freeze({
   pressedMouseButtons: [],
   pressedGamepadButtons: [],
   lastDiscreteTransition: null,
+  deviceMonitor: null,
 });
 
 function initialState() {
@@ -132,6 +133,7 @@ function stateFromSnapshot(snapshot, topologyRevision) {
       pressedMouseButtons: dynamic.pressed_mouse_buttons ?? [],
       pressedGamepadButtons: dynamic.pressed_gamepad_buttons ?? [],
       lastDiscreteTransition: null,
+      deviceMonitor: dynamic.device_monitor ?? null,
     },
     diagnostics:
       dynamic.diagnostics ?? snapshot.status?.latency_feedback ?? null,
@@ -245,6 +247,9 @@ export function createUiStore({
         break;
       case "key_button":
         next.inputVisuals = applyDiscrete(state.inputVisuals, change.payload);
+        break;
+      case "device_monitor":
+        next.inputVisuals = { ...state.inputVisuals, deviceMonitor: change.payload };
         break;
       case "session":
         next.mediaSession = {

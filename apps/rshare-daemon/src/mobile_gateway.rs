@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use rshare_core::ipc::PendingMobilePairing;
 use rshare_core::{
     DaemonRequest, DaemonResponse, EndpointEventKind, EndpointEventPayload, EndpointInjectMode,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LocalInputDiagnosticEvent,
@@ -10,7 +11,7 @@ use rshare_input::InputInjectionHandle;
 use rshare_net::NetworkManager;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -33,6 +34,7 @@ const MAX_MOBILE_CLIENT_ID_BYTES: usize = 128;
 const MAX_MOBILE_RELEASE_BATCH_REQUESTS: usize = 96;
 const MAX_MOBILE_HELD_KEYS: usize = 64;
 const MAX_MOBILE_HELD_MOUSE_BUTTONS: usize = 16;
+const MOBILE_GAMEPAD_LEASE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct MobileGatewayLimits {
@@ -102,6 +104,12 @@ struct MobileHeldOwnership {
     reservations: BTreeMap<u64, MobileOwnershipReservation>,
 }
 
+#[derive(Debug, Clone)]
+struct MobileGamepadOwner {
+    client_id: String,
+    last_seen: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MobileOwnershipReservation {
     client_id: String,
@@ -128,6 +136,7 @@ impl MobileClientSession {
 struct MobileClientSessions {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<MobileClientSession>>>>>,
     ownership: Arc<Mutex<MobileHeldOwnership>>,
+    gamepad_owner: Arc<Mutex<Option<MobileGamepadOwner>>>,
     next_operation_token: Arc<AtomicU64>,
     max_sessions: usize,
     held_input_lease: Duration,
@@ -138,6 +147,7 @@ impl MobileClientSessions {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ownership: Arc::new(Mutex::new(MobileHeldOwnership::default())),
+            gamepad_owner: Arc::new(Mutex::new(None)),
             next_operation_token: Arc::new(AtomicU64::new(1)),
             max_sessions: max_sessions.max(1),
             held_input_lease,
@@ -251,6 +261,14 @@ impl MobileClientSessions {
                 tracing::warn!("mobile lease cleanup task failed: {error}");
             }
         }
+        self.release_gamepad_if_expired(
+            now,
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+        )
+        .await;
         drop(sessions);
 
         let mut sessions = self.sessions.lock().await;
@@ -275,6 +293,44 @@ impl MobileClientSessions {
                 local_events_tx,
             )
             .await;
+        }
+        self.release_gamepad_if_expired(
+            Instant::now() + MOBILE_GAMEPAD_LEASE,
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+        )
+        .await;
+    }
+
+    async fn release_gamepad_if_expired(
+        &self,
+        now: Instant,
+        network_manager: &Arc<Mutex<NetworkManager>>,
+        inject_backend: &InputInjectionHandle,
+        state: &Arc<RwLock<DaemonState>>,
+        local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    ) {
+        let mut owner = self.gamepad_owner.lock().await;
+        if !owner.as_ref().is_some_and(|active| {
+            now.checked_duration_since(active.last_seen)
+                .unwrap_or_default()
+                >= MOBILE_GAMEPAD_LEASE
+        }) {
+            return;
+        }
+        let result = inject_endpoint_event(
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            EndpointInjectTarget::Local,
+            neutral_mobile_gamepad_request(),
+        )
+        .await;
+        if result.accepted {
+            *owner = None;
         }
     }
 
@@ -414,8 +470,19 @@ pub(crate) struct MobileGatewayAccess {
     token: String,
     advertise_host: String,
     activity: Arc<StdMutex<MobileGatewayActivity>>,
+    pairings: Arc<StdMutex<BTreeMap<String, MobilePairing>>>,
     display_hub: crate::extended_display::DisplayHub,
 }
+
+#[derive(Debug, Clone)]
+struct MobilePairing {
+    device_name: String,
+    client_addr: String,
+    created_at_ms: u64,
+    approved: bool,
+}
+
+const MOBILE_PAIRING_LIFETIME_MS: u64 = 120_000;
 
 #[derive(Debug, Default)]
 struct MobileGatewayActivity {
@@ -432,6 +499,7 @@ impl MobileGatewayAccess {
             token,
             advertise_host,
             activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
+            pairings: Arc::new(StdMutex::new(BTreeMap::new())),
             display_hub: crate::extended_display::DisplayHub::default(),
         }
     }
@@ -443,6 +511,7 @@ impl MobileGatewayAccess {
             token: String::new(),
             advertise_host: String::new(),
             activity: Arc::new(StdMutex::new(MobileGatewayActivity::default())),
+            pairings: Arc::new(StdMutex::new(BTreeMap::new())),
             display_hub: crate::extended_display::DisplayHub::default(),
         }
     }
@@ -476,6 +545,72 @@ impl MobileGatewayAccess {
             .unwrap_or((None, None, 0))
     }
 
+    fn request_pairing(&self, device_name: &str, peer_addr: SocketAddr) -> Result<String> {
+        let name = device_name.trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            bail!("invalid device name");
+        }
+        let mut pairings = self
+            .pairings
+            .lock()
+            .map_err(|_| anyhow!("pairing state unavailable"))?;
+        prune_mobile_pairings(&mut pairings);
+        if pairings.len() >= 8 {
+            bail!("too many pending pairings");
+        }
+        let request_id = rshare_core::DeviceId::new_v4().simple().to_string();
+        pairings.insert(
+            request_id.clone(),
+            MobilePairing {
+                device_name: name.to_string(),
+                client_addr: peer_addr.ip().to_string(),
+                created_at_ms: mobile_timestamp_ms_now(),
+                approved: false,
+            },
+        );
+        Ok(request_id)
+    }
+
+    fn pairing_status(&self, request_id: &str, peer_addr: SocketAddr) -> Option<bool> {
+        let mut pairings = self.pairings.lock().ok()?;
+        prune_mobile_pairings(&mut pairings);
+        let pairing = pairings.get(request_id)?;
+        (pairing.client_addr == peer_addr.ip().to_string()).then_some(pairing.approved)
+    }
+
+    pub(crate) fn decide_pairing(&self, request_id: &str, approved: bool) -> bool {
+        let Ok(mut pairings) = self.pairings.lock() else {
+            return false;
+        };
+        prune_mobile_pairings(&mut pairings);
+        if approved {
+            if let Some(pairing) = pairings.get_mut(request_id) {
+                pairing.approved = true;
+                return true;
+            }
+            false
+        } else {
+            pairings.remove(request_id).is_some()
+        }
+    }
+
+    fn pending_pairings(&self) -> Vec<PendingMobilePairing> {
+        let Ok(mut pairings) = self.pairings.lock() else {
+            return Vec::new();
+        };
+        prune_mobile_pairings(&mut pairings);
+        pairings
+            .iter()
+            .filter(|(_, pairing)| !pairing.approved)
+            .map(|(request_id, pairing)| PendingMobilePairing {
+                request_id: request_id.clone(),
+                device_name: pairing.device_name.clone(),
+                client_addr: pairing.client_addr.clone(),
+                created_at_ms: pairing.created_at_ms,
+            })
+            .collect()
+    }
+
     pub(crate) fn snapshot(&self) -> MobileAccessSnapshot {
         if !self.enabled {
             return MobileAccessSnapshot {
@@ -486,6 +621,7 @@ impl MobileGatewayAccess {
                 last_client_addr: None,
                 last_client_seen_at_ms: None,
                 client_count: 0,
+                pending_pairings: Vec::new(),
             };
         }
 
@@ -503,8 +639,16 @@ impl MobileGatewayAccess {
             last_client_addr,
             last_client_seen_at_ms,
             client_count,
+            pending_pairings: self.pending_pairings(),
         }
     }
+}
+
+fn prune_mobile_pairings(pairings: &mut BTreeMap<String, MobilePairing>) {
+    let now = mobile_timestamp_ms_now();
+    pairings.retain(|_, pairing| {
+        now.saturating_sub(pairing.created_at_ms) < MOBILE_PAIRING_LIFETIME_MS
+    });
 }
 
 fn mobile_timestamp_ms_now() -> u64 {
@@ -551,6 +695,9 @@ pub(crate) enum MobileGatewayRoute {
     DisplaySocket,
     LocalControls,
     Inject,
+    Discover,
+    PairRequest,
+    PairStatus,
     NotFound,
 }
 
@@ -567,6 +714,9 @@ pub(crate) fn route_mobile_http_request(method: &str, target: &str) -> MobileGat
         ("GET", "/api/display/socket") => MobileGatewayRoute::DisplaySocket,
         ("GET", "/api/local-controls") => MobileGatewayRoute::LocalControls,
         ("POST", "/api/inject") => MobileGatewayRoute::Inject,
+        ("GET", "/api/discover") => MobileGatewayRoute::Discover,
+        ("POST", "/api/pair/request") => MobileGatewayRoute::PairRequest,
+        ("GET", "/api/pair/status") => MobileGatewayRoute::PairStatus,
         _ => MobileGatewayRoute::NotFound,
     }
 }
@@ -659,7 +809,9 @@ async fn run_mobile_gateway_server_on_listener(
     let reaper_lease = limits.held_input_lease;
     let mut reaper_shutdown_rx = shutdown_rx.resubscribe();
     let reaper_task = tokio::spawn(async move {
-        let interval_duration = (reaper_lease / 2).max(Duration::from_millis(25));
+        let interval_duration = (reaper_lease / 2)
+            .max(Duration::from_millis(25))
+            .min(Duration::from_millis(250));
         let mut interval = tokio::time::interval(interval_duration);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
@@ -818,6 +970,86 @@ async fn handle_mobile_gateway_client_with_context(
             "text/javascript; charset=utf-8", crate::extended_display::CLIENT.as_bytes().to_vec(), limits.write_deadline).await;
     }
 
+    match route {
+        MobileGatewayRoute::Discover => {
+            let name = hostname::get()
+                .ok()
+                .and_then(|name| name.into_string().ok())
+                .unwrap_or_else(|| "R-ShareMouse PC".to_string());
+            return write_mobile_response_with_deadline(&mut stream, 200,
+                "application/json; charset=utf-8",
+                json!({ "service": "rshare-mobile", "name": name, "port": access.bind_addr().port() }).to_string().into_bytes(),
+                limits.write_deadline).await;
+        }
+        MobileGatewayRoute::PairRequest => {
+            #[derive(Deserialize)]
+            struct PairRequest {
+                device_name: String,
+            }
+            let result = serde_json::from_slice::<PairRequest>(&request.body)
+                .map_err(anyhow::Error::from)
+                .and_then(|body| access.request_pairing(&body.device_name, peer_addr));
+            return match result {
+                Ok(request_id) => {
+                    write_mobile_response_with_deadline(
+                        &mut stream,
+                        200,
+                        "application/json; charset=utf-8",
+                        json!({ "request_id": request_id, "status": "pending" })
+                            .to_string()
+                            .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await
+                }
+                Err(_) => {
+                    write_mobile_response_with_deadline(
+                        &mut stream,
+                        400,
+                        "application/json; charset=utf-8",
+                        json!({ "error": "invalid pairing request" })
+                            .to_string()
+                            .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await
+                }
+            };
+        }
+        MobileGatewayRoute::PairStatus => {
+            let status = mobile_query_value(&request.target, "request_id")
+                .and_then(|id| access.pairing_status(&id, peer_addr));
+            return match status {
+                Some(approved) => {
+                    write_mobile_response_with_deadline(
+                        &mut stream,
+                        200,
+                        "application/json; charset=utf-8",
+                        json!({ "status": if approved { "approved" } else { "pending" },
+                        "token": if approved { access.token() } else { "" } })
+                        .to_string()
+                        .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await
+                }
+                None => {
+                    write_mobile_response_with_deadline(
+                        &mut stream,
+                        404,
+                        "application/json; charset=utf-8",
+                        json!({ "error": "pairing expired" })
+                            .to_string()
+                            .into_bytes(),
+                        limits.write_deadline,
+                    )
+                    .await
+                }
+            };
+        }
+        _ => {}
+    }
+
     if !is_authorized_mobile_request(&request, access.token()) {
         return write_mobile_response_with_deadline(
             &mut stream,
@@ -953,6 +1185,9 @@ async fn handle_mobile_gateway_client_with_context(
             };
             write_mobile_json_with_deadline(&mut stream, &response, limits.write_deadline).await
         }
+        MobileGatewayRoute::Discover
+        | MobileGatewayRoute::PairRequest
+        | MobileGatewayRoute::PairStatus => unreachable!(),
         MobileGatewayRoute::NotFound => unreachable!("handled above"),
     }
 }
@@ -1014,17 +1249,22 @@ fn validate_mobile_release_batch(batch: &MobileReleaseBatch) -> Result<()> {
         };
         let event = crate::endpoint_payload_to_input_event(request)
             .context("invalid mobile release batch event")?;
-        if !matches!(
-            event,
-            rshare_input::InputEvent::Key {
-                state: rshare_input::ButtonState::Released,
-                ..
-            } | rshare_input::InputEvent::MouseButton {
-                state: rshare_input::ButtonState::Released,
-                ..
-            }
-        ) {
-            bail!("mobile release batch only accepts released key or mouse button events");
+        let gamepad_neutral = matches!(&request.payload,
+            EndpointEventPayload::GamepadState { state } if mobile_gamepad_is_neutral(state)
+        );
+        if !gamepad_neutral
+            && !matches!(
+                event,
+                rshare_input::InputEvent::Key {
+                    state: rshare_input::ButtonState::Released,
+                    ..
+                } | rshare_input::InputEvent::MouseButton {
+                    state: rshare_input::ButtonState::Released,
+                    ..
+                }
+            )
+        {
+            bail!("mobile release batch only accepts released key, mouse button, or neutral gamepad events");
         }
     }
     Ok(())
@@ -1318,20 +1558,132 @@ async fn process_mobile_inject_envelope(
             bail!("mobile envelope only accepts a local InjectEndpointEvent")
         }
     };
-    let result = process_reserved_mobile_request(
-        &envelope.client_id,
-        &session,
-        &sessions.ownership,
-        token,
+    let result = if matches!(&request.payload, EndpointEventPayload::GamepadState { .. }) {
+        process_mobile_gamepad_request(
+            sessions,
+            &envelope.client_id,
+            &session,
+            token,
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            request,
+        )
+        .await
+    } else {
+        process_reserved_mobile_request(
+            &envelope.client_id,
+            &session,
+            &sessions.ownership,
+            token,
+            network_manager,
+            inject_backend,
+            state,
+            local_events_tx,
+            request,
+        )
+        .await
+    };
+    end_mobile_operation(&envelope.client_id, &session, &sessions.ownership, token).await;
+    result
+}
+
+fn validate_mobile_gamepad_state(state: &rshare_core::GamepadState) -> Result<()> {
+    if state.gamepad_id != 0 || state.buttons.len() > 15 {
+        bail!("mobile gamepad supports one device and at most 15 buttons");
+    }
+    let mut seen = HashSet::new();
+    for entry in &state.buttons {
+        if !entry.pressed || !seen.insert(entry.button) {
+            bail!("mobile gamepad buttons must be unique pressed entries");
+        }
+        if matches!(
+            entry.button,
+            rshare_core::GamepadButton::Other(_)
+                | rshare_core::GamepadButton::LeftTrigger
+                | rshare_core::GamepadButton::RightTrigger
+        ) {
+            bail!("unsupported mobile gamepad button");
+        }
+    }
+    Ok(())
+}
+
+fn mobile_gamepad_is_neutral(state: &rshare_core::GamepadState) -> bool {
+    state.buttons.is_empty()
+        && state.left_stick_x == 0
+        && state.left_stick_y == 0
+        && state.right_stick_x == 0
+        && state.right_stick_y == 0
+        && state.left_trigger == 0
+        && state.right_trigger == 0
+}
+
+fn neutral_mobile_gamepad_request() -> EndpointInjectRequest {
+    lease_release_request(
+        "gamepad",
+        EndpointEventKind::Gamepad,
+        EndpointEventPayload::GamepadState {
+            state: rshare_core::GamepadState::neutral(0, 0, mobile_timestamp_ms_now()),
+        },
+    )
+}
+
+async fn process_mobile_gamepad_request(
+    sessions: &MobileClientSessions,
+    client_id: &str,
+    session: &Arc<Mutex<MobileClientSession>>,
+    token: u64,
+    network_manager: &Arc<Mutex<NetworkManager>>,
+    inject_backend: &InputInjectionHandle,
+    daemon_state: &Arc<RwLock<DaemonState>>,
+    local_events_tx: &broadcast::Sender<LocalInputDiagnosticEvent>,
+    request: EndpointInjectRequest,
+) -> Result<EndpointInjectResult> {
+    let EndpointEventPayload::GamepadState { state } = &request.payload else {
+        unreachable!()
+    };
+    if request.device_kind != EndpointEventKind::Gamepad {
+        bail!("gamepad payload requires gamepad device kind");
+    }
+    validate_mobile_gamepad_state(state)?;
+    let neutral = mobile_gamepad_is_neutral(state);
+    let mut owner = sessions.gamepad_owner.lock().await;
+    let now = Instant::now();
+    if let Some(active) = owner.as_ref() {
+        if active.client_id != client_id
+            && now.duration_since(active.last_seen) < MOBILE_GAMEPAD_LEASE
+        {
+            bail!("virtual gamepad is in use by another mobile client");
+        }
+    }
+    if session.lock().await.in_flight != Some(token) {
+        bail!("mobile gamepad request was superseded");
+    }
+    if neutral && owner.is_none() {
+        return Ok(accepted_mobile_noop(&request, inject_backend));
+    }
+    let result = inject_endpoint_event(
         network_manager,
         inject_backend,
-        state,
+        daemon_state,
         local_events_tx,
+        EndpointInjectTarget::Local,
         request,
     )
     .await;
-    end_mobile_operation(&envelope.client_id, &session, &sessions.ownership, token).await;
-    result
+    if result.accepted {
+        *owner = if neutral {
+            None
+        } else {
+            Some(MobileGamepadOwner {
+                client_id: client_id.to_string(),
+                last_seen: Instant::now(),
+            })
+        };
+    }
+    Ok(result)
 }
 
 async fn process_mobile_release_batch(
@@ -1356,18 +1708,33 @@ async fn process_mobile_release_batch(
             } => request,
             _ => unreachable!("release batch was validated before processing"),
         };
-        let result = process_reserved_mobile_request(
-            &batch.client_id,
-            &session,
-            &sessions.ownership,
-            token,
-            network_manager,
-            inject_backend,
-            state,
-            local_events_tx,
-            request,
-        )
-        .await;
+        let result = if matches!(&request.payload, EndpointEventPayload::GamepadState { .. }) {
+            process_mobile_gamepad_request(
+                sessions,
+                &batch.client_id,
+                &session,
+                token,
+                network_manager,
+                inject_backend,
+                state,
+                local_events_tx,
+                request,
+            )
+            .await
+        } else {
+            process_reserved_mobile_request(
+                &batch.client_id,
+                &session,
+                &sessions.ownership,
+                token,
+                network_manager,
+                inject_backend,
+                state,
+                local_events_tx,
+                request,
+            )
+            .await
+        };
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -2112,7 +2479,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
-    html, body { width: 100%; min-height: 100%; margin: 0; overflow: auto; background: #101214; color: #edf2ef; }
+    html, body { width: 100%; min-height: 100%; margin: 0; overflow: auto; background: #0b1513; color: #edf2ef; }
     body { overscroll-behavior: none; touch-action: manipulation; -webkit-touch-callout: none; }
     main { min-height: 100dvh; display: flex; flex-direction: column; gap: 12px; padding: 12px; max-width: 720px; margin: 0 auto; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -2137,7 +2504,54 @@ fn render_mobile_page_with_token(token: &str) -> String {
     input, textarea { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #edf2ef; font-size: 16px; }
     textarea { min-height: 56px; resize: none; line-height: 1.35; }
     .send { width: 58px; background: #47c27a; color: #07110b; border-color: #47c27a; }
+    #modeTabs { display: flex; gap: 8px; }
+    body.android-host #modeTabs { display: none; }
     body.android-host #extendedDisplayLink { display: none; }
+    body.android-host header { display: none; }
+    #modeTabs button { flex: 1; height: 42px; border-radius: 12px; background: #1a2824; }
+    #modeTabs button[aria-selected="true"] { color: #4be0a1; border: 2px solid #43d99b; background: linear-gradient(180deg, #193f31, #143327); font-weight: 700; }
+    #keyboardPanel { display: none; }
+    body.keyboard-mode { height: 100dvh; overflow: hidden; }
+    body.keyboard-mode main { max-width: none; height: 100dvh; min-height: 0; gap: 8px; padding: 8px 10px 10px; overflow: hidden; }
+    body.keyboard-mode main > :not(header):not(#modeTabs):not(#keyboardPanel) { display: none; }
+    body.keyboard-mode header .sub { display: none; }
+    body.keyboard-mode #keyboardPanel { display: flex; flex: 1; flex-direction: column; gap: 7px; min-height: 0; }
+    .keyboardRow { display: flex; flex: 1; min-height: 0; gap: 6px; }
+    .keyboardRow button { flex: 1; min-width: 0; height: auto; padding: 2px; font-size: clamp(11px, 1.75vw, 18px); font-weight: 600; border: 1px solid #3a4b45; border-radius: 10px; background: linear-gradient(160deg, #26332f, #1d2825); color: #f2f7f3; box-shadow: 0 2px 0 #101a17, inset 0 1px rgba(255,255,255,.06); }
+    .keyboardRow button:active { background: #1c4a36; border-color: #42d897; transform: translateY(1px); }
+    .keyboardRow button.wide { flex: 1.65; }
+    .keyboardRow button[data-key="Backspace"] { flex: 2.15; font-size: clamp(10px, 1.3vw, 15px); white-space: nowrap; }
+    .keyboardRow button.space { flex: 5.5; }
+    .keyboardRow button.accent { background: linear-gradient(160deg, #42dda0, #23b978); border-color: #56edb1; color: #092319; }
+    .keyboardRow .numberKey { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; }
+    .keyboardRow .keyHint { font-size: .62em; color: #9eafa5; font-weight: 500; line-height: 1; }
+    @media (max-height: 390px) { body.keyboard-mode main { padding: 4px 8px 6px; gap: 5px; } body.keyboard-mode #keyboardPanel { gap: 4px; } .keyboardRow { gap: 4px; } .keyboardRow button { border-radius: 7px; } }
+    @media (orientation: portrait) { body.keyboard-mode #keyboardPanel { min-height: 300px; } }
+    #gamepadPanel { display: none; }
+    body.gamepad-mode { height: 100dvh; overflow: hidden; }
+    body.gamepad-mode main { max-width: none; height: 100dvh; min-height: 0; gap: 5px; padding: 5px 10px; overflow: hidden; }
+    body.gamepad-mode main > :not(header):not(#modeTabs):not(#gamepadPanel) { display: none; }
+    body.gamepad-mode #gamepadPanel { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 5px; }
+    .gamepadTop { display: grid; grid-template-columns: repeat(4, 1fr) 1.2fr 1.2fr; gap: 6px; }
+    .gamepadTop button, .gamepadCenter button, .gamepadDpad button, .gamepadActions button, .gamepadStickClick { height: 38px; border-radius: 11px; background: #20302c; border-color: #3a5147; font-weight: 700; }
+    .gamepadTop .trigger { background: #263d36; color: #66e2ad; }
+    .gamepadStage { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(90px, .34fr) minmax(0, 1fr); gap: 8px; align-items: center; }
+    .gamepadBank { display: flex; align-items: center; justify-content: space-around; gap: 6px; min-width: 0; }
+    .gamepadCenter { display: flex; flex-direction: column; justify-content: center; gap: 7px; min-width: 0; }
+    .gamepadCenter button { font-size: 11px; height: 34px; }
+    .gamepadStickWrap { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+    .gamepadStick { position: relative; width: min(31dvh, 142px); height: min(31dvh, 142px); min-width: 76px; min-height: 76px; border-radius: 50%; border: 2px solid #416a58; background: radial-gradient(circle, #274238 0%, #182b25 68%, #11211b 100%); box-shadow: inset 0 0 20px #0a1912, 0 3px 12px #050b08; touch-action: none; user-select: none; }
+    .gamepadStick::before, .gamepadStick::after { content: ''; position: absolute; background: rgba(109, 215, 163, .15); pointer-events: none; }
+    .gamepadStick::before { width: 1px; top: 10%; bottom: 10%; left: 50%; }
+    .gamepadStick::after { height: 1px; left: 10%; right: 10%; top: 50%; }
+    .gamepadStickThumb { position: absolute; left: 50%; top: 50%; width: 40%; height: 40%; border-radius: 50%; background: linear-gradient(145deg, #5be0a0, #188458); border: 2px solid #a5ffd0; box-shadow: 0 3px 14px #071b12; transform: translate(-50%, -50%); pointer-events: none; }
+    .gamepadStickClick { width: 80px; height: 28px; font-size: 11px; }
+    .gamepadDpad, .gamepadActions { display: grid; grid-template-columns: repeat(3, 38px); grid-template-rows: repeat(3, 38px); gap: 3px; justify-content: center; align-items: center; }
+    .gamepadDpad button, .gamepadActions button { width: 38px; height: 38px; padding: 0; border-radius: 10px; font-size: 17px; }
+    .gamepadActions button { border-radius: 50%; color: #0c1d15; }
+    .gamepadActions .a { background: #4cde91; }.gamepadActions .b { background: #ee8079; }.gamepadActions .x { background: #7dc6f6; }.gamepadActions .y { background: #f1cc66; }
+    .gamepadHint { font-size: 11px; color: #94b19e; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    @media (max-height: 310px) { .gamepadTop button { height: 30px; } .gamepadDpad, .gamepadActions { grid-template-columns: repeat(3, 30px); grid-template-rows: repeat(3, 30px); } .gamepadDpad button, .gamepadActions button { width: 30px; height: 30px; } .gamepadHint:not(#gamepadStatus) { display: none; } #gamepadStatus { font-size: 10px; } }
   </style>
 </head>
 <body>
@@ -2151,6 +2565,33 @@ fn render_mobile_page_with_token(token: &str) -> String {
     <div class="status" id="status">连接中</div>
   </header>
   <a id="extendedDisplayLink" style="color:#8fe2b3;padding:8px 0">用作扩展显示器</a>
+  <nav id="modeTabs" aria-label="控制模式"><button id="touchModeTab" aria-selected="true">触控板</button><button id="keyboardModeTab" aria-selected="false">独立键盘</button><button id="gamepadModeTab" aria-selected="false">模拟手柄</button></nav>
+  <section id="keyboardPanel" aria-label="独立键盘">
+    <div class="keyboardRow"><button data-key="Escape">Esc</button><button data-raw="192" class="numberKey"><span class="keyHint">~</span>`</button><button data-char="49" class="numberKey"><span class="keyHint">!</span>1</button><button data-char="50" class="numberKey"><span class="keyHint">@</span>2</button><button data-char="51" class="numberKey"><span class="keyHint">#</span>3</button><button data-char="52" class="numberKey"><span class="keyHint">$</span>4</button><button data-char="53" class="numberKey"><span class="keyHint">%</span>5</button><button data-char="54" class="numberKey"><span class="keyHint">^</span>6</button><button data-char="55" class="numberKey"><span class="keyHint">&amp;</span>7</button><button data-char="56" class="numberKey"><span class="keyHint">*</span>8</button><button data-char="57" class="numberKey"><span class="keyHint">(</span>9</button><button data-char="48" class="numberKey"><span class="keyHint">)</span>0</button><button data-raw="189" class="numberKey"><span class="keyHint">_</span>-</button><button data-raw="187" class="numberKey"><span class="keyHint">+</span>=</button><button data-key="Backspace" class="wide">← Backspace</button></div>
+    <div class="keyboardRow"><button data-key="Tab" class="wide">Tab</button><button data-char="81">Q</button><button data-char="87">W</button><button data-char="69">E</button><button data-char="82">R</button><button data-char="84">T</button><button data-char="89">Y</button><button data-char="85">U</button><button data-char="73">I</button><button data-char="79">O</button><button data-char="80">P</button><button data-raw="219">[</button><button data-raw="221">]</button><button data-raw="220">\</button></div>
+    <div class="keyboardRow"><button data-key="CapsLock" class="wide">Caps</button><button data-char="65">A</button><button data-char="83">S</button><button data-char="68">D</button><button data-char="70">F</button><button data-char="71">G</button><button data-char="72">H</button><button data-char="74">J</button><button data-char="75">K</button><button data-char="76">L</button><button data-raw="186">;</button><button data-raw="222">'</button><button data-key="Enter" class="wide accent">Enter</button></div>
+    <div class="keyboardRow"><button data-key="ShiftLeft" class="wide">⇧ Shift</button><button data-char="90">Z</button><button data-char="88">X</button><button data-char="67">C</button><button data-char="86">V</button><button data-char="66">B</button><button data-char="78">N</button><button data-char="77">M</button><button data-raw="188">,</button><button data-raw="190">.</button><button data-raw="191">/</button><button data-key="ShiftRight" class="wide">⇧ Shift</button></div>
+    <div class="keyboardRow"><button data-key="ControlLeft" class="wide">Ctrl</button><button data-key="AltLeft" class="wide">Alt</button><button data-key="SuperLeft">Win</button><button data-key="Space" class="space">Space</button><button data-key="Left">←</button><button data-key="Down">↓</button><button data-key="Up">↑</button><button data-key="Right">→</button></div>
+  </section>
+  <section id="gamepadPanel" aria-label="模拟手柄">
+    <div class="gamepadTop">
+      <button data-gamepad-button="LeftTrigger" class="trigger">LT</button><button data-gamepad-button="LeftBumper">LB</button>
+      <button data-gamepad-button="RightBumper">RB</button><button data-gamepad-button="RightTrigger" class="trigger">RT</button>
+      <button data-gamepad-button="Select">SELECT</button><button data-gamepad-button="Start">START</button>
+    </div>
+    <div class="gamepadStage">
+      <div class="gamepadBank">
+        <div class="gamepadStickWrap"><div id="leftStick" class="gamepadStick" aria-label="左摇杆"><div class="gamepadStickThumb"></div></div><button data-gamepad-button="LeftStick" class="gamepadStickClick">L3</button></div>
+        <div class="gamepadDpad" aria-label="方向键"><span></span><button data-gamepad-button="DPadUp">↑</button><span></span><button data-gamepad-button="DPadLeft">←</button><span></span><button data-gamepad-button="DPadRight">→</button><span></span><button data-gamepad-button="DPadDown">↓</button><span></span></div>
+      </div>
+      <div class="gamepadCenter"><button data-gamepad-button="Guide">HOME</button><div class="gamepadHint" id="gamepadStatus">触碰按键检测手柄连接</div></div>
+      <div class="gamepadBank">
+        <div class="gamepadActions" aria-label="动作键"><span></span><button data-gamepad-button="North" class="y">Y</button><span></span><button data-gamepad-button="West" class="x">X</button><span></span><button data-gamepad-button="East" class="b">B</button><span></span><button data-gamepad-button="South" class="a">A</button><span></span></div>
+        <div class="gamepadStickWrap"><div id="rightStick" class="gamepadStick" aria-label="右摇杆"><div class="gamepadStickThumb"></div></div><button data-gamepad-button="RightStick" class="gamepadStickClick">R3</button></div>
+      </div>
+    </div>
+    <div class="gamepadHint">HID / DirectInput 模式 · 断开后自动释放按键</div>
+  </section>
   <section id="pad"><div class="dot"></div></section>
   <section class="rangeRow">
     <label for="sensitivity">灵敏度</label>
@@ -2211,6 +2652,22 @@ fn render_mobile_page_with_token(token: &str) -> String {
 <script>
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
 document.getElementById("extendedDisplayLink").href = "/display?t=" + encodeURIComponent(token);
+let controlMode = "touch";
+window.rshareSetMode = function(mode) {
+  const next = ["touch", "keyboard", "gamepad"].includes(mode) ? mode : "touch";
+  if (controlMode === "gamepad" && next !== "gamepad") releaseGamepadState();
+  controlMode = next;
+  document.body.classList.toggle("keyboard-mode", next === "keyboard");
+  document.body.classList.toggle("gamepad-mode", next === "gamepad");
+  document.getElementById("touchModeTab").setAttribute("aria-selected", String(next === "touch"));
+  document.getElementById("keyboardModeTab").setAttribute("aria-selected", String(next === "keyboard"));
+  document.getElementById("gamepadModeTab").setAttribute("aria-selected", String(next === "gamepad"));
+};
+window.rshareSetKeyboardMode = (enabled) => window.rshareSetMode(enabled ? "keyboard" : "touch");
+document.getElementById("touchModeTab").addEventListener("click", () => window.rshareSetMode("touch"));
+document.getElementById("keyboardModeTab").addEventListener("click", () => window.rshareSetMode("keyboard"));
+document.getElementById("gamepadModeTab").addEventListener("click", () => window.rshareSetMode("gamepad"));
+window.rshareSetMode(new URLSearchParams(location.search).get("mode") || "touch");
 function newMobileClientId() {
   return crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -2268,7 +2725,8 @@ function clampPointerSensitivity(value) {
 }
 function loadPointerSensitivity() {
   try {
-    return clampPointerSensitivity(localStorage.getItem(POINTER_SENSITIVITY_STORAGE_KEY));
+    const stored = localStorage.getItem(POINTER_SENSITIVITY_STORAGE_KEY);
+    return stored == null ? POINTER_SENSITIVITY_DEFAULT : clampPointerSensitivity(stored);
   } catch {
     return POINTER_SENSITIVITY_DEFAULT;
   }
@@ -2300,7 +2758,7 @@ function trackHeldInputBeforeInject(request) {
   const data = payload?.data || {};
   const state = String(data.state || "").toLowerCase();
   if (state !== "pressed") return;
-  if (kind === "Keyboard" && data.key) heldKeys.add(String(data.key));
+  if (kind === "Keyboard" && data.key) heldKeys.add(typeof data.key === "object" ? JSON.stringify(data.key) : String(data.key));
   if (kind === "MouseButton" && data.button) heldMouseButtons.add(String(data.button));
 }
 function clearReleasedHeldInput(request, accepted) {
@@ -2310,7 +2768,7 @@ function clearReleasedHeldInput(request, accepted) {
   const data = payload?.data || {};
   const state = String(data.state || "").toLowerCase();
   if (state !== "released") return;
-  if (kind === "Keyboard" && data.key) heldKeys.delete(String(data.key));
+  if (kind === "Keyboard" && data.key) heldKeys.delete(typeof data.key === "object" ? JSON.stringify(data.key) : String(data.key));
   if (kind === "MouseButton" && data.button) heldMouseButtons.delete(String(data.button));
 }
 function formatMobileError(error, scope = "移动端") {
@@ -2657,7 +3115,8 @@ function releaseAllRequests(prefix) {
     ...mouseButtons.map(([buttonName, correlationId]) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(correlationId))),
     ...modifierKeys.map(([key, correlationId]) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(correlationId), "BestEffort", 750)),
     ...Array.from(heldMouseButtons).filter((buttonName) => !knownMouseButtons.has(buttonName)).map((buttonName) => daemonRequest("Mouse", { kind: "MouseButton", data: { button: buttonName, state: "Released", x: pointer.x, y: pointer.y } }, cid(`${prefix}-mouse-${buttonName.toLowerCase()}`))),
-    ...Array.from(heldKeys).filter((key) => !knownModifierKeys.has(key)).map((key) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key, state: "Released" } }, cid(`${prefix}-key-${key.toLowerCase()}`), "BestEffort", 750))
+    ...Array.from(heldKeys).filter((key) => !knownModifierKeys.has(key)).map((key) => daemonRequest("Keyboard", { kind: "Keyboard", data: { key: key.startsWith('{') ? JSON.parse(key) : key, state: "Released" } }, cid(`${prefix}-key-${key.toLowerCase()}`), "BestEffort", 750)),
+    ...(gamepadEverActive ? [gamepadNeutralRequest()] : [])
   ];
 }
 async function sendReleaseAll() {
@@ -2667,6 +3126,11 @@ async function sendReleaseAll() {
   const accepted = await enqueueInjectBatchFactory(() => releaseAllRequests("mobile-release-all"), generation);
   if (accepted.length > 0 && accepted.every(Boolean) && resetRevision === heldButtonStateRevision) {
     heldButtonSilentResetters.forEach((reset) => reset());
+    heldGamepadButtons.clear();
+    gamepadSticks.left = { x: 0, y: 0 };
+    gamepadSticks.right = { x: 0, y: 0 };
+    resetGamepadStickVisuals();
+    gamepadEverActive = false;
   }
   return accepted;
 }
@@ -2708,6 +3172,11 @@ function releaseAllWithKeepalive() {
   }
   refreshInFlight = null;
   keepaliveReleaseBatch(releaseAllRequests("mobile-release-all-keepalive"));
+  heldGamepadButtons.clear();
+  gamepadSticks.left = { x: 0, y: 0 };
+  gamepadSticks.right = { x: 0, y: 0 };
+  resetGamepadStickVisuals();
+  gamepadEverActive = false;
 }
 function clearDragTimer() {
   if (dragTimer) {
@@ -3025,6 +3494,134 @@ function attachHeldButton(button, sendState) {
     if (document.visibilityState === "hidden") resetHeldButtonPointerState();
   });
 }
+const heldGamepadButtons = new Set();
+const gamepadSticks = { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } };
+const gamepadStatusEl = document.getElementById("gamepadStatus");
+let gamepadSequence = 0;
+let gamepadEverActive = false;
+let gamepadDirty = false;
+let gamepadFrame = 0;
+let gamepadSending = false;
+let gamepadDriverReady = false;
+function gamepadStateSnapshot() {
+  return {
+    gamepad_id: 0, sequence: ++gamepadSequence, timestamp_ms: Date.now(),
+    buttons: Array.from(heldGamepadButtons).filter((name) => name !== "LeftTrigger" && name !== "RightTrigger").map((button) => ({ button, pressed: true })),
+    left_stick_x: gamepadSticks.left.x, left_stick_y: gamepadSticks.left.y,
+    right_stick_x: gamepadSticks.right.x, right_stick_y: gamepadSticks.right.y,
+    left_trigger: heldGamepadButtons.has("LeftTrigger") ? 65535 : 0,
+    right_trigger: heldGamepadButtons.has("RightTrigger") ? 65535 : 0
+  };
+}
+function gamepadNeutralRequest() {
+  return daemonRequest("Gamepad", { kind: "GamepadState", data: { state: {
+    gamepad_id: 0, sequence: ++gamepadSequence, timestamp_ms: Date.now(), buttons: [],
+    left_stick_x: 0, left_stick_y: 0, right_stick_x: 0, right_stick_y: 0,
+    left_trigger: 0, right_trigger: 0
+  } } }, cid("mobile-gamepad-neutral"), "RequireHealthyBackend", 750);
+}
+function gamepadStateIsNeutral() {
+  return heldGamepadButtons.size === 0 && gamepadSticks.left.x === 0 && gamepadSticks.left.y === 0
+    && gamepadSticks.right.x === 0 && gamepadSticks.right.y === 0;
+}
+async function pumpGamepadState() {
+  if (!gamepadDirty || gamepadSending || inputSuspended || controlMode !== "gamepad") return;
+  gamepadDirty = false;
+  gamepadSending = true;
+  const activeInput = !gamepadStateIsNeutral();
+  const request = daemonRequest("Gamepad", { kind: "GamepadState", data: { state: gamepadStateSnapshot() } },
+    cid("mobile-gamepad-state"), "RequireHealthyBackend", 750);
+  const accepted = await enqueueInject(request);
+  gamepadSending = false;
+  if (activeInput) gamepadDriverReady = accepted;
+  if (!accepted) {
+    gamepadStatusEl.textContent = statusEl.textContent.includes("后端不可用") ?
+      "电脑端手柄驱动未就绪" : (statusEl.textContent || "手柄注入失败");
+  } else if (gamepadDriverReady) {
+    gamepadStatusEl.textContent = "● 手柄输入已就绪";
+  }
+  if (gamepadDirty) scheduleGamepadState();
+}
+function scheduleGamepadState() {
+  gamepadEverActive = true;
+  gamepadDirty = true;
+  if (gamepadFrame) return;
+  gamepadFrame = requestAnimationFrame(() => {
+    gamepadFrame = 0;
+    void pumpGamepadState();
+  });
+}
+function resetGamepadStickVisuals() {
+  document.querySelectorAll(".gamepadStickThumb").forEach((thumb) => {
+    thumb.style.left = "50%";
+    thumb.style.top = "50%";
+  });
+}
+function releaseGamepadState() {
+  heldGamepadButtons.clear();
+  gamepadSticks.left = { x: 0, y: 0 };
+  gamepadSticks.right = { x: 0, y: 0 };
+  resetGamepadStickVisuals();
+  gamepadDirty = false;
+  if (gamepadFrame) {
+    cancelAnimationFrame(gamepadFrame);
+    gamepadFrame = 0;
+  }
+  if (gamepadEverActive && !inputSuspended) void enqueueInject(gamepadNeutralRequest());
+  gamepadEverActive = false;
+}
+function bindGamepadStick(element, side) {
+  let activePointerId = null;
+  const thumb = element.querySelector(".gamepadStickThumb");
+  const update = (event) => {
+    const rect = element.getBoundingClientRect();
+    const radius = Math.min(rect.width, rect.height) * 0.38;
+    const dx = event.clientX - (rect.left + rect.width / 2);
+    const dy = event.clientY - (rect.top + rect.height / 2);
+    const scale = Math.min(1, radius / Math.max(1, Math.hypot(dx, dy)));
+    const normalizedX = Math.max(-1, Math.min(1, dx * scale / radius));
+    const normalizedY = Math.max(-1, Math.min(1, dy * scale / radius));
+    gamepadSticks[side] = { x: Math.round(normalizedX * 32767), y: Math.round(normalizedY * 32767) };
+    thumb.style.left = String(50 + normalizedX * 30) + "%";
+    thumb.style.top = String(50 + normalizedY * 30) + "%";
+    scheduleGamepadState();
+  };
+  element.addEventListener("pointerdown", (event) => {
+    if (activePointerId !== null) return;
+    event.preventDefault();
+    activePointerId = event.pointerId;
+    element.setPointerCapture(event.pointerId);
+    update(event);
+  });
+  element.addEventListener("pointermove", (event) => {
+    if (activePointerId === event.pointerId) update(event);
+  });
+  const release = (event) => {
+    if (activePointerId !== event.pointerId) return;
+    activePointerId = null;
+    gamepadSticks[side] = { x: 0, y: 0 };
+    thumb.style.left = "50%";
+    thumb.style.top = "50%";
+    scheduleGamepadState();
+  };
+  element.addEventListener("pointerup", release);
+  element.addEventListener("pointercancel", release);
+  element.addEventListener("lostpointercapture", release);
+}
+bindGamepadStick(document.getElementById("leftStick"), "left");
+bindGamepadStick(document.getElementById("rightStick"), "right");
+document.querySelectorAll("[data-gamepad-button]").forEach((button) => {
+  attachHeldButton(button, (state) => {
+    if (state === "Pressed") heldGamepadButtons.add(button.dataset.gamepadButton);
+    else heldGamepadButtons.delete(button.dataset.gamepadButton);
+    scheduleGamepadState();
+  });
+});
+setInterval(() => {
+  if (controlMode === "gamepad" && gamepadEverActive && !gamepadStateIsNeutral() && !inputSuspended) {
+    scheduleGamepadState();
+  }
+}, 400);
 document.querySelectorAll("[data-button]").forEach((button) => {
   const name = button.dataset.button;
   const sendButton = (state) => {
@@ -3066,6 +3663,14 @@ document.querySelectorAll("[data-key]").forEach((button) => {
     return sendKeyState(button, "Released");
   });
 });
+document.querySelectorAll("[data-char]").forEach((button) => button.addEventListener("click", () => {
+  const code = Number(button.dataset.char);
+  if (Number.isInteger(code) && code >= 0 && code <= 127) void sendKeyChord([String.fromCharCode(code)]);
+}));
+document.querySelectorAll("[data-raw]").forEach((button) => button.addEventListener("click", () => {
+  const code = Number(button.dataset.raw);
+  if (Number.isInteger(code) && code >= 0) void sendKeyChord([`Raw(${code})`]);
+}));
 document.querySelectorAll("[data-shortcut]").forEach((button) => button.addEventListener("click", () => {
   const keys = String(button.dataset.shortcut || "").split(",").filter(Boolean);
   sendKeyChord(keys);
@@ -3108,6 +3713,46 @@ fn mobile_token_query(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mobile_pairing_requires_desktop_approval_and_matches_requester_ip() {
+        use super::*;
+        let access = MobileGatewayAccess::new(
+            "127.0.0.1:27437".parse().unwrap(),
+            "secret".to_string(),
+            "127.0.0.1".to_string(),
+        );
+        let phone: SocketAddr = "192.168.1.24:40001".parse().unwrap();
+        let other: SocketAddr = "192.168.1.25:40002".parse().unwrap();
+        let id = access.request_pairing("Xiaomi 14 Pro", phone).unwrap();
+        assert_eq!(access.pending_pairings().len(), 1);
+        assert_eq!(access.pairing_status(&id, phone), Some(false));
+        assert_eq!(access.pairing_status(&id, other), None);
+        assert!(access.decide_pairing(&id, true));
+        assert_eq!(access.pairing_status(&id, phone), Some(true));
+        assert!(access.pending_pairings().is_empty());
+        assert!(!access.decide_pairing("missing", true));
+    }
+
+    #[test]
+    fn mobile_pairing_routes_are_explicit() {
+        use super::*;
+        assert_eq!(
+            route_mobile_http_request("GET", "/api/discover"),
+            MobileGatewayRoute::Discover
+        );
+        assert_eq!(
+            route_mobile_http_request("POST", "/api/pair/request"),
+            MobileGatewayRoute::PairRequest
+        );
+        assert_eq!(
+            route_mobile_http_request("GET", "/api/pair/status?request_id=abc"),
+            MobileGatewayRoute::PairStatus
+        );
+        assert_eq!(
+            route_mobile_http_request("GET", "/api/pair/request"),
+            MobileGatewayRoute::NotFound
+        );
+    }
     use super::*;
     use rshare_core::{
         BackendFailureReason, BackendHealth, BackendKind, DeviceId, EndpointEventKind,
@@ -5810,6 +6455,150 @@ mod tests {
         assert!(page.contains("for (const key of [...keys].reverse())"));
         assert!(page.contains("overflow: auto"));
         assert!(page.contains("min-height: 100dvh"));
+    }
+
+    fn gamepad_envelope(
+        client_id: &str,
+        sequence: u64,
+        state: rshare_core::GamepadState,
+    ) -> MobileInjectEnvelope {
+        MobileInjectEnvelope {
+            client_id: client_id.to_string(),
+            sequence,
+            request: DaemonRequest::InjectEndpointEvent {
+                target: EndpointInjectTarget::Local,
+                request: EndpointInjectRequest {
+                    correlation_id: format!("gamepad-{client_id}-{sequence}"),
+                    device_kind: EndpointEventKind::Gamepad,
+                    payload: EndpointEventPayload::GamepadState { state },
+                    mode: EndpointInjectMode::RequireHealthyBackend,
+                    timeout_ms: 750,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mobile_gamepad_has_one_owner_and_expiry_injects_neutral_state() {
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network, backend, events) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: injected.clone(),
+            }));
+        let sessions = MobileClientSessions::new(8, Duration::from_secs(15));
+        let mut pressed = rshare_core::GamepadState::neutral(0, 1, 0);
+        pressed.buttons.push(rshare_core::GamepadButtonState {
+            button: rshare_core::GamepadButton::South,
+            pressed: true,
+        });
+        assert!(
+            process_mobile_inject_envelope(
+                &sessions,
+                &network,
+                &backend,
+                &state,
+                &events,
+                gamepad_envelope("phone-a", 1, pressed.clone()),
+            )
+            .await
+            .unwrap()
+            .accepted
+        );
+        let competing = process_mobile_inject_envelope(
+            &sessions,
+            &network,
+            &backend,
+            &state,
+            &events,
+            gamepad_envelope("phone-b", 1, pressed),
+        )
+        .await
+        .unwrap_err();
+        assert!(competing.to_string().contains("another mobile client"));
+        sessions
+            .gamepad_owner
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .last_seen = Instant::now() - MOBILE_GAMEPAD_LEASE;
+        sessions
+            .reap_expired_at(Instant::now(), &network, &backend, &state, &events)
+            .await;
+        assert!(sessions.gamepad_owner.lock().await.is_none());
+        assert!(matches!(injected.lock().unwrap().last(),
+            Some(InputEvent::GamepadState { state }) if mobile_gamepad_is_neutral(state)));
+    }
+
+    #[test]
+    fn mobile_gamepad_rejects_duplicate_and_unsupported_buttons() {
+        let mut state = rshare_core::GamepadState::neutral(0, 1, 0);
+        state.buttons.push(rshare_core::GamepadButtonState {
+            button: rshare_core::GamepadButton::South,
+            pressed: true,
+        });
+        assert!(validate_mobile_gamepad_state(&state).is_ok());
+        state.buttons.push(state.buttons[0].clone());
+        assert!(validate_mobile_gamepad_state(&state).is_err());
+        state.buttons[1].button = rshare_core::GamepadButton::Other(99);
+        assert!(validate_mobile_gamepad_state(&state).is_err());
+    }
+
+    #[test]
+    fn rendered_mobile_page_has_multitouch_gamepad_and_lifecycle_release() {
+        let page = render_mobile_page();
+        for control in [
+            "leftStick",
+            "rightStick",
+            "DPadUp",
+            "DPadRight",
+            "South",
+            "East",
+            "North",
+            "West",
+            "LeftBumper",
+            "RightBumper",
+            "Start",
+            "Select",
+        ] {
+            assert!(page.contains(control), "missing {control}");
+        }
+        assert!(page.contains("window.rshareSetMode"));
+        assert!(page.contains("setPointerCapture(event.pointerId)"));
+        assert!(page.contains("function releaseGamepadState"));
+        assert!(page.contains("gamepadNeutralRequest"));
+    }
+
+    #[test]
+    fn rendered_mobile_letter_and_symbol_keys_use_string_key_protocol() {
+        let page = render_mobile_page();
+        assert!(page.contains("data-char=\"65\">A</button>"));
+        assert!(page.contains("data-raw=\"192\""));
+        assert!(page.contains("sendKeyChord([String.fromCharCode(code)])"));
+        assert!(page.contains("sendKeyChord([`Raw(${code})`])"));
+
+        let letter: rshare_core::EndpointEventPayload = serde_json::from_value(
+            serde_json::json!({"kind":"Keyboard","data":{"key":"A","state":"Pressed"}}),
+        )
+        .unwrap();
+        let symbol: rshare_core::EndpointEventPayload = serde_json::from_value(
+            serde_json::json!({"kind":"Keyboard","data":{"key":"Raw(192)","state":"Pressed"}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(letter, rshare_core::EndpointEventPayload::Keyboard { key, .. } if key == "A")
+        );
+        assert!(
+            matches!(symbol, rshare_core::EndpointEventPayload::Keyboard { key, .. } if key == "Raw(192)")
+        );
+        assert_eq!(
+            crate::parse_key_code("A").unwrap(),
+            rshare_input::KeyCode::Char(b'A')
+        );
+        assert_eq!(
+            crate::parse_key_code("Raw(192)").unwrap(),
+            rshare_input::KeyCode::Raw(192)
+        );
     }
 
     #[test]

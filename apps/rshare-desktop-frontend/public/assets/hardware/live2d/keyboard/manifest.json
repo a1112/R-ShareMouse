@@ -694,7 +694,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "/",
           "KeypadDivide",
           "Raw(111)"
         ]
@@ -714,7 +713,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "*",
           "KeypadMultiply",
           "Raw(106)"
         ]
@@ -734,7 +732,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "-",
           "KeypadSubtract",
           "Raw(109)"
         ]
@@ -1089,7 +1086,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "7",
           "Keypad7",
           "Raw(103)"
         ]
@@ -1109,7 +1105,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "8",
           "Keypad8",
           "Raw(104)"
         ]
@@ -1129,7 +1124,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "9",
           "Keypad9",
           "Raw(105)"
         ]
@@ -1149,7 +1143,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "+",
           "KeypadAdd",
           "Raw(107)"
         ]
@@ -1426,7 +1419,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "4",
           "Keypad4",
           "Raw(100)"
         ]
@@ -1446,7 +1438,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "5",
           "Keypad5",
           "Raw(101)"
         ]
@@ -1466,7 +1457,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "6",
           "Keypad6",
           "Raw(102)"
         ]
@@ -1486,7 +1476,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "+",
           "KeypadAdd",
           "Raw(107)"
         ]
@@ -1764,7 +1753,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "1",
           "Keypad1",
           "Raw(97)"
         ]
@@ -1784,7 +1772,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "2",
           "Keypad2",
           "Raw(98)"
         ]
@@ -1804,7 +1791,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "3",
           "Keypad3",
           "Raw(99)"
         ]
@@ -1824,9 +1810,8 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "Enter",
           "KeypadEnter",
-          "Raw(13)"
+          "Raw(57372)"
         ]
       },
       "shape": {
@@ -2066,7 +2051,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "0",
           "Keypad0",
           "Raw(96)"
         ]
@@ -2086,7 +2070,6 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          ".",
           "KeypadDecimal",
           "Raw(110)"
         ]
@@ -2106,9 +2089,8 @@
       "action": {
         "kind": "keyboard_key",
         "codes": [
-          "Enter",
           "KeypadEnter",
-          "Raw(13)"
+          "Raw(57372)"
         ]
       },
       "shape": {

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">R-ShareMouse Mobile</string>
+    <string name="connection_title">让手机成为电脑输入设备</string>
+    <string name="connection_hint">自动发现同一局域网内的电脑，在电脑端确认配对后连接。</string>
+    <string name="connection_warning">当前移动网关使用未加密的局域网 HTTP，仅供实验使用。</string>
+    <string name="url_hint">http://192.168.x.x:27437/mobile?t=…</string>
+    <string name="scan_qr">扫描二维码</string>
+    <string name="connect">连接</string>
+    <string name="disconnect">返回</string>
+    <string name="controller_title">移动端控制</string>
+    <string name="invalid_url">请输入有效的局域网移动控制链接，或使用自动发现。</string>
+    <string name="load_error">无法打开控制页面。请检查电脑端网关、同一 Wi-Fi 和访问令牌。</string>
+    <string name="scan_prompt">扫描电脑上的移动端控制二维码</string>
+</resources>

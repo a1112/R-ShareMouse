@@ -441,6 +441,19 @@ pub async fn request_mobile_access() -> Result<MobileAccessSnapshot> {
     }
 }
 
+pub async fn decide_mobile_pairing(request_id: String, approve: bool) -> Result<()> {
+    let request = if approve {
+        DaemonRequest::ApproveMobilePairing { request_id }
+    } else {
+        DaemonRequest::RejectMobilePairing { request_id }
+    };
+    match send_request(request).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
 pub async fn request_usb_devices() -> Result<Vec<UsbDeviceDescriptor>> {
     match send_request(DaemonRequest::ListUsbDevices).await? {
         DaemonResponse::UsbDevices(devices) => Ok(devices),
@@ -729,7 +742,9 @@ mod tests {
 }
 
 /// Query/configure daemon-owned network audio state.
-pub async fn request_network_audio(command: crate::network_audio::AudioCommand) -> Result<crate::network_audio::AudioSnapshot> {
+pub async fn request_network_audio(
+    command: crate::network_audio::AudioCommand,
+) -> Result<crate::network_audio::AudioSnapshot> {
     match send_request(DaemonRequest::NetworkAudio(command)).await? {
         DaemonResponse::NetworkAudio(snapshot) => Ok(snapshot),
         DaemonResponse::Error(error) => anyhow::bail!(error),

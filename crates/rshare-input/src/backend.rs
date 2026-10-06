@@ -300,6 +300,8 @@ impl CaptureBackend for PortableCaptureBackend {
 pub struct PortableInjectBackend {
     emulator: PortableInputEmulator,
     health: BackendHealth,
+    #[cfg(target_os = "windows")]
+    gamepad_driver: Option<rshare_platform::windows::WindowsDriverClient>,
 }
 
 impl PortableInjectBackend {
@@ -311,6 +313,8 @@ impl PortableInjectBackend {
         Ok(Self {
             emulator,
             health: BackendHealth::Healthy,
+            #[cfg(target_os = "windows")]
+            gamepad_driver: None,
         })
     }
 
@@ -406,6 +410,11 @@ impl InjectBackend for PortableInjectBackend {
             anyhow::bail!("Portable inject backend is not active");
         }
 
+        #[cfg(target_os = "windows")]
+        if let Some(result) = dispatch_windows_virtual_gamepad(&mut self.gamepad_driver, &event) {
+            return result;
+        }
+
         let result = self.emulator.emulate(event);
         #[cfg(target_os = "macos")]
         self.record_macos_injection_result(&result);
@@ -440,11 +449,44 @@ impl InjectBackend for PortableInjectBackend {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopPrivilegeBackend;
 
+#[cfg(target_os = "windows")]
+fn dispatch_windows_virtual_gamepad(
+    driver: &mut Option<rshare_platform::windows::WindowsDriverClient>,
+    event: &InputEvent,
+) -> Option<Result<()>> {
+    let neutral;
+    let state = match event {
+        InputEvent::GamepadState { state }
+        | InputEvent::GamepadButton {
+            state_after: state, ..
+        } => state,
+        InputEvent::GamepadDisconnected { gamepad_id } => {
+            neutral = rshare_core::GamepadState::neutral(*gamepad_id, 0, 0);
+            &neutral
+        }
+        InputEvent::GamepadConnected { .. } => return Some(Ok(())),
+        _ => return None,
+    };
+    if driver.is_none() {
+        *driver = match rshare_platform::windows::WindowsDriverClient::open_vhid() {
+            Ok(opened) => Some(opened),
+            Err(error) => return Some(Err(error)),
+        };
+    }
+    Some(
+        driver
+            .as_ref()
+            .expect("virtual HID driver opened")
+            .inject_gamepad_state(state),
+    )
+}
+
 /// Windows-native injection backend adapter.
 #[cfg(target_os = "windows")]
 pub struct WindowsNativeInjectBackend {
     emulator: crate::emulator::WindowsNativeInputEmulator,
     health: BackendHealth,
+    gamepad_driver: Option<rshare_platform::windows::WindowsDriverClient>,
 }
 
 #[cfg(target_os = "windows")]
@@ -457,6 +499,7 @@ impl WindowsNativeInjectBackend {
         Ok(Self {
             emulator,
             health: BackendHealth::Healthy,
+            gamepad_driver: None,
         })
     }
 
@@ -488,6 +531,10 @@ impl InjectBackend for WindowsNativeInjectBackend {
     fn inject(&mut self, event: InputEvent) -> Result<()> {
         if !InputEmulator::is_active(&self.emulator) {
             anyhow::bail!("Windows native inject backend is not active");
+        }
+
+        if let Some(result) = dispatch_windows_virtual_gamepad(&mut self.gamepad_driver, &event) {
+            return result;
         }
 
         InputEmulator::emulate(&mut self.emulator, event)
@@ -643,6 +690,7 @@ impl CaptureDriver for WindowsNativeCaptureDriver {
 pub struct VirtualHidInjectBackend {
     client: rshare_platform::windows::WindowsDriverClient,
     health: BackendHealth,
+    gamepad_supported: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -660,6 +708,7 @@ impl VirtualHidInjectBackend {
         Ok(Self {
             client,
             health: BackendHealth::Healthy,
+            gamepad_supported: capabilities.virtual_gamepad,
         })
     }
 
@@ -756,10 +805,27 @@ impl InjectBackend for VirtualHidInjectBackend {
                 self.client.inject_mouse_wheel(delta_x, delta_y)
             }
             InputEvent::TextCommit { text } => rshare_platform::windows::send_unicode_text(&text),
-            _ => anyhow::bail!(
-                "Virtual HID driver injection does not support {}",
-                event.event_type()
-            ),
+            InputEvent::GamepadState { state }
+            | InputEvent::GamepadButton {
+                state_after: state, ..
+            } => {
+                if !self.gamepad_supported {
+                    anyhow::bail!(
+                        "RShare Virtual HID gamepad unavailable: update the Windows driver"
+                    );
+                }
+                self.client.inject_gamepad_state(&state)
+            }
+            InputEvent::GamepadDisconnected { gamepad_id } => {
+                if !self.gamepad_supported {
+                    anyhow::bail!(
+                        "RShare Virtual HID gamepad unavailable: update the Windows driver"
+                    );
+                }
+                self.client
+                    .inject_gamepad_state(&rshare_core::GamepadState::neutral(gamepad_id, 0, 0))
+            }
+            InputEvent::GamepadConnected { .. } => Ok(()),
         }
     }
 
@@ -1459,6 +1525,29 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_non_hid_backends_dispatch_gamepad_to_virtual_driver() {
+        let state = rshare_core::GamepadState::neutral(0, 1, 0);
+        let mut backends: Vec<Box<dyn InjectBackend>> = vec![
+            Box::new(WindowsNativeInjectBackend::new_for_test().unwrap()),
+            Box::new(PortableInjectBackend::new_for_test().unwrap()),
+        ];
+        for backend in &mut backends {
+            if let Err(error) = backend.inject(InputEvent::GamepadState {
+                state: state.clone(),
+            }) {
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("not supported by this input emulator"),
+                    "{:?} passed gamepad input to its mouse/keyboard emulator: {error}",
+                    backend.kind()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn virtual_hid_backend_declares_text_commit_support_without_requiring_the_driver() {
         let source = include_str!("backend.rs");
         let start = source
@@ -1752,6 +1841,7 @@ mod tests {
             virtual_keyboard: true,
             virtual_mouse: false,
             virtual_gamepad_scaffold: false,
+            virtual_gamepad: false,
             max_event_size: 56,
         };
         let mouse_only = rshare_platform::windows::WindowsDriverCapabilities {
@@ -1761,6 +1851,7 @@ mod tests {
             virtual_keyboard: false,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,
+            virtual_gamepad: false,
             max_event_size: 56,
         };
         let keyboard_and_mouse = rshare_platform::windows::WindowsDriverCapabilities {
@@ -1770,6 +1861,7 @@ mod tests {
             virtual_keyboard: true,
             virtual_mouse: true,
             virtual_gamepad_scaffold: false,
+            virtual_gamepad: false,
             max_event_size: 56,
         };
 

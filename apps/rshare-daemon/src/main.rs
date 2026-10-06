@@ -3,10 +3,10 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
-mod network_audio;
 mod endpoint_runtime;
 mod mobile_gateway;
 mod extended_display;
+mod network_audio;
 mod static_capture;
 
 use anyhow::{Context, Result};
@@ -21,18 +21,18 @@ use rshare_core::{
     DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceCapabilities,
     DeviceCapabilitySnapshot, DeviceId, DisplayCaptureResult, DisplayIdentifyResult, DisplayNode,
     DisplayOperationStatus, DisplaySettingsUpdateResult, EndpointCapabilityKind,
-    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventStore,
-    EndpointInjectError, EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget,
-    FeatureConfig, InputRouter, IpcEnvelopeKind, IpcFrame, IpcFrameCodec, LatencyFeedbackSnapshot,
-    LatencyFeedbackStatus, LayoutGraph, LayoutNode, LocalAudioCaptureSource,
-    LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
+    EndpointCapabilitySnapshot, EndpointEvent, EndpointEventFilter, EndpointEventKind,
+    EndpointEventStore, EndpointInjectError, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, FeatureConfig, InputRouter, IpcEnvelopeKind, IpcFrame, IpcFrameCodec,
+    LatencyFeedbackSnapshot, LatencyFeedbackStatus, LayoutGraph, LayoutNode,
+    LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
     NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
     RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState, UiSnapshot,
-    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    TransportFeedback, UiActiveSessions, UiDeviceMonitorState, UiDynamicState, UiPointerState,
+    UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
@@ -55,7 +55,9 @@ use rshare_daemon::ipc_server::{
     handle_persistent_json_connection_with_first, read_json_request, stream_ui_state,
     ui_state_subscriber_for_request, write_json_response,
 };
-use rshare_daemon::state_aggregator::{StateAggregator, StateAggregatorHandle, UiProjectionSource};
+use rshare_daemon::state_aggregator::{
+    StateAggregator, StateAggregatorHandle, StateChange, UiProjectionSource,
+};
 use rshare_daemon::ui_state_server::{
     run_ui_state_server, LocalControlsFeed, LocalControlsSnapshotFuture,
 };
@@ -832,6 +834,37 @@ impl DaemonState {
         self.local_controls.clone()
     }
 
+    fn device_monitor_state(&self) -> UiDeviceMonitorState {
+        const PER_REMOTE_LIMIT: usize = 32;
+        const TOTAL_REMOTE_LIMIT: usize = 96;
+        let mut per_remote = HashMap::<DeviceId, usize>::new();
+        let mut remote_events = Vec::new();
+        for event in self
+            .endpoint_events
+            .query(&device_monitor_event_filter(None), None, Some(512))
+            .into_iter()
+            .rev()
+        {
+            if event.endpoint_id == self.status.device_id {
+                continue;
+            }
+            let count = per_remote.entry(event.endpoint_id).or_default();
+            if *count >= PER_REMOTE_LIMIT {
+                continue;
+            }
+            *count += 1;
+            remote_events.push(event);
+            if remote_events.len() == TOTAL_REMOTE_LIMIT {
+                break;
+            }
+        }
+        remote_events.reverse();
+        UiDeviceMonitorState {
+            local_controls: self.local_control_snapshot(),
+            remote_events,
+        }
+    }
+
     fn ui_snapshot(&self) -> UiSnapshot {
         let status = self.status_snapshot();
         let diagnostics = status.latency_feedback.clone();
@@ -854,6 +887,7 @@ impl DaemonState {
                 }),
                 gamepads: self.local_controls.gamepads.clone(),
                 diagnostics,
+                device_monitor: self.device_monitor_state(),
                 ..UiDynamicState::default()
             },
             active_sessions: UiActiveSessions {
@@ -2694,6 +2728,19 @@ fn diagnostic_generation_is_current(
     current == Some(subscriber_id.control_connection_id)
 }
 
+fn device_monitor_event_filter(endpoint_id: Option<DeviceId>) -> EndpointEventFilter {
+    EndpointEventFilter {
+        endpoint_id,
+        kinds: vec![
+            EndpointEventKind::Keyboard,
+            EndpointEventKind::Mouse,
+            EndpointEventKind::Gamepad,
+        ],
+        include_loopback: true,
+        ..EndpointEventFilter::default()
+    }
+}
+
 async fn request_remote_endpoint_events(
     network_manager: &Arc<Mutex<NetworkManager>>,
     state: &Arc<RwLock<DaemonState>>,
@@ -4088,6 +4135,12 @@ fn endpoint_payload_to_input_event(request: &EndpointInjectRequest) -> Result<In
                 delta_x, delta_y, ..
             },
         ) => Ok(InputEvent::mouse_wheel(*delta_x, *delta_y)),
+        (
+            rshare_core::EndpointEventKind::Gamepad,
+            rshare_core::EndpointEventPayload::GamepadState { state },
+        ) => Ok(InputEvent::GamepadState {
+            state: state.clone(),
+        }),
         _ => anyhow::bail!(
             "Unsupported endpoint inject event: {:?} {:?}",
             request.device_kind,
@@ -7351,7 +7404,9 @@ async fn main() -> Result<()> {
         ),
         RuntimeFeatureConfig::from_config(&config),
     );
-    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(layout_path.with_file_name("network-audio.json"))));
+    daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(
+        layout_path.with_file_name("network-audio.json"),
+    )));
     let wake_path = layout_path.with_file_name("wake-targets.json");
     daemon_state.wake = Arc::new(Mutex::new(match WakeManager::load(wake_path.clone()) {
         Ok(manager) => manager,
@@ -7669,6 +7724,26 @@ async fn main() -> Result<()> {
         diagnostics_samples,
         ui_network_changes,
     )?;
+    let _device_monitor_task = {
+        let state = state.clone();
+        let ui_state = ui_state.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = ticker.tick() => {
+                        if let Err(error) = publish_device_monitor_if_changed(&state, &ui_state).await {
+                            tracing::warn!("Device monitor UI publication stopped: {error:#}");
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
 
     #[cfg(target_os = "macos")]
     let _injection_status_sync_task = {
@@ -8041,6 +8116,12 @@ async fn main() -> Result<()> {
                             break;
                         }
                         send_layout_sync_to(&network_manager, &id, &layout, revision).await;
+                        request_remote_endpoint_events(
+                            &network_manager,
+                            &state,
+                            &device_monitor_event_filter(Some(id)),
+                        )
+                        .await;
                         if should_advertise_usb {
                             advertise_usb_devices_to(&network_manager, &usb_runtime, id).await;
                         }
@@ -8527,6 +8608,21 @@ fn network_message_may_mutate_ui(message: &Message) -> bool {
     }
 }
 
+async fn publish_device_monitor_if_changed(
+    daemon_state: &Arc<RwLock<DaemonState>>,
+    ui_state: &StateAggregatorHandle,
+) -> Result<bool> {
+    let monitor = daemon_state.read().await.device_monitor_state();
+    if ui_state.latest_snapshot().dynamic_state.device_monitor == monitor {
+        return Ok(false);
+    }
+    ui_state
+        .publish(StateChange::DeviceMonitor(monitor))
+        .await
+        .context("device monitor UI state publisher stopped")?;
+    Ok(true)
+}
+
 async fn reconcile_ui_state_if(state: &StateAggregatorHandle, required: bool) -> Result<()> {
     if required {
         state.reconcile_from_projection().await?;
@@ -8788,12 +8884,18 @@ async fn dispatch_ipc_request(
                 let trusted = match &command {
                     rshare_core::network_audio::AudioCommand::Grant(grant) => {
                         let store = rshare_net::encryption::QuicTrustStore::load_default()?;
-                        store.fingerprint_for(&grant.peer).is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
+                        store
+                            .fingerprint_for(&grant.peer)
+                            .is_some_and(|pin| store.is_operator_approved_exact(grant.peer, pin))
                     }
                     _ => false,
                 };
-                audio.lock().map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?.command(command, trusted)
-            }).await?;
+                audio
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("audio manager lock poisoned"))?
+                    .command(command, trusted)
+            })
+            .await?;
             match result {
                 Ok(snapshot) => DaemonResponse::NetworkAudio(snapshot),
                 Err(error) => DaemonResponse::Error(error.to_string()),
@@ -9023,6 +9125,22 @@ async fn dispatch_ipc_request(
         DaemonRequest::MobileAccess => {
             let state = state.read().await;
             DaemonResponse::MobileAccess(state.mobile_access.snapshot())
+        }
+        DaemonRequest::ApproveMobilePairing { request_id } => {
+            let state = state.read().await;
+            if state.mobile_access.decide_pairing(&request_id, true) {
+                DaemonResponse::Ack
+            } else {
+                DaemonResponse::Error("mobile pairing not found or expired".to_string())
+            }
+        }
+        DaemonRequest::RejectMobilePairing { request_id } => {
+            let state = state.read().await;
+            if state.mobile_access.decide_pairing(&request_id, false) {
+                DaemonResponse::Ack
+            } else {
+                DaemonResponse::Error("mobile pairing not found or expired".to_string())
+            }
         }
         DaemonRequest::InjectEndpointEvent { target, request } => {
             DaemonResponse::EndpointInjectResult(
@@ -12004,6 +12122,63 @@ mod tests {
             events[0].device.attribution,
             rshare_core::DeviceAttribution::Aggregate
         );
+    }
+
+    #[test]
+    fn device_monitor_bounds_remote_input_without_local_event_starvation() {
+        let mut state = test_daemon_state();
+        let remote = DeviceId::new_v4();
+        for _ in 0..40 {
+            let diagnostic = state.record_local_input_event(&rshare_input::InputEvent::key(
+                rshare_input::KeyCode::ShiftLeft,
+                rshare_input::ButtonState::Pressed,
+            ));
+            let event = EndpointEvent::from_local_diagnostic(remote, diagnostic);
+            state.mirror_remote_endpoint_event(remote, event);
+        }
+
+        let monitor = state.device_monitor_state();
+        assert_eq!(monitor.remote_events.len(), 32);
+        assert!(monitor
+            .remote_events
+            .iter()
+            .all(|event| event.endpoint_id == remote));
+        assert_eq!(monitor.local_controls.keyboard.event_count, 40);
+        assert!(!monitor.local_controls.recent_events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_monitor_publishes_only_changed_snapshots() {
+        let state = Arc::new(RwLock::new(test_daemon_state()));
+        let initial = state.read().await.ui_snapshot();
+        let ui_state = StateAggregator::new(initial, 8);
+        assert!(!publish_device_monitor_if_changed(&state, &ui_state)
+            .await
+            .unwrap());
+
+        state
+            .write()
+            .await
+            .record_local_input_event(&rshare_input::InputEvent::key(
+                rshare_input::KeyCode::ShiftLeft,
+                rshare_input::ButtonState::Pressed,
+            ));
+        assert!(publish_device_monitor_if_changed(&state, &ui_state)
+            .await
+            .unwrap());
+        let snapshot = ui_state.wait_for_revision(1).await.unwrap();
+        assert_eq!(
+            snapshot
+                .dynamic_state
+                .device_monitor
+                .local_controls
+                .keyboard
+                .event_count,
+            1
+        );
+        assert!(!publish_device_monitor_if_changed(&state, &ui_state)
+            .await
+            .unwrap());
     }
 
     #[test]

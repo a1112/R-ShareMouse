@@ -72,6 +72,48 @@ test("resolveActiveHardwareRegions matches pressed keyboard codes", () => {
   );
 });
 
+test("canonical wire keys light the correct keyboard regions without keypad collisions", () => {
+  for (const variant of ["", "gaming/"]) {
+    const asset = normalizeHardwareAssetManifest(JSON.parse(readFileSync(new URL(
+      `../../public/assets/hardware/live2d/keyboard/${variant}manifest.json`, import.meta.url,
+    ))));
+    const cases = [[27, "escape"], [65, "char.65"], [49, "char.49"], [13, "enter"],
+      [0xE01C, "keypadenter"], [97, "keypad1"], [160, "shiftleft"], [161, "shiftright"],
+      [162, "controlleft"], [163, "controlright"], [164, "altleft"], [165, "altright"],
+      [91, "superleft"], [92, "superright"], [32, "space"], [186, "raw.186"]];
+    cases.push([8,"backspace"],[9,"tab"],[19,"pause"],[20,"capslock"],[33,"pageup"],[34,"pagedown"],
+      [35,"end"],[36,"home"],[37,"left"],[38,"up"],[39,"right"],[40,"down"],[44,"printscreen"],
+      [45,"insert"],[46,"delete"],[93,"raw.93"],[144,"numlock"],[145,"scrolllock"],
+      [106,"keypadmultiply"],[107,"keypadadd"],[109,"keypadsubtract"],[110,"keypaddecimal"],[111,"keypaddivide"]);
+    for (let code=65; code<=90; code++) cases.push([code, `char.${code}`]);
+    for (let code=48; code<=57; code++) cases.push([code, `char.${code}`]);
+    for (let code=96; code<=105; code++) cases.push([code, `keypad${code-96}`]);
+    for (const code of [186,187,188,189,190,191,192,219,220,221,222]) cases.push([code, `raw.${code}`]);
+    for (let n = 0; n < 12; n++) cases.push([112 + n, `f${n + 1}`]);
+    for (const [code, id] of cases) {
+      const active = resolveActiveHardwareRegions(asset, { pressedKeys: [code] });
+      assert.deepEqual([...new Set(active.map(r => r.id.replace(/\.2$/, "")))], [`key.${id}`], `${variant} wire ${code}`);
+    }
+  }
+});
+
+test("authoritative released state overrides stale keyboard and mouse history", () => {
+  const asset = normalizeHardwareAssetManifest(keyboardManifest);
+  assert.deepEqual(resolveActiveHardwareRegions(asset, {
+    pressedKeys: [], keyboardEvents: [{device_kind: "Keyboard", payload: {key: "KeyA", state: "Pressed"}}],
+  }), []);
+  const mouse = normalizeHardwareAssetManifest({regions: [{id: "left", action: {kind: "mouse_button", buttons: ["Left"]}}]});
+  assert.deepEqual(resolveActiveHardwareRegions(mouse, {pressedButtons: [], recentButtons: ["Left"]}), []);
+});
+
+test("raw gamepad values near zero do not produce full deflection", () => {
+  const feedback = buildGamepadAnalogFeedback({leftStickX: 1, leftStickY: -1, rightTrigger: 1});
+  assert.equal(feedback.leftStick.active, false);
+  assert.equal(feedback.rightTrigger.active, false);
+  assert.ok(feedback.leftStick.x < 0.001);
+  assert.ok(feedback.rightTrigger.value < 0.001);
+});
+
 test("resolveActiveHardwareRegions does not keep released keyboard keys active", () => {
   const asset = normalizeHardwareAssetManifest(
     keyboardManifest,
@@ -96,7 +138,6 @@ test("resolveActiveHardwareRegions does not keep released keyboard keys active",
 
   assert.deepEqual(
     resolveActiveHardwareRegions(asset, {
-      pressedKeys: [],
       keyboardEvents: [
         {
           device_kind: "Keyboard",

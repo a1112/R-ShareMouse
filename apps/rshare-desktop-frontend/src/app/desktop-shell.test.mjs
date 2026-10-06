@@ -126,46 +126,28 @@ test("desktop app routes revisioned state through the selector store without fas
   );
 });
 
-test("remote endpoint event monitoring stays active with a healthy UI-state stream", () => {
+test("device monitoring consumes the UI-state monitor projection", () => {
   const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8").replaceAll("\r\n", "\n");
-  const endpointEffectStart = source.indexOf("useEffect(() => {\n    if (!endpointIds.length)");
-  const endpointEffectEnd = source.indexOf("\n  useEffect(", endpointEffectStart + 1);
-  const endpointEffect = source.slice(endpointEffectStart, endpointEffectEnd);
-
-  assert.notEqual(endpointEffectStart, -1);
-  assert.notEqual(endpointEffectEnd, -1);
-  assert.doesNotMatch(endpointEffect, /uiStreamHealthy/);
-  assert.match(endpointEffect, /endpointEventsStreamCoordinator\.acquire\(\)/);
-  assert.match(endpointEffect, /applyEndpointEvents/);
+  const devicesWrapper = source.slice(
+    source.indexOf("function DevicesPage({"),
+    source.indexOf("function DevicesPageWithLocalControls({"),
+  );
+  assert.match(devicesWrapper, /inputVisuals\.deviceMonitor\?\.remote_events/);
+  assert.match(devicesWrapper, /applyEndpointEvents/);
+  assert.doesNotMatch(source, /localControlsStreamCoordinator\.acquire\(\)/);
+  assert.doesNotMatch(source, /endpointEventsStreamCoordinator\.acquire\(\)/);
 });
 
-test("remote endpoint event stream excludes backend telemetry", () => {
+test("remote input projection excludes backend telemetry", () => {
   const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
-  const coordinatorStart = source.indexOf(
-    "const endpointEventsStreamCoordinator = createOwnerlessStreamCoordinator",
-  );
-  const coordinatorEnd = source.indexOf("\n});", coordinatorStart) + 4;
-  const coordinator = source.slice(coordinatorStart, coordinatorEnd);
-
-  assert.notEqual(coordinatorStart, -1);
-  assert.match(coordinator, /monitoredInputEndpointEventFilter\(null\)/);
-  assert.match(
-    source,
-    /kinds:\s*\["Keyboard",\s*"Mouse",\s*"Gamepad"\]/,
-  );
+  assert.match(source, /remoteEndpointEventsToLocalControlEvents/);
+  assert.doesNotMatch(source, /listenEndpointEvent\(/);
 });
 
-test("remote endpoint event monitoring restarts when peer connectivity changes", () => {
+test("remote event history follows peer connectivity through the UI state", () => {
   const source = fs.readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
-  const keyStart = source.indexOf("const endpointPollKey = [");
-  const keyEnd = source.indexOf("].join(\"|\");", keyStart);
-  const endpointKey = source.slice(keyStart, keyEnd);
-
-  assert.notEqual(keyStart, -1);
-  assert.notEqual(keyEnd, -1);
-  assert.match(endpointKey, /device\.connected/);
-  assert.match(endpointKey, /connected/);
-  assert.match(endpointKey, /offline/);
+  assert.doesNotMatch(source, /endpointPollKey/);
+  assert.match(source, /knownRemoteEndpointIds/);
 });
 
 test("remote latency probe uses the Tauri camelCase device argument", () => {

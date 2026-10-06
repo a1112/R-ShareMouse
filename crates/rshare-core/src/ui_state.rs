@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 use crate::{
     ButtonState, CapabilityRegistrySnapshot, ControlSessionState, DaemonDeviceSnapshot, DeviceId,
-    GamepadButton, KeyState, LatencyFeedbackSnapshot, LayoutGraph, LocalDisplayState,
-    LocalGamepadState, MouseButton, ServiceStatusSnapshot,
+    EndpointEvent, GamepadButton, KeyState, LatencyFeedbackSnapshot, LayoutGraph,
+    LocalControlDeviceSnapshot, LocalDisplayState, LocalGamepadState, MouseButton,
+    ServiceStatusSnapshot,
 };
 
 pub const UI_STATE_PROTOCOL_VERSION: u16 = 1;
@@ -107,6 +108,7 @@ pub enum UiChange {
     Pointer(UiPointerState),
     Gamepads(Vec<LocalGamepadState>),
     KeyButton(UiDiscreteInputState),
+    DeviceMonitor(UiDeviceMonitorState),
     Session(UiActiveSessions),
     Diagnostics(LatencyFeedbackSnapshot),
     MediaSessionUpsert(UiMediaSession),
@@ -127,6 +129,16 @@ pub struct UiDynamicState {
     pub pressed_gamepad_buttons: Vec<UiPressedGamepadButton>,
     #[serde(default)]
     pub diagnostics: LatencyFeedbackSnapshot,
+    #[serde(default)]
+    pub device_monitor: UiDeviceMonitorState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiDeviceMonitorState {
+    #[serde(default)]
+    pub local_controls: LocalControlDeviceSnapshot,
+    #[serde(default)]
+    pub remote_events: Vec<EndpointEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -364,6 +376,9 @@ impl UiView {
             UiChange::Gamepads(gamepads) => self.snapshot.dynamic_state.gamepads = gamepads,
             UiChange::KeyButton(transition) => {
                 apply_discrete_transition(&mut self.snapshot.dynamic_state, transition);
+            }
+            UiChange::DeviceMonitor(monitor) => {
+                self.snapshot.dynamic_state.device_monitor = monitor;
             }
             UiChange::Session(active_sessions) => {
                 if let Err(error) = validate_unique_media_sessions(&active_sessions.media_sessions)
@@ -687,6 +702,21 @@ mod tests {
         assert_eq!(first.revision, 1);
         assert_eq!(second.revision, 2);
         assert_eq!(sequencer.revision(), 2);
+    }
+
+    #[test]
+    fn device_monitor_snapshot_and_delta_preserve_recent_activity() {
+        let mut initial = snapshot(BOOT, 0);
+        let mut monitor = UiDeviceMonitorState::default();
+        monitor.local_controls.keyboard.event_count = 2;
+        initial.dynamic_state.device_monitor = monitor.clone();
+        let mut view = UiView::from_snapshot(initial).unwrap();
+        assert_eq!(view.snapshot().dynamic_state.device_monitor, monitor);
+
+        monitor.local_controls.keyboard.event_count = 3;
+        view.apply(delta(BOOT, 1, UiChange::DeviceMonitor(monitor.clone())))
+            .unwrap();
+        assert_eq!(view.snapshot().dynamic_state.device_monitor, monitor);
     }
 
     #[test]

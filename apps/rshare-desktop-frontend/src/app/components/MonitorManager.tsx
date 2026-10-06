@@ -1245,7 +1245,6 @@ export default function MonitorManager({
   };
 
   /* ---- Monitor fill colors adjusted for theme ---- */
-  const monFill = (color: string) => isDark ? color + "1a" : color + "18";
   const monBorderIdle = (color: string) => isDark ? color + "55" : color + "66";
   const monBorderAdj = (color: string) => isDark ? color + "aa" : color + "bb";
 
@@ -1622,10 +1621,11 @@ export default function MonitorManager({
                       onMouseDown={(e) => handleMouseDown(e, mon.id)}
                       onContextMenu={(e) => { e.stopPropagation(); setSelected(mon.id); }}
                       onClick={(e) => { e.stopPropagation(); setSelected(mon.id); }}
-                      className="absolute rounded-[5px] border-2 transition-shadow duration-150 flex flex-col items-center justify-center"
+                      className="absolute rounded-[8px] border-2 transition-shadow duration-150 flex flex-col items-center justify-center px-3"
                       style={{
                         left: mon.x, top: mon.y, width: mon.w, height: mon.h,
-                        backgroundColor: monFill(mon.color),
+                        backgroundColor: isDark ? "#25313c" : "#edf3fa",
+                        backgroundImage: `linear-gradient(145deg, ${mon.color}${isDark ? "24" : "1c"}, transparent 70%)`,
                         borderColor: isSelected ? t.selectBorder : isDraggingThis ? t.snapColor : isAdj ? monBorderAdj(mon.color) : monBorderIdle(mon.color),
                         cursor: isDraggingThis ? "grabbing" : "grab",
                         zIndex: isDraggingThis ? 15 : isSelected ? 12 : 5,
@@ -1634,22 +1634,21 @@ export default function MonitorManager({
                           : isDraggingThis
                           ? `0 4px 20px ${isDark ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.15)"}`
                           : `0 1px 4px ${isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.08)"}`,
-                        backdropFilter: isDark || dragging || isPanning ? "none" : "blur(2px)",
                         pointerEvents: "auto",
                       }}
                     >
                   <div
-                    className="w-[32px] h-[32px] rounded-full flex items-center justify-center mb-1"
-                    style={{ backgroundColor: mon.color + "33", border: `2px solid ${mon.color}` }}
+                    className="w-[36px] h-[36px] rounded-full flex items-center justify-center mb-2"
+                    style={{ backgroundColor: isDark ? "#1b2730" : "#ffffff", border: `2px solid ${mon.color}`, boxShadow: `0 2px 8px ${mon.color}33` }}
                   >
-                    <span className="text-[14px]" style={{ color: mon.color, fontWeight: 700 }}>{mon.label}</span>
+                    <span className="text-[16px]" style={{ color: mon.color, fontWeight: 700 }}>{mon.label}</span>
                   </div>
-                  <span className="text-[10px] truncate max-w-[90%] text-center" style={{ color: t.textSub }}>{mon.name}</span>
-                  <span className="text-[9px] mt-[2px]" style={{ color: t.textMuted }}>
+                  <span className="w-full truncate text-center text-[12px] font-semibold leading-5" style={{ color: t.text }} title={mon.name}>{mon.name}</span>
+                  <span className="text-[11px] mt-[2px] font-medium" style={{ color: t.textSub }}>
                     {mon.resWidth}×{mon.resHeight}
                   </span>
                   {mon.primary && (
-                    <div className="absolute top-1.5 right-1.5 w-[6px] h-[6px] rounded-full bg-[#d6a64b]" title="主显示器" />
+                    <span className="absolute top-2 right-2 rounded-full px-1.5 py-0.5 text-[9px] font-semibold" style={{ backgroundColor: isDark ? "#493b23" : "#fff0ca", color: isDark ? "#f4ce79" : "#805812" }} title="主显示器">主屏</span>
                   )}
                   {/* Directional move buttons - visible when selected */}
                   {isSelected && !isDraggingThis && (

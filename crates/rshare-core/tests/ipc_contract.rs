@@ -1033,6 +1033,7 @@ async fn mobile_access_request_round_trips_over_json_frames() {
         last_client_addr: Some("192.168.1.80:53120".to_string()),
         last_client_seen_at_ms: Some(1_800_000),
         client_count: 2,
+        pending_pairings: Vec::new(),
     };
     let response = DaemonResponse::MobileAccess(snapshot.clone());
     let (mut writer, mut reader) = duplex(2048);
@@ -1048,6 +1049,23 @@ async fn mobile_access_request_round_trips_over_json_frames() {
     );
     assert_eq!(snapshot.last_client_seen_at_ms, Some(1_800_000));
     assert_eq!(snapshot.client_count, 2);
+}
+
+#[tokio::test]
+async fn mobile_pairing_decision_round_trips_over_json_frames() {
+    for request in [
+        DaemonRequest::ApproveMobilePairing {
+            request_id: "phone-1".to_string(),
+        },
+        DaemonRequest::RejectMobilePairing {
+            request_id: "phone-2".to_string(),
+        },
+    ] {
+        let (mut writer, mut reader) = duplex(2048);
+        write_json_frame(&mut writer, &request).await.unwrap();
+        let decoded: DaemonRequest = read_json_frame(&mut reader).await.unwrap();
+        assert_eq!(decoded, request);
+    }
 }
 
 #[test]

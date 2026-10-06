@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:fitsSystemWindows="true" android:background="#0B1513">
+    <ScrollView android:id="@+id/connection_view" android:layout_width="match_parent"
+        android:layout_height="match_parent" android:fillViewport="true">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical" android:paddingStart="24dp" android:paddingEnd="24dp"
+            android:paddingTop="30dp" android:paddingBottom="28dp">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:gravity="center_vertical" android:orientation="horizontal">
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:text="R" android:textColor="#43D99B" android:textSize="23sp" android:textStyle="bold" />
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:text="-ShareMouse" android:textColor="#F1F5F2"
+                    android:textSize="23sp" android:textStyle="bold" />
+                <TextView android:id="@+id/settings_button" android:layout_width="42dp" android:layout_height="42dp"
+                    android:gravity="center" android:text="⚙" android:textColor="#C5D4CC"
+                    android:textSize="24sp" android:contentDescription="连接设置" />
+            </LinearLayout>
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="让手机成为你的电脑输入设备" android:textColor="#9EAEA5" android:textSize="14sp" />
+            <TextView android:id="@+id/discovery_title" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="52dp"
+                android:text="发现电脑" android:textColor="#F2F7F3" android:textSize="32sp" android:textStyle="bold" />
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp" android:text="在同一局域网内发现以下电脑"
+                android:textColor="#A9BAB0" android:textSize="15sp" />
+            <TextView android:id="@+id/discovery_status" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="20dp"
+                android:accessibilityLiveRegion="polite" android:text="正在搜索同一局域网内的电脑…"
+                android:textColor="#A3B7AB" android:textSize="13sp" />
+            <LinearLayout android:id="@+id/discovered_hosts" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="12dp" android:orientation="vertical" />
+            <Button android:id="@+id/refresh_button" android:layout_width="match_parent"
+                android:layout_height="48dp" android:layout_marginTop="14dp"
+                android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                android:text="重新搜索" android:textAllCaps="false" android:textColor="#BFEBD1" />
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="34dp" android:gravity="center_vertical" android:orientation="horizontal">
+                <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1" android:background="#365047" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:paddingStart="16dp" android:paddingEnd="16dp" android:text="或"
+                    android:textColor="#82998C" android:textSize="14sp" />
+                <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1" android:background="#365047" />
+            </LinearLayout>
+            <Button android:id="@+id/manual_toggle" android:layout_width="match_parent"
+                android:layout_height="54dp" android:layout_marginTop="24dp"
+                android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                android:text="＋  手动连接电脑" android:textAllCaps="false"
+                android:textColor="#F0F7F2" android:textSize="16sp" />
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="10dp" android:gravity="center"
+                android:text="输入电脑上的移动控制链接" android:textColor="#91A499" android:textSize="13sp" />
+            <LinearLayout android:id="@+id/manual_section" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="16dp"
+                android:orientation="vertical" android:visibility="gone">
+                <EditText android:id="@+id/url_input" android:layout_width="match_parent"
+                    android:layout_height="52dp" android:background="@drawable/mobile_input_background"
+                    android:hint="@string/url_hint" android:inputType="textUri" android:paddingStart="16dp"
+                    android:paddingEnd="16dp" android:singleLine="true" android:textColor="#F0F7F2"
+                    android:textColorHint="#81968A" android:textSize="14sp" />
+                <Button android:id="@+id/connect_button" android:layout_width="match_parent"
+                    android:layout_height="52dp" android:layout_marginTop="10dp"
+                    android:background="@drawable/mobile_primary_button" android:backgroundTint="@null"
+                    android:text="@string/connect" android:textAllCaps="false" android:textColor="#082018"
+                    android:textSize="16sp" android:textStyle="bold" />
+                <Button android:id="@+id/scan_button" android:layout_width="match_parent"
+                    android:layout_height="48dp" android:layout_marginTop="8dp"
+                    android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                    android:text="@string/scan_qr" android:textAllCaps="false" android:textColor="#C5E8D1" />
+                <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp" android:text="@string/connection_warning"
+                    android:textColor="#B8A978" android:textSize="12sp" />
+            </LinearLayout>
+            <TextView android:id="@+id/feedback_text" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="18dp"
+                android:accessibilityLiveRegion="polite" android:textColor="#E9BE76" android:textSize="14sp" />
+        </LinearLayout>
+    </ScrollView>
+    <LinearLayout android:id="@+id/controller_view" android:layout_width="match_parent"
+        android:layout_height="match_parent" android:orientation="vertical" android:visibility="gone">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="58dp"
+            android:gravity="center_vertical" android:orientation="horizontal"
+            android:paddingStart="8dp" android:paddingEnd="16dp">
+            <Button android:id="@+id/disconnect_button" android:layout_width="50dp"
+                android:layout_height="48dp" android:backgroundTint="#172723"
+                android:contentDescription="返回发现电脑" android:text="‹"
+                android:textColor="#EDF6F0" android:textSize="28sp" />
+            <ImageView android:layout_width="38dp" android:layout_height="38dp"
+                android:background="@drawable/mobile_device_tile" android:padding="7dp"
+                android:src="@drawable/mobile_desktop_icon" android:contentDescription="电脑" />
+            <TextView android:id="@+id/controller_host" android:layout_width="0dp"
+                android:layout_height="wrap_content" android:layout_weight="1" android:ellipsize="end"
+                android:maxLines="1" android:paddingStart="12dp" android:text="@string/controller_title"
+                android:textColor="#EFF5F1" android:textSize="17sp" android:textStyle="bold" />
+            <TextView android:id="@+id/controller_connection_status" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="● 连接中"
+                android:textColor="#92AE9C" android:textSize="13sp" />
+        </LinearLayout>
+        <LinearLayout android:layout_width="match_parent" android:layout_height="46dp"
+            android:layout_marginStart="12dp" android:layout_marginEnd="12dp"
+            android:layout_marginBottom="6dp" android:orientation="horizontal">
+            <Button android:id="@+id/touch_mode_button" android:layout_width="0dp"
+                android:layout_height="match_parent" android:layout_weight="1"
+                android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                android:text="触控板" android:textAllCaps="false" android:textColor="#B3C8BB" />
+            <View android:layout_width="8dp" android:layout_height="match_parent" />
+            <Button android:id="@+id/keyboard_mode_button" android:layout_width="0dp"
+                android:layout_height="match_parent" android:layout_weight="1"
+                android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                android:text="⌨  独立键盘" android:textAllCaps="false" android:textColor="#B3C8BB" />
+            <View android:layout_width="8dp" android:layout_height="match_parent" />
+            <Button android:id="@+id/gamepad_mode_button" android:layout_width="0dp"
+                android:layout_height="match_parent" android:layout_weight="1"
+                android:background="@drawable/mobile_outline_button" android:backgroundTint="@null"
+                android:text="🎮  模拟手柄" android:textAllCaps="false" android:textColor="#B3C8BB" />
+        </LinearLayout>
+        <WebView android:id="@+id/controller_webview" android:layout_width="match_parent"
+            android:layout_height="0dp" android:layout_weight="1" />
+    </LinearLayout>
+</FrameLayout>

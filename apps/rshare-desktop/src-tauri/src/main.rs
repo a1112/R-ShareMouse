@@ -461,6 +461,13 @@ async fn mobile_access() -> Result<MobileAccessSnapshot, String> {
 }
 
 #[tauri::command]
+async fn decide_mobile_pairing(request_id: String, approve: bool) -> Result<(), String> {
+    daemon_client::decide_mobile_pairing(request_id, approve)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn capture_display_binary(
     display_id: String,
     max_width: Option<u32>,
@@ -1170,6 +1177,7 @@ fn main() {
             wake_attempt,
             local_controls_state,
             mobile_access,
+            decide_mobile_pairing,
             capture_display_binary,
             identify_displays,
             update_display_settings,
@@ -2754,6 +2762,10 @@ mod tests {
 }
 
 #[tauri::command]
-async fn network_audio(command: rshare_core::network_audio::AudioCommand) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
-    daemon_client::request_network_audio(command).await.map_err(|e| e.to_string())
+async fn network_audio(
+    command: rshare_core::network_audio::AudioCommand,
+) -> Result<rshare_core::network_audio::AudioSnapshot, String> {
+    daemon_client::request_network_audio(command)
+        .await
+        .map_err(|e| e.to_string())
 }

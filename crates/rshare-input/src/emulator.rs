@@ -184,6 +184,10 @@ impl EnigoInputEmulator {
             KeyCode::PageDown => EKey::PageDown,
             KeyCode::Insert => return None,
             KeyCode::Delete => EKey::Delete,
+            #[cfg(target_os = "windows")]
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                EKey::Other(c.to_ascii_uppercase() as u32)
+            }
             KeyCode::Char(c) => EKey::Unicode(c as char),
             _ => return None,
         })
@@ -1149,6 +1153,17 @@ mod tests {
             EnigoInputEmulator::convert_keycode(KeyCode::Enter),
             Some(Key::Return)
         );
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                EnigoInputEmulator::convert_keycode(KeyCode::Char(b'A')),
+                Some(Key::Other(0x41))
+            );
+            assert_eq!(
+                EnigoInputEmulator::convert_keycode(KeyCode::Char(b'1')),
+                Some(Key::Other(0x31))
+            );
+        }
         // Enigo has no reliable press/release contract for canonical raw
         // punctuation here, so the portable fallback reports it unsupported.
         assert_eq!(

@@ -9,9 +9,9 @@ use futures_util::future::BoxFuture;
 use rshare_core::{
     ButtonState, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DeviceId, KeyState,
     LatencyFeedbackSnapshot, LayoutGraph, LocalDisplayState, LocalGamepadState,
-    ServiceStatusSnapshot, UiActiveSessions, UiChange, UiCursor, UiDelta, UiDiscreteInputState,
-    UiEnvelope, UiMediaSession, UiPointerState, UiResyncReason, UiRevisionSequencer, UiSnapshot,
-    UiView, UI_STATE_PROTOCOL_VERSION,
+    ServiceStatusSnapshot, UiActiveSessions, UiChange, UiCursor, UiDelta, UiDeviceMonitorState,
+    UiDiscreteInputState, UiEnvelope, UiMediaSession, UiPointerState, UiResyncReason,
+    UiRevisionSequencer, UiSnapshot, UiView, UI_STATE_PROTOCOL_VERSION,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -39,6 +39,7 @@ pub enum StateChange {
     Topology(LayoutGraph),
     DisplayInventory(LocalDisplayState),
     KeyButton(UiDiscreteInputState),
+    DeviceMonitor(UiDeviceMonitorState),
     Session(UiActiveSessions),
     Diagnostics(LatencyFeedbackSnapshot),
     MediaSessionUpsert(UiMediaSession),
@@ -55,6 +56,7 @@ impl StateChange {
             Self::Topology(value) => UiChange::Topology(value),
             Self::DisplayInventory(value) => UiChange::DisplayInventory(value),
             Self::KeyButton(value) => UiChange::KeyButton(value),
+            Self::DeviceMonitor(value) => UiChange::DeviceMonitor(value),
             Self::Session(value) => UiChange::Session(value),
             Self::Diagnostics(value) => UiChange::Diagnostics(value),
             Self::MediaSessionUpsert(value) => UiChange::MediaSessionUpsert(value),
@@ -843,6 +845,11 @@ impl AggregatorActor {
         }
         if current.dynamic_state.gamepads != snapshot.dynamic_state.gamepads {
             self.emit_realtime(UiChange::Gamepads(snapshot.dynamic_state.gamepads.clone()))?;
+        }
+        if current.dynamic_state.device_monitor != snapshot.dynamic_state.device_monitor {
+            self.emit_reliable(UiChange::DeviceMonitor(
+                snapshot.dynamic_state.device_monitor.clone(),
+            ))?;
         }
         if self.view.snapshot().dynamic_state.diagnostics != snapshot.dynamic_state.diagnostics {
             self.emit_reliable(UiChange::Diagnostics(

@@ -69,6 +69,7 @@ static void print_usage(void)
     wprintf(L"  rshare-driver-probe filter watch-mouse [timeout_seconds]\n");
     wprintf(L"  rshare-driver-probe vhid status\n");
     wprintf(L"  rshare-driver-probe vhid inject-smoke\n");
+    wprintf(L"  rshare-driver-probe vhid gamepad-smoke\n");
     wprintf(L"  rshare-driver-probe vdisplay status\n");
     wprintf(L"  rshare-driver-probe vdisplay create [width height refresh_millihz]\n");
     wprintf(L"  rshare-driver-probe vdisplay remove\n");
@@ -538,6 +539,44 @@ static int probe_vhid(BOOL inject_smoke)
     return 0;
 }
 
+static int probe_vhid_gamepad(void)
+{
+    HANDLE device = open_device(L"\\\\.\\RShareVirtualHidControl", L"vhid");
+    DWORD returned = 0;
+    RSHARE_DRIVER_CAPABILITIES capabilities = {0};
+    RSHARE_GAMEPAD_STATE state = {0};
+    if (device == INVALID_HANDLE_VALUE) return 7;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_QUERY_CAPABILITIES, NULL, 0,
+                         &capabilities, sizeof(capabilities), &returned, NULL) ||
+        (capabilities.Flags & RSHARE_CAP_VIRTUAL_GAMEPAD) == 0) {
+        wprintf(L"vhid gamepad capability unavailable; update the RShare VHF driver\n");
+        CloseHandle(device);
+        return 22;
+    }
+    state.Abi = RSHARE_DRIVER_ABI;
+    state.Buttons = 1; // South / A
+    state.LeftX = 16384;
+    state.Hat = 8;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_GAMEPAD_STATE, &state, sizeof(state),
+                         NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid gamepad press failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 23;
+    }
+    Sleep(100);
+    state.Buttons = 0;
+    state.LeftX = 0;
+    if (!DeviceIoControl(device, IOCTL_RSHARE_INJECT_GAMEPAD_STATE, &state, sizeof(state),
+                         NULL, 0, &returned, NULL)) {
+        wprintf(L"vhid gamepad release failed: %lu\n", GetLastError());
+        CloseHandle(device);
+        return 24;
+    }
+    printf("vhid gamepad smoke ok\n");
+    CloseHandle(device);
+    return 0;
+}
+
 static const char* vdisplay_activity_name(USHORT activity)
 {
     switch (activity) {
@@ -718,6 +757,9 @@ int wmain(int argc, wchar_t** argv)
             }
             if (wcscmp(argv[2], L"inject-smoke") == 0) {
                 return probe_vhid(TRUE);
+            }
+            if (wcscmp(argv[2], L"gamepad-smoke") == 0) {
+                return probe_vhid_gamepad();
             }
             print_usage();
             return 1;

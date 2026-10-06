@@ -1,3 +1,4 @@
+import { wireKeyName, inputButtonName } from "./input-feedback.mjs";
 import qrcode from "qrcode-generator";
 
 const DEVICE_COLORS = ["#5b8bd6", "#49b35c", "#d6a64b", "#9b6ef3", "#e56b6f"];
@@ -2118,7 +2119,7 @@ function uniqueGamepadButtonNames(values) {
 
 function pressedGamepadButtonNames(gamepad) {
   const pressedButtons = uniqueGamepadButtonNames(gamepad?.pressed_buttons);
-  if (pressedButtons.length) {
+  if (Array.isArray(gamepad?.pressed_buttons)) {
     return pressedButtons;
   }
   return uniqueGamepadButtonNames(
@@ -2642,7 +2643,8 @@ export function buildDeviceGalleryItems(snapshot, audioOutputs = [], remoteDevic
       metric: `${Number(snapshot?.mouse?.event_count ?? 0)} 次`,
       activity: {
         pressedButtons: snapshot?.mouse?.pressed_buttons ?? [],
-        recentButtons: recentMouseButtons(snapshot),
+        recentButtons: snapshot?.mouse?.pressed_buttons ?? [],
+        wheelSequence: [...(snapshot?.recent_events ?? [])].reverse().find((event) => event.device_kind === "Mouse" && event.event_kind === "wheel")?.sequence ?? null,
         x: Number(snapshot?.mouse?.x ?? 0),
         y: Number(snapshot?.mouse?.y ?? 0),
         wheelDeltaX: Number(snapshot?.mouse?.wheel_delta_x ?? 0),
@@ -3172,59 +3174,70 @@ export function projectUiInputToLocalControls(
   if (!authoritative) {
     return fallback;
   }
+  const monitorControls = input?.deviceMonitor?.local_controls ?? fallback;
   const pointer = input?.pointer;
   const displayInventory = topology?.displayInventory ?? {};
   return {
-    ...(fallback ?? {}),
+    ...(monitorControls ?? {}),
     sequence: Math.max(
-      Number(fallback?.sequence ?? 0),
+      Number(monitorControls?.sequence ?? 0),
       Number(pointer?.observed_at_ms ?? 0),
     ),
     keyboard: {
-      ...(fallback?.keyboard ?? {}),
+      ...(monitorControls?.keyboard ?? {}),
       detected: Boolean(
-        fallback?.keyboard?.detected ||
+        monitorControls?.keyboard?.detected ||
           input?.pressedKeys?.length ||
           input?.lastDiscreteTransition?.type === "key",
       ),
-      event_count: Number(fallback?.keyboard?.event_count ?? 0),
-      capture_source: fallback?.keyboard?.capture_source ?? "ui-state",
-      pressed_keys: (input?.pressedKeys ?? []).map(String),
+      event_count: Number(monitorControls?.keyboard?.event_count ?? 0),
+      capture_source: monitorControls?.keyboard?.capture_source ?? "ui-state",
+      pressed_keys: (input?.pressedKeys ?? []).map(wireKeyName),
     },
     mouse: {
-      ...(fallback?.mouse ?? {}),
+      ...(monitorControls?.mouse ?? {}),
       detected: Boolean(
-        fallback?.mouse?.detected ||
+        monitorControls?.mouse?.detected ||
           pointer ||
           input?.pressedMouseButtons?.length ||
           ["mouse_button", "wheel"].includes(
             input?.lastDiscreteTransition?.type,
           ),
       ),
-      x: Number(pointer?.x ?? fallback?.mouse?.x ?? 0),
-      y: Number(pointer?.y ?? fallback?.mouse?.y ?? 0),
-      event_count: Number(fallback?.mouse?.event_count ?? 0),
-      capture_source: fallback?.mouse?.capture_source ?? "ui-state",
-      pressed_buttons: input?.pressedMouseButtons ?? [],
+      x: Number(pointer?.x ?? monitorControls?.mouse?.x ?? 0),
+      y: Number(pointer?.y ?? monitorControls?.mouse?.y ?? 0),
+      event_count: Number(monitorControls?.mouse?.event_count ?? 0),
+      capture_source: monitorControls?.mouse?.capture_source ?? "ui-state",
+      pressed_buttons: (input?.pressedMouseButtons ?? []).map(inputButtonName),
       current_display_id:
-        pointer?.display_id ?? fallback?.mouse?.current_display_id ?? null,
+        pointer?.display_id ?? monitorControls?.mouse?.current_display_id ?? null,
     },
-    gamepads: input?.gamepads ?? fallback?.gamepads ?? [],
+    gamepads: (input?.gamepads ?? monitorControls?.gamepads ?? []).map((gamepad) => {
+      if (!Array.isArray(input?.pressedGamepadButtons)) return gamepad;
+      const pressed = input.pressedGamepadButtons
+        .filter((entry) => entry.gamepad_id === gamepad.gamepad_id && gamepad.connected !== false)
+        .map((entry) => entry.button);
+      return {
+        ...gamepad,
+        pressed_buttons: pressed.map(inputButtonName),
+        buttons: pressed.map((button) => ({ button, pressed: true })),
+      };
+    }),
     display: {
-      ...(fallback?.display ?? {}),
+      ...(monitorControls?.display ?? {}),
       ...displayInventory,
       displays:
-        displayInventory.displays ?? fallback?.display?.displays ?? [],
+        displayInventory.displays ?? monitorControls?.display?.displays ?? [],
       display_count: Number(
         displayInventory.display_count ??
           displayInventory.displays?.length ??
-          fallback?.display?.display_count ??
+          monitorControls?.display?.display_count ??
           0,
       ),
     },
-    capture_backend: fallback?.capture_backend ?? {},
-    inject_backend: fallback?.inject_backend ?? {},
-    virtual_gamepad: fallback?.virtual_gamepad ?? {
+    capture_backend: monitorControls?.capture_backend ?? {},
+    inject_backend: monitorControls?.inject_backend ?? {},
+    virtual_gamepad: monitorControls?.virtual_gamepad ?? {
       status: "unknown",
       detail: "由 UI state 流提供实时输入状态",
     },

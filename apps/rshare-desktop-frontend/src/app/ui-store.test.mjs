@@ -12,6 +12,8 @@ import {
   selectTopologyProjection,
 } from "./ui-store.mjs";
 import { UiStateClient } from "./ui-state-client.mjs";
+import { readFileSync } from "node:fs";
+import { normalizeHardwareAssetManifest, resolveActiveHardwareRegions } from "./hardware-assets.mjs";
 import { createUseUiStore } from "./use-ui-store.ts";
 import {
   buildDesktopViewModel,
@@ -163,6 +165,24 @@ test("continuous gamepad deltas use the latest pending slot", () => {
   assert.equal(frames.size, 1);
   frames.flush();
   assert.equal(selectInputVisuals(store.getState()).gamepads[0].left_stick_x, 99);
+});
+
+test("device monitor snapshot and delta update local and remote activity", () => {
+  const store = createUiStore();
+  const initial = snapshot();
+  initial.dynamic_state.device_monitor = {
+    local_controls: { keyboard: { event_count: 2 }, recent_events: [] },
+    remote_events: [],
+  };
+  store.applySnapshot(initial);
+  assert.equal(selectInputVisuals(store.getState()).deviceMonitor.local_controls.keyboard.event_count, 2);
+
+  store.applyEnvelope(delta(1, "device_monitor", {
+    local_controls: { keyboard: { event_count: 3 }, recent_events: [{ sequence: 3, device_kind: "Keyboard" }] },
+    remote_events: [{ event_id: 7, endpoint_id: "peer-1", kind: "Keyboard" }],
+  }));
+  assert.equal(selectInputVisuals(store.getState()).deviceMonitor.local_controls.keyboard.event_count, 3);
+  assert.equal(selectInputVisuals(store.getState()).deviceMonitor.remote_events[0].event_id, 7);
 });
 
 test("a pending pointer commit cannot roll revision back after a discrete delta", () => {
@@ -594,11 +614,35 @@ test("UI input slice projects into local visuals without mutating fallback truth
 
   assert.equal(projected.mouse.x, 80);
   assert.equal(projected.mouse.current_display_id, "display-1");
-  assert.deepEqual(projected.keyboard.pressed_keys, ["30"]);
+  assert.deepEqual(projected.keyboard.pressed_keys, ["Raw(30)"]);
   assert.equal(projected.keyboard.detected, true);
   assert.equal(projected.gamepads[0].name, "Pad");
   assert.equal(projected.display.display_count, 1);
   assert.equal(fallback.mouse.x, 1);
+});
+
+test("UI state key and mouse transitions drive hardware feedback and clear after release", () => {
+  const store = createUiStore();
+  store.applyEnvelope(envelope("snapshot", snapshot()));
+  const asset = kind => normalizeHardwareAssetManifest(JSON.parse(readFileSync(new URL(`../../public/assets/hardware/live2d/${kind}/manifest.json`, import.meta.url))));
+  const keyboard = asset("keyboard"), mouse = asset("mouse");
+  let revision = 0;
+  const send = transition => store.applyEnvelope(delta(++revision, "key_button", transition));
+  const controls = () => projectUiInputToLocalControls(store.getState().inputVisuals, store.getState().topology);
+  for (const key_code of [162, 65, 57372]) send({type: "key", key_code, state: "Pressed"});
+  const regions = () => resolveActiveHardwareRegions(keyboard, {pressedKeys: controls().keyboard.pressed_keys}).map(r => r.id);
+  assert.deepEqual(regions().sort(), ["key.char.65", "key.controlleft", "key.keypadenter", "key.keypadenter.2"].sort());
+  send({type: "key", key_code: 65, state: "Released"});
+  assert.equal(regions().includes("key.char.65"), false);
+  assert.equal(regions().includes("key.controlleft"), true);
+  for (const key_code of [162, 57372]) send({type: "key", key_code, state: "Released"});
+  assert.deepEqual(regions(), []);
+  for (const [button, id] of [["Left", "left"], ["Right", "right"], ["Middle", "middle"], ["Back", "back"], ["Forward", "forward"], [{Other: 4}, "back"]]) {
+    send({type: "mouse_button", button, state: "Pressed"});
+    assert.deepEqual(resolveActiveHardwareRegions(mouse, {pressedButtons: controls().mouse.pressed_buttons}).map(r=>r.id), [`mouse.${id}`]);
+    send({type: "mouse_button", button, state: "Released"});
+    assert.deepEqual(resolveActiveHardwareRegions(mouse, {pressedButtons: controls().mouse.pressed_buttons}), []);
+  }
 });
 
 test("UI input projection does not invent keyboard or mouse detection", () => {
@@ -617,6 +661,54 @@ test("UI input projection does not invent keyboard or mouse detection", () => {
 
   assert.equal(projected.keyboard.detected, false);
   assert.equal(projected.mouse.detected, false);
+});
+
+test("reliable gamepad button state overrides a delayed analog snapshot", () => {
+  const store = createUiStore();
+  const initial = snapshot();
+  initial.dynamic_state.gamepads = [{gamepad_id: 1, connected: true, pressed_buttons: [], buttons: []}];
+  store.applyEnvelope(envelope("snapshot", initial));
+  const asset = normalizeHardwareAssetManifest(JSON.parse(readFileSync(new URL("../../public/assets/hardware/live2d/gamepad/manifest.json", import.meta.url))));
+  let revision = 0;
+  const cases = [["South", "button.a"], ["East", "button.b"], ["West", "button.x"], ["North", "button.y"],
+    ["DPadUp", "dpad.up"], ["DPadDown", "dpad.down"], ["DPadLeft", "dpad.left"], ["DPadRight", "dpad.right"],
+    ["LeftBumper", "bumper.left"], ["RightBumper", "bumper.right"], ["LeftTrigger", "trigger.left"], ["RightTrigger", "trigger.right"],
+    ["LeftStick", "stick.left"], ["RightStick", "stick.right"], ["Select", "button.select"], ["Start", "button.start"], ["Guide", "button.guide"]];
+  for (const [button, region] of cases) {
+    for (const state of ["Pressed", "Released"]) {
+      store.applyEnvelope(delta(++revision, "key_button", {type: "gamepad_button", gamepad_id: 1, button, state}));
+      const projected = projectUiInputToLocalControls(store.getState().inputVisuals, {});
+      const active = resolveActiveHardwareRegions(asset, {pressedButtons: projected.gamepads[0].pressed_buttons}).map(r=>r.id);
+      assert.deepEqual(active, state === "Pressed" ? [`gamepad.${region}`] : [], `${button} ${state}`);
+    }
+  }
+});
+
+test("UI monitor truth replaces stale fallback event counts and history", () => {
+  const projected = projectUiInputToLocalControls(
+    {
+      pointer: null,
+      gamepads: [],
+      pressedKeys: [],
+      pressedMouseButtons: [],
+      lastDiscreteTransition: null,
+      deviceMonitor: {
+        local_controls: {
+          sequence: 9,
+          keyboard: { detected: true, event_count: 9, pressed_keys: [] },
+          mouse: { event_count: 4, pressed_buttons: [] },
+          gamepads: [],
+          display: { display_count: 1, displays: [] },
+          recent_events: [{ sequence: 9, device_kind: "Keyboard", summary: "A" }],
+        },
+        remote_events: [],
+      },
+    },
+    { displayInventory: { display_count: 1, displays: [] } },
+    { sequence: 2, keyboard: { event_count: 2 }, mouse: { event_count: 1 }, recent_events: [] },
+  );
+  assert.equal(projected.keyboard.event_count, 9);
+  assert.equal(projected.recent_events[0].summary, "A");
 });
 
 test("UI input projection preserves fallback identity before the first snapshot", () => {

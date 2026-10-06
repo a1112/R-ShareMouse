@@ -461,6 +461,16 @@ pub struct MobileAccessSnapshot {
     pub last_client_seen_at_ms: Option<u64>,
     #[serde(default)]
     pub client_count: u64,
+    #[serde(default)]
+    pub pending_pairings: Vec<PendingMobilePairing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingMobilePairing {
+    pub request_id: String,
+    pub device_name: String,
+    pub client_addr: String,
+    pub created_at_ms: u64,
 }
 
 /// Lightweight device snapshot returned by daemon queries.
@@ -571,6 +581,12 @@ pub enum DaemonRequest {
         limit: Option<u16>,
     },
     MobileAccess,
+    ApproveMobilePairing {
+        request_id: String,
+    },
+    RejectMobilePairing {
+        request_id: String,
+    },
     SubscribeEndpointEvents {
         #[serde(default)]
         filter: EndpointEventFilter,

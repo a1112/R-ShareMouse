@@ -85,9 +85,9 @@ pub use ipc::{
     default_mobile_gateway_addr, read_json_frame, read_optional_ui_state_frame,
     read_ui_state_frame, write_json_frame, write_ui_state_frame, DaemonDeviceSnapshot,
     DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot, PendingPeerApproval,
-    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
-    UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    LocalInputFeedback, MobileAccessSnapshot, NetworkTransportSnapshot, PendingMobilePairing,
+    PendingPeerApproval, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot,
+    TransportFeedback, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
 };
 pub use ipc_binary::{
     decode_display_capture_binary, encode_display_capture_binary, encode_display_capture_response,
@@ -150,10 +150,10 @@ pub use session::{CaptureSessionStateMachine, TransitionError};
 
 // Re-exports from the versioned daemon UI state stream.
 pub use ui_state::{
-    UiActiveSessions, UiApplyError, UiChange, UiCursor, UiDelta, UiDiscreteInputState,
-    UiDynamicState, UiEnvelope, UiMediaSession, UiMediaSessionState, UiPointerState,
-    UiPressedGamepadButton, UiResyncReason, UiRevisionError, UiRevisionSequencer, UiSnapshot,
-    UiView, UI_STATE_PROTOCOL_VERSION,
+    UiActiveSessions, UiApplyError, UiChange, UiCursor, UiDelta, UiDeviceMonitorState,
+    UiDiscreteInputState, UiDynamicState, UiEnvelope, UiMediaSession, UiMediaSessionState,
+    UiPointerState, UiPressedGamepadButton, UiResyncReason, UiRevisionError, UiRevisionSequencer,
+    UiSnapshot, UiView, UI_STATE_PROTOCOL_VERSION,
 };
 
 pub mod network_audio;

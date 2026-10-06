@@ -1,3 +1,5 @@
+import { normalizeKeyToken, normalizeMouseButtonToken } from "./input-feedback.mjs";
+
 export const BUILTIN_HARDWARE_ASSET_MANIFESTS = Object.freeze([
   "/assets/hardware/live2d/keyboard/manifest.json",
   "/assets/hardware/live2d/keyboard/gaming/manifest.json",
@@ -149,9 +151,8 @@ function regionMatchesActivity(region, activity) {
 
 function keyboardActionMatches(action, activity) {
   const candidates = new Set((action.codes ?? []).map(normalizeKeyToken));
-  const pressedKeys = activity.pressedKeys ?? [];
-  if (pressedKeys.some((key) => candidates.has(normalizeKeyToken(key)))) {
-    return true;
+  if (Array.isArray(activity.pressedKeys)) {
+    return activity.pressedKeys.some((key) => candidates.has(normalizeKeyToken(key)));
   }
   const latestEvent = [...(activity.keyboardEvents ?? [])].reverse().find((event) => {
     const key = keyboardEventKey(event);
@@ -161,17 +162,12 @@ function keyboardActionMatches(action, activity) {
 }
 
 function mouseActionMatches(action, activity) {
-  const candidates = new Set((action.buttons ?? []).map(normalizeButtonToken));
-  for (const [button, active] of Object.entries(mouseBooleanState(activity))) {
-    if (active && candidates.has(normalizeButtonToken(button))) {
-      return true;
-    }
-  }
-  const buttons = [
-    ...(activity.pressedButtons ?? []),
-    ...(activity.recentButtons ?? []),
-  ];
-  return buttons.some((button) => candidates.has(normalizeButtonToken(button)));
+  const candidates = new Set((action.buttons ?? []).map(normalizeMouseButtonToken));
+  const buttons = Array.isArray(activity.pressedButtons)
+    ? activity.pressedButtons
+    : Object.entries(mouseBooleanState(activity)).filter(([, active]) => active).map(([button]) => button);
+  return buttons.some((button) => candidates.has(normalizeMouseButtonToken(button)))
+    || Boolean(activity.wheelActive && candidates.has("wheel"));
 }
 
 function mouseBooleanState(activity) {
@@ -218,9 +214,6 @@ function normalizeGamepadAxis(value) {
   if (!Number.isFinite(numeric)) {
     return 0;
   }
-  if (Math.abs(numeric) <= 1) {
-    return clamp(numeric, -1, 1);
-  }
   return clamp(numeric / 32767, -1, 1);
 }
 
@@ -228,9 +221,6 @@ function normalizeGamepadTrigger(value) {
   const numeric = Number(value ?? 0);
   if (!Number.isFinite(numeric)) {
     return 0;
-  }
-  if (numeric >= 0 && numeric <= 1) {
-    return clamp(numeric, 0, 1);
   }
   return clamp(numeric / 65535, 0, 1);
 }
@@ -251,10 +241,6 @@ function uniqueTokens(values) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
-}
-
-function normalizeKeyToken(value) {
-  return String(value ?? "").toLowerCase().replace(/\s/g, "");
 }
 
 function normalizeButtonToken(value) {

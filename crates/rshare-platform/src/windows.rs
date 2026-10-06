@@ -26,8 +26,9 @@ mod windows_impl {
         DisplayCaptureFormat, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
         DisplayIdentifyResult, DisplayModeInfo, DisplayOperationStatus, DisplayOrientation,
         DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, DisplayWriteCapabilities,
-        LocalAudioEndpointFormFactor, LocalAudioInputDevice, LocalAudioInputKind,
-        LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState, LocalHardwareDevice,
+        GamepadButton, GamepadState, LocalAudioEndpointFormFactor, LocalAudioInputDevice,
+        LocalAudioInputKind, LocalAudioOutputDevice, LocalDisplayInfo, LocalDisplayState,
+        LocalHardwareDevice,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
@@ -589,6 +590,7 @@ mod windows_impl {
         pub virtual_keyboard: bool,
         pub virtual_mouse: bool,
         pub virtual_gamepad_scaffold: bool,
+        pub virtual_gamepad: bool,
         pub max_event_size: u32,
     }
 
@@ -1076,6 +1078,23 @@ mod windows_impl {
                     IOCTL_RSHARE_INJECT_REPORT,
                     (&mut raw as *mut RShareInjectReportRaw).cast(),
                     size_of::<RShareInjectReportRaw>() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }
+        }
+
+        pub fn inject_gamepad_state(&self, state: &GamepadState) -> Result<()> {
+            if !self.query_capabilities()?.virtual_gamepad {
+                anyhow::bail!("RShare Virtual HID gamepad unavailable: update the Windows driver");
+            }
+            let mut raw = pack_gamepad_state(state)?;
+            unsafe {
+                device_io_control(
+                    self.handle,
+                    IOCTL_RSHARE_INJECT_GAMEPAD_STATE,
+                    (&mut raw as *mut RShareGamepadStateRaw).cast(),
+                    size_of::<RShareGamepadStateRaw>() as u32,
                     std::ptr::null_mut(),
                     0,
                 )
@@ -2072,6 +2091,7 @@ mod windows_impl {
     const RSHARE_CAP_VIRTUAL_KEYBOARD: u32 = 0x0000_0002;
     const RSHARE_CAP_VIRTUAL_MOUSE: u32 = 0x0000_0004;
     const RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD: u32 = 0x0000_0008;
+    const RSHARE_CAP_VIRTUAL_GAMEPAD: u32 = 0x0000_0080;
     const RSHARE_CAP_FILTER_SEMANTIC_QUEUE: u32 = 0x0000_0020;
     const RSHARE_CAP_WAIT_EVENT: u32 = 0x0000_0040;
 
@@ -2121,6 +2141,8 @@ mod windows_impl {
         ctl_code(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_READ_DATA);
     const IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE: u32 =
         ctl_code(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_READ_DATA);
+    const IOCTL_RSHARE_INJECT_GAMEPAD_STATE: u32 =
+        ctl_code(FILE_DEVICE_UNKNOWN, 0x80a, METHOD_BUFFERED, FILE_WRITE_DATA);
     const ERROR_NO_MORE_ITEMS: i32 = 259;
     const ERROR_INVALID_HANDLE: i32 = 6;
     const ERROR_OPERATION_ABORTED: i32 = 995;
@@ -2691,6 +2713,7 @@ mod windows_impl {
                 virtual_keyboard: raw.flags & RSHARE_CAP_VIRTUAL_KEYBOARD != 0,
                 virtual_mouse: raw.flags & RSHARE_CAP_VIRTUAL_MOUSE != 0,
                 virtual_gamepad_scaffold: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD != 0,
+                virtual_gamepad: raw.flags & RSHARE_CAP_VIRTUAL_GAMEPAD != 0,
                 max_event_size: raw.max_event_size,
             })
         }
@@ -2814,6 +2837,96 @@ mod windows_impl {
         value1: i32,
         value2: i32,
         flags: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct RShareGamepadStateRaw {
+        abi: u16,
+        buttons: u16,
+        left_x: i16,
+        left_y: i16,
+        right_x: i16,
+        right_y: i16,
+        left_trigger: u8,
+        right_trigger: u8,
+        hat: u8,
+        reserved: u8,
+    }
+
+    fn pack_gamepad_state(state: &GamepadState) -> Result<RShareGamepadStateRaw> {
+        if state.gamepad_id != 0 {
+            anyhow::bail!("Only the first virtual gamepad is supported");
+        }
+        let mut buttons = 0u16;
+        let mut up = false;
+        let mut down = false;
+        let mut left = false;
+        let mut right = false;
+        for entry in &state.buttons {
+            if !entry.pressed {
+                continue;
+            }
+            let bit = match entry.button {
+                GamepadButton::South => Some(0),
+                GamepadButton::East => Some(1),
+                GamepadButton::West => Some(2),
+                GamepadButton::North => Some(3),
+                GamepadButton::LeftBumper => Some(4),
+                GamepadButton::RightBumper => Some(5),
+                GamepadButton::Select => Some(6),
+                GamepadButton::Start => Some(7),
+                GamepadButton::LeftStick => Some(8),
+                GamepadButton::RightStick => Some(9),
+                GamepadButton::Guide => Some(10),
+                GamepadButton::DPadUp => {
+                    up = true;
+                    None
+                }
+                GamepadButton::DPadDown => {
+                    down = true;
+                    None
+                }
+                GamepadButton::DPadLeft => {
+                    left = true;
+                    None
+                }
+                GamepadButton::DPadRight => {
+                    right = true;
+                    None
+                }
+                GamepadButton::LeftTrigger | GamepadButton::RightTrigger => None,
+                GamepadButton::Other(_) => anyhow::bail!("Unsupported virtual gamepad button"),
+            };
+            if let Some(bit) = bit {
+                buttons |= 1 << bit;
+            }
+        }
+        let vertical = (up as i8) - (down as i8);
+        let horizontal = (right as i8) - (left as i8);
+        let hat = match (vertical, horizontal) {
+            (1, 0) => 0,
+            (1, 1) => 1,
+            (0, 1) => 2,
+            (-1, 1) => 3,
+            (-1, 0) => 4,
+            (-1, -1) => 5,
+            (0, -1) => 6,
+            (1, -1) => 7,
+            _ => 8,
+        };
+        Ok(RShareGamepadStateRaw {
+            abi: RSHARE_DRIVER_ABI,
+            buttons,
+            left_x: state.left_stick_x,
+            left_y: state.left_stick_y,
+            right_x: state.right_stick_x,
+            right_y: state.right_stick_y,
+            left_trigger: ((u32::from(state.left_trigger) * 255 + 32767) / 65535) as u8,
+            right_trigger: ((u32::from(state.right_trigger) * 255 + 32767) / 65535) as u8,
+            hat,
+            reserved: 0,
+        })
     }
 
     #[repr(C)]
@@ -5457,6 +5570,7 @@ mod windows_impl {
             assert_eq!(size_of::<RShareDriverVersionRaw>(), 8);
             assert_eq!(size_of::<RShareDriverCapabilitiesRaw>(), 16);
             assert_eq!(size_of::<RShareInjectReportRaw>(), 20);
+            assert_eq!(size_of::<RShareGamepadStateRaw>(), 16);
             assert_eq!(size_of::<RShareTestPacketRaw>(), 20);
             assert_eq!(size_of::<RShareDriverEventRaw>(), 56);
             assert_eq!(size_of::<RShareDriverStatsRaw>(), 64);
@@ -5478,6 +5592,61 @@ mod windows_impl {
             assert_eq!(IOCTL_RSHARE_QUERY_FILTER_STATS_V2, 0x0022_601c);
             assert_eq!(IOCTL_RSHARE_WAIT_EVENT, 0x0022_6020);
             assert_eq!(IOCTL_RSHARE_QUERY_FILTER_WAIT_STATE, 0x0022_6024);
+            assert_eq!(IOCTL_RSHARE_INJECT_GAMEPAD_STATE, 0x0022_a028);
+        }
+
+        #[test]
+        fn gamepad_state_packs_axes_buttons_triggers_and_diagonal_hat() {
+            let mut state = GamepadState::neutral(0, 1, 0);
+            state.left_stick_x = i16::MIN;
+            state.left_stick_y = i16::MAX;
+            state.right_stick_x = -123;
+            state.right_stick_y = 456;
+            state.left_trigger = u16::MAX;
+            state.right_trigger = 32_896;
+            state.buttons = vec![
+                rshare_core::GamepadButtonState {
+                    button: GamepadButton::South,
+                    pressed: true,
+                },
+                rshare_core::GamepadButtonState {
+                    button: GamepadButton::Start,
+                    pressed: true,
+                },
+                rshare_core::GamepadButtonState {
+                    button: GamepadButton::DPadUp,
+                    pressed: true,
+                },
+                rshare_core::GamepadButtonState {
+                    button: GamepadButton::DPadRight,
+                    pressed: true,
+                },
+            ];
+
+            let report = pack_gamepad_state(&state).unwrap();
+            assert_eq!(report.abi, RSHARE_DRIVER_ABI);
+            assert_eq!(report.buttons, (1 << 0) | (1 << 7));
+            assert_eq!(
+                (report.left_x, report.left_y, report.right_x, report.right_y),
+                (i16::MIN, i16::MAX, -123, 456)
+            );
+            assert_eq!((report.left_trigger, report.right_trigger), (255, 128));
+            assert_eq!(report.hat, 1);
+
+            state.buttons.clear();
+            assert_eq!(pack_gamepad_state(&state).unwrap().hat, 8);
+        }
+
+        #[test]
+        fn gamepad_state_rejects_unknown_buttons_and_nonzero_device_id() {
+            let mut state = GamepadState::neutral(1, 1, 0);
+            assert!(pack_gamepad_state(&state).is_err());
+            state.gamepad_id = 0;
+            state.buttons.push(rshare_core::GamepadButtonState {
+                button: GamepadButton::Other(40),
+                pressed: true,
+            });
+            assert!(pack_gamepad_state(&state).is_err());
         }
 
         #[test]

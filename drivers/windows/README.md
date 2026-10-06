@@ -4,8 +4,10 @@ This directory contains RShare-owned Windows driver packages for driver-level lo
 
 - `rshare-common/` stores the shared IOCTL ABI used by the drivers and Rust daemon client.
 - `rshare-filter/` is the KMDF keyboard/mouse class filter path. It exposes a control device, a synthetic event test IOCTL, filter attachment/event counters, and class service callback interception for keyboard/mouse packets.
-- `rshare-vhid/` is the VHF virtual HID path for keyboard/mouse reports. Keyboard, relative mouse move, mouse buttons, vertical wheel, and horizontal wheel/pan reports are wired through the shared IOCTL ABI. The virtual gamepad descriptor is intentionally scaffolded only.
+- `rshare-vhid/` is the VHF virtual HID path for keyboard, mouse, and one HID/DirectInput gamepad. Keyboard, relative mouse, wheel, and full-state gamepad reports use the shared IOCTL ABI. The gamepad exposes two sticks, two triggers, an 8-way hat, and 11 buttons. XInput-only games are not supported by this HID collection.
 - `rshare-vdisplay/` is the UMDF/IddCx virtual display path. It initializes an IddCx adapter, exposes a UMDF/IddCx IOCTL control callback, reports an EDID-backed monitor on create, tracks pending IddCx arrival before the monitor becomes active, supports monitor departure on remove, exposes default/target modes, syncs committed Windows display modes back to driver state, and completes swap-chain frames. The daemon and desktop call the Windows control interface through `rshare-platform` when the installed IDD is present.
+
+To update only the virtual HID/gamepad driver, build with `scripts\driver\build.ps1`, then run `scripts\driver\install-test-driver.ps1 -HidOnly` from an elevated PowerShell. If `rshare-driver-probe vhid status` still reports version 0.1.0 after installation, reboot Windows to load the replacement kernel driver. Version 0.2.0 advertises the gamepad capability; check `rshare-driver-probe vhid gamepad-smoke` and the controller in `joy.cpl` after reboot.
 
 Generic USB device forwarding is intentionally not in these drivers yet. It is tracked as an experimental feature and requires a separate host capture layer plus a virtual USB bus/device endpoint, not only HID filter/vhid support.
 

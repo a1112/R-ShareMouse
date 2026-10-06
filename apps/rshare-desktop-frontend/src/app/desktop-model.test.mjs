@@ -1770,7 +1770,7 @@ test("buildDeviceGalleryItems carries live input activity for physical simulator
   assert.equal(keyboard.activity.lastKey, "Enter");
   assert.equal(keyboard.activity.keyboardEvents.length, 1);
   assert.deepEqual(mouse.activity.pressedButtons, ["Left"]);
-  assert.ok(mouse.activity.recentButtons.includes("Right"));
+  assert.deepEqual(mouse.activity.recentButtons, ["Left"]);
   assert.equal(mouse.activity.x, 420);
   assert.equal(mouse.activity.wheelDeltaY, -1);
   assert.equal(display.activity.pointerVisible, true);

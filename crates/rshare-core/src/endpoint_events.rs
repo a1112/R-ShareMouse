@@ -201,6 +201,9 @@ pub enum EndpointEventPayload {
         summary: String,
         fields: BTreeMap<String, String>,
     },
+    GamepadState {
+        state: crate::GamepadState,
+    },
     Display {
         summary: String,
         fields: BTreeMap<String, String>,
@@ -507,6 +510,20 @@ fn payload_i32(payload: &BTreeMap<String, String>, key: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_gamepad_state_payload_round_trips_with_typed_axes() {
+        let payload = EndpointEventPayload::GamepadState {
+            state: crate::GamepadState::neutral(0, 7, 123),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["kind"], "GamepadState");
+        assert_eq!(value["data"]["state"]["left_stick_x"], 0);
+        assert_eq!(
+            serde_json::from_value::<EndpointEventPayload>(value).unwrap(),
+            payload
+        );
+    }
 
     fn local_diagnostic_event(
         endpoint_id: DeviceId,

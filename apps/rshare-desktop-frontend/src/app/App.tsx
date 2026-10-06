@@ -1,3 +1,5 @@
+import { useInputPulse } from "./use-input-pulse.mjs";
+import { normalizeKeyToken, normalizeMouseButtonToken } from "./input-feedback.mjs";
 import { NetworkAudioPanel } from "./NetworkAudioPanel";
 import { WakePanel } from "./WakePanel";
 import {
@@ -191,7 +193,6 @@ import {
   selectHasAuthoritativeSnapshot,
   selectInputVisuals,
   selectTopologyProjection,
-  createOwnerlessStreamCoordinator,
 } from "./ui-store.mjs";
 import { uiStateStore, useUiStore } from "./use-ui-store";
 import {
@@ -615,6 +616,12 @@ type MobileAccessSnapshot = {
   last_client_addr?: string | null;
   last_client_seen_at_ms?: number | null;
   client_count?: number;
+  pending_pairings?: Array<{
+    request_id: string;
+    device_name: string;
+    client_addr: string;
+    created_at_ms: number;
+  }>;
 };
 
 type RemoteLatencySummary = {
@@ -751,15 +758,9 @@ type UiStateTransportOptions = {
   signal?: AbortSignal;
 };
 
-type LocalControlSubscription = {
-  stop: () => void;
-  usesTauriBridge: boolean;
-};
-
 type ThemeMode = "light" | "dark" | "system";
 
 const LOCAL_CONTROL_REFRESH_TIMING = getLocalControlRefreshTiming();
-const LOCAL_CONTROL_EVENT_FLUSH_MS = LOCAL_CONTROL_REFRESH_TIMING.eventFlushMs;
 const HIDDEN_MONITOR_IDS_STORAGE_KEY = "rshare.hiddenMonitorIds";
 const HARDWARE_RIG_VARIANT_STORAGE_KEY = "rshare.hardwareRigVariant";
 const HARDWARE_ASSET_KEYBOARD_STORAGE_KEY = "rshare.hardwareAsset.keyboard";
@@ -769,7 +770,6 @@ const DAEMON_IPC_BRIDGE_ENDPOINT = "/__rshare/ipc";
 const DISPLAY_CAPTURE_BRIDGE_ENDPOINT = "/__rshare/display-capture";
 const DAEMON_LOGS_BRIDGE_ENDPOINT = "/__rshare/logs";
 const DAEMON_SERVICE_BRIDGE_ENDPOINT = "/__rshare/service";
-const LOCAL_CONTROLS_WS_URL = "ws://127.0.0.1:27436/local-controls";
 const UI_STATE_WS_PATH = "/ui-state";
 const NETWORK_COMMANDS = new Set([
   "file_transfers",
@@ -1157,16 +1157,6 @@ function endpointEventFilter(endpointId?: string | null) {
   };
 }
 
-function monitoredInputEndpointEventFilter(endpointId?: string | null) {
-  return {
-    ...endpointEventFilter(endpointId),
-    // The device console visualizes input activity. Keeping high-frequency
-    // backend samples off this stream prevents telemetry from starving real
-    // keyboard, mouse, and gamepad events before the UI can render them.
-    kinds: ["Keyboard", "Mouse", "Gamepad"],
-  };
-}
-
 const INPUT_TEST_CONFIRMATION_TIMEOUT_MS = 5_000;
 
 function inputTestConfirmationKey(kind: string, remoteDeviceId?: string) {
@@ -1445,74 +1435,6 @@ async function invokeNetworkCommand<T = unknown>(
   }
 }
 
-async function listenLocalControlEvent(
-  handler: (payload: unknown) => void,
-): Promise<LocalControlSubscription | null> {
-  const unlisten = await listenTauriEvent<unknown>("local-control-event", handler);
-  if (unlisten) {
-    return {
-      stop: unlisten,
-      usesTauriBridge: true,
-    };
-  }
-
-  if (typeof WebSocket !== "undefined") {
-    const socket = new WebSocket(LOCAL_CONTROLS_WS_URL);
-    let intentionalClose = false;
-    socket.addEventListener("message", (event) => {
-      try {
-        const payload =
-          typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-        handler(payload);
-      } catch (error) {
-        handler(error instanceof Error ? error.message : String(error));
-      }
-    });
-    socket.addEventListener("error", () => {
-      if (!intentionalClose) {
-        handler("本机输入实时 WebSocket 不可用");
-      }
-    });
-    socket.addEventListener("close", (event) => {
-      if (!intentionalClose && event.code !== 1000) {
-        handler("本机输入实时 WebSocket 已断开");
-      }
-    });
-    const closeSocket = () => {
-      intentionalClose = true;
-      if (socket.readyState === WebSocket.CONNECTING) {
-        socket.addEventListener("open", () => socket.close(1000), { once: true });
-        return;
-      }
-      if (
-        socket.readyState === WebSocket.OPEN ||
-        socket.readyState === WebSocket.CLOSING
-      ) {
-        socket.close(1000);
-      }
-    };
-    return {
-      stop: closeSocket,
-      usesTauriBridge: false,
-    };
-  }
-  return null;
-}
-
-async function listenEndpointEvent(
-  handler: (payload: unknown) => void,
-): Promise<LocalControlSubscription | null> {
-  const unlisten = await listenTauriEvent<unknown>("endpoint-event", handler);
-  if (!unlisten) {
-    return null;
-  }
-
-  return {
-    stop: unlisten,
-    usesTauriBridge: true,
-  };
-}
-
 async function invokeCommand<T = unknown>(
   command: string,
   args?: Record<string, unknown>,
@@ -1570,19 +1492,6 @@ async function captureDisplayBinary(
   }
   return new Uint8Array(await response.arrayBuffer());
 }
-
-const localControlsStreamCoordinator = createOwnerlessStreamCoordinator({
-  start: () => invokeCommand("start_local_controls_stream"),
-  stop: () => invokeCommand("stop_local_controls_stream"),
-});
-
-const endpointEventsStreamCoordinator = createOwnerlessStreamCoordinator({
-  start: () =>
-    invokeCommand("start_endpoint_events_stream", {
-      filter: monitoredInputEndpointEventFilter(null),
-    }),
-  stop: () => invokeCommand("stop_endpoint_events_stream"),
-});
 
 function loadHiddenMonitorIds(): Set<string> {
   try {
@@ -2238,6 +2147,7 @@ function DesktopApp() {
     useState<LocalInputTestResult | null>(null);
   const [confirmingInputTest, setConfirmingInputTest] = useState<string | null>(null);
   const [uiStreamHealthy, setUiStreamHealthy] = useState(false);
+  const uiMonitorAvailable = useUiStore((state) => Boolean(state.inputVisuals.deviceMonitor));
   const [refreshTick, setRefreshTick] = useState(0);
   const [hiddenMonitorIds, setHiddenMonitorIds] = useState<Set<string>>(
     loadHiddenMonitorIds,
@@ -2251,7 +2161,6 @@ function DesktopApp() {
     });
   const [selectedHardwareAssetIds, setSelectedHardwareAssetIds] =
     useState<Record<HardwareRigKind, string>>(loadSelectedHardwareAssetIds);
-  const endpointSequencesRef = useRef<Record<string, number>>({});
   const uiStreamHealthyRef = useRef(false);
 
   useEffect(() => {
@@ -2284,26 +2193,6 @@ function DesktopApp() {
         runtimeReason: model.service.error ?? model.inputMode.reason,
       })
     : null;
-  const localEndpointId =
-    typeof payload.status === "object" &&
-    payload.status &&
-    "device_id" in payload.status
-      ? String((payload.status as { device_id?: unknown }).device_id ?? "")
-      : "";
-  const endpointIds = [
-    localEndpointId,
-    ...safeArray(payload.devices).map((device) => device.id),
-  ].filter((id, index, values) => id && values.indexOf(id) === index);
-  const knownRemoteEndpointIds = new Set(
-    safeArray(payload.devices).map((device) => device.id),
-  );
-  const endpointPollKey = [
-    localEndpointId,
-    ...safeArray(payload.devices).map(
-      (device) => `${device.id}:${device.connected ? "connected" : "offline"}`,
-    ),
-  ].join("|");
-
   async function refreshMacosPermissions() {
     if (!desktopShell.isMacOS || !getInvoke()) {
       setMacosPermissions(null);
@@ -2587,192 +2476,11 @@ function DesktopApp() {
   }, [selectedHardwareAssetIds]);
 
   useEffect(() => {
-    if (uiStreamHealthy) {
-      return;
-    }
-    let cancelled = false;
-    let subscription: LocalControlSubscription | null = null;
-    let streamLease: any = null;
-    let flushTimer: number | null = null;
-    const pendingEvents: LocalControlEvent[] = [];
-
-    const clearFlushTimer = () => {
-      if (flushTimer !== null) {
-        window.clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-    };
-
-    const drainPendingEvents = () => {
-      const events = pendingEvents.splice(0, pendingEvents.length);
-      return events;
-    };
-
-    const applyPendingEvents = () => {
-      flushTimer = null;
-      const events = drainPendingEvents();
-      if (!events.length) {
-        return;
-      }
-      setLocalControls((current) => {
-        if (!current) {
-          pendingEvents.unshift(...events);
-          return current;
-        }
-        return events.reduce(
-          (next, event) => applyLocalControlEvent(next, event),
-          current,
-        );
-      });
-      setLocalControlsError(null);
-    };
-
-    const scheduleEventFlush = () => {
-      if (flushTimer !== null) {
-        return;
-      }
-      flushTimer = window.setTimeout(applyPendingEvents, LOCAL_CONTROL_EVENT_FLUSH_MS);
-    };
-
-    async function startStream() {
-      try {
-        const nextSubscription = await listenLocalControlEvent((payload) => {
-          if (typeof payload === "string") {
-            setLocalControlsError(payload);
-            return;
-          }
-
-          const response = payload as {
-            LocalControls?: LocalControlsSnapshot;
-            LocalControlEvent?: LocalControlEvent;
-          };
-          if (response.LocalControls) {
-            clearFlushTimer();
-            const queuedEvents = drainPendingEvents();
-            setLocalControls((current) => {
-              const next = mergeLocalControlSnapshot(current, response.LocalControls!);
-              return queuedEvents.reduce(
-                (snapshot, event) => applyLocalControlEvent(snapshot, event),
-                next,
-              );
-            });
-            setLocalControlsError(null);
-          } else if (response.LocalControlEvent) {
-            pendingEvents.push(response.LocalControlEvent);
-            scheduleEventFlush();
-          }
-        });
-
-        if (cancelled) {
-          nextSubscription?.stop();
-          return;
-        }
-
-        subscription = nextSubscription;
-        if (subscription?.usesTauriBridge) {
-          streamLease = localControlsStreamCoordinator.acquire();
-          await streamLease.ready;
-        }
-      } catch (streamError) {
-        if (!cancelled) {
-          setLocalControlsError(errorMessage(streamError));
-        }
-      }
-    }
-
-    startStream();
-    return () => {
-      cancelled = true;
-      clearFlushTimer();
-      const usesTauriBridge = subscription?.usesTauriBridge ?? false;
-      subscription?.stop();
-      if (usesTauriBridge && streamLease) {
-        localControlsStreamCoordinator.release(streamLease).catch(() => {});
-      }
-    };
-  }, [uiStreamHealthy]);
-
-  useEffect(() => {
-    if (!endpointIds.length) {
-      return;
-    }
-
-    let cancelled = false;
-    let subscription: LocalControlSubscription | null = null;
-    let streamLease: any = null;
-
-    const rememberSequences = (events: EndpointEvent[]) => {
-      for (const event of events) {
-        const endpointId = event.endpoint_id;
-        if (!endpointId) {
-          continue;
-        }
-        endpointSequencesRef.current[endpointId] = Math.max(
-          endpointSequencesRef.current[endpointId] ?? 0,
-          Number(event.sequence ?? 0),
-        );
-      }
-    };
-
-    const applyEvents = (events: EndpointEvent[]) => {
-      if (!events.length) {
-        return;
-      }
-      rememberSequences(events);
-      setLocalControls((current) =>
-        applyEndpointEvents(
-          current,
-          events,
-          knownRemoteEndpointIds,
-          localEndpointId,
-        ),
-      );
-      setLocalControlsError(null);
-    };
-
-    const handleEndpointPayload = (payload: unknown) => {
-      if (typeof payload === "string") {
-        setLocalControlsError(payload);
-        return;
-      }
-      const response = payload as {
-        EndpointEvents?: EndpointEvent[];
-        EndpointEvent?: EndpointEvent;
-      };
-      if (response.EndpointEvents) {
-        applyEvents(response.EndpointEvents);
-      } else if (response.EndpointEvent) {
-        applyEvents([response.EndpointEvent]);
-      }
-    };
-
-    async function startEndpointStream() {
-      subscription = await listenEndpointEvent(handleEndpointPayload);
-      if (cancelled) {
-        subscription?.stop();
-        return;
-      }
-      if (subscription?.usesTauriBridge) {
-        streamLease = endpointEventsStreamCoordinator.acquire();
-        await streamLease.ready;
-      }
-    }
-
-    startEndpointStream().catch((streamError) => {
-      if (!cancelled) {
-        setLocalControlsError(errorMessage(streamError));
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      const usesTauriBridge = subscription?.usesTauriBridge ?? false;
-      subscription?.stop();
-      if (usesTauriBridge && streamLease) {
-        endpointEventsStreamCoordinator.release(streamLease).catch(() => {});
-      }
-    };
-  }, [endpointPollKey]);
+    if (uiStreamHealthy && uiMonitorAvailable) return;
+    void refreshLocalControls();
+    const timer = window.setInterval(() => void refreshLocalControls(), LOCAL_CONTROL_REFRESH_TIMING.fallbackPollMs);
+    return () => window.clearInterval(timer);
+  }, [uiStreamHealthy, uiMonitorAvailable]);
 
   useEffect(() => {
     if (uiStreamHealthy) {
@@ -3245,7 +2953,8 @@ function DesktopApp() {
               localDevice={model.settings.localDevice}
               latencyFeedback={model.latencyFeedback}
               localControls={localControls}
-              localControlsError={localControlsError}
+              localControlsError={uiStreamHealthy && uiMonitorAvailable ? null : localControlsError}
+              uiStreamHealthy={uiStreamHealthy && uiMonitorAvailable}
               localInputTestResult={localInputTestResult}
               remoteLatencyTestResult={remoteLatencyTestResult}
               confirmingInputTest={confirmingInputTest}
@@ -3274,6 +2983,15 @@ function DesktopApp() {
               onOpenMacosPermissions={openMacosPermissionDialog}
               mobileAccess={mobileAccess}
               mobileAccessError={mobileAccessError}
+              onRefreshMobileAccess={refreshMobileAccess}
+              onDecideMobilePairing={async (requestId, approve) => {
+                try {
+                  await invokeCommand("decide_mobile_pairing", { requestId, approve });
+                  await refreshMobileAccess();
+                } catch (pairingError) {
+                  setMobileAccessError(errorMessage(pairingError));
+                }
+              }}
               service={model.service}
               themeMode={themeMode}
               onThemeModeChange={setThemeMode}
@@ -3339,6 +3057,7 @@ function DevicesPage({
   latencyFeedback,
   localControls,
   localControlsError,
+  uiStreamHealthy,
   localInputTestResult,
   remoteLatencyTestResult,
   confirmingInputTest,
@@ -3371,6 +3090,7 @@ function DevicesPage({
   latencyFeedback: unknown | null;
   localControls: LocalControlsSnapshot | null;
   localControlsError: string | null;
+  uiStreamHealthy: boolean;
   localInputTestResult: LocalInputTestResult | null;
   remoteLatencyTestResult: LocalInputTestResult | null;
   confirmingInputTest: string | null;
@@ -3387,12 +3107,21 @@ function DevicesPage({
   const topology = useUiStore(selectTopologyProjection);
   const liveDiagnostics = useUiStore(selectDiagnostics);
   const hasAuthoritativeSnapshot = useUiStore(selectHasAuthoritativeSnapshot);
-  const effectiveLocalControls = projectUiInputToLocalControls(
+  const projectedLocalControls = projectUiInputToLocalControls(
     inputVisuals,
     topology,
     localControls,
-    { authoritative: hasAuthoritativeSnapshot },
+    { authoritative: hasAuthoritativeSnapshot && uiStreamHealthy },
   ) as LocalControlsSnapshot;
+  const knownRemoteEndpointIds = new Set(devices.map((device) => device.id));
+  const effectiveLocalControls = uiStreamHealthy
+    ? applyEndpointEvents(
+        projectedLocalControls,
+        inputVisuals.deviceMonitor?.remote_events ?? [],
+        knownRemoteEndpointIds,
+        localDevice.id,
+      )
+    : projectedLocalControls;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -4837,6 +4566,7 @@ type HardwareRigActivity = {
   backDown?: boolean;
   forwardDown?: boolean;
   wheelActive?: boolean;
+  wheelSequence?: number | null;
   wheelLabel?: string;
   recentButtons?: string[];
   pressedButtons?: string[];
@@ -5316,7 +5046,7 @@ function safeDownloadName(value: string) {
 function HardwareRigView({
   kind,
   variant = "office",
-  activity,
+  activity: inputActivity,
   accent,
   theme,
   compact = false,
@@ -5332,6 +5062,8 @@ function HardwareRigView({
   fitToHeight?: boolean;
   fitMaxHeight?: number;
 }) {
+  const wheelPulse = useInputPulse(inputActivity.wheelSequence);
+  const activity = { ...inputActivity, wheelActive: Boolean(inputActivity.wheelActive && wheelPulse) };
   const { assets, selectedIds } = useHardwareAssetCatalog();
   const rigVariant = normalizeHardwareRigVariant(variant);
   const fallbackRig = HARDWARE_RIGS[kind][rigVariant];
@@ -6293,6 +6025,7 @@ function PhysicalDeviceShape({
             backDown: backPressed,
             forwardDown: forwardPressed,
             recentButtons,
+            wheelSequence: activity.wheelSequence,
             wheelActive: wheelDeltaX !== 0 || wheelDeltaY !== 0,
             wheelLabel: wheelDeltaY > 0 ? "↑" : wheelDeltaY < 0 ? "↓" : wheelDeltaX > 0 ? "→" : wheelDeltaX < 0 ? "←" : "W",
           }}
@@ -6484,7 +6217,7 @@ function galleryKeyboardKeyActive(
 ) {
   const candidates = galleryKeyboardKeyCandidates(key);
   const normalizedCandidates = new Set(candidates.map((value) => normalizeKeyToken(value)));
-  return [...pressedKeys, lastKey]
+  return pressedKeys
     .filter((value): value is string => typeof value === "string")
     .some((value) => normalizedCandidates.has(normalizeKeyToken(value)));
 }
@@ -6713,7 +6446,7 @@ function keyboardMonitorState(
     }
   }
   return {
-    pressedKeys,
+    pressedKeys: pressedKeys.filter((key) => snapshot?.keyboard.pressed_keys.some((pressed) => normalizeKeyToken(pressed) === normalizeKeyToken(key))),
     lastKey,
     eventCount: events.length,
   };
@@ -6794,7 +6527,7 @@ function mouseMonitorState(
   return {
     x,
     y,
-    pressedButtons,
+    pressedButtons: pressedButtons.filter((button) => snapshot?.mouse.pressed_buttons.some((pressed) => normalizeMouseButtonToken(pressed) === normalizeMouseButtonToken(button))),
     wheelDeltaX,
     wheelDeltaY,
     wheelTotalX,
@@ -7578,7 +7311,7 @@ function LocalControlDetail({
       : null;
   const confirmationKey = inputTestConfirmationKey(kind, remoteDevice?.id);
   if (kind === "keyboard") {
-    const keyboardState = keyboardMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
+    const keyboardState = keyboardMonitorState(snapshot, attributionFallback ? undefined : effectiveSelectedDeviceId, recentEvents);
     const keyboardEvents = recentEvents.slice(-12).reverse();
     const actionLabel = remoteDevice
       ? confirmingInputTest === confirmationKey
@@ -7606,7 +7339,7 @@ function LocalControlDetail({
     );
   }
   if (kind === "mouse") {
-    const mouseState = mouseMonitorState(snapshot, effectiveSelectedDeviceId, recentEvents);
+    const mouseState = mouseMonitorState(snapshot, attributionFallback ? undefined : effectiveSelectedDeviceId, recentEvents);
     const mouseEvents = recentEvents.slice(-12).reverse();
     const mouseLayout = getMouseDetailLayoutClasses({ compact: compactLayout });
     const actionLabel = remoteDevice
@@ -8603,7 +8336,7 @@ const KEYBOARD_ROWS: Array<Array<{ label: string; codes: string[]; width?: numbe
     { label: "1", codes: ["Keypad1", "Raw(97)"] },
     { label: "2", codes: ["Keypad2", "Raw(98)"] },
     { label: "3", codes: ["Keypad3", "Raw(99)"] },
-    { label: "Enter", codes: ["KeypadEnter", "Raw(13)"] },
+    { label: "Enter", codes: ["KeypadEnter", "Raw(57372)"] },
   ],
   [
     { label: "Ctrl", codes: ["ControlLeft", "Raw(17)", "Raw(162)"], width: 1.5 },
@@ -8619,13 +8352,9 @@ const KEYBOARD_ROWS: Array<Array<{ label: string; codes: string[]; width?: numbe
     { label: "→", codes: ["Right", "Raw(39)"] },
     { label: "0", codes: ["Keypad0", "Raw(96)"], width: 2 },
     { label: ".", codes: ["KeypadDecimal", "Raw(110)"] },
-    { label: "Enter", codes: ["KeypadEnter", "Raw(13)"] },
+    { label: "Enter", codes: ["KeypadEnter", "Raw(57372)"] },
   ],
 ];
-
-function normalizeKeyToken(value: string | null | undefined) {
-  return String(value ?? "").toLowerCase().replace(/\s/g, "");
-}
 
 function keyboardEventKey(event: LocalControlEvent | null | undefined) {
   if (!event || event.device_kind !== "Keyboard") {
@@ -8702,7 +8431,7 @@ function keyboardEventMatchesKey(
     return false;
   }
   const normalizedEventKey = normalizeKeyToken(eventKey);
-  return [key.label, ...key.codes]
+  return (key.codes.length ? key.codes : [key.label])
     .map((value) => normalizeKeyToken(value))
     .includes(normalizedEventKey);
 }
@@ -8716,7 +8445,7 @@ function keyVisualState(
   const normalizedPressed = new Set(
     pressedKeys.map((value) => normalizeKeyToken(value)),
   );
-  const candidates = [key.label, ...key.codes].map((value) =>
+  const candidates = (key.codes.length ? key.codes : [key.label]).map((value) =>
     normalizeKeyToken(value),
   );
   if (candidates.some((candidate) => normalizedPressed.has(candidate))) {
@@ -9101,10 +8830,7 @@ function mouseButtonAliases(name: string) {
 }
 
 function mouseButtonPressed(buttons: string[], name: string) {
-  const wanted = new Set(mouseButtonAliases(name).map(normalizeInputToken));
-  return buttons.some((button) =>
-    wanted.has(normalizeInputToken(button)),
-  );
+  return buttons.some((button) => normalizeMouseButtonToken(button) === normalizeMouseButtonToken(name));
 }
 
 function SimulatedMouse({
@@ -9201,6 +8927,7 @@ function SimulatedMouse({
           middleDown={middleDown}
           backDown={backDown}
           forwardDown={forwardDown}
+          wheelSequence={[...recentEvents].reverse().find((event) => event.event_kind === "wheel")?.sequence}
           wheelActive={wheelActive}
           wheelLabel={wheelLabel}
           theme={theme}
@@ -9225,6 +8952,7 @@ function SimulatedMouse({
           middleDown={middleDown}
           backDown={backDown}
           forwardDown={forwardDown}
+          wheelSequence={[...recentEvents].reverse().find((event) => event.event_kind === "wheel")?.sequence}
           wheelActive={wheelActive}
           wheelLabel={wheelLabel}
           theme={theme}
@@ -9312,6 +9040,7 @@ function MouseHardwarePreview({
   backDown,
   forwardDown,
   wheelActive,
+  wheelSequence,
   wheelLabel,
   theme,
   compact = false,
@@ -9322,6 +9051,7 @@ function MouseHardwarePreview({
   backDown: boolean;
   forwardDown: boolean;
   wheelActive: boolean;
+  wheelSequence?: number;
   wheelLabel: string;
   theme: typeof FIGMA_DESKTOP_THEME;
   compact?: boolean;
@@ -9336,6 +9066,7 @@ function MouseHardwarePreview({
         backDown,
         forwardDown,
         wheelActive,
+        wheelSequence,
         wheelLabel,
       }}
       accent={theme.accent}
@@ -9370,7 +9101,7 @@ function gamepadPressedButtons(gamepad: LocalGamepadSnapshot | null) {
   if (!gamepad) {
     return [];
   }
-  if (gamepad.pressed_buttons?.length) {
+  if (Array.isArray(gamepad.pressed_buttons)) {
     return gamepad.pressed_buttons;
   }
   return (gamepad.buttons ?? [])
@@ -10343,6 +10074,8 @@ function SettingsPage({
   onOpenMacosPermissions,
   mobileAccess,
   mobileAccessError,
+  onRefreshMobileAccess,
+  onDecideMobilePairing,
   service,
   themeMode,
   onThemeModeChange,
@@ -10391,6 +10124,8 @@ function SettingsPage({
   onOpenMacosPermissions: () => void;
   mobileAccess: MobileAccessSnapshot | null;
   mobileAccessError: string | null;
+  onRefreshMobileAccess: () => Promise<void>;
+  onDecideMobilePairing: (requestId: string, approve: boolean) => Promise<void>;
   service: {
     online: boolean;
     healthy: boolean;
@@ -10404,6 +10139,12 @@ function SettingsPage({
   theme: typeof FIGMA_DESKTOP_THEME;
 }) {
   const [selectedSection, setSelectedSection] = useState<SettingsSectionKey>("local");
+  useEffect(() => {
+    if (selectedSection !== "mobile") return;
+    void onRefreshMobileAccess();
+    const timer = window.setInterval(() => void onRefreshMobileAccess(), 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedSection]);
   const selectedSectionMeta =
     SETTINGS_LAYOUT_SECTIONS.find((section) => section.key === selectedSection) ??
     SETTINGS_LAYOUT_SECTIONS[0];
@@ -10493,7 +10234,7 @@ function SettingsPage({
         {renderSectionHeader(
           <Smartphone size={18} />,
           "移动端控制",
-          "用手机浏览器连接本机移动网关，模拟鼠标、按键和手机输入法文本。",
+          "手机应用会自动发现本机；在这里确认配对。连接后可用触控板、横屏独立键盘和手机输入法。",
           true,
         )}
 
@@ -10515,6 +10256,41 @@ function SettingsPage({
             value={`${mobileAccessView.clientStatus} · ${mobileAccessView.clientDetail}`}
             theme={theme}
           />
+        </div>
+        <div className="mt-4 space-y-2">
+          <div className="text-sm font-semibold">待确认的手机</div>
+          {(mobileAccess?.pending_pairings ?? []).length === 0 ? (
+            <div className="text-sm" style={{ color: theme.textMuted }}>
+              手机打开应用后会自动发现本机，并在这里显示配对请求。
+            </div>
+          ) : (mobileAccess?.pending_pairings ?? []).map((pairing) => (
+            <div
+              key={pairing.request_id}
+              className="flex flex-wrap items-center gap-3 rounded-md p-3 text-sm"
+              style={{ background: theme.frame, border: `1px solid ${theme.border}` }}
+            >
+              <div className="min-w-0 flex-1">
+                <strong>{pairing.device_name}</strong>
+                <div style={{ color: theme.textMuted }}>{pairing.client_addr}</div>
+              </div>
+              <button
+                type="button"
+                className="rounded-md px-3 py-2"
+                style={{ color: theme.accent, border: `1px solid ${theme.accent}` }}
+                onClick={() => void onDecideMobilePairing(pairing.request_id, true)}
+              >
+                允许
+              </button>
+              <button
+                type="button"
+                className="rounded-md px-3 py-2"
+                style={{ color: theme.text, border: `1px solid ${theme.border}` }}
+                onClick={() => void onDecideMobilePairing(pairing.request_id, false)}
+              >
+                拒绝
+              </button>
+            </div>
+          ))}
         </div>
 
         <div

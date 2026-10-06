@@ -30,7 +30,20 @@ static const UCHAR RShareKeyboardMouseReportDescriptor[] = {
     0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
     0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
     0x95, 0x03, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38,
-    0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0
+    0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0,
+    // Report 3: independent HID/DirectInput gamepad collection.
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x03,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33,
+    0x09, 0x34, 0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F,
+    0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF,
+    0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00,
+    0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04,
+    0x95, 0x01, 0x81, 0x42,
+    0x65, 0x00, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03, 0xC0
 };
 
 typedef struct _RSHARE_VHID_CONTEXT {
@@ -323,6 +336,51 @@ static NTSTATUS RShareSubmitMouseReport(VHFHANDLE handle, UCHAR buttons, LONG dx
     return VhfReadReportSubmit(handle, &packet);
 }
 
+static VOID RShareWriteGamepadAxis(UCHAR* target, SHORT value)
+{
+    target[0] = (UCHAR)((USHORT)value & 0xFFu);
+    target[1] = (UCHAR)(((USHORT)value >> 8) & 0xFFu);
+}
+
+static NTSTATUS RShareSubmitGamepadReport(VHFHANDLE handle, const RSHARE_GAMEPAD_STATE* state)
+{
+    UCHAR report[14] = {0};
+    HID_XFER_PACKET packet;
+
+    if (state->Abi != RSHARE_DRIVER_ABI || state->Reserved != 0 ||
+        (state->Buttons & 0xF800u) != 0 || state->Hat > 8u) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    report[0] = 0x03;
+    report[1] = (UCHAR)(state->Buttons & 0xFFu);
+    report[2] = (UCHAR)((state->Buttons >> 8) & 0xFFu);
+    RShareWriteGamepadAxis(&report[3], state->LeftX);
+    RShareWriteGamepadAxis(&report[5], state->LeftY);
+    RShareWriteGamepadAxis(&report[7], state->RightX);
+    RShareWriteGamepadAxis(&report[9], state->RightY);
+    report[11] = state->LeftTrigger;
+    report[12] = state->RightTrigger;
+    report[13] = state->Hat;
+
+    RtlZeroMemory(&packet, sizeof(packet));
+    packet.reportBuffer = report;
+    packet.reportBufferLen = sizeof(report);
+    packet.reportId = report[0];
+    return VhfReadReportSubmit(handle, &packet);
+}
+
+static NTSTATUS RShareSubmitGamepadState(const RSHARE_GAMEPAD_STATE* state)
+{
+    NTSTATUS status;
+    ExAcquireFastMutex(&g_RShareVhidLock);
+    status = g_RShareVhidHandle == NULL
+        ? STATUS_DEVICE_NOT_READY
+        : RShareSubmitGamepadReport(g_RShareVhidHandle, state);
+    ExReleaseFastMutex(&g_RShareVhidLock);
+    return status;
+}
+
 static NTSTATUS RShareSubmitInjectReport(PRSHARE_INJECT_REPORT report)
 {
     NTSTATUS status;
@@ -459,6 +517,12 @@ NTSTATUS RShareVhidEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 
     ExAcquireFastMutex(&g_RShareVhidLock);
     g_RShareVhidHandle = context->VhfHandle;
+    {
+        RSHARE_GAMEPAD_STATE neutral = {0};
+        neutral.Abi = RSHARE_DRIVER_ABI;
+        neutral.Hat = 8;
+        (VOID)RShareSubmitGamepadReport(context->VhfHandle, &neutral);
+    }
     ExReleaseFastMutex(&g_RShareVhidLock);
 
     return STATUS_SUCCESS;
@@ -471,6 +535,10 @@ VOID RShareVhidEvtCleanup(WDFOBJECT DeviceObject)
     if (context->VhfHandle != NULL) {
         ExAcquireFastMutex(&g_RShareVhidLock);
         if (g_RShareVhidHandle == context->VhfHandle) {
+            RSHARE_GAMEPAD_STATE neutral = {0};
+            neutral.Abi = RSHARE_DRIVER_ABI;
+            neutral.Hat = 8;
+            (VOID)RShareSubmitGamepadReport(context->VhfHandle, &neutral);
             g_RShareVhidHandle = NULL;
             g_RShareKeyboardModifiers = 0;
             RtlZeroMemory(g_RShareKeyboardKeys, sizeof(g_RShareKeyboardKeys));
@@ -499,7 +567,7 @@ VOID RShareVhidEvtControlIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*version), (PVOID*)&version, NULL);
         if (NT_SUCCESS(status)) {
             version->Major = 0;
-            version->Minor = 1;
+            version->Minor = 2;
             version->Patch = 0;
             version->Abi = RSHARE_DRIVER_ABI;
             bytes = sizeof(*version);
@@ -511,7 +579,7 @@ VOID RShareVhidEvtControlIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*capabilities), (PVOID*)&capabilities, NULL);
         if (NT_SUCCESS(status)) {
             capabilities->Abi = RSHARE_DRIVER_ABI;
-            capabilities->Flags = RSHARE_CAP_VIRTUAL_KEYBOARD | RSHARE_CAP_VIRTUAL_MOUSE | RSHARE_CAP_VIRTUAL_GAMEPAD_SCAFFOLD;
+            capabilities->Flags = RSHARE_CAP_VIRTUAL_KEYBOARD | RSHARE_CAP_VIRTUAL_MOUSE | RSHARE_CAP_VIRTUAL_GAMEPAD;
             capabilities->MaxEventSize = sizeof(RSHARE_DRIVER_EVENT);
             capabilities->Reserved = 0;
             bytes = sizeof(*capabilities);
@@ -524,6 +592,19 @@ VOID RShareVhidEvtControlIoDeviceControl(
             status = WdfRequestRetrieveInputBuffer(Request, sizeof(*report), (PVOID*)&report, NULL);
             if (NT_SUCCESS(status)) {
                 status = RShareSubmitInjectReport(report);
+            }
+        }
+        break;
+    case IOCTL_RSHARE_INJECT_GAMEPAD_STATE:
+        {
+            PRSHARE_GAMEPAD_STATE gamepad;
+            if (InputBufferLength != sizeof(*gamepad)) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            status = WdfRequestRetrieveInputBuffer(Request, sizeof(*gamepad), (PVOID*)&gamepad, NULL);
+            if (NT_SUCCESS(status)) {
+                status = RShareSubmitGamepadState(gamepad);
             }
         }
         break;
