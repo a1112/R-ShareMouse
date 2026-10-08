@@ -33,6 +33,13 @@ use std::{
     time::Duration,
 };
 
+pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    Sha256::digest(bytes.as_ref())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rshare-perf",
@@ -283,10 +290,7 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
         )?;
         let (report, bytes) = validate_complete_report(report, &schema)?;
         atomic_write(&sidecar_path, &bytes)?;
-        sidecar_hashes.push((
-            batch.artifact_path.clone(),
-            format!("{:x}", Sha256::digest(&bytes)),
-        ));
+        sidecar_hashes.push((batch.artifact_path.clone(), sha256_hex(&bytes)));
         batch_reports.push(report);
     }
 
@@ -549,15 +553,12 @@ fn collect_fingerprints() -> Result<Fingerprints> {
             std::env::var("RSHARE_PERF_POWER_PLAN_GUID").unwrap_or_else(|_| "uncontrolled".into()),
         ),
     ]);
-    let runner_fingerprint = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
-            &runner_id,
-            &toolchain,
-            &hardware,
-            &runner_settings
-        ))?)
-    );
+    let runner_fingerprint = sha256_hex(serde_json::to_vec(&(
+        &runner_id,
+        &toolchain,
+        &hardware,
+        &runner_settings,
+    ))?);
     Ok(Fingerprints {
         commit,
         dirty,
@@ -638,7 +639,7 @@ fn process_output(program: &str, args: &[&str]) -> Result<String> {
 }
 
 fn digest_file(path: &Path) -> Result<String> {
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+    Ok(sha256_hex(fs::read(path)?))
 }
 
 fn summarize_metrics(runs: &[report::PerfRun]) -> BTreeMap<String, MetricSummary> {
@@ -764,7 +765,7 @@ fn run_compare(args: CompareArgs) -> Result<()> {
         let evidence = serde_json::json!({
             "baseline_id": args.baseline_id,
             "candidate_path": args.candidate,
-            "candidate_sha256": format!("{:x}", Sha256::digest(&candidate_bytes)),
+            "candidate_sha256": sha256_hex(&candidate_bytes),
             "verified_approval": approval,
             "comparison_verdict": verdict,
         });
@@ -922,7 +923,7 @@ mod tests {
         assert_eq!(report.batch_artifacts.len(), sidecars.len());
         for reference in &report.batch_artifacts {
             let bytes = fs::read(&reference.path).unwrap();
-            assert_eq!(format!("{:x}", Sha256::digest(&bytes)), reference.sha256);
+            assert_eq!(sha256_hex(&bytes), reference.sha256);
         }
         for sidecar in sidecars {
             let bytes = fs::read(sidecar).unwrap();
