@@ -8693,6 +8693,7 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
             | DaemonRequest::Connect { .. }
             | DaemonRequest::Disconnect { .. }
             | DaemonRequest::ApprovePeer { .. }
+            | DaemonRequest::RejectPeer { .. }
             | DaemonRequest::SetLayout { .. }
             | DaemonRequest::InjectEndpointEvent { .. }
             | DaemonRequest::RunLocalInputTest { .. }
@@ -9019,6 +9020,14 @@ async fn dispatch_ipc_request(
         DaemonRequest::ApprovePeer { approval_id } => {
             let manager = network_manager.lock().await;
             if manager.approve_peer(&approval_id).await {
+                DaemonResponse::Ack
+            } else {
+                DaemonResponse::Error("Unknown, expired, or already-used peer approval".to_string())
+            }
+        }
+        DaemonRequest::RejectPeer { approval_id } => {
+            let manager = network_manager.lock().await;
+            if manager.reject_peer(&approval_id).await {
                 DaemonResponse::Ack
             } else {
                 DaemonResponse::Error("Unknown, expired, or already-used peer approval".to_string())

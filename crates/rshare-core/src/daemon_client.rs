@@ -21,9 +21,9 @@ use crate::{
     EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
     EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph, LocalControlDeviceSnapshot,
     LocalInputTestRequest, LocalInputTestResult, MacosInputPermissionsSnapshot,
-    MobileAccessSnapshot, ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult,
-    UsbDeviceDescriptor, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    MobileAccessSnapshot, PendingPeerApproval, ServiceStatusSnapshot, UiCursor, UiEnvelope,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -194,6 +194,34 @@ pub async fn request_connect(device_id: crate::DeviceId) -> Result<()> {
         DaemonResponse::Ack => Ok(()),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+/// List inbound peer identities waiting for exact operator approval.
+pub async fn request_pending_peer_approvals() -> Result<Vec<PendingPeerApproval>> {
+    match send_request(DaemonRequest::ListPendingPeerApprovals).await? {
+        DaemonResponse::PendingPeerApprovals(approvals) => Ok(approvals),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Approve one opaque, single-use peer approval token after the UI has shown
+/// its exact device ID and certificate fingerprint to the operator.
+pub async fn request_approve_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::ApprovePeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Revoke one pending or approved peer approval token before it can be used.
+pub async fn request_reject_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::RejectPeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
     }
 }
 

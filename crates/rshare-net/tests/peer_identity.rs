@@ -87,26 +87,119 @@ async fn assert_no_connected_event(
     assert!(no_connected.is_err(), "event channel closed unexpectedly");
 }
 
-async fn approve_pending_peer(server: &ConnectionManager, peer_id: Uuid) {
+async fn wait_for_pending_approval(manager: &ConnectionManager) -> String {
     timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(approval) = server
-                .pending_peer_approvals()
-                .into_iter()
-                .find(|approval| approval.device_id == peer_id)
-            {
-                assert!(server.approve_peer(&approval.approval_id));
-                return;
+            if let Some(approval) = manager.pending_peer_approvals().into_iter().next() {
+                break approval.approval_id;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("first-seen peer must surface for explicit approval");
+    .expect("peer approval should be published")
+}
+
+async fn connect_after_exact_mutual_approval(
+    client: &mut ConnectionManager,
+    client_id: Uuid,
+    server: &mut ConnectionManager,
+    server_id: Uuid,
+    address: &str,
+) {
+    if client.connect(server_id, address).await.is_ok() {
+        return;
+    }
+    let client_approval = wait_for_pending_approval(client).await;
+    let server_approval = wait_for_pending_approval(server).await;
+    assert!(client.approve_peer(&client_approval));
+    assert!(server.approve_peer(&server_approval));
+    client
+        .connect(server_id, address)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("exactly approved peer {client_id} should connect to {server_id}: {error}")
+        });
 }
 
 #[tokio::test]
-async fn peers_first_seen_certificate_requires_explicit_approval() {
+async fn manual_connect_requires_exact_operator_approval_before_authority() {
+    let server_id = Uuid::new_v4();
+    let client_id = Uuid::new_v4();
+    let network = TestNetwork::new("manual-approval");
+    let mut server = network.manager(server_id, "server", generated_identity());
+    server.start_server("127.0.0.1:0").await.unwrap();
+    let address = server.transport_local_addr().unwrap().to_string();
+    let mut client = network.manager(client_id, "client", generated_identity());
+
+    let error = client
+        .connect(server_id, &address)
+        .await
+        .expect_err("first manual contact must wait for an explicit approval");
+    assert!(error.to_string().contains("explicit operator approval"));
+    assert!(client.connections().is_empty());
+    assert!(server.connections().is_empty());
+    assert!(
+        QuicTrustStore::load(network.trust_store_path("client"))
+            .unwrap()
+            .fingerprint_for(&server_id)
+            .is_none(),
+        "an unapproved manual contact must not persist a trust pin"
+    );
+
+    let client_approval = wait_for_pending_approval(&client).await;
+    let server_approval = wait_for_pending_approval(&server).await;
+    assert!(client.approve_peer(&client_approval));
+    assert!(server.approve_peer(&server_approval));
+    client.connect(server_id, &address).await.unwrap();
+    assert!(!client.connections().is_empty());
+}
+
+#[tokio::test]
+async fn revoked_approval_cannot_connect_or_persist_a_pin() {
+    let server_id = Uuid::new_v4();
+    let client_id = Uuid::new_v4();
+    let network = TestNetwork::new("revoked-approval");
+    let mut server = network.manager(server_id, "server", generated_identity());
+    server.start_server("127.0.0.1:0").await.unwrap();
+    let address = server.transport_local_addr().unwrap().to_string();
+    let mut client = network.manager(client_id, "client", generated_identity());
+
+    client
+        .connect(server_id, &address)
+        .await
+        .expect_err("first contact must wait for approval");
+    let client_approval = wait_for_pending_approval(&client).await;
+    let server_approval = wait_for_pending_approval(&server).await;
+    assert!(client.approve_peer(&client_approval));
+    assert!(server.approve_peer(&server_approval));
+    assert!(client.reject_peer(&client_approval));
+    assert!(server.reject_peer(&server_approval));
+
+    client
+        .connect(server_id, &address)
+        .await
+        .expect_err("a revoked approval must fail closed");
+    assert!(client.connections().is_empty());
+    assert!(server.connections().is_empty());
+    assert_eq!(
+        QuicTrustStore::load(network.trust_store_path("client"))
+            .unwrap()
+            .fingerprint_for(&server_id),
+        None,
+        "revocation must prevent the outbound trust pin"
+    );
+    assert_eq!(
+        QuicTrustStore::load(network.trust_store_path("server"))
+            .unwrap()
+            .fingerprint_for(&client_id),
+        None,
+        "revocation must prevent the inbound trust pin"
+    );
+}
+
+#[tokio::test]
+async fn peers_require_explicit_first_seen_approval_and_connect() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("mutual");
@@ -115,21 +208,9 @@ async fn peers_first_seen_certificate_requires_explicit_approval() {
     server.start_server("127.0.0.1:0").await.unwrap();
 
     let mut client = network.manager(client_id, "client", generated_identity());
-    assert!(client
-        .connect(
-            server_id,
-            &server.transport_local_addr().unwrap().to_string(),
-        )
-        .await
-        .is_err());
-    approve_pending_peer(&server, client_id).await;
-    client
-        .connect(
-            server_id,
-            &server.transport_local_addr().unwrap().to_string(),
-        )
-        .await
-        .unwrap();
+    let address = server.transport_local_addr().unwrap().to_string();
+    connect_after_exact_mutual_approval(&mut client, client_id, &mut server, server_id, &address)
+        .await;
 
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     assert_eq!(
@@ -185,9 +266,8 @@ async fn changed_fingerprint_never_enters_registry() {
     let first_identity = generated_identity();
     let first_fingerprint = PeerCertificateFingerprint::from_der(&first_identity.cert_der);
     let mut first = network.manager(claimed_id, "client", first_identity);
-    assert!(first.connect(server_id, &address).await.is_err());
-    approve_pending_peer(&server, claimed_id).await;
-    first.connect(server_id, &address).await.unwrap();
+    connect_after_exact_mutual_approval(&mut first, claimed_id, &mut server, server_id, &address)
+        .await;
     assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
     server.disconnect(&claimed_id).await.unwrap();
     assert!(server.connections().is_empty());
@@ -196,9 +276,11 @@ async fn changed_fingerprint_never_enters_registry() {
     let changed_fingerprint = PeerCertificateFingerprint::from_der(&changed_identity.cert_der);
     let mut changed = network.manager(claimed_id, "changed", changed_identity);
     assert!(changed.connect(server_id, &address).await.is_err());
+    let client_rotation_approval = wait_for_pending_approval(&changed).await;
+    let server_rotation_approval = wait_for_pending_approval(&server).await;
     assert_no_connected_event(&mut events, claimed_id).await;
     assert!(server.connections().is_empty());
-    assert!(server.pending_peer_approvals().is_empty());
+    assert!(!server.pending_peer_approvals().is_empty());
     let trust_store = QuicTrustStore::load(network.trust_store_path("server")).unwrap();
     assert_eq!(
         trust_store.fingerprint_for(&claimed_id),
@@ -212,6 +294,21 @@ async fn changed_fingerprint_never_enters_registry() {
     );
     assert_eq!(
         trust_store.provenance_for(&claimed_id),
+        Some(TrustProvenance::OperatorApproved)
+    );
+
+    assert!(changed.approve_peer(&client_rotation_approval));
+    assert!(server.approve_peer(&server_rotation_approval));
+    changed.connect(server_id, &address).await.unwrap();
+    assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
+    let rotated_store = QuicTrustStore::load(network.trust_store_path("server")).unwrap();
+    assert_eq!(
+        rotated_store.fingerprint_for(&claimed_id),
+        Some(&changed_fingerprint),
+        "only the exact approved replacement fingerprint may rotate the trust pin"
+    );
+    assert_eq!(
+        rotated_store.provenance_for(&claimed_id),
         Some(TrustProvenance::OperatorApproved)
     );
 }
@@ -253,9 +350,8 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     let address = server.transport_local_addr().unwrap().to_string();
 
     let mut first = network.manager(client_id, "client", client_identity.clone());
-    assert!(first.connect(server_id, &address).await.is_err());
-    approve_pending_peer(&server, client_id).await;
-    first.connect(server_id, &address).await.unwrap();
+    connect_after_exact_mutual_approval(&mut first, client_id, &mut server, server_id, &address)
+        .await;
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     let old_control_id = server.connections()[0]
         .control_connection_id

@@ -149,6 +149,16 @@ pub(crate) async fn complete_incoming_handshake(
     conn: &QuicConnection,
     local_device_id: DeviceId,
 ) -> Result<()> {
+    send_incoming_hello_back(conn, local_device_id).await?;
+    conn.complete_peer_protocol_handshake().await?;
+
+    Ok(())
+}
+
+pub(crate) async fn send_incoming_hello_back(
+    conn: &QuicConnection,
+    local_device_id: DeviceId,
+) -> Result<()> {
     conn.send_message(&hello_back_message(
         local_device_id,
         "R-ShareMouse".to_string(),
@@ -159,12 +169,61 @@ pub(crate) async fn complete_incoming_handshake(
         ScreenInfo::primary(),
     ))
     .await?;
-    conn.complete_peer_protocol_handshake().await?;
-
     Ok(())
 }
 
-pub(crate) async fn perform_outbound_handshake(
+pub(crate) async fn perform_outbound_handshake_with_approvals(
+    conn: &mut QuicConnection,
+    local_device_id: DeviceId,
+    approved_fingerprints: &[String],
+) -> Result<NegotiatedPeer> {
+    conn.send_message(&rshare_core::hello_message(
+        local_device_id,
+        "R-ShareMouse".to_string(),
+        hostname::get()
+            .unwrap_or_else(|_| "unknown".into())
+            .to_string_lossy()
+            .to_string(),
+    ))
+    .await?;
+
+    let response = receive_bootstrap(conn).await?;
+    let (peer_id, transport_capabilities) = match response {
+        Message::HelloRejected { reason, .. } => {
+            anyhow::bail!("peer rejected compatibility bootstrap: {reason:?}")
+        }
+        Message::HelloBack {
+            app_id,
+            device_id,
+            protocol_version,
+            transport_capabilities,
+            ..
+        } => {
+            if let Err(reason) = validate_hello(&app_id, protocol_version, &transport_capabilities)
+            {
+                anyhow::bail!("peer returned incompatible HelloBack: {reason:?}");
+            }
+            (device_id, transport_capabilities)
+        }
+        _ => anyhow::bail!("peer did not return HelloBack or HelloRejected"),
+    };
+
+    let certificate_fingerprint =
+        conn.confirm_peer_identity_with_approvals(peer_id, approved_fingerprints)?;
+    conn.complete_peer_protocol_handshake().await?;
+    Ok(NegotiatedPeer {
+        auth: PeerAuthContext {
+            peer_id,
+            certificate_fingerprint,
+            control_connection_id: ControlConnectionId::new(),
+        },
+        transport_capabilities,
+        inbound_trust_decision: None,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn perform_outbound_handshake_for_test(
     conn: &mut QuicConnection,
     local_device_id: DeviceId,
 ) -> Result<NegotiatedPeer> {
@@ -199,7 +258,7 @@ pub(crate) async fn perform_outbound_handshake(
         _ => anyhow::bail!("peer did not return HelloBack or HelloRejected"),
     };
 
-    let certificate_fingerprint = conn.confirm_peer_identity(peer_id)?;
+    let certificate_fingerprint = conn.confirm_peer_identity_for_test(peer_id)?;
     conn.complete_peer_protocol_handshake().await?;
     Ok(NegotiatedPeer {
         auth: PeerAuthContext {

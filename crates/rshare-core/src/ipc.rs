@@ -174,6 +174,14 @@ mod tests {
                 .unwrap(),
             request
         );
+        let reject = DaemonRequest::RejectPeer {
+            approval_id: "opaque-id".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&reject).unwrap())
+                .unwrap(),
+            reject
+        );
         let response = DaemonResponse::PendingPeerApprovals(vec![PendingPeerApproval {
             approval_id: "opaque-id".to_string(),
             device_id,
@@ -577,6 +585,9 @@ pub enum DaemonRequest {
     },
     ListPendingPeerApprovals,
     ApprovePeer {
+        approval_id: String,
+    },
+    RejectPeer {
         approval_id: String,
     },
     GetLayout,

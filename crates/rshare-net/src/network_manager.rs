@@ -543,6 +543,11 @@ impl NetworkManager {
         self.connection.lock().await.approve_peer(approval_id)
     }
 
+    /// Remove one pending or approved peer token before it can be consumed.
+    pub async fn reject_peer(&self, approval_id: &str) -> bool {
+        self.connection.lock().await.reject_peer(approval_id)
+    }
+
     /// Takes the typed terminal-release stream used by the input-plane
     /// integration. It is intentionally separate from legacy `Message`.
     pub async fn terminal_release_events(&self) -> Option<mpsc::Receiver<TerminalReleaseEvent>> {

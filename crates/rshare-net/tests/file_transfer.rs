@@ -175,6 +175,19 @@ fn manager(id: DeviceId, root: &std::path::Path) -> ConnectionManager {
     )
 }
 
+async fn wait_for_approval(manager: &ConnectionManager) -> String {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(approval) = manager.pending_peer_approvals().into_iter().next() {
+                break approval.approval_id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("peer approval should be published")
+}
+
 fn pump(
     mut events: mpsc::Receiver<ManagerEvent>,
     service: Arc<FileTransferService>,
@@ -223,25 +236,13 @@ impl Pair {
         );
         b.start_server("127.0.0.1:0").await.unwrap();
         let address = b.transport_local_addr().unwrap().to_string();
-        // The first-seen connection is rejected until the fixture approves
-        // the exact certificate fingerprint, matching the daemon control
-        // plane instead of relying on implicit trust.
-        let _ = a.connect(b_id, &address).await;
-        timeout(Duration::from_secs(3), async {
-            loop {
-                if let Some(approval) = b
-                    .pending_peer_approvals()
-                    .into_iter()
-                    .find(|approval| approval.device_id == a_id)
-                {
-                    assert!(b.approve_peer(&approval.approval_id));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("first-seen peer must be surfaced for explicit test approval");
+        a.connect(b_id, &address)
+            .await
+            .expect_err("first file-transfer contact must wait for approval");
+        let a_approval = wait_for_approval(&a).await;
+        let b_approval = wait_for_approval(&b).await;
+        assert!(a.approve_peer(&a_approval));
+        assert!(b.approve_peer(&b_approval));
         a.connect(b_id, &address).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while b.qos_registry().peer(&a_id).is_none() {
