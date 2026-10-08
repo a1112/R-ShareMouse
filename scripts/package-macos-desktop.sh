@@ -32,7 +32,7 @@ cargo build --manifest-path "$root/Cargo.toml" -p rshare-daemon -p rshare-cli --
 
 cp "$target_dir/release/rshare-daemon" "$bundle/Contents/MacOS/rshare-daemon"
 cp "$target_dir/release/rshare" "$bundle/Contents/MacOS/rshare"
-"$root/scripts/sign-macos-desktop.sh" "$bundle" "$identity"
+bash "$root/scripts/sign-macos-desktop.sh" "$bundle" "$identity"
 
 if [[ $# -eq 1 ]]; then
   if pgrep -f "$installed/Contents/MacOS/rshare-(gui|daemon)" >/dev/null; then
