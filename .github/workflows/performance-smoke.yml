@@ -248,7 +248,7 @@ jobs:
         uses: ./.github/actions/prepare-linux-build
       - name: Test workspace
         id: tests
-        run: cargo test --workspace --locked --no-fail-fast
+        run: xvfb-run -a -s "-screen 0 1280x800x24 +extension XTEST" cargo test --workspace --locked --no-fail-fast
       - name: Test HID report behavior
         id: hid_reports
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
