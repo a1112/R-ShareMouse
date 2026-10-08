@@ -173,6 +173,19 @@ fn manager(id: DeviceId, root: &std::path::Path) -> ConnectionManager {
     )
 }
 
+async fn wait_for_approval(manager: &ConnectionManager) -> String {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(approval) = manager.pending_peer_approvals().into_iter().next() {
+                break approval.approval_id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("peer approval should be published")
+}
+
 fn pump(
     mut events: mpsc::Receiver<ManagerEvent>,
     service: Arc<FileTransferService>,
@@ -220,9 +233,15 @@ impl Pair {
             resolver,
         );
         b.start_server("127.0.0.1:0").await.unwrap();
-        a.connect(b_id, &b.transport_local_addr().unwrap().to_string())
+        let address = b.transport_local_addr().unwrap().to_string();
+        a.connect(b_id, &address)
             .await
-            .unwrap();
+            .expect_err("first file-transfer contact must wait for approval");
+        let a_approval = wait_for_approval(&a).await;
+        let b_approval = wait_for_approval(&b).await;
+        assert!(a.approve_peer(&a_approval));
+        assert!(b.approve_peer(&b_approval));
+        a.connect(b_id, &address).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while b.qos_registry().peer(&a_id).is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;

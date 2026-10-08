@@ -11,15 +11,18 @@ use tokio::time::Instant;
 use rshare_core::{ControlConnectionId, DeviceId, Message, PendingPeerApproval};
 
 use super::encryption::{PeerCertificateFingerprint, QuicTrustDecision};
+#[cfg(test)]
+use super::handshake::perform_outbound_handshake_for_test;
 use super::handshake::{
-    complete_incoming_handshake, perform_outbound_handshake, receive_incoming_handshake,
+    complete_incoming_handshake, perform_outbound_handshake_with_approvals,
+    receive_incoming_handshake, send_incoming_hello_back,
 };
 use super::qos::{
     BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
     TerminalReleaseEvent, TransportSendError,
 };
 use super::transport::{
-    ConnectionPool, PeerInbound, QuicTransport, TransportDiagnosticsNotifier,
+    ConnectionPool, PeerApprovalRequired, PeerInbound, QuicTransport, TransportDiagnosticsNotifier,
     TransportProtocolError,
 };
 
@@ -415,10 +418,12 @@ pub struct ConnectionManager {
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
     pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+    #[cfg(test)]
+    allow_unapproved_test_peers: bool,
 }
 
-// Retained for the future explicit approval mode. The current single-user
-// runtime automatically pins first-seen peers after identity verification.
+// Pending identities are short-lived and must be approved over authenticated
+// local IPC before a first-seen, legacy, or rotated certificate is trusted.
 #[allow(dead_code)]
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
 
@@ -460,7 +465,6 @@ impl PendingApprovalRegistry {
         approvals
     }
 
-    #[allow(dead_code)]
     fn observe(
         &mut self,
         device_id: DeviceId,
@@ -502,7 +506,17 @@ impl PendingApprovalRegistry {
         true
     }
 
-    #[allow(dead_code)]
+    fn approved_fingerprints(&mut self, device_id: DeviceId, now_ms: u64) -> Vec<String> {
+        self.prune(now_ms);
+        self.approvals
+            .values()
+            .filter(|expectation| {
+                expectation.approved && expectation.approval.device_id == device_id
+            })
+            .map(|expectation| expectation.approval.fingerprint.clone())
+            .collect()
+    }
+
     fn consume_matching(
         &mut self,
         device_id: DeviceId,
@@ -522,6 +536,54 @@ impl PendingApprovalRegistry {
         matching_id
             .and_then(|approval_id| self.approvals.remove(&approval_id))
             .is_some()
+    }
+}
+
+fn authorize_inbound_peer(
+    connection: &mut super::transport::QuicConnection,
+    device_id: DeviceId,
+    fingerprint: &PeerCertificateFingerprint,
+    decision: Option<&QuicTrustDecision>,
+    pending_approvals: &Arc<StdRwLock<PendingApprovalRegistry>>,
+) -> bool {
+    match decision {
+        Some(QuicTrustDecision::OperatorApproved) => true,
+        Some(
+            decision @ (QuicTrustDecision::FirstSeen
+            | QuicTrustDecision::LegacyTofu
+            | QuicTrustDecision::Rejected { .. }),
+        ) => {
+            let approved = pending_approvals
+                .write()
+                .expect("pending approval registry poisoned")
+                .consume_matching(device_id, fingerprint, PendingApprovalRegistry::now_ms());
+            if !approved {
+                pending_approvals
+                    .write()
+                    .expect("pending approval registry poisoned")
+                    .observe(device_id, fingerprint, PendingApprovalRegistry::now_ms());
+                tracing::info!(
+                    "Inbound peer {} is waiting for exact certificate approval",
+                    device_id
+                );
+                false
+            } else {
+                let replace_existing = matches!(decision, QuicTrustDecision::Rejected { .. });
+                if let Err(error) =
+                    connection.commit_inbound_operator_approval(device_id, replace_existing)
+                {
+                    tracing::warn!(
+                        "Failed to persist explicitly approved inbound peer {}: {}",
+                        device_id,
+                        error
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+        None => false,
     }
 }
 
@@ -894,10 +956,12 @@ impl ConnectionManager {
 
     #[cfg(test)]
     pub(crate) fn isolated_for_test(local_device_id: DeviceId) -> Self {
-        Self::with_transport(
+        let mut manager = Self::with_transport(
             local_device_id,
             QuicTransport::isolated_for_test(local_device_id),
-        )
+        );
+        manager.allow_unapproved_test_peers = true;
+        manager
     }
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
@@ -911,6 +975,8 @@ impl ConnectionManager {
             projection_tx.clone(),
         ));
         transport.require_peer_protocol_handshake();
+        #[cfg(test)]
+        let allow_unapproved_test_peers = transport.allow_unapproved_test_peers;
         let pool = Arc::new(ConnectionPool::new(local_device_id));
 
         Self {
@@ -930,6 +996,8 @@ impl ConnectionManager {
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
             pending_approvals: Arc::new(StdRwLock::new(PendingApprovalRegistry::default())),
+            #[cfg(test)]
+            allow_unapproved_test_peers,
         }
     }
 
@@ -959,7 +1027,10 @@ impl ConnectionManager {
         let qos_registry = self.qos_registry.clone();
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
+        let pending_approvals = self.pending_approvals.clone();
         let local_device_id = self.local_device_id;
+        #[cfg(test)]
+        let allow_unapproved_test_peers = self.allow_unapproved_test_peers;
 
         tokio::spawn(async move {
             while let Some(mut incoming) = incoming.recv().await {
@@ -979,27 +1050,41 @@ impl ConnectionManager {
                         }
                     };
                 let device_id = negotiated.auth.peer_id;
-                let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
-                    Some(QuicTrustDecision::OperatorApproved) => true,
-                    Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
-                        if let Err(error) = incoming
-                            .connection
-                            .commit_inbound_operator_approval(device_id)
-                        {
-                            tracing::warn!(
-                                "Failed to persist automatically trusted inbound peer {}: {}",
-                                device_id,
-                                error
-                            );
-                            false
-                        } else {
-                            true
-                        }
+                let inbound_authorized = {
+                    #[cfg(test)]
+                    if allow_unapproved_test_peers {
+                        true
+                    } else {
+                        authorize_inbound_peer(
+                            &mut incoming.connection,
+                            device_id,
+                            &negotiated.auth.certificate_fingerprint,
+                            negotiated.inbound_trust_decision.as_ref(),
+                            &pending_approvals,
+                        )
                     }
-                    Some(QuicTrustDecision::Rejected { .. }) | None => false,
+                    #[cfg(not(test))]
+                    {
+                        authorize_inbound_peer(
+                            &mut incoming.connection,
+                            device_id,
+                            &negotiated.auth.certificate_fingerprint,
+                            negotiated.inbound_trust_decision.as_ref(),
+                            &pending_approvals,
+                        )
+                    }
                 };
                 if !inbound_authorized {
                     tracing::info!("Inbound peer {} was rejected by the trust store", device_id);
+                    if let Err(error) =
+                        send_incoming_hello_back(&incoming.connection, local_device_id).await
+                    {
+                        tracing::debug!(
+                            "Failed to return the pending-approval identity response to {}: {}",
+                            device_id,
+                            error
+                        );
+                    }
                     incoming.connection.close().await;
                     continue;
                 }
@@ -1230,7 +1315,16 @@ impl ConnectionManager {
             }
         }
 
-        let mut conn = match self.transport.connect(address, device_id).await {
+        let approved_fingerprints = self
+            .pending_approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .approved_fingerprints(device_id, PendingApprovalRegistry::now_ms());
+        let mut conn = match self
+            .transport
+            .connect_with_approvals(address, device_id, &approved_fingerprints)
+            .await
+        {
             Ok(conn) => conn,
             Err(error) => {
                 let _ = self
@@ -1244,9 +1338,37 @@ impl ConnectionManager {
                 return Err(error);
             }
         };
-        let negotiated = match perform_outbound_handshake(&mut conn, self.local_device_id).await {
+        #[cfg(test)]
+        let negotiated_result = if self.allow_unapproved_test_peers {
+            perform_outbound_handshake_for_test(&mut conn, self.local_device_id).await
+        } else {
+            perform_outbound_handshake_with_approvals(
+                &mut conn,
+                self.local_device_id,
+                &approved_fingerprints,
+            )
+            .await
+        };
+        #[cfg(not(test))]
+        let negotiated_result = perform_outbound_handshake_with_approvals(
+            &mut conn,
+            self.local_device_id,
+            &approved_fingerprints,
+        )
+        .await;
+        let negotiated = match negotiated_result {
             Ok(negotiated) => negotiated,
             Err(error) => {
+                if let Some(required) = error.downcast_ref::<PeerApprovalRequired>() {
+                    self.pending_approvals
+                        .write()
+                        .expect("pending approval registry poisoned")
+                        .observe(
+                            required.device_id,
+                            &required.fingerprint,
+                            PendingApprovalRegistry::now_ms(),
+                        );
+                }
                 conn.reject_pending_peer_identity();
                 let _ = self
                     .event_tx
@@ -1269,6 +1391,14 @@ impl ConnectionManager {
         }
 
         conn.set_device_id(device_id);
+        self.pending_approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .consume_matching(
+                device_id,
+                &negotiated.auth.certificate_fingerprint,
+                PendingApprovalRegistry::now_ms(),
+            );
         let auth = Arc::new(negotiated.auth.clone());
         let (qos_transport, releases) = conn.install_qos(auth.clone());
         let peer_inbound = conn
@@ -2305,7 +2435,9 @@ mod tests {
             .await
             .unwrap();
         let _server_connection = accepted.await.unwrap();
-        connection.confirm_peer_identity(remote_id).unwrap();
+        connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         connection.set_device_id(remote_id);
         let messages = connection.message_channel();
 
@@ -2469,7 +2601,9 @@ mod tests {
             .await
             .unwrap();
         let _first_server_connection = incoming.recv().await.unwrap().connection;
-        old_connection.confirm_peer_identity(remote_id).unwrap();
+        old_connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         old_connection.set_device_id(remote_id);
 
         let mut second_client = QuicTransport::isolated_for_test(local_id);
@@ -2478,7 +2612,9 @@ mod tests {
             .await
             .unwrap();
         let _second_server_connection = incoming.recv().await.unwrap().connection;
-        new_connection.confirm_peer_identity(remote_id).unwrap();
+        new_connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         new_connection.set_device_id(remote_id);
 
         let mut manager = ConnectionManager::isolated_for_test(local_id);
@@ -2771,7 +2907,9 @@ mod tests {
             .await
             .unwrap();
         let _server_connection = accepted.await.unwrap();
-        connection.confirm_peer_identity(remote_id).unwrap();
+        connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         connection.set_device_id(remote_id);
         let _held_messages = connection.message_channel();
 

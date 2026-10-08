@@ -290,6 +290,32 @@ impl QuicTrustStore {
         store.approve(device_id, fingerprint)?;
         write_trust_store_atomic(path, &store)
     }
+
+    /// Replace an existing certificate pin after an exact operator approval.
+    ///
+    /// `approve_at` deliberately refuses to replace a different fingerprint so
+    /// that a caller cannot silently turn certificate rotation into TOFU.  The
+    /// pending peer approval flow calls this method only after the local
+    /// operator approved the exact new device ID and fingerprint.
+    pub fn replace_at(
+        path: impl AsRef<Path>,
+        device_id: DeviceId,
+        fingerprint: PeerCertificateFingerprint,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let _guard = TRUST_STORE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("QUIC trust store lock poisoned"))?;
+        let mut store = Self::load(path)?;
+        store.peers.insert(
+            device_id,
+            TrustedPeerEntry {
+                fingerprint,
+                provenance: TrustProvenance::OperatorApproved,
+            },
+        );
+        write_trust_store_atomic(path, &store)
+    }
 }
 
 /// Encryption using rustls (via QUIC).

@@ -93,6 +93,15 @@ pub struct TransportConnectionDiagnostics {
     pub cert_trust_state: Option<String>,
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "peer {device_id} requires explicit operator approval for certificate fingerprint {fingerprint}"
+)]
+pub(crate) struct PeerApprovalRequired {
+    pub(crate) device_id: DeviceId,
+    pub(crate) fingerprint: PeerCertificateFingerprint,
+}
+
 #[derive(Clone)]
 pub(crate) struct TransportDiagnosticsNotifier {
     revision: Arc<AtomicU64>,
@@ -343,6 +352,8 @@ pub struct QuicTransport {
     diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
     state_lifetime: Option<Arc<StateLifetimeOwner>>,
     #[cfg(test)]
+    pub(crate) allow_unapproved_test_peers: bool,
+    #[cfg(test)]
     accept_task_barrier: Option<Arc<Notify>>,
     #[cfg(test)]
     accept_task_waiting: Arc<AtomicBool>,
@@ -423,6 +434,8 @@ impl QuicTransport {
             diagnostics_notifier: None,
             state_lifetime: None,
             #[cfg(test)]
+            allow_unapproved_test_peers: false,
+            #[cfg(test)]
             accept_task_barrier: None,
             #[cfg(test)]
             accept_task_waiting: Arc::new(AtomicBool::new(false)),
@@ -453,6 +466,7 @@ impl QuicTransport {
         let mut transport = Self::from_identity(local_device_id, identity)
             .with_trust_store_path(state_dir.join("quic-trust.json"));
         transport.state_lifetime = Some(lifetime);
+        transport.allow_unapproved_test_peers = true;
         transport
     }
 
@@ -606,6 +620,16 @@ impl QuicTransport {
         remote_addr: &str,
         device_id: DeviceId,
     ) -> Result<QuicConnection> {
+        self.connect_with_approvals(remote_addr, device_id, &[])
+            .await
+    }
+
+    pub(crate) async fn connect_with_approvals(
+        &mut self,
+        remote_addr: &str,
+        device_id: DeviceId,
+        approved_fingerprints: &[String],
+    ) -> Result<QuicConnection> {
         let remote_addr: SocketAddr = remote_addr
             .parse()
             .map_err(|_| anyhow!("Invalid remote address: {}", remote_addr))?;
@@ -635,6 +659,7 @@ impl QuicTransport {
             &connection,
             device_id,
             trust_store_path.clone(),
+            approved_fingerprints,
             self.state_lifetime.clone(),
         )
         .await?;
@@ -840,6 +865,7 @@ struct PendingPeerTrust {
     fingerprint: PeerCertificateFingerprint,
     trust_store_path: PathBuf,
     decision: QuicTrustDecision,
+    approved_fingerprints: Vec<String>,
     _state_lifetime: Option<Arc<StateLifetimeOwner>>,
 }
 
@@ -1297,6 +1323,14 @@ impl QuicConnection {
         &mut self,
         actual_device_id: DeviceId,
     ) -> Result<PeerCertificateFingerprint> {
+        self.confirm_peer_identity_with_approvals(actual_device_id, &[])
+    }
+
+    pub(crate) fn confirm_peer_identity_with_approvals(
+        &mut self,
+        actual_device_id: DeviceId,
+        approved_fingerprints: &[String],
+    ) -> Result<PeerCertificateFingerprint> {
         let pending = self
             .pending_peer_trust
             .take()
@@ -1313,38 +1347,57 @@ impl QuicConnection {
         }
 
         let fingerprint = pending.fingerprint.clone();
+        let explicitly_approved = pending
+            .approved_fingerprints
+            .iter()
+            .chain(approved_fingerprints.iter())
+            .any(|approved| approved == fingerprint.as_str());
         let decision = match pending.decision {
-            QuicTrustDecision::Rejected { expected, actual } => {
-                Ok(QuicTrustDecision::Rejected { expected, actual })
+            QuicTrustDecision::OperatorApproved => Ok(QuicTrustDecision::OperatorApproved),
+            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu if explicitly_approved => {
+                QuicTrustStore::approve_at(
+                    &pending.trust_store_path,
+                    pending.expected_device_id,
+                    pending.fingerprint,
+                )
+                .map(|_| QuicTrustDecision::OperatorApproved)
             }
-            _ => QuicTrustStore::approve_at(
-                &pending.trust_store_path,
-                pending.expected_device_id,
-                pending.fingerprint,
-            )
-            .map(|_| QuicTrustDecision::OperatorApproved),
+            QuicTrustDecision::Rejected { .. } if explicitly_approved => {
+                QuicTrustStore::replace_at(
+                    &pending.trust_store_path,
+                    pending.expected_device_id,
+                    pending.fingerprint,
+                )
+                .map(|_| QuicTrustDecision::OperatorApproved)
+            }
+            QuicTrustDecision::FirstSeen
+            | QuicTrustDecision::LegacyTofu
+            | QuicTrustDecision::Rejected { .. } => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"operator approval required");
+                return Err(anyhow::Error::new(PeerApprovalRequired {
+                    device_id: pending.expected_device_id,
+                    fingerprint,
+                }));
+            }
         };
         match decision {
             Ok(QuicTrustDecision::OperatorApproved) => {
                 self.cert_trust_state = Some("operator_approved".to_string());
                 Ok(fingerprint)
             }
-            Ok(QuicTrustDecision::Rejected { expected, actual }) => {
-                self.inner
-                    .connection
-                    .close(0u32.into(), b"certificate fingerprint mismatch");
-                anyhow::bail!(
-                    "QUIC certificate fingerprint changed for {} while confirming identity: expected {}, got {}",
-                    actual_device_id,
-                    expected,
-                    actual
-                );
-            }
             Ok(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
                 self.inner
                     .connection
                     .close(0u32.into(), b"invalid outbound trust state");
                 anyhow::bail!("outbound trust promotion did not commit operator approval")
+            }
+            Ok(QuicTrustDecision::Rejected { .. }) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"invalid outbound trust state");
+                anyhow::bail!("outbound trust replacement did not commit operator approval")
             }
             Err(error) => {
                 self.inner
@@ -1353,6 +1406,20 @@ impl QuicConnection {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_peer_identity_for_test(
+        &mut self,
+        actual_device_id: DeviceId,
+    ) -> Result<PeerCertificateFingerprint> {
+        let approval = self
+            .pending_peer_trust
+            .as_ref()
+            .map(|pending| pending.fingerprint.as_str().to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.confirm_peer_identity_with_approvals(actual_device_id, &approval)
     }
 
     pub fn inspect_inbound_peer_identity(
@@ -1369,23 +1436,24 @@ impl QuicConnection {
             QuicTrustDecision::FirstSeen
             | QuicTrustDecision::LegacyTofu
             | QuicTrustDecision::OperatorApproved => Ok((fingerprint, decision)),
-            QuicTrustDecision::Rejected { expected, actual } => {
-                anyhow::bail!(
-                    "QUIC certificate fingerprint changed for {}: expected {}, got {}",
-                    actual_device_id,
-                    expected,
-                    actual
-                )
-            }
+            QuicTrustDecision::Rejected { .. } => Ok((fingerprint, decision)),
         }
     }
 
-    pub fn commit_inbound_operator_approval(&mut self, device_id: DeviceId) -> Result<()> {
+    pub fn commit_inbound_operator_approval(
+        &mut self,
+        device_id: DeviceId,
+        replace_existing: bool,
+    ) -> Result<()> {
         let fingerprint = self
             .peer_fingerprint
             .clone()
             .ok_or_else(|| anyhow!("peer certificate unavailable"))?;
-        QuicTrustStore::approve_at(&self.trust_store_path, device_id, fingerprint)?;
+        if replace_existing {
+            QuicTrustStore::replace_at(&self.trust_store_path, device_id, fingerprint)?;
+        } else {
+            QuicTrustStore::approve_at(&self.trust_store_path, device_id, fingerprint)?;
+        }
         self.cert_trust_state = Some("operator_approved".to_string());
         Ok(())
     }
@@ -3363,6 +3431,7 @@ async fn inspect_outbound_peer_trust(
     connection: &quinn::Connection,
     device_id: DeviceId,
     trust_store_path: PathBuf,
+    approved_fingerprints: &[String],
     state_lifetime: Option<Arc<StateLifetimeOwner>>,
 ) -> Result<PendingPeerTrust> {
     let fingerprint = match peer_certificate_fingerprint(connection) {
@@ -3383,21 +3452,14 @@ async fn inspect_outbound_peer_trust(
     match &decision {
         QuicTrustDecision::FirstSeen => {}
         QuicTrustDecision::LegacyTofu | QuicTrustDecision::OperatorApproved => {}
-        QuicTrustDecision::Rejected { expected, actual } => {
-            connection.close(0u32.into(), b"certificate fingerprint mismatch");
-            anyhow::bail!(
-                "QUIC certificate fingerprint changed for {}: expected {}, got {}",
-                device_id,
-                expected,
-                actual
-            );
-        }
+        QuicTrustDecision::Rejected { .. } => {}
     }
     Ok(PendingPeerTrust {
         expected_device_id: device_id,
         fingerprint,
         trust_store_path,
         decision,
+        approved_fingerprints: approved_fingerprints.to_vec(),
         _state_lifetime: state_lifetime,
     })
 }
@@ -3492,8 +3554,9 @@ impl ClientCertVerifier for OptionalBootstrapClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, RustlsError> {
-        // Self-signed identities are authorized only after the claimed DeviceId
-        // is checked against TOFU during the application bootstrap.
+        // Self-signed identities are accepted at TLS only so the application
+        // bootstrap can bind the claimed DeviceId to an explicit local
+        // operator approval for this certificate fingerprint.
         Ok(ClientCertVerified::assertion())
     }
 
@@ -7118,7 +7181,9 @@ mod tests {
             .expect("the original listener must accept within the deadline")
             .expect("the original listener must publish its connection")
             .connection;
-        client_connection.confirm_peer_identity(server_id).unwrap();
+        client_connection
+            .confirm_peer_identity_for_test(server_id)
+            .unwrap();
         server_connection
             .inspect_inbound_peer_identity(client_id)
             .unwrap();
@@ -7285,7 +7350,9 @@ mod tests {
         drop(client);
         assert!(server_state.exists());
         assert!(client_state.exists());
-        client_connection.confirm_peer_identity(server_id).unwrap();
+        client_connection
+            .confirm_peer_identity_for_test(server_id)
+            .unwrap();
         server_connection
             .inspect_inbound_peer_identity(client_id)
             .unwrap();
@@ -7328,7 +7395,7 @@ mod tests {
 
         drop(client);
         assert!(client_state.exists());
-        pending.confirm_peer_identity(server_id).unwrap();
+        pending.confirm_peer_identity_for_test(server_id).unwrap();
         assert!(
             pending.trust_store_path.exists(),
             "confirmation after transport drop must still persist trust"

@@ -9,9 +9,8 @@ use rshare_core::{
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalDisplayState, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, MobileAccessSnapshot,
-    ServiceStatusSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
-    VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
+    LocalInputTestResult, MobileAccessSnapshot, ServiceStatusSnapshot, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use serde::Serialize;
 use std::{
@@ -475,6 +474,20 @@ async fn capabilities_state(
 async fn connect_device(device_id: String) -> Result<(), String> {
     let device_id = parse_device_id(&device_id)?;
     daemon_client::request_connect(device_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn pending_peer_approvals() -> Result<Vec<rshare_core::PendingPeerApproval>, String> {
+    daemon_client::request_pending_peer_approvals()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn approve_peer(approval_id: String) -> Result<(), String> {
+    daemon_client::request_approve_peer(approval_id)
         .await
         .map_err(|err| err.to_string())
 }
@@ -1286,6 +1299,8 @@ fn main() {
             stop_service,
             capabilities_state,
             connect_device,
+            pending_peer_approvals,
+            approve_peer,
             disconnect_device,
             wake_targets,
             wake_attempts,

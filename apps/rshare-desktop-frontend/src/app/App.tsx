@@ -302,6 +302,14 @@ type DashboardPayload = {
   auto_started?: boolean;
 };
 
+type PendingPeerApproval = {
+  approval_id: string;
+  device_id: string;
+  fingerprint: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+};
+
 type CapabilityOverview = {
   available: boolean;
   localDeviceId: string | null;
@@ -831,6 +839,8 @@ const NETWORK_COMMANDS = new Set([
   "get_logs",
   "clear_logs",
   "connect_device",
+  "pending_peer_approvals",
+  "approve_peer",
   "disconnect_device",
   "wake_targets",
   "wake_attempts",
@@ -1329,6 +1339,13 @@ async function invokeNetworkCommand<T = unknown>(
     case "connect_device":
       return await daemonRequestValue<T>(
         { Connect: { device_id: args?.device_id ?? args?.deviceId } },
+        "Ack",
+      );
+    case "pending_peer_approvals":
+      return await daemonRequestValue<T>("ListPendingPeerApprovals", "PendingPeerApprovals");
+    case "approve_peer":
+      return await daemonRequestValue<T>(
+        { ApprovePeer: { approval_id: args?.approval_id ?? args?.approvalId } },
         "Ack",
       );
     case "disconnect_device":
@@ -4508,6 +4525,7 @@ function DevicesPageWithLocalControls({
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-auto">
+      <PeerApprovalsPanel busy={busy} theme={theme} />
       <LocalControlCenter
         snapshot={localControls}
         error={localControlsError}
@@ -4614,6 +4632,128 @@ function DevicesPageWithLocalControls({
         )}
       </section>
     </div>
+  );
+}
+
+function PeerApprovalsPanel({
+  busy,
+  theme,
+}: {
+  busy: boolean;
+  theme: typeof FIGMA_DESKTOP_THEME;
+}) {
+  const [approvals, setApprovals] = useState<PendingPeerApproval[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      const next = await invokeCommand<PendingPeerApproval[]>("pending_peer_approvals");
+      setApprovals(safeArray(next));
+      setError(null);
+    } catch (refreshError) {
+      // The daemon may be restarting; an unavailable approval list is not a
+      // reason to present stale identity material to the operator.
+      setApprovals([]);
+      setError(errorMessage(refreshError));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const approve = async (approvalId: string) => {
+    setApprovingId(approvalId);
+    try {
+      await invokeCommand("approve_peer", { approval_id: approvalId });
+      await refresh();
+    } catch (approveError) {
+      setError(errorMessage(approveError));
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
+  if (!approvals.length && !error) {
+    return null;
+  }
+
+  return (
+    <section
+      className="shrink-0 px-4 py-3"
+      style={{
+        borderBottom: `1px solid ${theme.border}`,
+        background: theme.toolbar,
+      }}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold" style={{ color: theme.text }}>
+            待确认的设备身份
+          </h2>
+          <p className="mt-1 text-xs" style={{ color: theme.textMuted }}>
+            连接前请核对完整设备 ID 和证书指纹；确认只对当前精确身份生效。
+          </p>
+        </div>
+        <button
+          type="button"
+          className="rounded-md px-2 py-1 text-xs"
+          style={{ border: `1px solid ${theme.border}`, color: theme.textSub }}
+          disabled={loading || busy}
+          onClick={() => void refresh()}
+        >
+          刷新
+        </button>
+      </div>
+      {error ? (
+        <div className="mt-2 text-xs" style={{ color: "#ffb8c1" }}>
+          {error}
+        </div>
+      ) : null}
+      <div className="mt-3 grid grid-cols-1 gap-2 xl:grid-cols-2">
+        {approvals.map((approval) => (
+          <article
+            key={approval.approval_id}
+            className="rounded-md p-3"
+            style={{
+              border: `1px solid ${theme.border}`,
+              background: theme.frame,
+            }}
+          >
+            <div className="grid gap-1 text-xs" style={{ color: theme.textSub }}>
+              <div>
+                <span style={{ color: theme.textMuted }}>设备 ID：</span>
+                <code className="break-all">{approval.device_id}</code>
+              </div>
+              <div>
+                <span style={{ color: theme.textMuted }}>证书指纹：</span>
+                <code className="break-all">{approval.fingerprint}</code>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="mt-3 rounded-md px-3 py-1.5 text-xs"
+              style={{
+                border: `1px solid ${theme.accent}`,
+                background: theme.accentSoft,
+                color: theme.text,
+              }}
+              disabled={busy || approvingId !== null}
+              onClick={() => void approve(approval.approval_id)}
+            >
+              {approvingId === approval.approval_id ? "确认中…" : "确认此设备身份"}
+            </button>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
