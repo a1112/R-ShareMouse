@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use rshare_core::{ControlConnectionId, DeviceId, LocalInputDiagnosticEvent};
+use rshare_core::{
+    ControlConnectionId, DeviceId, EndpointEvent, EndpointEventFilter, LocalInputDeviceKind,
+    LocalInputDiagnosticEvent, LocalInputEventSource,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::input_state::{ControlMetricSnapshot, ControlMetrics};
@@ -72,6 +75,8 @@ impl RuntimeCounters {
 struct SubscriptionEntry {
     token: u64,
     tx: watch::Sender<Option<Arc<DiagnosticPublication>>>,
+    filter: Option<EndpointEventFilter>,
+    endpoint_id: DeviceId,
 }
 
 struct PeerSubscriptionState {
@@ -134,7 +139,47 @@ impl SubscriptionRegistry {
             })
             .expect("diagnostics subscription tokens exhausted");
         let (tx, rx) = watch::channel(None);
-        peer.subscription = Some(SubscriptionEntry { token, tx });
+        peer.subscription = Some(SubscriptionEntry {
+            token,
+            tx,
+            filter: None,
+            endpoint_id: DeviceId::nil(),
+        });
+        Some(DiagnosticsSubscription {
+            id,
+            token,
+            rx,
+            registry: Arc::downgrade(self),
+        })
+    }
+
+    fn subscribe_current_filtered(
+        self: &Arc<Self>,
+        id: DiagnosticSubscriberId,
+        endpoint_id: DeviceId,
+        filter: EndpointEventFilter,
+    ) -> Option<DiagnosticsSubscription> {
+        let mut peers = self
+            .peers
+            .lock()
+            .expect("diagnostics subscription registry poisoned");
+        let peer = peers.get_mut(&id.peer_id)?;
+        if peer.generation != id.control_connection_id || peer.subscription.is_some() {
+            return None;
+        }
+        let token = self
+            .next_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .expect("diagnostics subscription tokens exhausted");
+        let (tx, rx) = watch::channel(None);
+        peer.subscription = Some(SubscriptionEntry {
+            token,
+            tx,
+            filter: Some(filter),
+            endpoint_id,
+        });
         Some(DiagnosticsSubscription {
             id,
             token,
@@ -216,11 +261,63 @@ impl SubscriptionRegistry {
             .values()
             .filter_map(|peer| peer.subscription.as_ref())
             .map(|subscription| {
-                subscription.tx.send_replace(Some(publication.clone()));
+                let publication = subscription
+                    .filter
+                    .as_ref()
+                    .map(|filter| {
+                        let items = publication
+                            .items
+                            .iter()
+                            .filter(|item| {
+                                diagnostic_item_matches_filter(
+                                    subscription.endpoint_id,
+                                    publication.sequence,
+                                    item,
+                                    filter,
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        Arc::new(DiagnosticPublication {
+                            sequence: publication.sequence,
+                            items: items.into(),
+                        })
+                    })
+                    .unwrap_or_else(|| publication.clone());
+                subscription.tx.send_replace(Some(publication));
                 1_u64
             })
             .sum()
     }
+}
+
+fn diagnostic_item_matches_filter(
+    endpoint_id: DeviceId,
+    sequence: u64,
+    item: &DiagnosticPublicationItem,
+    filter: &EndpointEventFilter,
+) -> bool {
+    let event = match &item.payload {
+        DiagnosticPayload::Discrete(event) => event.clone(),
+        DiagnosticPayload::Metrics(snapshot) => LocalInputDiagnosticEvent {
+            sequence,
+            timestamp_ms: 0,
+            device_kind: LocalInputDeviceKind::Backend,
+            event_kind: "control_metrics_sample".to_string(),
+            summary: "Sampled control-path metrics".to_string(),
+            device_id: None,
+            device_instance_id: None,
+            capture_path: Some("diagnostics-runtime".to_string()),
+            source: LocalInputEventSource::System,
+            payload: [
+                ("captured".to_string(), snapshot.captured.to_string()),
+                ("routed".to_string(), snapshot.routed.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    };
+    filter.matches(&EndpointEvent::from_local_diagnostic(endpoint_id, event))
 }
 
 pub struct DiagnosticsSubscription {
@@ -268,6 +365,7 @@ pub struct DiagnosticsHandle {
     discrete: Arc<Mutex<VecDeque<LocalInputDiagnosticEvent>>>,
     discrete_capacity: usize,
     counters: Arc<RuntimeCounters>,
+    endpoint_id: DeviceId,
 }
 
 impl DiagnosticsHandle {
@@ -277,6 +375,15 @@ impl DiagnosticsHandle {
 
     pub fn subscribe_current(&self, id: DiagnosticSubscriberId) -> Option<DiagnosticsSubscription> {
         self.subscribers.subscribe_current(id)
+    }
+
+    pub fn subscribe_current_filtered(
+        &self,
+        id: DiagnosticSubscriberId,
+        filter: EndpointEventFilter,
+    ) -> Option<DiagnosticsSubscription> {
+        self.subscribers
+            .subscribe_current_filtered(id, self.endpoint_id, filter)
     }
 
     pub fn unsubscribe(&self, id: DiagnosticSubscriberId) -> bool {
@@ -327,6 +434,7 @@ pub struct DiagnosticsRuntime {
     publication_sequence: u64,
     discrete: Arc<Mutex<VecDeque<LocalInputDiagnosticEvent>>>,
     counters: Arc<RuntimeCounters>,
+    endpoint_id: DeviceId,
 }
 
 impl DiagnosticsRuntime {
@@ -355,7 +463,13 @@ impl DiagnosticsRuntime {
             publication_sequence: 0,
             discrete: Arc::new(Mutex::new(VecDeque::with_capacity(history_capacity))),
             counters: Arc::new(RuntimeCounters::default()),
+            endpoint_id: DeviceId::nil(),
         }
+    }
+
+    pub fn with_endpoint_id(mut self, endpoint_id: DeviceId) -> Self {
+        self.endpoint_id = endpoint_id;
+        self
     }
 
     pub fn handle(&self) -> DiagnosticsHandle {
@@ -364,6 +478,7 @@ impl DiagnosticsRuntime {
             discrete: self.discrete.clone(),
             discrete_capacity: self.history_capacity,
             counters: self.counters.clone(),
+            endpoint_id: self.endpoint_id,
         }
     }
 

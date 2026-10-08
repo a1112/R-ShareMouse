@@ -87,8 +87,26 @@ async fn assert_no_connected_event(
     assert!(no_connected.is_err(), "event channel closed unexpectedly");
 }
 
+async fn approve_pending_peer(server: &ConnectionManager, peer_id: Uuid) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(approval) = server
+                .pending_peer_approvals()
+                .into_iter()
+                .find(|approval| approval.device_id == peer_id)
+            {
+                assert!(server.approve_peer(&approval.approval_id));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first-seen peer must surface for explicit approval");
+}
+
 #[tokio::test]
-async fn peers_auto_trust_first_seen_certificate_and_connect() {
+async fn peers_first_seen_certificate_requires_explicit_approval() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("mutual");
@@ -97,6 +115,14 @@ async fn peers_auto_trust_first_seen_certificate_and_connect() {
     server.start_server("127.0.0.1:0").await.unwrap();
 
     let mut client = network.manager(client_id, "client", generated_identity());
+    assert!(client
+        .connect(
+            server_id,
+            &server.transport_local_addr().unwrap().to_string(),
+        )
+        .await
+        .is_err());
+    approve_pending_peer(&server, client_id).await;
     client
         .connect(
             server_id,
@@ -159,6 +185,8 @@ async fn changed_fingerprint_never_enters_registry() {
     let first_identity = generated_identity();
     let first_fingerprint = PeerCertificateFingerprint::from_der(&first_identity.cert_der);
     let mut first = network.manager(claimed_id, "client", first_identity);
+    assert!(first.connect(server_id, &address).await.is_err());
+    approve_pending_peer(&server, claimed_id).await;
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
     server.disconnect(&claimed_id).await.unwrap();
@@ -225,6 +253,8 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     let address = server.transport_local_addr().unwrap().to_string();
 
     let mut first = network.manager(client_id, "client", client_identity.clone());
+    assert!(first.connect(server_id, &address).await.is_err());
+    approve_pending_peer(&server, client_id).await;
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     let old_control_id = server.connections()[0]

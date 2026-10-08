@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -493,11 +493,17 @@ impl MobileGatewayAccess {
         MobileAccessSnapshot {
             enabled: true,
             bind_address: self.bind_addr.to_string(),
+            // Never put the bearer in a URL: browsers, proxies and history
+            // routinely persist URLs. The gateway is loopback-only, and the
+            // page authenticates API calls with an Authorization header.
             page_url: format!(
-                "http://{}:{}/mobile{}",
-                self.advertise_host,
-                self.bind_addr.port(),
-                mobile_token_query(&self.token)
+                "http://{}:{}/mobile",
+                if self.bind_addr.ip().is_loopback() {
+                    "127.0.0.1"
+                } else {
+                    &self.advertise_host
+                },
+                self.bind_addr.port()
             ),
             token: self.token.clone(),
             last_client_addr,
@@ -576,24 +582,15 @@ pub(crate) fn is_authorized_mobile_request(request: &MobileHttpRequest, expected
         return false;
     }
 
-    mobile_token_from_target(&request.target)
-        .or_else(|| mobile_token_from_authorization(request.header("authorization")))
+    mobile_token_from_authorization(request.header("authorization"))
         .or_else(|| request.header("x-rshare-mobile-token").map(str::to_string))
         .as_deref()
         == Some(expected)
 }
 
 pub(crate) fn preferred_mobile_advertise_host(hostname: &str) -> String {
-    detect_lan_ipv4()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|| {
-            let trimmed = hostname.trim();
-            if trimmed.is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                trimmed.to_string()
-            }
-        })
+    let _ = hostname;
+    "127.0.0.1".to_string()
 }
 
 pub(crate) async fn run_mobile_gateway_server(
@@ -604,6 +601,20 @@ pub(crate) async fn run_mobile_gateway_server(
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
+    if !access.bind_addr().ip().is_loopback() {
+        let reason = format!(
+            "Mobile gateway refuses plaintext non-loopback bind on {}",
+            access.bind_addr()
+        );
+        tracing::warn!("{}", reason);
+        {
+            let mut state = state.write().await;
+            state.mobile_access = MobileGatewayAccess::disabled(reason);
+        }
+        let _ = shutdown_rx.recv().await;
+        return Ok(());
+    }
+
     let listener = match TcpListener::bind(access.bind_addr()).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -824,7 +835,8 @@ async fn handle_mobile_gateway_client_with_context(
         .await;
     }
 
-    if !is_authorized_mobile_request(&request, access.token()) {
+    let local_only_route = route == MobileGatewayRoute::Page && peer_addr.ip().is_loopback();
+    if !local_only_route && !is_authorized_mobile_request(&request, access.token()) {
         return write_mobile_response_with_deadline(
             &mut stream,
             401,
@@ -2057,10 +2069,6 @@ fn mobile_token_from_authorization(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn mobile_token_from_target(target: &str) -> Option<String> {
-    mobile_query_value(target, "t").or_else(|| mobile_query_value(target, "token"))
-}
-
 fn mobile_query_value(target: &str, expected_key: &str) -> Option<String> {
     let query = target.split_once('?')?.1;
     query.split('&').find_map(|part| {
@@ -2090,38 +2098,11 @@ fn percent_decode_query_value(value: &str) -> String {
     String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
 }
 
-fn percent_encode_query_value(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
-    for &byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push(HEX[(byte >> 4) as usize] as char);
-                encoded.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    encoded
-}
-
 fn hex_digit_value(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn detect_lan_ipv4() -> Option<std::net::Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(addr) if !addr.is_loopback() => Some(addr),
         _ => None,
     }
 }
@@ -2239,8 +2220,8 @@ fn render_mobile_page_with_token(token: &str) -> String {
   <div class="sub" id="textCapability" role="status">当前输入后端不支持文本输入，请使用按键控制。</div>
 </main>
 <script>
-const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
-document.getElementById("extendedDisplayLink").href = "/display?t=" + encodeURIComponent(token);
+const token = __MOBILE_TOKEN_JSON__ || "";
+document.getElementById("extendedDisplayLink").href = "/display";
 function newMobileClientId() {
   return crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -2703,13 +2684,7 @@ async function sendReleaseAll() {
 function keepaliveReleaseBatch(requests) {
   if (!Array.isArray(requests) || requests.length === 0) return false;
   const body = JSON.stringify({ client_id: clientId, sequence: ++mobileSequence, requests: requests });
-  const path = `/api/inject?t=${encodeURIComponent(token)}`;
-  try {
-    if (navigator.sendBeacon) {
-      const blob = new Blob([body], { type: "application/json" });
-      if (navigator.sendBeacon(path, blob)) return true;
-    }
-  } catch {}
+  const path = "/api/inject";
   try {
     fetch(path, {
       method: "POST",
@@ -3128,14 +3103,6 @@ setInterval(refresh, 1500);
     .replace("__MOBILE_TOKEN_JSON__", &token_json)
 }
 
-fn mobile_token_query(token: &str) -> String {
-    if token.is_empty() {
-        String::new()
-    } else {
-        format!("?t={}", percent_encode_query_value(token))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3161,7 +3128,7 @@ mod tests {
     async fn post_mobile_json(addr: SocketAddr, body: Vec<u8>) -> Vec<u8> {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let request = format!(
-            "POST /api/inject?t=mobile-secret HTTP/1.1\r\nHost: mobile\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            "POST /api/inject HTTP/1.1\r\nHost: mobile\r\nAuthorization: Bearer mobile-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         client.write_all(request.as_bytes()).await.unwrap();
@@ -3473,8 +3440,16 @@ mod tests {
                 "test".into(),
                 "127.0.0.1".into(),
             );
+            let authorization = if target.contains("t=test") {
+                "Authorization: Bearer test\r\n"
+            } else {
+                ""
+            };
             client
-                .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .write_all(
+                    format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n{authorization}\r\n")
+                        .as_bytes(),
+                )
                 .await
                 .unwrap();
             let task = tokio::spawn(handle_mobile_gateway_client(
@@ -3522,6 +3497,9 @@ mod tests {
             request
                 .headers_mut()
                 .insert("origin", format!("http://{addr}").parse().unwrap());
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer socket-test".parse().unwrap());
             request
         };
         let (mut host, _) = connect_async(request("host")).await.unwrap();
@@ -6025,7 +6003,7 @@ mod tests {
         let page = render_mobile_page();
 
         assert!(page.contains("function releaseAllWithKeepalive()"));
-        assert!(page.contains("navigator.sendBeacon"));
+        assert!(page.contains("Authorization: `Bearer ${token}`"));
         assert!(page.contains("keepalive: true"));
         assert!(page.contains("mobile-release-all-keepalive"));
         assert!(page.contains("window.addEventListener(\"pagehide\", releaseAllWithKeepalive);"));
@@ -6085,10 +6063,7 @@ mod tests {
 
         let snapshot = access.snapshot();
 
-        assert_eq!(
-            snapshot.page_url,
-            "http://192.168.1.50:27437/mobile?t=mobile%2Bsecret%2Ftoken%3D"
-        );
+        assert_eq!(snapshot.page_url, "http://127.0.0.1:27437/mobile");
         assert_eq!(snapshot.token, "mobile+secret/token=");
     }
 
@@ -6099,7 +6074,9 @@ mod tests {
         let client_task = tokio::spawn(async move {
             let mut client = TcpStream::connect(listener_addr).await.unwrap();
             client
-                .write_all(b"GET /mobile?t=mobile-secret HTTP/1.1\r\nHost: mobile\r\n\r\n")
+                .write_all(
+                    b"GET /mobile HTTP/1.1\r\nHost: mobile\r\nAuthorization: Bearer mobile-secret\r\n\r\n",
+                )
                 .await
                 .unwrap();
             let mut response = Vec::new();
@@ -6168,8 +6145,9 @@ mod tests {
         let client_task = tokio::spawn(async move {
             let mut client = TcpStream::connect(listener_addr).await.unwrap();
             let request = format!(
-                "POST /api/inject?t=mobile-secret HTTP/1.1\r\n\
+                "POST /api/inject HTTP/1.1\r\n\
                  Host: mobile\r\n\
+                 Authorization: Bearer mobile-secret\r\n\
                  Content-Type: application/json\r\n\
                  Content-Length: {}\r\n\r\n",
                 body.len()

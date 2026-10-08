@@ -224,13 +224,16 @@ mod tests {
     fn cross_device_test_ipc_variants_round_trip() {
         let request = CrossDeviceTestRequest::default();
         for request in [
-            DaemonRequest::RunCrossDeviceTest { request: request.clone() },
+            DaemonRequest::RunCrossDeviceTest {
+                request: request.clone(),
+            },
             DaemonRequest::StartCrossDeviceStress { request },
             DaemonRequest::StopCrossDeviceStress,
             DaemonRequest::CrossDeviceTestStatus,
         ] {
             assert_eq!(
-                serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap()).unwrap(),
+                serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap())
+                    .unwrap(),
                 request
             );
         }
@@ -239,7 +242,8 @@ mod tests {
             report: None,
         });
         assert_eq!(
-            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap()).unwrap(),
+            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
             response
         );
     }
@@ -668,6 +672,9 @@ pub enum DaemonRequest {
         paths: Vec<String>,
     },
     FileTransfers,
+    ApproveFileTransfer {
+        transfer_id: DeviceId,
+    },
     CancelFileTransfer {
         transfer_id: DeviceId,
     },
@@ -728,7 +735,10 @@ pub fn default_local_controls_ws_url() -> String {
 
 pub fn default_mobile_gateway_addr() -> SocketAddr {
     SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        // The gateway speaks plain HTTP and therefore must stay local. A
+        // deliberate LAN deployment needs a separately terminated TLS/WSS
+        // proxy rather than exposing the bearer token on the wire.
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
         DEFAULT_MOBILE_GATEWAY_PORT,
     )
 }
