@@ -12,7 +12,9 @@ pub fn device_id(peer: DeviceId, endpoint: &str, direction: Direction) -> String
         Direction::Output => 1,
     }]);
     digest.update(endpoint.as_bytes());
-    format!("rshare-audio-{:x}", digest.finalize())
+    let digest = digest.finalize();
+    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("rshare-audio-{digest_hex}")
 }
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
