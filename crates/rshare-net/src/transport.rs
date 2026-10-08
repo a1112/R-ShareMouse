@@ -855,6 +855,7 @@ pub struct QuicConnection {
     inner: Arc<QuicConnectionInner>,
     cert_trust_state: Option<String>,
     pending_peer_trust: Option<PendingPeerTrust>,
+    approved_peer_trust: Option<PendingPeerTrust>,
     peer_fingerprint: Option<PeerCertificateFingerprint>,
     trust_store_path: PathBuf,
 }
@@ -1110,6 +1111,7 @@ impl QuicConnection {
             inner,
             cert_trust_state,
             pending_peer_trust,
+            approved_peer_trust: None,
             peer_fingerprint,
             trust_store_path,
         }
@@ -1355,20 +1357,12 @@ impl QuicConnection {
         let decision = match pending.decision {
             QuicTrustDecision::OperatorApproved => Ok(QuicTrustDecision::OperatorApproved),
             QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu if explicitly_approved => {
-                QuicTrustStore::approve_at(
-                    &pending.trust_store_path,
-                    pending.expected_device_id,
-                    pending.fingerprint,
-                )
-                .map(|_| QuicTrustDecision::OperatorApproved)
+                self.approved_peer_trust = Some(pending);
+                Ok(QuicTrustDecision::OperatorApproved)
             }
             QuicTrustDecision::Rejected { .. } if explicitly_approved => {
-                QuicTrustStore::replace_at(
-                    &pending.trust_store_path,
-                    pending.expected_device_id,
-                    pending.fingerprint,
-                )
-                .map(|_| QuicTrustDecision::OperatorApproved)
+                self.approved_peer_trust = Some(pending);
+                Ok(QuicTrustDecision::OperatorApproved)
             }
             QuicTrustDecision::FirstSeen
             | QuicTrustDecision::LegacyTofu
@@ -1384,7 +1378,14 @@ impl QuicConnection {
         };
         match decision {
             Ok(QuicTrustDecision::OperatorApproved) => {
-                self.cert_trust_state = Some("operator_approved".to_string());
+                self.cert_trust_state = Some(
+                    if self.approved_peer_trust.is_some() {
+                        "operator_approved_pending"
+                    } else {
+                        "operator_approved"
+                    }
+                    .to_string(),
+                );
                 Ok(fingerprint)
             }
             Ok(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
@@ -1408,6 +1409,46 @@ impl QuicConnection {
         }
     }
 
+    /// Persist a newly approved peer only after the compatibility bootstrap
+    /// has completed. Keeping this separate from identity confirmation makes
+    /// an interrupted handshake fail closed without leaving a trust pin.
+    pub(crate) fn commit_outbound_operator_approval(&mut self) -> Result<()> {
+        let Some(pending) = self.approved_peer_trust.take() else {
+            return Ok(());
+        };
+        let result = match pending.decision {
+            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu => {
+                QuicTrustStore::approve_at(
+                    &pending.trust_store_path,
+                    pending.expected_device_id,
+                    pending.fingerprint,
+                )
+            }
+            QuicTrustDecision::Rejected { .. } => QuicTrustStore::replace_at(
+                &pending.trust_store_path,
+                pending.expected_device_id,
+                pending.fingerprint,
+            ),
+            QuicTrustDecision::OperatorApproved => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.cert_trust_state = Some("operator_approved".to_string());
+                Ok(())
+            }
+            Err(error) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"failed to persist peer trust");
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn has_pending_operator_approval(&self) -> bool {
+        self.approved_peer_trust.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn confirm_peer_identity_for_test(
         &mut self,
@@ -1419,7 +1460,9 @@ impl QuicConnection {
             .map(|pending| pending.fingerprint.as_str().to_string())
             .into_iter()
             .collect::<Vec<_>>();
-        self.confirm_peer_identity_with_approvals(actual_device_id, &approval)
+        let fingerprint = self.confirm_peer_identity_with_approvals(actual_device_id, &approval)?;
+        self.commit_outbound_operator_approval()?;
+        Ok(fingerprint)
     }
 
     pub fn inspect_inbound_peer_identity(
@@ -1485,6 +1528,7 @@ impl QuicConnection {
 
     pub fn reject_pending_peer_identity(&mut self) {
         self.pending_peer_trust = None;
+        self.approved_peer_trust = None;
         self.inner
             .connection
             .close(0u32.into(), b"peer identity unavailable");
@@ -7420,6 +7464,54 @@ mod tests {
         })
         .await
         .expect("the confirmed pending trust owner must clean its state");
+    }
+
+    #[tokio::test]
+    async fn approved_peer_trust_is_not_persisted_when_bootstrap_is_aborted() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let mut pending = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let remote = incoming.recv().await.unwrap().connection;
+        let fingerprint = pending
+            .peer_fingerprint
+            .clone()
+            .expect("test peer must present a certificate");
+        let fingerprint_text = fingerprint.to_string();
+
+        pending
+            .confirm_peer_identity_with_approvals(server_id, &[fingerprint_text])
+            .unwrap();
+        assert!(pending.has_pending_operator_approval());
+        assert_eq!(
+            QuicTrustStore::load(&pending.trust_store_path)
+                .unwrap()
+                .fingerprint_for(&server_id),
+            None,
+            "identity confirmation must not persist trust before bootstrap"
+        );
+
+        pending.reject_pending_peer_identity();
+        assert_eq!(
+            QuicTrustStore::load(&pending.trust_store_path)
+                .unwrap()
+                .fingerprint_for(&server_id),
+            None,
+            "an aborted bootstrap must leave no trust pin"
+        );
+        remote
+            .inner
+            .connection
+            .close(0u32.into(), b"forced bootstrap abort");
+        server.close().await.unwrap();
     }
 
     #[tokio::test]

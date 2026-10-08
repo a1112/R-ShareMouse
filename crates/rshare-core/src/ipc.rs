@@ -174,6 +174,14 @@ mod tests {
                 .unwrap(),
             request
         );
+        let reject = DaemonRequest::RejectPeer {
+            approval_id: "opaque-id".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&reject).unwrap())
+                .unwrap(),
+            reject
+        );
         let response = DaemonResponse::PendingPeerApprovals(vec![PendingPeerApproval {
             approval_id: "opaque-id".to_string(),
             device_id,
@@ -224,13 +232,16 @@ mod tests {
     fn cross_device_test_ipc_variants_round_trip() {
         let request = CrossDeviceTestRequest::default();
         for request in [
-            DaemonRequest::RunCrossDeviceTest { request: request.clone() },
+            DaemonRequest::RunCrossDeviceTest {
+                request: request.clone(),
+            },
             DaemonRequest::StartCrossDeviceStress { request },
             DaemonRequest::StopCrossDeviceStress,
             DaemonRequest::CrossDeviceTestStatus,
         ] {
             assert_eq!(
-                serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap()).unwrap(),
+                serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap())
+                    .unwrap(),
                 request
             );
         }
@@ -239,7 +250,8 @@ mod tests {
             report: None,
         });
         assert_eq!(
-            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap()).unwrap(),
+            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
             response
         );
     }
@@ -573,6 +585,9 @@ pub enum DaemonRequest {
     },
     ListPendingPeerApprovals,
     ApprovePeer {
+        approval_id: String,
+    },
+    RejectPeer {
         approval_id: String,
     },
     GetLayout,

@@ -156,6 +156,49 @@ async fn manual_connect_requires_exact_operator_approval_before_authority() {
 }
 
 #[tokio::test]
+async fn revoked_approval_cannot_connect_or_persist_a_pin() {
+    let server_id = Uuid::new_v4();
+    let client_id = Uuid::new_v4();
+    let network = TestNetwork::new("revoked-approval");
+    let mut server = network.manager(server_id, "server", generated_identity());
+    server.start_server("127.0.0.1:0").await.unwrap();
+    let address = server.transport_local_addr().unwrap().to_string();
+    let mut client = network.manager(client_id, "client", generated_identity());
+
+    client
+        .connect(server_id, &address)
+        .await
+        .expect_err("first contact must wait for approval");
+    let client_approval = wait_for_pending_approval(&client).await;
+    let server_approval = wait_for_pending_approval(&server).await;
+    assert!(client.approve_peer(&client_approval));
+    assert!(server.approve_peer(&server_approval));
+    assert!(client.reject_peer(&client_approval));
+    assert!(server.reject_peer(&server_approval));
+
+    client
+        .connect(server_id, &address)
+        .await
+        .expect_err("a revoked approval must fail closed");
+    assert!(client.connections().is_empty());
+    assert!(server.connections().is_empty());
+    assert_eq!(
+        QuicTrustStore::load(network.trust_store_path("client"))
+            .unwrap()
+            .fingerprint_for(&server_id),
+        None,
+        "revocation must prevent the outbound trust pin"
+    );
+    assert_eq!(
+        QuicTrustStore::load(network.trust_store_path("server"))
+            .unwrap()
+            .fingerprint_for(&client_id),
+        None,
+        "revocation must prevent the inbound trust pin"
+    );
+}
+
+#[tokio::test]
 async fn peers_require_explicit_first_seen_approval_and_connect() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();

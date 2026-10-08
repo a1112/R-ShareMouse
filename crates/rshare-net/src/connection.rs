@@ -426,6 +426,8 @@ pub struct ConnectionManager {
 // local IPC before a first-seen, legacy, or rotated certificate is trusted.
 #[allow(dead_code)]
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
+const MAX_PENDING_APPROVALS: usize = 256;
+const MAX_PENDING_APPROVALS_PER_DEVICE: usize = 8;
 
 #[derive(Debug, Clone)]
 struct ApprovalExpectation {
@@ -470,13 +472,23 @@ impl PendingApprovalRegistry {
         device_id: DeviceId,
         fingerprint: &PeerCertificateFingerprint,
         now_ms: u64,
-    ) {
+    ) -> bool {
         self.prune(now_ms);
         if self.approvals.values().any(|expectation| {
             expectation.approval.device_id == device_id
                 && expectation.approval.fingerprint == fingerprint.as_str()
         }) {
-            return;
+            return true;
+        }
+        let device_count = self
+            .approvals
+            .values()
+            .filter(|expectation| expectation.approval.device_id == device_id)
+            .count();
+        if self.approvals.len() >= MAX_PENDING_APPROVALS
+            || device_count >= MAX_PENDING_APPROVALS_PER_DEVICE
+        {
+            return false;
         }
         let approval = PendingPeerApproval {
             approval_id: uuid::Uuid::new_v4().to_string(),
@@ -492,6 +504,7 @@ impl PendingApprovalRegistry {
                 approved: false,
             },
         );
+        true
     }
 
     fn approve(&mut self, approval_id: &str, now_ms: u64) -> bool {
@@ -504,6 +517,25 @@ impl PendingApprovalRegistry {
         }
         expectation.approved = true;
         true
+    }
+
+    fn reject(&mut self, approval_id: &str, now_ms: u64) -> bool {
+        self.prune(now_ms);
+        self.approvals.remove(approval_id).is_some()
+    }
+
+    fn is_approved(
+        &mut self,
+        device_id: DeviceId,
+        fingerprint: &PeerCertificateFingerprint,
+        now_ms: u64,
+    ) -> bool {
+        self.prune(now_ms);
+        self.approvals.values().any(|expectation| {
+            expectation.approved
+                && expectation.approval.device_id == device_id
+                && expectation.approval.fingerprint == fingerprint.as_str()
+        })
     }
 
     fn approved_fingerprints(&mut self, device_id: DeviceId, now_ms: u64) -> Vec<String> {
@@ -540,7 +572,6 @@ impl PendingApprovalRegistry {
 }
 
 fn authorize_inbound_peer(
-    connection: &mut super::transport::QuicConnection,
     device_id: DeviceId,
     fingerprint: &PeerCertificateFingerprint,
     decision: Option<&QuicTrustDecision>,
@@ -549,38 +580,27 @@ fn authorize_inbound_peer(
     match decision {
         Some(QuicTrustDecision::OperatorApproved) => true,
         Some(
-            decision @ (QuicTrustDecision::FirstSeen
+            QuicTrustDecision::FirstSeen
             | QuicTrustDecision::LegacyTofu
-            | QuicTrustDecision::Rejected { .. }),
+            | QuicTrustDecision::Rejected { .. },
         ) => {
             let approved = pending_approvals
                 .write()
                 .expect("pending approval registry poisoned")
-                .consume_matching(device_id, fingerprint, PendingApprovalRegistry::now_ms());
+                .is_approved(device_id, fingerprint, PendingApprovalRegistry::now_ms());
             if !approved {
-                pending_approvals
+                let observed = pending_approvals
                     .write()
                     .expect("pending approval registry poisoned")
                     .observe(device_id, fingerprint, PendingApprovalRegistry::now_ms());
                 tracing::info!(
-                    "Inbound peer {} is waiting for exact certificate approval",
-                    device_id
+                    "Inbound peer {} is waiting for exact certificate approval (registered={})",
+                    device_id,
+                    observed
                 );
                 false
             } else {
-                let replace_existing = matches!(decision, QuicTrustDecision::Rejected { .. });
-                if let Err(error) =
-                    connection.commit_inbound_operator_approval(device_id, replace_existing)
-                {
-                    tracing::warn!(
-                        "Failed to persist explicitly approved inbound peer {}: {}",
-                        device_id,
-                        error
-                    );
-                    false
-                } else {
-                    true
-                }
+                true
             }
         }
         None => false,
@@ -1015,6 +1035,13 @@ impl ConnectionManager {
             .approve(approval_id, PendingApprovalRegistry::now_ms())
     }
 
+    pub fn reject_peer(&self, approval_id: &str) -> bool {
+        self.pending_approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .reject(approval_id, PendingApprovalRegistry::now_ms())
+    }
+
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
         self.transport.start_server(bind_addr).await?;
 
@@ -1056,7 +1083,6 @@ impl ConnectionManager {
                         true
                     } else {
                         authorize_inbound_peer(
-                            &mut incoming.connection,
                             device_id,
                             &negotiated.auth.certificate_fingerprint,
                             negotiated.inbound_trust_decision.as_ref(),
@@ -1066,7 +1092,6 @@ impl ConnectionManager {
                     #[cfg(not(test))]
                     {
                         authorize_inbound_peer(
-                            &mut incoming.connection,
                             device_id,
                             &negotiated.auth.certificate_fingerprint,
                             negotiated.inbound_trust_decision.as_ref(),
@@ -1098,6 +1123,68 @@ impl ConnectionManager {
                     );
                     incoming.connection.close().await;
                     continue;
+                }
+                #[cfg(test)]
+                let requires_explicit_approval = !allow_unapproved_test_peers
+                    && matches!(
+                        negotiated.inbound_trust_decision.as_ref(),
+                        Some(
+                            QuicTrustDecision::FirstSeen
+                                | QuicTrustDecision::LegacyTofu
+                                | QuicTrustDecision::Rejected { .. }
+                        )
+                    );
+                #[cfg(not(test))]
+                let requires_explicit_approval = matches!(
+                    negotiated.inbound_trust_decision.as_ref(),
+                    Some(
+                        QuicTrustDecision::FirstSeen
+                            | QuicTrustDecision::LegacyTofu
+                            | QuicTrustDecision::Rejected { .. }
+                    )
+                );
+                if requires_explicit_approval {
+                    let approved = pending_approvals
+                        .write()
+                        .expect("pending approval registry poisoned")
+                        .is_approved(
+                            device_id,
+                            &negotiated.auth.certificate_fingerprint,
+                            PendingApprovalRegistry::now_ms(),
+                        );
+                    if !approved
+                        || !pending_approvals
+                            .write()
+                            .expect("pending approval registry poisoned")
+                            .consume_matching(
+                                device_id,
+                                &negotiated.auth.certificate_fingerprint,
+                                PendingApprovalRegistry::now_ms(),
+                            )
+                    {
+                        tracing::info!(
+                            "Inbound peer {} approval expired or was revoked before trust commit",
+                            device_id
+                        );
+                        incoming.connection.close().await;
+                        continue;
+                    }
+                    let replace_existing = matches!(
+                        negotiated.inbound_trust_decision.as_ref(),
+                        Some(QuicTrustDecision::Rejected { .. })
+                    );
+                    if let Err(error) = incoming
+                        .connection
+                        .commit_inbound_operator_approval(device_id, replace_existing)
+                    {
+                        tracing::warn!(
+                            "Failed to persist explicitly approved inbound peer {}: {}",
+                            device_id,
+                            error
+                        );
+                        incoming.connection.close().await;
+                        continue;
+                    }
                 }
                 let address = incoming.address.to_string();
                 incoming.connection.set_device_id(device_id);
@@ -1390,15 +1477,47 @@ impl ConnectionManager {
             );
         }
 
+        if conn.has_pending_operator_approval() {
+            let consumed = self
+                .pending_approvals
+                .write()
+                .expect("pending approval registry poisoned")
+                .consume_matching(
+                    device_id,
+                    &negotiated.auth.certificate_fingerprint,
+                    PendingApprovalRegistry::now_ms(),
+                );
+            if !consumed {
+                let error = anyhow::anyhow!(
+                    "peer {} approval expired or was revoked before trust commit",
+                    device_id
+                );
+                conn.reject_pending_peer_identity();
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        peer_id: Some(device_id),
+                        control_connection_id: None,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+            if let Err(error) = conn.commit_outbound_operator_approval() {
+                conn.reject_pending_peer_identity();
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::Error {
+                        peer_id: Some(device_id),
+                        control_connection_id: None,
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+        }
+
         conn.set_device_id(device_id);
-        self.pending_approvals
-            .write()
-            .expect("pending approval registry poisoned")
-            .consume_matching(
-                device_id,
-                &negotiated.auth.certificate_fingerprint,
-                PendingApprovalRegistry::now_ms(),
-            );
         let auth = Arc::new(negotiated.auth.clone());
         let (qos_transport, releases) = conn.install_qos(auth.clone());
         let peer_inbound = conn
@@ -1782,6 +1901,34 @@ mod tests {
     }
 
     #[test]
+    fn pending_approval_registry_is_bounded_per_device_and_globally() {
+        let device_id = DeviceId::new_v4();
+        let mut registry = PendingApprovalRegistry::default();
+        for index in 0..MAX_PENDING_APPROVALS_PER_DEVICE {
+            let fingerprint =
+                PeerCertificateFingerprint::from_der(format!("device-cert-{index}").as_bytes());
+            assert!(registry.observe(device_id, &fingerprint, 1_000));
+        }
+        let overflow = PeerCertificateFingerprint::from_der(b"device-overflow");
+        assert!(!registry.observe(device_id, &overflow, 1_000));
+        assert_eq!(registry.list(1_000).len(), MAX_PENDING_APPROVALS_PER_DEVICE);
+
+        let mut full = PendingApprovalRegistry::default();
+        for index in 0..MAX_PENDING_APPROVALS {
+            let peer = DeviceId::from_u128(index as u128 + 1);
+            let fingerprint =
+                PeerCertificateFingerprint::from_der(format!("global-cert-{index}").as_bytes());
+            assert!(full.observe(peer, &fingerprint, 1_000));
+        }
+        assert!(!full.observe(
+            DeviceId::new_v4(),
+            &PeerCertificateFingerprint::from_der(b"global-overflow"),
+            1_000
+        ));
+        assert_eq!(full.list(1_000).len(), MAX_PENDING_APPROVALS);
+    }
+
+    #[test]
     fn unknown_and_legacy_inbound_have_no_authority_before_matching_approval() {
         let device_id = DeviceId::new_v4();
         let fingerprint = PeerCertificateFingerprint::from_der(b"cert-a");
@@ -1792,6 +1939,19 @@ mod tests {
         assert!(!registry.consume_matching(device_id, &fingerprint, 11));
         assert!(registry.approve(&approval.approval_id, 12));
         assert!(registry.consume_matching(device_id, &fingerprint, 13));
+    }
+
+    #[test]
+    fn approved_peer_can_be_revoked_before_consumption() {
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"cert-revoke");
+        let mut registry = PendingApprovalRegistry::default();
+        assert!(registry.observe(device_id, &fingerprint, 10));
+        let approval = registry.list(10).pop().unwrap();
+        assert!(registry.approve(&approval.approval_id, 11));
+        assert!(registry.reject(&approval.approval_id, 12));
+        assert!(!registry.is_approved(device_id, &fingerprint, 13));
+        assert!(!registry.consume_matching(device_id, &fingerprint, 13));
     }
     use crate::encryption::{Encryption, QuicIdentity, QuicTrustStore};
     use rshare_core::{hello_back_message, ScreenInfo};

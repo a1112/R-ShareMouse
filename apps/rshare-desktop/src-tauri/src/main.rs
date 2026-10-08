@@ -493,6 +493,13 @@ async fn approve_peer(approval_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn reject_peer(approval_id: String) -> Result<(), String> {
+    daemon_client::request_reject_peer(approval_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn disconnect_device(device_id: String) -> Result<(), String> {
     let device_id = parse_device_id(&device_id)?;
     daemon_client::request_disconnect(device_id)
@@ -1301,6 +1308,7 @@ fn main() {
             connect_device,
             pending_peer_approvals,
             approve_peer,
+            reject_peer,
             disconnect_device,
             wake_targets,
             wake_attempts,

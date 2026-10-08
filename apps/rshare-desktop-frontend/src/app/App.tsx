@@ -841,6 +841,7 @@ const NETWORK_COMMANDS = new Set([
   "connect_device",
   "pending_peer_approvals",
   "approve_peer",
+  "reject_peer",
   "disconnect_device",
   "wake_targets",
   "wake_attempts",
@@ -1346,6 +1347,11 @@ async function invokeNetworkCommand<T = unknown>(
     case "approve_peer":
       return await daemonRequestValue<T>(
         { ApprovePeer: { approval_id: args?.approval_id ?? args?.approvalId } },
+        "Ack",
+      );
+    case "reject_peer":
+      return await daemonRequestValue<T>(
+        { RejectPeer: { approval_id: args?.approval_id ?? args?.approvalId } },
         "Ack",
       );
     case "disconnect_device":
@@ -4681,6 +4687,18 @@ function PeerApprovalsPanel({
     }
   };
 
+  const reject = async (approvalId: string) => {
+    setApprovingId(approvalId);
+    try {
+      await invokeCommand("reject_peer", { approval_id: approvalId });
+      await refresh();
+    } catch (rejectError) {
+      setError(errorMessage(rejectError));
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
   if (!approvals.length && !error) {
     return null;
   }
@@ -4737,19 +4755,34 @@ function PeerApprovalsPanel({
                 <code className="break-all">{approval.fingerprint}</code>
               </div>
             </div>
-            <button
-              type="button"
-              className="mt-3 rounded-md px-3 py-1.5 text-xs"
-              style={{
-                border: `1px solid ${theme.accent}`,
-                background: theme.accentSoft,
-                color: theme.text,
-              }}
-              disabled={busy || approvingId !== null}
-              onClick={() => void approve(approval.approval_id)}
-            >
-              {approvingId === approval.approval_id ? "确认中…" : "确认此设备身份"}
-            </button>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                className="rounded-md px-3 py-1.5 text-xs"
+                style={{
+                  border: `1px solid ${theme.accent}`,
+                  background: theme.accentSoft,
+                  color: theme.text,
+                }}
+                disabled={busy || approvingId !== null}
+                onClick={() => void approve(approval.approval_id)}
+              >
+                {approvingId === approval.approval_id ? "处理中…" : "确认此设备身份"}
+              </button>
+              <button
+                type="button"
+                className="rounded-md px-3 py-1.5 text-xs"
+                style={{
+                  border: `1px solid ${theme.border}`,
+                  background: "rgba(197, 48, 48, 0.12)",
+                  color: "#ffb5c0",
+                }}
+                disabled={busy || approvingId !== null}
+                onClick={() => void reject(approval.approval_id)}
+              >
+                撤销
+              </button>
+            </div>
           </article>
         ))}
       </div>

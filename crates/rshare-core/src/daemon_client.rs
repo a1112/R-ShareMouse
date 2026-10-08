@@ -208,6 +208,15 @@ pub async fn request_approve_peer(approval_id: String) -> Result<()> {
     }
 }
 
+/// Revoke one pending or approved peer approval token before it can be used.
+pub async fn request_reject_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::RejectPeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
 pub async fn request_disconnect(device_id: crate::DeviceId) -> Result<()> {
     match send_request(DaemonRequest::Disconnect { device_id }).await? {
         DaemonResponse::Ack => Ok(()),

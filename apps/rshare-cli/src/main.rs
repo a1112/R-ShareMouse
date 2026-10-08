@@ -31,7 +31,9 @@ fn build_metadata() -> String {
     )
 }
 
-use commands::{approvals, config_cmd, devices, discover, display, doctor, start, stop, test, usb, wake};
+use commands::{
+    approvals, config_cmd, devices, discover, display, doctor, start, stop, test, usb, wake,
+};
 use config_cmd::ConfigCommands;
 
 #[derive(Parser)]
@@ -195,6 +197,7 @@ enum Commands {
 enum ApprovalCommands {
     List,
     Approve { approval_id: String },
+    Reject { approval_id: String },
 }
 
 #[tokio::main]
@@ -282,6 +285,7 @@ async fn main() -> Result<()> {
         Commands::Approvals { approval_cmd } => match approval_cmd {
             ApprovalCommands::List => approvals::list().await?,
             ApprovalCommands::Approve { approval_id } => approvals::approve(approval_id).await?,
+            ApprovalCommands::Reject { approval_id } => approvals::reject(approval_id).await?,
         },
     }
 
@@ -293,7 +297,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_approval_list_and_approve_commands() {
+    fn parses_approval_list_approve_and_reject_commands() {
         let list = Cli::try_parse_from(["rshare", "approvals", "list"]).unwrap();
         assert!(matches!(
             list.command,
@@ -306,6 +310,13 @@ mod tests {
             approve.command,
             Commands::Approvals {
                 approval_cmd: ApprovalCommands::Approve { approval_id }
+            } if approval_id == "opaque-id"
+        ));
+        let reject = Cli::try_parse_from(["rshare", "approvals", "reject", "opaque-id"]).unwrap();
+        assert!(matches!(
+            reject.command,
+            Commands::Approvals {
+                approval_cmd: ApprovalCommands::Reject { approval_id }
             } if approval_id == "opaque-id"
         ));
     }
