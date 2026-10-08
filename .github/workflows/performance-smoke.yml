@@ -133,7 +133,7 @@ jobs:
         shell: bash
         run: |
           cargo run --release --locked -p rshare-perf -- \
-            quic --rate-hz 125 --duration-secs 5 \
+            quic --validation-profile hosted-catastrophe --rate-hz 125 --duration-secs 5 \
             --output artifacts/hosted-smoke/quic-125hz-5s.json
           REPORT_PATH=artifacts/hosted-smoke/quic-125hz-5s.json node <<'NODE'
           const fs = require("node:fs");

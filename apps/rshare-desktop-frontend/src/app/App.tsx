@@ -4717,7 +4717,7 @@ function PeerApprovalsPanel({
             待确认的设备身份
           </h2>
           <p className="mt-1 text-xs" style={{ color: theme.textMuted }}>
-            连接前请核对完整设备 ID 和证书指纹；确认只对当前精确身份生效。
+            连接前请核对完整设备 ID 和证书指纹；确认只对当前精确身份的下一次握手生效。确认后请重新连接，连接成功前仍可撤销。
           </p>
         </div>
         <button

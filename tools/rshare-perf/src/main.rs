@@ -6,7 +6,7 @@ mod quic;
 mod report;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use compare::{
     compare, load_reviewed_baseline, verify_github_approval, BaselineManifest, ComparisonPolicy,
     ReportBatch,
@@ -62,6 +62,11 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct QuicArgs {
+    /// Select the acceptance gate for this measurement. The default keeps the
+    /// fixed-runner stability policy; hosted-catastrophe is only for the
+    /// deliberately wide hosted smoke ceilings.
+    #[arg(long, value_enum, default_value_t = QuicValidationProfile::FixedRunner)]
+    validation_profile: QuicValidationProfile,
     #[arg(long)]
     rate_hz: Option<u32>,
     #[arg(long)]
@@ -74,6 +79,19 @@ struct QuicArgs {
     stall_ms: Option<u64>,
     #[arg(long)]
     output: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum QuicValidationProfile {
+    #[default]
+    FixedRunner,
+    HostedCatastrophe,
+}
+
+impl QuicValidationProfile {
+    fn allows_known_hosted_instability(self, reason: &str) -> bool {
+        matches!(self, Self::HostedCatastrophe) && reason == "unstable_after_one_complete_retry"
+    }
 }
 
 #[derive(Debug, Args)]
@@ -323,10 +341,20 @@ fn run_quic_with_duration(args: QuicArgs, effective_duration: Option<Duration>) 
 
     write_primary_report(&args.output, report, &schema)?;
     if let Some(reason) = orchestration.infrastructure_failure {
-        bail!(
-            "wrote an available but unstable artifact to {}: {reason}",
-            args.output.display()
-        );
+        if args
+            .validation_profile
+            .allows_known_hosted_instability(&reason)
+        {
+            eprintln!(
+                "wrote an available but unstable artifact to {}: {reason}; hosted-catastrophe will apply only its explicit absolute ceilings",
+                args.output.display()
+            );
+        } else {
+            bail!(
+                "wrote an available but unstable artifact to {}: {reason}",
+                args.output.display()
+            );
+        }
     }
     Ok(())
 }
@@ -862,6 +890,7 @@ mod tests {
             std::env::temp_dir().join(format!("rshare-perf-cli-{}-{nonce}", std::process::id()));
         let output = directory.join("quic.json");
         let args = QuicArgs {
+            validation_profile: QuicValidationProfile::FixedRunner,
             rate_hz: Some(125),
             duration_secs: Some(10),
             load: vec![],
@@ -937,6 +966,36 @@ mod tests {
             assert!(batch.runs.iter().all(|run| run.schema_valid));
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hosted_catastrophe_profile_is_explicit_and_narrow() {
+        let cli = Cli::try_parse_from([
+            "rshare-perf",
+            "quic",
+            "--validation-profile",
+            "hosted-catastrophe",
+            "--rate-hz",
+            "125",
+            "--duration-secs",
+            "5",
+            "--output",
+            "quic.json",
+        ])
+        .unwrap();
+        let Command::Quic(args) = cli.command else {
+            panic!("expected QUIC command");
+        };
+        assert_eq!(
+            args.validation_profile,
+            QuicValidationProfile::HostedCatastrophe
+        );
+        assert!(!QuicValidationProfile::FixedRunner
+            .allows_known_hosted_instability("unstable_after_one_complete_retry"));
+        assert!(QuicValidationProfile::HostedCatastrophe
+            .allows_known_hosted_instability("unstable_after_one_complete_retry"));
+        assert!(!QuicValidationProfile::HostedCatastrophe
+            .allows_known_hosted_instability("unexpected_failure"));
     }
 
     #[test]
