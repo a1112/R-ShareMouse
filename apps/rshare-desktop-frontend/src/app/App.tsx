@@ -159,7 +159,9 @@ import {
 } from "./desktop-shell.mjs";
 import {
   MACOS_PERMISSION_ITEMS,
+  assessMacosInputRecovery,
   buildMacosInputWarning,
+  canRestartMacosInputService,
   macosInputPermissionSummary,
   missingMacosInputPermissions,
   normalizeMacosInputPermissions,
@@ -2553,8 +2555,8 @@ function DesktopApp() {
     }
   }
 
-  async function refreshMacosPermissions() {
-    if (!desktopShell.isMacOS || !model.service.online) {
+  async function refreshMacosPermissions(daemonOnline = model.service.online) {
+    if (!desktopShell.isMacOS || !daemonOnline) {
       setMacosPermissions(null);
       setMacosPermissionsChecked(false);
       setMacosPermissionError(null);
@@ -2599,7 +2601,7 @@ function DesktopApp() {
       const normalized = normalizeMacosInputPermissions(snapshot);
       setMacosPermissions(normalized);
       setMacosPermissionsChecked(true);
-      if (normalized?.ready) {
+      if (normalized?.supported) {
         setMacosPermissionRestartRequired(true);
       }
     } catch (permissionError) {
@@ -2638,10 +2640,17 @@ function DesktopApp() {
         await invokeCommand("stop_service");
       }
       await invokeCommand("start_service");
-      await refreshDashboard();
-      await refreshMacosPermissions();
-      setMacosPermissionRestartRequired(false);
-      setMacosPermissionDialogOpen(false);
+      const snapshot = await refreshDashboard();
+      const permissions = await refreshMacosPermissions(Boolean(snapshot?.status));
+      await refreshLocalControls();
+      const recovery = assessMacosInputRecovery(permissions, snapshot?.status);
+      setMacosPermissionRestartRequired(!recovery.ready);
+      if (recovery.ready) {
+        setMacosPermissionDialogOpen(false);
+      } else {
+        setMacosPermissionDialogOpen(true);
+        setMacosPermissionError(recovery.reason);
+      }
     } catch (serviceError) {
       setMacosPermissionError(errorMessage(serviceError));
     } finally {
@@ -2655,21 +2664,23 @@ function DesktopApp() {
     setMacosPermissionDialogOpen(true);
   }
 
-  async function refreshDashboard(expectedUiVersion?: number) {
+  async function refreshDashboard(expectedUiVersion?: number): Promise<DashboardPayload | null> {
     const expectedVersion =
       expectedUiVersion ?? uiStateStore.currentVersion();
     try {
       const snapshot = await invokeCommand<DashboardPayload>("dashboard_state");
       if (expectedVersion !== uiStateStore.currentVersion()) {
-        return;
+        return snapshot;
       }
       uiStateStore.applyDashboardSnapshot(snapshot, expectedVersion);
       setError(snapshot.layout_error ? `布局异常：${snapshot.layout_error}` : null);
+      return snapshot;
     } catch (refreshError) {
       if (expectedVersion !== uiStateStore.currentVersion()) {
-        return;
+        return null;
       }
       setError(errorMessage(refreshError));
+      return null;
     }
   }
 
@@ -3709,7 +3720,7 @@ function DesktopApp() {
           onRequest={requestMacosPermissions}
           onOpenSettings={openMacosPermissionSettings}
           onRestartService={restartMacosService}
-          onRefresh={refreshMacosPermissions}
+          onRefresh={() => void refreshMacosPermissions()}
         />
       ) : null}
       </div>
@@ -10667,9 +10678,13 @@ function MacosPermissionDialog({
 }) {
   const missing = missingMacosInputPermissions(permissions);
   const supported = permissions?.supported === true;
-  const ready = supported && permissions?.ready && !runtimeIssue;
+  const ready = supported && permissions?.ready && daemonInputReady && !runtimeIssue;
   const canRequest = permissions === null || supported;
   const daemonNeedsAttention = !daemonInputReady;
+  const canRestart = canRestartMacosInputService(permissions, {
+    restartRequired,
+    daemonInputReady,
+  });
   const requestLabel = missing.length || permissions === null ? "请求系统权限" : "重新检测输入后端";
 
   return (
@@ -10706,10 +10721,11 @@ function MacosPermissionDialog({
           </div>
           <div className="min-w-0 flex-1">
             <h2 id="rshare-macos-permission-title" className="text-lg font-semibold">
-              macOS 输入权限
+              macOS 输入能力与授权
             </h2>
             <p className="mt-1 text-sm leading-6" style={{ color: theme.textMuted }}>
-              本机作为控制端需要输入监控权限；接收远端控制还需要辅助功能权限。
+              当前完整键鼠共享需要辅助功能授权。辅助功能可同时提供输入监听和注入能力；
+              监听可用时，系统“输入监控”列表仍可能为空。
             </p>
             {daemonNeedsAttention ? (
               <p className="mt-2 text-xs leading-5" style={{ color: "#f0ca7a" }}>
@@ -10771,7 +10787,7 @@ function MacosPermissionDialog({
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <span>{item.label}</span>
                     <span className="text-xs" style={{ color: enabled ? theme.success : "#f0ca7a" }}>
-                      {enabled ? "当前版本可用" : "当前版本未生效"}
+                      {enabled ? "守护进程可用" : "守护进程不可用"}
                     </span>
                   </div>
                   <div className="mt-1 text-xs leading-5" style={{ color: theme.textMuted }}>
@@ -10800,8 +10816,8 @@ function MacosPermissionDialog({
 
         {supported && missing.length ? (
           <p className="mt-4 text-xs leading-5" style={{ color: theme.textMuted }}>
-            若系统设置中的开关已经打开，但这里仍显示未生效，请确认授权的是当前 R-ShareMouse.app。
-            若签名身份或安装位置已改变，请在对应设置中移除旧记录、重新添加当前应用，然后完全退出并重启应用。
+            若已开启辅助功能，请点击“重启服务并应用”，让新进程重新读取授权。
+            重启后仍不可用时，请确认授权的是当前 R-ShareMouse.app；若签名身份或安装位置已改变，请更新对应授权记录。
           </p>
         ) : null}
 
@@ -10862,7 +10878,7 @@ function MacosPermissionDialog({
               {requestLabel}
             </button>
           ) : null}
-          {supported && permissions?.ready && restartRequired ? (
+          {canRestart ? (
             <button
               type="button"
               className="rounded-md px-3 py-2 text-sm transition"
@@ -11356,7 +11372,7 @@ function SettingsPage({
           >
             {macosPermissions?.ready && !macosRuntimeIssue ? <Check size={17} style={{ color: theme.success }} /> : <AlertTriangle size={17} style={{ color: "#f0ca7a" }} />}
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-medium">macOS 输入权限与后端</span>
+              <span className="block text-sm font-medium">macOS 输入能力与后端</span>
               <span className="mt-1 block text-xs" style={{ color: theme.textMuted }}>
                 {macosRuntimeIssue ?? `${macosInputPermissionSummary(macosPermissions)} · 点击查看权限状态`}
               </span>
