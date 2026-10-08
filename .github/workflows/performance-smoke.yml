@@ -249,6 +249,35 @@ jobs:
       - name: Test workspace
         id: tests
         run: xvfb-run -a -s "-screen 0 1280x800x24 +extension XTEST" cargo test --workspace --locked --no-fail-fast
+      - name: Capture daemon abort backtrace
+        id: daemon_gdb
+        if: ${{ !cancelled() && steps.tests.outcome == 'failure' && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y gdb
+          fi
+          daemon_bin="$(find target/debug/deps -maxdepth 1 -type f -name 'rshare_daemon-*' -perm -111 -print -quit)"
+          backtrace_path="artifacts/workspace-tests/daemon-gdb-backtrace.log"
+          if [[ -z "$daemon_bin" ]]; then
+            echo 'daemon test binary was not found for backtrace capture' | tee "$backtrace_path"
+            exit 1
+          fi
+          {
+            echo "daemon test binary: $daemon_bin"
+            echo 'rerunning the default concurrent daemon test harness under gdb'
+          } | tee "$backtrace_path"
+          timeout 120s xvfb-run -a -s "-screen 0 1280x800x24 +extension XTEST" \
+            gdb -q -batch \
+              -ex 'set pagination off' \
+              -ex run \
+              -ex 'thread apply all bt full' \
+              --args "$daemon_bin" --nocapture 2>&1 | tee -a "$backtrace_path"
+          diagnostic_status=${PIPESTATUS[0]}
+          echo "gdb diagnostic exit status: $diagnostic_status" | tee -a "$backtrace_path"
+          exit "$diagnostic_status"
       - name: Test HID report behavior
         id: hid_reports
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
