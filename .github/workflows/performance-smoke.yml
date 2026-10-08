@@ -54,15 +54,46 @@ jobs:
 
       - name: Compile every benchmark from lockfile
         id: bench
-        run: cargo bench --workspace --no-run --locked
+        run: |
+          mkdir -p artifacts/hosted-smoke
+          cargo bench --workspace --no-run --locked --message-format=json \
+            > artifacts/hosted-smoke/benchmark-build.json
 
       - name: Check 100k CPU path catastrophe ceiling
         id: cpu
         shell: bash
         run: |
           mkdir -p artifacts/hosted-smoke
+          bench_binary="$(node <<'NODE'
+          const fs = require("node:fs");
+          const records = fs
+            .readFileSync("artifacts/hosted-smoke/benchmark-build.json", "utf8")
+            .split(/\r?\n/)
+            .flatMap((line) => {
+              try {
+                return [JSON.parse(line)];
+              } catch {
+                return [];
+              }
+            })
+            .filter(
+              (record) =>
+                record.reason === "compiler-artifact" &&
+                record.target?.kind?.includes("bench") &&
+                record.target.name === "perf_record_alloc" &&
+                typeof record.executable === "string",
+            );
+          if (records.length !== 1) {
+            throw new Error(
+              `expected exactly one perf_record_alloc executable, found ${records.length}`,
+            );
+          }
+          process.stdout.write(records[0].executable);
+          NODE
+          )"
+          test -x "$bench_binary"
           started_ms="$(date +%s%3N)"
-          cargo bench -p rshare-core --bench perf_record_alloc --locked \
+          "$bench_binary" \
             2>&1 | tee artifacts/hosted-smoke/cpu-path.txt
           elapsed_ms="$(( $(date +%s%3N) - started_ms ))"
           printf '{"measured_calls":100000,"elapsed_ms":%s,"ceiling_ms":5000}\n' \

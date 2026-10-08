@@ -293,7 +293,10 @@ async fn websocket_connection_count_and_message_bytes_are_bounded() {
     let mut socket = connect(address, "/ui-state", Some("http://localhost:5176"))
         .await
         .expect("permit must be released after the first connection closes");
-    socket.send(WsMessage::Text("x".repeat(256))).await.unwrap();
+    socket
+        .send(WsMessage::Text("x".repeat(256).into()))
+        .await
+        .unwrap();
     let ended = tokio::time::timeout(Duration::from_secs(1), socket.next())
         .await
         .expect("oversized first message must close the websocket");
