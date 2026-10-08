@@ -444,7 +444,15 @@ fn print_detailed_status(
         &status.network.reliable_stream_reset_count.to_string(),
     );
     if let Some(cert_state) = &status.network.cert_trust_state {
-        kv("Certificate Trust", cert_state);
+        // Trust state is a protocol-derived value. Keep the status output
+        // deliberately closed over the states the daemon exposes so a future
+        // peer-controlled diagnostic cannot be echoed into terminal logs.
+        let trust_label = match cert_state.as_str() {
+            "trusted" => "trusted",
+            "operator_approved" => "operator_approved",
+            _ => "unknown",
+        };
+        kv("Certificate Trust", trust_label);
     }
 
     println!();

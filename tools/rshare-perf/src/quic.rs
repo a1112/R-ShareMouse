@@ -1605,9 +1605,9 @@ mod tests {
         assert!(
             measured.run.counters["transport_send_completed"] * 100
                 >= measured.run.counters["expected_sent"] * 90,
-            "counters={:?}, errors={:?}",
+            "counters={:?}, error_count={}",
             measured.run.counters,
-            measured.run.errors
+            measured.run.errors.len()
         );
         assert!(measured.run.metrics["achieved_hz"] >= 900.0);
         assert_eq!(measured.run.counters["independent_producer"], 1);
@@ -1701,9 +1701,9 @@ mod tests {
         assert!(
             measured.run.counters["transport_send_completed"] * 100
                 >= measured.run.counters["expected_sent"] * 90,
-            "counters={:?}, errors={:?}",
+            "counters={:?}, error_count={}",
             measured.run.counters,
-            measured.run.errors
+            measured.run.errors.len()
         );
         assert!(
             measured.run.counters["actual_sent"]
@@ -1739,9 +1739,9 @@ mod tests {
         );
         assert!(
             measured.run.counters["stall_recovery_consecutive_deliveries"] >= 3,
-            "counters={:?}, errors={:?}",
+            "counters={:?}, error_count={}",
             measured.run.counters,
-            measured.run.errors
+            measured.run.errors.len()
         );
     }
 
