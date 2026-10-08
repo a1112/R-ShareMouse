@@ -15,6 +15,8 @@ use rshare_core::{
     PeerTransportCapabilities, ScreenInfo, DISCOVERY_APP_ID, PROTOCOL_VERSION,
 };
 
+const MAX_DISCOVERED_DEVICES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerProtocolCompatibility {
     Compatible,
@@ -187,6 +189,26 @@ impl ServiceDiscovery {
     /// Get all currently discovered devices
     pub fn devices(&self) -> Vec<&DiscoveredDevice> {
         self.devices.values().collect()
+    }
+
+    /// Insert a discovery record with a hard cardinality bound. Discovery
+    /// packets are unauthenticated, so spoofed IDs must not grow persistent
+    /// state without limit.
+    fn record_device(&mut self, device: DiscoveredDevice) -> (bool, Option<DeviceId>) {
+        let device_id = device.id;
+        let was_known = self.devices.contains_key(&device_id);
+        let evicted = if !was_known && self.devices.len() >= MAX_DISCOVERED_DEVICES {
+            let oldest_id = self
+                .devices
+                .iter()
+                .min_by_key(|(_, candidate)| candidate.last_seen)
+                .map(|(id, _)| *id);
+            oldest_id.and_then(|id| self.devices.remove(&id).map(|_| id))
+        } else {
+            None
+        };
+        self.devices.insert(device_id, device);
+        (was_known, evicted)
     }
 
     /// Get a specific device by ID
@@ -366,11 +388,7 @@ impl ServiceDiscovery {
                 );
 
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
-                    let device_id = device.id;
-                    let was_known = self.devices.contains_key(&device_id);
-
-                    // Update device (refresh last_seen time)
-                    self.devices.insert(device_id, device.clone());
+                    let (was_known, evicted) = self.record_device(device.clone());
 
                     // Send HelloBack response immediately
                     let hello_back = hello_back_message(
@@ -389,6 +407,9 @@ impl ServiceDiscovery {
 
                     // Notify about the device
                     if let Some(tx) = &self.event_tx {
+                        if let Some(evicted_id) = evicted {
+                            let _ = tx.try_send(DiscoveryEvent::DeviceLost(evicted_id));
+                        }
                         let event = if was_known {
                             DiscoveryEvent::DeviceUpdated(device)
                         } else {
@@ -414,13 +435,12 @@ impl ServiceDiscovery {
                 );
 
                 if let Some(device) = DiscoveredDevice::from_message(addr, &msg) {
-                    let device_id = device.id;
-                    let was_known = self.devices.contains_key(&device_id);
-
-                    // Update device (refresh last_seen time)
-                    self.devices.insert(device_id, device.clone());
+                    let (was_known, evicted) = self.record_device(device.clone());
 
                     if let Some(tx) = &self.event_tx {
+                        if let Some(evicted_id) = evicted {
+                            let _ = tx.try_send(DiscoveryEvent::DeviceLost(evicted_id));
+                        }
                         let event = if was_known {
                             DiscoveryEvent::DeviceUpdated(device)
                         } else {

@@ -415,12 +415,15 @@ pub struct ConnectionManager {
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
     pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+    #[cfg(test)]
+    test_auto_approve_first_seen: bool,
 }
 
-// Retained for the future explicit approval mode. The current single-user
-// runtime automatically pins first-seen peers after identity verification.
+// First-seen and legacy TOFU identities stay quarantined until the operator
+// explicitly approves the pending identity through the daemon control plane.
 #[allow(dead_code)]
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
+const MAX_PENDING_APPROVALS: usize = 256;
 
 #[derive(Debug, Clone)]
 struct ApprovalExpectation {
@@ -481,6 +484,16 @@ impl PendingApprovalRegistry {
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(PENDING_APPROVAL_TTL_MS),
         };
+        if self.approvals.len() >= MAX_PENDING_APPROVALS {
+            if let Some(oldest_id) = self
+                .approvals
+                .iter()
+                .min_by_key(|(_, expectation)| expectation.approval.created_at_ms)
+                .map(|(approval_id, _)| approval_id.clone())
+            {
+                self.approvals.remove(&oldest_id);
+            }
+        }
         self.approvals.insert(
             approval.approval_id.clone(),
             ApprovalExpectation {
@@ -894,10 +907,12 @@ impl ConnectionManager {
 
     #[cfg(test)]
     pub(crate) fn isolated_for_test(local_device_id: DeviceId) -> Self {
-        Self::with_transport(
+        let mut manager = Self::with_transport(
             local_device_id,
             QuicTransport::isolated_for_test(local_device_id),
-        )
+        );
+        manager.test_auto_approve_first_seen = true;
+        manager
     }
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
@@ -930,6 +945,8 @@ impl ConnectionManager {
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
             pending_approvals: Arc::new(StdRwLock::new(PendingApprovalRegistry::default())),
+            #[cfg(test)]
+            test_auto_approve_first_seen: true,
         }
     }
 
@@ -959,6 +976,9 @@ impl ConnectionManager {
         let qos_registry = self.qos_registry.clone();
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
+        let pending_approvals = self.pending_approvals.clone();
+        #[cfg(test)]
+        let test_auto_approve_first_seen = self.test_auto_approve_first_seen;
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -982,18 +1002,71 @@ impl ConnectionManager {
                 let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
                     Some(QuicTrustDecision::OperatorApproved) => true,
                     Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
-                        if let Err(error) = incoming
-                            .connection
-                            .commit_inbound_operator_approval(device_id)
-                        {
-                            tracing::warn!(
-                                "Failed to persist automatically trusted inbound peer {}: {}",
-                                device_id,
-                                error
-                            );
-                            false
-                        } else {
+                        #[cfg(test)]
+                        if test_auto_approve_first_seen {
                             true
+                        } else {
+                            let fingerprint = &negotiated.auth.certificate_fingerprint;
+                            let approved = {
+                                let mut approvals = pending_approvals
+                                    .write()
+                                    .expect("pending approval registry poisoned");
+                                let now_ms = PendingApprovalRegistry::now_ms();
+                                approvals.observe(device_id, fingerprint, now_ms);
+                                approvals.consume_matching(device_id, fingerprint, now_ms)
+                            };
+                            if !approved {
+                                tracing::info!(
+                                    peer_id = %device_id,
+                                    fingerprint = %fingerprint,
+                                    "Quarantining first-seen inbound peer pending explicit approval"
+                                );
+                                false
+                            } else if let Err(error) = incoming
+                                .connection
+                                .commit_inbound_operator_approval(device_id)
+                            {
+                                tracing::warn!(
+                                    "Failed to persist explicitly approved inbound peer {}: {}",
+                                    device_id,
+                                    error
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        #[cfg(not(test))]
+                        {
+                            let fingerprint = &negotiated.auth.certificate_fingerprint;
+                            let approved = {
+                                let mut approvals = pending_approvals
+                                    .write()
+                                    .expect("pending approval registry poisoned");
+                                let now_ms = PendingApprovalRegistry::now_ms();
+                                approvals.observe(device_id, fingerprint, now_ms);
+                                approvals.consume_matching(device_id, fingerprint, now_ms)
+                            };
+                            if !approved {
+                                tracing::info!(
+                                    peer_id = %device_id,
+                                    fingerprint = %fingerprint,
+                                    "Quarantining first-seen inbound peer pending explicit approval"
+                                );
+                                false
+                            } else if let Err(error) = incoming
+                                .connection
+                                .commit_inbound_operator_approval(device_id)
+                            {
+                                tracing::warn!(
+                                    "Failed to persist explicitly approved inbound peer {}: {}",
+                                    device_id,
+                                    error
+                                );
+                                false
+                            } else {
+                                true
+                            }
                         }
                     }
                     Some(QuicTrustDecision::Rejected { .. }) | None => false,
@@ -1662,6 +1735,29 @@ mod tests {
         assert!(!registry.consume_matching(device_id, &fingerprint, 11));
         assert!(registry.approve(&approval.approval_id, 12));
         assert!(registry.consume_matching(device_id, &fingerprint, 13));
+    }
+
+    #[test]
+    fn pending_approvals_are_cardinality_bounded() {
+        let mut registry = PendingApprovalRegistry::default();
+        let first_device = DeviceId::new_v4();
+        registry.observe(
+            first_device,
+            &PeerCertificateFingerprint::from_der(b"first"),
+            1,
+        );
+        for index in 0..(MAX_PENDING_APPROVALS + 8) {
+            registry.observe(
+                DeviceId::new_v4(),
+                &PeerCertificateFingerprint::from_der(index.to_string().as_bytes()),
+                2 + index as u64,
+            );
+        }
+        let approvals = registry.list(2 + (MAX_PENDING_APPROVALS + 8) as u64);
+        assert_eq!(approvals.len(), MAX_PENDING_APPROVALS);
+        assert!(!approvals
+            .iter()
+            .any(|approval| approval.device_id == first_device));
     }
     use crate::encryption::{Encryption, QuicIdentity, QuicTrustStore};
     use rshare_core::{hello_back_message, ScreenInfo};

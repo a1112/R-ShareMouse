@@ -2619,7 +2619,18 @@ fn publication_item_to_local_diagnostic(
     item: &DiagnosticPublicationItem,
 ) -> LocalInputDiagnosticEvent {
     match &item.payload {
-        DiagnosticPayload::Discrete(event) => event.clone(),
+        DiagnosticPayload::Discrete(event) => {
+            let mut event = event.clone();
+            // A diagnostics subscription is a health stream, not a keylogger.
+            // Keep the event kind and timing useful while removing individual
+            // key/text values before serializing a live remote publication.
+            if event.device_kind == LocalInputDeviceKind::Keyboard {
+                event.payload.remove("key");
+                event.payload.remove("text");
+                event.summary = "Keyboard input event".to_string();
+            }
+            event
+        }
         DiagnosticPayload::Metrics(snapshot) => {
             let mut payload = BTreeMap::new();
             payload.insert("snapshot_json".to_string(), item.json.to_string());
@@ -2705,13 +2716,14 @@ fn spawn_peer_diagnostics_forwarder(
     input_registry: Arc<ConnectionRegistry>,
     local_device_id: DeviceId,
     subscriber_id: DiagnosticSubscriberId,
+    filter: EndpointEventFilter,
 ) {
     let Some(peer) = input_registry.peer(&subscriber_id.peer_id).filter(|peer| {
         diagnostic_generation_is_current(subscriber_id, Some(peer.auth.control_connection_id))
     }) else {
         return;
     };
-    let Some(subscription) = diagnostics.subscribe_current(subscriber_id) else {
+    let Some(subscription) = diagnostics.subscribe_current_filtered(subscriber_id, filter) else {
         return;
     };
     tokio::spawn(run_peer_diagnostics_forwarder(
@@ -5138,6 +5150,7 @@ async fn handle_network_message(
                     input_registry.clone(),
                     local_device_id,
                     subscriber_id,
+                    filter,
                 );
             };
         }
@@ -5359,7 +5372,8 @@ async fn handle_network_message(
                     .await;
                 return;
             }
-            let render_result = audio_runtime.start_render(stream_id, format.clone());
+            let render_result =
+                audio_runtime.start_render(from, control_connection_id, stream_id, format.clone());
             let event = {
                 let mut state = state.write().await;
                 match render_result {
@@ -5419,7 +5433,7 @@ async fn handle_network_message(
             if !audio_forwarding_enabled {
                 return;
             }
-            let render_result = audio_runtime.push_frame(&frame);
+            let render_result = audio_runtime.push_frame(from, control_connection_id, &frame);
             let event = {
                 let mut state = state.write().await;
                 match render_result {
@@ -5478,7 +5492,7 @@ async fn handle_network_message(
             }
         }
         Message::AudioStreamStop { stream_id, reason } => {
-            audio_runtime.stop_render();
+            audio_runtime.stop_render(from, control_connection_id, stream_id);
             let event = {
                 let mut state = state.write().await;
                 state.local_controls.audio_stream_state.active = false;
@@ -7310,10 +7324,9 @@ async fn main() -> Result<()> {
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
             mdns_enabled: config.network.mdns_enabled,
-            // Compatible discovered peers connect automatically. The first
-            // certificate is pinned during the handshake; security policy can
-            // add an explicit approval mode later.
-            auto_connect: true,
+            // Discovery is untrusted. The operator must approve the pending
+            // certificate before a connection can be established.
+            auto_connect: false,
             ..Default::default()
         });
 
@@ -7657,7 +7670,8 @@ async fn main() -> Result<()> {
     let (input_state, input_feeds) = input_state_channel(32);
     let input_metrics = Arc::new(ControlMetrics::default());
     let diagnostics_runtime =
-        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
+        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY)
+            .with_endpoint_id(device_id);
     let diagnostics_samples = diagnostics_runtime.latest_receiver();
     let diagnostics = diagnostics_runtime.handle();
     let (diagnostics_shutdown_tx, diagnostics_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -8112,6 +8126,7 @@ async fn main() -> Result<()> {
                         }
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
+                        audio_runtime.stop_render_for_peer(id, control_connection_id);
                         if let Some(service) = &state.file_transfers {
                             service.disconnect(id, control_connection_id);
                         }
@@ -8268,7 +8283,7 @@ async fn main() -> Result<()> {
     set_local_shortcut_suppression(false);
     usb_maintenance.abort();
     audio_runtime.stop_capture();
-    audio_runtime.stop_render();
+    audio_runtime.clear_render();
     audio_runtime.shutdown();
     drop(system_safety_watcher);
     #[cfg(windows)]
@@ -8879,6 +8894,16 @@ async fn dispatch_ipc_request(
                 .clone()
                 .context("文件传输服务未启动")?;
             DaemonResponse::FileTransfers(service.snapshots())
+        }
+        DaemonRequest::ApproveFileTransfer { transfer_id } => {
+            let service = state
+                .read()
+                .await
+                .file_transfers
+                .clone()
+                .context("文件传输服务未启动")?;
+            service.approve_incoming(transfer_id)?;
+            DaemonResponse::Ack
         }
         DaemonRequest::CancelFileTransfer { transfer_id } => {
             let service = state
@@ -13072,10 +13097,10 @@ mod tests {
     }
 
     #[test]
-    fn mobile_gateway_authorizes_query_or_bearer_token() {
+    fn mobile_gateway_authorizes_header_token_only() {
         let query_request =
             mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=mobile-secret", Vec::new());
-        assert!(mobile_gateway::is_authorized_mobile_request(
+        assert!(!mobile_gateway::is_authorized_mobile_request(
             &query_request,
             "mobile-secret"
         ));
@@ -13095,7 +13120,7 @@ mod tests {
             "/mobile?t=mobile%2Bsecret%2Ftoken%3D",
             Vec::new(),
         );
-        assert!(mobile_gateway::is_authorized_mobile_request(
+        assert!(!mobile_gateway::is_authorized_mobile_request(
             &encoded_query_request,
             "mobile+secret/token="
         ));

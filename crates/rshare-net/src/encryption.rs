@@ -9,6 +9,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -340,16 +342,19 @@ impl Encryption {
 
     pub fn load_or_generate_identity_in(state_dir: impl AsRef<Path>) -> Result<QuicIdentity> {
         let state_dir = state_dir.as_ref();
-        fs::create_dir_all(state_dir).with_context(|| {
-            format!(
-                "Failed to create QUIC identity state directory {}",
-                state_dir.display()
-            )
-        })?;
+        ensure_private_state_dir(state_dir)?;
 
         let cert_path = state_dir.join(QUIC_CERT_FILE);
         let key_path = state_dir.join(QUIC_KEY_FILE);
+        if cert_path.exists() != key_path.exists() {
+            anyhow::bail!(
+                "QUIC identity is incomplete in {}; refusing to replace a partial identity",
+                state_dir.display()
+            );
+        }
         if cert_path.exists() && key_path.exists() {
+            ensure_private_file(&cert_path)?;
+            ensure_private_file(&key_path)?;
             return Ok(QuicIdentity {
                 cert_der: fs::read(&cert_path).with_context(|| {
                     format!("Failed to read QUIC certificate {}", cert_path.display())
@@ -360,32 +365,187 @@ impl Encryption {
         }
 
         let (cert_der, key_der) = Self::generate_cert()?;
-        fs::write(&cert_path, &cert_der).with_context(|| {
-            format!("Failed to persist QUIC certificate {}", cert_path.display())
-        })?;
-        fs::write(&key_path, &key_der)
-            .with_context(|| format!("Failed to persist QUIC key {}", key_path.display()))?;
+        if let Err(error) = write_private_new(&cert_path, &cert_der) {
+            return Err(error).with_context(|| {
+                format!("Failed to persist QUIC certificate {}", cert_path.display())
+            });
+        }
+        if let Err(error) = write_private_new(&key_path, &key_der) {
+            let _ = fs::remove_file(&cert_path);
+            return Err(error)
+                .with_context(|| format!("Failed to persist QUIC key {}", key_path.display()));
+        }
         Ok(QuicIdentity { cert_der, key_der })
     }
 
     pub fn regenerate_identity_in(state_dir: impl AsRef<Path>) -> Result<QuicIdentity> {
         let state_dir = state_dir.as_ref();
-        fs::create_dir_all(state_dir).with_context(|| {
-            format!(
-                "Failed to create QUIC identity state directory {}",
-                state_dir.display()
-            )
-        })?;
+        ensure_private_state_dir(state_dir)?;
         let cert_path = state_dir.join(QUIC_CERT_FILE);
         let key_path = state_dir.join(QUIC_KEY_FILE);
         let (cert_der, key_der) = Self::generate_cert()?;
-        fs::write(&cert_path, &cert_der).with_context(|| {
+        write_private_atomic(&cert_path, &cert_der).with_context(|| {
             format!("Failed to persist QUIC certificate {}", cert_path.display())
         })?;
-        fs::write(&key_path, &key_der)
+        write_private_atomic(&key_path, &key_der)
             .with_context(|| format!("Failed to persist QUIC key {}", key_path.display()))?;
         Ok(QuicIdentity { cert_der, key_der })
     }
+}
+
+fn ensure_private_state_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| {
+        format!(
+            "Failed to create QUIC identity state directory {}",
+            path.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "Failed to inspect QUIC identity state directory {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "QUIC identity state path is not a real directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid {
+            anyhow::bail!("QUIC identity state directory is not owned by the daemon user");
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+        let mode = fs::metadata(path)?.mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!("QUIC identity state directory is accessible by another user");
+        }
+    }
+    #[cfg(windows)]
+    ensure_windows_private_acl(path, true)?;
+    Ok(())
+}
+
+fn ensure_private_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect QUIC identity file {}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "QUIC identity file is not a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "QUIC identity file permissions are too broad: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    ensure_windows_private_acl(path, false)?;
+    Ok(())
+}
+
+fn write_private_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    #[cfg(windows)]
+    ensure_windows_private_acl(path, false)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_private_acl(path: &Path, directory: bool) -> Result<()> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    // Owner Rights (OW) resolves to the current file owner; SYSTEM remains
+    // available for recovery/service maintenance. Protected DACLs remove
+    // inherited broad grants from the state directory and identity files.
+    let sddl = if directory {
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"
+    } else {
+        "D:P(A;;FA;;;SY)(A;;FA;;;OW)"
+    };
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+    let sddl: Vec<u16> = sddl.encode_utf16().chain(once(0)).collect();
+    let mut descriptor = null_mut();
+    let mut descriptor_size = 0_u32;
+    // SAFETY: Both strings are NUL-terminated and the API initializes the
+    // descriptor pointer on success.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            &mut descriptor_size,
+        )
+    };
+    if converted == 0 || descriptor.is_null() {
+        anyhow::bail!("failed to construct the QUIC identity Windows ACL");
+    }
+    // SAFETY: `descriptor` came from LocalAlloc inside the conversion API and
+    // remains valid until LocalFree below.
+    let result = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    // SAFETY: The descriptor is owned by this function after conversion.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if result == 0 {
+        anyhow::bail!("failed to apply the QUIC identity Windows ACL");
+    }
+    let _ = descriptor_size;
+    Ok(())
+}
+
+fn write_private_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..16 {
+        let counter = TRUST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("quic-identity"));
+        let temp = parent.join(format!(".{name}.{counter}.tmp"));
+        match write_private_new(&temp, data) {
+            Ok(()) => {
+                #[cfg(windows)]
+                let _ = fs::remove_file(path);
+                fs::rename(&temp, path)?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("failed to allocate a private QUIC identity temporary file")
 }
 
 pub fn trust_store_path() -> Result<PathBuf> {
