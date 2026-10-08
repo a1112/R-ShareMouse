@@ -248,7 +248,7 @@ jobs:
         uses: ./.github/actions/prepare-linux-build
       - name: Test workspace
         id: tests
-        run: xvfb-run -a -s "-screen 0 1280x800x24 +extension XTEST" cargo test --workspace --locked --no-fail-fast
+        run: xvfb-run -a -s "-noreset -screen 0 1280x800x24 +extension XTEST" cargo test --workspace --locked --no-fail-fast
       - name: Capture daemon abort backtrace
         id: daemon_gdb
         if: ${{ !cancelled() && steps.tests.outcome == 'failure' && steps.prepare.outcome == 'success' }}
@@ -269,7 +269,7 @@ jobs:
             echo "daemon test binary: $daemon_bin"
             echo 'rerunning the default concurrent daemon test harness under gdb'
           } | tee "$backtrace_path"
-          timeout 120s xvfb-run -a -s "-screen 0 1280x800x24 +extension XTEST" \
+          timeout 120s xvfb-run -a -s "-noreset -screen 0 1280x800x24 +extension XTEST" \
             gdb -q -batch \
               -ex 'set pagination off' \
               -ex run \
