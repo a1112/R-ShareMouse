@@ -321,11 +321,9 @@ pub(crate) async fn serve(
     let header = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", derive_accept_key(key.as_bytes()));
     timeout(Duration::from_secs(3), stream.write_all(header.as_bytes())).await??;
     stream.set_nodelay(true)?;
-    let config = WebSocketConfig {
-        max_message_size: Some(65_536),
-        max_frame_size: Some(65_536),
-        ..Default::default()
-    };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(65_536))
+        .max_frame_size(Some(65_536));
     let mut socket = WebSocketStream::from_raw_socket(stream, WsRole::Server, Some(config)).await;
     if role == Role::Host {
         let (tx, rx) = blocking::sync_channel(32);
@@ -345,7 +343,7 @@ pub(crate) async fn serve(
     }
     timeout(
         Duration::from_secs(2),
-        socket.send(Message::Text(json!({"type":"hello"}).to_string())),
+        socket.send(Message::Text(json!({"type":"hello"}).to_string().into())),
     )
     .await??;
     let mut last_message = Instant::now();
@@ -358,7 +356,7 @@ pub(crate) async fn serve(
             event = events.recv() => {
                 let Some(event) = event else { break };
                 let ended = event["type"] == "host_left";
-                timeout(Duration::from_secs(2), socket.send(Message::Text(event.to_string()))).await??;
+                timeout(Duration::from_secs(2), socket.send(Message::Text(event.to_string().into()))).await??;
                 if ended { break; }
             }
             incoming = socket.next() => {
@@ -379,7 +377,7 @@ pub(crate) async fn serve(
                             Ok(())
                         })();
                         if let Err(error) = result {
-                            timeout(Duration::from_secs(2), socket.send(Message::Text(json!({"type":"error","message":error.to_string()}).to_string()))).await??;
+                            timeout(Duration::from_secs(2), socket.send(Message::Text(json!({"type":"error","message":error.to_string()}).to_string().into()))).await??;
                             // Fail closed: no stale touch may survive an invalid/overflowed input.
                             break;
                         }
