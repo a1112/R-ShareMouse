@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Networking
 quinn = "0.11"
 bytes = "1.10"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 rcgen = "0.14"
 rustls = "0.23"
