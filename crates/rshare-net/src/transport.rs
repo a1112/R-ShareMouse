@@ -20,8 +20,8 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Once;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Once, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify, Semaphore};
@@ -48,6 +48,49 @@ const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 const AUTHENTICATED_UNI_STREAM_TASK_BUDGET: usize = 32;
 const AUTHENTICATED_UNI_STREAM_BUDGET_EXHAUSTED_CODE: u32 = 0x525342;
+// A peer must make progress while sending an authenticated frame. These
+// bounds apply before allocation, so a stalled or fragmented length prefix
+// cannot retain a large receive task indefinitely.
+const QOS_FRAME_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+const QOS_CONTROL_FRAME_MAX: usize = 256 * 1024;
+const QOS_TELEMETRY_FRAME_MAX: usize = 256 * 1024;
+// Clipboard and file-transfer payloads are JSON encoded before the QoS frame;
+// allow normal wire expansion while keeping any single authenticated bulk
+// frame small enough for the per-connection memory budget.
+const QOS_BULK_FRAME_MAX: usize = 4 * 1024 * 1024;
+const QOS_FRAME_MEMORY_UNIT: usize = 64 * 1024;
+const QOS_CONNECTION_FRAME_BUDGET: usize = 8 * 1024 * 1024;
+const QOS_PROCESS_FRAME_BUDGET: usize = 64 * 1024 * 1024;
+
+fn qos_lane_frame_limit(lane: u8, configured_limit: usize) -> usize {
+    let lane_limit = match lane {
+        value if value == LaneDiscriminator::Control as u8 => QOS_CONTROL_FRAME_MAX,
+        value if value == LaneDiscriminator::Telemetry as u8 => QOS_TELEMETRY_FRAME_MAX,
+        value if value == LaneDiscriminator::Bulk as u8 => QOS_BULK_FRAME_MAX,
+        _ => 0,
+    };
+    configured_limit.min(lane_limit)
+}
+
+fn qos_frame_permits(bytes: usize) -> u32 {
+    bytes
+        .saturating_add(QOS_FRAME_MEMORY_UNIT - 1)
+        .checked_div(QOS_FRAME_MEMORY_UNIT)
+        .unwrap_or(u32::MAX as usize)
+        .max(1)
+        .min(u32::MAX as usize) as u32
+}
+
+fn process_qos_frame_budget() -> Arc<Semaphore> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                qos_frame_permits(QOS_PROCESS_FRAME_BUDGET) as usize
+            ))
+        })
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuicServerStartError {
@@ -754,6 +797,7 @@ struct QuicConnectionInner {
     qos_receive_notify: Notify,
     qos_inbound: StdMutex<QosInboundState>,
     authenticated_uni_stream_tasks: Arc<Semaphore>,
+    qos_frame_budget: Arc<Semaphore>,
     #[cfg(test)]
     qos_reliable_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
     #[cfg(test)]
@@ -1042,6 +1086,9 @@ impl QuicConnection {
             qos_inbound: StdMutex::new(QosInboundState::default()),
             authenticated_uni_stream_tasks: Arc::new(Semaphore::new(
                 AUTHENTICATED_UNI_STREAM_TASK_BUDGET,
+            )),
+            qos_frame_budget: Arc::new(Semaphore::new(
+                qos_frame_permits(QOS_CONNECTION_FRAME_BUDGET) as usize,
             )),
             #[cfg(test)]
             qos_reliable_reader_start_barrier: StdMutex::new(None),
@@ -2168,7 +2215,16 @@ async fn read_authenticated_uni_stream(
             }
         }
     } else {
-        stream.read_exact(&mut prefix).await
+        match tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut prefix)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                inner
+                    .connection
+                    .close(0u32.into(), b"authenticated qos prefix timed out");
+                return;
+            }
+        }
     };
     if let Err(error) = prefix_result {
         if is_terminal_cancel_reset(&error) {
@@ -2208,7 +2264,18 @@ async fn read_authenticated_uni_stream(
     }
     if &prefix == QOS_LANE_MAGIC {
         let mut lane = [0u8; 1];
-        if let Err(error) = stream.read_exact(&mut lane).await {
+        let lane_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut lane)).await;
+        let lane_result = match lane_result {
+            Ok(result) => result,
+            Err(_) => {
+                inner
+                    .connection
+                    .close(0u32.into(), b"authenticated qos lane timed out");
+                return;
+            }
+        };
+        if let Err(error) = lane_result {
             if is_terminal_cancel_reset(&error) {
                 #[cfg(test)]
                 inner
@@ -2366,9 +2433,27 @@ async fn read_qos_message_stream(
                 .store(false, Ordering::Release);
         }
     }
+    let frame_limit = qos_lane_frame_limit(lane, max_message_size);
+    if frame_limit == 0 {
+        fail_close_current_qos_generation(&inner, &context, b"unknown qos message lane");
+        return;
+    }
     loop {
         let mut len_buf = [0u8; 4];
-        if let Err(error) = stream.read_exact(&mut len_buf).await {
+        let length_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = match length_result {
+            Ok(result) => result,
+            Err(_) => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos message length timed out",
+                );
+                return;
+            }
+        };
+        if let Err(error) = length_result {
             if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
                 #[cfg(test)]
                 inner
@@ -2380,12 +2465,59 @@ async fn read_qos_message_stream(
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > max_message_size {
+        if len > frame_limit {
             fail_close_current_qos_generation(&inner, &context, b"oversized qos message frame");
             return;
         }
+        let permits = qos_frame_permits(len);
+        let connection_permit = match tokio::time::timeout(
+            QOS_FRAME_PROGRESS_TIMEOUT,
+            inner.qos_frame_budget.clone().acquire_many_owned(permits),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos connection frame budget exhausted",
+                );
+                return;
+            }
+        };
+        let process_permit = match tokio::time::timeout(
+            QOS_FRAME_PROGRESS_TIMEOUT,
+            process_qos_frame_budget().acquire_many_owned(permits),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                drop(connection_permit);
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos process frame budget exhausted",
+                );
+                return;
+            }
+        };
         let mut data = vec![0u8; len];
-        if let Err(error) = stream.read_exact(&mut data).await {
+        let payload_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut data)).await;
+        let payload_result = match payload_result {
+            Ok(result) => result,
+            Err(_) => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos message payload timed out",
+                );
+                return;
+            }
+        };
+        if let Err(error) = payload_result {
             if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
                 #[cfg(test)]
                 inner
@@ -2493,6 +2625,8 @@ async fn read_qos_message_stream(
             }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
         }
+        drop(process_permit);
+        drop(connection_permit);
     }
 }
 
@@ -2569,7 +2703,27 @@ async fn read_qos_reliable_stream(
             }
         }
         let mut len_buf = [0u8; 4];
-        if let Err(error) = stream.read_exact(&mut len_buf).await {
+        let length_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = match length_result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(context) = await_qos_receive_context(&inner).await {
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"qos reliable length timed out",
+                    );
+                } else {
+                    inner
+                        .connection
+                        .close(0u32.into(), b"qos reliable length timed out");
+                }
+                return;
+            }
+        };
+        if let Err(error) = length_result {
             if let Some(context) = await_qos_receive_context(&inner).await {
                 if !(is_terminal_cancel_reset(&error)
                     && handle_terminal_cancel_reset(&inner, &context, stream_epoch))
@@ -2604,7 +2758,27 @@ async fn read_qos_reliable_stream(
             return;
         }
         let mut data = vec![0u8; len];
-        if let Err(error) = stream.read_exact(&mut data).await {
+        let payload_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut data)).await;
+        let payload_result = match payload_result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(context) = await_qos_receive_context(&inner).await {
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"qos reliable payload timed out",
+                    );
+                } else {
+                    inner
+                        .connection
+                        .close(0u32.into(), b"qos reliable payload timed out");
+                }
+                return;
+            }
+        };
+        if let Err(error) = payload_result {
             if let Some(context) = await_qos_receive_context(&inner).await {
                 if !(is_terminal_cancel_reset(&error)
                     && handle_terminal_cancel_reset(&inner, &context, stream_epoch))

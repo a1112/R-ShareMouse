@@ -62,6 +62,7 @@ async fn folder_drop_publishes_into_the_resolved_folder_and_preserves_collisions
                 drop_point(),
             )
             .unwrap();
+        pair.approve(sent.id).await;
         let sent = pair.wait(&pair.sender, sent.id).await;
         assert_eq!(
             sent.status,
@@ -126,6 +127,7 @@ async fn folder_drop_rejects_invalid_gestures_and_never_falls_back_to_downloads(
             },
         )
         .unwrap();
+    pair.approve(sent.id).await;
     let sent = pair.wait(&pair.sender, sent.id).await;
     assert_eq!(sent.status, FileTransferStatus::Cancelled);
     assert!(sent.error.unwrap().contains("松手事件"));
@@ -303,6 +305,25 @@ impl Pair {
         })
     }
 
+    async fn approve(&self, id: DeviceId) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if self
+                    .receiver
+                    .snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.id == id && snapshot.incoming)
+                    && self.receiver.approve_incoming(id).is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("incoming file offer must be visible before approval");
+    }
+
     async fn close(mut self) {
         let _ = self.a.disconnect(&self.b_id).await;
         let _ = self.b.disconnect(&self.a_id).await;
@@ -329,6 +350,7 @@ async fn file_drop_copies_bytes_empty_files_folders_and_same_names_over_real_qui
             .sender
             .send_files(pair.b_id, vec![source.to_string_lossy().into()])
             .unwrap();
+        pair.approve(sent.id).await;
         let sent = pair.wait(&pair.sender, sent.id).await;
         assert_eq!(
             sent.status,
@@ -418,6 +440,9 @@ async fn file_drop_rejects_corrupt_content_and_cleans_staging() {
             }))
             .await
             .unwrap();
+        if sequence == 0 {
+            pair.approve(id).await;
+        }
     }
     let received = pair.wait(&pair.receiver, id).await;
     assert_eq!(received.status, FileTransferStatus::Failed);
@@ -456,6 +481,7 @@ async fn file_drop_cancel_disconnect_and_stale_generation_remove_partial_files()
         assert!(!pair.receiver.snapshots().iter().any(|s| s.id == id));
         pair.receiver
             .receive(pair.a_id, peer.auth.control_connection_id, offer);
+        pair.approve(id).await;
         timeout(Duration::from_secs(3), async {
             while !pair._root.path().join("b-received").exists()
                 || pair
@@ -522,6 +548,9 @@ async fn file_drop_invalid_chunk_offsets_and_sizes_never_commit() {
                 }))
                 .await
                 .unwrap();
+            if sequence == 0 {
+                pair.approve(id).await;
+            }
         }
         let received = pair.wait(&pair.receiver, id).await;
         assert_eq!(received.status, FileTransferStatus::Failed);

@@ -85,7 +85,9 @@ impl Default for NetworkManagerConfig {
         Self {
             discovery_port: 27432,
             bind_address: "0.0.0.0:27431".to_string(),
-            auto_connect: true,
+            // Discovery is an untrusted hint. A peer must be explicitly
+            // approved before a QUIC connection can be established.
+            auto_connect: false,
             broadcast_interval: Duration::from_secs(5),
             device_timeout: Duration::from_secs(30),
             mdns_enabled: false,
@@ -119,20 +121,34 @@ pub struct NetworkManager {
 // unavailable discovered peer from creating an unbounded stream of QUIC attempts.
 const AUTO_CONNECT_RETRY_BASE: Duration = Duration::from_secs(1);
 const AUTO_CONNECT_RETRY_MAX: Duration = Duration::from_secs(60);
+const AUTO_CONNECT_MAX_TRACKED: usize = 256;
+const AUTO_CONNECT_MAX_IN_FLIGHT: usize = 8;
+const AUTO_CONNECT_ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Default)]
 struct AutoConnectAttempt {
     in_flight: bool,
     failures: u32,
     next_allowed_attempt: Option<Instant>,
+    last_seen: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
 struct AutoConnectScheduler {
     attempts: HashMap<DeviceId, AutoConnectAttempt>,
+    in_flight: usize,
 }
 
 impl AutoConnectScheduler {
+    fn prune(&mut self, now: Instant) {
+        self.attempts.retain(|_, attempt| {
+            attempt.in_flight
+                || attempt.last_seen.is_none_or(|last_seen| {
+                    now.saturating_duration_since(last_seen) <= AUTO_CONNECT_ENTRY_TTL
+                })
+        });
+    }
+
     fn start_attempt_if_disconnected(
         &mut self,
         device_id: DeviceId,
@@ -143,28 +159,49 @@ impl AutoConnectScheduler {
     }
 
     fn start_attempt(&mut self, device_id: DeviceId, now: Instant) -> bool {
+        self.prune(now);
+        if !self.attempts.contains_key(&device_id)
+            && self.attempts.len() >= AUTO_CONNECT_MAX_TRACKED
+        {
+            return false;
+        }
+        let can_start = self.in_flight < AUTO_CONNECT_MAX_IN_FLIGHT;
         let attempt = self.attempts.entry(device_id).or_default();
         if attempt.in_flight
             || attempt
                 .next_allowed_attempt
                 .is_some_and(|next_allowed| now < next_allowed)
+            || !can_start
         {
             return false;
         }
         attempt.in_flight = true;
+        attempt.last_seen = Some(now);
+        self.in_flight = self.in_flight.saturating_add(1);
         true
     }
 
     fn complete_attempt(&mut self, device_id: DeviceId, now: Instant, succeeded: bool) {
         if succeeded {
+            if self
+                .attempts
+                .get(&device_id)
+                .is_some_and(|attempt| attempt.in_flight)
+            {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
             self.attempts.remove(&device_id);
             return;
         }
 
         let attempt = self.attempts.entry(device_id).or_default();
+        if attempt.in_flight {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
         attempt.in_flight = false;
         attempt.failures = attempt.failures.saturating_add(1);
         attempt.next_allowed_attempt = Some(now + auto_connect_retry_delay(attempt.failures));
+        attempt.last_seen = Some(now);
     }
 
     fn on_device_lost(&mut self, _device_id: DeviceId) {
@@ -332,6 +369,15 @@ async fn handle_discovery_event(
             let device_id = device.id;
             {
                 let mut devices = discovered_devices.write().await;
+                if !devices.contains_key(&device_id) && devices.len() >= 256 {
+                    if let Some(oldest_id) = devices
+                        .iter()
+                        .min_by_key(|(_, candidate)| candidate.last_seen)
+                        .map(|(id, _)| *id)
+                    {
+                        devices.remove(&oldest_id);
+                    }
+                }
                 devices.insert(device_id, device.clone());
             }
             let _ = discovery_tx.try_send(NetworkEvent::DeviceFound(device.clone()));
@@ -866,7 +912,7 @@ mod tests {
     fn test_network_manager_config_default() {
         let config = NetworkManagerConfig::default();
         assert_eq!(config.discovery_port, 27432);
-        assert!(config.auto_connect);
+        assert!(!config.auto_connect);
         assert!(!config.mdns_enabled);
     }
 

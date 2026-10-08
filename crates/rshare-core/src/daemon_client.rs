@@ -155,6 +155,14 @@ pub async fn request_file_transfers() -> Result<Vec<crate::file_transfer::FileTr
     }
 }
 
+pub async fn request_approve_file_transfer(transfer_id: crate::DeviceId) -> Result<()> {
+    match send_request(DaemonRequest::ApproveFileTransfer { transfer_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
 pub async fn request_cancel_file_transfer(transfer_id: crate::DeviceId) -> Result<()> {
     match send_request(DaemonRequest::CancelFileTransfer { transfer_id }).await? {
         DaemonResponse::Ack => Ok(()),
