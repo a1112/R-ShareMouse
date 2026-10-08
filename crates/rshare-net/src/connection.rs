@@ -1,8 +1,9 @@
 //! Connection management
 
 use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify, RwLock};
@@ -10,7 +11,9 @@ use tokio::time::Instant;
 
 use rshare_core::{ControlConnectionId, DeviceId, Message, PendingPeerApproval};
 
-use super::encryption::{PeerCertificateFingerprint, QuicTrustDecision};
+use super::encryption::{
+    PeerCertificateFingerprint, QuicTrustDecision, QuicTrustStore, TrustProvenance,
+};
 use super::handshake::{
     complete_incoming_handshake, perform_outbound_handshake, receive_incoming_handshake,
 };
@@ -415,11 +418,101 @@ pub struct ConnectionManager {
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
     pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+    peer_connection_policy: Arc<PeerConnectionPolicy>,
 }
 
-// Retained for the future explicit approval mode. The current single-user
-// runtime automatically pins first-seen peers after identity verification.
-#[allow(dead_code)]
+/// Shared across automatic outbound tasks and the independent inbound server.
+/// A local disconnect takes effect before either path waits for a lifecycle lock.
+pub(crate) struct PeerConnectionPolicy {
+    auto_connect_enabled: AtomicBool,
+    suppressed_peers: StdRwLock<HashSet<DeviceId>>,
+    outbound_attempts: StdRwLock<HashSet<DeviceId>>,
+    trust_store_path: Option<PathBuf>,
+}
+
+impl PeerConnectionPolicy {
+    fn new(trust_store_path: Option<PathBuf>) -> Self {
+        Self {
+            auto_connect_enabled: AtomicBool::new(true),
+            suppressed_peers: StdRwLock::new(HashSet::new()),
+            outbound_attempts: StdRwLock::new(HashSet::new()),
+            trust_store_path,
+        }
+    }
+
+    pub(crate) fn set_auto_connect(&self, enabled: bool) {
+        self.auto_connect_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn suppress(&self, device_id: DeviceId) {
+        self.suppressed_peers
+            .write()
+            .expect("peer suppression set poisoned")
+            .insert(device_id);
+    }
+
+    fn allow_manual_connect(&self, device_id: DeviceId) {
+        self.suppressed_peers
+            .write()
+            .expect("peer suppression set poisoned")
+            .remove(&device_id);
+    }
+
+    fn is_suppressed(&self, device_id: &DeviceId) -> bool {
+        self.suppressed_peers
+            .read()
+            .expect("peer suppression set poisoned")
+            .contains(device_id)
+    }
+
+    fn reject_colliding_inbound(&self, local_id: DeviceId, peer_id: DeviceId) -> bool {
+        // Only arbitrate while this endpoint is also dialing. When one endpoint
+        // alone enables automatic connection, either device can still initiate.
+        local_id < peer_id
+            && self
+                .outbound_attempts
+                .read()
+                .expect("outbound attempt set poisoned")
+                .contains(&peer_id)
+    }
+
+    pub(crate) fn can_auto_connect(&self, device_id: DeviceId) -> bool {
+        self.auto_connect_enabled.load(Ordering::Acquire)
+            && !self.is_suppressed(&device_id)
+            && self.trust_store_path.as_ref().is_some_and(|path| {
+                QuicTrustStore::load(path).is_ok_and(|store| {
+                    store.provenance_for(&device_id) == Some(TrustProvenance::OperatorApproved)
+                })
+            })
+    }
+}
+
+struct OutboundAttemptGuard {
+    policy: Arc<PeerConnectionPolicy>,
+    peer_id: DeviceId,
+}
+
+impl OutboundAttemptGuard {
+    fn new(policy: Arc<PeerConnectionPolicy>, peer_id: DeviceId) -> Self {
+        policy
+            .outbound_attempts
+            .write()
+            .expect("outbound attempt set poisoned")
+            .insert(peer_id);
+        Self { policy, peer_id }
+    }
+}
+
+impl Drop for OutboundAttemptGuard {
+    fn drop(&mut self) {
+        self.policy
+            .outbound_attempts
+            .write()
+            .expect("outbound attempt set poisoned")
+            .remove(&self.peer_id);
+    }
+}
+
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -431,6 +524,27 @@ struct ApprovalExpectation {
 #[derive(Debug, Default)]
 struct PendingApprovalRegistry {
     approvals: HashMap<String, ApprovalExpectation>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerApprovalHandle {
+    approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+}
+
+impl PeerApprovalHandle {
+    pub(crate) fn list(&self) -> Vec<PendingPeerApproval> {
+        self.approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .list(PendingApprovalRegistry::now_ms())
+    }
+
+    pub(crate) fn approve(&self, approval_id: &str) -> bool {
+        self.approvals
+            .write()
+            .expect("pending approval registry poisoned")
+            .approve(approval_id, PendingApprovalRegistry::now_ms())
+    }
 }
 
 impl PendingApprovalRegistry {
@@ -460,7 +574,6 @@ impl PendingApprovalRegistry {
         approvals
     }
 
-    #[allow(dead_code)]
     fn observe(
         &mut self,
         device_id: DeviceId,
@@ -502,7 +615,6 @@ impl PendingApprovalRegistry {
         true
     }
 
-    #[allow(dead_code)]
     fn consume_matching(
         &mut self,
         device_id: DeviceId,
@@ -901,6 +1013,9 @@ impl ConnectionManager {
     }
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
+        let peer_connection_policy = Arc::new(PeerConnectionPolicy::new(
+            transport.resolved_trust_store_path().ok(),
+        ));
         let (event_tx, event_rx) = mpsc::channel(100);
         let (authenticated_peer_tx, authenticated_peer_rx) = mpsc::channel(32);
         let (terminal_release_tx, terminal_release_rx) = mpsc::channel(32);
@@ -930,21 +1045,56 @@ impl ConnectionManager {
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
             pending_approvals: Arc::new(StdRwLock::new(PendingApprovalRegistry::default())),
+            peer_connection_policy,
         }
     }
 
+    pub(crate) fn peer_connection_policy(&self) -> Arc<PeerConnectionPolicy> {
+        self.peer_connection_policy.clone()
+    }
+
+    pub(crate) fn peer_approval_handle(&self) -> PeerApprovalHandle {
+        PeerApprovalHandle {
+            approvals: self.pending_approvals.clone(),
+        }
+    }
+
+    pub(crate) fn local_certificate_fingerprint(&self) -> String {
+        self.transport.local_certificate_fingerprint().to_string()
+    }
+
+    /// Provision the real trust store for loopback fixtures; authentication and
+    /// the production approval checks still run unchanged.
+    #[cfg(test)]
+    pub(crate) fn approve_inbound_peer_for_test(&self, peer: &Self) {
+        QuicTrustStore::approve_at(
+            self.transport.resolved_trust_store_path().unwrap(),
+            peer.local_device_id,
+            peer.transport.identity_fingerprint_for_test(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_trust_store_path_for_test(&self) -> PathBuf {
+        self.transport.resolved_trust_store_path().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_peer_transport_for_test(&self, peer_id: &DeviceId) {
+        self.pool
+            .remove_now(peer_id)
+            .expect("fixture peer must be connected")
+            .close()
+            .await;
+    }
+
     pub fn pending_peer_approvals(&self) -> Vec<PendingPeerApproval> {
-        self.pending_approvals
-            .write()
-            .expect("pending approval registry poisoned")
-            .list(PendingApprovalRegistry::now_ms())
+        self.peer_approval_handle().list()
     }
 
     pub fn approve_peer(&self, approval_id: &str) -> bool {
-        self.pending_approvals
-            .write()
-            .expect("pending approval registry poisoned")
-            .approve(approval_id, PendingApprovalRegistry::now_ms())
+        self.peer_approval_handle().approve(approval_id)
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -960,6 +1110,8 @@ impl ConnectionManager {
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
         let local_device_id = self.local_device_id;
+        let pending_approvals = self.pending_approvals.clone();
+        let peer_connection_policy = self.peer_connection_policy.clone();
 
         tokio::spawn(async move {
             while let Some(mut incoming) = incoming.recv().await {
@@ -979,15 +1131,42 @@ impl ConnectionManager {
                         }
                     };
                 let device_id = negotiated.auth.peer_id;
+                if peer_connection_policy.is_suppressed(&device_id)
+                    || peer_connection_policy.reject_colliding_inbound(local_device_id, device_id)
+                {
+                    incoming.connection.close().await;
+                    continue;
+                }
                 let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
                     Some(QuicTrustDecision::OperatorApproved) => true,
                     Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
-                        if let Err(error) = incoming
+                        let has_matching_approval = {
+                            let mut approvals = pending_approvals
+                                .write()
+                                .expect("pending approval registry poisoned");
+                            let now_ms = PendingApprovalRegistry::now_ms();
+                            let approved = approvals.consume_matching(
+                                device_id,
+                                &negotiated.auth.certificate_fingerprint,
+                                now_ms,
+                            );
+                            if !approved {
+                                approvals.observe(
+                                    device_id,
+                                    &negotiated.auth.certificate_fingerprint,
+                                    now_ms,
+                                );
+                            }
+                            approved
+                        };
+                        if !has_matching_approval {
+                            false
+                        } else if let Err(error) = incoming
                             .connection
                             .commit_inbound_operator_approval(device_id)
                         {
                             tracing::warn!(
-                                "Failed to persist automatically trusted inbound peer {}: {}",
+                                "Failed to persist operator-approved inbound peer {}: {}",
                                 device_id,
                                 error
                             );
@@ -1080,7 +1259,10 @@ impl ConnectionManager {
                 };
                 let installed = {
                     let _lifecycle = lifecycle_lock.lock().await;
-                    if pool.diagnostics_for_now(&device_id).is_some()
+                    if peer_connection_policy.is_suppressed(&device_id)
+                        || peer_connection_policy
+                            .reject_colliding_inbound(local_device_id, device_id)
+                        || pool.diagnostics_for_now(&device_id).is_some()
                         || !candidate_connection
                             .as_ref()
                             .expect("incoming connection candidate must be present")
@@ -1223,14 +1405,42 @@ impl ConnectionManager {
     }
 
     pub async fn connect(&mut self, device_id: DeviceId, address: &str) -> Result<()> {
-        {
+        self.peer_connection_policy.allow_manual_connect(device_id);
+        self.connect_with_policy(device_id, address, false).await
+    }
+
+    pub(crate) async fn connect_trusted(
+        &mut self,
+        device_id: DeviceId,
+        address: &str,
+    ) -> Result<()> {
+        if !self.peer_connection_policy.can_auto_connect(device_id) {
+            anyhow::bail!("Automatic connection disabled or peer lacks operator approval");
+        }
+        self.connect_with_policy(device_id, address, true).await
+    }
+
+    async fn connect_with_policy(
+        &mut self,
+        device_id: DeviceId,
+        address: &str,
+        automatic: bool,
+    ) -> Result<()> {
+        let _outbound_attempt = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.pool.diagnostics_for_now(&device_id).is_some() {
                 anyhow::bail!("Already connected to device {}", device_id);
             }
-        }
-
-        let mut conn = match self.transport.connect(address, device_id).await {
+            OutboundAttemptGuard::new(self.peer_connection_policy.clone(), device_id)
+        };
+        let transport_result = if automatic {
+            self.transport
+                .connect_operator_approved(address, device_id)
+                .await
+        } else {
+            self.transport.connect(address, device_id).await
+        };
+        let mut conn = match transport_result {
             Ok(conn) => conn,
             Err(error) => {
                 let _ = self
@@ -1317,7 +1527,9 @@ impl ConnectionManager {
         };
         let installation = {
             let _lifecycle = self.lifecycle_lock.lock().await;
-            if self.pool.diagnostics_for_now(&device_id).is_some()
+            if self.peer_connection_policy.is_suppressed(&device_id)
+                || (automatic && !self.peer_connection_policy.can_auto_connect(device_id))
+                || self.pool.diagnostics_for_now(&device_id).is_some()
                 || !candidate_connection
                     .as_ref()
                     .expect("outbound connection candidate must be present")
@@ -1430,6 +1642,7 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&mut self, device_id: &DeviceId) -> Result<()> {
+        self.peer_connection_policy.suppress(*device_id);
         let (removed_connection_info, removed_pool_connection) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             let removed_connection_info = self
@@ -1663,6 +1876,155 @@ mod tests {
         assert!(registry.approve(&approval.approval_id, 12));
         assert!(registry.consume_matching(device_id, &fingerprint, 13));
     }
+
+    #[tokio::test]
+    async fn legacy_inbound_requires_fingerprint_bound_approval_before_promotion() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = ConnectionManager::isolated_for_test(server_id);
+        let mut client = ConnectionManager::isolated_for_test(client_id);
+        let path = server.transport_trust_store_path_for_test();
+        QuicTrustStore::trust_first_seen_at(
+            &path,
+            client_id,
+            client.transport.identity_fingerprint_for_test(),
+        )
+        .unwrap();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.transport_local_addr().unwrap().to_string();
+
+        assert!(client.connect(server_id, &address).await.is_err());
+        assert!(!server.is_connected(&client_id).await);
+        assert!(server.qos_registry.peer(&client_id).is_none());
+        assert_eq!(
+            QuicTrustStore::load(&path)
+                .unwrap()
+                .provenance_for(&client_id),
+            Some(TrustProvenance::LegacyTofu)
+        );
+        let approval = server.pending_peer_approvals().pop().unwrap();
+        assert_eq!(
+            approval.fingerprint,
+            client.transport.identity_fingerprint_for_test().to_string()
+        );
+        assert!(server.approve_peer(&approval.approval_id));
+        client.connect(server_id, &address).await.unwrap();
+        assert_eq!(
+            QuicTrustStore::load(path)
+                .unwrap()
+                .provenance_for(&client_id),
+            Some(TrustProvenance::OperatorApproved)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_connect_rechecks_the_exact_operator_approved_certificate() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut remote = ConnectionManager::isolated_for_test(remote_id);
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let mut local = ConnectionManager::isolated_for_test(local_id);
+        let trust_path = local.transport_trust_store_path_for_test();
+        let pin = PeerCertificateFingerprint::from_der(b"previous certificate");
+        QuicTrustStore::approve_at(&trust_path, remote_id, pin.clone()).unwrap();
+
+        assert!(local.peer_connection_policy.can_auto_connect(remote_id));
+        let error = local
+            .connect_trusted(
+                remote_id,
+                &remote.transport_local_addr().unwrap().to_string(),
+            )
+            .await
+            .expect_err("changed certificate must fail even with an approved device ID");
+        assert!(error.to_string().contains("fingerprint changed"));
+        assert_eq!(
+            QuicTrustStore::load(trust_path)
+                .unwrap()
+                .fingerprint_for(&remote_id),
+            Some(&pin)
+        );
+        assert!(!local.is_connected(&remote_id).await);
+        assert!(local.qos_registry.peer(&remote_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_trusted_outbound_attempts_keep_one_stable_connection() {
+        for _ in 0..8 {
+            let left_id = DeviceId::from_bytes([0x10; 16]);
+            let right_id = DeviceId::from_bytes([0xf0; 16]);
+            let mut left = ConnectionManager::isolated_for_test(left_id);
+            let mut right = ConnectionManager::isolated_for_test(right_id);
+            left.approve_inbound_peer_for_test(&right);
+            right.approve_inbound_peer_for_test(&left);
+            left.start_server("127.0.0.1:0").await.unwrap();
+            right.start_server("127.0.0.1:0").await.unwrap();
+            let left_address = left.transport_local_addr().unwrap().to_string();
+            let right_address = right.transport_local_addr().unwrap().to_string();
+            let (_left_result, _right_result) = tokio::join!(
+                left.connect_trusted(right_id, &right_address),
+                right.connect_trusted(left_id, &left_address),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                left.is_connected(&right_id).await && right.is_connected(&left_id).await,
+                "simultaneous automatic attempts must not close both canonical transports"
+            );
+            assert_eq!(left.connected_count().await, 1);
+            assert_eq!(right.connected_count().await, 1);
+            left.send_to(
+                &right_id,
+                Message::Heartbeat {
+                    sequence: 1,
+                    timestamp: 1,
+                },
+            )
+            .await
+            .unwrap();
+            right
+                .send_to(
+                    &left_id,
+                    Message::Heartbeat {
+                        sequence: 2,
+                        timestamp: 2,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_disconnect_blocks_trusted_inbound_until_local_explicit_connect() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let mut local = ConnectionManager::isolated_for_test(local_id);
+        let mut remote = ConnectionManager::isolated_for_test(remote_id);
+        local.approve_inbound_peer_for_test(&remote);
+        remote.approve_inbound_peer_for_test(&local);
+        local.start_server("127.0.0.1:0").await.unwrap();
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let local_address = local.transport_local_addr().unwrap().to_string();
+        let remote_address = remote.transport_local_addr().unwrap().to_string();
+        local.connect(remote_id, &remote_address).await.unwrap();
+        local.disconnect(&remote_id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while remote.is_connected(&local_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!local.peer_connection_policy.can_auto_connect(remote_id));
+        assert!(remote.connect(local_id, &local_address).await.is_err());
+        assert!(!local.is_connected(&remote_id).await);
+        assert!(local.pending_peer_approvals().is_empty());
+        assert!(local.qos_registry.peer(&remote_id).is_none());
+
+        local.connect(remote_id, &remote_address).await.unwrap();
+        assert!(local.is_connected(&remote_id).await);
+        assert!(local.peer_connection_policy.can_auto_connect(remote_id));
+    }
     use crate::encryption::{Encryption, QuicIdentity, QuicTrustStore};
     use rshare_core::{hello_back_message, ScreenInfo};
 
@@ -1743,6 +2105,7 @@ mod tests {
         let address = manager.transport_local_addr().unwrap();
 
         let mut remote_manager = ConnectionManager::isolated_for_test(remote_id);
+        manager.approve_inbound_peer_for_test(&remote_manager);
         remote_manager
             .connect(local_id, &address.to_string())
             .await
@@ -2683,6 +3046,7 @@ mod tests {
         let address = remote.transport_local_addr().unwrap();
 
         let mut local = ConnectionManager::isolated_for_test(local_id);
+        remote.approve_inbound_peer_for_test(&local);
         local
             .connect(remote_id, &address.to_string())
             .await
@@ -2841,6 +3205,7 @@ mod tests {
 
         let mut manager = ConnectionManager::isolated_for_test(local_id);
         let mut events = manager.events().unwrap();
+        remote_manager.approve_inbound_peer_for_test(&manager);
         manager
             .connect(remote_id, &address.to_string())
             .await
@@ -2901,6 +3266,7 @@ mod tests {
         let address = server.transport_local_addr().unwrap();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client
             .connect(server_id, &address.to_string())
             .await
@@ -2955,6 +3321,7 @@ mod tests {
         let address = server.transport_local_addr().unwrap();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client
             .connect(server_id, &address.to_string())
             .await
@@ -3017,6 +3384,7 @@ mod tests {
         let address = server.transport_local_addr().unwrap();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client
             .connect(server_id, &address.to_string())
             .await
@@ -3078,6 +3446,7 @@ mod tests {
         let address = server.transport_local_addr().unwrap();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client
             .connect(server_id, &address.to_string())
             .await
@@ -3178,6 +3547,7 @@ mod tests {
         server.start_server("127.0.0.1:0").await.unwrap();
         let address = server.transport_local_addr().unwrap();
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client
             .connect(server_id, &address.to_string())
             .await
@@ -3236,6 +3606,7 @@ mod tests {
         let address = server.transport_local_addr().unwrap().to_string();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
+        server.approve_inbound_peer_for_test(&client);
         client.connect(server_id, &address).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3270,6 +3641,7 @@ mod tests {
         let address = manager.transport_local_addr().unwrap();
 
         let mut remote_manager = ConnectionManager::isolated_for_test(remote_id);
+        manager.approve_inbound_peer_for_test(&remote_manager);
         remote_manager
             .connect(local_id, &address.to_string())
             .await
@@ -3331,6 +3703,7 @@ mod tests {
         let address = manager.transport_local_addr().unwrap();
 
         let mut remote_manager = ConnectionManager::isolated_for_test(remote_id);
+        manager.approve_inbound_peer_for_test(&remote_manager);
         remote_manager
             .connect(local_id, &address.to_string())
             .await
@@ -3364,6 +3737,7 @@ mod tests {
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity.clone()),
         );
+        manager.approve_inbound_peer_for_test(&first_peer);
         first_peer
             .connect(local_id, &address.to_string())
             .await
@@ -3473,6 +3847,7 @@ mod tests {
 
         let mut manager = ConnectionManager::isolated_for_test(local_id);
         let mut events = manager.events().unwrap();
+        remote_manager.approve_inbound_peer_for_test(&manager);
         manager
             .connect(remote_id, &address.to_string())
             .await
@@ -3507,6 +3882,7 @@ mod tests {
 
         let mut manager = ConnectionManager::isolated_for_test(local_id);
         let mut events = manager.events().unwrap();
+        first_remote.approve_inbound_peer_for_test(&manager);
         manager
             .connect(remote_id, &first_address.to_string())
             .await
@@ -3576,6 +3952,7 @@ mod tests {
             .unwrap();
         let replacement_address = replacement_remote.transport_local_addr().unwrap();
 
+        replacement_remote.approve_inbound_peer_for_test(&manager);
         manager
             .connect(remote_id, &replacement_address.to_string())
             .await

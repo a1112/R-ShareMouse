@@ -220,9 +220,15 @@ impl Pair {
             resolver,
         );
         b.start_server("127.0.0.1:0").await.unwrap();
-        a.connect(b_id, &b.transport_local_addr().unwrap().to_string())
-            .await
-            .unwrap();
+        let address = b.transport_local_addr().unwrap().to_string();
+        assert!(a.connect(b_id, &address).await.is_err());
+        let approval = b
+            .pending_peer_approvals()
+            .into_iter()
+            .find(|approval| approval.device_id == a_id)
+            .expect("file-transfer peer must request target-local approval");
+        assert!(b.approve_peer(&approval.approval_id));
+        a.connect(b_id, &address).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while b.qos_registry().peer(&a_id).is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;

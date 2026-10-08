@@ -9,7 +9,7 @@ use rshare_core::{
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
     LocalControlDeviceSnapshot, LocalDisplayState, LocalInputTestKind, LocalInputTestRequest,
-    LocalInputTestResult, MobileAccessSnapshot,
+    LocalInputTestResult, MobileAccessSnapshot, PeerConnectionSettings, PendingPeerApproval,
     ServiceStatusSnapshot, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
     VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
@@ -30,6 +30,7 @@ use tauri::{
     AppHandle, Emitter, Manager, WebviewWindow, Wry,
 };
 use tauri_plugin_single_instance::init;
+use tauri_plugin_notification::{NotificationExt, PermissionState};
 use ui_state_bridge::{
     reserve_ui_state_stream, start_ui_state_stream, stop_ui_state_stream, UiStateStreamState,
 };
@@ -471,7 +472,7 @@ async fn capabilities_state(
         .map_err(|err| err.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn connect_device(device_id: String) -> Result<(), String> {
     let device_id = parse_device_id(&device_id)?;
     daemon_client::request_connect(device_id)
@@ -479,12 +480,131 @@ async fn connect_device(device_id: String) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn disconnect_device(device_id: String) -> Result<(), String> {
     let device_id = parse_device_id(&device_id)?;
     daemon_client::request_disconnect(device_id)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn peer_connection_settings() -> Result<PeerConnectionSettings, String> {
+    daemon_client::request_peer_connection_settings()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn local_peer_identity() -> Result<rshare_core::LocalPeerIdentity, String> {
+    daemon_client::request_local_peer_identity()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn set_peer_connection_settings(
+    settings: PeerConnectionSettings,
+) -> Result<PeerConnectionSettings, String> {
+    daemon_client::request_set_peer_connection_settings(settings)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn list_pending_peer_approvals() -> Result<Vec<PendingPeerApproval>, String> {
+    daemon_client::request_pending_peer_approvals()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn approve_peer(approval_id: String) -> Result<(), String> {
+    daemon_client::request_approve_peer(approval_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeviceNotificationKind {
+    Discovered,
+    Joined,
+    Reconnected,
+}
+
+fn device_notification_text(
+    device: &DaemonDeviceSnapshot,
+    kind: DeviceNotificationKind,
+) -> Option<(&'static str, String)> {
+    let name = if device.name.is_empty() {
+        device.id.to_string()
+    } else {
+        device.name.clone()
+    };
+    match kind {
+        DeviceNotificationKind::Discovered if !device.connected => Some((
+            "发现附近设备",
+            format!("{name} 已被发现，请在设备页确认连接。"),
+        )),
+        DeviceNotificationKind::Joined if device.connected => {
+            Some(("设备已加入", format!("{name} 已通过认证并连接。")))
+        }
+        DeviceNotificationKind::Reconnected if device.connected => {
+            Some(("设备恢复连接", format!("{name} 已重新连接。")))
+        }
+        _ => None,
+    }
+}
+
+// The frontend supplies only an identity and typed transition; daemon truth
+// supplies the name and connection state. Arbitrary notification text is never
+// accepted over the webview bridge.
+#[tauri::command(rename_all = "snake_case")]
+async fn notify_device_event(
+    app: AppHandle,
+    device_id: String,
+    event_kind: DeviceNotificationKind,
+) -> Result<bool, String> {
+    let device_id = parse_device_id(&device_id)?;
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false) {
+            return Ok(false);
+        }
+    }
+    if !daemon_client::request_peer_connection_settings()
+        .await
+        .map_err(|err| err.to_string())?
+        .notify_device_events
+    {
+        return Ok(false);
+    }
+    let devices = daemon_client::request_devices()
+        .await
+        .map_err(|err| err.to_string())?;
+    let Some(device) = devices.iter().find(|device| device.id == device_id) else {
+        return Ok(false);
+    };
+    let Some((title, body)) = device_notification_text(device, event_kind) else {
+        return Ok(false);
+    };
+    if app
+        .notification()
+        .permission_state()
+        .map_err(|err| err.to_string())?
+        != PermissionState::Granted
+    {
+        return Ok(false);
+    }
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|err| err.to_string())?;
+    // Dispatch success does not prove the OS displayed a banner. Focus modes
+    // and the user's notification settings can still suppress delivery.
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1245,6 +1365,7 @@ fn build_acceptance(
 fn main() {
     eprintln!("{}", build_metadata());
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .plugin(init(|app, _args, _cwd| {
@@ -1287,6 +1408,12 @@ fn main() {
             capabilities_state,
             connect_device,
             disconnect_device,
+            peer_connection_settings,
+            local_peer_identity,
+            set_peer_connection_settings,
+            list_pending_peer_approvals,
+            approve_peer,
+            notify_device_event,
             wake_targets,
             wake_attempts,
             save_wake_target,
@@ -1784,6 +1911,32 @@ mod tests {
         Arc,
     };
     use std::time::Duration;
+
+    #[test]
+    fn native_device_notifications_require_matching_daemon_connection_state() {
+        let mut device = DaemonDeviceSnapshot {
+            id: DeviceId::new_v4(),
+            name: "verified peer".to_string(),
+            hostname: "host".to_string(),
+            addresses: Vec::new(),
+            connected: false,
+            last_seen_secs: None,
+        };
+        assert!(device_notification_text(&device, DeviceNotificationKind::Joined).is_none());
+        assert!(device_notification_text(&device, DeviceNotificationKind::Reconnected).is_none());
+        let (_, discovered) =
+            device_notification_text(&device, DeviceNotificationKind::Discovered).unwrap();
+        assert!(discovered.contains("确认连接"));
+        device.connected = true;
+        assert!(device_notification_text(&device, DeviceNotificationKind::Discovered).is_none());
+        assert!(
+            device_notification_text(&device, DeviceNotificationKind::Joined)
+                .unwrap()
+                .1
+                .contains("verified peer")
+        );
+        assert!(serde_json::from_str::<DeviceNotificationKind>("\"arbitrary text\"").is_err());
+    }
 
     fn sample_status() -> ServiceStatusSnapshot {
         ServiceStatusSnapshot {

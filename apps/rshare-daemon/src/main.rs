@@ -28,9 +28,11 @@ use rshare_core::{
     LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
+    LocalPeerIdentity,
     LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus,
-    MacosInputPermissionsSnapshot, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
-    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
+    MacosInputPermissionsSnapshot, Message, NetworkTransportSnapshot, PeerConnectionSettings,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode,
+    RouterCommand, ScreenInfo,
     ServiceStatusSnapshot, TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState,
     UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
@@ -408,6 +410,8 @@ struct DaemonState {
     // Backend state with separate capture/inject health
     backend_state: BackendRuntimeState,
     features: RuntimeFeatureConfig,
+    peer_connection_settings: PeerConnectionSettings,
+    peer_settings_update_lock: Arc<Mutex<()>>,
     local_controls: LocalControlDeviceSnapshot,
     endpoint_events: EndpointEventStore,
     pending_keyboard_loopback_until_ms: u64,
@@ -467,6 +471,8 @@ impl DaemonState {
             session: CaptureSessionStateMachine::new(),
             backend_state,
             features,
+            peer_connection_settings: PeerConnectionSettings::default(),
+            peer_settings_update_lock: Arc::new(Mutex::new(())),
             local_controls,
             endpoint_events: EndpointEventStore::default(),
             pending_keyboard_loopback_until_ms: 0,
@@ -7310,10 +7316,7 @@ async fn main() -> Result<()> {
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
             mdns_enabled: config.network.mdns_enabled,
-            // Compatible discovered peers connect automatically. The first
-            // certificate is pinned during the handshake; security policy can
-            // add an explicit approval mode later.
-            auto_connect: true,
+            auto_connect: config.network.auto_connect_trusted,
             ..Default::default()
         });
 
@@ -7359,6 +7362,7 @@ async fn main() -> Result<()> {
         ),
         RuntimeFeatureConfig::from_config(&config),
     );
+    daemon_state.peer_connection_settings = PeerConnectionSettings::from_config(&config);
     daemon_state.network_audio = Arc::new(std::sync::Mutex::new(network_audio::Manager::load(
         layout_path.with_file_name("network-audio.json"),
     )));
@@ -8991,6 +8995,29 @@ async fn dispatch_ipc_request(
             let manager = network_manager.lock().await;
             DaemonResponse::PendingPeerApprovals(manager.pending_peer_approvals().await)
         }
+        DaemonRequest::GetPeerConnectionSettings => {
+            DaemonResponse::PeerConnectionSettings(state.read().await.peer_connection_settings)
+        }
+        DaemonRequest::GetLocalPeerIdentity => {
+            let device_id = state.read().await.status.device_id;
+            let fingerprint = network_manager.lock().await.local_certificate_fingerprint();
+            DaemonResponse::LocalPeerIdentity(LocalPeerIdentity { device_id, fingerprint })
+        }
+        DaemonRequest::SetPeerConnectionSettings { settings } => {
+            let update_lock = state.read().await.peer_settings_update_lock.clone();
+            let _update_guard = update_lock.lock().await;
+            match persist_peer_connection_settings(settings, Config::load, Config::save) {
+                Ok(settings) => {
+                    network_manager
+                        .lock()
+                        .await
+                        .set_auto_connect(settings.auto_connect_trusted);
+                    state.write().await.peer_connection_settings = settings;
+                    DaemonResponse::PeerConnectionSettings(settings)
+                }
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
         DaemonRequest::ApprovePeer { approval_id } => {
             let manager = network_manager.lock().await;
             if manager.approve_peer(&approval_id).await {
@@ -9495,17 +9522,31 @@ fn load_config_with_env_overrides() -> Result<Config> {
     Ok(config)
 }
 
+fn persist_peer_connection_settings(
+    settings: PeerConnectionSettings,
+    load: impl FnOnce() -> Result<Config>,
+    save: impl FnOnce(&Config) -> Result<()>,
+) -> Result<PeerConnectionSettings> {
+    // A read or write failure must not reset unrelated preferences or advertise
+    // a runtime setting that was not persisted successfully.
+    let mut config = load()?;
+    settings.apply_to_config(&mut config);
+    save(&config)?;
+    Ok(settings)
+}
+
 fn load_config_or_fail_closed(load: impl FnOnce() -> Result<Config>) -> Config {
     match load() {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(
-                "Failed to load persisted config: {}. Disabling automatic input and mobile gateway access.",
+                "Failed to load persisted config: {}. Disabling automatic connections, automatic input and mobile gateway access.",
                 error
             );
             let mut config = Config::default();
             config.features.automatic_input_forwarding = false;
             config.features.mobile_gateway_enabled = false;
+            config.network.auto_connect_trusted = false;
             config
         }
     }
@@ -9938,6 +9979,54 @@ mod tests {
 
         assert!(!config.features.automatic_input_forwarding);
         assert!(!config.features.mobile_gateway_enabled);
+        assert!(!config.network.auto_connect_trusted);
+    }
+
+    #[test]
+    fn peer_settings_save_preserves_unrelated_config() {
+        let mut previous = Config::default();
+        previous.network.port = 4242;
+        previous.features.audio_forwarding = false;
+        previous.security.trusted_devices.push(DeviceId::new_v4());
+        let settings = PeerConnectionSettings {
+            auto_connect_trusted: false,
+            notify_device_events: false,
+        };
+        let original = previous.clone();
+        let result = persist_peer_connection_settings(
+            settings,
+            || Ok(previous),
+            |saved| {
+                let mut expected = original.clone();
+                settings.apply_to_config(&mut expected);
+                assert_eq!(*saved, expected);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, settings);
+    }
+
+    #[test]
+    fn peer_settings_load_or_save_failure_does_not_report_success() {
+        let saved = Cell::new(false);
+        let settings = PeerConnectionSettings::default();
+        assert!(persist_peer_connection_settings(
+            settings,
+            || anyhow::bail!("corrupt configuration"),
+            |_| {
+                saved.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!saved.get());
+        assert!(persist_peer_connection_settings(
+            settings,
+            || Ok(Config::default()),
+            |_| anyhow::bail!("configuration is read-only"),
+        )
+        .is_err());
     }
 
     #[test]

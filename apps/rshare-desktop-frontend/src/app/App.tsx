@@ -1,5 +1,7 @@
 import { NetworkAudioPanel } from "./NetworkAudioPanel";
 import { WakePanel } from "./WakePanel";
+import { Toaster, toast } from "sonner";
+import { createDeviceNotificationTracker, describeDeviceNotification, deviceNotificationSnapshot } from "./device-notifications.mjs";
 import {
   createContext,
   memo,
@@ -301,6 +303,47 @@ type DashboardPayload = {
   display_inventory?: unknown | null;
   auto_started?: boolean;
 };
+
+type PeerConnectionSettings = {
+  auto_connect_trusted: boolean;
+  notify_device_events: boolean;
+};
+
+type PendingPeerApproval = {
+  approval_id: string;
+  device_id: string;
+  fingerprint: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+};
+
+type LocalPeerIdentity = { device_id: string; fingerprint: string };
+
+// Subscribe only to connection changes. Pointer and keyboard frames never run
+// this observer, and a new daemon establishes a silent notification baseline.
+function DeviceNotificationBridge({ enabled, onOpenDevices }: { enabled: boolean; onOpenDevices: () => void }) {
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+  const openDevicesRef = useRef(onOpenDevices);
+  openDevicesRef.current = onOpenDevices;
+  const trackerRef = useRef(createDeviceNotificationTracker());
+  useEffect(() => {
+    const observe = (connections: any) => {
+      const state = uiStateStore.getState();
+      const events = trackerRef.current.observe(deviceNotificationSnapshot({ ...state, connections }), { enabled: enabledRef.current });
+      for (const event of events) {
+        const text = describeDeviceNotification(event);
+        toast(text.title, { description: text.description, duration: 6000, action: { label: "查看设备", onClick: () => openDevicesRef.current() } });
+        if (getInvoke()) {
+          void invokeCommand("notify_device_event", { device_id: event.deviceId, event_kind: event.kind }).catch(() => {});
+        }
+      }
+    };
+    observe(uiStateStore.getState().connections);
+    return uiStateStore.subscribe((state: any) => state.connections, observe);
+  }, []);
+  return null;
+}
 
 type CapabilityOverview = {
   available: boolean;
@@ -832,6 +875,11 @@ const NETWORK_COMMANDS = new Set([
   "clear_logs",
   "connect_device",
   "disconnect_device",
+  "peer_connection_settings",
+  "set_peer_connection_settings",
+  "list_pending_peer_approvals",
+  "approve_peer",
+  "local_peer_identity",
   "wake_targets",
   "wake_attempts",
   "save_wake_target",
@@ -1044,6 +1092,7 @@ function isDaemonIpcUnavailable(error: unknown): boolean {
   const message = errorMessage(error);
   return (
     message.includes("ECONNREFUSED") ||
+    message.includes("ENOENT") ||
     message.includes("Connection refused") ||
     message.includes("Failed to fetch") ||
     message.includes("网关不可用")
@@ -1336,6 +1385,16 @@ async function invokeNetworkCommand<T = unknown>(
         { Disconnect: { device_id: args?.device_id ?? args?.deviceId } },
         "Ack",
       );
+    case "peer_connection_settings":
+      return await daemonRequestValue<T>("GetPeerConnectionSettings", "PeerConnectionSettings");
+    case "set_peer_connection_settings":
+      return await daemonRequestValue<T>({ SetPeerConnectionSettings: { settings: args?.settings } }, "PeerConnectionSettings");
+    case "list_pending_peer_approvals":
+      return await daemonRequestValue<T>("ListPendingPeerApprovals", "PendingPeerApprovals");
+    case "approve_peer":
+      return await daemonRequestValue<T>({ ApprovePeer: { approval_id: args?.approval_id ?? args?.approvalId } }, "Ack");
+    case "local_peer_identity":
+      return await daemonRequestValue<T>("GetLocalPeerIdentity", "LocalPeerIdentity");
     case "wake_targets":
       return await daemonRequestValue<T>("ListWakeTargets", "WakeTargets");
     case "wake_attempts":
@@ -2308,6 +2367,17 @@ function DesktopApp() {
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [systemPrefersDark, setSystemPrefersDark] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [peerConnectionSettings, setPeerConnectionSettings] = useState<PeerConnectionSettings | null>(null);
+  const [localPeerIdentity, setLocalPeerIdentity] = useState<LocalPeerIdentity | null>(null);
+  const [peerSettingsBusy, setPeerSettingsBusy] = useState(false);
+  const peerSettingsBusyRef = useRef(false);
+  const peerSettingsRevisionRef = useRef(0);
+  const [peerSettingsError, setPeerSettingsError] = useState<string | null>(null);
+  const [pendingPeerApprovals, setPendingPeerApprovals] = useState<PendingPeerApproval[]>([]);
+  const [approvingPeer, setApprovingPeer] = useState<string | null>(null);
+  const peerApprovalBusyRef = useRef(false);
+  const peerApprovalRevisionRef = useRef(0);
+  const [peerApprovalError, setPeerApprovalError] = useState<string | null>(null);
   const [macosPermissions, setMacosPermissions] =
     useState<MacosInputPermissions | null>(null);
   const [macosPermissionsChecked, setMacosPermissionsChecked] = useState(false);
@@ -2394,6 +2464,94 @@ function DesktopApp() {
       (device) => `${device.id}:${device.connected ? "connected" : "offline"}`,
     ),
   ].join("|");
+
+  useEffect(() => {
+    if (!model.service.online) {
+      setPeerConnectionSettings(null);
+      setLocalPeerIdentity(null);
+      setPendingPeerApprovals([]);
+      return;
+    }
+    let cancelled = false;
+    let polling = false;
+    const poll = async () => {
+      if (polling || peerSettingsBusyRef.current) return;
+      polling = true;
+      const settingsRevision = peerSettingsRevisionRef.current;
+      const approvalRevision = peerApprovalRevisionRef.current;
+      try {
+        const results = await Promise.allSettled([
+          invokeCommand<PeerConnectionSettings>("peer_connection_settings"),
+          invokeCommand<PendingPeerApproval[]>("list_pending_peer_approvals"),
+          invokeCommand<LocalPeerIdentity>("local_peer_identity"),
+        ]);
+        if (cancelled) return;
+        if (results[0].status === "fulfilled" && !peerSettingsBusyRef.current && settingsRevision === peerSettingsRevisionRef.current) {
+          setPeerConnectionSettings(results[0].value);
+          setPeerSettingsError(null);
+        } else if (results[0].status === "rejected" && !peerSettingsBusyRef.current && settingsRevision === peerSettingsRevisionRef.current) {
+          setPeerSettingsError(errorMessage(results[0].reason));
+        }
+        if (results[1].status === "fulfilled" && !peerApprovalBusyRef.current && approvalRevision === peerApprovalRevisionRef.current) {
+          setPendingPeerApprovals(results[1].value);
+          setPeerApprovalError(null);
+        } else if (results[1].status === "rejected" && !peerApprovalBusyRef.current && approvalRevision === peerApprovalRevisionRef.current) {
+          setPeerApprovalError(errorMessage(results[1].reason));
+        }
+        if (results[2].status === "fulfilled") setLocalPeerIdentity(results[2].value);
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [model.service.online]);
+
+  async function updatePeerConnectionSettings(settings: PeerConnectionSettings) {
+    if (peerSettingsBusyRef.current) return;
+    peerSettingsBusyRef.current = true;
+    peerSettingsRevisionRef.current += 1;
+    setPeerSettingsBusy(true);
+    setPeerSettingsError(null);
+    try {
+      const saved = await invokeCommand<PeerConnectionSettings>("set_peer_connection_settings", { settings });
+      setPeerConnectionSettings(saved);
+    } catch (settingsError) {
+      setPeerSettingsError(errorMessage(settingsError));
+    } finally {
+      peerSettingsBusyRef.current = false;
+      setPeerSettingsBusy(false);
+    }
+  }
+
+  async function approvePeer(approvalId: string) {
+    if (peerApprovalBusyRef.current) return;
+    peerApprovalBusyRef.current = true;
+    peerApprovalRevisionRef.current += 1;
+    setApprovingPeer(approvalId);
+    setPeerApprovalError(null);
+    try {
+      await invokeCommand("approve_peer", { approval_id: approvalId });
+      setPendingPeerApprovals((current) => current.filter((approval) => approval.approval_id !== approvalId));
+      toast.success("设备已批准", { description: "请让对方再次连接；只有认证成功后才会加入。" });
+    } catch (approvalError) {
+      setPeerApprovalError(errorMessage(approvalError));
+    } finally {
+      peerApprovalBusyRef.current = false;
+      setApprovingPeer(null);
+    }
+  }
+
+  async function copyLocalPeerIdentity() {
+    if (!localPeerIdentity) return;
+    try {
+      await navigator.clipboard.writeText(`设备 ID：${localPeerIdentity.device_id}\n证书指纹：${localPeerIdentity.fingerprint}`);
+      toast.success("已复制本机身份和证书指纹");
+    } catch (copyError) {
+      setPeerSettingsError(`复制失败，请直接选择指纹文本复制：${errorMessage(copyError)}`);
+    }
+  }
 
   async function refreshMacosPermissions() {
     if (!desktopShell.isMacOS || !model.service.online) {
@@ -3179,6 +3337,8 @@ function DesktopApp() {
 
   return (
     <HardwareAssetContext.Provider value={hardwareAssetContext}>
+      <DeviceNotificationBridge enabled={peerConnectionSettings?.notify_device_events === true} onOpenDevices={() => setPage("devices")} />
+      <Toaster theme={isDark ? "dark" : "light"} position="bottom-right" closeButton />
       <div
         className={`rshare-desktop-shell ${desktopShell.rootClassName} flex h-full min-h-0 flex-col overflow-hidden`}
         data-desktop-platform={desktopShell.dataDesktopPlatform}
@@ -3388,6 +3548,23 @@ function DesktopApp() {
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {pendingPeerApprovals.length > 0 ? (
+          <section className="mx-4 mt-3 max-h-72 shrink-0 overflow-auto rounded-md px-4 py-3 text-sm" style={{ border: `1px solid ${theme.accent}`, background: theme.sidebar }}>
+            <h2 className="font-semibold">设备请求加入 · {pendingPeerApprovals.length}</h2>
+            <p className="mt-1" style={{ color: theme.textMuted }}>请与对方核对设备身份和证书指纹。批准后，对方需要再次连接。</p>
+            {pendingPeerApprovals.map((approval) => (
+              <div key={approval.approval_id} className="mt-3 flex items-start gap-3 border-t pt-3" style={{ borderColor: theme.border }}>
+                <div className="min-w-0 flex-1">
+                  <div className="break-all">设备 ID：{approval.device_id}</div>
+                  <div className="mt-1 break-all font-mono text-xs" style={{ color: theme.textMuted }}>证书指纹：{approval.fingerprint}</div>
+                  <div className="mt-1 text-xs" style={{ color: theme.textMuted }}>有效至 {new Date(approval.expires_at_ms).toLocaleTimeString()}</div>
+                </div>
+                <button type="button" className="shrink-0 rounded-md px-3 py-2" style={{ border: `1px solid ${theme.accent}`, background: theme.accentSoft, color: theme.accent }} disabled={Boolean(approvingPeer)} onClick={() => approvePeer(approval.approval_id)}>{approvingPeer === approval.approval_id ? "批准中…" : "确认并批准"}</button>
+              </div>
+            ))}
+            {peerApprovalError ? <p className="mt-2" role="alert">{peerApprovalError}</p> : null}
+          </section>
+        ) : null}
         {performanceProbesEnabled ? (
           <>
             <TopologyCommitProbe />
@@ -3476,6 +3653,12 @@ function DesktopApp() {
               mobileAccess={mobileAccess}
               mobileAccessError={mobileAccessError}
               service={model.service}
+              peerConnectionSettings={peerConnectionSettings}
+              localPeerIdentity={localPeerIdentity}
+              onCopyLocalPeerIdentity={copyLocalPeerIdentity}
+              peerSettingsBusy={peerSettingsBusy}
+              peerSettingsError={peerSettingsError ?? peerApprovalError}
+              onPeerConnectionSettingsChange={updatePeerConnectionSettings}
               themeMode={themeMode}
               onThemeModeChange={setThemeMode}
               onToggleService={() =>
@@ -10724,6 +10907,12 @@ function SettingsPage({
   mobileAccess,
   mobileAccessError,
   service,
+  peerConnectionSettings,
+  localPeerIdentity,
+  onCopyLocalPeerIdentity,
+  peerSettingsBusy,
+  peerSettingsError,
+  onPeerConnectionSettingsChange,
   themeMode,
   onThemeModeChange,
   onToggleService,
@@ -10777,6 +10966,12 @@ function SettingsPage({
     discoveredDevices: number;
     connectedDevices: number;
   };
+  peerConnectionSettings: PeerConnectionSettings | null;
+  localPeerIdentity: LocalPeerIdentity | null;
+  onCopyLocalPeerIdentity: () => void;
+  peerSettingsBusy: boolean;
+  peerSettingsError: string | null;
+  onPeerConnectionSettingsChange: (settings: PeerConnectionSettings) => void;
   themeMode: ThemeMode;
   onThemeModeChange: (mode: ThemeMode) => void;
   onToggleService: () => void;
@@ -10845,6 +11040,25 @@ function SettingsPage({
           <InfoRow label="健康度" value={service.healthy ? "正常" : "降级"} theme={theme} />
           <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
           <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
+        </div>
+
+        <div className="mt-5 grid gap-4 border-t pt-5" style={{ borderColor: theme.border }}>
+          <div className="rounded-md p-3 text-sm" style={{ border: `1px solid ${theme.border}`, background: theme.frame }}>
+            <div className="flex items-center justify-between gap-2"><span className="font-medium">本机连接身份</span><button type="button" disabled={!localPeerIdentity} onClick={onCopyLocalPeerIdentity} className="flex items-center gap-1 rounded-md px-2 py-1 text-xs" style={{ border: `1px solid ${theme.border}`, color: theme.textSub }}><Copy size={12} />复制</button></div>
+            <p className="mt-2 break-all">设备 ID：{localPeerIdentity?.device_id ?? "服务就绪后显示"}</p>
+            <p className="mt-1 select-text break-all font-mono text-xs">证书指纹：{localPeerIdentity?.fingerprint ?? "服务就绪后显示"}</p>
+            <p className="mt-2 text-xs" style={{ color: theme.textMuted }}>请将此身份与对方的加入请求核对，确认指纹一致后再批准。</p>
+          </div>
+          <label className="flex items-start gap-3 text-sm">
+            <input type="checkbox" className="mt-1" checked={peerConnectionSettings?.auto_connect_trusted ?? false} disabled={!peerConnectionSettings || peerSettingsBusy} onChange={(event) => peerConnectionSettings && onPeerConnectionSettingsChange({ ...peerConnectionSettings, auto_connect_trusted: event.target.checked })} />
+            <span><span className="font-medium">自动连接已信任设备</span><span className="mt-1 block" style={{ color: theme.textMuted }}>重新发现后自动连接，并在掉线后重试。首次连接仍需确认；手动断开会暂停本次会话的自动重连。</span></span>
+          </label>
+          <label className="flex items-start gap-3 text-sm">
+            <input type="checkbox" className="mt-1" checked={peerConnectionSettings?.notify_device_events ?? false} disabled={!peerConnectionSettings || peerSettingsBusy} onChange={(event) => peerConnectionSettings && onPeerConnectionSettingsChange({ ...peerConnectionSettings, notify_device_events: event.target.checked })} />
+            <span><span className="font-medium">设备加入通知</span><span className="mt-1 block" style={{ color: theme.textMuted }}>提示新设备发现、认证加入和恢复连接。应用在后台时发送系统通知；系统禁用通知时仍保留应用内提示。首次加入的批准请求始终显示。</span></span>
+          </label>
+          <p className="text-xs" style={{ color: theme.textMuted }}>{peerSettingsBusy ? "正在保存…" : peerConnectionSettings ? "设置已保存，立即生效。" : service.online ? "正在读取连接设置…" : "启动服务后可修改连接设置。"}</p>
+          {peerSettingsError ? <p className="text-sm" role="alert" style={{ color: "#d86170" }}>{peerSettingsError}</p> : null}
         </div>
 
         <button

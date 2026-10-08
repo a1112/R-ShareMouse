@@ -189,6 +189,26 @@ mod tests {
     }
 
     #[test]
+    fn peer_connection_settings_round_trip_and_reflect_persisted_config() {
+        let mut config = crate::Config::default();
+        config.network.auto_connect_trusted = false;
+        config.gui.show_notifications = false;
+        let settings = PeerConnectionSettings::from_config(&config);
+        assert!(!settings.auto_connect_trusted);
+        assert!(!settings.notify_device_events);
+        let request = DaemonRequest::SetPeerConnectionSettings { settings };
+        assert_eq!(
+            serde_json::from_value::<DaemonRequest>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = DaemonResponse::PeerConnectionSettings(settings);
+        assert_eq!(
+            serde_json::from_value::<DaemonResponse>(serde_json::to_value(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn macos_permission_ipc_variants_round_trip_with_stable_payload_shape() {
         let query = DaemonRequest::GetMacosInputPermissions;
         assert_eq!(
@@ -539,6 +559,40 @@ pub struct PendingPeerApproval {
     pub expires_at_ms: u64,
 }
 
+/// The local certificate identity for out-of-band pairing verification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalPeerIdentity {
+    pub device_id: DeviceId,
+    pub fingerprint: String,
+}
+
+/// Persisted connection and notification preferences owned by the daemon.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerConnectionSettings {
+    pub auto_connect_trusted: bool,
+    pub notify_device_events: bool,
+}
+
+impl PeerConnectionSettings {
+    pub fn from_config(config: &crate::Config) -> Self {
+        Self {
+            auto_connect_trusted: config.network.auto_connect_trusted,
+            notify_device_events: config.gui.show_notifications,
+        }
+    }
+
+    pub fn apply_to_config(self, config: &mut crate::Config) {
+        config.network.auto_connect_trusted = self.auto_connect_trusted;
+        config.gui.show_notifications = self.notify_device_events;
+    }
+}
+
+impl Default for PeerConnectionSettings {
+    fn default() -> Self {
+        Self::from_config(&crate::Config::default())
+    }
+}
+
 /// Client request over localhost IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonRequest {
@@ -572,6 +626,11 @@ pub enum DaemonRequest {
         device_id: DeviceId,
     },
     ListPendingPeerApprovals,
+    GetPeerConnectionSettings,
+    GetLocalPeerIdentity,
+    SetPeerConnectionSettings {
+        settings: PeerConnectionSettings,
+    },
     ApprovePeer {
         approval_id: String,
     },
@@ -704,6 +763,8 @@ pub enum DaemonResponse {
     VirtualDisplayOperation(VirtualDisplayOperationResult),
     UsbDescriptorProbe(UsbDescriptorProbeResult),
     PendingPeerApprovals(Vec<PendingPeerApproval>),
+    PeerConnectionSettings(PeerConnectionSettings),
+    LocalPeerIdentity(LocalPeerIdentity),
     Ack,
     Error(String),
     FileTransfer(crate::file_transfer::FileTransferSnapshot),

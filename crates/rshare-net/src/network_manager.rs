@@ -9,7 +9,10 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::{
-    connection::{ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent},
+    connection::{
+        ConnectionInfo, ConnectionManager, ConnectionView, ManagerEvent, PeerApprovalHandle,
+        PeerConnectionPolicy,
+    },
     discovery::{DiscoveredDevice, DiscoveryEvent, PeerProtocolCompatibility, ServiceDiscovery},
     handshake::PeerAuthContext,
     qos::{
@@ -69,7 +72,7 @@ pub struct NetworkManagerConfig {
     pub discovery_port: u16,
     /// Transport bind address
     pub bind_address: String,
-    /// Enables automatic connection attempts for compatible discovered peers.
+    /// Enables automatic connection attempts for compatible operator-approved peers.
     pub auto_connect: bool,
     /// Discovery broadcast interval
     pub broadcast_interval: Duration,
@@ -111,8 +114,12 @@ pub struct NetworkManager {
 
     discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
     auto_connect_scheduler: Arc<TokioMutex<AutoConnectScheduler>>,
+    peer_connection_policy: Arc<PeerConnectionPolicy>,
+    peer_approval_handle: PeerApprovalHandle,
+    local_certificate_fingerprint: String,
     running: bool,
     discovery_task: Option<JoinHandle<()>>,
+    auto_connect_retry_task: Option<JoinHandle<()>>,
 }
 
 // Repeated UDP discovery broadcasts are expected. These bounds keep a bad or
@@ -172,6 +179,12 @@ impl AutoConnectScheduler {
         // history across DeviceLost/Goodbye churn so a discovered peer cannot
         // turn bounded backoff into repeated connection attempts.
     }
+
+    fn cancel_attempt(&mut self, device_id: DeviceId) {
+        if let Some(attempt) = self.attempts.get_mut(&device_id) {
+            attempt.in_flight = false;
+        }
+    }
 }
 
 fn auto_connect_retry_delay(failures: u32) -> Duration {
@@ -201,8 +214,9 @@ async fn maybe_auto_connect_discovered_device(
     connection: &Arc<TokioMutex<ConnectionManager>>,
     connection_view: &ConnectionView,
     scheduler: &Arc<TokioMutex<AutoConnectScheduler>>,
+    policy: &Arc<PeerConnectionPolicy>,
 ) {
-    if !config.auto_connect || device.id == local_device_id {
+    if device.id == local_device_id || !policy.can_auto_connect(device.id) {
         return;
     }
     if let PeerProtocolCompatibility::Incompatible { local, remote } =
@@ -235,11 +249,19 @@ async fn maybe_auto_connect_discovered_device(
     let device_id = device.id;
     let connection = connection.clone();
     let scheduler = scheduler.clone();
+    let policy = policy.clone();
     tokio::spawn(async move {
         // This is the connection-manager lifecycle mutex, not the daemon's outer
         // NetworkManager mutex. The subsequent QUIC handshake rechecks the pinned
         // certificate and rejects any changed fingerprint without overwriting it.
-        let result = connection.lock().await.connect(device_id, &address).await;
+        let mut connection = connection.lock().await;
+        // Settings and manual disconnect can change while this task is queued.
+        // Recheck only after owning the lifecycle manager; never promote trust.
+        if !policy.can_auto_connect(device_id) {
+            scheduler.lock().await.cancel_attempt(device_id);
+            return;
+        }
+        let result = connection.connect_trusted(device_id, &address).await;
         let succeeded = result.is_ok();
         scheduler
             .lock()
@@ -249,6 +271,57 @@ async fn maybe_auto_connect_discovered_device(
             tracing::debug!(peer_id = %device_id, error = %error, "Discovery auto-connect failed");
         }
     });
+}
+
+fn spawn_auto_connect_retry_task(
+    local_device_id: DeviceId,
+    config: NetworkManagerConfig,
+    discovered_devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
+    connection: Arc<TokioMutex<ConnectionManager>>,
+    connection_view: ConnectionView,
+    scheduler: Arc<TokioMutex<AutoConnectScheduler>>,
+    policy: Arc<PeerConnectionPolicy>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut retry_tick = tokio::time::interval(Duration::from_secs(1));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut scan_offset = 0;
+        loop {
+            retry_tick.tick().await;
+            // Retry known addresses after transport loss without requiring a new
+            // discovery packet. Each tick scans at most 64 peers, round-robin.
+            let peers = {
+                let devices = discovered_devices.read().await;
+                if devices.is_empty() {
+                    Vec::new()
+                } else {
+                    scan_offset %= devices.len();
+                    let count = devices.len().min(64);
+                    let peers = devices
+                        .values()
+                        .cycle()
+                        .skip(scan_offset)
+                        .take(count)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    scan_offset = (scan_offset + count) % devices.len();
+                    peers
+                }
+            };
+            for device in peers {
+                maybe_auto_connect_discovered_device(
+                    device,
+                    local_device_id,
+                    &config,
+                    &connection,
+                    &connection_view,
+                    &scheduler,
+                    &policy,
+                )
+                .await;
+            }
+        }
+    })
 }
 
 fn spawn_connection_event_forwarder(
@@ -326,6 +399,7 @@ async fn handle_discovery_event(
     connection: &Arc<TokioMutex<ConnectionManager>>,
     connection_view: &ConnectionView,
     auto_connect_scheduler: &Arc<TokioMutex<AutoConnectScheduler>>,
+    peer_connection_policy: &Arc<PeerConnectionPolicy>,
 ) {
     match event {
         DiscoveryEvent::DeviceFound(device) | DiscoveryEvent::DeviceUpdated(device) => {
@@ -342,6 +416,7 @@ async fn handle_discovery_event(
                 connection,
                 connection_view,
                 auto_connect_scheduler,
+                peer_connection_policy,
             )
             .await;
         }
@@ -409,6 +484,9 @@ impl NetworkManager {
 
         let qos_registry = connection_manager.qos_registry();
         let connection_view = connection_manager.connection_view();
+        let peer_connection_policy = connection_manager.peer_connection_policy();
+        let peer_approval_handle = connection_manager.peer_approval_handle();
+        let local_certificate_fingerprint = connection_manager.local_certificate_fingerprint();
         let connection = Arc::new(TokioMutex::new(connection_manager));
 
         Self {
@@ -425,15 +503,28 @@ impl NetworkManager {
             authenticated_peer_rx: Some(authenticated_peer_rx),
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
             auto_connect_scheduler: Arc::new(TokioMutex::new(AutoConnectScheduler::default())),
+            peer_connection_policy,
+            peer_approval_handle,
+            local_certificate_fingerprint,
             running: false,
             discovery_task: None,
+            auto_connect_retry_task: None,
         }
     }
 
     /// Set the configuration
     pub fn with_config(mut self, config: NetworkManagerConfig) -> Self {
+        self.peer_connection_policy
+            .set_auto_connect(config.auto_connect);
         self.config = config;
         self
+    }
+
+    /// Change the shared automatic dialing policy without restarting discovery.
+    /// Established sessions remain connected; queued tasks recheck this switch.
+    pub fn set_auto_connect(&mut self, enabled: bool) {
+        self.config.auto_connect = enabled;
+        self.peer_connection_policy.set_auto_connect(enabled);
     }
 
     /// Get the event receiver
@@ -488,13 +579,18 @@ impl NetworkManager {
 
     /// List inbound peer approvals that are waiting for this target's local operator.
     pub async fn pending_peer_approvals(&self) -> Vec<PendingPeerApproval> {
-        self.connection.lock().await.pending_peer_approvals()
+        self.peer_approval_handle.list()
     }
 
     /// Mark one opaque approval ID as expected once. A matching retry still has to
     /// prove the same device ID and full certificate fingerprint before trust is saved.
     pub async fn approve_peer(&self, approval_id: &str) -> bool {
-        self.connection.lock().await.approve_peer(approval_id)
+        self.peer_approval_handle.approve(approval_id)
+    }
+
+    /// Fingerprint of the certificate actually used by this daemon's transport.
+    pub fn local_certificate_fingerprint(&self) -> String {
+        self.local_certificate_fingerprint.clone()
     }
 
     /// Takes the typed terminal-release stream used by the input-plane
@@ -595,6 +691,8 @@ impl NetworkManager {
         }
 
         self.running = true;
+        self.peer_connection_policy
+            .set_auto_connect(self.config.auto_connect);
 
         // Start connection manager (server)
         let connection_events = {
@@ -615,6 +713,7 @@ impl NetworkManager {
         let connection = self.connection.clone();
         let connection_view = self.connection_view.clone();
         let auto_connect_scheduler = self.auto_connect_scheduler.clone();
+        let peer_connection_policy = self.peer_connection_policy.clone();
 
         let mut discovery = ServiceDiscovery::new(
             self.local_device_id,
@@ -654,12 +753,23 @@ impl NetworkManager {
                     &connection,
                     &connection_view,
                     &auto_connect_scheduler,
+                    &peer_connection_policy,
                 )
                 .await;
             }
 
             discovery_task.abort();
         }));
+
+        self.auto_connect_retry_task = Some(spawn_auto_connect_retry_task(
+            self.local_device_id,
+            self.config.clone(),
+            self.discovered_devices.clone(),
+            self.connection.clone(),
+            self.connection_view.clone(),
+            self.auto_connect_scheduler.clone(),
+            self.peer_connection_policy.clone(),
+        ));
 
         tracing::info!("Network manager started");
         Ok(())
@@ -672,6 +782,7 @@ impl NetworkManager {
         }
 
         self.running = false;
+        self.peer_connection_policy.set_auto_connect(false);
         if let Err(error) = ServiceDiscovery::broadcast_goodbye(
             self.local_device_id,
             self.config.discovery_port,
@@ -682,6 +793,10 @@ impl NetworkManager {
             tracing::warn!("Failed to broadcast Goodbye during network stop: {}", error);
         }
         if let Some(task) = self.discovery_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.auto_connect_retry_task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -714,6 +829,7 @@ impl NetworkManager {
 
     /// Disconnect from a device
     pub async fn disconnect_from(&mut self, device_id: &DeviceId) -> Result<()> {
+        self.peer_connection_policy.suppress(*device_id);
         let mut conn = self.connection.lock().await;
         conn.disconnect(device_id).await
     }
@@ -786,6 +902,7 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         );
+        remote.approve_inbound_peer_for_test(&local_connection);
         manager.qos_registry = local_connection.qos_registry();
         manager.connection_view = local_connection.connection_view();
         manager.connection = Arc::new(TokioMutex::new(local_connection));
@@ -967,6 +1084,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_approval_and_local_identity_bypass_connection_lifecycle_mutex() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let manager = NetworkManager::isolated_for_test(local_id, "local".into(), "host".into());
+        let (address, actual_fingerprint) = {
+            let mut connection = manager.connection.lock().await;
+            connection.start_server("127.0.0.1:0").await.unwrap();
+            (
+                connection.transport_local_addr().unwrap().to_string(),
+                connection.local_certificate_fingerprint(),
+            )
+        };
+        let mut peer = ConnectionManager::isolated_for_test(remote_id);
+        assert!(peer.connect(local_id, &address).await.is_err());
+        let _held = manager.connection.lock().await;
+        tokio::time::timeout(Duration::from_millis(50), async {
+            let approval = manager.pending_peer_approvals().await.pop().unwrap();
+            assert_eq!(approval.device_id, remote_id);
+            assert!(manager.approve_peer(&approval.approval_id).await);
+            assert!(manager.pending_peer_approvals().await.is_empty());
+            assert_eq!(manager.local_certificate_fingerprint(), actual_fingerprint);
+        })
+        .await
+        .expect("local approval and identity queries must not wait for an automatic handshake");
+    }
+
+    #[tokio::test]
     async fn status_query_does_not_wait_for_outer_connection_manager_lock() {
         let manager = NetworkManager::isolated_for_test(
             DeviceId::new_v4(),
@@ -1062,6 +1206,7 @@ mod tests {
             "local".to_string(),
             "local-host".to_string(),
         );
+        remote.approve_inbound_peer_for_test(&local_connection);
         manager.qos_registry = local_connection.qos_registry();
         manager.connection_view = local_connection.connection_view();
         manager.connection = Arc::new(TokioMutex::new(local_connection));
@@ -1132,6 +1277,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_does_not_dial_unknown_legacy_or_corrupt_trust_store() {
+        use crate::encryption::{PeerCertificateFingerprint, QuicTrustStore};
+
+        for trust_state in ["unknown", "legacy", "corrupt"] {
+            let local_id = DeviceId::new_v4();
+            let remote_id = DeviceId::new_v4();
+            let state_dir =
+                std::env::temp_dir().join(format!("rshare-auto-{}", uuid::Uuid::new_v4()));
+            let trust_path = state_dir.join("trust.json");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            match trust_state {
+                "legacy" => {
+                    QuicTrustStore::trust_first_seen_at(
+                        &trust_path,
+                        remote_id,
+                        PeerCertificateFingerprint::from_der(b"legacy certificate"),
+                    )
+                    .unwrap();
+                }
+                "corrupt" => std::fs::write(&trust_path, b"invalid json").unwrap(),
+                _ => {}
+            }
+            let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let manager = NetworkManager::with_connection_manager(
+                local_id,
+                "local".into(),
+                "local-host".into(),
+                ConnectionManager::with_transport(
+                    local_id,
+                    crate::transport::QuicTransport::isolated_for_test(local_id)
+                        .with_trust_store_path(&trust_path),
+                ),
+            );
+            handle_discovery_event(
+                DiscoveryEvent::DeviceFound(discovered_device(
+                    remote_id,
+                    probe.local_addr().unwrap(),
+                    "unapproved",
+                )),
+                &manager.config,
+                manager.local_device_id,
+                &manager.discovered_devices,
+                &manager.event_tx,
+                &manager.connection,
+                &manager.connection_view,
+                &manager.auto_connect_scheduler,
+                &manager.peer_connection_policy,
+            )
+            .await;
+            let mut packet = [0; 2048];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), probe.recv_from(&mut packet))
+                    .await
+                    .is_err(),
+                "{trust_state} peer must remain visible without an automatic dial"
+            );
+            assert_eq!(manager.discovered_devices().await.len(), 1);
+            assert!(manager
+                .auto_connect_scheduler
+                .lock()
+                .await
+                .attempts
+                .is_empty());
+            std::fs::remove_dir_all(state_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_retry_restores_transport_without_rediscovery_and_respects_hot_toggle() {
+        let local_id = DeviceId::new_v4();
+        let remote_id = DeviceId::new_v4();
+        let local = ConnectionManager::isolated_for_test(local_id);
+        let mut remote = ConnectionManager::isolated_for_test(remote_id);
+        local.approve_inbound_peer_for_test(&remote);
+        remote.approve_inbound_peer_for_test(&local);
+        remote.start_server("127.0.0.1:0").await.unwrap();
+        let address = remote.transport_local_addr().unwrap();
+        let mut manager =
+            NetworkManager::with_connection_manager(local_id, "local".into(), "host".into(), local)
+                .with_config(NetworkManagerConfig {
+                    auto_connect: false,
+                    ..NetworkManagerConfig::default()
+                });
+        manager
+            .discovered_devices
+            .write()
+            .await
+            .insert(remote_id, discovered_device(remote_id, address, "approved"));
+        let retry_task = spawn_auto_connect_retry_task(
+            local_id,
+            manager.config.clone(),
+            manager.discovered_devices.clone(),
+            manager.connection.clone(),
+            manager.connection_view.clone(),
+            manager.auto_connect_scheduler.clone(),
+            manager.peer_connection_policy.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!manager.is_connected(&remote_id).await);
+        manager.set_auto_connect(true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.is_connected(&remote_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("enabling should connect already discovered approved devices");
+        let first_generation = manager.connection_infos().await[0].control_connection_id;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !remote.is_connected(&local_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("target must publish its inbound transport before fault injection");
+        manager.set_auto_connect(false);
+        assert!(
+            manager.is_connected(&remote_id).await,
+            "disabling auto-connect preserves active sessions"
+        );
+        remote.close_peer_transport_for_test(&local_id).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.is_connected(&remote_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            !manager.is_connected(&remote_id).await,
+            "disabled policy must prevent automatic reconnection"
+        );
+        manager.set_auto_connect(true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.is_connected(&remote_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cached discovery address must reconnect without another discovery packet");
+        assert_ne!(
+            manager.connection_infos().await[0].control_connection_id,
+            first_generation
+        );
+        assert!(manager.peer_connection_policy.can_auto_connect(remote_id));
+        retry_task.abort();
+        manager.disconnect_from(&remote_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_auto_connect_rechecks_hot_disable_and_manual_suppression() {
+        for manual_disconnect in [false, true] {
+            let local_id = DeviceId::new_v4();
+            let remote_id = DeviceId::new_v4();
+            let mut manager =
+                NetworkManager::isolated_for_test(local_id, "local".into(), "host".into());
+            let trust_path = manager
+                .connection
+                .lock()
+                .await
+                .transport_trust_store_path_for_test();
+            crate::encryption::QuicTrustStore::approve_at(
+                trust_path,
+                remote_id,
+                crate::encryption::PeerCertificateFingerprint::from_der(b"approved certificate"),
+            )
+            .unwrap();
+            let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let connection = manager.connection.clone();
+            let held = connection.lock().await;
+            maybe_auto_connect_discovered_device(
+                discovered_device(remote_id, probe.local_addr().unwrap(), "approved"),
+                local_id,
+                &manager.config,
+                &manager.connection,
+                &manager.connection_view,
+                &manager.auto_connect_scheduler,
+                &manager.peer_connection_policy,
+            )
+            .await;
+            assert!(manager.auto_connect_scheduler.lock().await.attempts[&remote_id].in_flight);
+            if manual_disconnect {
+                // The lifecycle mutex is held: suppression must become visible
+                // before disconnect can acquire it, including for queued dials.
+                assert!(tokio::time::timeout(
+                    Duration::from_millis(20),
+                    manager.disconnect_from(&remote_id)
+                )
+                .await
+                .is_err());
+            } else {
+                manager.set_auto_connect(false);
+            }
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while manager.auto_connect_scheduler.lock().await.attempts[&remote_id].in_flight {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut packet = [0; 2048];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), probe.recv_from(&mut packet))
+                    .await
+                    .is_err()
+            );
+            assert!(!manager.peer_connection_policy.can_auto_connect(remote_id));
+            manager.set_auto_connect(true);
+            assert_eq!(
+                manager.peer_connection_policy.can_auto_connect(remote_id),
+                !manual_disconnect
+            );
+            if manual_disconnect {
+                assert!(manager
+                    .connect_to(remote_id, "invalid address")
+                    .await
+                    .is_err());
+                assert!(manager.peer_connection_policy.can_auto_connect(remote_id));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn auto_connect_attempts_found_and_updated_compatible_devices() {
         let local_id = DeviceId::from_bytes([0x10; 16]);
         let remote_id = DeviceId::from_bytes([0xf0; 16]);
@@ -1148,6 +1518,17 @@ mod tests {
         )
         .with_config(config);
         let mut events = manager.events();
+        let trust_path = manager
+            .connection
+            .lock()
+            .await
+            .transport_trust_store_path_for_test();
+        crate::encryption::QuicTrustStore::approve_at(
+            trust_path,
+            remote_id,
+            crate::encryption::PeerCertificateFingerprint::from_der(b"approved peer"),
+        )
+        .unwrap();
 
         let found = discovered_device(remote_id, probe.local_addr().unwrap(), "first");
         handle_discovery_event(
@@ -1159,6 +1540,7 @@ mod tests {
             &manager.connection,
             &manager.connection_view,
             &manager.auto_connect_scheduler,
+            &manager.peer_connection_policy,
         )
         .await;
         let mut updated = found;
@@ -1172,6 +1554,7 @@ mod tests {
             &manager.connection,
             &manager.connection_view,
             &manager.auto_connect_scheduler,
+            &manager.peer_connection_policy,
         )
         .await;
 
@@ -1334,6 +1717,11 @@ mod tests {
         for _ in 0..32 {
             let client_id = DeviceId::new_v4();
             let mut client = ConnectionManager::isolated_for_test(client_id);
+            manager
+                .connection
+                .lock()
+                .await
+                .approve_inbound_peer_for_test(&client);
             client.connect(server_id, &address).await.unwrap();
             let connected = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -1368,6 +1756,11 @@ mod tests {
 
         let overflow_id = DeviceId::new_v4();
         let mut overflow_client = ConnectionManager::isolated_for_test(overflow_id);
+        manager
+            .connection
+            .lock()
+            .await
+            .approve_inbound_peer_for_test(&overflow_client);
         overflow_client.connect(server_id, &address).await.unwrap();
         let error = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

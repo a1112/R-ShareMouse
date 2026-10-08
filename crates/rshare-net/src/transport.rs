@@ -466,6 +466,22 @@ impl QuicTransport {
         self
     }
 
+    pub(crate) fn resolved_trust_store_path(&self) -> Result<PathBuf> {
+        match &self.trust_store_path {
+            Some(path) => Ok(path.clone()),
+            None => super::encryption::trust_store_path(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_fingerprint_for_test(&self) -> PeerCertificateFingerprint {
+        self.local_certificate_fingerprint()
+    }
+
+    pub(crate) fn local_certificate_fingerprint(&self) -> PeerCertificateFingerprint {
+        PeerCertificateFingerprint::from_der(&self.identity.cert_der)
+    }
+
     pub fn without_client_certificate(mut self) -> Self {
         self.present_client_certificate = false;
         self
@@ -606,6 +622,32 @@ impl QuicTransport {
         remote_addr: &str,
         device_id: DeviceId,
     ) -> Result<QuicConnection> {
+        self.connect_with_approval(remote_addr, device_id, false)
+            .await
+    }
+
+    pub(crate) async fn connect_operator_approved(
+        &mut self,
+        remote_addr: &str,
+        device_id: DeviceId,
+    ) -> Result<QuicConnection> {
+        self.connect_with_approval(remote_addr, device_id, true)
+            .await
+    }
+
+    async fn connect_with_approval(
+        &mut self,
+        remote_addr: &str,
+        device_id: DeviceId,
+        require_operator_approval: bool,
+    ) -> Result<QuicConnection> {
+        let trust_store_path = self.resolved_trust_store_path()?;
+        if require_operator_approval
+            && QuicTrustStore::load(&trust_store_path)?.provenance_for(&device_id)
+                != Some(super::encryption::TrustProvenance::OperatorApproved)
+        {
+            anyhow::bail!("Automatic connection requires an operator-approved peer");
+        }
         let remote_addr: SocketAddr = remote_addr
             .parse()
             .map_err(|_| anyhow!("Invalid remote address: {}", remote_addr))?;
@@ -627,17 +669,20 @@ impl QuicTransport {
             .await
             .with_context(|| format!("QUIC handshake failed for {remote_addr}"))?;
 
-        let trust_store_path = match &self.trust_store_path {
-            Some(path) => path.clone(),
-            None => super::encryption::trust_store_path()?,
-        };
-        let pending_peer_trust = inspect_outbound_peer_trust(
+        let mut pending_peer_trust = inspect_outbound_peer_trust(
             &connection,
             device_id,
             trust_store_path.clone(),
             self.state_lifetime.clone(),
         )
         .await?;
+        pending_peer_trust.require_operator_approval = require_operator_approval;
+        if require_operator_approval
+            && pending_peer_trust.decision != QuicTrustDecision::OperatorApproved
+        {
+            connection.close(0u32.into(), b"peer approval required");
+            anyhow::bail!("Automatic connection requires an operator-approved certificate");
+        }
 
         info!("Connected to QUIC peer {}", connection.remote_address());
 
@@ -840,6 +885,7 @@ struct PendingPeerTrust {
     fingerprint: PeerCertificateFingerprint,
     trust_store_path: PathBuf,
     decision: QuicTrustDecision,
+    require_operator_approval: bool,
     _state_lifetime: Option<Arc<StateLifetimeOwner>>,
 }
 
@@ -1313,6 +1359,25 @@ impl QuicConnection {
         }
 
         let fingerprint = pending.fingerprint.clone();
+        if pending.require_operator_approval {
+            let store = match QuicTrustStore::load(&pending.trust_store_path) {
+                Ok(store) => store,
+                Err(error) => {
+                    self.inner
+                        .connection
+                        .close(0u32.into(), b"peer trust store unavailable");
+                    return Err(error);
+                }
+            };
+            if !store.is_operator_approved_exact(actual_device_id, &fingerprint) {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"peer approval required");
+                anyhow::bail!("Automatic connection requires the approved certificate pin");
+            }
+            self.cert_trust_state = Some("operator_approved".to_string());
+            return Ok(fingerprint);
+        }
         let decision = match pending.decision {
             QuicTrustDecision::Rejected { expected, actual } => {
                 Ok(QuicTrustDecision::Rejected { expected, actual })
@@ -3398,6 +3463,7 @@ async fn inspect_outbound_peer_trust(
         fingerprint,
         trust_store_path,
         decision,
+        require_operator_approval: false,
         _state_lifetime: state_lifetime,
     })
 }
@@ -6972,6 +7038,12 @@ mod tests {
         let address = manager.transport_local_addr().unwrap();
 
         let mut client = QuicTransport::isolated_for_test(client_id);
+        QuicTrustStore::approve_at(
+            manager.transport_trust_store_path_for_test(),
+            client_id,
+            client.identity_fingerprint_for_test(),
+        )
+        .unwrap();
         let mut client_connection = client
             .connect(&address.to_string(), server_id)
             .await
@@ -7307,6 +7379,44 @@ mod tests {
         })
         .await
         .expect("the final connection/task owner must clean both state directories");
+    }
+
+    #[tokio::test]
+    async fn automatic_identity_confirmation_never_recreates_removed_or_corrupt_pins() {
+        for corrupt in [false, true] {
+            let server_id = DeviceId::new_v4();
+            let mut server = QuicTransport::isolated_for_test(server_id);
+            let mut client = QuicTransport::isolated_for_test(DeviceId::new_v4());
+            let trust_path = client.resolved_trust_store_path().unwrap();
+            QuicTrustStore::approve_at(
+                &trust_path,
+                server_id,
+                server.local_certificate_fingerprint(),
+            )
+            .unwrap();
+            server.start_server("127.0.0.1:0").await.unwrap();
+            let mut incoming = server.incoming();
+            let mut connection = client
+                .connect_operator_approved(&server.local_addr().unwrap().to_string(), server_id)
+                .await
+                .unwrap();
+            let _remote = incoming.recv().await.unwrap().connection;
+            if corrupt {
+                fs::write(&trust_path, b"invalid json").unwrap();
+            } else {
+                fs::remove_file(&trust_path).unwrap();
+            }
+            assert!(connection.confirm_peer_identity(server_id).is_err());
+            assert!(!connection.is_connected());
+            if corrupt {
+                assert_eq!(fs::read(trust_path).unwrap(), b"invalid json");
+            } else {
+                assert!(
+                    !trust_path.exists(),
+                    "auto-connect must never save a first-seen certificate"
+                );
+            }
+        }
     }
 
     #[tokio::test]

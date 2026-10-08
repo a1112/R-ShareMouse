@@ -86,9 +86,10 @@ pub use ipc::{
     default_mobile_gateway_addr, read_json_frame, read_optional_ui_state_frame,
     read_ui_state_frame, write_json_frame, write_ui_state_frame, DaemonDeviceSnapshot,
     DaemonRequest, DaemonResponse, LatencyFeedbackSnapshot, LatencyFeedbackStatus,
-    LocalInputFeedback, MacosInputPermissionsSnapshot, MobileAccessSnapshot,
-    NetworkTransportSnapshot, PendingPeerApproval, RemoteDeviceLatencyFeedback,
-    RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback, UsbDescriptorProbeResult,
+    LocalInputFeedback, LocalPeerIdentity, MacosInputPermissionsSnapshot, MobileAccessSnapshot,
+    NetworkTransportSnapshot, PeerConnectionSettings, PendingPeerApproval,
+    RemoteDeviceLatencyFeedback, RemoteLatencyFeedback, ServiceStatusSnapshot, TransportFeedback,
+    UsbDescriptorProbeResult,
     UsbDescriptorProbeStatus,
 };
 pub use ipc_binary::{

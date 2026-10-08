@@ -17,18 +17,21 @@ identity=${APPLE_SIGNING_IDENTITY:-}
 }
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bundle="$root/apps/rshare-desktop/target/release/bundle/macos/R-ShareMouse.app"
+target_dir=$(cargo metadata --manifest-path "$root/Cargo.toml" --no-deps --format-version 1 |
+  node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).target_directory')
+bundle="$target_dir/release/bundle/macos/R-ShareMouse.app"
 installed="$root/R-ShareMouse.app"
 
 npm ci --prefix "$root/apps/rshare-desktop-frontend"
 cargo build --manifest-path "$root/Cargo.toml" -p rshare-daemon -p rshare-cli --release --locked
 (
   cd "$root/apps/rshare-desktop"
-  APPLE_SIGNING_IDENTITY="$identity" npx --yes @tauri-apps/cli@2.11.4 build --bundles app
+  APPLE_SIGNING_IDENTITY="$identity" CARGO_TARGET_DIR="$target_dir" \
+    npx --yes @tauri-apps/cli@2.11.4 build --bundles app
 )
 
-cp "$root/target/release/rshare-daemon" "$bundle/Contents/MacOS/rshare-daemon"
-cp "$root/target/release/rshare" "$bundle/Contents/MacOS/rshare"
+cp "$target_dir/release/rshare-daemon" "$bundle/Contents/MacOS/rshare-daemon"
+cp "$target_dir/release/rshare" "$bundle/Contents/MacOS/rshare"
 "$root/scripts/sign-macos-desktop.sh" "$bundle" "$identity"
 
 if [[ $# -eq 1 ]]; then

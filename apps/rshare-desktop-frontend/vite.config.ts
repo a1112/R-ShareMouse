@@ -7,14 +7,20 @@ import { spawn } from 'node:child_process'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { daemonBridgeGuard } from './src/app/dev-bridge-security.mjs'
+import { resolveDaemonIpcEndpoint } from './src/app/dev-ipc-endpoint.mjs'
 import {
   IPC_ENVELOPE_KIND,
   IpcFrameDecoder,
   encodeIpcFrame,
 } from './src/app/ipc-frame.mjs'
 
-const DAEMON_IPC_HOST = '127.0.0.1'
-const DAEMON_IPC_PORT = Number(process.env.RSHARE_DAEMON_IPC_PORT ?? 27435)
+function connectDaemonIpc() {
+  return net.createConnection(resolveDaemonIpcEndpoint({
+    platform: process.platform,
+    uid: process.geteuid?.(),
+    env: process.env,
+  }))
+}
 const ANSI_ESCAPE_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g
 
 type LogEntry = {
@@ -30,6 +36,7 @@ function isDaemonIpcUnavailable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return (
     message.includes('ECONNREFUSED') ||
+    message.includes('ENOENT') ||
     message.includes('ECONNRESET') ||
     message.includes('daemon IPC closed without a response') ||
     message.includes('daemon IPC timed out')
@@ -38,7 +45,7 @@ function isDaemonIpcUnavailable(error: unknown): boolean {
 
 function sendDaemonIpc(request: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(DAEMON_IPC_PORT, DAEMON_IPC_HOST)
+    const socket = connectDaemonIpc()
     const decoder = new IpcFrameDecoder()
     let settled = false
 
@@ -104,7 +111,7 @@ function concatBytes(...parts: Uint8Array[]): Uint8Array {
 
 function sendDaemonDisplayCapture(request: unknown): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(DAEMON_IPC_PORT, DAEMON_IPC_HOST)
+    const socket = connectDaemonIpc()
     const decoder = new IpcFrameDecoder()
     let settled = false
     let metadataFrame: Uint8Array | null = null

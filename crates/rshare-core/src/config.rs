@@ -31,6 +31,9 @@ pub struct Config {
 pub struct NetworkConfig {
     pub port: u16,
     pub bind_address: String,
+    /// Automatically connect and reconnect only certificate-pinned, operator-approved peers.
+    #[serde(default = "default_true")]
+    pub auto_connect_trusted: bool,
     /// Legacy mDNS switch. Discovery currently uses UDP broadcast only.
     #[serde(default)]
     pub mdns_enabled: bool,
@@ -137,6 +140,7 @@ impl Default for NetworkConfig {
         Self {
             port: 27431,
             bind_address: "0.0.0.0".to_string(),
+            auto_connect_trusted: true,
             mdns_enabled: false,
         }
     }
@@ -257,16 +261,39 @@ impl Config {
 
     /// Save configuration to a specific path.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
+        use std::io::Write;
 
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create config directory: {}", parent.display())
+        })?;
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))
+        let temporary = parent.join(format!(".rshare-config-{}.tmp", DeviceId::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.with_context(|| format!("Failed to write config file: {}", path.display()))
     }
 
     /// Get the bind address for the server
@@ -412,6 +439,21 @@ mod tests {
     }
 
     #[test]
+    fn trusted_auto_connect_defaults_for_legacy_config_and_preserves_opt_out() {
+        let legacy: Config = toml::from_str(
+            "[network]\nport = 27431\nbind_address = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        assert!(legacy.network.auto_connect_trusted);
+
+        let disabled: Config = toml::from_str(
+            "[network]\nport = 27431\nbind_address = \"0.0.0.0\"\nauto_connect_trusted = false\n",
+        )
+        .unwrap();
+        assert!(!disabled.network.auto_connect_trusted);
+    }
+
+    #[test]
     fn load_creates_missing_config_file() {
         let path = temp_config_path("missing");
         let config = Config::load_from_path(&path).unwrap();
@@ -443,6 +485,40 @@ mod tests {
         let loaded = Config::load_from_path(&path).unwrap();
 
         assert_eq!(loaded, config);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_replaces_existing_config_and_cleans_failed_temporary_files() {
+        let path = temp_config_path("atomic-replace");
+        Config::default().save_to_path(&path).unwrap();
+        let mut changed = Config::default();
+        changed.network.auto_connect_trusted = false;
+        changed.save_to_path(&path).unwrap();
+        assert_eq!(Config::load_from_path(&path).unwrap(), changed);
+        let parent = path.parent().unwrap();
+        let blocked_path = parent.join("blocked.toml");
+        std::fs::create_dir(&blocked_path).unwrap();
+        let marker = blocked_path.join("preserved");
+        std::fs::write(&marker, b"original").unwrap();
+        assert!(changed.save_to_path(&blocked_path).is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"original");
+        assert_eq!(Config::load_from_path(&path).unwrap(), changed);
+        assert!(std::fs::read_dir(parent).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".rshare-config-")
+        }));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_save_preserves_private_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_config_path("permissions");
+        Config::default().save_to_path(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Config::default().save_to_path(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

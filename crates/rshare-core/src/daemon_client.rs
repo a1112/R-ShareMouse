@@ -20,8 +20,9 @@ use crate::{
     DisplayIdentifyResult, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
     EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
     EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph, LocalControlDeviceSnapshot,
-    LocalInputTestRequest, LocalInputTestResult, MacosInputPermissionsSnapshot,
-    MobileAccessSnapshot, ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult,
+    LocalInputTestRequest, LocalInputTestResult, LocalPeerIdentity, MacosInputPermissionsSnapshot,
+    MobileAccessSnapshot, PeerConnectionSettings, PendingPeerApproval, ServiceStatusSnapshot,
+    UiCursor, UiEnvelope, UsbDescriptorProbeResult,
     UsbDeviceDescriptor, VirtualDisplayCreateRequest, VirtualDisplayOperationResult,
     VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
@@ -42,6 +43,48 @@ async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<
 pub async fn request_status() -> Result<ServiceStatusSnapshot> {
     match send_request(DaemonRequest::Status).await? {
         DaemonResponse::Status(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_peer_connection_settings() -> Result<PeerConnectionSettings> {
+    match send_request(DaemonRequest::GetPeerConnectionSettings).await? {
+        DaemonResponse::PeerConnectionSettings(settings) => Ok(settings),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_local_peer_identity() -> Result<LocalPeerIdentity> {
+    match send_request(DaemonRequest::GetLocalPeerIdentity).await? {
+        DaemonResponse::LocalPeerIdentity(identity) => Ok(identity),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_set_peer_connection_settings(
+    settings: PeerConnectionSettings,
+) -> Result<PeerConnectionSettings> {
+    match send_request(DaemonRequest::SetPeerConnectionSettings { settings }).await? {
+        DaemonResponse::PeerConnectionSettings(settings) => Ok(settings),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_pending_peer_approvals() -> Result<Vec<PendingPeerApproval>> {
+    match send_request(DaemonRequest::ListPendingPeerApprovals).await? {
+        DaemonResponse::PendingPeerApprovals(approvals) => Ok(approvals),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_approve_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::ApprovePeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

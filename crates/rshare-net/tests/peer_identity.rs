@@ -39,6 +39,15 @@ impl TestNetwork {
     fn trust_store_path(&self, role: &str) -> PathBuf {
         self.state_dir.join(role).join("quic-trust.json")
     }
+
+    fn approve_identity(&self, role: &str, device_id: Uuid, identity: &QuicIdentity) {
+        QuicTrustStore::approve_at(
+            self.trust_store_path(role),
+            device_id,
+            PeerCertificateFingerprint::from_der(&identity.cert_der),
+        )
+        .unwrap();
+    }
 }
 
 impl Drop for TestNetwork {
@@ -79,7 +88,7 @@ async fn assert_no_connected_event(
         while let Some(event) = events.recv().await {
             assert!(
                 !matches!(event, ManagerEvent::Connected(auth) if auth.peer_id == device_id),
-                "peer with a changed fingerprint entered the canonical registry"
+                "unauthorized peer entered the canonical registry"
             );
         }
     })
@@ -88,27 +97,99 @@ async fn assert_no_connected_event(
 }
 
 #[tokio::test]
-async fn peers_auto_trust_first_seen_certificate_and_connect() {
+async fn unknown_peer_requires_approval_before_entering_registry() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("mutual");
     let mut server = network.manager(server_id, "server", generated_identity());
     let mut events = server.events().unwrap();
+    let mut authenticated_peers = server.authenticated_peers().unwrap();
     server.start_server("127.0.0.1:0").await.unwrap();
 
-    let mut client = network.manager(client_id, "client", generated_identity());
-    client
-        .connect(
-            server_id,
-            &server.transport_local_addr().unwrap().to_string(),
-        )
-        .await
-        .unwrap();
+    let client_identity = generated_identity();
+    let client_fingerprint = PeerCertificateFingerprint::from_der(&client_identity.cert_der);
+    let mut client = network.manager(client_id, "client", client_identity);
+    let address = server.transport_local_addr().unwrap().to_string();
+    assert!(client.connect(server_id, &address).await.is_err());
+    assert_no_connected_event(&mut events, client_id).await;
+    assert!(server.connections().is_empty());
+    assert!(server.qos_registry().peer(&client_id).is_none());
+    assert!(matches!(
+        authenticated_peers.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(QuicTrustStore::load(network.trust_store_path("server"))
+        .unwrap()
+        .fingerprint_for(&client_id)
+        .is_none());
+
+    let approvals = server.pending_peer_approvals();
+    assert_eq!(approvals.len(), 1);
+    let approval = &approvals[0];
+    assert_eq!(approval.device_id, client_id);
+    assert_eq!(approval.fingerprint, client_fingerprint.as_str());
+    assert!(server.approve_peer(&approval.approval_id));
+    assert!(!server.approve_peer(&approval.approval_id));
+    assert!(server.connections().is_empty());
+    assert!(server.qos_registry().peer(&client_id).is_none());
+    assert!(matches!(
+        authenticated_peers.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(QuicTrustStore::load(network.trust_store_path("server"))
+        .unwrap()
+        .fingerprint_for(&client_id)
+        .is_none());
+
+    client.connect(server_id, &address).await.unwrap();
 
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     assert_eq!(
         server.connections()[0].cert_trust_state.as_deref(),
         Some("trusted")
+    );
+    assert!(server.pending_peer_approvals().is_empty());
+    assert_eq!(
+        QuicTrustStore::load(network.trust_store_path("server"))
+            .unwrap()
+            .provenance_for(&client_id),
+        Some(TrustProvenance::OperatorApproved)
+    );
+}
+
+#[tokio::test]
+async fn approval_for_one_fingerprint_cannot_be_consumed_by_another() {
+    let server_id = Uuid::new_v4();
+    let client_id = Uuid::new_v4();
+    let network = TestNetwork::new("approval-fingerprint");
+    let mut server = network.manager(server_id, "server", generated_identity());
+    let mut events = server.events().unwrap();
+    server.start_server("127.0.0.1:0").await.unwrap();
+    let address = server.transport_local_addr().unwrap().to_string();
+
+    let client_identity = generated_identity();
+    let client_fingerprint = PeerCertificateFingerprint::from_der(&client_identity.cert_der);
+    let mut client = network.manager(client_id, "client", client_identity);
+    assert!(client.connect(server_id, &address).await.is_err());
+    let approval = server.pending_peer_approvals().pop().unwrap();
+    assert!(server.approve_peer(&approval.approval_id));
+
+    let mut imposter = network.manager(client_id, "imposter", generated_identity());
+    assert!(imposter.connect(server_id, &address).await.is_err());
+    assert_no_connected_event(&mut events, client_id).await;
+    assert!(server.connections().is_empty());
+    assert!(server.qos_registry().peer(&client_id).is_none());
+    assert!(QuicTrustStore::load(network.trust_store_path("server"))
+        .unwrap()
+        .fingerprint_for(&client_id)
+        .is_none());
+
+    client.connect(server_id, &address).await.unwrap();
+    assert_eq!(event_until_connected(&mut events).await, Some(client_id));
+    let trust_store = QuicTrustStore::load(network.trust_store_path("server")).unwrap();
+    assert_eq!(
+        trust_store.fingerprint_for(&client_id),
+        Some(&client_fingerprint)
     );
 }
 
@@ -144,6 +225,7 @@ async fn peer_without_client_certificate_is_rejected_after_hello() {
     ));
     assert!(event_until_connected(&mut events).await.is_none());
     assert!(server.connections().is_empty());
+    assert!(server.pending_peer_approvals().is_empty());
 }
 
 #[tokio::test]
@@ -158,10 +240,15 @@ async fn changed_fingerprint_never_enters_registry() {
 
     let first_identity = generated_identity();
     let first_fingerprint = PeerCertificateFingerprint::from_der(&first_identity.cert_der);
+    network.approve_identity("server", claimed_id, &first_identity);
     let mut first = network.manager(claimed_id, "client", first_identity);
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
-    server.disconnect(&claimed_id).await.unwrap();
+    first.disconnect(&server_id).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), events.recv()).await,
+        Ok(Some(ManagerEvent::Disconnected { peer_id, .. })) if peer_id == claimed_id
+    ));
     assert!(server.connections().is_empty());
 
     let changed_identity = generated_identity();
@@ -219,6 +306,7 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("sequential-reconnect");
     let client_identity = generated_identity();
+    network.approve_identity("server", client_id, &client_identity);
     let mut server = network.manager(server_id, "server", generated_identity());
     let mut events = server.events().unwrap();
     server.start_server("127.0.0.1:0").await.unwrap();
@@ -231,7 +319,9 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
         .control_connection_id
         .expect("first negotiated connection id");
 
-    server.disconnect(&client_id).await.unwrap();
+    // A remote close exercises transport recovery without suppressing inbound
+    // reconnection as an explicit local disconnect would.
+    first.disconnect(&server_id).await.unwrap();
     assert!(matches!(
         timeout(Duration::from_secs(1), events.recv()).await,
         Ok(Some(ManagerEvent::Disconnected { peer_id, .. })) if peer_id == client_id

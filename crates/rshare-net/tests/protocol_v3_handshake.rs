@@ -111,6 +111,7 @@ async fn assert_v2_rejected_after_tls() {
     ));
     assert!(manager.connections().is_empty());
     assert_no_connected(&mut events).await;
+    assert!(manager.pending_peer_approvals().is_empty());
 }
 
 #[tokio::test]
@@ -133,6 +134,7 @@ async fn timed_out_hello_never_emits_connected() {
 
     assert_no_connected(&mut events).await;
     assert!(manager.connections().is_empty());
+    assert!(manager.pending_peer_approvals().is_empty());
 }
 
 #[tokio::test]
@@ -162,6 +164,7 @@ async fn non_hello_first_message_never_enters_registry() {
 
     assert_no_connected(&mut events).await;
     assert!(manager.connections().is_empty());
+    assert!(manager.pending_peer_approvals().is_empty());
 }
 
 #[tokio::test]
