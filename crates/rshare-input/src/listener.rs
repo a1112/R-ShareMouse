@@ -223,6 +223,8 @@ impl RDevInputListener {
 
     /// Start listening
     pub async fn start(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        rshare_platform::linux::ensure_xlib_thread_support()?;
         let mut running = self.running.lock().await;
         if *running {
             return Ok(());
@@ -323,6 +325,8 @@ impl RDevInputListener {
     /// async `start` method. The rdev listener itself is blocking, so keeping it
     /// on a dedicated thread also avoids blocking a Tokio worker.
     pub fn start_background_thread(&self) -> Result<std::thread::JoinHandle<()>> {
+        #[cfg(target_os = "linux")]
+        rshare_platform::linux::ensure_xlib_thread_support()?;
         {
             let mut running = self.running.blocking_lock();
             if *running {

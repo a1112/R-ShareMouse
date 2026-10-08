@@ -110,6 +110,7 @@ fn linux_x11_query_display_state() -> Result<LocalDisplayState> {
     use std::ptr;
     use x11::{xlib, xrandr};
 
+    crate::linux::ensure_xlib_thread_support()?;
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
         if display.is_null() {
@@ -247,6 +248,7 @@ fn linux_x11_update_display_settings(
         return Ok(scale_requires_system_settings());
     }
 
+    crate::linux::ensure_xlib_thread_support()?;
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
         if display.is_null() {
