@@ -106,11 +106,24 @@ pub fn update_display_settings(
 }
 
 #[cfg(all(target_os = "linux", feature = "x11"))]
+fn lock_xrandr_transaction() -> Result<std::sync::MutexGuard<'static, ()>> {
+    // Native extension metadata is shared across Display connections. Linux
+    // stress reproduced XextFindDisplay crashes while another thread closed
+    // an independent XRandR connection, even after XInitThreads. Protect the
+    // complete transaction through XCloseDisplay, not just an individual call.
+    static TRANSACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TRANSACTION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("XRandR transaction lock was poisoned"))
+}
+
+#[cfg(all(target_os = "linux", feature = "x11"))]
 fn linux_x11_query_display_state() -> Result<LocalDisplayState> {
     use std::ptr;
     use x11::{xlib, xrandr};
 
     crate::linux::ensure_xlib_thread_support()?;
+    let _transaction_guard = lock_xrandr_transaction()?;
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
         if display.is_null() {
@@ -249,6 +262,7 @@ fn linux_x11_update_display_settings(
     }
 
     crate::linux::ensure_xlib_thread_support()?;
+    let _transaction_guard = lock_xrandr_transaction()?;
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
         if display.is_null() {
