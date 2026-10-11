@@ -710,31 +710,7 @@ async fn run_loopback_once_started(
             } else {
                 state.duplicate += 1;
             }
-            if let Some(previous) = state.last_received {
-                if sequence < previous {
-                    state.out_of_order += 1;
-                } else if sequence > previous + 1 {
-                    state.realtime_overwrites += sequence - previous - 1;
-                }
-            } else if sequence > 1 {
-                state.realtime_overwrites += sequence - 1;
-            }
-            if let Some(stall_cleared_at) = state.stall_cleared_at {
-                let floor = state.stall_convergence_floor_sequence.unwrap_or(sequence);
-                if sequence < floor {
-                    state.same_epoch_stale_replay += 1;
-                }
-                if sequence >= floor {
-                    if state.stall_recovery_us.is_none() {
-                        state.stall_recovery_us =
-                            Some(stall_cleared_at.elapsed().as_micros() as f64);
-                        state.stall_converged_sequence = Some(sequence);
-                    }
-                    state.post_stall_consecutive += 1;
-                    state.stall_recovery_consecutive_deliveries = state.post_stall_consecutive;
-                }
-            }
-            state.last_received = Some(sequence);
+            state.record_realtime_sequence(sequence);
             if sequence >= expected_sent {
                 break;
             }
@@ -1261,6 +1237,7 @@ async fn run_loopback_once_started(
 struct ReceiveState {
     latencies_us: Vec<f64>,
     received_sequences: HashSet<u64>,
+    // Highest observed sequence; a replay must never move this boundary backwards.
     last_received: Option<u64>,
     duplicate: u64,
     out_of_order: u64,
@@ -1275,6 +1252,46 @@ struct ReceiveState {
     same_epoch_stale_replay: u64,
     same_epoch_stale_filtered: u64,
     stale_epoch_delivered: u64,
+}
+
+impl ReceiveState {
+    fn record_realtime_sequence(&mut self, sequence: u64) {
+        // The caller has already validated the frame against this run's fixed epoch.
+        let replayed = self
+            .last_received
+            .is_some_and(|previous| sequence <= previous);
+        if let Some(previous) = self.last_received {
+            if sequence < previous {
+                self.out_of_order += 1;
+            } else if sequence > previous + 1 {
+                self.realtime_overwrites += sequence - previous - 1;
+            }
+        } else if sequence > 1 {
+            self.realtime_overwrites += sequence - 1;
+        }
+        if let Some(stall_cleared_at) = self.stall_cleared_at {
+            // A successful send only queues a datagram. A new, increasing frame
+            // below the sender's floor can still be in flight when the stall
+            // clears; it is forward progress, not replay. Keep that sender floor
+            // for convergence, and use observed sequences to detect replay.
+            if replayed {
+                self.same_epoch_stale_replay += 1;
+            }
+            let floor = self.stall_convergence_floor_sequence.unwrap_or(sequence);
+            if sequence >= floor && !replayed {
+                if self.stall_recovery_us.is_none() {
+                    self.stall_recovery_us = Some(stall_cleared_at.elapsed().as_micros() as f64);
+                    self.stall_converged_sequence = Some(sequence);
+                }
+                self.post_stall_consecutive += 1;
+                self.stall_recovery_consecutive_deliveries = self.post_stall_consecutive;
+            }
+        }
+        self.last_received = Some(
+            self.last_received
+                .map_or(sequence, |previous| previous.max(sequence)),
+        );
+    }
 }
 
 #[derive(Default)]
@@ -1709,6 +1726,118 @@ mod tests {
             measured.run.counters["actual_sent"]
                 <= measured.run.counters["production_fanout_calls"]
         );
+    }
+
+    #[test]
+    fn realtime_forward_sequences_before_stall_preserve_accounting() {
+        let mut state = ReceiveState::default();
+
+        for sequence in [1, 2, 4] {
+            state.record_realtime_sequence(sequence);
+        }
+        assert_eq!(state.last_received, Some(4));
+        assert_eq!(state.realtime_overwrites, 1);
+        assert_eq!(state.out_of_order, 0);
+        assert_eq!(state.same_epoch_stale_replay, 0);
+        assert!(state.stall_recovery_us.is_none());
+    }
+
+    #[test]
+    fn stall_recovery_forward_sequences_above_floor_keep_progressing() {
+        let mut state = ReceiveState {
+            last_received: Some(348),
+            stall_cleared_at: Some(Instant::now()),
+            stall_convergence_floor_sequence: Some(350),
+            ..Default::default()
+        };
+
+        for sequence in [350, 351, 353] {
+            state.record_realtime_sequence(sequence);
+        }
+        assert_eq!(state.last_received, Some(353));
+        assert_eq!(state.realtime_overwrites, 2);
+        assert_eq!(state.out_of_order, 0);
+        assert_eq!(state.same_epoch_stale_replay, 0);
+        assert_eq!(state.stall_convergence_floor_sequence, Some(350));
+        assert_eq!(state.stall_converged_sequence, Some(350));
+        assert_eq!(state.stall_recovery_consecutive_deliveries, 3);
+        assert!(state.stall_recovery_us.is_some());
+    }
+
+    #[test]
+    fn stall_recovery_in_flight_sequence_is_not_stale_replay() {
+        let mut state = ReceiveState {
+            last_received: Some(348),
+            stall_cleared_at: Some(Instant::now()),
+            stall_convergence_floor_sequence: Some(350),
+            ..Default::default()
+        };
+
+        // 350 is queued at the sender while 349 is the newest received frame.
+        state.record_realtime_sequence(349);
+        assert_eq!(state.same_epoch_stale_replay, 0);
+        assert_eq!(state.out_of_order, 0);
+        assert!(state.stall_recovery_us.is_none());
+        assert_eq!(state.stall_converged_sequence, None);
+        assert_eq!(state.stall_recovery_consecutive_deliveries, 0);
+
+        state.record_realtime_sequence(350);
+        assert_eq!(state.stall_convergence_floor_sequence, Some(350));
+        assert_eq!(state.stall_converged_sequence, Some(350));
+        assert!(state.stall_recovery_us.is_some());
+        assert_eq!(state.same_epoch_stale_replay, 0);
+        assert_eq!(state.stall_recovery_consecutive_deliveries, 1);
+    }
+
+    #[test]
+    fn stall_recovery_rejects_replay_before_convergence() {
+        let mut state = ReceiveState {
+            last_received: Some(348),
+            stall_cleared_at: Some(Instant::now()),
+            stall_convergence_floor_sequence: Some(350),
+            ..Default::default()
+        };
+
+        state.record_realtime_sequence(347);
+        assert_eq!(state.same_epoch_stale_replay, 1);
+        assert_eq!(state.out_of_order, 1);
+        assert_eq!(state.last_received, Some(348));
+        assert!(state.stall_recovery_us.is_none());
+    }
+
+    #[test]
+    fn stall_recovery_rejects_duplicate_after_convergence() {
+        let mut state = ReceiveState {
+            last_received: Some(348),
+            stall_cleared_at: Some(Instant::now()),
+            stall_convergence_floor_sequence: Some(350),
+            ..Default::default()
+        };
+
+        state.record_realtime_sequence(350);
+        state.record_realtime_sequence(350);
+        assert_eq!(state.same_epoch_stale_replay, 1);
+        assert_eq!(state.stall_recovery_consecutive_deliveries, 1);
+        assert_eq!(state.stall_converged_sequence, Some(350));
+    }
+
+    #[test]
+    fn stall_recovery_replay_cannot_lower_received_high_watermark() {
+        let mut state = ReceiveState {
+            last_received: Some(348),
+            stall_cleared_at: Some(Instant::now()),
+            stall_convergence_floor_sequence: Some(350),
+            ..Default::default()
+        };
+
+        state.record_realtime_sequence(351);
+        state.record_realtime_sequence(349);
+        state.record_realtime_sequence(350);
+        assert_eq!(state.same_epoch_stale_replay, 2);
+        assert_eq!(state.out_of_order, 2);
+        assert_eq!(state.last_received, Some(351));
+        assert_eq!(state.stall_recovery_consecutive_deliveries, 1);
+        assert_eq!(state.stall_converged_sequence, Some(351));
     }
 
     #[tokio::test]
