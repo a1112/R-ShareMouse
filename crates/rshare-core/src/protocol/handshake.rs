@@ -17,6 +17,9 @@ pub struct PeerTransportCapabilities {
     pub file_transfer_version: u16,
     #[serde(default)]
     pub folder_drop_version: u16,
+    /// Both endpoints acknowledge their committed receive guards before use.
+    #[serde(default)]
+    pub bootstrap_commit_ack: bool,
 }
 
 impl PeerTransportCapabilities {
@@ -35,6 +38,7 @@ impl PeerTransportCapabilities {
             } else {
                 0
             },
+            bootstrap_commit_ack: true,
         }
     }
 
@@ -42,6 +46,7 @@ impl PeerTransportCapabilities {
         self.realtime_input_version == Self::REALTIME_INPUT_VERSION
             && self.reliable_input_version == Self::RELIABLE_INPUT_VERSION
             && self.qos_lanes
+            && self.bootstrap_commit_ack
     }
 
     pub fn missing_required_v3_capabilities(&self) -> Vec<String> {
@@ -54,6 +59,9 @@ impl PeerTransportCapabilities {
         }
         if !self.qos_lanes {
             missing.push("qos-lanes".to_string());
+        }
+        if !self.bootstrap_commit_ack {
+            missing.push("bootstrap-commit-ack".to_string());
         }
         missing
     }
@@ -89,5 +97,22 @@ impl ControlConnectionId {
 impl Default for ControlConnectionId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_capabilities_do_not_claim_mutual_commit_acknowledgement() {
+        let legacy: PeerTransportCapabilities = serde_json::from_str(
+            r#"{"realtime_input_version":1,"reliable_input_version":1,"qos_lanes":true,"separate_media_quic_version":0}"#,
+        ).unwrap();
+        assert!(!legacy.bootstrap_commit_ack);
+        assert!(legacy
+            .missing_required_v3_capabilities()
+            .contains(&"bootstrap-commit-ack".to_string()));
+        assert!(PeerTransportCapabilities::required_v3().bootstrap_commit_ack);
     }
 }

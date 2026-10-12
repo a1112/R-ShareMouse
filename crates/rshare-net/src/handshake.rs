@@ -12,7 +12,10 @@ use crate::{
 };
 
 pub const BOOTSTRAP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+#[cfg(test)]
 pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAuthContext {
@@ -151,6 +154,7 @@ pub(crate) async fn complete_incoming_handshake(
 ) -> Result<()> {
     send_incoming_hello_back(conn, local_device_id).await?;
     conn.complete_incoming_peer_protocol_handshake().await?;
+    conn.acknowledge_connector_commit().await?;
 
     Ok(())
 }
@@ -211,6 +215,7 @@ pub(crate) async fn perform_outbound_handshake_with_approvals(
     let certificate_fingerprint =
         conn.confirm_peer_identity_with_approvals(peer_id, approved_fingerprints)?;
     conn.complete_peer_protocol_handshake().await?;
+    conn.confirm_acceptor_commit().await?;
     Ok(NegotiatedPeer {
         auth: PeerAuthContext {
             peer_id,
@@ -260,6 +265,7 @@ pub(crate) async fn perform_outbound_handshake_for_test(
 
     let certificate_fingerprint = conn.confirm_peer_identity_for_test(peer_id)?;
     conn.complete_peer_protocol_handshake().await?;
+    conn.confirm_acceptor_commit().await?;
     Ok(NegotiatedPeer {
         auth: PeerAuthContext {
             peer_id,

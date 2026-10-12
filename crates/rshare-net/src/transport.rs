@@ -44,6 +44,8 @@ use tracing::info;
 
 const BOOTSTRAP_RELIABLE_READER_ACK: u8 = 0b01;
 const BOOTSTRAP_DATAGRAM_READER_ACK: u8 = 0b10;
+const BOOTSTRAP_READY_TOKEN: &[u8; 8] = b"RSH_RDY1";
+const BOOTSTRAP_READY_ACK: &[u8; 8] = b"RSH_ACK1";
 const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 const AUTHENTICATED_UNI_STREAM_TASK_BUDGET: usize = 32;
@@ -1574,6 +1576,33 @@ impl QuicConnection {
                 .context("Failed to finish compatibility bootstrap stream")?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn confirm_acceptor_commit(&self) -> Result<()> {
+        if !self.inner.bootstrap_complete.load(Ordering::Acquire) {
+            anyhow::bail!("local receive guards are not committed");
+        }
+        tokio::time::timeout(super::handshake::BOOTSTRAP_TIMEOUT, async {
+            let (mut send, mut receive) = self.inner.connection.open_bi().await?;
+            send.write_all(BOOTSTRAP_READY_TOKEN).await?;
+            send.finish()?;
+            read_bootstrap_ready_token(&mut receive, BOOTSTRAP_READY_ACK).await
+        }).await.context("peer ready acknowledgement timed out")?
+    }
+
+    pub(crate) async fn acknowledge_connector_commit(&self) -> Result<()> {
+        if !self.inner.bootstrap_complete.load(Ordering::Acquire) {
+            anyhow::bail!("local receive guards are not committed");
+        }
+        // A dedicated, bounded bidirectional stream carries only the ready
+        // token. No application lane is published until both sides are ready.
+        tokio::time::timeout(super::handshake::BOOTSTRAP_TIMEOUT, async {
+            let (mut send, mut receive) = self.inner.connection.accept_bi().await?;
+            read_bootstrap_ready_token(&mut receive, BOOTSTRAP_READY_TOKEN).await?;
+            send.write_all(BOOTSTRAP_READY_ACK).await?;
+            send.finish()?;
+            Ok(())
+        }).await.context("peer ready confirmation timed out")?
     }
 
     async fn commit_bootstrap_readers(&self) -> Result<()> {
@@ -3352,6 +3381,21 @@ fn terminalize_qos_generation(
     (true, active_epoch)
 }
 
+async fn read_bootstrap_ready_token(
+    stream: &mut quinn::RecvStream,
+    expected: &[u8; 8],
+) -> Result<()> {
+    let mut token = [0u8; 8];
+    stream.read_exact(&mut token).await?;
+    if &token != expected {
+        anyhow::bail!("invalid bootstrap ready token");
+    }
+    if stream.read(&mut [0u8; 1]).await?.is_some() {
+        anyhow::bail!("bootstrap ready stream carried trailing data");
+    }
+    Ok(())
+}
+
 async fn enforce_bootstrap_stream_eof(
     inner: &Arc<QuicConnectionInner>,
     stream: &mut quinn::RecvStream,
@@ -3669,6 +3713,7 @@ fn make_quinn_transport_config(config: &TransportConfig) -> Result<QuinnTranspor
             .map_err(|_| anyhow!("Invalid QUIC idle timeout"))?,
     ));
     transport.keep_alive_interval(Some(config.keep_alive_interval));
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(1));
     transport.datagram_receive_buffer_size(Some(config.datagram_receive_buffer_size));
     transport.datagram_send_buffer_size(config.datagram_send_buffer_size);
     transport.initial_rtt(Duration::from_millis(20));
@@ -7092,6 +7137,121 @@ mod tests {
         )
         .await
         .expect("a partial compatibility-bootstrap frame must time out and close the connection");
+    }
+
+    #[tokio::test]
+    async fn ready_confirmation_rejects_wrong_magic_and_trailing_payload() {
+        for payload in [
+            b"WRONGTOK".to_vec(),
+            [BOOTSTRAP_READY_TOKEN.as_slice(), b"!"].concat(),
+        ] {
+            let server_id = DeviceId::new_v4();
+            let client_id = DeviceId::new_v4();
+            let mut server = QuicTransport::isolated_for_test(server_id);
+            server.require_peer_protocol_handshake();
+            server.start_server("127.0.0.1:0").await.unwrap();
+            let mut incoming = server.incoming();
+            let mut client = QuicTransport::isolated_for_test(client_id);
+            client.require_peer_protocol_handshake();
+            let mut connection = client
+                .connect(&server.local_addr().unwrap().to_string(), server_id)
+                .await
+                .unwrap();
+            let mut server_connection = incoming.recv().await.unwrap().connection;
+            let acceptor = tokio::spawn(async move {
+                crate::handshake::receive_incoming_handshake(&mut server_connection, server_id)
+                    .await
+                    .unwrap();
+                let result =
+                    crate::handshake::complete_incoming_handshake(&server_connection, server_id).await;
+                server_connection.close().await;
+                result
+            });
+            connection
+                .send_message(&rshare_core::hello_message(
+                    client_id,
+                    "client".into(),
+                    "client".into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                connection.receive_message().await.unwrap(),
+                Message::HelloBack { .. }
+            ));
+            connection.complete_peer_protocol_handshake().await.unwrap();
+            let (mut send, _receive) = connection.inner.connection.open_bi().await.unwrap();
+            send.write_all(&payload).await.unwrap();
+            send.finish().unwrap();
+            let result = timeout(Duration::from_secs(2), acceptor)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "a malformed ready confirmation must never finish authentication"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptor_waits_for_connector_receive_guards_before_publication() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let barrier = Arc::new(Notify::new());
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id)
+            .with_test_datagram_reader_barrier(barrier.clone());
+        client.require_peer_protocol_handshake();
+        let mut connection = client
+            .connect(&server.local_addr().unwrap().to_string(), server_id)
+            .await
+            .unwrap();
+        let client_inner = connection.inner.clone();
+        let mut incoming_connection = incoming.recv().await.unwrap().connection;
+        let mut acceptor = tokio::spawn(async move {
+            crate::handshake::receive_incoming_handshake(&mut incoming_connection, server_id)
+                .await
+                .unwrap();
+            crate::handshake::complete_incoming_handshake(&incoming_connection, server_id)
+                .await
+                .unwrap();
+            incoming_connection
+        });
+        let connector = tokio::spawn(async move {
+            crate::handshake::perform_outbound_handshake_for_test(&mut connection, client_id)
+                .await
+                .unwrap();
+            connection
+        });
+        timeout(Duration::from_secs(2), async {
+            while !client_inner
+                .bootstrap_commit_requested
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), &mut acceptor)
+                .await
+                .is_err(),
+            "the acceptor cannot publish application traffic before the connector is ready"
+        );
+        barrier.notify_one();
+        timeout(Duration::from_secs(2), connector)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), acceptor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
