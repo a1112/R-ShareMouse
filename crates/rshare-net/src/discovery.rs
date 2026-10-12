@@ -582,8 +582,20 @@ pub fn spawn_discovery(
     event_tx: mpsc::Sender<DiscoveryEvent>,
 ) -> DiscoveryTask {
     let error_tx = event_tx.clone();
+    spawn_discovery_loop(
+        async move { discovery.start_with_channel(event_tx).await },
+        error_tx,
+    )
+}
+
+// Keep task ownership/error forwarding independently testable without opening
+// a socket or assuming the host accepts UDP broadcasts (including port zero).
+fn spawn_discovery_loop(
+    run: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    error_tx: mpsc::Sender<DiscoveryEvent>,
+) -> DiscoveryTask {
     let handle = tokio::spawn(async move {
-        if let Err(err) = discovery.start_with_channel(event_tx).await {
+        if let Err(err) = run.await {
             let _ = error_tx.send(DiscoveryEvent::Error(err.to_string())).await;
         }
     });
@@ -721,7 +733,10 @@ mod tests {
         let mut discovery = ServiceDiscovery::new(DeviceId::new_v4(), "test".into(), "test".into());
         let (tx, mut rx) = mpsc::channel(4);
         discovery.event_tx = Some(tx);
-        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::TimedOut] {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+        ] {
             discovery.report_io_error("UDP broadcast", &std::io::Error::from(kind));
             match rx.try_recv().unwrap() {
                 DiscoveryEvent::Error(message) => {
@@ -882,26 +897,41 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_discovery_returns_without_blocking_event_consumer() {
-        let discovery =
-            ServiceDiscovery::new(Uuid::new_v4(), "Test".to_string(), "test-host".to_string())
-                .with_config(DiscoveryConfig {
-                    port: 0,
-                    initial_broadcast_interval: Duration::from_secs(60),
-                    broadcast_interval: Duration::from_secs(60),
-                    initial_broadcast_count: 1,
-                    device_timeout: Duration::from_secs(60),
-                    mdns_enabled: false,
-                });
-
         let (tx, mut rx) = mpsc::channel(4);
-        let task = spawn_discovery(discovery, tx);
+        let task = spawn_discovery_loop(std::future::pending(), tx);
 
         let no_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
         assert!(
             no_event.is_err(),
             "event consumer should remain independently pollable"
         );
-
+        assert!(!task.is_finished());
         task.stop().await;
+        assert!(rx.recv().await.is_none(), "stop must release the sender");
+    }
+
+    #[tokio::test]
+    async fn discovery_loop_failure_is_forwarded_without_a_network_probe() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = spawn_discovery_loop(async { anyhow::bail!("synthetic startup failure") }, tx);
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("failure must remain independently observable")
+            .expect("error event");
+        assert!(
+            matches!(event, DiscoveryEvent::Error(message) if message == "synthetic startup failure")
+        );
+        task.stop().await;
+    }
+
+    #[tokio::test]
+    async fn discovery_loop_tolerates_dropped_error_receiver() {
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let task = spawn_discovery_loop(async { anyhow::bail!("synthetic startup failure") }, tx);
+        tokio::time::timeout(Duration::from_secs(1), task.handle)
+            .await
+            .expect("a dropped consumer must not block completion")
+            .expect("task must not panic");
     }
 }
