@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "notes": "Source package numbers are preserved. A numeric source version does not claim a released/stable product. See VERSIONING.md for release history, native release owners and limitations.",
+  "units": {
+    "rust-workspace": {
+      "canonical": {
+        "path": "Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "workspace",
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-audio",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-cli",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-common",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-core",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-daemon",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-desktop",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-input",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-net",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-perf",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rshare-platform",
+          "format": "semver"
+        },
+        {
+          "path": "apps/rshare-desktop/src-tauri/tauri.conf.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        }
+      ],
+      "assertions": [
+        {
+          "path": "apps/rshare-cli/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/rshare-daemon/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/rshare-desktop/src-tauri/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-audio/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-common/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-core/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-input/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-net/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/rshare-platform/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "tools/rshare-perf/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        }
+      ],
+      "notes": "Rust workspace package version; inherited crate declarations remain source bindings Tauri application packaging version is synchronized with its own Cargo package."
+    },
+    "node-apps-rshare-desktop-frontend": {
+      "canonical": {
+        "path": "apps/rshare-desktop-frontend/package.json",
+        "adapter": "json",
+        "pointer": "/version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "apps/rshare-desktop-frontend/package-lock.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        },
+        {
+          "path": "apps/rshare-desktop-frontend/package-lock.json",
+          "adapter": "json",
+          "pointer": "/packages//version",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Node package version; independent unless explicitly coupled by the application package below."
+    }
+  },
+  "unmanaged": [
+    {
+      "name": "non-product versions",
+      "reason": "Dependency/toolchain/Swift tools/SDK, protocol, schema, database and generated/upstream versions are not application release versions.",
+      "paths": []
+    },
+    {
+      "name": "historical sources",
+      "reason": "Vendored code, generated Apple projects, docs/evidence and junk snapshots retain their original versions and are excluded from bump operations.",
+      "paths": []
+    }
+  ]
+}
