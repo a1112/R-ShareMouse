@@ -1361,6 +1361,13 @@ fn main() {
             setup_system_tray(app.handle())?;
             start_tray_status_refresh(app.handle().clone());
 
+            if Config::load()
+                .map(|config| config.gui.start_minimized)
+                .unwrap_or(false)
+            {
+                hide_main_window(app.handle()).map_err(std::io::Error::other)?;
+            }
+
             // Handle window close event to minimize to tray
             let app_handle = app.handle().clone();
             app.get_webview_window("main")

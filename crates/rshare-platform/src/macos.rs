@@ -1,5 +1,9 @@
 //! macOS platform-specific implementations.
 
+#[cfg(target_os = "macos")]
+#[path = "macos_cursor.rs"]
+mod cursor;
+
 #[cfg(any(test, target_os = "macos"))]
 const MAX_MACOS_UNICODE_SCALARS_PER_EVENT: usize = 20;
 
@@ -59,7 +63,7 @@ cfg_if::cfg_if! {
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    use super::{macos_text_operation_plan, MacosTextOperation};
+    use super::{cursor::LocalCursorLease, macos_text_operation_plan, MacosTextOperation};
     use anyhow::{anyhow, bail, Context, Result};
     use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardItem, NSURLPboardType};
     use cocoa::base::{id, nil};
@@ -93,6 +97,7 @@ mod macos_impl {
     const MACOS_INPUT_EVENT_TAP_RUN_LOOP_MODE_NAME: &str = "com.rshare.input-event-tap";
 
     static LOCAL_INPUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+    static LOCAL_CURSOR_LEASE: Mutex<LocalCursorLease> = Mutex::new(LocalCursorLease::new());
 
     fn macos_input_event_tap_location() -> CGEventTapLocation {
         CGEventTapLocation::Session
@@ -216,7 +221,33 @@ mod macos_impl {
     /// remote control session owns local input. R-ShareMouse's own marked
     /// injected events are always allowed through.
     pub fn set_macos_local_input_suppressed(enabled: bool) {
+        let mut cursor = LOCAL_CURSOR_LEASE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         LOCAL_INPUT_SUPPRESSED.store(enabled, Ordering::Release);
+        if let Err(error) = cursor.update(enabled, update_native_cursor_visibility) {
+            tracing::warn!(
+                hidden = enabled,
+                error,
+                "macOS: unable to update local cursor visibility"
+            );
+        }
+    }
+
+    #[cfg(not(test))]
+    fn update_native_cursor_visibility(hidden: bool) -> std::result::Result<(), i32> {
+        let display = CGDisplay::main();
+        if hidden {
+            display.hide_cursor()
+        } else {
+            display.show_cursor()
+        }
+    }
+
+    #[cfg(test)]
+    fn update_native_cursor_visibility(_hidden: bool) -> std::result::Result<(), i32> {
+        // Platform unit tests must not hide the developer's desktop cursor.
+        Ok(())
     }
 
     /// Report whether physical local events are currently suppressed because
@@ -538,7 +569,7 @@ mod macos_impl {
 
         pub fn stop(&mut self) -> Result<()> {
             self.running.store(false, Ordering::SeqCst);
-            LOCAL_INPUT_SUPPRESSED.store(false, Ordering::Release);
+            set_macos_local_input_suppressed(false);
             if let Some(worker) = self.worker.take() {
                 worker
                     .join()
@@ -1046,7 +1077,7 @@ mod macos_impl {
         // A disabled tap may have lost a physical release. Keep the local
         // session usable immediately; the daemon's reserved ingress fault
         // lane performs the epoch reset and remote release safety action.
-        LOCAL_INPUT_SUPPRESSED.store(false, Ordering::Release);
+        set_macos_local_input_suppressed(false);
         if !capture_fault_reported.swap(true, Ordering::AcqRel) {
             // This may be invoked from CoreGraphics' unsafe extern callback;
             // no user-provided fault bridge may unwind across that boundary.

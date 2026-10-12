@@ -7324,9 +7324,9 @@ async fn main() -> Result<()> {
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
             mdns_enabled: config.network.mdns_enabled,
-            // Discovery is untrusted. The operator must approve the pending
-            // certificate before a connection can be established.
-            auto_connect: false,
+            // Discovery cannot grant trust. Every retry still verifies the
+            // operator-approved certificate through the connection manager.
+            auto_connect: config.network.auto_connect_trusted,
             ..Default::default()
         });
 

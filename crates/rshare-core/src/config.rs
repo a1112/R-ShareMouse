@@ -34,6 +34,9 @@ pub struct NetworkConfig {
     /// Legacy mDNS switch. Discovery currently uses UDP broadcast only.
     #[serde(default)]
     pub mdns_enabled: bool,
+    /// Retry discovered peers; certificate approval remains mandatory.
+    #[serde(default = "default_true")]
+    pub auto_connect_trusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +141,7 @@ impl Default for NetworkConfig {
             port: 27431,
             bind_address: "0.0.0.0".to_string(),
             mdns_enabled: false,
+            auto_connect_trusted: true,
         }
     }
 }
@@ -357,6 +361,16 @@ impl Default for HotkeyConfig {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn legacy_network_config_reconnects_and_explicit_opt_out_survives() {
+        let legacy = "port = 27431\nbind_address = '0.0.0.0'\n";
+        let network: NetworkConfig = toml::from_str(legacy).unwrap();
+        assert!(network.auto_connect_trusted);
+        let network: NetworkConfig =
+            toml::from_str(&format!("{legacy}auto_connect_trusted = false\n")).unwrap();
+        assert!(!network.auto_connect_trusted);
+    }
 
     fn temp_config_path(name: &str) -> PathBuf {
         std::env::temp_dir()
