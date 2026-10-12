@@ -1242,7 +1242,8 @@ impl QuicConnection {
         let monitor_auth = auth.clone();
         let monitor_release_emitter = release_emitter.clone();
         tokio::spawn(async move {
-            let _ = monitor_inner.connection.closed().await;
+            let reason = monitor_inner.connection.closed().await;
+            tracing::info!(peer_id = %monitor_auth.peer_id, ?reason, "authenticated QUIC connection closed");
             let active_epoch = {
                 let mut state = monitor_inner
                     .qos_inbound
@@ -2455,6 +2456,25 @@ fn try_report_protocol_error(context: &QosReceiveContext, error: String) {
     }
 }
 
+async fn read_persistent_frame_length(
+    stream: &mut quinn::RecvStream,
+    length: &mut [u8; 4],
+    after_complete_frame: bool,
+) -> std::result::Result<std::result::Result<(), quinn::ReadExactError>, tokio::time::error::Elapsed> {
+    if after_complete_frame {
+        // A bounded, authenticated persistent lane may legitimately be idle.
+        // The progress deadline starts as soon as the next frame begins.
+        match stream.read(&mut length[..1]).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(Err(quinn::ReadExactError::FinishedEarly(0))),
+            Err(error) => return Ok(Err(error.into())),
+        }
+        tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut length[1..])).await
+    } else {
+        tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(length)).await
+    }
+}
+
 async fn read_qos_message_stream(
     inner: Arc<QuicConnectionInner>,
     mut stream: quinn::RecvStream,
@@ -2486,10 +2506,10 @@ async fn read_qos_message_stream(
         fail_close_current_qos_generation(&inner, &context, b"unknown qos message lane");
         return;
     }
+    let mut after_complete_frame = false;
     loop {
         let mut len_buf = [0u8; 4];
-        let length_result =
-            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = read_persistent_frame_length(&mut stream, &mut len_buf, after_complete_frame).await;
         let length_result = match length_result {
             Ok(result) => result,
             Err(_) => {
@@ -2512,6 +2532,7 @@ async fn read_qos_message_stream(
             fail_close_current_qos_generation(&inner, &context, b"truncated qos message length");
             return;
         }
+        after_complete_frame = true;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > frame_limit {
             fail_close_current_qos_generation(&inner, &context, b"oversized qos message frame");
@@ -2738,6 +2759,7 @@ async fn read_qos_reliable_stream(
     emergency: bool,
 ) {
     let mut stream_epoch: Option<SessionEpoch> = None;
+    let mut after_complete_frame = false;
     loop {
         #[cfg(test)]
         if !emergency {
@@ -2751,8 +2773,7 @@ async fn read_qos_reliable_stream(
             }
         }
         let mut len_buf = [0u8; 4];
-        let length_result =
-            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = read_persistent_frame_length(&mut stream, &mut len_buf, after_complete_frame).await;
         let length_result = match length_result {
             Ok(result) => result,
             Err(_) => {
@@ -2794,6 +2815,7 @@ async fn read_qos_reliable_stream(
                 .fetch_add(1, Ordering::AcqRel);
             return;
         }
+        after_complete_frame = true;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > crate::codec::MAX_RELIABLE_INPUT_FRAME + 2 {
             if let Some(context) = await_qos_receive_context(&inner).await {
@@ -4589,6 +4611,129 @@ mod tests {
             server_releases.try_recv().is_err(),
             "an unbound cancel reset must not release any unrelated active epoch"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_idle_input_session_accepts_the_next_event() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let connection = client
+            .connect(&server.local_addr().unwrap().to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let (_server_qos, _server_releases) =
+            server_connection.install_qos(Arc::new(PeerAuthContext {
+                peer_id: client_id,
+                certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+                control_connection_id: ControlConnectionId::new(),
+            }));
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let (client_qos, _client_releases) = connection.install_qos(Arc::new(PeerAuthContext {
+            peer_id: server_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+            control_connection_id: ControlConnectionId::new(),
+        }));
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                1,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "primary".into(),
+                    x: 10,
+                    y: 10,
+                },
+            ))
+            .unwrap();
+        timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(QOS_FRAME_PROGRESS_TIMEOUT + Duration::from_millis(150)).await;
+        assert!(
+            server_connection.is_connected(),
+            "an idle control session must remain usable"
+        );
+        client_qos
+            .try_send_reliable_input(reliable_frame(
+                1,
+                2,
+                ReliableInputEvent::Wheel {
+                    delta_x: 0,
+                    delta_y: 1,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_idle_control_survives_but_partial_next_header_times_out() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let connection = client
+            .connect(&server.local_addr().unwrap().to_string(), server_id)
+            .await
+            .unwrap();
+        let server_connection = incoming.recv().await.unwrap().connection;
+        let (_qos, _releases) = server_connection.install_qos(Arc::new(PeerAuthContext {
+            peer_id: client_id,
+            certificate_fingerprint: PeerCertificateFingerprint::from_der(b"client"),
+            control_connection_id: ControlConnectionId::new(),
+        }));
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let mut stream = connection.inner.connection.open_uni().await.unwrap();
+        stream
+            .write_all(&[
+                QOS_LANE_MAGIC[0],
+                QOS_LANE_MAGIC[1],
+                QOS_LANE_MAGIC[2],
+                QOS_LANE_MAGIC[3],
+                LaneDiscriminator::Control as u8,
+            ])
+            .await
+            .unwrap();
+        let message = ControlMessageCodec::encode(&Message::Heartbeat {
+            sequence: 1,
+            timestamp: 1,
+        })
+        .unwrap();
+        stream
+            .write_all(&(message.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&message).await.unwrap();
+        timeout(Duration::from_secs(1), inbound.control_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(QOS_FRAME_PROGRESS_TIMEOUT + Duration::from_millis(150)).await;
+        assert!(
+            server_connection.is_connected(),
+            "idle after a complete authenticated frame must keep the connection alive"
+        );
+        stream.write_all(&[0]).await.unwrap();
+        timeout(
+            QOS_FRAME_PROGRESS_TIMEOUT + Duration::from_secs(1),
+            server_connection.inner.connection.closed(),
+        )
+        .await
+        .expect("an incomplete next frame header must still fail closed");
     }
 
     #[tokio::test]
