@@ -181,6 +181,8 @@ build_app_bundle() {
     <string>1.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>R-ShareMouse discovers your other computers on the local network and connects to the devices you choose for keyboard, mouse and file sharing.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSUIElement</key>

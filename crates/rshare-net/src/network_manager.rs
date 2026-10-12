@@ -24,6 +24,8 @@ use rshare_core::{ControlConnectionId, DeviceId, Message};
 /// Network event
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
+    /// Discovery operation failed; this does not identify an OS permission state.
+    DiscoveryError(String),
     /// Device discovered
     DeviceFound(DiscoveredDevice),
     /// Discovery expired or a peer sent Goodbye. This is not a transport
@@ -402,6 +404,7 @@ async fn handle_discovery_event(
         }
         DiscoveryEvent::Error(error) => {
             tracing::error!("Discovery error: {}", error);
+            let _ = discovery_tx.try_send(NetworkEvent::DiscoveryError(error));
         }
     }
 }

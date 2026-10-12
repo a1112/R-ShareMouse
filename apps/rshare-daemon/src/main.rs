@@ -8001,6 +8001,9 @@ async fn main() -> Result<()> {
                     Err(event) => event,
                 };
                 match event {
+                    NetworkEvent::DiscoveryError(error) => {
+                        state.write().await.status.last_discovery_error = Some(error);
+                    }
                     NetworkEvent::DeviceFound(device) => {
                         let _layout_guard = layout_update_lock.lock().await;
                         let layout_to_publish = {

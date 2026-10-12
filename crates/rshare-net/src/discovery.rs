@@ -216,6 +216,14 @@ impl ServiceDiscovery {
         self.devices.get(id)
     }
 
+    fn report_io_error(&self, operation: &str, error: &std::io::Error) {
+        // POSIX PermissionDenied is not authoritative macOS Local Network TCC
+        // evidence. Surface the actual operation; keep permission status unknown.
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.try_send(DiscoveryEvent::Error(format!("{operation}: {error}")));
+        }
+    }
+
     /// Start discovering devices with event channel
     pub async fn start_with_channel(
         &mut self,
@@ -264,6 +272,7 @@ impl ServiceDiscovery {
         // Send immediate broadcast on startup
         for target in &broadcast_targets {
             if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                self.report_io_error("UDP broadcast", &e);
                 tracing::warn!(
                     "Failed to send initial discovery packet to {}: {}",
                     target,
@@ -290,6 +299,7 @@ impl ServiceDiscovery {
                             }
                         }
                         Err(e) => {
+                            self.report_io_error("UDP receive", &e);
                             tracing::warn!("Error receiving discovery packet: {}", e);
                         }
                     }
@@ -302,6 +312,7 @@ impl ServiceDiscovery {
                     broadcast_targets = discovery_broadcast_targets(self.config.port);
                     for target in &broadcast_targets {
                         if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                            self.report_io_error("UDP broadcast", &e);
                             tracing::warn!("Failed to send discovery packet to {}: {}", target, e);
                         } else {
                             tracing::trace!("Sent discovery broadcast to {}", target);
@@ -320,6 +331,7 @@ impl ServiceDiscovery {
                     broadcast_targets = discovery_broadcast_targets(self.config.port);
                     for target in &broadcast_targets {
                         if let Err(e) = socket.send_to(&hello_bytes, target).await {
+                            self.report_io_error("UDP broadcast", &e);
                             tracing::warn!("Failed to send discovery packet to {}: {}", target, e);
                         } else {
                             tracing::trace!("Sent discovery broadcast to {}", target);
@@ -400,6 +412,7 @@ impl ServiceDiscovery {
                     let bytes = serialize_message(&hello_back)?;
 
                     if let Err(e) = socket.send_to(&bytes, addr).await {
+                        self.report_io_error("UDP reply", &e);
                         tracing::warn!("Failed to send HelloBack to {}: {}", addr, e);
                     } else {
                         tracing::debug!("Sent HelloBack to {} at {}", device_id, addr);
@@ -702,6 +715,23 @@ fn compute_directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn discovery_io_failure_reaches_consumers_without_claiming_tcc_denial() {
+        let mut discovery = ServiceDiscovery::new(DeviceId::new_v4(), "test".into(), "test".into());
+        let (tx, mut rx) = mpsc::channel(4);
+        discovery.event_tx = Some(tx);
+        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::TimedOut] {
+            discovery.report_io_error("UDP broadcast", &std::io::Error::from(kind));
+            match rx.try_recv().unwrap() {
+                DiscoveryEvent::Error(message) => {
+                    assert!(message.starts_with("UDP broadcast:"));
+                    assert!(!message.contains("Local Network denied"));
+                }
+                _ => panic!("expected an operation error"),
+            }
+        }
+    }
 
     #[test]
     fn test_discovery_config_default() {

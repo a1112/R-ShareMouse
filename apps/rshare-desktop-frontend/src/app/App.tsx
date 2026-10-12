@@ -3493,6 +3493,7 @@ function DesktopApp() {
               localDevice={model.settings.localDevice}
               inputMode={model.settings.inputMode}
               privilegeState={model.settings.privilegeState}
+              isMacOS={desktopShell.isMacOS}
               macosPermissions={macosPermissions}
               macosRuntimeIssue={macosInputWarning?.runtimeIssue ?? null}
               onOpenMacosPermissions={openMacosPermissionDialog}
@@ -10891,6 +10892,7 @@ function SettingsPage({
   localDevice,
   inputMode,
   privilegeState,
+  isMacOS,
   macosPermissions,
   macosRuntimeIssue,
   onOpenMacosPermissions,
@@ -10939,6 +10941,7 @@ function SettingsPage({
     reason: string | null;
   };
   privilegeState: string;
+  isMacOS: boolean;
   macosPermissions: MacosInputPermissions | null;
   macosRuntimeIssue: string | null;
   onOpenMacosPermissions: () => void;
@@ -10947,6 +10950,7 @@ function SettingsPage({
   service: {
     online: boolean;
     healthy: boolean;
+    discoveryError?: string | null;
     discoveredDevices: number;
     connectedDevices: number;
   };
@@ -11019,6 +11023,21 @@ function SettingsPage({
           <InfoRow label="已连接设备" value={String(service.connectedDevices)} theme={theme} />
           <InfoRow label="已发现设备" value={String(service.discoveredDevices)} theme={theme} />
         </div>
+
+        {service.discoveryError ? (
+          <p role="status" className="mt-4 text-sm">
+            最近一次设备发现错误：{service.discoveryError}。此错误无法确认本地网络权限是否被拒绝。
+          </p>
+        ) : null}
+        {isMacOS ? (
+          <p className="mt-4 text-sm" style={{ color: theme.textMuted }}>
+            无设备不代表权限被拒绝。请检查同一局域网、对方在线状态和防火墙。
+            若 macOS 15 或更新版本禁用了本地网络访问，请在系统设置 → 隐私与安全性 → 本地网络中检查
+            R-ShareMouse 及实际运行的服务。当前守护进程 PID：{localDevice.pid ?? "未知"}。
+            GUI 的辅助功能授权不代表此服务获得本地网络权限。请使用已签名安装包；
+            更改设置后，可用下方按钮先停止、再启动服务重试（会中断当前共享）。
+          </p>
+        ) : null}
 
         <button
           type="button"

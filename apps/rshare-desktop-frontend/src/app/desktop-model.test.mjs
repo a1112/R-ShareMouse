@@ -2926,3 +2926,13 @@ test("buildDesktopViewModel prioritizes local acceptance when no remote devices 
   assert.equal(dualMachineCheck.state, "warn");
   assert.equal(layoutCheck.detail, "本机显示器 2 块，Layout 当前显示 1 个在线节点");
 });
+
+test("discovery operation errors remain separate from input permissions and an empty peer list", () => {
+  const empty = buildDesktopViewModel({ status: { discovered_devices: 0 }, devices: [] });
+  assert.equal(empty.service.discoveryError, null);
+  const failed = buildDesktopViewModel({
+    status: { discovered_devices: 0, last_discovery_error: "UDP broadcast: Permission denied" }, devices: [],
+  });
+  assert.equal(failed.service.discoveryError, "UDP broadcast: Permission denied");
+  assert.equal(failed.service.error, null);
+});

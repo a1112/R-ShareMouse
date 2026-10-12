@@ -49,6 +49,9 @@ pub struct ServiceStatusSnapshot {
     pub discovered_devices: usize,
     pub connected_devices: usize,
     pub healthy: bool,
+    /// Most recent discovery operation error in this daemon session, not TCC status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_discovery_error: Option<String>,
 
     // Input backend status fields
     /// The resolved input mode currently in use.
@@ -467,6 +470,7 @@ impl ServiceStatusSnapshot {
             discovered_devices: 0,
             connected_devices: 0,
             healthy: true,
+            last_discovery_error: None,
             input_mode: None,
             available_backends: None,
             backend_health: None,

@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>R-ShareMouse 需要读取 Finder 中的目标文件夹，将您跨设备拖拽的文件保存到松手位置。</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>R-ShareMouse 需要读取 Finder 中的目标文件夹，将您跨设备拖拽的文件保存到松手位置。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>R-ShareMouse discovers your other computers on the local network and connects to the devices you choose for keyboard, mouse and file sharing.</string>
 </dict>
 </plist>

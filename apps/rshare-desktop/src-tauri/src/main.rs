@@ -1819,6 +1819,7 @@ mod tests {
             discovered_devices: 0,
             connected_devices: 0,
             healthy: true,
+            last_discovery_error: None,
             input_mode: None,
             available_backends: Some(Vec::new()),
             backend_health: None,

@@ -3098,6 +3098,7 @@ export function buildDesktopViewModel(payload, localControls = null) {
   const service = {
     online: Boolean(status),
     healthy: Boolean(status?.healthy),
+    discoveryError: status?.last_discovery_error ?? null,
     label: status ? "运行中" : "已停止",
     error: status?.last_backend_error ?? payload?.layout_error ?? null,
     discoveredDevices: status?.discovered_devices ?? discoveredRemoteDevices.length,
