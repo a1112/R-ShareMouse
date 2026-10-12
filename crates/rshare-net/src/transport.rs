@@ -1552,12 +1552,31 @@ impl QuicConnection {
         if self.inner.bootstrap_complete.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.finish_bootstrap_send_stream().await?;
+        self.commit_bootstrap_readers().await
+    }
+
+    pub(crate) async fn complete_incoming_peer_protocol_handshake(&self) -> Result<()> {
+        if self.inner.bootstrap_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // HelloBack's FIN releases the connector to open application streams.
+        // Keep that FIN pending until our EOF checks and receive guards have
+        // committed, so honest early traffic cannot race our authentication.
+        self.commit_bootstrap_readers().await?;
+        self.finish_bootstrap_send_stream().await
+    }
+
+    async fn finish_bootstrap_send_stream(&self) -> Result<()> {
         if let Some(mut bootstrap_stream) = self.inner.reliable_send_stream.lock().await.take() {
             bootstrap_stream
                 .finish()
                 .context("Failed to finish compatibility bootstrap stream")?;
         }
+        Ok(())
+    }
 
+    async fn commit_bootstrap_readers(&self) -> Result<()> {
         wait_for_bootstrap_stream_verification(&self.inner).await?;
         self.inner
             .bootstrap_commit_requested
@@ -3401,9 +3420,18 @@ async fn guard_reliable_until_authenticated(inner: &Arc<QuicConnectionInner>) ->
     let authenticated = inner.bootstrap_notify.notified();
     tokio::pin!(authenticated);
     authenticated.as_mut().enable();
+    // Check queued traffic before acknowledging admission. After that check,
+    // the committed-authentication wake must win over legitimate new traffic.
+    if let Some(stream) = futures_util::FutureExt::now_or_never(inner.connection.accept_uni()) {
+        if stream.is_ok() {
+            inner.connection.close(0u32.into(), b"pre-authentication stream");
+        }
+        return false;
+    }
     mark_bootstrap_reader_ack(inner, BOOTSTRAP_RELIABLE_READER_ACK);
     tokio::select! {
         biased;
+        _ = authenticated => true,
         stream = inner.connection.accept_uni() => {
             if stream.is_ok() {
                 tracing::warn!("Closing peer that opened a stream during bootstrap commit");
@@ -3411,7 +3439,6 @@ async fn guard_reliable_until_authenticated(inner: &Arc<QuicConnectionInner>) ->
             }
             false
         }
-        _ = authenticated => true,
         _ = inner.connection.closed() => false,
     }
 }
@@ -3446,9 +3473,16 @@ async fn read_realtime_datagrams(inner: Arc<QuicConnectionInner>) {
         let authenticated = inner.bootstrap_notify.notified();
         tokio::pin!(authenticated);
         authenticated.as_mut().enable();
+        if let Some(datagram) = futures_util::FutureExt::now_or_never(inner.connection.read_datagram()) {
+            if datagram.is_ok() {
+                inner.connection.close(0u32.into(), b"datagram before peer authentication");
+            }
+            return;
+        }
         mark_bootstrap_reader_ack(&inner, BOOTSTRAP_DATAGRAM_READER_ACK);
         tokio::select! {
             biased;
+            _ = authenticated => {},
             datagram = inner.connection.read_datagram() => {
                 if datagram.is_ok() {
                     tracing::warn!("Closing peer that queued a datagram during bootstrap commit");
@@ -3456,7 +3490,6 @@ async fn read_realtime_datagrams(inner: Arc<QuicConnectionInner>) {
                 }
                 return;
             }
-            _ = authenticated => {}
             _ = inner.connection.closed() => return,
         }
     }
@@ -7059,6 +7092,88 @@ mod tests {
         )
         .await
         .expect("a partial compatibility-bootstrap frame must time out and close the connection");
+    }
+
+    #[tokio::test]
+    async fn client_cannot_finish_bootstrap_before_acceptor_readers_commit() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let reader_barrier = Arc::new(Notify::new());
+        let mut server = QuicTransport::isolated_for_test(server_id)
+            .with_test_datagram_reader_barrier(reader_barrier.clone());
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        client.require_peer_protocol_handshake();
+        let mut client_connection = client
+            .connect(&server.local_addr().unwrap().to_string(), server_id)
+            .await
+            .unwrap();
+        let mut server_connection = incoming.recv().await.unwrap().connection;
+        let server_inner = server_connection.inner.clone();
+        let acceptor = tokio::spawn(async move {
+            let negotiated =
+                crate::handshake::receive_incoming_handshake(&mut server_connection, server_id)
+                    .await
+                    .unwrap();
+            crate::handshake::complete_incoming_handshake(&server_connection, server_id)
+                .await
+                .unwrap();
+            (server_connection, Arc::new(negotiated.auth))
+        });
+        let mut connector = tokio::spawn(async move {
+            let negotiated = crate::handshake::perform_outbound_handshake_for_test(
+                &mut client_connection,
+                client_id,
+            )
+            .await
+            .unwrap();
+            (client_connection, Arc::new(negotiated.auth))
+        });
+        timeout(Duration::from_secs(2), async {
+            while !server_inner
+                .bootstrap_commit_requested
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), &mut connector)
+                .await
+                .is_err(),
+            "the client must wait until the acceptor can accept authenticated streams"
+        );
+        reader_barrier.notify_one();
+        let (client_connection, client_auth) = timeout(Duration::from_secs(2), connector)
+            .await
+            .unwrap()
+            .unwrap();
+        let (server_connection, server_auth) = timeout(Duration::from_secs(2), acceptor)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_server_qos, _server_releases) = server_connection.install_qos(server_auth);
+        let mut inbound = server_connection.take_peer_inbound().unwrap();
+        let (client_qos, _client_releases) = client_connection.install_qos(client_auth);
+        client_qos
+            .send_control(ControlFrame::heartbeat(42, 84))
+            .await
+            .unwrap();
+        let delivered = timeout(Duration::from_secs(2), inbound.control_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            delivered.into_message(),
+            Message::Heartbeat {
+                sequence: 42,
+                timestamp: 84
+            }
+        ));
     }
 
     #[tokio::test]

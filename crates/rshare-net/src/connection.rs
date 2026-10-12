@@ -3534,7 +3534,8 @@ mod tests {
         let address = server.transport_local_addr().unwrap().to_string();
 
         let mut client = ConnectionManager::isolated_for_test(client_id);
-        client.connect(server_id, &address).await.unwrap();
+        // The admission rejection may reach the connector before its final EOF.
+        let _ = client.connect(server_id, &address).await;
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -3690,10 +3691,8 @@ mod tests {
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity),
         );
-        duplicate_peer
-            .connect(local_id, &address.to_string())
-            .await
-            .unwrap();
+        // Rejecting the duplicate may now be visible during outbound bootstrap.
+        let _ = duplicate_peer.connect(local_id, &address.to_string()).await;
 
         let duplicate_connected = tokio::time::timeout(Duration::from_millis(150), async {
             loop {

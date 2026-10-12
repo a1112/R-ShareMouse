@@ -1419,7 +1419,8 @@ mod tests {
 
         let overflow_id = DeviceId::new_v4();
         let mut overflow_client = ConnectionManager::isolated_for_test(overflow_id);
-        overflow_client.connect(server_id, &address).await.unwrap();
+        // Capacity rejection may close the peer before its bootstrap completes.
+        let _ = overflow_client.connect(server_id, &address).await;
         let error = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(NetworkEvent::ConnectionError {

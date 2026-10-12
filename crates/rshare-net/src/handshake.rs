@@ -150,7 +150,7 @@ pub(crate) async fn complete_incoming_handshake(
     local_device_id: DeviceId,
 ) -> Result<()> {
     send_incoming_hello_back(conn, local_device_id).await?;
-    conn.complete_peer_protocol_handshake().await?;
+    conn.complete_incoming_peer_protocol_handshake().await?;
 
     Ok(())
 }
