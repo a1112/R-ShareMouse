@@ -2905,17 +2905,12 @@ async fn read_qos_reliable_stream(
                     .qos_inbound
                     .lock()
                     .expect("qos inbound state poisoned");
-                if state.terminal_generation == Some(key.0) {
+                if state.terminal_generation == Some(key.0) || inbound_epoch_retired(&state, key) {
+                    // Terminal notifications travel on independent streams and
+                    // can arrive after later crossings have already returned.
+                    // Retired cleanup is idempotent: don't enqueue input,
+                    // release again, or change the active session.
                     EmergencyDisposition::Ignore
-                } else if inbound_epoch_retired(&state, key) {
-                    if state.active.is_some_and(|(generation, active_epoch, _)| {
-                        generation == key.0 && active_epoch.0 > key.1 .0
-                    }) {
-                        EmergencyDisposition::Ignore
-                    } else {
-                        terminalize_qos_generation(&mut state, key.0);
-                        EmergencyDisposition::Violation(frame.session_epoch)
-                    }
                 } else {
                     match state.active {
                         Some((generation, epoch, _)) if (generation, epoch) == key => {
@@ -4078,6 +4073,48 @@ mod tests {
             generation,
             _server_qos: server_qos,
         }
+    }
+
+    async fn take_two_epoch_input(fixture: &TwoEpochReliableFixture) -> PeerInbound {
+        let mut inbound = fixture.server_connection.take_peer_inbound().unwrap();
+        for epoch in [1, 2] {
+            let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+                .await
+                .expect("both initial Enter frames must be delivered")
+                .unwrap();
+            assert_eq!(enter.session_epoch, SessionEpoch(epoch));
+        }
+        inbound
+    }
+
+    async fn wait_for_completed_uni_stream(connection: &QuicConnection, previous: usize) {
+        timeout(Duration::from_secs(1), async {
+            while connection.authenticated_uni_stream_task_counts_for_test().4 == previous {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream must finish processing");
+    }
+
+    async fn terminal_cancelled_epoch_fixture() -> (TwoEpochReliableFixture, PeerInbound) {
+        let mut fixture = two_epoch_reliable_fixture().await;
+        let inbound = take_two_epoch_input(&fixture).await;
+        let completed = fixture
+            .server_connection
+            .authenticated_uni_stream_task_counts_for_test()
+            .4;
+        fixture
+            .new_stream
+            .reset(quinn::VarInt::from_u32(TERMINAL_CANCEL_RESET_CODE))
+            .unwrap();
+        let release = timeout(Duration::from_secs(1), fixture.releases.recv())
+            .await
+            .expect("terminal cancellation must release the active epoch")
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(2));
+        wait_for_completed_uni_stream(&fixture.server_connection, completed).await;
+        (fixture, inbound)
     }
 
     #[tokio::test]
@@ -6116,6 +6153,288 @@ mod tests {
             .is_err(),
             "recognized old terminal signals must not close the live connection"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_cancel_reset_before_emergency_preserves_connection_for_reentry() {
+        let (mut fixture, mut inbound) = terminal_cancelled_epoch_fixture().await;
+
+        let completed = fixture
+            .server_connection
+            .authenticated_uni_stream_task_counts_for_test()
+            .4;
+        write_raw_qos_input(
+            &fixture.client_connection,
+            LaneDiscriminator::Emergency,
+            &reliable_frame(
+                2,
+                2,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            ),
+        )
+        .await;
+        wait_for_completed_uni_stream(&fixture.server_connection, completed).await;
+        assert!(
+            fixture
+                .server_connection
+                .inner
+                .connection
+                .close_reason()
+                .is_none(),
+            "the matching emergency must acknowledge an already handled terminal reset"
+        );
+        assert!(fixture.releases.try_recv().is_err());
+        assert!(inbound.reliable_input_rx.try_recv().is_err());
+
+        let _next_stream = open_raw_qos_input_stream(
+            &fixture.client_connection,
+            LaneDiscriminator::ReliableInput,
+            &reliable_frame(
+                3,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "next".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+        )
+        .await;
+        let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("a later crossing must reuse the authenticated connection")
+            .unwrap();
+        assert_eq!(enter.session_epoch, SessionEpoch(3));
+        assert_eq!(
+            fixture
+                .server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .active,
+            Some((fixture.generation, SessionEpoch(3), 1))
+        );
+        let _ = fixture.old_stream;
+    }
+
+    #[tokio::test]
+    async fn delayed_terminal_emergencies_across_many_epochs_preserve_connection_for_reentry() {
+        let (mut fixture, mut inbound) = terminal_cancelled_epoch_fixture().await;
+        for epoch in 3..=18 {
+            let mut stream = open_raw_qos_input_stream(
+                &fixture.client_connection,
+                LaneDiscriminator::ReliableInput,
+                &reliable_frame(
+                    epoch,
+                    1,
+                    ReliableInputEvent::Enter {
+                        target_display_id: "next".into(),
+                        x: 0,
+                        y: 0,
+                    },
+                ),
+            )
+            .await;
+            let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+                .await
+                .expect("each new epoch must become active before its reset")
+                .unwrap();
+            assert_eq!(enter.session_epoch, SessionEpoch(epoch));
+            let completed = fixture
+                .server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .4;
+            stream
+                .reset(quinn::VarInt::from_u32(TERMINAL_CANCEL_RESET_CODE))
+                .unwrap();
+            let release = timeout(Duration::from_secs(1), fixture.releases.recv())
+                .await
+                .expect("each reset must release exactly its active epoch")
+                .unwrap();
+            assert_eq!(release.epoch, SessionEpoch(epoch));
+            wait_for_completed_uni_stream(&fixture.server_connection, completed).await;
+        }
+
+        // Independent QUIC streams can deliver these terminal notifications
+        // after many subsequent crossings have already entered and returned.
+        for epoch in (2..=18).chain([2, 18]) {
+            let completed = fixture
+                .server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .4;
+            write_raw_qos_input(
+                &fixture.client_connection,
+                LaneDiscriminator::Emergency,
+                &reliable_frame(
+                    epoch,
+                    2,
+                    ReliableInputEvent::ReleaseAll {
+                        reason: ReleaseAllReason::SessionEnded,
+                    },
+                ),
+            )
+            .await;
+            wait_for_completed_uni_stream(&fixture.server_connection, completed).await;
+            assert!(
+                fixture
+                    .server_connection
+                    .inner
+                    .connection
+                    .close_reason()
+                    .is_none(),
+                "a delayed or repeated terminal emergency for epoch {epoch} must be idempotent"
+            );
+            assert!(fixture.releases.try_recv().is_err());
+            assert!(inbound.reliable_input_rx.try_recv().is_err());
+            assert!(fixture
+                .server_connection
+                .inner
+                .qos_inbound
+                .lock()
+                .unwrap()
+                .active
+                .is_none());
+        }
+
+        let _next_stream = open_raw_qos_input_stream(
+            &fixture.client_connection,
+            LaneDiscriminator::ReliableInput,
+            &reliable_frame(
+                19,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "next".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+        )
+        .await;
+        let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("later input must reuse the same connection after delayed terminals")
+            .unwrap();
+        assert_eq!(enter.session_epoch, SessionEpoch(19));
+    }
+
+    #[tokio::test]
+    async fn retired_emergency_replays_are_idempotent_without_reinjection() {
+        let (mut fixture, mut inbound) = terminal_cancelled_epoch_fixture().await;
+        for retired_epoch in [1, 2, 2] {
+            let completed = fixture
+                .server_connection
+                .authenticated_uni_stream_task_counts_for_test()
+                .4;
+            write_raw_qos_input(
+                &fixture.client_connection,
+                LaneDiscriminator::Emergency,
+                &reliable_frame(
+                    retired_epoch,
+                    2,
+                    ReliableInputEvent::ReleaseAll {
+                        reason: ReleaseAllReason::SessionEnded,
+                    },
+                ),
+            )
+            .await;
+            wait_for_completed_uni_stream(&fixture.server_connection, completed).await;
+            assert!(fixture
+                .server_connection
+                .inner
+                .connection
+                .close_reason()
+                .is_none());
+            assert!(fixture.releases.try_recv().is_err());
+            assert!(inbound.reliable_input_rx.try_recv().is_err());
+            let state = fixture.server_connection.inner.qos_inbound.lock().unwrap();
+            assert!(state.active.is_none());
+            assert_eq!(
+                state.retired_through,
+                Some((fixture.generation, SessionEpoch(2)))
+            );
+            assert!(state.terminal_generation.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn emergency_before_terminal_cancel_reset_preserves_connection_for_reentry() {
+        let mut fixture = two_epoch_reliable_fixture().await;
+        let mut inbound = take_two_epoch_input(&fixture).await;
+        write_raw_qos_input(
+            &fixture.client_connection,
+            LaneDiscriminator::Emergency,
+            &reliable_frame(
+                2,
+                2,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            ),
+        )
+        .await;
+        let release = timeout(Duration::from_secs(1), fixture.releases.recv())
+            .await
+            .expect("the emergency must release the active epoch")
+            .unwrap();
+        assert_eq!(release.epoch, SessionEpoch(2));
+        assert_eq!(release.reason, ReleaseAllReason::SessionEnded);
+        let release_frame = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("the emergency must be delivered exactly once")
+            .unwrap();
+        assert!(matches!(
+            release_frame.event,
+            ReliableInputEvent::ReleaseAll { .. }
+        ));
+
+        fixture
+            .new_stream
+            .reset(quinn::VarInt::from_u32(TERMINAL_CANCEL_RESET_CODE))
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while fixture
+                .server_connection
+                .inner
+                .qos_reliable_faults_handled
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the delayed terminal reset must be handled");
+        assert!(fixture
+            .server_connection
+            .inner
+            .connection
+            .close_reason()
+            .is_none());
+        assert!(fixture.releases.try_recv().is_err());
+        assert!(inbound.reliable_input_rx.try_recv().is_err());
+
+        let _next_stream = open_raw_qos_input_stream(
+            &fixture.client_connection,
+            LaneDiscriminator::ReliableInput,
+            &reliable_frame(
+                3,
+                1,
+                ReliableInputEvent::Enter {
+                    target_display_id: "next".into(),
+                    x: 0,
+                    y: 0,
+                },
+            ),
+        )
+        .await;
+        let enter = timeout(Duration::from_secs(1), inbound.reliable_input_rx.recv())
+            .await
+            .expect("a later crossing must reuse the authenticated connection")
+            .unwrap();
+        assert_eq!(enter.session_epoch, SessionEpoch(3));
     }
 
     #[tokio::test]

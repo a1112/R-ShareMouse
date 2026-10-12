@@ -103,6 +103,12 @@ pub trait InputTransport: Send + Sync + 'static {
     fn bind(&self, target: DeviceId) -> Option<Self::Binding>;
     fn try_send_realtime(&self, binding: &Self::Binding, frame: RealtimeInputFrame);
     fn try_send_reliable(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool;
+
+    /// Retry cleanup without requiring an Enter on a newly rebound transport.
+    /// Real transports must retain their retired-epoch and ownership guards.
+    fn try_send_emergency(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool {
+        self.try_send_reliable(binding, frame)
+    }
 }
 
 impl InputTransport for ConnectionRegistry {
@@ -118,6 +124,13 @@ impl InputTransport for ConnectionRegistry {
 
     fn try_send_reliable(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool {
         binding.transport.try_send_reliable_input(frame).is_ok()
+    }
+
+    fn try_send_emergency(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool {
+        binding
+            .transport
+            .try_confirm_or_send_terminal_release(frame)
+            .is_ok()
     }
 }
 
@@ -137,11 +150,20 @@ pub struct InputRuntime<T: InputTransport = ConnectionRegistry> {
     last_dropped: u64,
     last_overflow: u64,
     active_transports: HashMap<DeviceId, T::Binding>,
+    pending_emergency_release: Option<PendingEmergencyRelease>,
     forwarding_policy: InputForwardingPolicy,
     shortcut_suppressor: Arc<dyn LocalShortcutSuppressor>,
     capture_observer: Option<Arc<dyn CapturedInputObserver>>,
     file_drag_observer: Option<Arc<dyn FileDragObserver>>,
 }
+
+struct PendingEmergencyRelease {
+    target: DeviceId,
+    frame: ReliableInputFrame,
+    release_token: u64,
+}
+
+const EMERGENCY_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 impl<T: InputTransport> InputRuntime<T> {
     pub fn new(
@@ -167,6 +189,7 @@ impl<T: InputTransport> InputRuntime<T> {
             last_dropped: 0,
             last_overflow: 0,
             active_transports: HashMap::new(),
+            pending_emergency_release: None,
             forwarding_policy: InputForwardingPolicy::default(),
             shortcut_suppressor: Arc::new(NoopShortcutSuppressor),
             capture_observer: None,
@@ -249,6 +272,11 @@ impl<T: InputTransport> InputRuntime<T> {
     }
 
     pub async fn run(mut self, mut commands: mpsc::Receiver<RouterCommand>) {
+        let mut release_retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + EMERGENCY_RELEASE_RETRY_INTERVAL,
+            EMERGENCY_RELEASE_RETRY_INTERVAL,
+        );
+        release_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -261,6 +289,7 @@ impl<T: InputTransport> InputRuntime<T> {
                         }
                     }
                 }
+                _ = release_retry.tick() => self.retry_pending_emergency_release(),
                 event = self.ingress.recv_event() => {
                     match event {
                         Some(event) => self.process_ingress_event(event),
@@ -286,6 +315,11 @@ impl<T: InputTransport> InputRuntime<T> {
         mut safety_events: mpsc::UnboundedReceiver<SystemSafetyEvent>,
     ) {
         let mut safety_open = true;
+        let mut release_retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + EMERGENCY_RELEASE_RETRY_INTERVAL,
+            EMERGENCY_RELEASE_RETRY_INTERVAL,
+        );
+        release_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -304,6 +338,7 @@ impl<T: InputTransport> InputRuntime<T> {
                         }
                     }
                 }
+                _ = release_retry.tick() => self.retry_pending_emergency_release(),
                 event = self.ingress.recv_event() => {
                     match event {
                         Some(event) => self.process_ingress_event(event),
@@ -541,6 +576,32 @@ impl<T: InputTransport> InputRuntime<T> {
                     if success {
                         self.metrics.record_routed();
                         self.apply_reliable_projection(&frame);
+                        if self
+                            .pending_emergency_release
+                            .as_ref()
+                            .is_some_and(|pending| Some(pending.release_token) == release_token)
+                        {
+                            self.pending_emergency_release = None;
+                        }
+                    } else {
+                        tracing::warn!(
+                            target = %target,
+                            session_epoch = frame.session_epoch.0,
+                            release_token = ?release_token,
+                            "emergency input release was not admitted by transport"
+                        );
+                        if let Some(token) = release_token
+                            .filter(|token| self.router.pending_release_token() == Some(*token))
+                        {
+                            // Core admits only one pending release ledger. Keep
+                            // its rejected frame until the matching admission
+                            // succeeds; local ownership can already be restored.
+                            self.pending_emergency_release = Some(PendingEmergencyRelease {
+                                target,
+                                frame: frame.clone(),
+                                release_token: token,
+                            });
+                        }
                     }
                     self.active_transports.remove(&target);
                     if let Some(token) = release_token {
@@ -551,6 +612,7 @@ impl<T: InputTransport> InputRuntime<T> {
                     }
                 }
                 RouterOutput::LocalSessionChanged(session) => {
+                    tracing::info!(session = ?session, "local input session changed");
                     if matches!(
                         session,
                         rshare_core::ControlSessionState::LocalReady
@@ -570,6 +632,47 @@ impl<T: InputTransport> InputRuntime<T> {
                 RouterOutput::Metric(_) => {}
             }
         }
+    }
+
+    fn retry_pending_emergency_release(&mut self) {
+        let Some(pending) = self.pending_emergency_release.as_ref() else {
+            return;
+        };
+        if self.router.pending_release_token() != Some(pending.release_token) {
+            self.pending_emergency_release = None;
+            return;
+        }
+        // Obtain the current generation rather than retaining a detached
+        // transport across a peer reconnect.
+        let success = self.transports.bind(pending.target).is_some_and(|binding| {
+            self.transports
+                .try_send_emergency(&binding, pending.frame.clone())
+        });
+        if !success {
+            return;
+        }
+        let pending = self.pending_emergency_release.take().unwrap();
+        tracing::info!(
+            target = %pending.target,
+            session_epoch = pending.frame.session_epoch.0,
+            release_token = pending.release_token,
+            "pending emergency input release admitted by transport"
+        );
+        self.metrics.record_routed();
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+        // A capture fault may have advanced the local projection while this
+        // older remote-session release waited for admission.
+        self.state.publish_discrete(InputDiscreteProjection {
+            session_epoch: self.current_epoch,
+            pressed_keys: Vec::new(),
+            pressed_buttons: Vec::new(),
+        });
+        let completion = self.router.handle(RouterCommand::ReleaseAllCompleted {
+            token: pending.release_token,
+            success: true,
+        });
+        self.dispatch_outputs(completion);
     }
 
     fn apply_reliable_projection(&mut self, frame: &ReliableInputFrame) {

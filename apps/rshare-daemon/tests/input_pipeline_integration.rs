@@ -327,6 +327,35 @@ fn linked_router() -> (DeviceId, DeviceId, InputRouter) {
     (local, remote, router)
 }
 
+fn three_machine_router() -> (DeviceId, DeviceId, DeviceId, InputRouter) {
+    let local = DeviceId::new_v4();
+    let windows = DeviceId::new_v4();
+    let macbook = DeviceId::new_v4();
+    let mut layout = LayoutGraph::new(local);
+    layout.add_node(LayoutNode::new(windows, 0, 0, 100, 100));
+    layout.add_node(LayoutNode::new(local, 100, 0, 100, 100));
+    layout.add_node(LayoutNode::new(macbook, 200, 0, 100, 100));
+    layout.add_link(LayoutLink::new(
+        local,
+        Direction::Left,
+        windows,
+        Direction::Right,
+    ));
+    layout.add_link(LayoutLink::new(
+        local,
+        Direction::Right,
+        macbook,
+        Direction::Left,
+    ));
+    let router = InputRouter::new(
+        local,
+        layout,
+        VirtualDesktopGeometry::new(PixelRect::new(0, 0, 100, 100)),
+        [windows, macbook],
+    );
+    (local, windows, macbook, router)
+}
+
 fn ui_snapshot(local_id: DeviceId) -> UiSnapshot {
     UiSnapshot {
         protocol_version: UI_STATE_PROTOCOL_VERSION,
@@ -546,6 +575,194 @@ async fn physical_relative_return_releases_remote_and_restores_local_input() {
             }
         )
     }));
+}
+
+#[tokio::test]
+async fn three_machine_physical_return_from_right_allows_entering_left() {
+    let (_, windows, macbook, router) = three_machine_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(RecordingTransport::default());
+    let (state, feeds) = input_state_channel(8);
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = InputRuntime::new(
+        consumer,
+        router,
+        transport.clone(),
+        state,
+        Arc::new(ControlMetrics::default()),
+        injection,
+    )
+    .with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    for dx in [20, -21] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+                dx,
+                dy: 0,
+                observed_x: Some(99),
+                observed_y: Some(50),
+            })),
+        ));
+        assert!(runtime.process_next().await);
+    }
+    assert_eq!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::LocalReady
+    );
+
+    for x in [50, 0] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x,
+                y: 50,
+            })),
+        ));
+        assert!(runtime.process_next().await);
+    }
+
+    assert!(matches!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::RemoteActive { target, .. } if target == windows
+    ));
+    let values = suppressor.values.lock().unwrap().clone();
+    assert_eq!(values, [true, false, true]);
+    let events = transport.events.lock().unwrap().clone();
+    let reliable = events
+        .iter()
+        .filter_map(|event| match event {
+            InputDispatch::Reliable { target, frame } => Some((*target, &frame.event)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        reliable.as_slice(),
+        [
+            (right, ReliableInputEvent::Enter { .. }),
+            (released, ReliableInputEvent::ReleaseAll { reason: ReleaseAllReason::OwnershipTransfer }),
+            (left, ReliableInputEvent::Enter { .. }),
+        ] if *right == macbook && *released == macbook && *left == windows
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_machine_failed_return_release_recovers_after_transport_unblocks() {
+    assert_three_machine_release_retry_recovers(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_machine_failed_return_release_recovers_with_system_safety_lane() {
+    assert_three_machine_release_retry_recovers(true).await;
+}
+
+async fn assert_three_machine_release_retry_recovers(with_safety_lane: bool) {
+    let (_, windows, macbook, router) = three_machine_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(BoundedBlockedTransport::new(0));
+    let (state, mut feeds) = input_state_channel(8);
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = InputRuntime::new(
+        consumer,
+        router,
+        transport.clone(),
+        state,
+        Arc::new(ControlMetrics::default()),
+        injection,
+    )
+    .with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    assert!(matches!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::RemoteActive { target, .. } if target == macbook
+    ));
+    transport.block_for(Duration::from_millis(100));
+    producer.try_push(producer.capture(
+        origin(CaptureSource::PortableHook),
+        CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+            dx: -1,
+            dy: 0,
+            observed_x: Some(99),
+            observed_y: Some(50),
+        })),
+    ));
+    assert!(runtime.process_next().await);
+    assert_eq!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::LocalReady
+    );
+    let values = suppressor.values.lock().unwrap().clone();
+    assert_eq!(values, [true, false]);
+
+    let (commands_tx, commands_rx) = mpsc::channel(8);
+    let (_safety_tx, safety_rx) = mpsc::unbounded_channel();
+    let actor = if with_safety_lane {
+        tokio::spawn(runtime.run_with_safety(commands_rx, safety_rx))
+    } else {
+        tokio::spawn(runtime.run(commands_rx))
+    };
+    tokio::task::yield_now().await;
+    transport.advance(Duration::from_millis(100));
+    assert!(transport.flush_if_unblocked());
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert!(transport.state.lock().unwrap().sent_reliable.is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    for x in [50, 0] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x,
+                y: 50,
+            })),
+        ));
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        feeds.authoritative_rx.wait_for(|projection| {
+            matches!(projection.session, ControlSessionState::RemoteActive { target, .. } if target == windows)
+        }),
+    )
+    .await
+    .expect("opposite edge should recover after pending release is admitted")
+    .unwrap();
+    let values = suppressor.values.lock().unwrap().clone();
+    assert_eq!(values, [true, false, true]);
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tokio::task::yield_now().await;
+    let sent = transport.state.lock().unwrap().sent_reliable.clone();
+    assert!(matches!(
+        sent.as_slice(),
+        [
+            ReliableInputFrame {
+                event: ReliableInputEvent::ReleaseAll { .. },
+                ..
+            },
+            ReliableInputFrame {
+                event: ReliableInputEvent::Enter { .. },
+                ..
+            },
+        ]
+    ));
+    drop(commands_tx);
+    actor.await.unwrap();
 }
 
 #[tokio::test]

@@ -369,6 +369,7 @@ struct AwaitedWriteProbes {
 struct SenderEpochState {
     active: Option<SessionEpoch>,
     retired_through: Option<SessionEpoch>,
+    terminal_admitted_through: Option<SessionEpoch>,
 }
 
 impl SenderEpochState {
@@ -668,6 +669,53 @@ impl PeerTransportHandle {
         self.enqueue_emergency_locked(frame)
     }
 
+    /// Complete a caller's pending terminal cleanup without sending an already
+    /// admitted release twice. The caller must still match its pending-release
+    /// token before invoking this on the current connection generation.
+    pub fn try_confirm_or_send_terminal_release(
+        &self,
+        frame: ReliableInputFrame,
+    ) -> Result<(), TransportSendError> {
+        let _admission = self.inner.admission.lock().expect("qos admission poisoned");
+        if !matches!(frame.event, ReliableInputEvent::ReleaseAll { .. }) {
+            return Err(TransportSendError::UnsupportedMessage);
+        }
+        if self.inner.emergency_tx.is_closed()
+            || self
+                .inner
+                .realtime_connection
+                .as_ref()
+                .is_some_and(|connection| connection.close_reason().is_some())
+        {
+            return Err(TransportSendError::LaneClosed);
+        }
+        let state = self
+            .inner
+            .epoch_state
+            .lock()
+            .expect("qos epoch state poisoned");
+        if state
+            .active
+            .is_some_and(|active| active != frame.session_epoch)
+            || state
+                .retired_through
+                .is_some_and(|retired| retired.0 > frame.session_epoch.0)
+            || (state.active.is_none()
+                && state
+                    .retired_through
+                    .is_some_and(|retired| retired != frame.session_epoch))
+        {
+            return Err(TransportSendError::UnsupportedMessage);
+        }
+        if state.terminal_admitted_through == Some(frame.session_epoch) {
+            return Ok(());
+        }
+        drop(state);
+        self.retire_epoch_locked(frame.session_epoch);
+        self.cancel_reliable_through_locked(frame.session_epoch);
+        self.enqueue_emergency_locked(frame)
+    }
+
     fn enqueue_emergency_locked(
         &self,
         frame: ReliableInputFrame,
@@ -693,6 +741,7 @@ impl PeerTransportHandle {
             emergency_capacity - self.inner.emergency_tx.capacity() + 1,
             emergency_capacity,
         );
+        let terminal_epoch = frame.session_epoch;
         self.inner
             .emergency_tx
             .try_send(frame.clone())
@@ -708,7 +757,19 @@ impl PeerTransportHandle {
                     }
                     mpsc::error::TrySendError::Closed(_) => TransportSendError::LaneClosed,
                 }
-            })
+            })?;
+        let mut state = self
+            .inner
+            .epoch_state
+            .lock()
+            .expect("qos epoch state poisoned");
+        if state
+            .terminal_admitted_through
+            .is_none_or(|admitted| terminal_epoch.0 > admitted.0)
+        {
+            state.terminal_admitted_through = Some(terminal_epoch);
+        }
+        Ok(())
     }
 
     pub async fn send_control(&self, frame: ControlFrame) -> Result<(), TransportSendError> {
@@ -2135,6 +2196,139 @@ mod tests {
         assert!(handle.is_tombstoned(epoch));
         assert!(emergency_rx.try_recv().is_err());
         assert!(local_releases.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_retry_confirms_internal_reliable_failure_without_duplicate() {
+        let (handle, _reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        handle
+            .try_send_reliable_input(reliable_enter(73, 1))
+            .unwrap();
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_key_down(73, 2)),
+            Err(TransportSendError::ReliableLaneFull)
+        );
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_release(73, 3)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+
+        handle
+            .try_confirm_or_send_terminal_release(reliable_release(73, 3))
+            .expect("the internal terminal admission must complete the daemon's cached cleanup");
+        handle
+            .try_confirm_or_send_terminal_release(reliable_release(73, 3))
+            .expect("confirming the same cleanup must be idempotent");
+        assert_eq!(
+            emergency_rx.recv().await.unwrap().session_epoch,
+            SessionEpoch(73)
+        );
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(local_releases.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_retry_on_fresh_generation_admits_once_without_enter() {
+        let (handle, _reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        let cleanup = reliable_release(74, 3);
+        handle
+            .try_confirm_or_send_terminal_release(cleanup.clone())
+            .expect("reconnected generation must admit pending cleanup before a new Enter");
+        handle
+            .try_confirm_or_send_terminal_release(cleanup)
+            .expect("admitted cleanup must not send a duplicate emergency frame");
+        assert_eq!(
+            emergency_rx.recv().await.unwrap().session_epoch,
+            SessionEpoch(74)
+        );
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(local_releases.try_recv().is_err());
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_enter(74, 1)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+        assert_eq!(
+            handle.try_send_reliable_input(reliable_key_down(74, 4)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_retry_rejects_wrong_epoch_without_retiring_active() {
+        let (handle, mut reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        handle
+            .try_send_reliable_input(reliable_enter(75, 1))
+            .unwrap();
+        reliable.reliable_rx.recv().await.unwrap();
+        for wrong_epoch in [74, 76] {
+            assert_eq!(
+                handle.try_confirm_or_send_terminal_release(reliable_release(wrong_epoch, 3)),
+                Err(TransportSendError::UnsupportedMessage)
+            );
+        }
+        assert_eq!(
+            handle.try_confirm_or_send_terminal_release(reliable_enter(75, 3)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+        assert!(!handle.is_tombstoned(SessionEpoch(75)));
+        handle
+            .try_send_reliable_input(reliable_key_down(75, 2))
+            .expect("mismatched cleanup cannot cancel the active epoch");
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(local_releases.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_retry_cannot_confirm_before_newer_active_or_retired_epoch() {
+        let (handle, mut reliable, mut emergency_rx, mut local_releases) =
+            fixture_handle_with_stalled_emergency();
+        handle
+            .try_confirm_or_send_terminal_release(reliable_release(76, 3))
+            .unwrap();
+        emergency_rx.recv().await.unwrap();
+        // Model the emergency writer completing and releasing its reserved slot.
+        handle
+            .inner
+            .emergency_reserved
+            .store(false, Ordering::Release);
+        handle
+            .try_send_reliable_input(reliable_enter(77, 1))
+            .unwrap();
+        reliable.reliable_rx.recv().await.unwrap();
+        assert_eq!(
+            handle.try_confirm_or_send_terminal_release(reliable_release(76, 3)),
+            Err(TransportSendError::UnsupportedMessage)
+        );
+        assert!(!handle.is_tombstoned(SessionEpoch(77)));
+        handle
+            .try_send_reliable_input(reliable_release(77, 2))
+            .unwrap();
+        emergency_rx.recv().await.unwrap();
+        for wrong_epoch in [76, 78] {
+            assert_eq!(
+                handle.try_confirm_or_send_terminal_release(reliable_release(wrong_epoch, 3)),
+                Err(TransportSendError::UnsupportedMessage)
+            );
+        }
+        assert!(emergency_rx.try_recv().is_err());
+        assert!(local_releases.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_retry_does_not_confirm_a_closed_emergency_lane() {
+        let (handle, _reliable, emergency_rx, _local_releases) =
+            fixture_handle_with_stalled_emergency();
+        handle
+            .try_confirm_or_send_terminal_release(reliable_release(78, 3))
+            .unwrap();
+        drop(emergency_rx);
+        assert_eq!(
+            handle.try_confirm_or_send_terminal_release(reliable_release(78, 3)),
+            Err(TransportSendError::LaneClosed)
+        );
     }
 
     #[tokio::test]
