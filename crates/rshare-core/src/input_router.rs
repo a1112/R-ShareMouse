@@ -191,13 +191,25 @@ impl RouterInput {
 pub enum RouterCommand {
     Input(RouterInput),
     LayoutChanged(LayoutGraph),
-    ConnectivityChanged { peer: DeviceId, connected: bool },
+    ConnectivityChanged {
+        peer: DeviceId,
+        connected: bool,
+    },
     QuickReturn,
     SystemSuspended,
     BackendDegraded,
     LeaseExpired,
     Shutdown,
-    ReleaseAllCompleted { token: u64, success: bool },
+    ReleaseAllCompleted {
+        token: u64,
+        success: bool,
+    },
+    LocalPointerRestoreCompleted {
+        x: i32,
+        y: i32,
+        success: bool,
+        allow_edge_entry: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +235,11 @@ pub enum RouterOutput {
         frame: ReliableInputFrame,
         release_token: Option<u64>,
     },
+    RestoreLocalPointer {
+        x: i32,
+        y: i32,
+        allow_edge_entry: bool,
+    },
     LocalSessionChanged(ControlSessionState),
     SuppressLocalShortcuts(bool),
     Metric(RouterMetric),
@@ -247,6 +264,7 @@ pub struct InputRouter {
     last_captured_at: MonotonicStamp,
     last_absolute: Option<(i32, i32)>,
     remote_pointer: Option<RemotePointerState>,
+    local_pointer_handoff: Option<LocalPointerHandoff>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -261,6 +279,14 @@ struct RemotePointerState {
     entry_edge: Direction,
     x: i32,
     y: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalPointerHandoff {
+    returned_edge: Direction,
+    x: i32,
+    y: i32,
+    anchor_confirmed: bool,
 }
 
 impl InputRouter {
@@ -290,6 +316,7 @@ impl InputRouter {
             last_captured_at: MonotonicStamp::new(crate::ClockDomainId(0), 0),
             last_absolute: None,
             remote_pointer: None,
+            local_pointer_handoff: None,
         }
     }
 
@@ -311,6 +338,12 @@ impl InputRouter {
             RouterCommand::ReleaseAllCompleted { token, success } => {
                 self.handle_release_all_completed(token, success)
             }
+            RouterCommand::LocalPointerRestoreCompleted {
+                x,
+                y,
+                success,
+                allow_edge_entry,
+            } => self.handle_local_pointer_restore_completed(x, y, success, allow_edge_entry),
         }
     }
 
@@ -503,6 +536,22 @@ impl InputRouter {
                 )
             });
         }
+        if let Some(handoff) = self.local_pointer_handoff {
+            let bounds = self.geometry.bounds();
+            let interior = match handoff.returned_edge {
+                Direction::Left => x > bounds.x,
+                Direction::Right => x < bounds.last_x(),
+                Direction::Top => y > bounds.y,
+                Direction::Bottom => y < bounds.last_y(),
+            };
+            if !interior {
+                // The return-triggering hardware event was suppressed. A
+                // stale native boundary sample must not replace the restored
+                // logical anchor or immediately re-enter the same peer.
+                return SmallVec::new();
+            }
+            self.local_pointer_handoff = None;
+        }
         self.last_absolute = Some((x, y));
         if !self.session.is_local_ready() {
             return SmallVec::new();
@@ -600,6 +649,9 @@ impl InputRouter {
         dy: i32,
         captured_at: MonotonicStamp,
     ) -> SmallVec<[RouterOutput; 4]> {
+        if self.session.is_local_ready() {
+            return self.restore_queued_local_motion(dx, dy);
+        }
         let Some(target) = self.session.active_target() else {
             return SmallVec::new();
         };
@@ -650,8 +702,100 @@ impl InputRouter {
         if bounded_dx != 0 || bounded_dy != 0 {
             outputs.extend(self.send_relative(bounded_dx, bounded_dy, captured_at));
         }
-        outputs.extend(self.return_to_local(ReleaseAllReason::OwnershipTransfer));
+        let bounds = self.geometry.bounds();
+        let (projected_x, projected_y) = pointer.display.project_to(bounds, next_x, next_y);
+        let returned_edge = pointer.entry_edge.opposite();
+        let (local_x, local_y) = match returned_edge {
+            Direction::Right => (
+                i64::from(bounds.last_x()) + candidate_x - i64::from(pointer.display.x),
+                i64::from(projected_y),
+            ),
+            Direction::Left => (
+                i64::from(bounds.x) + candidate_x - i64::from(pointer.display.last_x()),
+                i64::from(projected_y),
+            ),
+            Direction::Bottom => (
+                i64::from(projected_x),
+                i64::from(bounds.last_y()) + candidate_y - i64::from(pointer.display.y),
+            ),
+            Direction::Top => (
+                i64::from(projected_x),
+                i64::from(bounds.y) + candidate_y - i64::from(pointer.display.last_y()),
+            ),
+        };
+        let handoff = LocalPointerHandoff {
+            returned_edge,
+            x: local_x.clamp(i64::from(bounds.x), i64::from(bounds.last_x())) as i32,
+            y: local_y.clamp(i64::from(bounds.y), i64::from(bounds.last_y())) as i32,
+            anchor_confirmed: false,
+        };
+        outputs.extend(
+            self.return_to_local_with_handoff(ReleaseAllReason::OwnershipTransfer, Some(handoff)),
+        );
         outputs
+    }
+
+    fn restore_queued_local_motion(&mut self, dx: i32, dy: i32) -> SmallVec<[RouterOutput; 4]> {
+        let Some(mut handoff) = self.local_pointer_handoff else {
+            return SmallVec::new();
+        };
+        if !handoff.anchor_confirmed {
+            return SmallVec::new();
+        }
+        let bounds = self.geometry.bounds();
+        handoff.x = (i64::from(handoff.x) + i64::from(dx))
+            .clamp(i64::from(bounds.x), i64::from(bounds.last_x())) as i32;
+        handoff.y = (i64::from(handoff.y) + i64::from(dy))
+            .clamp(i64::from(bounds.y), i64::from(bounds.last_y())) as i32;
+        self.last_absolute = Some((handoff.x, handoff.y));
+        handoff.anchor_confirmed = false;
+        self.local_pointer_handoff = Some(handoff);
+        smallvec![RouterOutput::RestoreLocalPointer {
+            x: handoff.x,
+            y: handoff.y,
+            allow_edge_entry: true,
+        }]
+    }
+
+    fn handle_local_pointer_restore_completed(
+        &mut self,
+        x: i32,
+        y: i32,
+        success: bool,
+        allow_edge_entry: bool,
+    ) -> SmallVec<[RouterOutput; 4]> {
+        let Some(mut handoff) = self.local_pointer_handoff else {
+            return SmallVec::new();
+        };
+        if !self.session.is_local_ready() || (handoff.x, handoff.y) != (x, y) {
+            return SmallVec::new();
+        }
+        handoff.anchor_confirmed = success;
+        self.local_pointer_handoff = Some(handoff);
+        if !success {
+            self.last_absolute = None;
+            return SmallVec::new();
+        }
+        // Relative samples queued while suppression was enabled represent
+        // swallowed hardware motion. Restore them locally, but only a fresh
+        // absolute interior sample rearms the original return edge.
+        if allow_edge_entry
+            && self
+                .geometry
+                .bounds()
+                .edge_at(x, y)
+                .is_some_and(|edge| edge != handoff.returned_edge)
+        {
+            // Queued motion can enter another peer only after the synchronous
+            // native restoration succeeded. That output batch has no later
+            // local-session or suppression outputs to overwrite this entry.
+            let outputs = self.handle_absolute_move(x, y, self.last_captured_at);
+            if self.session.is_local_ready() {
+                self.local_pointer_handoff = Some(handoff);
+            }
+            return outputs;
+        }
+        SmallVec::new()
     }
 
     fn send_relative(
@@ -723,6 +867,7 @@ impl InputRouter {
         if self.layout == layout {
             return SmallVec::new();
         }
+        self.clear_local_pointer_handoff();
         let active_route = match self.session.state() {
             ControlSessionState::RemoteActive {
                 target,
@@ -840,6 +985,7 @@ impl InputRouter {
     }
 
     fn handle_backend_degraded(&mut self) -> SmallVec<[RouterOutput; 4]> {
+        self.clear_local_pointer_handoff();
         let active_target = self.session.active_target();
         self.remote_pointer = None;
         let mut outputs = SmallVec::new();
@@ -860,6 +1006,21 @@ impl InputRouter {
     }
 
     fn return_to_local(&mut self, reason: ReleaseAllReason) -> SmallVec<[RouterOutput; 4]> {
+        self.clear_local_pointer_handoff();
+        self.return_to_local_with_handoff(reason, None)
+    }
+
+    fn clear_local_pointer_handoff(&mut self) {
+        if self.local_pointer_handoff.take().is_some() {
+            self.last_absolute = None;
+        }
+    }
+
+    fn return_to_local_with_handoff(
+        &mut self,
+        reason: ReleaseAllReason,
+        handoff: Option<LocalPointerHandoff>,
+    ) -> SmallVec<[RouterOutput; 4]> {
         let Some(target) = self.session.active_target() else {
             return SmallVec::new();
         };
@@ -876,6 +1037,17 @@ impl InputRouter {
             let _ = self.session.on_return_edge_hit(return_edge);
         }
         if !self.session.is_remote_active() {
+            if self.session.is_local_ready() {
+                if let Some(handoff) = handoff {
+                    self.last_absolute = Some((handoff.x, handoff.y));
+                    self.local_pointer_handoff = Some(handoff);
+                    outputs.push(RouterOutput::RestoreLocalPointer {
+                        x: handoff.x,
+                        y: handoff.y,
+                        allow_edge_entry: false,
+                    });
+                }
+            }
             outputs.push(RouterOutput::LocalSessionChanged(self.session.state()));
             outputs.push(RouterOutput::SuppressLocalShortcuts(false));
         }
@@ -1066,6 +1238,382 @@ mod tests {
             }) => *token,
             other => panic!("expected emergency release token, got {other:?}"),
         }
+    }
+
+    fn three_machine_router() -> (InputRouter, DeviceId, DeviceId) {
+        let local = DeviceId::new_v4();
+        let windows = DeviceId::new_v4();
+        let macbook = DeviceId::new_v4();
+        let mut graph = LayoutGraph::new(local);
+        graph.add_node(LayoutNode::new(windows, 0, 0, 2560, 1600));
+        graph.add_node(LayoutNode::new(local, 2560, 0, 1920, 1080));
+        graph.add_node(LayoutNode::new(macbook, 4480, 0, 1728, 1117));
+        graph.add_link(LayoutLink::new(
+            local,
+            Direction::Left,
+            windows,
+            Direction::Right,
+        ));
+        graph.add_link(LayoutLink::new(
+            local,
+            Direction::Right,
+            macbook,
+            Direction::Left,
+        ));
+        (
+            InputRouter::new(
+                local,
+                graph,
+                VirtualDesktopGeometry::new(PixelRect::new(0, 0, 1920, 1080)),
+                [windows, macbook],
+            ),
+            windows,
+            macbook,
+        )
+    }
+
+    #[test]
+    fn physical_return_stale_right_edge_does_not_bounce_and_left_entry_still_works() {
+        let (mut router, windows, macbook) = three_machine_router();
+        let entered = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            540,
+            stamp(1),
+        )));
+        assert!(matches!(
+            entered.first(),
+            Some(RouterOutput::SendReliable { target, .. }) if *target == macbook
+        ));
+        router.handle(RouterCommand::Input(RouterInput::relative_move(
+            100,
+            0,
+            stamp(2),
+        )));
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -104,
+            0,
+            stamp(3),
+        )));
+        let token = returned
+            .iter()
+            .find_map(|output| match output {
+                RouterOutput::EmergencyReleaseAll { release_token, .. } => *release_token,
+                _ => None,
+            })
+            .unwrap();
+        router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+
+        for captured_at in [stamp(4), stamp(5)] {
+            let stale = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                540,
+                captured_at,
+            )));
+            assert!(
+                stale.is_empty(),
+                "stale return boundary must not enter MacBook again"
+            );
+            assert!(router.session.is_local_ready());
+        }
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1000,
+            540,
+            stamp(6),
+        )));
+        let left = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            0,
+            540,
+            stamp(7),
+        )));
+        assert!(matches!(
+            left.first(),
+            Some(RouterOutput::SendReliable { target, .. }) if *target == windows
+        ));
+    }
+
+    #[test]
+    fn physical_return_projects_and_preserves_overshoot_before_releasing_local_input() {
+        let bounds = PixelRect::new(-1920, -1080, 3840, 2160);
+        for (entered_via, entry_edge, entry, movement, expected) in [
+            (
+                Direction::Right,
+                Direction::Left,
+                (1919, 0),
+                (-4, 0),
+                (1915, 0),
+            ),
+            (
+                Direction::Left,
+                Direction::Right,
+                (-1920, 0),
+                (4, 0),
+                (-1916, 0),
+            ),
+            (
+                Direction::Bottom,
+                Direction::Top,
+                (0, 1079),
+                (0, -4),
+                (0, 1075),
+            ),
+            (
+                Direction::Top,
+                Direction::Bottom,
+                (0, -1080),
+                (0, 4),
+                (0, -1076),
+            ),
+        ] {
+            let (mut router, _, _) = linked_router(
+                bounds,
+                entered_via,
+                entry_edge,
+                PixelRect::new(0, 0, 2560, 1440),
+            );
+            router.handle(RouterCommand::Input(RouterInput::absolute_move(
+                entry.0,
+                entry.1,
+                stamp(1),
+            )));
+            let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+                movement.0,
+                movement.1,
+                stamp(2),
+            )));
+            assert!(
+                matches!(
+                    returned.as_slice(),
+                    [
+                        RouterOutput::EmergencyReleaseAll { .. },
+                        RouterOutput::RestoreLocalPointer { x, y, allow_edge_entry: false },
+                        RouterOutput::LocalSessionChanged(ControlSessionState::LocalReady),
+                        RouterOutput::SuppressLocalShortcuts(false),
+                    ] if (*x, *y) == expected
+                ),
+                "return {entered_via:?}: {returned:?}"
+            );
+            assert_eq!(router.last_absolute, Some(expected));
+        }
+    }
+
+    #[test]
+    fn queued_suppressed_relative_motion_uses_restored_anchor_and_can_enter_opposite_edge() {
+        let (mut router, windows, _) = three_machine_router();
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            540,
+            stamp(1),
+        )));
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -4,
+            0,
+            stamp(2),
+        )));
+        let token = emergency_release_token(&returned);
+        router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+        router.handle(RouterCommand::LocalPointerRestoreCompleted {
+            x: 1915,
+            y: 540,
+            success: true,
+            allow_edge_entry: false,
+        });
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            540,
+            stamp(3),
+        )));
+        let queued = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -10,
+            0,
+            stamp(4),
+        )));
+        assert_eq!(
+            queued.as_slice(),
+            &[RouterOutput::RestoreLocalPointer {
+                x: 1905,
+                y: 540,
+                allow_edge_entry: true
+            }]
+        );
+        router.handle(RouterCommand::LocalPointerRestoreCompleted {
+            x: 1905,
+            y: 540,
+            success: true,
+            allow_edge_entry: true,
+        });
+        let crossed = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            i32::MIN,
+            i32::MAX,
+            stamp(5),
+        )));
+        assert_eq!(
+            crossed.first(),
+            Some(&RouterOutput::RestoreLocalPointer {
+                x: 0,
+                y: 1079,
+                allow_edge_entry: true
+            })
+        );
+        assert!(router.session.is_local_ready());
+        let admitted = router.handle(RouterCommand::LocalPointerRestoreCompleted {
+            x: 0,
+            y: 1079,
+            success: true,
+            allow_edge_entry: true,
+        });
+        assert!(admitted.iter().any(|output| matches!(output,
+            RouterOutput::SendReliable { target, frame } if *target == windows && matches!(frame.event, ReliableInputEvent::Enter { .. })
+        )));
+    }
+
+    #[test]
+    fn physical_return_disarms_left_edge_and_fresh_interior_rearms_same_edge() {
+        let (mut router, windows, macbook) = three_machine_router();
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            0,
+            540,
+            stamp(1),
+        )));
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            4,
+            0,
+            stamp(2),
+        )));
+        let token = emergency_release_token(&returned);
+        router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+        assert_eq!(router.last_absolute, Some((4, 540)));
+        assert!(router
+            .handle(RouterCommand::Input(RouterInput::absolute_move(
+                0,
+                540,
+                stamp(3)
+            )))
+            .is_empty());
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1000,
+            540,
+            stamp(4),
+        )));
+        let reentered = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            0,
+            540,
+            stamp(5),
+        )));
+        assert!(
+            matches!(reentered.first(), Some(RouterOutput::SendReliable { target, .. }) if *target == windows)
+        );
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            1,
+            0,
+            stamp(6),
+        )));
+        let token = emergency_release_token(&returned);
+        router.handle(RouterCommand::ReleaseAllCompleted {
+            token,
+            success: true,
+        });
+        let opposite = router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            540,
+            stamp(7),
+        )));
+        assert!(
+            matches!(opposite.first(), Some(RouterOutput::SendReliable { target, .. }) if *target == macbook)
+        );
+    }
+
+    #[test]
+    fn explicit_return_and_backend_fault_discard_handoff_without_clearing_release_ledger() {
+        for command in [
+            RouterCommand::SystemSuspended,
+            RouterCommand::QuickReturn,
+            RouterCommand::LeaseExpired,
+            RouterCommand::Shutdown,
+            RouterCommand::BackendDegraded,
+        ] {
+            let (mut router, _, _) = three_machine_router();
+            router.handle(RouterCommand::Input(RouterInput::absolute_move(
+                1919,
+                540,
+                stamp(1),
+            )));
+            let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+                -1,
+                0,
+                stamp(2),
+            )));
+            let token = emergency_release_token(&returned);
+            router.handle(RouterCommand::LocalPointerRestoreCompleted {
+                x: 1918,
+                y: 540,
+                success: true,
+                allow_edge_entry: false,
+            });
+            router.handle(command);
+            assert!(router.local_pointer_handoff.is_none());
+            assert!(router.last_absolute.is_none());
+            assert_eq!(router.pending_release_token(), Some(token));
+            assert!(router
+                .handle(RouterCommand::Input(RouterInput::relative_move(
+                    -5000,
+                    0,
+                    stamp(3)
+                )))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn changed_layout_discards_handoff_but_unchanged_sync_keeps_it() {
+        let (mut router, _, _) = three_machine_router();
+        router.handle(RouterCommand::Input(RouterInput::absolute_move(
+            1919,
+            540,
+            stamp(1),
+        )));
+        let returned = router.handle(RouterCommand::Input(RouterInput::relative_move(
+            -1,
+            0,
+            stamp(2),
+        )));
+        let token = emergency_release_token(&returned);
+        router.handle(RouterCommand::LocalPointerRestoreCompleted {
+            x: 1918,
+            y: 540,
+            success: true,
+            allow_edge_entry: false,
+        });
+        assert!(router
+            .handle(RouterCommand::LayoutChanged(router.layout.clone()))
+            .is_empty());
+        assert!(router.local_pointer_handoff.unwrap().anchor_confirmed);
+        let mut changed = router.layout.clone();
+        *changed
+            .nodes
+            .iter_mut()
+            .find(|node| node.device_id == router.local_id)
+            .unwrap() = LayoutNode::new(router.local_id, 2560, 0, 1280, 720);
+        router.handle(RouterCommand::LayoutChanged(changed));
+        assert!(router.local_pointer_handoff.is_none());
+        assert!(router.last_absolute.is_none());
+        assert_eq!(router.geometry.bounds(), PixelRect::new(0, 0, 1280, 720));
+        assert_eq!(router.pending_release_token(), Some(token));
+        assert!(router
+            .handle(RouterCommand::Input(RouterInput::relative_move(
+                -5000,
+                0,
+                stamp(3)
+            )))
+            .is_empty());
     }
 
     #[test]
@@ -1370,6 +1918,7 @@ mod tests {
                     target: release_target,
                     ..
                 },
+                RouterOutput::RestoreLocalPointer { x: 1918, y: 700, allow_edge_entry: false },
                 RouterOutput::LocalSessionChanged(ControlSessionState::LocalReady),
                 RouterOutput::SuppressLocalShortcuts(false),
             ] if *move_target == target && *release_target == target

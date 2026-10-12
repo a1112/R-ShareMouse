@@ -3922,6 +3922,24 @@ impl LocalShortcutSuppressor for PlatformShortcutSuppressor {
     fn set_suppressed(&self, enabled: bool) {
         set_local_shortcut_suppression(enabled);
     }
+
+    fn restore_local_pointer(&self, x: i32, y: i32) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            match rshare_platform::restore_macos_local_pointer(x, y) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(x, y, error = %error, "failed to restore the local macOS pointer");
+                    false
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (x, y);
+            false
+        }
+    }
 }
 
 fn create_inject_backend(mode: Option<ResolvedInputMode>) -> Result<Box<dyn InjectBackend>> {

@@ -63,6 +63,13 @@ impl Default for InputForwardingPolicy {
 /// Thread-safe platform seam for the router's suppression output.
 pub trait LocalShortcutSuppressor: Send + Sync + 'static {
     fn set_suppressed(&self, enabled: bool);
+
+    /// Restore motion swallowed by native capture during a physical return.
+    /// False leaves local input released and reports the unsupported/faulted
+    /// pointer operation instead of claiming that a native warp succeeded.
+    fn restore_local_pointer(&self, _x: i32, _y: i32) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -628,6 +635,25 @@ impl<T: InputTransport> InputRuntime<T> {
                     self.shortcut_suppressor.set_suppressed(
                         enabled && self.forwarding_policy.suppress_local_shortcuts_when_remote,
                     );
+                }
+                RouterOutput::RestoreLocalPointer {
+                    x,
+                    y,
+                    allow_edge_entry,
+                } => {
+                    let success = self.shortcut_suppressor.restore_local_pointer(x, y);
+                    if !success {
+                        tracing::warn!(x, y, "local return pointer restoration was unavailable");
+                    }
+                    let completion =
+                        self.router
+                            .handle(RouterCommand::LocalPointerRestoreCompleted {
+                                x,
+                                y,
+                                success,
+                                allow_edge_entry,
+                            });
+                    self.dispatch_outputs(completion);
                 }
                 RouterOutput::Metric(_) => {}
             }

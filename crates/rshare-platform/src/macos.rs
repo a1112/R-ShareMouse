@@ -263,6 +263,18 @@ mod macos_impl {
         LOCAL_INPUT_SUPPRESSED.load(Ordering::Acquire)
     }
 
+    /// Restore the physical cursor before the daemon releases local suppression.
+    /// Warping generates no input event, so this cannot be recaptured and routed
+    /// back to the remote peer during the ownership handoff.
+    pub fn restore_macos_local_pointer(x: i32, y: i32) -> Result<()> {
+        #[cfg(not(test))]
+        CGDisplay::warp_mouse_cursor_position(CGPoint::new(f64::from(x), f64::from(y)))
+            .map_err(|code| anyhow!("macOS local cursor restoration failed: {code}"))?;
+        #[cfg(test)]
+        let _ = (x, y); // Unit tests never move the developer's desktop cursor.
+        Ok(())
+    }
+
     /// Input event captured by the native macOS listener.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum MacosInputEvent {

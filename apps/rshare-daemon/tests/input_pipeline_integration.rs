@@ -144,6 +144,35 @@ impl LocalShortcutSuppressor for RecordingSuppressor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalHandoffEffect {
+    Suppress(bool),
+    Restore { x: i32, y: i32 },
+}
+
+#[derive(Default)]
+struct RecordingHandoffSuppressor {
+    effects: Mutex<Vec<LocalHandoffEffect>>,
+    fail_at: Option<(i32, i32)>,
+}
+
+impl LocalShortcutSuppressor for RecordingHandoffSuppressor {
+    fn set_suppressed(&self, enabled: bool) {
+        self.effects
+            .lock()
+            .unwrap()
+            .push(LocalHandoffEffect::Suppress(enabled));
+    }
+
+    fn restore_local_pointer(&self, x: i32, y: i32) -> bool {
+        self.effects
+            .lock()
+            .unwrap()
+            .push(LocalHandoffEffect::Restore { x, y });
+        self.fail_at != Some((x, y))
+    }
+}
+
 #[derive(Default)]
 struct RotatingTransport {
     generation: AtomicU64,
@@ -650,6 +679,172 @@ async fn three_machine_physical_return_from_right_allows_entering_left() {
             (released, ReliableInputEvent::ReleaseAll { reason: ReleaseAllReason::OwnershipTransfer }),
             (left, ReliableInputEvent::Enter { .. }),
         ] if *right == macbook && *released == macbook && *left == windows
+    ));
+}
+
+#[tokio::test]
+async fn three_machine_return_restores_before_unsuppression_and_ignores_stale_boundary() {
+    let (_, windows, _, router) = three_machine_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(RecordingTransport::default());
+    let (state, feeds) = input_state_channel(8);
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let suppressor = Arc::new(RecordingHandoffSuppressor::default());
+    let mut runtime = InputRuntime::new(
+        consumer,
+        router,
+        transport,
+        state,
+        Arc::new(ControlMetrics::default()),
+        injection,
+    )
+    .with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    for payload in [
+        PointerSample::Relative {
+            dx: -4,
+            dy: 0,
+            observed_x: Some(99),
+            observed_y: Some(50),
+        },
+        PointerSample::Absolute { x: 99, y: 50 },
+        PointerSample::Relative {
+            dx: -10,
+            dy: 0,
+            observed_x: Some(99),
+            observed_y: Some(50),
+        },
+        PointerSample::Absolute { x: 50, y: 50 },
+        PointerSample::Absolute { x: 0, y: 50 },
+    ] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(payload)),
+        ));
+        assert!(runtime.process_next().await);
+    }
+
+    assert!(matches!(feeds.authoritative_rx.borrow().session,
+        ControlSessionState::RemoteActive { target, .. } if target == windows
+    ));
+    let effects = suppressor.effects.lock().unwrap().clone();
+    assert_eq!(
+        effects,
+        [
+            LocalHandoffEffect::Suppress(true),
+            LocalHandoffEffect::Restore { x: 95, y: 50 },
+            LocalHandoffEffect::Suppress(false),
+            LocalHandoffEffect::Restore { x: 85, y: 50 },
+            LocalHandoffEffect::Suppress(true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failed_queued_pointer_restore_stays_local_until_fresh_native_absolute_motion() {
+    let (_, windows, macbook, router) = three_machine_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(RecordingTransport::default());
+    let (state, feeds) = input_state_channel(8);
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let suppressor = Arc::new(RecordingHandoffSuppressor {
+        fail_at: Some((0, 50)),
+        ..RecordingHandoffSuppressor::default()
+    });
+    let mut runtime = InputRuntime::new(
+        consumer,
+        router,
+        transport.clone(),
+        state,
+        Arc::new(ControlMetrics::default()),
+        injection,
+    )
+    .with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+    for dx in [-4, -100] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Relative {
+                dx,
+                dy: 0,
+                observed_x: Some(99),
+                observed_y: Some(50),
+            })),
+        ));
+        assert!(runtime.process_next().await);
+    }
+    assert_eq!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::LocalReady
+    );
+    let effects = suppressor.effects.lock().unwrap().clone();
+    assert_eq!(
+        effects,
+        [
+            LocalHandoffEffect::Suppress(true),
+            LocalHandoffEffect::Restore { x: 95, y: 50 },
+            LocalHandoffEffect::Suppress(false),
+            LocalHandoffEffect::Restore { x: 0, y: 50 },
+        ]
+    );
+    let enters = transport
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            InputDispatch::Reliable { target, frame }
+                if matches!(frame.event, ReliableInputEvent::Enter { .. }) =>
+            {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(enters, [macbook]);
+    for payload in [
+        PointerSample::Relative {
+            dx: -100,
+            dy: 0,
+            observed_x: Some(99),
+            observed_y: Some(50),
+        },
+        PointerSample::Absolute { x: 99, y: 50 },
+    ] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(payload)),
+        ));
+        assert!(runtime.process_next().await);
+    }
+    assert_eq!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::LocalReady
+    );
+    for x in [50, 0] {
+        producer.try_push(producer.capture(
+            origin(CaptureSource::PortableHook),
+            CapturedInputPayload::Continuous(ContinuousInput::Pointer(PointerSample::Absolute {
+                x,
+                y: 50,
+            })),
+        ));
+        assert!(runtime.process_next().await);
+    }
+    assert!(matches!(feeds.authoritative_rx.borrow().session,
+        ControlSessionState::RemoteActive { target, .. } if target == windows
     ));
 }
 
