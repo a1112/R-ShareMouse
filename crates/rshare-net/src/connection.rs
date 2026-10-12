@@ -2634,6 +2634,7 @@ mod tests {
             Some(Message::Heartbeat {
                 sequence: 3,
                 timestamp: 5,
+                input_session_lease: None,
             }),
             manager.event_tx.clone(),
             manager.connections.clone(),
@@ -3161,6 +3162,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 7,
                     timestamp: 9,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -3184,7 +3186,8 @@ mod tests {
             received.1,
             Message::Heartbeat {
                 sequence: 7,
-                timestamp: 9
+                timestamp: 9,
+                input_session_lease: None,
             }
         ));
     }
@@ -3274,6 +3277,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 41,
                     timestamp: 43,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -3490,6 +3494,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 7,
                     timestamp: 9,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -3579,6 +3584,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 11,
                     timestamp: 13,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -3601,7 +3607,8 @@ mod tests {
             received.1,
             Message::Heartbeat {
                 sequence: 11,
-                timestamp: 13
+                timestamp: 13,
+                input_session_lease: None,
             }
         ));
 
@@ -3726,6 +3733,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 31,
                     timestamp: 37,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -3744,7 +3752,8 @@ mod tests {
             received.1,
             Message::Heartbeat {
                 sequence: 31,
-                timestamp: 37
+                timestamp: 37,
+                input_session_lease: None,
             }
         ));
 

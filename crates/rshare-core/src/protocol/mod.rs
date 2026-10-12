@@ -10,6 +10,7 @@ use crate::{
     endpoint_events::{
         EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
     },
+    input::SessionEpoch,
     layout::LayoutGraph,
     local_controls::LocalInputDiagnosticEvent,
 };
@@ -840,6 +841,10 @@ pub enum Message {
     Heartbeat {
         sequence: u64,
         timestamp: u64,
+        /// Renew only an already active authenticated input session. This is
+        /// control metadata and must never create input or reopen an epoch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_session_lease: Option<SessionEpoch>,
     },
     /// Acknowledgment for reliable delivery
     Ack {
@@ -986,6 +991,7 @@ pub fn heartbeat_message(sequence: u64) -> Message {
     Message::Heartbeat {
         sequence,
         timestamp: timestamp_ms(),
+        input_session_lease: None,
     }
 }
 
@@ -1048,6 +1054,7 @@ mod tests {
         let msg = Message::Heartbeat {
             sequence: 100,
             timestamp: 200,
+            input_session_lease: None,
         };
         let serialized = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&serialized).unwrap();
@@ -1055,12 +1062,40 @@ mod tests {
             Message::Heartbeat {
                 sequence,
                 timestamp,
+                input_session_lease: None,
             } => {
                 assert_eq!(sequence, 100);
                 assert_eq!(timestamp, 200);
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn input_session_lease_metadata_round_trips_with_legacy_heartbeat_compatibility() {
+        let heartbeat = serde_json::json!({
+            "Heartbeat": {
+                "sequence": 0,
+                "timestamp": 200,
+                "input_session_lease": 9,
+            }
+        });
+        let message: Message = serde_json::from_value(heartbeat.clone()).unwrap();
+        assert_eq!(serde_json::to_value(message).unwrap(), heartbeat);
+
+        #[derive(Deserialize)]
+        enum LegacyMessage {
+            Heartbeat { sequence: u64, timestamp: u64 },
+        }
+        let LegacyMessage::Heartbeat {
+            sequence,
+            timestamp,
+        } = serde_json::from_value::<LegacyMessage>(heartbeat).unwrap();
+        assert_eq!((sequence, timestamp), (0, 200));
+
+        let legacy = serde_json::json!({"Heartbeat": {"sequence": 7, "timestamp": 11}});
+        let message: Message = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(message).unwrap(), legacy);
     }
 
     #[test]

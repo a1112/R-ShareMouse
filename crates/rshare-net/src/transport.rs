@@ -3989,6 +3989,7 @@ mod tests {
     }
 
     struct TwoEpochReliableFixture {
+        server_id: DeviceId,
         client_connection: QuicConnection,
         server_connection: QuicConnection,
         releases: mpsc::Receiver<TerminalReleaseEvent>,
@@ -4065,6 +4066,7 @@ mod tests {
             Some((generation, SessionEpoch(2), 1))
         );
         TwoEpochReliableFixture {
+            server_id,
             client_connection,
             server_connection,
             releases,
@@ -4748,6 +4750,7 @@ mod tests {
         let message = ControlMessageCodec::encode(&Message::Heartbeat {
             sequence: 1,
             timestamp: 1,
+            input_session_lease: None,
         })
         .unwrap();
         stream
@@ -4771,6 +4774,42 @@ mod tests {
         )
         .await
         .expect("an incomplete next frame header must still fail closed");
+    }
+
+    #[tokio::test]
+    async fn nonblocking_session_lease_is_delivered_without_input_or_write_waiter() {
+        let fixture = two_epoch_reliable_fixture().await;
+        let mut inbound = take_two_epoch_input(&fixture).await;
+        let (client_qos, _client_releases) =
+            fixture
+                .client_connection
+                .install_qos(Arc::new(PeerAuthContext {
+            peer_id: fixture.server_id,
+                    certificate_fingerprint: PeerCertificateFingerprint::from_der(b"server"),
+                    control_connection_id: ControlConnectionId::new(),
+                }));
+        client_qos
+            .try_send_control(ControlFrame::session_lease(SessionEpoch(2)))
+            .unwrap();
+        let heartbeat = timeout(Duration::from_secs(1), inbound.control_rx.recv())
+            .await
+            .expect("the detached lease heartbeat must be written, not cancelled")
+            .unwrap();
+        assert!(matches!(
+            heartbeat.into_message(),
+            Message::Heartbeat {
+                input_session_lease: Some(SessionEpoch(2)),
+                ..
+            }
+        ));
+        assert!(inbound.reliable_input_rx.try_recv().is_err());
+        assert!(fixture
+            .server_connection
+            .inner
+            .connection
+            .close_reason()
+            .is_none());
+        assert_eq!(client_qos.awaited_write_counts_for_test().2, 0);
     }
 
     #[tokio::test]
@@ -7795,7 +7834,8 @@ mod tests {
             delivered.into_message(),
             Message::Heartbeat {
                 sequence: 42,
-                timestamp: 84
+                timestamp: 84,
+                input_session_lease: None,
             }
         ));
     }
@@ -7887,6 +7927,7 @@ mod tests {
         let non_bootstrap = ControlMessageCodec::encode(&Message::Heartbeat {
             sequence: 99,
             timestamp: 101,
+            input_session_lease: None,
         })
         .unwrap();
 
@@ -7943,6 +7984,7 @@ mod tests {
         let non_bootstrap = ControlMessageCodec::encode(&Message::Heartbeat {
             sequence: 7,
             timestamp: 9,
+            input_session_lease: None,
         })
         .unwrap();
 
@@ -8590,6 +8632,7 @@ mod tests {
                 &Message::Heartbeat {
                     sequence: 1,
                     timestamp: 2,
+                    input_session_lease: None,
                 },
             )
             .await;
@@ -8634,6 +8677,7 @@ mod tests {
                     &Message::Heartbeat {
                         sequence: 1,
                         timestamp: 2,
+                        input_session_lease: None,
                     },
                 )
                 .await

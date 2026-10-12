@@ -156,6 +156,7 @@ async fn non_hello_first_message_never_enters_registry() {
         .send_message(&Message::Heartbeat {
             sequence: 1,
             timestamp: 1,
+            input_session_lease: None,
         })
         .await
         .unwrap();
@@ -230,6 +231,7 @@ async fn bootstrap_is_bounded_and_has_a_closed_allowlist() {
     assert!(!is_bootstrap_message(&Message::Heartbeat {
         sequence: 1,
         timestamp: 2,
+        input_session_lease: None,
     }));
 }
 

@@ -59,6 +59,7 @@ pub enum RealtimeSubmitResult {
     OutOfOrder,
     WrongOwnerOrEpoch,
     EpochClosed,
+    BackendFailed,
     ProtocolViolation,
     DeadlineOverflow,
     ShuttingDown,
@@ -74,6 +75,10 @@ pub enum InjectionQueueFull {
     WrongOwnerOrEpoch,
     #[error("the session epoch is already terminal")]
     EpochClosed,
+    #[error("the input session lease has expired")]
+    LeaseExpired,
+    #[error("the native input injection backend failed")]
+    BackendFailed,
     #[error("the input protocol or sequence is invalid")]
     ProtocolViolation,
     #[error("the requested lease deadline is outside the local monotonic clock range")]
@@ -236,13 +241,19 @@ impl InputInjectionHandle {
         if state.shutdown {
             return Err(InjectionQueueFull::ShuttingDown);
         }
+        if state
+            .active
+            .is_some_and(|active| active.key.owner == owner && active.backend_failed)
+        {
+            return Err(InjectionQueueFull::BackendFailed);
+        }
         let required_control_slots =
             1 + usize::from(state.active.is_some_and(|active| !active.closed));
         if state.controls.len() + required_control_slots > CONTROL_QUEUE_CAPACITY {
             return Err(InjectionQueueFull::QueueFull);
         }
         if let Some(active) = state.active {
-            if epoch.0 <= active.key.epoch.0 {
+            if active.key.owner == owner && epoch.0 <= active.key.epoch.0 {
                 return Err(InjectionQueueFull::ProtocolViolation);
             }
             if !active.closed {
@@ -258,12 +269,58 @@ impl InputInjectionHandle {
         state.active = Some(AdmissionSession {
             key,
             closed: false,
+            closed_reason: None,
+            backend_failed: false,
             last_realtime_sequence: None,
             last_reliable_sequence: None,
             lease_duration,
             deadline,
         });
         state.controls.push_back(ControlCommand::Begin { key });
+        self.inner.queue.changed.notify_one();
+        Ok(())
+    }
+
+    /// Renew an existing authenticated input lease without submitting input.
+    /// A stale heartbeat cannot open a session or revive a terminal lease.
+    pub fn renew_session_lease(
+        &self,
+        owner: AuthenticatedInputOwner,
+        epoch: SessionEpoch,
+    ) -> Result<(), InjectionQueueFull> {
+        let mut state = self.inner.queue.state.lock().unwrap();
+        if state.shutdown {
+            return Err(InjectionQueueFull::ShuttingDown);
+        }
+        let Some(mut active) = state.active else {
+            return Err(InjectionQueueFull::WrongOwnerOrEpoch);
+        };
+        let key = SessionKey { owner, epoch };
+        if active.key != key {
+            return Err(InjectionQueueFull::WrongOwnerOrEpoch);
+        }
+        if active.closed {
+            return Err(if active.backend_failed {
+                InjectionQueueFull::BackendFailed
+            } else if active.closed_reason == Some(ReleaseAllReason::Timeout) {
+                InjectionQueueFull::LeaseExpired
+            } else {
+                InjectionQueueFull::EpochClosed
+            });
+        }
+        let now = Instant::now();
+        if now >= active.deadline {
+            close_admission(&mut state, key, ReleaseAllReason::Timeout);
+            self.inner.queue.changed.notify_one();
+            return Err(InjectionQueueFull::LeaseExpired);
+        }
+        let Some(deadline) = now.checked_add(active.lease_duration) else {
+            close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
+            self.inner.queue.changed.notify_one();
+            return Err(InjectionQueueFull::DeadlineOverflow);
+        };
+        active.deadline = deadline;
+        state.active = Some(active);
         self.inner.queue.changed.notify_one();
         Ok(())
     }
@@ -288,7 +345,11 @@ impl InputInjectionHandle {
             return RealtimeSubmitResult::WrongOwnerOrEpoch;
         }
         if active.closed {
-            return RealtimeSubmitResult::EpochClosed;
+            return if active.backend_failed {
+                RealtimeSubmitResult::BackendFailed
+            } else {
+                RealtimeSubmitResult::EpochClosed
+            };
         }
         if frame.protocol_version != INPUT_PROTOCOL_VERSION {
             close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
@@ -368,7 +429,11 @@ impl InputInjectionHandle {
             return Err(InjectionQueueFull::WrongOwnerOrEpoch);
         }
         if active.closed {
-            return Err(InjectionQueueFull::EpochClosed);
+            return Err(if active.backend_failed {
+                InjectionQueueFull::BackendFailed
+            } else {
+                InjectionQueueFull::EpochClosed
+            });
         }
         if frame.protocol_version != INPUT_PROTOCOL_VERSION {
             close_admission(&mut state, key, ReleaseAllReason::BackendFailure);
@@ -432,7 +497,10 @@ impl InputInjectionHandle {
             return;
         }
         if let Some(active) = state.active.as_mut() {
-            active.closed = true;
+            if !active.closed {
+                active.closed = true;
+                active.closed_reason = Some(reason);
+            }
         }
         state.clear_ordinary();
         state.controls.clear();
@@ -661,6 +729,8 @@ struct SessionKey {
 struct AdmissionSession {
     key: SessionKey,
     closed: bool,
+    closed_reason: Option<ReleaseAllReason>,
+    backend_failed: bool,
     last_realtime_sequence: Option<u64>,
     last_reliable_sequence: Option<u64>,
     lease_duration: Duration,
@@ -836,6 +906,7 @@ fn close_admission(state: &mut QueueState, key: SessionKey, reason: ReleaseAllRe
             return;
         }
         active.closed = true;
+        active.closed_reason = Some(reason);
     } else {
         return;
     }
@@ -1000,7 +1071,13 @@ fn run_worker(
                     completed,
                 );
                 if result.is_err() {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    fail_worker_session(
+                        &queue,
+                        current.key,
+                        WorkerFailureOrigin::NativeBackend,
+                        &mut *backend,
+                        &mut remote_ledger,
+                    );
                     release_held(
                         &mut *backend,
                         &mut trusted_ledger,
@@ -1022,7 +1099,13 @@ fn run_worker(
                     queued.frame.sequence,
                 );
                 if !matches!(accepted, AcceptReliable::Accepted) {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    fail_worker_session(
+                        &queue,
+                        current.key,
+                        WorkerFailureOrigin::InputProtocol,
+                        &mut *backend,
+                        &mut remote_ledger,
+                    );
                     release_held(
                         &mut *backend,
                         &mut trusted_ledger,
@@ -1074,7 +1157,13 @@ fn run_worker(
                     completed,
                 );
                 if result.is_err() {
-                    fail_worker_session(&queue, current.key, &mut *backend, &mut remote_ledger);
+                    fail_worker_session(
+                        &queue,
+                        current.key,
+                        WorkerFailureOrigin::NativeBackend,
+                        &mut *backend,
+                        &mut remote_ledger,
+                    );
                     release_held(
                         &mut *backend,
                         &mut trusted_ledger,
@@ -1475,9 +1564,16 @@ fn release_held(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerFailureOrigin {
+    NativeBackend,
+    InputProtocol,
+}
+
 fn fail_worker_session(
     queue: &InjectionQueue,
     key: SessionKey,
+    origin: WorkerFailureOrigin,
     backend: &mut dyn InjectBackend,
     ledger: &mut PressedStateLedger,
 ) {
@@ -1486,12 +1582,19 @@ fn fail_worker_session(
         if state
             .active
             .as_ref()
-            .is_some_and(|active| active.key == key && !active.closed)
+            .is_some_and(|active| active.key == key)
         {
             if let Some(active) = state.active.as_mut() {
-                active.closed = true;
+                if !active.closed {
+                    active.closed = true;
+                    active.closed_reason = Some(ReleaseAllReason::BackendFailure);
+                }
+                if origin == WorkerFailureOrigin::NativeBackend {
+                    active.backend_failed = true;
+                }
             }
             state.clear_ordinary();
+            queue.changed.notify_one();
         }
     }
     release_held(backend, ledger, ReleaseAllReason::BackendFailure);
@@ -1578,6 +1681,548 @@ impl LocalMonotonicClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_owner() -> AuthenticatedInputOwner {
+        AuthenticatedInputOwner {
+            peer_id: rshare_core::DeviceId::new_v4(),
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        }
+    }
+
+    fn wait_for_closed_session(handle: &InputInjectionHandle) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = handle.inner.queue.state.lock().unwrap();
+        while !state.active.is_some_and(|active| active.closed) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "native backend failure must close admission"
+            );
+            state = handle
+                .inner
+                .queue
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+    }
+
+    #[test]
+    fn native_backend_failure_is_fatal_for_matching_data_and_lease_renewal() {
+        let handle = InputInjectionHandle::spawn(
+            Box::new(PermissionRevokedInjectBackend::new()),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        handle
+            .begin_session(owner, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(owner, key_frame(1, 1, b'A'))
+            .unwrap();
+        wait_for_closed_session(&handle);
+        assert_eq!(
+            handle.try_submit_reliable(owner, key_frame(1, 2, b'B')),
+            Err(InjectionQueueFull::BackendFailed)
+        );
+        assert_eq!(
+            handle.submit_realtime(
+                owner,
+                RealtimeInputFrame {
+                    protocol_version: INPUT_PROTOCOL_VERSION,
+                    session_epoch: SessionEpoch(1),
+                    sequence: 1,
+                    captured_at: MonotonicStamp::new(ClockDomainId(1), 1),
+                    payload: RealtimeInputPayload::AbsoluteAnchor { x: 1, y: 2 },
+                }
+            ),
+            RealtimeSubmitResult::BackendFailed
+        );
+        handle.request_release_through(owner, SessionEpoch(1), ReleaseAllReason::BackendFailure);
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::BackendFailed),
+            "later transport cleanup cannot mask a native worker failure"
+        );
+        assert_eq!(
+            handle.begin_session(owner, SessionEpoch(2), Duration::from_secs(2)),
+            Err(InjectionQueueFull::BackendFailed),
+            "a later Enter on the failed authenticated binding cannot reopen admission"
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct DelayedFailureInjectBackend {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        observed: std::sync::mpsc::Sender<InputEvent>,
+    }
+
+    impl InjectBackend for DelayedFailureInjectBackend {
+        fn kind(&self) -> rshare_core::BackendKind {
+            rshare_core::BackendKind::Portable
+        }
+
+        fn health(&self) -> rshare_core::BackendHealth {
+            rshare_core::BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+            if matches!(
+                event,
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'A'),
+                    state: ButtonState::Pressed
+                }
+            ) {
+                self.entered.take().unwrap().send(())?;
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))?;
+                anyhow::bail!("old owner's delayed native injection failed");
+            }
+            self.observed.send(event)?;
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn delayed_native_failure_from_previous_owner_cannot_poison_replacement() {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let (observed, observed_rx) = std::sync::mpsc::channel();
+        let handle = InputInjectionHandle::spawn(
+            Box::new(DelayedFailureInjectBackend {
+                entered: Some(entered),
+                resume: Mutex::new(resume_rx),
+                observed,
+            }),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let previous = input_owner();
+        let replacement = AuthenticatedInputOwner {
+            peer_id: previous.peer_id,
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        handle
+            .begin_session(previous, SessionEpoch(42), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(previous, key_frame(42, 1, b'A'))
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle
+            .begin_session(replacement, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(replacement, key_frame(1, 1, b'B'))
+            .unwrap();
+        resume.send(()).unwrap();
+        loop {
+            if matches!(
+                observed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'B'),
+                    state: ButtonState::Pressed
+                }
+            ) {
+                break;
+            }
+        }
+        handle
+            .renew_session_lease(replacement, SessionEpoch(1))
+            .unwrap();
+        handle
+            .try_submit_reliable(replacement, key_frame(1, 2, b'C'))
+            .unwrap();
+        assert_eq!(
+            handle.try_submit_reliable(previous, key_frame(42, 2, b'D')),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn transport_backend_failure_cleanup_stays_a_benign_terminal() {
+        let handle = InputInjectionHandle::spawn(
+            Box::<RecordingInjectBackend>::default(),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        handle
+            .begin_session(owner, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        handle.request_release_through(owner, SessionEpoch(1), ReleaseAllReason::BackendFailure);
+        assert_eq!(
+            handle.try_submit_reliable(owner, key_frame(1, 1, b'A')),
+            Err(InjectionQueueFull::EpochClosed)
+        );
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::EpochClosed)
+        );
+        handle.shutdown().unwrap();
+    }
+
+    fn key_frame(epoch: u64, sequence: u64, key: u8) -> ReliableInputFrame {
+        ReliableInputFrame {
+            protocol_version: INPUT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(epoch),
+            sequence,
+            captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+            event: ReliableInputEvent::Key {
+                keycode: KeyCode::Char(key).to_raw(),
+                state: KeyState::Pressed,
+            },
+        }
+    }
+
+    #[test]
+    fn reconnected_owner_can_restart_epoch_after_previous_generation_closed() {
+        let handle = InputInjectionHandle::spawn(
+            Box::<RecordingInjectBackend>::default(),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let previous = input_owner();
+        let replacement = AuthenticatedInputOwner {
+            peer_id: previous.peer_id,
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        handle
+            .begin_session(previous, SessionEpoch(42), Duration::from_secs(2))
+            .unwrap();
+        handle.request_release_through(previous, SessionEpoch(42), ReleaseAllReason::SessionEnded);
+        handle
+            .begin_session(replacement, SessionEpoch(1), Duration::from_secs(2))
+            .expect("epoch ordering belongs to the authenticated connection owner");
+        assert_eq!(
+            handle.try_submit_reliable(previous, key_frame(42, 1, b'A')),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        handle.request_release_through(previous, SessionEpoch(u64::MAX), ReleaseAllReason::Timeout);
+        handle
+            .try_submit_reliable(replacement, key_frame(1, 1, b'B'))
+            .expect("old generation cleanup must not close the replacement");
+        assert!(handle
+            .wait_for_timing(SessionEpoch(1), true, 1, Duration::from_secs(1))
+            .is_some());
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn same_authenticated_owner_keeps_epoch_replay_protection() {
+        let handle = InputInjectionHandle::spawn(
+            Box::<RecordingInjectBackend>::default(),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        handle
+            .begin_session(owner, SessionEpoch(42), Duration::from_secs(2))
+            .unwrap();
+        handle.request_release_through(owner, SessionEpoch(42), ReleaseAllReason::SessionEnded);
+        for replay in [1, 42] {
+            assert_eq!(
+                handle.begin_session(owner, SessionEpoch(replay), Duration::from_secs(2)),
+                Err(InjectionQueueFull::ProtocolViolation)
+            );
+        }
+        handle
+            .begin_session(owner, SessionEpoch(43), Duration::from_secs(2))
+            .expect("the same connection may enter only a newer epoch");
+        handle.shutdown().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct SharedRecordingInjectBackend {
+        events: Arc<Mutex<Vec<InputEvent>>>,
+        emitted: Option<std::sync::mpsc::Sender<InputEvent>>,
+    }
+
+    impl InjectBackend for SharedRecordingInjectBackend {
+        fn kind(&self) -> rshare_core::BackendKind {
+            rshare_core::BackendKind::Portable
+        }
+
+        fn health(&self) -> rshare_core::BackendHealth {
+            rshare_core::BackendHealth::Healthy
+        }
+
+        fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            if let Some(emitted) = &self.emitted {
+                let _ = emitted.send(event);
+            }
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn changing_authenticated_owner_releases_held_input_before_lower_epoch() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (emitted, observed) = std::sync::mpsc::channel();
+        let handle = InputInjectionHandle::spawn(
+            Box::new(SharedRecordingInjectBackend {
+                events: events.clone(),
+                emitted: Some(emitted),
+            }),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let previous = input_owner();
+        let replacement = input_owner();
+        handle
+            .begin_session(previous, SessionEpoch(42), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(previous, key_frame(42, 1, b'A'))
+            .unwrap();
+        assert!(handle
+            .wait_for_timing(SessionEpoch(42), true, 1, Duration::from_secs(1))
+            .is_some());
+        handle
+            .begin_session(replacement, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(replacement, key_frame(1, 1, b'B'))
+            .unwrap();
+        // Observe actual injection rather than timing's epoch-only lookup,
+        // which can still contain the previous authenticated owner's 42.
+        loop {
+            if matches!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'B'),
+                    state: ButtonState::Pressed
+                }
+            ) {
+                break;
+            }
+        }
+        let observed = events.lock().unwrap();
+        assert!(matches!(
+            observed.as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'A'),
+                    state: ButtonState::Pressed
+                },
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'A'),
+                    state: ButtonState::Released
+                },
+                InputEvent::Key {
+                    keycode: KeyCode::Char(b'B'),
+                    state: ButtonState::Pressed
+                }
+            ]
+        ));
+        drop(observed);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_lease_renewal_preserves_idle_input_without_injecting_events() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let handle = InputInjectionHandle::spawn(
+            Box::new(SharedRecordingInjectBackend {
+                events: events.clone(),
+                emitted: None,
+            }),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        handle
+            .begin_session(owner, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .try_submit_reliable(owner, key_frame(1, 1, b'A'))
+            .unwrap();
+        assert!(handle
+            .wait_for_timing(SessionEpoch(1), true, 1, Duration::from_secs(1))
+            .is_some());
+        thread::sleep(Duration::from_millis(1200));
+        handle.renew_session_lease(owner, SessionEpoch(1)).unwrap();
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            events.lock().unwrap().len(),
+            1,
+            "renewal cannot inject or release a key"
+        );
+        handle
+            .try_submit_reliable(owner, key_frame(1, 2, b'B'))
+            .expect("the renewed lease must remain open past its original deadline");
+        assert!(handle
+            .wait_for_timing(SessionEpoch(1), true, 2, Duration::from_secs(1))
+            .is_some());
+        handle.request_release_through(owner, SessionEpoch(1), ReleaseAllReason::SessionEnded);
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::EpochClosed)
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_lease_renewal_stopping_releases_pressed_state_and_reports_expiry() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (emitted, observed) = std::sync::mpsc::channel();
+        let handle = InputInjectionHandle::spawn(
+            Box::new(SharedRecordingInjectBackend {
+                events,
+                emitted: Some(emitted),
+            }),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        handle
+            .begin_session(owner, SessionEpoch(1), Duration::from_millis(100))
+            .unwrap();
+        handle
+            .try_submit_reliable(owner, key_frame(1, 1, b'A'))
+            .unwrap();
+        assert!(matches!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputEvent::Key {
+                keycode: KeyCode::Char(b'A'),
+                state: ButtonState::Pressed
+            }
+        ));
+        handle.renew_session_lease(owner, SessionEpoch(1)).unwrap();
+        assert!(matches!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputEvent::Key {
+                keycode: KeyCode::Char(b'A'),
+                state: ButtonState::Released
+            }
+        ));
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::LeaseExpired)
+        );
+        // Normal data admission retains its existing terminal-epoch contract.
+        assert_eq!(
+            handle.try_submit_reliable(owner, key_frame(1, 2, b'B')),
+            Err(InjectionQueueFull::EpochClosed)
+        );
+        handle.request_release_all_sources(ReleaseAllReason::SessionEnded);
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::LeaseExpired),
+            "later release notifications must preserve the original timeout cause"
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_lease_renewal_cannot_extend_another_generation_or_reopen_explicit_release() {
+        let handle = InputInjectionHandle::spawn(
+            Box::<RecordingInjectBackend>::default(),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let previous = input_owner();
+        let replacement = AuthenticatedInputOwner {
+            peer_id: previous.peer_id,
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        handle
+            .begin_session(previous, SessionEpoch(42), Duration::from_secs(2))
+            .unwrap();
+        handle
+            .begin_session(replacement, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        let deadline = handle
+            .inner
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .unwrap()
+            .deadline;
+        assert_eq!(
+            handle.renew_session_lease(previous, SessionEpoch(42)),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        assert_eq!(
+            handle
+                .inner
+                .queue
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .unwrap()
+                .deadline,
+            deadline,
+            "a stale generation cannot extend the replacement's lease"
+        );
+        handle.request_release_all_sources(ReleaseAllReason::SessionEnded);
+        assert_eq!(
+            handle.renew_session_lease(replacement, SessionEpoch(1)),
+            Err(InjectionQueueFull::EpochClosed)
+        );
+        handle.shutdown().unwrap();
+        assert_eq!(
+            handle.renew_session_lease(replacement, SessionEpoch(1)),
+            Err(InjectionQueueFull::ShuttingDown)
+        );
+    }
+
+    #[test]
+    fn session_lease_renewal_rejects_wrong_owner_epoch_and_expired_session() {
+        let handle = InputInjectionHandle::spawn(
+            Box::<RecordingInjectBackend>::default(),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = input_owner();
+        let wrong_owner = AuthenticatedInputOwner {
+            peer_id: owner.peer_id,
+            control_connection_id: rshare_core::ControlConnectionId::new(),
+        };
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        handle
+            .begin_session(owner, SessionEpoch(1), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            handle.renew_session_lease(wrong_owner, SessionEpoch(1)),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(2)),
+            Err(InjectionQueueFull::WrongOwnerOrEpoch)
+        );
+        handle
+            .begin_session(owner, SessionEpoch(2), Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            handle.renew_session_lease(owner, SessionEpoch(2)),
+            Err(InjectionQueueFull::LeaseExpired)
+        );
+        handle.shutdown().unwrap();
+    }
 
     #[test]
     fn folder_drop_receipt_requires_successful_remote_release_injection() {

@@ -1048,6 +1048,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 10,
                     timestamp: 20,
+                    input_session_lease: None,
                 },
             ),
         )
@@ -1134,6 +1135,7 @@ mod tests {
                 Message::Heartbeat {
                     sequence: 1,
                     timestamp: 1,
+                    input_session_lease: None,
                 },
             )
             .await
@@ -1146,6 +1148,7 @@ mod tests {
             .broadcast(Message::Heartbeat {
                 sequence: 2,
                 timestamp: 2,
+                input_session_lease: None,
             })
             .await
             .unwrap();
@@ -1290,7 +1293,8 @@ mod tests {
                     frame.into_message(),
                     Message::Heartbeat {
                         sequence: 1,
-                        timestamp: 2
+                        timestamp: 2,
+                        input_session_lease: None,
                     }
                 ));
             }
@@ -1358,6 +1362,144 @@ mod tests {
         } = manager.receivers();
         assert!(!authenticated_peers.is_closed());
         assert!(!events.is_closed());
+    }
+
+    #[tokio::test]
+    async fn two_peer_input_consumers_survive_release_reentry_and_reconnect_epoch_reset() {
+        use rshare_core::{
+            ClockDomainId, MonotonicStamp, ReleaseAllReason, ReliableInputEvent,
+            ReliableInputFrame, SessionEpoch, INPUT_PROTOCOL_VERSION,
+        };
+
+        fn frame(epoch: u64, sequence: u64, terminal: bool) -> ReliableInputFrame {
+            ReliableInputFrame {
+                protocol_version: INPUT_PROTOCOL_VERSION,
+                session_epoch: SessionEpoch(epoch),
+                sequence,
+                captured_at: MonotonicStamp::new(ClockDomainId(1), sequence),
+                event: if terminal {
+                    ReliableInputEvent::ReleaseAll {
+                        reason: ReleaseAllReason::SessionEnded,
+                    }
+                } else {
+                    ReliableInputEvent::Enter {
+                        target_display_id: "primary".into(),
+                        x: 0,
+                        y: 0,
+                    }
+                },
+            }
+        }
+
+        async fn deliver(
+            controller: &NetworkManager,
+            peer: &mut PeerInbound,
+            peer_id: DeviceId,
+            expected: ReliableInputFrame,
+        ) {
+            controller
+                .input_registry()
+                .peer(&peer_id)
+                .unwrap()
+                .transport
+                .try_send_reliable_input(expected.clone())
+                .unwrap();
+            let received =
+                tokio::time::timeout(Duration::from_secs(2), peer.reliable_input_rx.recv())
+                    .await
+                    .expect("manager-owned typed input consumer must receive the next frame")
+                    .expect("input lane must remain open across release and reentry");
+            assert_eq!(received, expected);
+        }
+
+        let controller_id = DeviceId::new_v4();
+        let left_id = DeviceId::new_v4();
+        let right_id = DeviceId::new_v4();
+        let mut controller =
+            NetworkManager::isolated_for_test(controller_id, "controller".into(), "host".into());
+        let mut left = NetworkManager::isolated_for_test(left_id, "left".into(), "host".into());
+        let mut right = NetworkManager::isolated_for_test(right_id, "right".into(), "host".into());
+        for manager in [&mut controller, &mut left, &mut right] {
+            manager.config.bind_address = "127.0.0.1:0".into();
+            manager.config.discovery_port = 0;
+            manager.start().await.unwrap();
+        }
+        // Retain every manager's public receiver ownership, including the
+        // controller's passive input lanes, rather than bypassing publication.
+        let _controller_receivers = controller.receivers();
+        let mut left_receivers = left.receivers();
+        let mut right_receivers = right.receivers();
+        let left_address = left
+            .connection
+            .lock()
+            .await
+            .transport_local_addr()
+            .unwrap()
+            .to_string();
+        let right_address = right
+            .connection
+            .lock()
+            .await
+            .transport_local_addr()
+            .unwrap()
+            .to_string();
+        controller.connect_to(left_id, &left_address).await.unwrap();
+        controller
+            .connect_to(right_id, &right_address)
+            .await
+            .unwrap();
+        let mut left_input = tokio::time::timeout(
+            Duration::from_secs(2),
+            left_receivers.authenticated_peers.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut right_input = tokio::time::timeout(
+            Duration::from_secs(2),
+            right_receivers.authenticated_peers.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let old_left_generation = left_input.auth.control_connection_id;
+        assert_eq!(left_input.auth.peer_id, controller_id);
+        assert_eq!(right_input.auth.peer_id, controller_id);
+
+        deliver(&controller, &mut right_input, right_id, frame(42, 1, false)).await;
+        deliver(&controller, &mut right_input, right_id, frame(42, 2, true)).await;
+        deliver(&controller, &mut left_input, left_id, frame(43, 1, false)).await;
+        deliver(&controller, &mut left_input, left_id, frame(43, 2, true)).await;
+        deliver(&controller, &mut right_input, right_id, frame(44, 1, false)).await;
+        deliver(&controller, &mut right_input, right_id, frame(44, 2, true)).await;
+        assert!(controller.is_connected(&left_id).await);
+        assert!(controller.is_connected(&right_id).await);
+
+        controller.disconnect_from(&left_id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while left.is_connected(&controller_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old generation must leave the manager before reconnection");
+        controller.connect_to(left_id, &left_address).await.unwrap();
+        let mut replacement = tokio::time::timeout(
+            Duration::from_secs(2),
+            left_receivers.authenticated_peers.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(replacement.auth.control_connection_id, old_left_generation);
+        deliver(&controller, &mut replacement, left_id, frame(1, 1, false)).await;
+        deliver(&controller, &mut replacement, left_id, frame(1, 2, true)).await;
+        deliver(&controller, &mut right_input, right_id, frame(45, 1, false)).await;
+        assert!(controller.is_connected(&left_id).await);
+        assert!(controller.is_connected(&right_id).await);
+        for manager in [&mut controller, &mut left, &mut right] {
+            manager.stop().await.unwrap();
+        }
     }
 
     #[tokio::test]

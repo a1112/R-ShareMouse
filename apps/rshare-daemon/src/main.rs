@@ -7989,6 +7989,45 @@ async fn main() -> Result<()> {
             while let Some(event) = events.recv().await {
                 let event = match into_authenticated_network_message(event) {
                     Ok((from, control_connection_id, message)) => {
+                        if let Message::Heartbeat {
+                            input_session_lease: Some(epoch),
+                            ..
+                        } = &message
+                        {
+                            // This control-only renewal must never inject an OS
+                            // event, reopen a retired lease, or affect a newer
+                            // authenticated connection generation.
+                            if let Some(peer) = input_registry.peer(&from).filter(|peer| {
+                                peer.auth.control_connection_id == control_connection_id
+                            }) {
+                                let owner = rshare_core::AuthenticatedInputOwner {
+                                    peer_id: from,
+                                    control_connection_id,
+                                };
+                                match injection.renew_session_lease(owner, *epoch) {
+                                    Err(rshare_input::InjectionQueueFull::LeaseExpired) => {
+                                        tracing::warn!(
+                                            peer = %from,
+                                            generation = ?control_connection_id,
+                                            epoch = epoch.0,
+                                            "input session lease expired; closing its generation for recovery"
+                                        );
+                                        peer.transport.close_input_lease_expired();
+                                    }
+                                    Err(rshare_input::InjectionQueueFull::BackendFailed) => {
+                                        tracing::error!(
+                                            peer = %from,
+                                            generation = ?control_connection_id,
+                                            epoch = epoch.0,
+                                            "input injection backend failed; closing its generation for recovery"
+                                        );
+                                        peer.transport.close_input_backend_failed();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            continue;
+                        }
                         let reconcile = network_message_may_mutate_ui(&message);
                         handle_network_message(
                             &state,

@@ -90,6 +90,40 @@ struct BlockingInjectBackend {
     gate: Arc<BlockingInjectGate>,
 }
 
+#[derive(Debug)]
+struct FailingInjectBackend {
+    events: Arc<Mutex<Vec<InputEvent>>>,
+}
+
+impl InjectBackend for FailingInjectBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Portable
+    }
+    fn health(&self) -> BackendHealth {
+        BackendHealth::Healthy
+    }
+    fn inject(&mut self, event: InputEvent) -> anyhow::Result<()> {
+        let fail = matches!(
+            event,
+            InputEvent::Key {
+                keycode: KeyCode::Char(b'F'),
+                state: CaptureButtonState::Pressed,
+            }
+        );
+        self.events.lock().unwrap().push(event);
+        if fail {
+            anyhow::bail!("deliberate backend injection failure");
+        }
+        Ok(())
+    }
+    fn inject_relative_pointer(&mut self, _dx: i32, _dy: i32) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
+}
+
 impl InjectBackend for BlockingInjectBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Portable
@@ -1668,6 +1702,446 @@ fn peer(
         realtime_tx,
         reliable_tx,
     )
+}
+
+fn incoming_reliable(epoch: u64, sequence: u64, event: ReliableInputEvent) -> ReliableInputFrame {
+    ReliableInputFrame {
+        protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+        session_epoch: SessionEpoch(epoch),
+        sequence,
+        captured_at: stamp(sequence + 1),
+        event,
+    }
+}
+
+fn incoming_enter(epoch: u64) -> ReliableInputFrame {
+    incoming_reliable(
+        epoch,
+        0,
+        ReliableInputEvent::Enter {
+            target_display_id: "primary".to_owned(),
+            x: 0,
+            y: 0,
+        },
+    )
+}
+
+async fn wait_for_incoming_timing(
+    injection: &InputInjectionHandle,
+    reliable: &mpsc::Sender<ReliableInputFrame>,
+    epoch: u64,
+    sequence: u64,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while injection.latest_timing().is_none_or(|sample| {
+        sample.epoch != SessionEpoch(epoch) || !sample.reliable || sample.sequence != sequence
+    }) {
+        assert!(
+            !reliable.is_closed(),
+            "authenticated reliable consumer must remain alive"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "incoming {epoch}:{sequence} never reached injection"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn independent_terminal_release_keeps_peer_consumer_alive_for_next_enter() {
+    assert_peer_consumer_survives_independent_terminal_release(
+        true,
+        ReleaseAllReason::SessionEnded,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stale_closed_epoch_data_keeps_peer_consumer_alive_for_next_enter() {
+    assert_peer_consumer_survives_independent_terminal_release(
+        false,
+        ReleaseAllReason::SessionEnded,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn independent_backend_failure_cleanup_still_keeps_peer_consumer_alive() {
+    assert_peer_consumer_survives_independent_terminal_release(
+        true,
+        ReleaseAllReason::BackendFailure,
+    )
+    .await;
+}
+
+async fn assert_peer_consumer_survives_independent_terminal_release(
+    with_terminal_frame: bool,
+    terminal_reason: ReleaseAllReason,
+) {
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let owner = rshare_core::AuthenticatedInputOwner {
+        peer_id: DeviceId::new_v4(),
+        control_connection_id: ControlConnectionId::new(),
+    };
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let worker = tokio::spawn(run_authenticated_input_peers(
+        peer_rx,
+        injection.clone(),
+        Duration::from_secs(2),
+        shutdown_rx,
+    ));
+    let (inbound, realtime, reliable) = peer(owner.peer_id, owner.control_connection_id);
+    peer_tx.send(inbound).await.unwrap();
+    reliable.send(incoming_enter(1)).await.unwrap();
+    wait_for_incoming_timing(&injection, &reliable, 1, 0).await;
+
+    injection.request_release_through(owner, SessionEpoch(1), terminal_reason);
+    let stale_event = if with_terminal_frame {
+        ReliableInputEvent::ReleaseAll {
+            reason: terminal_reason,
+        }
+    } else {
+        ReliableInputEvent::Key {
+            keycode: 0x43,
+            state: KeyState::Pressed,
+        }
+    };
+    reliable
+        .send(incoming_reliable(1, 1, stale_event))
+        .await
+        .unwrap();
+    reliable.send(incoming_enter(2)).await.unwrap();
+    reliable
+        .send(incoming_reliable(
+            2,
+            1,
+            ReliableInputEvent::Key {
+                keycode: 0x42,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &reliable, 2, 1).await;
+    realtime.send(RealtimeInputFrame {
+        protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+        session_epoch: SessionEpoch(1),
+        sequence: 99,
+        captured_at: stamp(99),
+        payload: rshare_core::RealtimeInputPayload::RelativeMouse { dx: 10, dy: 0 },
+    });
+    reliable
+        .send(incoming_reliable(
+            1,
+            2,
+            ReliableInputEvent::Key {
+                keycode: 0x43,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    reliable
+        .send(incoming_reliable(
+            2,
+            2,
+            ReliableInputEvent::Key {
+                keycode: 0x42,
+                state: KeyState::Released,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &reliable, 2, 2).await;
+    assert!(!reliable.is_closed());
+    shutdown_tx.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn actual_backend_error_releases_held_input_and_closes_peer_consumer() {
+    assert_actual_backend_failure_closes_consumer(false).await;
+}
+
+#[tokio::test]
+async fn actual_backend_error_closes_peer_consumer_on_next_realtime_frame() {
+    assert_actual_backend_failure_closes_consumer(true).await;
+}
+
+async fn assert_actual_backend_failure_closes_consumer(next_realtime: bool) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injection = InputInjectionHandle::spawn(
+        Box::new(FailingInjectBackend {
+            events: events.clone(),
+        }),
+        InjectionActorConfig::default(),
+    )
+    .unwrap();
+    let owner = rshare_core::AuthenticatedInputOwner {
+        peer_id: DeviceId::new_v4(),
+        control_connection_id: ControlConnectionId::new(),
+    };
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let worker = tokio::spawn(run_authenticated_input_peers(
+        peer_rx,
+        injection.clone(),
+        Duration::from_secs(2),
+        shutdown_rx,
+    ));
+    let (inbound, realtime, reliable) = peer(owner.peer_id, owner.control_connection_id);
+    peer_tx.send(inbound).await.unwrap();
+    reliable.send(incoming_enter(1)).await.unwrap();
+    reliable
+        .send(incoming_reliable(
+            1,
+            1,
+            ReliableInputEvent::Key {
+                keycode: 0x43,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &reliable, 1, 1).await;
+    reliable
+        .send(incoming_reliable(
+            1,
+            2,
+            ReliableInputEvent::Key {
+                keycode: 0x46,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while injection
+        .renew_session_lease(owner, SessionEpoch(1))
+        .is_ok()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "backend error did not close actor admission"
+        );
+        tokio::task::yield_now().await;
+    }
+    if next_realtime {
+        realtime.send(RealtimeInputFrame {
+            protocol_version: rshare_core::INPUT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(1),
+            sequence: 0,
+            captured_at: stamp(4),
+            payload: rshare_core::RealtimeInputPayload::RelativeMouse { dx: 10, dy: 0 },
+        });
+    } else {
+        reliable
+            .send(incoming_reliable(
+                1,
+                3,
+                ReliableInputEvent::Key {
+                    keycode: 0x44,
+                    state: KeyState::Pressed,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), reliable.closed())
+        .await
+        .expect("actual backend failure must close the authenticated input consumer");
+    let release_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !events.lock().unwrap().iter().any(|event| {
+        matches!(
+            event,
+            InputEvent::Key {
+                keycode: KeyCode::Char(b'C'),
+                state: CaptureButtonState::Released
+            }
+        )
+    }) {
+        assert!(
+            tokio::time::Instant::now() < release_deadline,
+            "backend failure left prior held key pressed"
+        );
+        tokio::task::yield_now().await;
+    }
+    let observed = events.lock().unwrap().clone();
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        InputEvent::Key {
+            keycode: KeyCode::Char(b'C'),
+            state: CaptureButtonState::Released
+        }
+    )));
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        InputEvent::Key {
+            keycode: KeyCode::Char(b'D'),
+            state: CaptureButtonState::Pressed
+        }
+    )));
+    shutdown_tx.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnected_same_peer_epoch_restarts_after_old_generation_epoch_42() {
+    let gate = Arc::new(BlockingInjectGate::default());
+    let injection = InputInjectionHandle::spawn(
+        Box::new(BlockingInjectBackend { gate: gate.clone() }),
+        InjectionActorConfig::default(),
+    )
+    .unwrap();
+    let peer_id = DeviceId::new_v4();
+    let old_owner = rshare_core::AuthenticatedInputOwner {
+        peer_id,
+        control_connection_id: ControlConnectionId::new(),
+    };
+    let new_connection = ControlConnectionId::new();
+    let (peer_tx, peer_rx) = mpsc::channel(2);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let worker = tokio::spawn(run_authenticated_input_peers(
+        peer_rx,
+        injection.clone(),
+        Duration::from_secs(2),
+        shutdown_rx,
+    ));
+    let (old, _old_realtime, old_reliable) = peer(peer_id, old_owner.control_connection_id);
+    peer_tx.send(old).await.unwrap();
+    old_reliable.send(incoming_enter(42)).await.unwrap();
+    old_reliable
+        .send(incoming_reliable(
+            42,
+            1,
+            ReliableInputEvent::Key {
+                keycode: 0x43,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &old_reliable, 42, 1).await;
+
+    let (new, _new_realtime, new_reliable) = peer(peer_id, new_connection);
+    peer_tx.send(new).await.unwrap();
+    new_reliable.send(incoming_enter(1)).await.unwrap();
+    new_reliable
+        .send(incoming_reliable(
+            1,
+            1,
+            ReliableInputEvent::Key {
+                keycode: 0x42,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &new_reliable, 1, 1).await;
+    old_reliable
+        .send(incoming_reliable(
+            42,
+            2,
+            ReliableInputEvent::Key {
+                keycode: 0x44,
+                state: KeyState::Pressed,
+            },
+        ))
+        .await
+        .unwrap();
+    injection.request_release_through(old_owner, SessionEpoch(42), ReleaseAllReason::SessionEnded);
+    new_reliable
+        .send(incoming_reliable(
+            1,
+            2,
+            ReliableInputEvent::Key {
+                keycode: 0x42,
+                state: KeyState::Released,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_incoming_timing(&injection, &new_reliable, 1, 2).await;
+    let events = gate.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        InputEvent::Key {
+            keycode: KeyCode::Char(b'B'),
+            state: CaptureButtonState::Pressed
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        InputEvent::Key {
+            keycode: KeyCode::Char(b'D'),
+            state: CaptureButtonState::Pressed
+        }
+    )));
+    assert!(!new_reliable.is_closed());
+    shutdown_tx.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_terminal_protocol_and_reliable_sequence_still_close_peer_consumer() {
+    for malformed_terminal in [true, false] {
+        let injection = InputInjectionHandle::spawn(
+            Box::new(NoopInjectBackend),
+            InjectionActorConfig::default(),
+        )
+        .unwrap();
+        let owner = rshare_core::AuthenticatedInputOwner {
+            peer_id: DeviceId::new_v4(),
+            control_connection_id: ControlConnectionId::new(),
+        };
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let worker = tokio::spawn(run_authenticated_input_peers(
+            peer_rx,
+            injection.clone(),
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+        let (inbound, _realtime, reliable) = peer(owner.peer_id, owner.control_connection_id);
+        peer_tx.send(inbound).await.unwrap();
+        reliable.send(incoming_enter(1)).await.unwrap();
+        wait_for_incoming_timing(&injection, &reliable, 1, 0).await;
+        let invalid = if malformed_terminal {
+            injection.request_release_through(
+                owner,
+                SessionEpoch(1),
+                ReleaseAllReason::SessionEnded,
+            );
+            let mut frame = incoming_reliable(
+                1,
+                1,
+                ReliableInputEvent::ReleaseAll {
+                    reason: ReleaseAllReason::SessionEnded,
+                },
+            );
+            frame.protocol_version += 1;
+            frame
+        } else {
+            incoming_reliable(
+                1,
+                2,
+                ReliableInputEvent::Key {
+                    keycode: 0x42,
+                    state: KeyState::Pressed,
+                },
+            )
+        };
+        reliable.send(invalid).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reliable.closed())
+            .await
+            .expect("invalid protocol or skipped reliable sequence must fail closed");
+        shutdown_tx.send(()).unwrap();
+        worker.await.unwrap();
+    }
 }
 
 #[tokio::test]

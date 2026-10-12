@@ -11,7 +11,7 @@ use rshare_input::{
     CapturedInput, CapturedInputPayload, ContinuousInput, IngressEvent, IngressFault,
     InjectionQueueFull, InputEvent, InputInjectionHandle, PointerSample, SemanticInputConsumer,
 };
-use rshare_net::qos::{ConnectionRegistry, RegisteredPeer};
+use rshare_net::qos::{ConnectionRegistry, ControlFrame, RegisteredPeer, TransportSendError};
 use rshare_net::PeerInbound;
 use rshare_platform::SystemSafetyEvent;
 use tokio::sync::{broadcast, mpsc};
@@ -111,6 +111,16 @@ pub trait InputTransport: Send + Sync + 'static {
     fn try_send_realtime(&self, binding: &Self::Binding, frame: RealtimeInputFrame);
     fn try_send_reliable(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool;
 
+    /// Non-injecting renewal for an already active authenticated session.
+    /// Admission is bounded and never waits for a network write.
+    fn try_send_session_lease(
+        &self,
+        _binding: &Self::Binding,
+        _epoch: SessionEpoch,
+    ) -> Result<(), TransportSendError> {
+        Ok(())
+    }
+
     /// Retry cleanup without requiring an Enter on a newly rebound transport.
     /// Real transports must retain their retired-epoch and ownership guards.
     fn try_send_emergency(&self, binding: &Self::Binding, frame: ReliableInputFrame) -> bool {
@@ -138,6 +148,20 @@ impl InputTransport for ConnectionRegistry {
             .transport
             .try_confirm_or_send_terminal_release(frame)
             .is_ok()
+    }
+
+    fn try_send_session_lease(
+        &self,
+        binding: &Self::Binding,
+        epoch: SessionEpoch,
+    ) -> Result<(), TransportSendError> {
+        let result = binding
+            .transport
+            .try_send_control(ControlFrame::session_lease(epoch));
+        if result.is_err_and(|error| error != TransportSendError::ControlLaneFull) {
+            binding.transport.close_input_lease_expired();
+        }
+        result
     }
 }
 
@@ -171,6 +195,7 @@ struct PendingEmergencyRelease {
 }
 
 const EMERGENCY_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const INPUT_SESSION_LEASE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl<T: InputTransport> InputRuntime<T> {
     pub fn new(
@@ -284,6 +309,11 @@ impl<T: InputTransport> InputRuntime<T> {
             EMERGENCY_RELEASE_RETRY_INTERVAL,
         );
         release_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut session_lease = tokio::time::interval_at(
+            tokio::time::Instant::now() + INPUT_SESSION_LEASE_INTERVAL,
+            INPUT_SESSION_LEASE_INTERVAL,
+        );
+        session_lease.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -297,6 +327,7 @@ impl<T: InputTransport> InputRuntime<T> {
                     }
                 }
                 _ = release_retry.tick() => self.retry_pending_emergency_release(),
+                _ = session_lease.tick() => self.renew_remote_session_lease(),
                 event = self.ingress.recv_event() => {
                     match event {
                         Some(event) => self.process_ingress_event(event),
@@ -327,6 +358,11 @@ impl<T: InputTransport> InputRuntime<T> {
             EMERGENCY_RELEASE_RETRY_INTERVAL,
         );
         release_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut session_lease = tokio::time::interval_at(
+            tokio::time::Instant::now() + INPUT_SESSION_LEASE_INTERVAL,
+            INPUT_SESSION_LEASE_INTERVAL,
+        );
+        session_lease.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -346,6 +382,7 @@ impl<T: InputTransport> InputRuntime<T> {
                     }
                 }
                 _ = release_retry.tick() => self.retry_pending_emergency_release(),
+                _ = session_lease.tick() => self.renew_remote_session_lease(),
                 event = self.ingress.recv_event() => {
                     match event {
                         Some(event) => self.process_ingress_event(event),
@@ -660,6 +697,27 @@ impl<T: InputTransport> InputRuntime<T> {
         }
     }
 
+    fn renew_remote_session_lease(&mut self) {
+        // Bindings are installed by Enter and removed by terminal release.
+        // Renew their captured generation, rather than rebinding an old input
+        // session onto a replacement transport.
+        let disconnected = self.active_transports.iter().find_map(|(target, binding)| {
+            match self.transports.try_send_session_lease(binding, self.current_epoch) {
+                Ok(()) | Err(TransportSendError::ControlLaneFull) => None,
+                Err(error) => {
+                    tracing::warn!(target = %target, error = %error, "active input lease transport unavailable");
+                    Some(*target)
+                }
+            }
+        });
+        if let Some(peer) = disconnected {
+            self.handle_command(RouterCommand::ConnectivityChanged {
+                peer,
+                connected: false,
+            });
+        }
+    }
+
     fn retry_pending_emergency_release(&mut self) {
         let Some(pending) = self.pending_emergency_release.as_ref() else {
             return;
@@ -961,6 +1019,7 @@ async fn run_peer_input_lanes(
         }
     });
     let mut active_epoch = None;
+    let mut retired_through = None;
     let mut terminal_epoch = None;
     let mut realtime_open = true;
     let mut reliable_open = true;
@@ -995,41 +1054,98 @@ async fn run_peer_input_lanes(
             }
             reliable => reliable,
         };
-        if !is_current_generation(&generations, owner) {
+        // Serialize the generation check with admission so a replaced worker
+        // cannot open an old session after its replacement has been published.
+        // All operations below are nonblocking actor-queue admission calls.
+        let current_generations = generations.lock().unwrap();
+        if current_generations.get(&owner.peer_id) != Some(&owner.control_connection_id) {
             continue;
         }
         let epoch = frame.epoch();
+        if frame.protocol_version() != rshare_core::INPUT_PROTOCOL_VERSION {
+            tracing::warn!(
+                peer = %owner.peer_id,
+                generation = ?owner.control_connection_id,
+                epoch = epoch.0,
+                stage = "protocol_validation",
+                error = ?InjectionQueueFull::ProtocolViolation,
+                "authenticated input consumer stopped after injection failure"
+            );
+            injection.request_release_through(
+                owner,
+                SessionEpoch(u64::MAX),
+                ReleaseAllReason::BackendFailure,
+            );
+            terminal_epoch = Some(epoch);
+            break;
+        }
+        if let PeerInputFrame::Reliable(ReliableInputFrame {
+            event: ReliableInputEvent::ReleaseAll { reason },
+            ..
+        }) = &frame
+        {
+            // A terminal notification may already have closed this epoch on
+            // the independent release lane. Cleanup is idempotent and must
+            // never reopen a session or consume ordinary injection capacity.
+            injection.request_release_through(owner, epoch, *reason);
+            retire_peer_epoch(&mut active_epoch, &mut retired_through, epoch);
+            tracing::debug!(peer = %owner.peer_id, generation = ?owner.control_connection_id,
+                epoch = epoch.0, reason = ?reason, "authenticated input terminal release applied");
+            continue;
+        }
+        if retired_through.is_some_and(|retired: SessionEpoch| epoch.0 <= retired.0) {
+            continue;
+        }
         if active_epoch != Some(epoch) {
             if let Err(error) = injection.begin_session(owner, epoch, lease) {
-                if !matches!(error, InjectionQueueFull::WrongOwnerOrEpoch)
-                    || is_current_generation(&generations, owner)
-                {
-                    injection.request_release_through(
-                        owner,
-                        epoch,
-                        ReleaseAllReason::BackendFailure,
-                    );
-                    terminal_epoch = Some(epoch);
-                }
+                tracing::warn!(peer = %owner.peer_id, generation = ?owner.control_connection_id,
+                    epoch = epoch.0, stage = "begin_session", error = ?error,
+                    "authenticated input consumer stopped after injection failure");
+                injection.request_release_through(
+                    owner,
+                    SessionEpoch(u64::MAX),
+                    ReleaseAllReason::BackendFailure,
+                );
+                terminal_epoch = Some(epoch);
                 break;
             }
             active_epoch = Some(epoch);
         }
         match frame {
-            PeerInputFrame::Realtime(frame) => {
-                let _ = injection.submit_realtime(owner, frame);
-            }
+            PeerInputFrame::Realtime(frame) => match injection.submit_realtime(owner, frame) {
+                rshare_input::RealtimeSubmitResult::EpochClosed => {
+                    retire_peer_epoch(&mut active_epoch, &mut retired_through, epoch);
+                }
+                error @ (rshare_input::RealtimeSubmitResult::ProtocolViolation
+                | rshare_input::RealtimeSubmitResult::BackendFailed
+                | rshare_input::RealtimeSubmitResult::DeadlineOverflow
+                | rshare_input::RealtimeSubmitResult::ShuttingDown) => {
+                    tracing::warn!(peer = %owner.peer_id, generation = ?owner.control_connection_id,
+                            epoch = epoch.0, stage = "realtime_admission", error = ?error,
+                            "authenticated input consumer stopped after injection failure");
+                    injection.request_release_through(
+                        owner,
+                        SessionEpoch(u64::MAX),
+                        ReleaseAllReason::BackendFailure,
+                    );
+                    terminal_epoch = Some(epoch);
+                    break;
+                }
+                _ => {}
+            },
             PeerInputFrame::Reliable(frame) => {
                 let epoch = frame.session_epoch;
                 if let Err(error) = injection.try_submit_reliable(owner, frame) {
-                    if matches!(error, InjectionQueueFull::WrongOwnerOrEpoch)
-                        && !is_current_generation(&generations, owner)
-                    {
-                        break;
+                    if error == InjectionQueueFull::EpochClosed {
+                        retire_peer_epoch(&mut active_epoch, &mut retired_through, epoch);
+                        continue;
                     }
+                    tracing::warn!(peer = %owner.peer_id, generation = ?owner.control_connection_id,
+                        epoch = epoch.0, stage = "reliable_admission", error = ?error,
+                        "authenticated input consumer stopped after injection failure");
                     injection.request_release_through(
                         owner,
-                        epoch,
+                        SessionEpoch(u64::MAX),
                         ReleaseAllReason::BackendFailure,
                     );
                     terminal_epoch = Some(epoch);
@@ -1063,8 +1179,29 @@ impl PeerInputFrame {
             Self::Reliable(frame) => frame.session_epoch,
         }
     }
+
+    fn protocol_version(&self) -> u16 {
+        match self {
+            Self::Realtime(frame) => frame.protocol_version,
+            Self::Reliable(frame) => frame.protocol_version,
+        }
+    }
 }
 
+fn retire_peer_epoch(
+    active_epoch: &mut Option<SessionEpoch>,
+    retired_through: &mut Option<SessionEpoch>,
+    epoch: SessionEpoch,
+) {
+    if retired_through.is_none_or(|retired| epoch.0 > retired.0) {
+        *retired_through = Some(epoch);
+    }
+    if active_epoch.is_some_and(|active| active.0 <= epoch.0) {
+        *active_epoch = None;
+    }
+}
+
+#[cfg(test)]
 fn is_current_generation(
     generations: &Mutex<HashMap<DeviceId, ControlConnectionId>>,
     owner: AuthenticatedInputOwner,

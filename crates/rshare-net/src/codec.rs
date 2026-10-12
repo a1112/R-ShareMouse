@@ -555,6 +555,7 @@ mod tests {
         let msg = Message::Heartbeat {
             sequence: 100,
             timestamp: 200,
+            input_session_lease: None,
         };
 
         let encoded = MessageCodec::encode_raw(&msg).unwrap();
@@ -564,6 +565,7 @@ mod tests {
             Message::Heartbeat {
                 sequence,
                 timestamp,
+                input_session_lease: None,
             } => {
                 assert_eq!(sequence, 100);
                 assert_eq!(timestamp, 200);
@@ -577,10 +579,12 @@ mod tests {
         let msg1 = Message::Heartbeat {
             sequence: 100,
             timestamp: 200,
+            input_session_lease: None,
         };
         let msg2 = Message::Heartbeat {
             sequence: 300,
             timestamp: 400,
+            input_session_lease: None,
         };
 
         let enc1 = MessageCodec::frame_message(&msg1).unwrap();
@@ -599,6 +603,7 @@ mod tests {
             Message::Heartbeat {
                 sequence,
                 timestamp,
+                input_session_lease: None,
             } => {
                 assert_eq!(sequence, 100);
                 assert_eq!(timestamp, 200);
@@ -613,6 +618,7 @@ mod tests {
             Message::Heartbeat {
                 sequence,
                 timestamp,
+                input_session_lease: None,
             } => {
                 assert_eq!(sequence, 300);
                 assert_eq!(timestamp, 400);

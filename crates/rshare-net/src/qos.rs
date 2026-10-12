@@ -154,6 +154,8 @@ pub enum TransportSendError {
     ReliableLaneFull,
     #[error("telemetry lane is full")]
     TelemetryLaneFull,
+    #[error("control lane is full")]
+    ControlLaneFull,
     #[error("transport lane is closed")]
     LaneClosed,
     #[error("emergency slot is occupied")]
@@ -347,6 +349,7 @@ impl TerminalReleaseEmitter {
 struct AwaitedFrame<T> {
     frame: T,
     written: oneshot::Sender<Result<(), TransportSendError>>,
+    cancel_on_caller_drop: bool,
 }
 
 #[derive(Default)]
@@ -781,6 +784,47 @@ impl PeerTransportHandle {
         send_awaited(&self.inner.control_tx, frame).await
     }
 
+    /// Admit a control frame without waiting for its write. The existing
+    /// bounded writer owns delivery; no task or dropped caller can cancel it.
+    pub fn try_send_control(&self, frame: ControlFrame) -> Result<(), TransportSendError> {
+        let capacity = self.inner.control_tx.max_capacity();
+        self.inner
+            .queue_probes
+            .control
+            .observe_queued(capacity - self.inner.control_tx.capacity() + 1, capacity);
+        let (written, _ack) = oneshot::channel();
+        self.inner
+            .control_tx
+            .try_send(AwaitedFrame {
+                frame,
+                written,
+                cancel_on_caller_drop: false,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    self.inner.queue_probes.control.overflow(capacity);
+                    TransportSendError::ControlLaneFull
+                }
+                mpsc::error::TrySendError::Closed(_) => TransportSendError::LaneClosed,
+            })
+    }
+
+    /// Close this generation's transport after authenticated input lease
+    /// expiry. Callers must validate the received owner and epoch first.
+    pub fn close_input_lease_expired(&self) {
+        if let Some(connection) = &self.inner.realtime_connection {
+            connection.close(0u32.into(), b"authenticated input session lease expired");
+        }
+    }
+
+    /// Retire this generation after its native injection backend failed.
+    /// Callers must validate the authenticated owner before closing it.
+    pub fn close_input_backend_failed(&self) {
+        if let Some(connection) = &self.inner.realtime_connection {
+            connection.close(0u32.into(), b"input injection backend failed");
+        }
+    }
+
     pub async fn send_bulk(&self, frame: BulkFrame) -> Result<(), TransportSendError> {
         let capacity = self.inner.bulk_tx.max_capacity();
         self.inner
@@ -1059,6 +1103,17 @@ impl ControlFrame {
             message: Message::Heartbeat {
                 sequence,
                 timestamp,
+                input_session_lease: None,
+            },
+        }
+    }
+
+    pub fn session_lease(epoch: SessionEpoch) -> Self {
+        Self {
+            message: Message::Heartbeat {
+                sequence: 0,
+                timestamp: rshare_core::timestamp_ms(),
+                input_session_lease: Some(epoch),
             },
         }
     }
@@ -1483,7 +1538,12 @@ fn spawn_awaited_writer<T, F>(
     tokio::spawn(async move {
         let _guard = guard;
         let mut stream: Option<quinn::SendStream> = None;
-        while let Some(AwaitedFrame { frame, mut written }) = rx.recv().await {
+        while let Some(AwaitedFrame {
+            frame,
+            mut written,
+            cancel_on_caller_drop,
+        }) = rx.recv().await
+        {
             let result = match convert(frame) {
                 Ok(message) => {
                     #[cfg(test)]
@@ -1500,7 +1560,7 @@ fn spawn_awaited_writer<T, F>(
                             _probes.completed.fetch_add(1, Ordering::AcqRel);
                             Some(result)
                         },
-                        _ = written.closed() => {
+                        _ = written.closed(), if cancel_on_caller_drop => {
                             #[cfg(test)]
                             _probes.cancelled.fetch_add(1, Ordering::AcqRel);
                             None
@@ -1619,9 +1679,13 @@ async fn send_awaited<T>(
     frame: T,
 ) -> Result<(), TransportSendError> {
     let (written, ack) = oneshot::channel();
-    tx.send(AwaitedFrame { frame, written })
-        .await
-        .map_err(|_| TransportSendError::LaneClosed)?;
+    tx.send(AwaitedFrame {
+        frame,
+        written,
+        cancel_on_caller_drop: true,
+    })
+    .await
+    .map_err(|_| TransportSendError::LaneClosed)?;
     ack.await.map_err(|_| TransportSendError::LaneClosed)?
 }
 
@@ -2109,6 +2173,40 @@ mod tests {
                 reason: ReleaseAllReason::BackendFailure,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn nonblocking_control_admission_is_bounded_and_detached_from_caller() {
+        let (mut handle, _probe, _releases) = fixture_handle(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        Arc::get_mut(&mut handle.inner).unwrap().control_tx = control_tx;
+        handle
+            .try_send_control(ControlFrame::session_lease(SessionEpoch(9)))
+            .unwrap();
+        assert_eq!(
+            handle.try_send_control(ControlFrame::session_lease(SessionEpoch(9))),
+            Err(TransportSendError::ControlLaneFull)
+        );
+        let admitted = control_rx.try_recv().unwrap();
+        assert!(!admitted.cancel_on_caller_drop);
+        assert!(
+            admitted.written.is_closed(),
+            "the fire-and-forget caller retains no write waiter"
+        );
+        assert!(matches!(
+            admitted.frame.into_message(),
+            Message::Heartbeat {
+                input_session_lease: Some(SessionEpoch(9)),
+                ..
+            }
+        ));
+        assert_eq!(handle.queue_diagnostics()["control"].high_watermark, 1);
+        assert_eq!(handle.queue_diagnostics()["control"].overflows, 1);
+        drop(control_rx);
+        assert_eq!(
+            handle.try_send_control(ControlFrame::session_lease(SessionEpoch(9))),
+            Err(TransportSendError::LaneClosed)
+        );
     }
 
     #[tokio::test]
