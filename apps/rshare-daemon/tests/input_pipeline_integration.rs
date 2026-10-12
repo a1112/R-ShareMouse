@@ -469,6 +469,41 @@ async fn suppression_output_drives_platform_callback_and_clears_on_exit() {
 }
 
 #[tokio::test]
+async fn rejected_enter_keeps_local_input_unsuppressed_and_session_suspended() {
+    let (_, _, router) = linked_router();
+    let (producer, consumer) = SemanticInputIngress::new(8);
+    let transport = Arc::new(BoundedBlockedTransport::new(0));
+    transport.block_for(Duration::from_secs(10));
+    let (state, feeds) = input_state_channel(8);
+    let injection =
+        InputInjectionHandle::spawn(Box::new(NoopInjectBackend), InjectionActorConfig::default())
+            .unwrap();
+    let suppressor = Arc::new(RecordingSuppressor::default());
+    let mut runtime = InputRuntime::new(
+        consumer,
+        router,
+        transport.clone(),
+        state,
+        Arc::new(ControlMetrics::default()),
+        injection,
+    )
+    .with_forwarding_policy(
+        automatic_forwarding_policy(true, true, true),
+        suppressor.clone(),
+    );
+
+    enter_remote(&producer, &mut runtime).await;
+
+    let suppression_values = suppressor.values.lock().unwrap().clone();
+    assert_eq!(suppression_values, [false]);
+    assert!(matches!(
+        feeds.authoritative_rx.borrow().session,
+        ControlSessionState::Suspended { .. }
+    ));
+    assert!(transport.state.lock().unwrap().latest_realtime.is_none());
+}
+
+#[tokio::test]
 async fn physical_relative_return_releases_remote_and_restores_local_input() {
     let (producer, runtime, transport) = runtime(8);
     let suppressor = Arc::new(RecordingSuppressor::default());

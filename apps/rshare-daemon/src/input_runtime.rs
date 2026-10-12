@@ -515,6 +515,10 @@ impl<T: InputTransport> InputRuntime<T> {
                     } else {
                         let failure = self.router.handle(RouterCommand::BackendDegraded);
                         self.dispatch_outputs(failure);
+                        // The failure transition invalidates the rest of this
+                        // batch, including an Enter's remote-state publication
+                        // and local suppression output.
+                        return;
                     }
                 }
                 RouterOutput::EmergencyReleaseAll {

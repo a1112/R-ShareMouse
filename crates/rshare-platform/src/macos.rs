@@ -225,7 +225,11 @@ mod macos_impl {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         LOCAL_INPUT_SUPPRESSED.store(enabled, Ordering::Release);
-        if let Err(error) = cursor.update(enabled, update_native_cursor_visibility) {
+        if let Err(error) = cursor.update(
+            enabled,
+            super::cursor::prepare_background_cursor_access,
+            update_native_cursor_visibility,
+        ) {
             tracing::warn!(
                 hidden = enabled,
                 error,
@@ -235,17 +239,18 @@ mod macos_impl {
     }
 
     #[cfg(not(test))]
-    fn update_native_cursor_visibility(hidden: bool) -> std::result::Result<(), i32> {
+    fn update_native_cursor_visibility(hidden: bool) -> std::result::Result<(), String> {
         let display = CGDisplay::main();
-        if hidden {
+        let result = if hidden {
             display.hide_cursor()
         } else {
             display.show_cursor()
-        }
+        };
+        result.map_err(|code| format!("CoreGraphics cursor visibility update failed: {code}"))
     }
 
     #[cfg(test)]
-    fn update_native_cursor_visibility(_hidden: bool) -> std::result::Result<(), i32> {
+    fn update_native_cursor_visibility(_hidden: bool) -> std::result::Result<(), String> {
         // Platform unit tests must not hide the developer's desktop cursor.
         Ok(())
     }
