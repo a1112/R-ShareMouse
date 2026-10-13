@@ -62,7 +62,16 @@ pub fn fit(
     let compact_h = available_h
         .min(area.height / scale * 0.8 - frame.1)
         .max(1.0);
-    let min = (minimum.0.min(compact_w), minimum.1.min(compact_h));
+    let min = (
+        minimum
+            .0
+            .min(compact_w)
+            .min(valid.map_or(f64::INFINITY, |g| g.width)),
+        minimum
+            .1
+            .min(compact_h)
+            .min(valid.map_or(f64::INFINITY, |g| g.height)),
+    );
     let (max_w, max_h) = if valid.is_some() {
         (available_w, available_h)
     } else {
@@ -207,6 +216,24 @@ mod tests {
                 g
             );
         }
+    }
+    #[test]
+    fn saved_small_screen_geometry_stays_valid_on_a_larger_monitor() {
+        let saved = Geometry {
+            x: 30.0,
+            y: 80.0,
+            width: 640.0,
+            height: 400.0,
+        };
+        let (g, min) = fit(
+            Some(saved),
+            (1100.0, 720.0),
+            (820.0, 560.0),
+            screen(0.0, 1.0),
+            (0.0, 28.0),
+        );
+        assert_eq!(g, saved);
+        assert!(min.0 <= g.width && min.1 <= g.height);
     }
     #[test]
     fn invalid_saved_values_fall_back_to_default() {
