@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod window_geometry;
+mod window_placement;
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode,
@@ -1140,6 +1142,7 @@ fn main() {
             clear_logs
         ])
         .setup(|app| {
+            window_placement::install(app, "main", (1000.0, 680.0), (800.0, 540.0), true);
             // Setup system tray
             setup_system_tray(app.handle())?;
             start_tray_status_refresh(app.handle().clone());
