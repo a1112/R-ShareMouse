@@ -104,12 +104,13 @@ fn apply(
         _ => (0.0, 32.0),
     };
     let (geometry, min) = window_geometry::fit(saved, default, minimum, screen, frame);
-    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min.0, min.1)));
-    let _ = window.set_size(tauri::LogicalSize::new(geometry.width, geometry.height));
+    // Adopt the destination monitor before applying logical dimensions.
     let _ = window.set_position(tauri::PhysicalPosition::new(
         geometry.x.round() as i32,
         geometry.y.round() as i32,
     ));
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min.0, min.1)));
+    let _ = window.set_size(tauri::LogicalSize::new(geometry.width, geometry.height));
 }
 
 pub fn install(
@@ -127,7 +128,12 @@ pub fn install(
         .app_config_dir()
         .ok()
         .map(|base| base.join(format!("window-geometry-{label}-v1.txt")));
-    apply(&window, path.as_ref().and_then(|path| read(path)), default, minimum);
+    apply(
+        &window,
+        path.as_ref().and_then(|path| read(path)),
+        default,
+        minimum,
+    );
     if let Some(path) = &path {
         save(&window, path);
     }
