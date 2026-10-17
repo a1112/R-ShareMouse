@@ -1,19 +1,23 @@
 // Shared desktop window behavior. Keep this file and its regression tests together.
 (function (root) {
   'use strict';
-  const interactive = 'button,a,input,select,textarea,label,summary,[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[role="textbox"],[role="combobox"],[role="option"]';
+  const interactive = 'button,a,input,select,textarea,label,summary,[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[role="textbox"],[role="combobox"],[role="option"],[data-no-drag]';
 
   function dragRegion(path) {
+    let region = false;
+    let found = false;
     for (const element of path) {
       if (typeof element?.getAttribute !== 'function') continue;
-      // Interactive children always win, even if a parent is a drag region.
+      // An interactive ancestor must win over a marked passive child too.
       if (element.matches(interactive)) return false;
       const value = element.getAttribute('data-tauri-drag-region');
       if (value === 'false') return false;
-      if (value === 'deep') return true;
-      if (value === '' || value === 'true') return element === path[0];
+      if (!found && ['deep', '', 'true'].includes(value)) {
+        region = value === 'deep' || element === path[0];
+        found = true;
+      }
     }
-    return false;
+    return region;
   }
 
   function canResize(state) {
@@ -34,6 +38,7 @@
     let reading = false;
     let again = false;
     let scheduled = 0;
+    let resizeTimer = null;
     let doubleClick = null;
     let edges;
     const removers = [];
@@ -65,7 +70,9 @@
           ['is_decorated', 'is_resizable', 'is_maximized', 'is_fullscreen', 'is_focused', 'is_maximizable'].map(c => invoke(c))
         );
         if (disposed) return;
-        state = { decorated, resizable, maximized, fullscreen, focused, maximizable };
+        const next = { decorated, resizable, maximized, fullscreen, focused, maximizable };
+        if (state && Object.keys(next).every(key => next[key] === state[key])) return;
+        state = next;
         const html = doc.documentElement;
         for (const [name, value] of Object.entries(state)) html.setAttribute('data-window-' + name, String(value));
         const radius = cornerRadius(state, macos);
@@ -122,8 +129,19 @@
     listen(win, 'dblclick', event => { if (handles(event)) consume(event); }, true);
     listen(win, 'blur', () => { doubleClick = null; schedule(); });
     listen(win, 'focus', schedule);
-    listen(win, 'resize', schedule);
-    listen(win, 'project-native-window-state', schedule);
+    // One refresh per interval during live resize, with a final trailing read.
+    // Focus and command completion still use the next animation frame.
+    function scheduleResize() {
+      if (!disposed && resizeTimer === null) resizeTimer = win.setTimeout(() => {
+        resizeTimer = null;
+        schedule();
+      }, 80);
+    }
+    listen(win, 'resize', scheduleResize);
+    listen(win, 'project-native-window-state', scheduleResize);
+    listen(win, 'pointercancel', () => { doubleClick = null; }, true);
+    listen(win, 'dragstart', () => { doubleClick = null; }, true);
+    listen(win, 'keydown', event => { if (event.key === 'Escape') doubleClick = null; }, true);
     listen(doc, 'visibilitychange', () => { if (!doc.hidden) schedule(); });
 
     function mount() {
@@ -149,7 +167,7 @@
         listen(edge, 'pointerdown', event => {
           if (event.button !== 0 || !canResize(state)) return;
           consume(event);
-          void run('start_resize_dragging', { direction });
+          void run('start_resize_dragging', { value: direction });
         });
         shadow.appendChild(edge);
       }
@@ -161,6 +179,7 @@
       disposed = true;
       removers.splice(0).forEach(remove => remove());
       if (scheduled) win.cancelAnimationFrame(scheduled);
+      if (resizeTimer !== null) win.clearTimeout(resizeTimer);
       edges?.remove();
       restoreCorners();
       for (const key of ['decorated', 'resizable', 'maximized', 'fullscreen', 'focused', 'maximizable']) doc.documentElement.removeAttribute('data-window-' + key);
@@ -173,5 +192,10 @@
     return win.__projectWindowChrome;
   }
   if (typeof module === 'object' && module.exports) module.exports = { dragRegion, canResize, cornerRadius, install };
-  else install(root, root.document, __PROJECT_CHROME_MACOS__);
+  else {
+    const boot = () => install(root, root.document, __PROJECT_CHROME_MACOS__);
+    if (root.document.readyState === 'loading') root.document.addEventListener('DOMContentLoaded', boot, { once: true });
+    else boot();
+    root.addEventListener('pageshow', boot);
+  }
 })(typeof window === 'undefined' ? globalThis : window);

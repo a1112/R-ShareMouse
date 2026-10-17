@@ -25,15 +25,19 @@ class Element extends Target {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 function fixture({ macos = false, decorated = false, resizable = true, maximized = false, fullscreen = false, reject = false } = {}) {
-  const win = new Target(), doc = new Target(), calls = [];
+  const win = new Target(), doc = new Target(), calls = [], timers = new Map();
+  let timerId = 0;
   const state = { decorated, resizable, maximized, fullscreen, focused: true, maximizable: true };
   Object.assign(win, {
     top: win, location: { protocol: 'tauri:', hostname: 'localhost' },
     CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
     requestAnimationFrame: fn => setImmediate(fn), cancelAnimationFrame: clearImmediate,
+    setTimeout: fn => { const id = ++timerId; timers.set(id, fn); return id; },
+    clearTimeout: id => timers.delete(id),
     __TAURI_INTERNALS__: { invoke: async (command, args) => {
       calls.push({ command: command.split('|')[1], args });
       if (reject) throw new Error('permission denied');
+      if (command.endsWith('|start_resize_dragging') && !args.value) throw new Error('missing required key value');
       return state[command.split('|')[1].replace('is_', '')];
     } }
   });
@@ -45,7 +49,7 @@ function fixture({ macos = false, decorated = false, resizable = true, maximized
     win.dispatchEvent(e); return e;
   }
   const actions = () => calls.filter(c => !c.command.startsWith('is_'));
-  return { win, doc, calls, state, controller, event, actions };
+  return { win, doc, calls, state, controller, event, actions, timers, advanceTimers() { const pending = [...timers.values()]; timers.clear(); pending.forEach(fn => fn()); } };
 }
 test('deep regions accept passive descendants; self regions require direct hits', () => {
   const text = new Element();
@@ -110,7 +114,7 @@ test('eight resize edges call native directions and hide after maximizing', asyn
   assert.equal(edges.style.display, 'block');
   const handles = edges.shadow.children; assert.equal(handles.length, 8);
   for (const handle of handles) handle.dispatchEvent({ type: 'pointerdown', button: 0, preventDefault() {}, stopImmediatePropagation() {} });
-  assert.deepEqual(f.actions().map(c => c.args.direction), ['North', 'NorthEast', 'East', 'SouthEast', 'South', 'SouthWest', 'West', 'NorthWest']);
+  assert.deepEqual(f.actions().map(c => c.args.value), ['North', 'NorthEast', 'East', 'SouthEast', 'South', 'SouthWest', 'West', 'NorthWest']);
   f.state.maximized = true; f.controller.refresh(); await tick(); await tick();
   assert.equal(edges.style.display, 'none'); f.controller.destroy();
 });
@@ -130,4 +134,54 @@ test('installation is idempotent and rejects remote documents and subframes', ()
   const f = fixture(); assert.equal(install(f.win, f.doc, false), undefined); f.controller.destroy();
   f.win.location = { protocol: 'https:', hostname: 'example.com' }; assert.equal(install(f.win, f.doc, false), undefined);
   f.win.location.hostname = 'localhost'; f.win.top = {}; assert.equal(install(f.win, f.doc, false), undefined);
+});
+
+test('interactive ancestors override marked descendants', () => {
+  assert.equal(dragRegion([new Element('deep'), new Element(null, true)]), false);
+  assert.equal(dragRegion([new Element('deep'), new Element('false')]), false);
+});
+test('cancelled double clicks and file drags preserve normal window state', async () => {
+  for (const cancel of ['pointercancel', 'dragstart', 'keydown']) {
+    const f = fixture({ macos: true }); await tick(); const path = [new Element('deep')];
+    f.event('mousedown', path, {detail: 2});
+    const event = f.event(cancel, path, {key: 'Escape'});
+    assert.equal(event.prevented, undefined);
+    f.event('mouseup', path, {detail: 2});
+    assert.equal(f.actions().length, 0);
+    f.controller.destroy();
+  }
+});
+test('unchanged state does not publish or mutate DOM; resize burst reads are bounded', async () => {
+  const f = fixture(); await tick();
+  let writes = 0, publications = 0;
+  f.doc.documentElement.setAttribute = () => { writes++; };
+  f.doc.documentElement.style.setProperty = () => { writes++; };
+  f.win.addEventListener('project-window-state', () => { publications++; });
+  f.calls.length = 0;
+  for (let i = 0; i < 120; i++) {
+    f.win.dispatchEvent({type: 'resize'});
+    f.win.dispatchEvent({type: 'project-native-window-state'});
+    await tick();
+  }
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.timers.size, 1);
+  f.advanceTimers(); await tick(); await tick();
+  assert.equal(f.calls.length, 6);
+  assert.equal(writes, 0); assert.equal(publications, 0);
+  f.controller.destroy();
+});
+test('document-start boot waits for root and pageshow reinstalls after pagehide', async () => {
+  const f = fixture(); f.controller.destroy();
+  f.win.document = f.doc; f.doc.documentElement = null; f.doc.readyState = 'loading';
+  const source = fs.readFileSync(path.join(__dirname, 'project-window-chrome.js'), 'utf8').replaceAll('__PROJECT_CHROME_MACOS__', 'true');
+  assert.doesNotThrow(() => vm.runInNewContext(source, {window: f.win}));
+  assert.equal(f.win.__projectWindowChrome, undefined);
+  f.doc.documentElement = new Element(); f.doc.readyState = 'complete';
+  f.doc.dispatchEvent({type: 'DOMContentLoaded'}); await tick();
+  assert.ok(f.win.__projectWindowChrome);
+  f.win.dispatchEvent({type: 'pagehide'});
+  assert.equal(f.win.__projectWindowChrome, undefined);
+  f.win.dispatchEvent({type: 'pageshow'}); await tick();
+  assert.ok(f.win.__projectWindowChrome);
+  f.win.__projectWindowChrome.destroy();
 });
