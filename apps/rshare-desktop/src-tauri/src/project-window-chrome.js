@@ -1,7 +1,7 @@
 // Shared desktop window behavior. Keep this file and its regression tests together.
 (function (root) {
   'use strict';
-  const interactive = 'button,a,input,select,textarea,label,summary,[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[role="textbox"],[role="combobox"],[role="option"],[data-no-drag]';
+  const interactive = 'button,a,input,select,textarea,label,summary,[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[role="textbox"],[role="combobox"],[role="option"],[data-no-drag],[data-no-window-drag]';
 
   function dragRegion(path) {
     let region = false;
@@ -98,7 +98,7 @@
       event.stopImmediatePropagation();
     }
     function handles(event) {
-      return state && !state.decorated && !state.fullscreen && event.button === 0 && dragRegion(event.composedPath());
+      return !event.defaultPrevented && state && !state.decorated && !state.fullscreen && event.button === 0 && dragRegion(event.composedPath());
     }
     // Cancel custom pointer handlers; mousedown below owns the native operation.
     // Do not preventDefault here: that would suppress the compatibility mousedown.
@@ -106,6 +106,7 @@
       if (handles(event) && event.pointerType === 'mouse') event.stopImmediatePropagation();
     }, true);
     listen(win, 'mousedown', event => {
+      doubleClick = null;
       if (!handles(event)) return;
       consume(event);
       if (event.detail === 2) {
@@ -165,7 +166,7 @@
           Object.assign(edge.style, { top: '10px', bottom: '10px', width: '4px', cursor: 'ew-resize', [name === 'w' ? 'left' : 'right']: '0' });
         }
         listen(edge, 'pointerdown', event => {
-          if (event.button !== 0 || !canResize(state)) return;
+          if (event.defaultPrevented || event.button !== 0 || !canResize(state)) return;
           consume(event);
           void run('start_resize_dragging', { value: direction });
         });

@@ -185,3 +185,88 @@ test('document-start boot waits for root and pageshow reinstalls after pagehide'
   assert.ok(f.win.__projectWindowChrome);
   f.win.__projectWindowChrome.destroy();
 });
+
+// Cancellation compatibility: keep these checks with the shared production JS.
+test('previously cancelled title events stay with their application owner', async () => {
+  for (const type of ['pointerdown', 'mousedown', 'mouseup', 'dblclick']) {
+    const f = fixture({ macos: true }); await tick();
+    try {
+      const event = f.event(type, [new Element('deep')], { defaultPrevented: true });
+      assert.equal(event.stopped, undefined, type);
+      assert.equal(event.prevented, undefined, type);
+      assert.equal(f.actions().length, 0, type);
+    } finally { f.controller.destroy(); }
+  }
+});
+
+test('cancelled macOS double-click release cannot maximize or retain a pending gesture', async () => {
+  const f = fixture({ macos: true }); await tick();
+  try {
+    const path = [new Element('deep')];
+    f.event('mousedown', path, { detail: 2 });
+    assert.equal(f.event('mouseup', path, { detail: 2, defaultPrevented: true }).stopped, undefined);
+    f.event('mouseup', path, { detail: 2 });
+    assert.equal(f.actions().length, 0);
+    f.event('mousedown', path, { detail: 2 });
+    f.event('mouseup', path, { detail: 2 });
+    assert.deepEqual(f.actions().map(call => call.command), ['internal_toggle_maximize']);
+  } finally { f.controller.destroy(); }
+});
+
+test('every new down invalidates an older pending macOS double click', async () => {
+  for (const next of ['cancelled', 'control', 'right-button', 'unmarked']) {
+    const f = fixture({ macos: true }); await tick();
+    try {
+      const path = [new Element('deep')];
+      f.event('mousedown', path, { detail: 2 });
+      const nextPath = next === 'control' ? [new Element(null, true), ...path] : next === 'unmarked' ? [new Element()] : path;
+      f.event('mousedown', nextPath, { detail: 1, defaultPrevented: next === 'cancelled', button: next === 'right-button' ? 2 : 0 });
+      f.event('mouseup', path, { detail: 2 });
+      assert.equal(f.actions().length, 0, next);
+    } finally { f.controller.destroy(); }
+  }
+});
+
+test('all eight resize handles respect cancellation and retain normal native directions', async () => {
+  const f = fixture(); await tick();
+  try {
+    const handles = f.doc.documentElement.children[0].shadow.children;
+    assert.equal(handles.length, 8);
+    for (const handle of handles) {
+      const event = { type: 'pointerdown', button: 0, defaultPrevented: true,
+        preventDefault() { assert.fail('already cancelled edge consumed'); },
+        stopImmediatePropagation() { assert.fail('already cancelled edge stopped'); } };
+      handle.dispatchEvent(event);
+    }
+    assert.equal(f.actions().length, 0);
+    for (const handle of handles) handle.dispatchEvent({ type: 'pointerdown', button: 0, defaultPrevented: false, preventDefault() {}, stopImmediatePropagation() {} });
+    assert.deepEqual(f.actions().map(call => call.args.value), ['North', 'NorthEast', 'East', 'SouthEast', 'South', 'SouthWest', 'West', 'NorthWest']);
+  } finally { f.controller.destroy(); }
+});
+
+test('both explicit drag opt-out attributes protect marked descendants', async () => {
+  for (const attribute of ['data-no-drag', 'data-no-window-drag']) {
+    const f = fixture(); await tick();
+    try {
+      const parent = new Element(); parent.setAttribute(attribute, '');
+      parent.matches = selector => selector.split(',').includes('[' + attribute + ']');
+      const event = f.event('mousedown', [new Element('deep'), parent]);
+      assert.equal(event.stopped, undefined, attribute);
+      assert.equal(f.actions().length, 0, attribute);
+    } finally { f.controller.destroy(); }
+  }
+});
+
+test('file drag/drop events remain available to application handlers', async () => {
+  const f = fixture({ macos: true }); await tick();
+  try {
+    for (const type of ['dragover', 'drop']) {
+      const event = f.event(type, [new Element('deep')]);
+      assert.equal(event.prevented, undefined, type);
+      assert.equal(event.stopped, undefined, type);
+    }
+    assert.equal(f.actions().length, 0);
+    f.event('mousedown', [new Element('deep')]);
+    assert.deepEqual(f.actions().map(call => call.command), ['start_dragging']);
+  } finally { f.controller.destroy(); }
+});
