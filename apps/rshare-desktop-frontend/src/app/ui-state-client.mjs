@@ -286,42 +286,64 @@ export function createWebSocketUiStateConnector({ WebSocket, url }) {
   }
   return ({ cursor, onEnvelope, onDisconnect, signal }) =>
     new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(abortError());
+        return;
+      }
       const socket = new WebSocket(url);
       let opened = false;
       let closed = false;
-      let disconnectReported = false;
 
-      const cleanupAbort = () => signal?.removeEventListener("abort", abort);
-      const reportDisconnect = (error) => {
-        if (closed || disconnectReported) return;
-        disconnectReported = true;
-        if (opened) {
-          onDisconnect(error);
-        } else {
-          cleanupAbort();
-          reject(error);
-        }
+      const cleanup = () => {
+        onEnvelope = null;
+        onDisconnect = null;
+        signal?.removeEventListener("abort", abort);
+        socket.removeEventListener("open", open);
+        socket.removeEventListener("message", message);
+        socket.removeEventListener("error", error);
+        socket.removeEventListener("close", disconnected);
       };
       const close = () => {
         if (closed) return;
         closed = true;
-        cleanupAbort();
-        socket.close(1000);
+        cleanup();
+        if (
+          socket.readyState !== WebSocket.CLOSED &&
+          socket.readyState !== WebSocket.CLOSING
+        ) {
+          try {
+            socket.close(1000);
+          } catch {
+            // Consumer ownership is released even if platform close fails.
+          }
+        }
+      };
+      const reportDisconnect = (error) => {
+        if (closed) return;
+        const notify = onDisconnect;
+        close();
+        if (opened) notify?.(error);
+        else reject(error);
       };
       const abort = () => {
         close();
         if (!opened) reject(abortError());
       };
-      signal?.addEventListener("abort", abort, { once: true });
 
-      socket.addEventListener("open", () => {
-        if (closed || signal?.aborted) {
-          close();
-          reject(abortError());
+      const open = () => {
+        if (closed) return;
+        if (signal?.aborted) {
+          abort();
           return;
         }
+        try {
+          socket.send(JSON.stringify({ type: "subscribe", cursor }));
+        } catch (error) {
+          reportDisconnect(error);
+          return;
+        }
+        if (closed) return;
         opened = true;
-        socket.send(JSON.stringify({ type: "subscribe", cursor }));
         resolve({
           close,
           requestFullResync() {
@@ -330,30 +352,34 @@ export function createWebSocketUiStateConnector({ WebSocket, url }) {
             }
           },
         });
-      });
-      socket.addEventListener("message", (event) => {
+      };
+      const message = (event) => {
+        if (closed) return;
         try {
           if (typeof event.data !== "string") {
             throw new Error("UI state WebSocket returned a non-text envelope");
           }
-          onEnvelope(JSON.parse(event.data));
+          onEnvelope?.(JSON.parse(event.data));
         } catch (error) {
           reportDisconnect(error);
         }
-      });
-      socket.addEventListener("error", () => {
+      };
+      const error = () => {
         reportDisconnect(new Error("UI state WebSocket is unavailable"));
-      });
-      socket.addEventListener("close", (event) => {
-        if (!closed) {
-          reportDisconnect(
-            new Error(
-              event.reason ||
-                `UI state WebSocket closed (${event.code || "unknown"})`,
-            ),
-          );
-        }
-      });
+      };
+      const disconnected = (event) => {
+        reportDisconnect(
+          new Error(
+            event.reason ||
+              `UI state WebSocket closed (${event.code || "unknown"})`,
+          ),
+        );
+      };
+      socket.addEventListener("open", open);
+      socket.addEventListener("message", message);
+      socket.addEventListener("error", error);
+      socket.addEventListener("close", disconnected);
+      signal?.addEventListener("abort", abort, { once: true });
     });
 }
 
