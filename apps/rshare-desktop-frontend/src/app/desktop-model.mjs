@@ -42,6 +42,15 @@ export function buildMobilePairingPayload(url, token) {
   return bearer ? `${url}\nAuthorization: Bearer ${bearer}` : url;
 }
 
+export function buildLocalDisplaySenderUrl(url) {
+  const local = new URL(url);
+  local.hostname = "localhost";
+  local.pathname = "/display";
+  local.search = "";
+  local.searchParams.set("role", "host");
+  return local.toString();
+}
+
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
 }

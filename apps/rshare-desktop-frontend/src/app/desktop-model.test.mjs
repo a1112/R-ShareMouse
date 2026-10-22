@@ -14,6 +14,7 @@ import {
   buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
+  buildLocalDisplaySenderUrl,
   buildMobilePairingPayload,
   buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
@@ -170,6 +171,12 @@ test("buildMobilePairingPayload keeps the bearer outside the URL", () => {
   const payload = buildMobilePairingPayload("http://192.168.1.50:27437/mobile", "abc123");
   assert.equal(payload, "http://192.168.1.50:27437/mobile\nAuthorization: Bearer abc123");
   assert.equal(new URL(payload.split("\n", 1)[0]).search, "");
+});
+
+test("buildLocalDisplaySenderUrl preserves the host role without a bearer", () => {
+  const url = buildLocalDisplaySenderUrl("http://192.168.1.50:27437/mobile?legacy=ignored");
+  assert.equal(url, "http://localhost:27437/display?role=host");
+  assert.equal(new URL(url).searchParams.get("t"), null);
 });
 
 test("buildDisplaySettingsViewModel exposes system display settings", () => {

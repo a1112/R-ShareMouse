@@ -36,7 +36,10 @@ final class PairingLinkTests: XCTestCase {
         XCTAssertEqual(link.bearerToken, "a&b+c")
         XCTAssertEqual(link.authorizationHeader, "Bearer a&b+c")
         XCTAssertEqual(link.initialPath, "/display")
-        XCTAssertEqual(link.serialized, "http://192.168.1.10:27437/mobile\nAuthorization: Bearer a&b+c")
+        XCTAssertEqual(link.serialized, "http://192.168.1.10:27437/display\nAuthorization: Bearer a&b+c")
+        let roundTrip = try PairingLink(link.serialized)
+        XCTAssertEqual(roundTrip.initialPath, "/display")
+        XCTAssertEqual(roundTrip.serialized, link.serialized)
         XCTAssertTrue(link.allowsNavigation(to: link.displayURL))
 
         let legacy = try PairingLink("http://192.168.1.10:27437/display?role=host&t=a%26b%2Bc#fragment")

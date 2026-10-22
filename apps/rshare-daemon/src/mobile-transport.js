@@ -1,6 +1,6 @@
 // One ordered connection; at most four unacknowledged events. Callers can wait
 // for `sent` for motion, but must wait for `result` before confirming a key state.
-function createMobileInputTransport(token, post) {
+function createMobileInputTransport(post) {
   let socket = null;
   let opening = null;
   let retryAt = 0;
@@ -46,7 +46,6 @@ function createMobileInputTransport(token, post) {
     if (Date.now() < retryAt || typeof WebSocket === 'undefined') return Promise.resolve(false);
     const url = new URL('/api/input/socket', location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    url.searchParams.set('t', token);
     let ws;
     try { ws = new WebSocket(url); } catch { retryAt = Date.now() + 5000; return Promise.resolve(false); }
     socket = ws;

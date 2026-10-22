@@ -130,6 +130,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildLocalDeviceSelectItems,
+  buildLocalDisplaySenderUrl,
   buildMobilePairingPayload,
   buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
@@ -11201,11 +11202,7 @@ function SettingsPage({
             <p style={{ color: theme.textMuted }}>Windows 主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。iPhone / iPad 应用可直接粘贴接收配对信息，或进入“扩展屏”；浏览器接收请从已认证的移动控制页面进入扩展屏。主机确认后可启用多点触摸。</p>
             <div className="flex flex-wrap gap-2">
               <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
-                const url = new URL(mobileAccessView.url);
-                url.hostname = "localhost";
-                url.pathname = "/display";
-                url.search = "";
-                void navigator.clipboard?.writeText(url.toString());
+                void navigator.clipboard?.writeText(buildLocalDisplaySenderUrl(mobileAccessView.url));
               }}>复制本机发送链接</button>
               <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
                 const url = new URL(mobileAccessView.url); url.pathname = "/display";

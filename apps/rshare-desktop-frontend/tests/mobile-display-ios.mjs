@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const assets = new URL('../../rshare-daemon/src/extended-display/', import.meta.url);
+const liveTest = 'RShareMouseUITests/LiveClientUITests/testMobileDisplayPlaybackFullscreenRotationAndRecovery';
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const script = url.pathname === '/display/client.mjs';
@@ -81,8 +83,14 @@ try {
     '-project', 'apps/rshare-ios/RShareMouse.xcodeproj', '-scheme', 'RShareMouse',
     '-destination', `platform=iOS Simulator,id=${destination}`,
     '-derivedDataPath', 'target/mobile-display-ios', '-resultBundlePath', resultPath,
-    '-only-testing:RShareMouseUITests/LiveClientUITests/testMobileDisplayPlaybackFullscreenRotationAndRecovery', 'test'
-  ], { cwd: root, timeout: 180_000, env: { ...process.env, RSHARE_DISPLAY_TEST_URL: `${base}/display\nBearer test` } });
+    `-only-testing:${liveTest}`, 'test'
+  ], {
+    cwd: root,
+    timeout: 180_000,
+    // xcodebuild strips TEST_RUNNER_ and forwards the remainder to XCTest's
+    // runner environment; ordinary child-process variables are not forwarded.
+    env: { ...process.env, TEST_RUNNER_RSHARE_DISPLAY_TEST_URL: `${base}/display\nBearer test` },
+  });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', data => { output += data; process.stdout.write(data); });
   const code = await new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
   assert.equal(code, 0, 'iOS UI test must pass');

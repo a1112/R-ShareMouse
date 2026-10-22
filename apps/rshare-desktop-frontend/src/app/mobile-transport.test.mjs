@@ -8,7 +8,7 @@ function fixture() {
   const sockets = [];
   class Socket {
     readyState = 0; bufferedAmount = 0; messages = [];
-    constructor() { sockets.push(this); }
+    constructor(url) { this.url = String(url); sockets.push(this); }
     send(value) { this.messages.push(JSON.parse(value)); }
     close() { this.readyState = 3; this.onclose?.(); }
     open() { this.readyState = 1; this.onopen(); }
@@ -17,7 +17,7 @@ function fixture() {
   const context = vm.createContext({ WebSocket: Socket, URL, setTimeout, clearTimeout, location: { href: 'http://192.168.1.2:27437/mobile' } });
   vm.runInContext(source, context);
   let posts = 0;
-  const transport = context.createMobileInputTransport('test', async () => { posts++; return { accepted: true }; });
+  const transport = context.createMobileInputTransport(async () => { posts++; return { accepted: true }; });
   transport.connect(); sockets[0].open();
   return { context, transport, socket: sockets[0], posts: () => posts };
 }
@@ -25,6 +25,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('movement pipelines without waiting for RTT but bounds outstanding input', async () => {
   const { transport, socket, posts } = fixture();
+  assert.equal(socket.url, 'ws://192.168.1.2:27437/api/input/socket');
   const tickets = Array.from({ length: 5 }, (_, i) => transport.submit({ sequence: i + 1 }));
   let confirmed = false;
   tickets[0].result.then(() => { confirmed = true; });
@@ -43,7 +44,7 @@ test('old hosts fall back to HTTP and wait for its real response', async () => {
   const context = vm.createContext({ URL, setTimeout, clearTimeout, location: { href: 'http://192.168.1.2/mobile' } });
   vm.runInContext(source, context);
   let complete;
-  const transport = context.createMobileInputTransport('test', () => new Promise(resolve => { complete = resolve; }));
+  const transport = context.createMobileInputTransport(() => new Promise(resolve => { complete = resolve; }));
   const ticket = transport.submit({ sequence: 1 });
   let sent = false; ticket.sent.then(() => { sent = true; });
   await tick(); assert.equal(sent, false);

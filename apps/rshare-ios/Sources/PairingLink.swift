@@ -14,7 +14,8 @@ struct PairingLink: Equatable {
     /// its own line so it is never copied into browser history, referrers or
     /// navigation URLs.
     var serialized: String {
-        "\(controlURL.absoluteString)\nAuthorization: Bearer \(bearerToken)"
+        let initialURL = initialPath == "/display" ? displayURL : controlURL
+        return "\(initialURL.absoluteString)\nAuthorization: Bearer \(bearerToken)"
     }
 
     var authorizationHeader: String { "Bearer \(bearerToken)" }

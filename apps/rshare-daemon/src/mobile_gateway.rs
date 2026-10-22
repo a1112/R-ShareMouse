@@ -2285,7 +2285,7 @@ fn render_mobile_page_with_token(token: &str) -> String {
 <script>
 __MOBILE_TRANSPORT_JS__
 const token = __MOBILE_TOKEN_JSON__ || "";
-const inputTransport = createMobileInputTransport(token, envelope => api("/api/inject", {
+const inputTransport = createMobileInputTransport(envelope => api("/api/inject", {
   method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(envelope)
 }));
 const pointerDelta = createPointerDeltaAccumulator();
@@ -6211,6 +6211,7 @@ mod tests {
 
         assert!(page.contains("function releaseAllWithKeepalive()"));
         assert!(page.contains("Authorization: `Bearer ${token}`"));
+        assert!(!page.contains("searchParams.set('t'"));
         assert!(page.contains("keepalive: true"));
         assert!(page.contains("mobile-release-all-keepalive"));
         assert!(page.contains("window.addEventListener(\"pagehide\", releaseAllWithKeepalive);"));
