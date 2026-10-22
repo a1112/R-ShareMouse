@@ -504,8 +504,9 @@ pub struct UsbDescriptorProbeResult {
     pub descriptor_bytes: Vec<u8>,
 }
 
-/// A target-local request to approve an inbound peer certificate. `approval_id`
-/// is intentionally opaque and may be used only once before it expires.
+/// A target-local request to approve a peer certificate observed during a
+/// handshake. `approval_id` is intentionally opaque and may be used only once
+/// before it expires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingPeerApproval {
     pub approval_id: String,
@@ -630,6 +631,11 @@ pub enum DaemonRequest {
     ListVirtualDisplays,
     CreateVirtualDisplay(VirtualDisplayCreateRequest),
     RemoveVirtualDisplay(VirtualDisplayRemoveRequest),
+    ListUsbDisplayDevices,
+    StartUsbDisplay(crate::usb_display::UsbDisplayStart),
+    StartLanDisplay(crate::usb_display::LanDisplayStart),
+    StopUsbDisplay,
+    UsbDisplayStatus,
     Shutdown,
     SendFiles {
         device_id: DeviceId,
@@ -668,6 +674,8 @@ pub enum DaemonResponse {
     DisplaySettingsUpdated(DisplaySettingsUpdateResult),
     VirtualDisplays(Vec<VirtualDisplaySnapshot>),
     VirtualDisplayOperation(VirtualDisplayOperationResult),
+    UsbDisplayDevices(Vec<crate::usb_display::UsbDisplayDevice>),
+    UsbDisplayStatus(crate::usb_display::UsbDisplayStatus),
     UsbDescriptorProbe(UsbDescriptorProbeResult),
     PendingPeerApprovals(Vec<PendingPeerApproval>),
     Ack,

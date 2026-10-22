@@ -18,6 +18,12 @@
 - 同时最多 32 个本地客户端，首个请求超时 5 秒。尚未实现按敏感操作分组的 capability scope，也没有跨提权边界的服务 broker。
 - 性能工具中的 TCP 是独立的临时端口测试夹具，只衡量帧协议 handler；报告明确标注，不代表命名管道/Unix socket 的性能。
 
+### QUIC 对端审批（RSM-001）
+
+- 未知或旧 TOFU 对端只会进入 daemon 的待审批列表；不会完成认证连接、安装 QoS 或进入输入运行时。客户端和服务端各自都必须批准同一个 `device_id + 证书指纹`，然后重试连接。
+- 当前可用的人工入口是同一账户的 CLI/daemon IPC：`rshare approvals list` 查看一次性审批 ID、设备 ID、指纹和过期时间，确认后在对应机器执行 `rshare approvals approve <approval-id>`。桌面 UI 只消费 daemon 的连接状态，不维护第二份信任库或绕过 CLI/IPC 的自动批准路径。
+- 旧 v2 信任库中历史自动写入的 `operator_approved` 会在加载时降级为 Legacy TOFU，保留指纹用于拒绝证书变化，但必须重新执行上述人工批准。未知的未来信任库版本会拒绝加载并保持 fail-closed。
+
 ### 实验性 USB 主机端
 
 - 本地明确授权后才向指定且人工批准证书的 peer 公布设备。导出标识为随机 UUID，网络端不能用本机设备路径作为 claim 的回退入口。

@@ -138,6 +138,7 @@ export function formatMobileInjectResultStatus(result) {
 }
 
 export function normalizeMobilePointerSensitivity(value, config = MOBILE_POINTER_SENSITIVITY) {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return config.defaultValue;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
     return config.defaultValue;

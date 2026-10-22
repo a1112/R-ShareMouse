@@ -33,6 +33,8 @@ impl TestNetwork {
     }
 
     fn manager(&self, device_id: Uuid, role: &str, identity: QuicIdentity) -> ConnectionManager {
+        // Keep this on the public constructor: integration tests compile the
+        // library exactly as the daemon does and must exercise strict approval.
         ConnectionManager::with_transport(device_id, self.transport(device_id, role, identity))
     }
 
@@ -88,15 +90,47 @@ async fn assert_no_connected_event(
 }
 
 #[tokio::test]
-async fn peers_auto_trust_first_seen_certificate_and_connect() {
+async fn first_seen_peer_stays_pending_until_both_operators_approve() {
     let server_id = Uuid::new_v4();
     let client_id = Uuid::new_v4();
     let network = TestNetwork::new("mutual");
     let mut server = network.manager(server_id, "server", generated_identity());
     let mut events = server.events().unwrap();
+    let mut authenticated = server.authenticated_peers().unwrap();
     server.start_server("127.0.0.1:0").await.unwrap();
 
     let mut client = network.manager(client_id, "client", generated_identity());
+    let first_error = client
+        .connect(
+            server_id,
+            &server.transport_local_addr().unwrap().to_string(),
+        )
+        .await
+        .expect_err("first-seen peer must be rejected until approval");
+    assert!(
+        first_error.to_string().contains("ApprovalRequired"),
+        "server must reject the bootstrap with an approval-required reason: {first_error:#}"
+    );
+
+    assert!(server.connections().is_empty());
+    assert!(client.connections().is_empty());
+    assert!(
+        timeout(Duration::from_millis(100), authenticated.recv())
+            .await
+            .is_err(),
+        "a pending peer must not reach the authenticated input receiver"
+    );
+    let server_approval = server
+        .pending_peer_approvals()
+        .pop()
+        .expect("inbound first-seen peer must be pending");
+    let client_approval = client
+        .pending_peer_approvals()
+        .pop()
+        .expect("outbound first-seen peer must be pending");
+    assert!(server.approve_peer(&server_approval.approval_id));
+    assert!(client.approve_peer(&client_approval.approval_id));
+
     client
         .connect(
             server_id,
@@ -159,6 +193,17 @@ async fn changed_fingerprint_never_enters_registry() {
     let first_identity = generated_identity();
     let first_fingerprint = PeerCertificateFingerprint::from_der(&first_identity.cert_der);
     let mut first = network.manager(claimed_id, "client", first_identity);
+    assert!(first.connect(server_id, &address).await.is_err());
+    let server_approval = server
+        .pending_peer_approvals()
+        .pop()
+        .expect("first inbound peer must be pending");
+    let client_approval = first
+        .pending_peer_approvals()
+        .pop()
+        .expect("first outbound peer must be pending");
+    assert!(server.approve_peer(&server_approval.approval_id));
+    assert!(first.approve_peer(&client_approval.approval_id));
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(claimed_id));
     server.disconnect(&claimed_id).await.unwrap();
@@ -225,6 +270,17 @@ async fn sequential_reconnect_assigns_new_control_connection_id() {
     let address = server.transport_local_addr().unwrap().to_string();
 
     let mut first = network.manager(client_id, "client", client_identity.clone());
+    assert!(first.connect(server_id, &address).await.is_err());
+    let server_approval = server
+        .pending_peer_approvals()
+        .pop()
+        .expect("first inbound peer must be pending");
+    let client_approval = first
+        .pending_peer_approvals()
+        .pop()
+        .expect("first outbound peer must be pending");
+    assert!(server.approve_peer(&server_approval.approval_id));
+    assert!(first.approve_peer(&client_approval.approval_id));
     first.connect(server_id, &address).await.unwrap();
     assert_eq!(event_until_connected(&mut events).await, Some(client_id));
     let old_control_id = server.connections()[0]

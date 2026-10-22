@@ -11,6 +11,8 @@
 .vscode/
 *.swp
 *.swo
+xcuserdata/
+*.xcuserstate
 *~
 
 # OS

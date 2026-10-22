@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod service;
 pub mod session;
 pub mod ui_state;
+pub mod usb_display;
 pub mod wake;
 
 // Re-exports from protocol

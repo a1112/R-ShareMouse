@@ -607,6 +607,11 @@ async fn open_display_settings() -> Result<(), String> {
 
 #[tauri::command]
 async fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>, String> {
+    if cfg!(target_os = "macos") {
+        return daemon_client::request_virtual_displays()
+            .await
+            .map_err(|e| e.to_string());
+    }
     list_virtual_displays_with(
         || Box::pin(async { daemon_client::request_virtual_displays().await }),
         || rshare_platform::virtual_display::list_virtual_displays(),
@@ -615,9 +620,49 @@ async fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>, String> 
 }
 
 #[tauri::command]
+async fn usb_display_devices() -> Result<Vec<rshare_core::usb_display::UsbDisplayDevice>, String> {
+    daemon_client::request_usb_display_devices()
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn usb_display_status() -> Result<rshare_core::usb_display::UsbDisplayStatus, String> {
+    daemon_client::request_usb_display(None, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn start_usb_display(
+    request: rshare_core::usb_display::UsbDisplayStart,
+) -> Result<rshare_core::usb_display::UsbDisplayStatus, String> {
+    daemon_client::request_usb_display(Some(request), false)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn start_lan_display(
+    request: rshare_core::usb_display::LanDisplayStart,
+) -> Result<rshare_core::usb_display::UsbDisplayStatus, String> {
+    daemon_client::request_lan_display(request)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn stop_usb_display() -> Result<rshare_core::usb_display::UsbDisplayStatus, String> {
+    daemon_client::request_usb_display(None, true)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn create_virtual_display(
     request: VirtualDisplayCreateRequest,
 ) -> Result<VirtualDisplayOperationResult, String> {
+    if cfg!(target_os = "macos") {
+        return daemon_client::request_create_virtual_display(request)
+            .await
+            .map_err(|e| e.to_string());
+    }
     create_virtual_display_with(
         request,
         |request| Box::pin(async { daemon_client::request_create_virtual_display(request).await }),
@@ -630,6 +675,11 @@ async fn create_virtual_display(
 async fn remove_virtual_display(
     request: VirtualDisplayRemoveRequest,
 ) -> Result<VirtualDisplayOperationResult, String> {
+    if cfg!(target_os = "macos") {
+        return daemon_client::request_remove_virtual_display(request)
+            .await
+            .map_err(|e| e.to_string());
+    }
     remove_virtual_display_with(
         request,
         |request| Box::pin(async { daemon_client::request_remove_virtual_display(request).await }),
@@ -1266,6 +1316,11 @@ fn main() {
             update_display_settings,
             open_display_settings,
             list_virtual_displays,
+            usb_display_devices,
+            usb_display_status,
+            start_usb_display,
+            start_lan_display,
+            stop_usb_display,
             create_virtual_display,
             remove_virtual_display,
             endpoint_events_state,

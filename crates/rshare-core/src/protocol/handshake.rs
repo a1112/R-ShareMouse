@@ -67,10 +67,18 @@ impl PeerTransportCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HandshakeRejectReason {
-    ProtocolMismatch { required: u32, received: u32 },
+    ProtocolMismatch {
+        required: u32,
+        received: u32,
+    },
     ApplicationMismatch,
-    MissingCapabilities { missing: Vec<String> },
+    MissingCapabilities {
+        missing: Vec<String>,
+    },
     IdentityUnavailable,
+    /// The peer's certificate is known to the local trust store, but an
+    /// operator has not approved this device/fingerprint pair yet.
+    ApprovalRequired,
 }
 
 /// Unique identity for one authenticated control connection.

@@ -1,0 +1,39 @@
+name: Peer approval contracts
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  peer-approval:
+    name: Peer approval (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxfixes-dev libxcb1-dev libpipewire-0.3-dev
+
+      - name: Trust migration and public-constructor contracts
+        run: cargo test -p rshare-net --lib --locked
+
+      - name: Production peer approval handshake
+        run: cargo test -p rshare-net --test peer_identity --locked
+
+      - name: Production file-transfer handshake
+        run: cargo test -p rshare-net --test file_transfer --locked
+
+      - name: Protocol rejection handshake
+        run: cargo test -p rshare-net --test protocol_v3_handshake --locked

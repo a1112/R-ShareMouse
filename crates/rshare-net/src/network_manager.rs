@@ -486,7 +486,7 @@ impl NetworkManager {
         self.connection_view.connection_infos().await
     }
 
-    /// List inbound peer approvals that are waiting for this target's local operator.
+    /// List peer approvals that are waiting for this target's local operator.
     pub async fn pending_peer_approvals(&self) -> Vec<PendingPeerApproval> {
         self.connection.lock().await.pending_peer_approvals()
     }
@@ -773,14 +773,16 @@ mod tests {
     ) -> (NetworkManager, ConnectionManager, DeviceId, String) {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut remote = ConnectionManager::with_transport(
+        let mut remote = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             QuicTransport::isolated_for_test(remote_id),
         );
         remote.start_server("127.0.0.1:0").await.unwrap();
         let address = remote.transport_local_addr().unwrap().to_string();
-        let local_connection =
-            ConnectionManager::with_transport(local_id, QuicTransport::isolated_for_test(local_id));
+        let local_connection = ConnectionManager::isolated_for_test_with_transport(
+            local_id,
+            QuicTransport::isolated_for_test(local_id),
+        );
         let mut manager = NetworkManager::isolated_for_test(
             local_id,
             "local".to_string(),
@@ -1046,14 +1048,14 @@ mod tests {
     async fn qos_direct_send_and_broadcast_update_connection_metrics() {
         let local_id = DeviceId::new_v4();
         let remote_id = DeviceId::new_v4();
-        let mut remote = ConnectionManager::with_transport(
+        let mut remote = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             crate::transport::QuicTransport::isolated_for_test(remote_id),
         );
         remote.start_server("127.0.0.1:0").await.unwrap();
         let address = remote.transport_local_addr().unwrap();
 
-        let local_connection = ConnectionManager::with_transport(
+        let local_connection = ConnectionManager::isolated_for_test_with_transport(
             local_id,
             crate::transport::QuicTransport::isolated_for_test(local_id),
         );

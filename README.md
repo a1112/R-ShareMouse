@@ -11,6 +11,9 @@ R-ShareMouse is a cross-platform mouse and keyboard sharing software written in 
 - **File drag and drop**: Drag files across screens into Finder/Explorer folders, or onto a device card; encrypted copying with progress, cancellation and SHA-256 verification
 - **Auto-discovery**: Automatically find devices on your local network
 - **Desktop UI & CLI**: Borderless Tauri desktop shell plus command-line interface
+- **iPhone/iPad companion**: Native connection and settings, daemon-backed touchpad
+  and keyboard, and an experimental Windows extended-display receiver. See the
+  [iOS build and pairing guide](apps/rshare-ios/README.md).
 
 ## Project Status
 

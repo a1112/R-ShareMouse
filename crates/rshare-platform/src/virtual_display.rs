@@ -47,11 +47,15 @@ const RSHARE_VDISPLAY_SUPPORTED_MODES: &[(u32, u32, u32)] = &[
 ];
 
 pub fn list_virtual_displays() -> Result<Vec<VirtualDisplaySnapshot>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_display::list()
+    }
     #[cfg(windows)]
     {
         windows_list_virtual_displays()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(Vec::new())
     }
@@ -77,7 +81,11 @@ pub fn create_virtual_display(
     {
         windows_create_virtual_display(request)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_display::create(request)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let status = unavailable_operation_status();
         Ok(VirtualDisplayOperationResult {
@@ -107,7 +115,11 @@ pub fn remove_virtual_display(
     {
         windows_remove_virtual_display(request)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_display::remove(request)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let status = unavailable_operation_status();
         Ok(VirtualDisplayOperationResult {
@@ -165,7 +177,7 @@ fn invalid_mode_message(width: u32, height: u32, refresh_rate_millihz: Option<u3
     )
 }
 
-fn virtual_display_id(id: Option<&str>) -> String {
+pub(crate) fn virtual_display_id(id: Option<&str>) -> String {
     id.map(str::trim)
         .filter(|id| !id.is_empty())
         .unwrap_or(RSHARE_DEFAULT_VDISPLAY_ID)

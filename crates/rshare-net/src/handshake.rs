@@ -164,9 +164,37 @@ pub(crate) async fn complete_incoming_handshake(
     Ok(())
 }
 
+/// Tell an inbound peer why its bootstrap was stopped before any authenticated
+/// QoS lanes or input receivers are installed.  Keeping this response on the
+/// compatibility stream lets the initiating side surface an actionable
+/// pending-approval state while the target remains fail-closed.
+pub(crate) async fn reject_incoming_handshake(
+    conn: &QuicConnection,
+    local_device_id: DeviceId,
+    reason: HandshakeRejectReason,
+) -> Result<()> {
+    send_rejection(conn, local_device_id, reason).await
+}
+
 pub(crate) async fn perform_outbound_handshake(
     conn: &mut QuicConnection,
     local_device_id: DeviceId,
+) -> Result<NegotiatedPeer> {
+    perform_outbound_handshake_impl(conn, local_device_id, false).await
+}
+
+#[cfg(test)]
+pub(crate) async fn perform_outbound_handshake_for_test(
+    conn: &mut QuicConnection,
+    local_device_id: DeviceId,
+) -> Result<NegotiatedPeer> {
+    perform_outbound_handshake_impl(conn, local_device_id, true).await
+}
+
+async fn perform_outbound_handshake_impl(
+    conn: &mut QuicConnection,
+    local_device_id: DeviceId,
+    test_auto_approve: bool,
 ) -> Result<NegotiatedPeer> {
     conn.send_message(&rshare_core::hello_message(
         local_device_id,
@@ -199,7 +227,18 @@ pub(crate) async fn perform_outbound_handshake(
         _ => anyhow::bail!("peer did not return HelloBack or HelloRejected"),
     };
 
-    let certificate_fingerprint = conn.confirm_peer_identity(peer_id)?;
+    let certificate_fingerprint = if test_auto_approve {
+        #[cfg(test)]
+        {
+            conn.confirm_peer_identity_for_test(peer_id)?
+        }
+        #[cfg(not(test))]
+        {
+            unreachable!("test auto-approval is unavailable in production builds")
+        }
+    } else {
+        conn.require_operator_approved_peer_identity(peer_id)?
+    };
     conn.complete_peer_protocol_handshake().await?;
     Ok(NegotiatedPeer {
         auth: PeerAuthContext {

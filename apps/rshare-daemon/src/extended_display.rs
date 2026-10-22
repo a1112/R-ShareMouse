@@ -1,5 +1,8 @@
 //! Single daemon-owned extended desktop. WebRTC video never enters this channel.
-use crate::{mobile_gateway::MobileHttpRequest, DaemonState};
+use crate::{
+    mobile_gateway::{MobileGatewayAccess, MobileHttpRequest},
+    DaemonState,
+};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use rshare_core::{
@@ -125,6 +128,7 @@ struct HubState {
     host: Option<Slot>,
     receiver: Option<Slot>,
     worker: Option<blocking::SyncSender<Work>>,
+    display: Option<Value>,
 }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DisplayHub(Arc<Mutex<HubState>>);
@@ -139,6 +143,7 @@ impl DisplayHub {
             state.host = None;
             state.receiver = None;
             state.worker = None;
+            state.display = None;
         }
         timeout(Duration::from_secs(5), async {
             loop {
@@ -172,6 +177,11 @@ impl DisplayHub {
         state.next_id += 1;
         let id = state.next_id;
         let (events, rx) = mpsc::channel(32);
+        if role == Role::Receiver {
+            if let Some(display) = &state.display {
+                let _ = events.try_send(display.clone());
+            }
+        }
         let slot = Slot { id, events };
         match role {
             Role::Host => state.host = Some(slot),
@@ -193,6 +203,23 @@ impl DisplayHub {
             },
             rx,
         ))
+    }
+    fn publish_display(&self, host_id: u64, event: Value) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("display hub unavailable"))?;
+        ensure!(
+            state.host.as_ref().map(|slot| slot.id) == Some(host_id),
+            "display host generation expired"
+        );
+        state.display = Some(event.clone());
+        for slot in [&state.host, &state.receiver].into_iter().flatten() {
+            slot.events
+                .try_send(event.clone())
+                .context("display event queue congested")?;
+        }
+        Ok(())
     }
     fn send(&self, role: Role, event: Value) -> Result<()> {
         let state = self
@@ -267,6 +294,7 @@ impl Drop for Registration {
             }
             if self.role == Role::Host {
                 state.worker = None;
+                state.display = None;
             }
             let other = match self.role {
                 Role::Host => &state.receiver,
@@ -293,6 +321,7 @@ pub(crate) async fn serve(
     role: Role,
     hub: DisplayHub,
     daemon: Arc<RwLock<DaemonState>>,
+    activity: MobileGatewayAccess,
 ) -> Result<()> {
     ensure!(
         allow_role(role, peer),
@@ -369,6 +398,9 @@ pub(crate) async fn serve(
                         let result = (|| -> Result<()> {
                             let message = validate_message(role, &text)?;
                             last_message = Instant::now();
+                            if role == Role::Receiver {
+                                activity.record_client(peer);
+                            }
                             match &message {
                                 ClientMessage::Ping => {},
                                 ClientMessage::Offer { sdp } => hub.send(role.other(), json!({"type":"offer","sdp":sdp}))?,
@@ -436,6 +468,7 @@ fn run_worker(
                 Role::Receiver,
                 json!({"type":"touch_enabled","enabled":false}),
             );
+            let _ = hub.send(Role::Host, json!({"type":"touch_enabled","enabled":false}));
         }
         if injector.is_some() && last_touch.elapsed() > Duration::from_secs(1) {
             if let Some(touch) = injector.as_mut() {
@@ -513,7 +546,7 @@ fn run_worker(
                     let active = display
                         .as_ref()
                         .context("驱动已接受创建，但系统尚未识别扩展屏；已结束会话以清理")?;
-                    hub.send(Role::Host, json!({"type":"display", "display":active}))?;
+                    hub.publish_display(host_id, json!({"type":"display", "display":active}))?;
                     refresh_inventory(&daemon);
                 }
                 ClientMessage::EnableTouch { enabled } => {
@@ -530,6 +563,11 @@ fn run_worker(
                     hub.send(Role::Host, event)?;
                 }
                 ClientMessage::Touch { sequence, contacts } => {
+                    // A final empty release can race with host revocation or
+                    // receiver replacement. It cannot introduce new input.
+                    if injector.is_none() && contacts.is_empty() {
+                        return Ok(());
+                    }
                     let touch = injector.as_mut().context("触摸未被主机启用")?;
                     let active = display.as_ref().context("扩展屏不可用")?;
                     touch.inject(sequence, &contacts, bounds(active))?;
@@ -617,6 +655,27 @@ mod tests {
             r#"{"type":"create","width":80000,"height":1080}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn extended_display_replacement_receiver_gets_current_screen() {
+        let hub = DisplayHub::default();
+        let (host, mut host_events) = hub.attach(Role::Host).unwrap();
+        let host_id = host.id;
+        let event =
+            json!({"type":"display", "display":{"display_id":"test", "width":1920,"height":1080}});
+        hub.publish_display(host_id, event.clone()).unwrap();
+        assert_eq!(host_events.try_recv().unwrap(), event);
+        let (receiver, mut events) = hub.attach(Role::Receiver).unwrap();
+        assert_eq!(events.try_recv().unwrap(), event);
+        drop(receiver);
+        let (_receiver, mut events) = hub.attach(Role::Receiver).unwrap();
+        assert_eq!(events.try_recv().unwrap(), event);
+        drop(host);
+        assert!(hub.0.lock().unwrap().display.is_none());
+        let (_replacement_host, _) = hub.attach(Role::Host).unwrap();
+        assert!(hub.publish_display(host_id, event).is_err());
+        assert!(hub.0.lock().unwrap().display.is_none());
     }
 
     #[test]

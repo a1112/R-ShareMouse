@@ -8,6 +8,7 @@ mod extended_display;
 mod mobile_gateway;
 mod network_audio;
 mod static_capture;
+mod usb_display;
 mod usb_service;
 
 use anyhow::{Context, Result};
@@ -419,6 +420,7 @@ struct DaemonState {
     pending_usb_transfers: HashMap<u64, PendingUsbTransfer>,
     pending_endpoint_injects: HashMap<String, PendingEndpointInject>,
     virtual_displays: VirtualDisplayManager,
+    usb_display: usb_display::Manager,
     mobile_access: mobile_gateway::MobileGatewayAccess,
     file_transfers: Option<Arc<rshare_net::file_transfer::FileTransferService>>,
 }
@@ -479,6 +481,7 @@ impl DaemonState {
             pending_endpoint_injects: HashMap::new(),
             network_audio: Arc::new(std::sync::Mutex::new(network_audio::Manager::default())),
             virtual_displays: VirtualDisplayManager::default(),
+            usb_display: usb_display::Manager::default(),
             mobile_access,
             file_transfers: None,
         }
@@ -8247,6 +8250,7 @@ async fn main() -> Result<()> {
         }
     };
 
+    state.read().await.usb_display.shutdown();
     let mobile_shutdown_result = complete_mobile_gateway_shutdown(
         &shutdown_tx,
         if mobile_gateway_finished {
@@ -8679,6 +8683,9 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
             | DaemonRequest::ListVirtualDisplays
             | DaemonRequest::CreateVirtualDisplay(_)
             | DaemonRequest::RemoveVirtualDisplay(_)
+            | DaemonRequest::StartUsbDisplay(_)
+            | DaemonRequest::StartLanDisplay(_)
+            | DaemonRequest::StopUsbDisplay
     )
 }
 
@@ -9239,6 +9246,28 @@ async fn dispatch_ipc_request(
                 Err(error) => DaemonResponse::Error(error.to_string()),
             }
         }
+        DaemonRequest::ListUsbDisplayDevices => match state.read().await.usb_display.devices() {
+            Ok(devices) => DaemonResponse::UsbDisplayDevices(devices),
+            Err(error) => DaemonResponse::Error(error.to_string()),
+        },
+        DaemonRequest::StartUsbDisplay(request) => {
+            match state.read().await.usb_display.start(request) {
+                Ok(status) => DaemonResponse::UsbDisplayStatus(status),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::StartLanDisplay(request) => {
+            match state.read().await.usb_display.start_lan(request) {
+                Ok(status) => DaemonResponse::UsbDisplayStatus(status),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::StopUsbDisplay => {
+            DaemonResponse::UsbDisplayStatus(state.read().await.usb_display.stop())
+        }
+        DaemonRequest::UsbDisplayStatus => {
+            DaemonResponse::UsbDisplayStatus(state.read().await.usb_display.status())
+        }
         DaemonRequest::ListVirtualDisplays => {
             let platform_displays = rshare_platform::virtual_display::list_virtual_displays();
             let mut state = state.write().await;
@@ -9257,6 +9286,13 @@ async fn dispatch_ipc_request(
         }
         DaemonRequest::RemoveVirtualDisplay(request) => {
             let mut state = state.write().await;
+            if request.id.starts_with("usb-display-")
+                && state.usb_display.status().display_id.is_some()
+            {
+                return Ok(DaemonResponse::Error(
+                    "Stop the USB display session before removing its screen".into(),
+                ));
+            }
             let result = state.virtual_displays.remove(request);
             state.refresh_local_controls_platform();
             DaemonResponse::VirtualDisplayOperation(result)

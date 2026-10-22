@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,6 +176,19 @@ test("mobile pointer sensitivity is clamped to a phone-friendly range", () => {
   assert.equal(normalizeMobilePointerSensitivity(0.1), 0.5);
   assert.equal(normalizeMobilePointerSensitivity(9), 3);
   assert.equal(normalizeMobilePointerSensitivity(Number.NaN), 1.35);
+});
+
+test("first-run touchpad sensitivity uses the default in both served and desktop controllers", () => {
+  const source = readAppFile("../rshare-daemon/src/mobile_gateway.rs");
+  const start = source.indexOf("const POINTER_SENSITIVITY_DEFAULT =");
+  const end = source.indexOf("function loadPointerSensitivity()", start);
+  assert.ok(start >= 0 && end > start);
+  const servedNormalize = vm.runInNewContext(source.slice(start, end) + "; clampPointerSensitivity");
+  for (const normalize of [servedNormalize, normalizeMobilePointerSensitivity]) {
+    for (const missing of [null, undefined, "", "  "]) assert.equal(normalize(missing), 1.35);
+    assert.equal(normalize("0.5"), 0.5);
+    assert.equal(normalize("2.4"), 2.4);
+  }
 });
 
 test("buildKeyChordRequests presses keys in order and releases in reverse", () => {

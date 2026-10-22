@@ -39,24 +39,65 @@ export function selectedPath(stats) {
   return { local: local?.address || '隐藏', remote: remote?.address || '隐藏', protocol: local?.protocol || '未知', rttMs: Number.isFinite(pair.currentRoundTripTime) ? Math.round(pair.currentRoundTripTime * 1000) : null };
 }
 
+export function isVideoPlaying(video) {
+  // WebKit can resolve play() on a remote track before ICE or its first frame.
+  return !!video.srcObject && !video.paused && !video.ended && video.readyState >= 2
+    && video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+// Browsers may deny this on HTTP; native receivers implement the same lifecycle.
+export class ScreenWakeLock {
+  constructor(api) { this.api = api; this.active = false; this.lock = null; this.pending = false; }
+  async setActive(active) {
+    this.active = active;
+    if (!active) {
+      const lock = this.lock; this.lock = null;
+      try { await lock?.release(); } catch {}
+      return;
+    }
+    if (!this.api || this.lock || this.pending) return;
+    this.pending = true;
+    try {
+      const lock = await this.api.request('screen');
+      if (!this.active) { await lock.release(); return; }
+      this.lock = lock;
+      lock.addEventListener('release', () => { if (this.lock === lock) this.lock = null; });
+    } catch {} finally { this.pending = false; }
+  }
+}
+
 export function startPage() {
   const el = id => document.getElementById(id);
   const token = new URL(location.href).searchParams.get('t') ?? '';
   const host = new URL(location.href).searchParams.get('role') === 'host';
-  const video = el('video'), contacts = new ContactTracker();
+  const video = el('video'), contacts = new ContactTracker(), wakeLock = new ScreenWakeLock(navigator.wakeLock);
   let socket, pc, stream, screen, receiver = false, sequence = 0, touchEnabled = false;
   let makingOffer = false, stopped = false, signalChain = Promise.resolve(), touchPending = false;
+  let heartbeat, statsTimer, retryTimer = null, retries = 0, resumeOnShow = false, queuedIce = [];
+  let previousBytes = 0, previousTime = 0;
   const status = text => { el('status').textContent = text; };
   el('host-controls').hidden = !host;
   el('receiver-controls').hidden = host;
   el('title').textContent = host ? '扩展显示器 · 主机' : '扩展显示器 · 接收端';
   history.replaceState(null, '', `${location.pathname}${host ? '?role=host' : ''}`);
+  function presentation() {
+    const playing = !host && !stopped && !document.hidden && pc?.connectionState === 'connected' && isVideoPlaying(video);
+    const immersive = playing && document.body.classList.contains('immersive');
+    void wakeLock.setActive(playing);
+    window.dispatchEvent(new CustomEvent('rshare-display-state', { detail: { playing, immersive } }));
+  }
+  for (const event of ['playing', 'pause', 'ended', 'emptied', 'loadeddata', 'resize', 'waiting']) video.addEventListener(event, presentation);
+  video.addEventListener('playing', () => { retries = 0; });
   function send(message) {
     if (socket?.readyState !== WebSocket.OPEN) return false;
     if (socket.bufferedAmount > 64 * 1024) { stop('控制通道拥塞，已停止连接'); return false; }
     socket.send(JSON.stringify(message)); return true;
   }
   function release() { contacts.clear(); sendTouch(); }
+  function resetTouch() {
+    touchEnabled = false; touchPending = false; contacts.clear();
+    el('touch').checked = false; el('touch-status').textContent = '触摸未启用';
+  }
   function sendTouch() {
     if (host || !touchEnabled) return;
     touchPending = false;
@@ -65,17 +106,38 @@ export function startPage() {
   function closePeer() {
     release(); pc?.close(); pc = null;
     if (!host) video.srcObject = null;
+    presentation();
   }
   function stop(reason = '连接已结束') {
     if (stopped) return;
     stopped = true;
+    clearTimeout(retryTimer); retryTimer = null; resumeOnShow = false;
     release(); stream?.getTracks().forEach(t => t.stop()); stream = null;
     document.body.classList.remove('immersive');
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
-    pc?.close(); pc = null; socket?.close();
+    closePeer(); resetTouch(); queuedIce = [];
+    const previous = socket; socket = null; previous?.close();
     clearInterval(heartbeat); clearInterval(statsTimer);
-    status(`${reason}。重新打开连接链接可重试。`);
+    status(reason);
     el('share').disabled = true; el('create').disabled = true; el('touch').disabled = true;
+    el('play').disabled = true; el('reconnect').hidden = host;
+    presentation();
+  }
+  function interrupted(reason) {
+    stop(reason);
+    if (host || document.hidden || retries >= 5) return;
+    const delay = Math.min(500 * 2 ** retries++, 5000);
+    status(`${reason}，正在重连（${retries}/5）…`);
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
+  }
+  function suspend() {
+    if (host || (stopped && retryTimer === null)) return;
+    clearTimeout(retryTimer); retryTimer = null;
+    stop('附屏已暂停'); resumeOnShow = true;
+  }
+  function resume() {
+    if (resumeOnShow && !document.hidden) { resumeOnShow = false; retries = 0; connect(); }
+    presentation();
   }
   function newPeer() {
     closePeer();
@@ -85,20 +147,25 @@ export function startPage() {
     next.onicecandidate = e => { if (e.candidate && pc === next) send({ type: 'ice', candidate: e.candidate.toJSON() }); };
     next.onconnectionstatechange = () => {
       if (pc !== next) return;
-      status(`视频连接：${next.connectionState}`);
+      const labels = { new: '等待视频连接', connecting: '正在连接视频', connected: '视频已连接', disconnected: '视频连接中断', failed: '视频连接失败', closed: '视频已关闭' };
+      status(labels[next.connectionState] || '等待视频连接');
+      presentation();
       if (next.connectionState === 'failed' || next.connectionState === 'disconnected') release();
+      if (!host && next.connectionState === 'failed') interrupted('视频连接中断');
     };
     next.ontrack = e => {
+      if (pc !== next || stopped) return;
       video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
       // Browser support varies. Targets are hints, never a measured latency claim.
       if ('jitterBufferTarget' in e.receiver) { try { e.receiver.jitterBufferTarget = 0; } catch {} }
       if ('playoutDelayHint' in e.receiver) { try { e.receiver.playoutDelayHint = 0; } catch {} }
-      video.play().catch(() => status('请点击“播放 / 全屏”开始播放'));
+      el('play').disabled = false;
+      video.play().then(presentation).catch(() => status('请点击“播放 / 全屏”开始播放'));
     };
     return next;
   }
   async function offer() {
-    if (!receiver || !stream || makingOffer) return;
+    if (stopped || !receiver || !stream || makingOffer) return;
     makingOffer = true;
     try {
       const next = newPeer();
@@ -109,6 +176,7 @@ export function startPage() {
       const codecs = RTCRtpSender.getCapabilities?.('video')?.codecs;
       if (codecs && transceiver.setCodecPreferences) transceiver.setCodecPreferences(preferH264(codecs));
       await next.setLocalDescription(await next.createOffer());
+      if (pc !== next || stopped) return;
       send({ type: 'offer', sdp: next.localDescription.sdp });
       const parameters = sender.getParameters();
       if (parameters.encodings?.length) {
@@ -127,20 +195,34 @@ export function startPage() {
         screen = message.display;
         el('screen').textContent = `${screen.friendly_name || screen.display_id} · ${screen.width} × ${screen.height}`;
         el('share').disabled = false; el('create').disabled = true;
-        status('扩展屏已被系统识别；请在屏幕选择器中选中它'); break;
+        status(host ? '扩展屏已被系统识别；请在屏幕选择器中选中它' : '扩展屏已就绪，等待主机分享画面'); break;
       case 'receiver_ready': receiver = true; await offer(); break;
-      case 'receiver_left': receiver = false; closePeer(); touchEnabled = false; el('touch').checked = false; status('接收端已断开，等待重新连接'); break;
+      case 'receiver_left': receiver = false; closePeer(); resetTouch(); queuedIce = []; status('接收端已断开，等待重新连接'); break;
       case 'host_left': stop('主机已断开'); break;
       case 'session_ended': stop('扩展屏会话已结束'); break;
       case 'touch_enabled': touchEnabled = message.enabled; el('touch').checked = touchEnabled; if (!touchEnabled) contacts.clear(); el('touch-status').textContent = touchEnabled ? 'Windows 多点触摸已启用' : '触摸未启用'; break;
       case 'offer': {
         const next = newPeer();
         await next.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+        if (pc !== next || stopped) return;
+        for (const candidate of queuedIce.splice(0)) await next.addIceCandidate(candidate);
         await next.setLocalDescription(await next.createAnswer());
+        if (pc !== next || stopped) return;
         send({ type: 'answer', sdp: next.localDescription.sdp }); break;
       }
-      case 'answer': if (pc) await pc.setRemoteDescription({ type: 'answer', sdp: message.sdp }); break;
-      case 'ice': if (pc) await pc.addIceCandidate(message.candidate); break;
+      case 'answer': {
+        const next = pc;
+        if (next) {
+          await next.setRemoteDescription({ type: 'answer', sdp: message.sdp });
+          if (pc === next) for (const candidate of queuedIce.splice(0)) await next.addIceCandidate(candidate);
+        }
+        break;
+      }
+      case 'ice':
+        if (pc?.remoteDescription) await pc.addIceCandidate(message.candidate);
+        else if (queuedIce.length < 64) queuedIce.push(message.candidate);
+        else interrupted('视频协商数据过多');
+        break;
     }
   }
   el('create').onclick = () => send({ type: 'create', width: 1920, height: 1080 });
@@ -156,6 +238,7 @@ export function startPage() {
       stream = null;
       // Call directly from the click gesture, without preceding asynchronous work.
       stream = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: 'monitor', frameRate: { ideal: 60, max: 60 }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+      if (stopped) { stream.getTracks().forEach(t => t.stop()); stream = null; return; }
       const track = stream.getVideoTracks()[0];
       if (track.getSettings().displaySurface && track.getSettings().displaySurface !== 'monitor') {
         stream.getTracks().forEach(t => t.stop()); stream = null;
@@ -169,21 +252,25 @@ export function startPage() {
     } catch (error) { status(error.message); }
   };
   el('touch').onchange = e => send({ type: 'enable_touch', enabled: e.target.checked });
-  el('stop').onclick = () => stop();
+  el('stop').onclick = () => { clearTimeout(retryTimer); retryTimer = null; resumeOnShow = false; stop(); status('连接已结束'); };
+  el('reconnect').onclick = () => { retries = 0; resumeOnShow = false; connect(); };
   el('play').onclick = () => {
     video.play().catch(() => {});
     document.body.classList.add('immersive');
     // Fullscreen the DOM container, not Safari's native video player: the video
     // must remain a Pointer Events target. CSS covers browsers without the API.
-    el('viewer').requestFullscreen?.().catch(() => {});
+    if (!window.rshareNativeDisplay) el('viewer').requestFullscreen?.().catch(() => {});
+    presentation();
   };
   el('leave-fullscreen').onclick = () => {
     release(); document.body.classList.remove('immersive');
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    presentation();
   };
   document.addEventListener('fullscreenchange', () => {
     release();
     if (!document.fullscreenElement) document.body.classList.remove('immersive');
+    presentation();
   });
   for (const name of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture']) {
     video.addEventListener(name, event => {
@@ -199,14 +286,17 @@ export function startPage() {
       } else { contacts.up(event.pointerId); sendTouch(); }
     });
   }
-  document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
-  window.addEventListener('pagehide', () => stop());
-  const heartbeat = setInterval(() => { send({ type: 'ping' }); if (contacts.contacts.size) sendTouch(); }, 250);
-  let previousBytes = 0, previousTime = 0;
-  const statsTimer = setInterval(async () => {
-    if (!pc) return;
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { release(); suspend(); } else resume(); });
+  window.addEventListener('pagehide', () => { if (host) stop(); else suspend(); });
+  window.addEventListener('pageshow', resume);
+  window.addEventListener('resize', release);
+  async function updateStats() {
+    const peer = pc;
+    if (!peer) return;
     try {
-      const report = await pc.getStats(); const path = selectedPath(report);
+      const report = await peer.getStats();
+      if (pc !== peer) return;
+      const path = selectedPath(report);
       const media = [...report.values()].find(s => s.type === (host ? 'outbound-rtp' : 'inbound-rtp') && s.kind === 'video');
       const bytes = media?.bytesSent ?? media?.bytesReceived ?? 0;
       const elapsed = (media?.timestamp ?? 0) - previousTime;
@@ -215,17 +305,27 @@ export function startPage() {
       const codec = media && report.get(media.codecId);
       el('stats').textContent = `${media?.framesPerSecond ?? '?'} fps · ${Math.max(0, mbps).toFixed(1)} Mbps · ${codec?.mimeType ?? ''}${path ? ` · RTT ${path.rttMs ?? '?'} ms · ${path.local} → ${path.remote} (${path.protocol})` : ''}`;
     } catch {}
-  }, 1000);
-  try {
-    if (typeof RTCPeerConnection !== 'function') throw new Error('此浏览器环境未提供 WebRTC，请使用支持 WebRTC 的浏览器');
-    const url = new URL('/api/display/socket', location.href);
-    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    url.searchParams.set('t', token); url.searchParams.set('role', host ? 'host' : 'receiver');
-    socket = new WebSocket(url);
-    socket.onmessage = event => {
-      signalChain = signalChain.then(() => receive(JSON.parse(event.data))).catch(error => status(error.message));
-    };
-    socket.onclose = () => stop('连接已关闭');
-    socket.onerror = () => status('连接失败，请检查地址、配对令牌和主机网关');
-  } catch (error) { stop(error.message); }
+  }
+  function connect() {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (socket) return;
+    stopped = false; sequence = 0; signalChain = Promise.resolve(); queuedIce = [];
+    resetTouch(); el('reconnect').hidden = true; el('play').disabled = true;
+    status('正在连接…');
+    heartbeat = setInterval(() => { send({ type: 'ping' }); if (contacts.contacts.size) sendTouch(); }, 250);
+    statsTimer = setInterval(updateStats, 1000);
+    try {
+      if (typeof RTCPeerConnection !== 'function') throw new Error('此浏览器环境未提供 WebRTC，请使用支持 WebRTC 的浏览器');
+      const url = new URL('/api/display/socket', location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      url.searchParams.set('t', token); url.searchParams.set('role', host ? 'host' : 'receiver');
+      const next = new WebSocket(url); socket = next;
+      next.onmessage = event => {
+        signalChain = signalChain.then(() => { if (socket === next) return receive(JSON.parse(event.data)); }).catch(error => { if (socket === next) status(error.message); });
+      };
+      next.onclose = () => { if (socket === next) interrupted('连接已关闭'); };
+      next.onerror = () => { if (socket === next) status('连接失败，请检查地址、配对令牌和主机网关'); };
+    } catch (error) { stop(error.message); }
+  }
+  connect();
 }

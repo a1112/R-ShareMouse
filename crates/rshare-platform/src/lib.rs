@@ -47,6 +47,12 @@ pub mod display_capture;
 pub mod remote_touch;
 
 // Cross-platform virtual display control helpers
+#[cfg(target_os = "macos")]
+pub mod lan_display;
+#[cfg(target_os = "macos")]
+pub mod macos_display;
+#[cfg(target_os = "macos")]
+pub mod usbmux;
 pub mod virtual_display;
 
 // Experimental USB forwarding host runtime

@@ -27,6 +27,8 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 
 use crate::{endpoint_runtime::inject_endpoint_event, DaemonState};
 
+mod input_stream;
+
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_MOBILE_CLIENT_ID_BYTES: usize = 128;
@@ -549,6 +551,7 @@ pub(crate) enum MobileGatewayRoute {
     DisplayPage,
     DisplayScript,
     DisplaySocket,
+    InputSocket,
     LocalControls,
     Inject,
     NotFound,
@@ -565,6 +568,7 @@ pub(crate) fn route_mobile_http_request(method: &str, target: &str) -> MobileGat
         ("GET", "/display") => MobileGatewayRoute::DisplayPage,
         ("GET", "/display/client.mjs") => MobileGatewayRoute::DisplayScript,
         ("GET", "/api/display/socket") => MobileGatewayRoute::DisplaySocket,
+        ("GET", "/api/input/socket") => MobileGatewayRoute::InputSocket,
         ("GET", "/api/local-controls") => MobileGatewayRoute::LocalControls,
         ("POST", "/api/inject") => MobileGatewayRoute::Inject,
         _ => MobileGatewayRoute::NotFound,
@@ -837,6 +841,18 @@ async fn handle_mobile_gateway_client_with_context(
     access.record_client(peer_addr);
 
     match route {
+        MobileGatewayRoute::InputSocket => {
+            input_stream::serve(
+                stream,
+                &request,
+                &sessions,
+                &network_manager,
+                &inject_backend,
+                &state,
+                &local_events_tx,
+            )
+            .await
+        }
         MobileGatewayRoute::DisplayPage => {
             let local_sender =
                 mobile_query_value(&request.target, "role").as_deref() == Some("host");
@@ -874,6 +890,7 @@ async fn handle_mobile_gateway_client_with_context(
                 role,
                 access.display_hub.clone(),
                 state,
+                access.clone(),
             )
             .await
         }
@@ -2238,7 +2255,12 @@ fn render_mobile_page_with_token(token: &str) -> String {
   <div class="sub" id="textCapability" role="status">当前输入后端不支持文本输入，请使用按键控制。</div>
 </main>
 <script>
+__MOBILE_TRANSPORT_JS__
 const token = __MOBILE_TOKEN_JSON__ || new URLSearchParams(location.search).get("t") || "";
+const inputTransport = createMobileInputTransport(token, envelope => api("/api/inject", {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(envelope)
+}));
+const pointerDelta = createPointerDeltaAccumulator();
 document.getElementById("extendedDisplayLink").href = "/display?t=" + encodeURIComponent(token);
 function newMobileClientId() {
   return crypto.randomUUID ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -2290,6 +2312,7 @@ const POINTER_SENSITIVITY_MIN = 0.5;
 const POINTER_SENSITIVITY_MAX = 3;
 const POINTER_SENSITIVITY_STEP = 0.05;
 function clampPointerSensitivity(value) {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return POINTER_SENSITIVITY_DEFAULT;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return POINTER_SENSITIVITY_DEFAULT;
   const clamped = Math.max(POINTER_SENSITIVITY_MIN, Math.min(POINTER_SENSITIVITY_MAX, parsed));
@@ -2467,11 +2490,7 @@ async function inject(request, expectedGeneration = inputGeneration) {
   const envelope = prepareOrdinaryInjectEnvelope(request, expectedGeneration);
   if (!envelope) return false;
   try {
-    const result = await api("/api/inject", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(envelope)
-    });
+    const result = await inputTransport.submit(envelope).result;
     if (inputSuspended || expectedGeneration !== inputGeneration) return false;
     const feedback = formatInjectResultStatus(result);
     clearReleasedHeldInput(request, feedback.accepted);
@@ -2595,8 +2614,24 @@ function beginPointerWrite() {
 }
 function sendMoveNow(next, expectedGeneration = inputGeneration) {
   const completePointerWrite = beginPointerWrite();
-  return enqueueInject(daemonRequest("Mouse", { kind: "MouseMove", data: { x: next.x, y: next.y, display_id: next.displayId } }, cid("mobile-move")), expectedGeneration)
-    .finally(completePointerWrite);
+  const queued = mobileRequestQueueTail.then(async () => {
+    const request = daemonRequest("Mouse", { kind: "MouseMove", data: { x: next.x, y: next.y, display_id: next.displayId } }, cid("mobile-move"));
+    const envelope = prepareOrdinaryInjectEnvelope(request, expectedGeneration);
+    if (!envelope) { completePointerWrite(); return; }
+    const ticket = inputTransport.submit(envelope);
+    // Motion can pipeline; pointer snapshots remain fenced until the real ack.
+    void ticket.result.then(result => {
+      if (inputSuspended || expectedGeneration !== inputGeneration) return;
+      const feedback = formatInjectResultStatus(result);
+      if (!feedback.accepted) { statusRevision++; statusEl.textContent = feedback.status; }
+    }, error => {
+      if (inputSuspended || expectedGeneration !== inputGeneration) return;
+      statusRevision++; statusEl.textContent = formatMobileError(error, "移动端注入");
+    }).finally(completePointerWrite);
+    await ticket.sent;
+  });
+  mobileRequestQueueTail = queued.catch(() => {});
+  return queued.catch(() => { completePointerWrite(); });
 }
 function queuePendingMove() {
   const next = pendingMove;
@@ -2724,6 +2759,8 @@ function keepaliveReleaseBatch(requests) {
 function releaseAllWithKeepalive() {
   inputSuspended = true;
   inputGeneration += 1;
+  inputTransport.close();
+  pointerDelta.reset();
   setGestureActive(false);
   pendingMove = null;
   if (pendingMoveFrame) {
@@ -2803,6 +2840,7 @@ function resumeMobileInput() {
   if (!inputSuspended) return;
   rotateMobileClientSession();
   inputSuspended = false;
+  void inputTransport.connect();
   refresh();
 }
 function resumeMobileInputWhenVisible() {
@@ -2862,6 +2900,7 @@ async function sendTwoFingerTapClick() {
   ], generation);
 }
 pad.addEventListener("pointerdown", (event) => {
+  if (touchPoints.size === 0) pointerDelta.reset();
   touchPoints.set(event.pointerId, { id: event.pointerId, x: event.clientX, y: event.clientY });
   activePointer = event.pointerId;
   lastPoint = { x: event.clientX, y: event.clientY };
@@ -2909,8 +2948,9 @@ pad.addEventListener("pointermove", (event) => {
   if (tapStart && Math.hypot(event.clientX - tapStart.x, event.clientY - tapStart.y) > 12) {
     clearDragTimer();
   }
-  const dx = Math.round((event.clientX - lastPoint.x) * pointerSensitivity);
-  const dy = Math.round((event.clientY - lastPoint.y) * pointerSensitivity);
+  const { x: dx, y: dy } = pointerDelta.take(
+    (event.clientX - lastPoint.x) * pointerSensitivity,
+    (event.clientY - lastPoint.y) * pointerSensitivity);
   lastPoint = { x: event.clientX, y: event.clientY };
   const maxX = pointer.minX + pointer.width - 1;
   const maxY = pointer.minY + pointer.height - 1;
@@ -3118,12 +3158,14 @@ document.addEventListener("visibilitychange", releaseAllWithKeepaliveWhenHidden)
 window.addEventListener("focus", resumeMobileInput);
 window.addEventListener("pageshow", resumeMobileInput);
 document.addEventListener("visibilitychange", resumeMobileInputWhenVisible);
+void inputTransport.connect();
 refresh();
 setInterval(refresh, 1500);
 </script>
 </body>
 </html>
 "#
+    .replace("__MOBILE_TRANSPORT_JS__", include_str!("mobile-transport.js"))
     .replace("__MOBILE_TOKEN_JSON__", &token_json)
 }
 
@@ -3493,6 +3535,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_socket_auth_order_and_stale_sequence_are_preserved() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{client::IntoClientRequest, Message},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access = MobileGatewayAccess::new(addr, "socket-test".into(), "127.0.0.1".into());
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let (state, network, injection, events) =
+            test_mobile_runtime(Box::new(RecordingInjectBackend {
+                injected: recorded.clone(),
+            }));
+        let (shutdown, rx) = broadcast::channel(1);
+        let server = tokio::spawn(run_mobile_gateway_server_on_listener(
+            listener,
+            access,
+            state,
+            network,
+            injection,
+            events,
+            rx,
+            MobileGatewayLimits::default(),
+        ));
+        let request = |token: &str, origin: String| {
+            let mut request = format!("ws://{addr}/api/input/socket?t={token}")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+            request
+        };
+        assert!(connect_async(request("wrong", format!("http://{addr}")))
+            .await
+            .is_err());
+        assert!(
+            connect_async(request("socket-test", "http://other.local".into()))
+                .await
+                .is_err()
+        );
+        let (mut socket, _) = connect_async(request("socket-test", format!("http://{addr}")))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text("{\"type\":\"ping\"}".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap().to_text().unwrap(),
+            "{\"type\":\"pong\"}"
+        );
+        // Pipeline before reading acknowledgements, including a stale replay.
+        for sequence in [1, 2, 2, 3, 4] {
+            let envelope = json!({ "client_id": "pipeline", "sequence": sequence,
+                "request": { "InjectEndpointEvent": { "target": "Local", "request": {
+                    "correlation_id": format!("move-{sequence}"), "device_kind": "Mouse",
+                    "payload": { "kind": "MouseMove", "data": { "x": sequence, "y": 10, "display_id": null } },
+                    "mode": "BestEffort", "timeout_ms": 250
+                } } } });
+            socket
+                .send(Message::Text(envelope.to_string().into()))
+                .await
+                .unwrap();
+        }
+        for (index, sequence) in [1, 2, 2, 3, 4].into_iter().enumerate() {
+            let frame = timeout(Duration::from_secs(3), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let reply: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(reply["sequence"], sequence);
+            if index == 2 {
+                assert!(reply["error"].is_string());
+            } else {
+                assert_eq!(reply["result"]["EndpointInjectResult"]["accepted"], true);
+            }
+        }
+        let positions: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                InputEvent::MouseMove { x, .. } => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec![1, 2, 3, 4]);
+        socket.close(None).await.unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn extended_display_real_websocket_relay_and_role_violation_cleanup() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::{
@@ -3502,6 +3640,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let access = MobileGatewayAccess::new(addr, "socket-test".into(), "127.0.0.1".into());
+        let activity = access.clone();
         let (state, network, injection, events) = test_mobile_runtime(Box::new(NoopInjectBackend));
         let (shutdown, shutdown_rx) = broadcast::channel(1);
         let server = tokio::spawn(run_mobile_gateway_server_on_listener(
@@ -3562,6 +3701,18 @@ mod tests {
             .into_text()
             .unwrap();
         assert!(offer.contains("integration-offer"));
+        let before = activity.activity_snapshot().2;
+        receiver
+            .send(Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while activity.activity_snapshot().2 == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("display heartbeat must keep mobile connection status current");
         receiver
             .send(Message::Text(
                 r#"{"type":"create","width":1920,"height":1080}"#.into(),
@@ -5265,7 +5416,9 @@ mod tests {
         );
         assert!(
             inject.find("if (!envelope) return false;").unwrap()
-                < inject.find("await api(\"/api/inject\"").unwrap()
+                < inject
+                    .find("await inputTransport.submit(envelope).result")
+                    .unwrap()
         );
         assert!(!inject.contains("mobileEnvelope(request)"));
         let refresh_end = page[refresh_start..]
@@ -5308,7 +5461,9 @@ mod tests {
             .map(|offset| inject_start + offset)
             .expect("missing refresh function");
         let inject = &page[inject_start..refresh_start];
-        let await_api = inject.find("await api(\"/api/inject\"").unwrap();
+        let await_api = inject
+            .find("await inputTransport.submit(envelope).result")
+            .unwrap();
         let catch_start = inject.find("} catch (error) {").unwrap();
         let success = &inject[await_api..catch_start];
         let generation_guard = success
@@ -5441,7 +5596,7 @@ mod tests {
             .expect("missing dequeue-time sequence allocation");
         let inject = &page[inject_start..refresh_start];
         let network = inject
-            .find("await api(\"/api/inject\"")
+            .find("await inputTransport.submit(envelope).result")
             .expect("missing inject request");
         assert!(generation_gate < sequence);
         assert!(inject.contains("prepareOrdinaryInjectEnvelope(request, expectedGeneration)"));

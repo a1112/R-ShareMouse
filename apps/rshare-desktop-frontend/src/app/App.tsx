@@ -618,6 +618,82 @@ type MobileAccessSnapshot = {
   client_count?: number;
 };
 
+type UsbDisplaySnapshot = {
+  phase: string;
+  transport: string | null;
+  display_id: string | null;
+  frames_sent: number;
+  frames_decoded: number;
+  bytes_sent: number;
+  message: string | null;
+};
+
+function NativeUsbDisplayPanel() {
+  const [transport, setTransport] = useState("usb");
+  const [lanLink, setLanLink] = useState("");
+  const [devices, setDevices] = useState<{ udid: string; connection: string }[]>([]);
+  const [device, setDevice] = useState("");
+  const [code, setCode] = useState("");
+  const [status, setStatus] = useState<UsbDisplaySnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [resolution, setResolution] = useState("1920x1080");
+  const active = !!status && ["Starting", "WaitingForVideo", "Streaming", "Stopping"].includes(status.phase);
+  useEffect(() => {
+    let disposed = false;
+    let refreshing = false;
+    async function refresh() {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const [nextDevices, nextStatus] = await Promise.all([
+          invokeCommand<{ udid: string; connection: string }[]>("usb_display_devices").catch(() => []),
+          invokeCommand<UsbDisplaySnapshot>("usb_display_status"),
+        ]);
+        if (disposed) return;
+        setDevices(nextDevices); setStatus(nextStatus);
+        setDevice(previous => nextDevices.some(item => item.udid === previous) ? previous : nextDevices[0]?.udid ?? "");
+      } catch (failure) { if (!disposed) setError(errorMessage(failure)); }
+      finally { refreshing = false; }
+    }
+    void refresh(); const timer = window.setInterval(() => void refresh(), 1500);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, []);
+  async function control(stop: boolean) {
+    setBusy(true); setError(null);
+    try {
+      const [width, height] = resolution.split("x").map(Number);
+      const next = await invokeCommand<UsbDisplaySnapshot>(stop ? "stop_usb_display" : transport === "lan" ? "start_lan_display" : "start_usb_display",
+        stop ? undefined : { request: transport === "lan" ? { endpoint: lanLink.trim(), width, height, fps: 60 } : { udid: device, code, width, height, fps: 60 } });
+      setStatus(next); if (!stop) { setCode(""); setLanLink(""); }
+    } catch (failure) { setError(errorMessage(failure)); }
+    finally { setBusy(false); }
+  }
+  const phase: Record<string, string> = { Stopped: "已停止", Starting: "正在连接", WaitingForVideo: "等待首帧", Streaming: "手机正在显示", Stopping: "正在移除附屏", Failed: "连接结束" };
+  return <div className="mb-6 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+    <h3 className="mb-2 font-semibold">Mac → iPhone / iPad 扩展屏</h3>
+    <p className="mb-3 text-sm opacity-70">在手机“扩展屏 → 连接 Mac 附屏”选择 USB 或局域网并开启接收。USB 输入六位配对码；Wi-Fi / 局域网粘贴手机提供的加密配对链接。</p>
+    <div className="flex flex-wrap gap-2">
+      <select aria-label="附屏连接方式" className="rounded border bg-transparent p-2" value={transport} disabled={active || busy} onChange={event => setTransport(event.target.value)}>
+        <option value="usb">USB 数据线</option><option value="lan">局域网 / Wi-Fi（加密）</option>
+      </select>
+      {transport === "usb" && <select aria-label="USB 接收设备" className="min-w-48 rounded border bg-transparent p-2" value={device} disabled={active || busy} onChange={event => setDevice(event.target.value)}>
+        {!devices.length && <option value="">未发现 USB iPhone / iPad</option>}
+        {devices.map(item => <option key={item.udid} value={item.udid}>USB · {item.udid}</option>)}
+      </select>}
+      <select aria-label="USB 附屏分辨率" className="rounded border bg-transparent p-2" value={resolution} disabled={active || busy} onChange={event => setResolution(event.target.value)}>
+        <option value="1920x1080">1920 × 1080</option><option value="1280x720">1280 × 720</option>
+      </select>
+      {transport === "usb" ? <input aria-label="手机 USB 配对码" className="w-36 rounded border bg-transparent p-2 font-mono" placeholder="6 位配对码" inputMode="numeric" maxLength={6} value={code} disabled={active || busy} onChange={event => setCode(event.target.value.replace(/\D/g, ""))} />
+        : <input aria-label="手机局域网配对链接" className="min-w-64 flex-1 rounded border bg-transparent p-2" type="password" autoComplete="off" placeholder="粘贴 rshare-display:// 配对链接" value={lanLink} disabled={active || busy} onChange={event => setLanLink(event.target.value)} />}
+      <button className="rounded bg-emerald-600 px-4 py-2 text-white disabled:opacity-40" disabled={busy || (!active && (transport === "usb" ? !device || code.length !== 6 : !lanLink.trim()))} onClick={() => void control(active)}>{active ? "停止附屏" : "开始附屏"}</button>
+    </div>
+    <p className="mt-3 text-sm" role="status">{phase[status?.phase ?? ""] ?? "读取服务状态…"}{status?.transport === "lan-tls" ? " · 局域网加密连接" : status?.transport === "usbmuxd-usb" ? " · USB 直连" : ""}{status?.display_id ? ` · ${status.display_id}` : ""}{status && status.frames_sent > 0 ? ` · 发送 ${status.frames_sent} 帧 / 手机确认显示 ${status.frames_decoded} 帧` : ""}</p>
+    {(error || status?.message) && <p className="mt-2 text-sm text-amber-600" role="alert">{error || status?.message}</p>}
+    <p className="mt-2 text-xs opacity-60">首次使用需为 R-ShareMouse 开启屏幕录制权限。连接中断、手机进入后台或停止会话时，自动移除本次创建的屏幕。局域网接收需允许手机访问本地网络。Mac 虚拟屏接口目前属于实验功能。</p>
+  </div>;
+}
+
 type RemoteLatencySummary = {
   state: "idle" | "pending" | "pass" | "warn" | "fail";
   message: string;
@@ -812,6 +888,11 @@ const NETWORK_COMMANDS = new Set([
   "update_display_settings",
   "open_display_settings",
   "list_virtual_displays",
+  "usb_display_devices",
+  "usb_display_status",
+  "start_usb_display",
+  "start_lan_display",
+  "stop_usb_display",
   "create_virtual_display",
   "remove_virtual_display",
 ]);
@@ -1426,6 +1507,16 @@ async function invokeNetworkCommand<T = unknown>(
       return await daemonRequestValue<T>("OpenDisplaySettings", "Ack");
     case "list_virtual_displays":
       return await daemonRequestValue<T>("ListVirtualDisplays", "VirtualDisplays");
+    case "usb_display_devices":
+      return await daemonRequestValue<T>("ListUsbDisplayDevices", "UsbDisplayDevices");
+    case "usb_display_status":
+      return await daemonRequestValue<T>("UsbDisplayStatus", "UsbDisplayStatus");
+    case "start_usb_display":
+      return await daemonRequestValue<T>({ StartUsbDisplay: args?.request ?? args }, "UsbDisplayStatus");
+    case "start_lan_display":
+      return await daemonRequestValue<T>({ StartLanDisplay: args?.request ?? args }, "UsbDisplayStatus");
+    case "stop_usb_display":
+      return await daemonRequestValue<T>("StopUsbDisplay", "UsbDisplayStatus");
     case "create_virtual_display":
       return await daemonRequestValue<T>(
         { CreateVirtualDisplay: args?.request ?? args },
@@ -10511,6 +10602,7 @@ function SettingsPage({
   } else if (selectedSection === "mobile") {
     sectionContent = (
       <section className="p-5" style={panelStyle}>
+        {getDesktopShellState().isMacOS && <NativeUsbDisplayPanel />}
         {renderSectionHeader(
           <Smartphone size={18} />,
           "移动端控制",
@@ -10573,7 +10665,7 @@ function SettingsPage({
         {mobileAccessView.available && (
           <div className="mt-4 space-y-2 rounded-md p-3 text-sm" style={{ border: `1px solid ${theme.border}` }}>
             <strong>扩展显示器 · 实验功能</strong>
-            <p style={{ color: theme.textMuted }}>主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。其他电脑或 iPad 打开接收链接；主机确认后可启用 Windows 多点触摸。</p>
+            <p style={{ color: theme.textMuted }}>Windows 主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。iPhone / iPad 应用可直接粘贴接收链接，或进入“扩展屏”；Android 可在系统浏览器打开接收链接。主机确认后可启用多点触摸。</p>
             <div className="flex flex-wrap gap-2">
               <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
                 void navigator.clipboard?.writeText(`http://localhost:${mobileAccessView.port}/display?role=host&t=${encodeURIComponent(mobileAccessView.token)}`);
@@ -10583,7 +10675,7 @@ function SettingsPage({
                 void navigator.clipboard?.writeText(url.toString());
               }}>复制接收链接</button>
             </div>
-            <p style={{ color: theme.textMuted }}>有线模式可使用 USB 网络共享或 USB 以太网，并改用对应网卡的 IP。iPad 普通数据线直连尚不支持。</p>
+            <p style={{ color: theme.textMuted }}>浏览器接收可使用 USB 网络共享或 USB 以太网。Mac 普通数据线直连请使用上方原生附屏入口。</p>
           </div>
         )}
         <div className="mt-4 flex flex-wrap gap-2">

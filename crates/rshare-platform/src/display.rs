@@ -38,7 +38,14 @@ pub fn query_display_state() -> Result<LocalDisplayState> {
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn query_display_state() -> Result<LocalDisplayState> {
-    Ok(LocalDisplayState::default())
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_display::query()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(LocalDisplayState::default())
+    }
 }
 
 #[cfg(windows)]

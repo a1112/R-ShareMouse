@@ -16,6 +16,10 @@ use std::sync::Mutex;
 const QUIC_CERT_FILE: &str = "quic-cert.der";
 const QUIC_KEY_FILE: &str = "quic-key.pkcs8.der";
 const QUIC_TRUST_FILE: &str = "quic-trust.json";
+// Version 2 was written by the automatic first-seen promotion path.  Its
+// `operator_approved` entries cannot prove that a human approved them, so
+// loading one must require re-approval.  New approvals are written as v3.
+const TRUST_STORE_VERSION: u8 = 3;
 static IDENTITY_LOCK: Mutex<()> = Mutex::new(());
 static TRUST_STORE_LOCK: Mutex<()> = Mutex::new(());
 static TRUST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +39,10 @@ impl PeerCertificateFingerprint {
     pub fn from_der(cert_der: &[u8]) -> Self {
         let digest = Sha256::digest(cert_der);
         Self(hex_encode(&digest))
+    }
+
+    pub(crate) fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -81,7 +89,7 @@ pub struct QuicTrustStore {
 impl Default for QuicTrustStore {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: TRUST_STORE_VERSION,
             peers: HashMap::new(),
         }
     }
@@ -95,7 +103,7 @@ enum TrustStoreWire {
     },
     Versioned {
         #[serde(default, rename = "version")]
-        _version: u8,
+        version: u8,
         peers: HashMap<DeviceId, TrustedPeerEntry>,
     },
 }
@@ -104,7 +112,7 @@ impl<'de> Deserialize<'de> for QuicTrustStore {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match TrustStoreWire::deserialize(deserializer)? {
             TrustStoreWire::Legacy { peers } => Ok(Self {
-                version: 2,
+                version: TRUST_STORE_VERSION,
                 peers: peers
                     .into_iter()
                     .map(|(device_id, fingerprint)| {
@@ -118,7 +126,31 @@ impl<'de> Deserialize<'de> for QuicTrustStore {
                     })
                     .collect(),
             }),
-            TrustStoreWire::Versioned { peers, .. } => Ok(Self { version: 2, peers }),
+            TrustStoreWire::Versioned { version, peers } => {
+                if version > TRUST_STORE_VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported future QUIC trust store version {version}"
+                    )));
+                }
+                let peers = peers
+                    .into_iter()
+                    .map(|(device_id, mut entry)| {
+                        // v2 was produced before approvals were operator
+                        // gated.  Preserve the certificate pin for mismatch
+                        // detection, but force a fresh explicit approval.
+                        if version < TRUST_STORE_VERSION
+                            && entry.provenance == TrustProvenance::OperatorApproved
+                        {
+                            entry.provenance = TrustProvenance::LegacyTofu;
+                        }
+                        (device_id, entry)
+                    })
+                    .collect();
+                Ok(Self {
+                    version: TRUST_STORE_VERSION,
+                    peers,
+                })
+            }
         }
     }
 }
@@ -189,7 +221,7 @@ impl QuicTrustStore {
         }
     }
 
-    pub fn trust_first_seen(
+    fn trust_first_seen(
         &mut self,
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
@@ -207,14 +239,16 @@ impl QuicTrustStore {
         decision
     }
 
-    pub fn trust_first_seen_default(
+    #[allow(dead_code)]
+    pub(crate) fn trust_first_seen_default(
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
     ) -> Result<QuicTrustDecision> {
         Self::trust_first_seen_at(trust_store_path()?, device_id, fingerprint)
     }
 
-    pub fn trust_first_seen_at(
+    #[allow(dead_code)]
+    pub(crate) fn trust_first_seen_at(
         path: impl AsRef<Path>,
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
@@ -252,7 +286,7 @@ impl QuicTrustStore {
         )
     }
 
-    pub fn approve(
+    fn approve(
         &mut self,
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
@@ -277,7 +311,7 @@ impl QuicTrustStore {
         }
     }
 
-    pub fn approve_at(
+    pub(crate) fn approve_at(
         path: impl AsRef<Path>,
         device_id: DeviceId,
         fingerprint: PeerCertificateFingerprint,
@@ -605,6 +639,55 @@ mod tests {
             store.check(device_id, &PeerCertificateFingerprint::from_der(b"cert-b")),
             QuicTrustDecision::Rejected { .. }
         ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn v2_automatic_operator_entries_require_fresh_approval() {
+        let dir = temp_dir("quic-trust-v2-migration");
+        let path = dir.join("trust.json");
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"legacy-auto");
+        fs::create_dir_all(&dir).unwrap();
+        let wire = serde_json::json!({
+            "version": 2,
+            "peers": {
+                device_id.to_string(): {
+                    "fingerprint": fingerprint,
+                    "provenance": "operator_approved"
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+
+        let store = QuicTrustStore::load(&path).unwrap();
+        assert_eq!(
+            store.provenance_for(&device_id),
+            Some(TrustProvenance::LegacyTofu)
+        );
+        assert!(!store.is_operator_approved_exact(device_id, &fingerprint));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_trust_store_version_fails_closed() {
+        let dir = temp_dir("quic-trust-future-version");
+        let path = dir.join("trust.json");
+        let device_id = DeviceId::new_v4();
+        let fingerprint = PeerCertificateFingerprint::from_der(b"future-version");
+        fs::create_dir_all(&dir).unwrap();
+        let wire = serde_json::json!({
+            "version": TRUST_STORE_VERSION + 1,
+            "peers": {
+                device_id.to_string(): {
+                    "fingerprint": fingerprint,
+                    "provenance": "operator_approved"
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+
+        assert!(QuicTrustStore::load(&path).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 

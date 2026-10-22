@@ -24,11 +24,46 @@ const SUPPORTED_VIRTUAL_DISPLAY_MODES: &[(u32, u32, u32)] = &[
 
 #[derive(Subcommand)]
 pub enum DisplayCommand {
+    /// Start an encrypted LAN/Wi-Fi extended display using the phone's link
+    Lan {
+        #[arg(long)]
+        link: String,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+    },
+    /// Use a USB-connected iPhone/iPad as a native macOS extended display
+    Usb {
+        #[command(subcommand)]
+        command: UsbDisplayCommand,
+    },
     /// Validate virtual display visibility through daemon display state
     Virtual {
         #[command(subcommand)]
         command: VirtualDisplayCommand,
     },
+}
+
+#[derive(Subcommand)]
+pub enum UsbDisplayCommand {
+    Devices,
+    Start {
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        code: String,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+    },
+    Status,
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -57,7 +92,7 @@ pub enum VirtualDisplayCommand {
         #[arg(long, default_value = "rshare-vdisplay-1")]
         id: String,
     },
-    /// Verify the active virtual display appears in the Windows display topology
+    /// Verify the active virtual display appears in the system display topology
     Verify {
         #[arg(long)]
         mode: Option<String>,
@@ -72,6 +107,55 @@ pub enum VirtualDisplayCommand {
 
 pub async fn execute(command: DisplayCommand) -> Result<()> {
     match command {
+        DisplayCommand::Lan {
+            link,
+            width,
+            height,
+            fps,
+        } => {
+            let result = rshare_core::daemon_client::request_lan_display(
+                rshare_core::usb_display::LanDisplayStart {
+                    endpoint: link,
+                    width,
+                    height,
+                    fps,
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        DisplayCommand::Usb { command } => {
+            if matches!(command, UsbDisplayCommand::Devices) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &rshare_core::daemon_client::request_usb_display_devices().await?
+                    )?
+                );
+                return Ok(());
+            }
+            let stop = matches!(command, UsbDisplayCommand::Stop);
+            let request = match command {
+                UsbDisplayCommand::Start {
+                    device,
+                    code,
+                    width,
+                    height,
+                    fps,
+                } => Some(rshare_core::usb_display::UsbDisplayStart {
+                    udid: device,
+                    code,
+                    width,
+                    height,
+                    fps,
+                }),
+                _ => None,
+            };
+            let result = rshare_core::daemon_client::request_usb_display(request, stop).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         DisplayCommand::Virtual { command } => execute_virtual(command).await,
     }
 }

@@ -8,11 +8,16 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify, RwLock};
 use tokio::time::Instant;
 
-use rshare_core::{ControlConnectionId, DeviceId, Message, PendingPeerApproval};
+use rshare_core::{
+    ControlConnectionId, DeviceId, HandshakeRejectReason, Message, PendingPeerApproval,
+};
 
 use super::encryption::{PeerCertificateFingerprint, QuicTrustDecision};
+#[cfg(test)]
+use super::handshake::perform_outbound_handshake_for_test;
 use super::handshake::{
     complete_incoming_handshake, perform_outbound_handshake, receive_incoming_handshake,
+    reject_incoming_handshake,
 };
 use super::qos::{
     BulkFrame, ClassifiedMessage, ConnectionRegistry, ControlFrame, RegisteredPeer, TelemetryFrame,
@@ -415,11 +420,13 @@ pub struct ConnectionManager {
     terminal_release_tx: mpsc::Sender<TerminalReleaseEvent>,
     terminal_release_rx: Option<mpsc::Receiver<TerminalReleaseEvent>>,
     pending_approvals: Arc<StdRwLock<PendingApprovalRegistry>>,
+    /// Only the explicit `isolated_for_test*` helpers enable the historical
+    /// auto-promotion behavior needed by legacy in-process fixtures. All
+    /// public constructors, including `new` and `with_transport`, remain
+    /// explicit-approval only even when this crate is compiled for tests.
+    test_auto_approve: bool,
 }
 
-// Retained for the future explicit approval mode. The current single-user
-// runtime automatically pins first-seen peers after identity verification.
-#[allow(dead_code)]
 const PENDING_APPROVAL_TTL_MS: u64 = 2 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -490,16 +497,34 @@ impl PendingApprovalRegistry {
         );
     }
 
+    #[allow(dead_code)]
     fn approve(&mut self, approval_id: &str, now_ms: u64) -> bool {
+        self.approve_identity(approval_id, now_ms).is_some()
+    }
+
+    fn approve_identity(
+        &mut self,
+        approval_id: &str,
+        now_ms: u64,
+    ) -> Option<(DeviceId, PeerCertificateFingerprint)> {
         self.prune(now_ms);
         let Some(expectation) = self.approvals.get_mut(approval_id) else {
-            return false;
+            return None;
         };
         if expectation.approved {
-            return false;
+            return None;
         }
         expectation.approved = true;
-        true
+        Some((
+            expectation.approval.device_id,
+            PeerCertificateFingerprint::from_string(&expectation.approval.fingerprint),
+        ))
+    }
+
+    fn unapprove(&mut self, approval_id: &str) {
+        if let Some(expectation) = self.approvals.get_mut(approval_id) {
+            expectation.approved = false;
+        }
     }
 
     #[allow(dead_code)]
@@ -894,10 +919,24 @@ impl ConnectionManager {
 
     #[cfg(test)]
     pub(crate) fn isolated_for_test(local_device_id: DeviceId) -> Self {
-        Self::with_transport(
+        Self::isolated_for_test_with_transport(
             local_device_id,
             QuicTransport::isolated_for_test(local_device_id),
         )
+    }
+
+    /// Construct a manager for legacy unit fixtures that use an isolated
+    /// transport and do not exercise the approval IPC flow. Integration tests
+    /// must use the public `with_transport` constructor so the production
+    /// approval boundary remains covered.
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test_with_transport(
+        local_device_id: DeviceId,
+        transport: QuicTransport,
+    ) -> Self {
+        let mut manager = Self::with_transport(local_device_id, transport);
+        manager.test_auto_approve = true;
+        manager
     }
 
     pub fn with_transport(local_device_id: DeviceId, mut transport: QuicTransport) -> Self {
@@ -930,6 +969,7 @@ impl ConnectionManager {
             terminal_release_tx,
             terminal_release_rx: Some(terminal_release_rx),
             pending_approvals: Arc::new(StdRwLock::new(PendingApprovalRegistry::default())),
+            test_auto_approve: false,
         }
     }
 
@@ -940,11 +980,28 @@ impl ConnectionManager {
             .list(PendingApprovalRegistry::now_ms())
     }
 
-    pub fn approve_peer(&self, approval_id: &str) -> bool {
-        self.pending_approvals
+    pub fn approve_peer(&mut self, approval_id: &str) -> bool {
+        let identity = self
+            .pending_approvals
             .write()
             .expect("pending approval registry poisoned")
-            .approve(approval_id, PendingApprovalRegistry::now_ms())
+            .approve_identity(approval_id, PendingApprovalRegistry::now_ms());
+        let Some((device_id, fingerprint)) = identity else {
+            return false;
+        };
+        if let Err(error) = self.transport.approve_peer_identity(device_id, fingerprint) {
+            tracing::warn!(
+                peer_id = %device_id,
+                error = %error,
+                "Failed to persist explicit peer approval"
+            );
+            self.pending_approvals
+                .write()
+                .expect("pending approval registry poisoned")
+                .unapprove(approval_id);
+            return false;
+        }
+        true
     }
 
     pub async fn start_server(&mut self, bind_addr: &str) -> Result<()> {
@@ -959,6 +1016,8 @@ impl ConnectionManager {
         let qos_registry = self.qos_registry.clone();
         let terminal_release_tx = self.terminal_release_tx.clone();
         let authenticated_peer_tx = self.authenticated_peer_tx.clone();
+        let pending_approvals = self.pending_approvals.clone();
+        let test_auto_approve = self.test_auto_approve;
         let local_device_id = self.local_device_id;
 
         tokio::spawn(async move {
@@ -982,18 +1041,30 @@ impl ConnectionManager {
                 let inbound_authorized = match negotiated.inbound_trust_decision.as_ref() {
                     Some(QuicTrustDecision::OperatorApproved) => true,
                     Some(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
-                        if let Err(error) = incoming
-                            .connection
-                            .commit_inbound_operator_approval(device_id)
-                        {
-                            tracing::warn!(
-                                "Failed to persist automatically trusted inbound peer {}: {}",
-                                device_id,
-                                error
-                            );
-                            false
+                        if test_auto_approve {
+                            incoming
+                                .connection
+                                .approve_peer_identity(
+                                    device_id,
+                                    negotiated.auth.certificate_fingerprint.clone(),
+                                )
+                                .is_ok()
                         } else {
-                            true
+                            pending_approvals
+                                .write()
+                                .expect("pending approval registry poisoned")
+                                .observe(
+                                    device_id,
+                                    &negotiated.auth.certificate_fingerprint,
+                                    PendingApprovalRegistry::now_ms(),
+                                );
+                            let _ = reject_incoming_handshake(
+                                &incoming.connection,
+                                local_device_id,
+                                HandshakeRejectReason::ApprovalRequired,
+                            )
+                            .await;
+                            false
                         }
                     }
                     Some(QuicTrustDecision::Rejected { .. }) | None => false,
@@ -1244,9 +1315,39 @@ impl ConnectionManager {
                 return Err(error);
             }
         };
-        let negotiated = match perform_outbound_handshake(&mut conn, self.local_device_id).await {
+        let pending_peer_identity = conn.pending_peer_identity();
+        let negotiated = match if self.test_auto_approve {
+            #[cfg(test)]
+            {
+                perform_outbound_handshake_for_test(&mut conn, self.local_device_id).await
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("test auto-approval is unavailable in production builds")
+            }
+        } else {
+            perform_outbound_handshake(&mut conn, self.local_device_id).await
+        } {
             Ok(negotiated) => negotiated,
             Err(error) => {
+                if !self.test_auto_approve {
+                    if let Some((pending_device_id, fingerprint, decision)) = pending_peer_identity
+                    {
+                        if matches!(
+                            decision,
+                            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu
+                        ) {
+                            self.pending_approvals
+                                .write()
+                                .expect("pending approval registry poisoned")
+                                .observe(
+                                    pending_device_id,
+                                    &fingerprint,
+                                    PendingApprovalRegistry::now_ms(),
+                                );
+                        }
+                    }
+                }
                 conn.reject_pending_peer_identity();
                 let _ = self
                     .event_tx
@@ -1707,6 +1808,16 @@ mod tests {
     async fn test_manager_new() {
         let manager = ConnectionManager::isolated_for_test(DeviceId::new_v4());
         assert_eq!(manager.connected_count().await, 0);
+    }
+
+    #[test]
+    fn public_constructor_keeps_explicit_approval_mode_in_unit_tests() {
+        let device_id = DeviceId::new_v4();
+        let manager = ConnectionManager::with_transport(
+            device_id,
+            QuicTransport::isolated_for_test(device_id),
+        );
+        assert!(!manager.test_auto_approve);
     }
 
     #[tokio::test]
@@ -2305,7 +2416,9 @@ mod tests {
             .await
             .unwrap();
         let _server_connection = accepted.await.unwrap();
-        connection.confirm_peer_identity(remote_id).unwrap();
+        connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         connection.set_device_id(remote_id);
         let messages = connection.message_channel();
 
@@ -2469,7 +2582,9 @@ mod tests {
             .await
             .unwrap();
         let _first_server_connection = incoming.recv().await.unwrap().connection;
-        old_connection.confirm_peer_identity(remote_id).unwrap();
+        old_connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         old_connection.set_device_id(remote_id);
 
         let mut second_client = QuicTransport::isolated_for_test(local_id);
@@ -2478,7 +2593,9 @@ mod tests {
             .await
             .unwrap();
         let _second_server_connection = incoming.recv().await.unwrap().connection;
-        new_connection.confirm_peer_identity(remote_id).unwrap();
+        new_connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         new_connection.set_device_id(remote_id);
 
         let mut manager = ConnectionManager::isolated_for_test(local_id);
@@ -2771,7 +2888,9 @@ mod tests {
             .await
             .unwrap();
         let _server_connection = accepted.await.unwrap();
-        connection.confirm_peer_identity(remote_id).unwrap();
+        connection
+            .confirm_peer_identity_for_test(remote_id)
+            .unwrap();
         connection.set_device_id(remote_id);
         let _held_messages = connection.message_channel();
 
@@ -3360,7 +3479,7 @@ mod tests {
         manager.start_server("127.0.0.1:0").await.unwrap();
         let address = manager.transport_local_addr().unwrap();
 
-        let mut first_peer = ConnectionManager::with_transport(
+        let mut first_peer = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity.clone()),
         );
@@ -3388,7 +3507,7 @@ mod tests {
             .expect("the first inbound connection should be present")
             .generation;
 
-        let mut duplicate_peer = ConnectionManager::with_transport(
+        let mut duplicate_peer = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity),
         );
@@ -3498,7 +3617,7 @@ mod tests {
         let remote_id = DeviceId::new_v4();
         let remote_identity = generated_identity();
 
-        let mut first_remote = ConnectionManager::with_transport(
+        let mut first_remote = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity.clone()),
         );
@@ -3566,7 +3685,7 @@ mod tests {
         .expect("the first connection reader should report its closed transport");
         assert!(!manager.is_connected(&remote_id).await);
 
-        let mut replacement_remote = ConnectionManager::with_transport(
+        let mut replacement_remote = ConnectionManager::isolated_for_test_with_transport(
             remote_id,
             QuicTransport::isolated_with_identity_for_test(remote_id, remote_identity),
         );
@@ -3686,7 +3805,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut manager = ConnectionManager::with_transport(
+        let mut manager = ConnectionManager::isolated_for_test_with_transport(
             local_id,
             QuicTransport::isolated_for_test(local_id).with_trust_store_path(trust_path.clone()),
         );
@@ -3732,7 +3851,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
         });
 
-        let mut manager = ConnectionManager::with_transport(
+        let mut manager = ConnectionManager::isolated_for_test_with_transport(
             local_id,
             QuicTransport::isolated_for_test(local_id).with_trust_store_path(trust_path.clone()),
         );

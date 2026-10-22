@@ -23,6 +23,6 @@
 <div id="viewer"><video id="video" autoplay muted playsinline disablepictureinpicture></video><button id="leave-fullscreen">退出全屏</button></div>
 <div id="receiver-controls" hidden><button id="play">播放 / 全屏</button></div>
 <div id="touch-status" class="muted">触摸未启用</div><div id="stats" class="muted">视频直连 · 无公共中继 · 实际性能以统计为准</div>
-<div><button id="stop">断开</button></div>
+<div class="actions"><button id="stop">断开</button><button id="reconnect" hidden>重新连接</button></div>
 <details class="muted"><summary>USB / 有线连接</summary><p>可使用已建立的 USB 网络共享或 USB 以太网。通过该网卡的主机 IP 打开接收链接，并核对上方实际连接地址；必要时关闭 Wi‑Fi，确保视频走有线连接。RTT 是网络往返时间，不是屏幕显示延迟。</p><p>iPad 普通数据线直连尚不支持。USB 热点依赖蜂窝版 iPad、运营商支持及 Windows Apple 驱动；Wi‑Fi 版 iPad 可使用兼容的以太网适配器接入局域网。</p><p>当前入口复用实验性移动网关的 HTTP 配对，仅用于受信任局域网；WebRTC 视频本身加密。画面触摸使用 Windows 原生触摸注入，不会注册硬件触摸屏。</p></details>
 </main><script type="module">import { startPage } from '/display/client.mjs'; startPage();</script></body></html>

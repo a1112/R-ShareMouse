@@ -101,7 +101,7 @@ fn rejects_zero_sized_virtual_display_without_accessing_driver() {
     assert!(result.display.is_none());
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[test]
 fn reports_virtual_display_as_unsupported_off_windows() {
     let result =

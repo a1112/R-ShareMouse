@@ -220,6 +220,18 @@ impl Pair {
             resolver,
         );
         b.start_server("127.0.0.1:0").await.unwrap();
+        let address = b.transport_local_addr().unwrap().to_string();
+        assert!(a.connect(b_id, &address).await.is_err());
+        let b_approval = b
+            .pending_peer_approvals()
+            .pop()
+            .expect("inbound peer must remain pending until approval");
+        let a_approval = a
+            .pending_peer_approvals()
+            .pop()
+            .expect("outbound peer must remain pending until approval");
+        assert!(b.approve_peer(&b_approval.approval_id));
+        assert!(a.approve_peer(&a_approval.approval_id));
         a.connect(b_id, &b.transport_local_addr().unwrap().to_string())
             .await
             .unwrap();

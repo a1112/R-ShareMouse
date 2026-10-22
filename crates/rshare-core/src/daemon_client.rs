@@ -30,6 +30,40 @@ async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
     send_request_at(default_ipc_addr(), request).await
 }
 
+pub async fn request_usb_display_devices() -> Result<Vec<crate::usb_display::UsbDisplayDevice>> {
+    match send_request(DaemonRequest::ListUsbDisplayDevices).await? {
+        DaemonResponse::UsbDisplayDevices(devices) => Ok(devices),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected USB display response: {other:?}"),
+    }
+}
+pub async fn request_lan_display(
+    request: crate::usb_display::LanDisplayStart,
+) -> Result<crate::usb_display::UsbDisplayStatus> {
+    match send_request(DaemonRequest::StartLanDisplay(request)).await? {
+        DaemonResponse::UsbDisplayStatus(status) => Ok(status),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        _ => anyhow::bail!("Unexpected LAN display response"),
+    }
+}
+pub async fn request_usb_display(
+    command: Option<crate::usb_display::UsbDisplayStart>,
+    stop: bool,
+) -> Result<crate::usb_display::UsbDisplayStatus> {
+    let request = if stop {
+        DaemonRequest::StopUsbDisplay
+    } else if let Some(request) = command {
+        DaemonRequest::StartUsbDisplay(request)
+    } else {
+        DaemonRequest::UsbDisplayStatus
+    };
+    match send_request(request).await? {
+        DaemonResponse::UsbDisplayStatus(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected USB display response: {other:?}"),
+    }
+}
+
 async fn send_request_at(address: SocketAddr, request: DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = connect_at(address)
         .await
