@@ -42,11 +42,9 @@ pub(super) async fn serve(
     stream.set_nodelay(true)?;
     let header = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", derive_accept_key(key.as_bytes()));
     timeout(Duration::from_secs(3), stream.write_all(header.as_bytes())).await??;
-    let config = WebSocketConfig {
-        max_message_size: Some(MAX_BODY_BYTES),
-        max_frame_size: Some(MAX_BODY_BYTES),
-        ..Default::default()
-    };
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_BODY_BYTES);
+    config.max_frame_size = Some(MAX_BODY_BYTES);
     let mut socket = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
     while let Some(message) = timeout(Duration::from_secs(60), socket.next()).await? {
         let message = message?;

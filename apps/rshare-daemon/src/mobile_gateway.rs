@@ -3537,12 +3537,15 @@ mod tests {
             MobileGatewayLimits::default(),
         ));
         let request = |token: &str, origin: String| {
-            let mut request = format!("ws://{addr}/api/input/socket?t={token}")
+            let mut request = format!("ws://{addr}/api/input/socket")
                 .into_client_request()
                 .unwrap();
             request
                 .headers_mut()
                 .insert("origin", origin.parse().unwrap());
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
             request
         };
         assert!(connect_async(request("wrong", format!("http://{addr}")))
