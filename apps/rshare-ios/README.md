@@ -6,7 +6,8 @@ The desktop Rust workspace is not embedded in the phone app.
 
 ## Interface and capabilities
 
-- Connection page: paste the desktop's authenticated mobile URL; reconnect to the
+- Connection page: paste the desktop's mobile pairing payload (a token-free URL
+  followed by an `Authorization: Bearer ...` line); reconnect to the
   last paired computer. Credentials are stored in the device-only Keychain,
   never in UserDefaults, screenshot labels, analytics, or committed configuration.
 - Remote: the existing daemon touchpad, mouse buttons, scrolling, shortcuts,
@@ -43,13 +44,17 @@ desktop-only window/tray implementation. The WindowBase checkout is unchanged.
 
 Enable `features.mobile_gateway_enabled = true` in the computer's R-ShareMouse
 configuration and restart its service. From desktop Settings → Mobile control,
-copy its complete `/mobile?t=...` link to the iOS connection page. Both devices
+copy its complete pairing information (the `/mobile` URL and the separate
+`Authorization: Bearer ...` line) to the iOS connection page. Both devices
 must be on the same LAN. The experimental desktop gateway currently uses HTTP;
 use it only on a trusted LAN. Public hosts, malformed links, changed origins and
 host-mode display navigation are rejected by the app.
 
 The app requests no camera or microphone access. Copy/paste uses the system
 Paste button. The local HTTP exception is limited to web content/local networking.
+The extension-display page authenticates its first request, then uses a same-origin
+HttpOnly session cookie for signaling; the display URL and WebSocket URL contain no
+bearer token.
 
 ## Build and install
 

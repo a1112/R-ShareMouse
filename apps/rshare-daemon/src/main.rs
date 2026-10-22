@@ -13142,7 +13142,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_gateway_authorizes_header_token_only() {
+    fn mobile_gateway_authorizes_header_or_cookie_but_not_query_token() {
         let query_request =
             mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=mobile-secret", Vec::new());
         assert!(!mobile_gateway::is_authorized_mobile_request(
@@ -13168,6 +13168,25 @@ mod tests {
         assert!(!mobile_gateway::is_authorized_mobile_request(
             &encoded_query_request,
             "mobile+secret/token="
+        ));
+
+        let cookie_request = mobile_gateway::MobileHttpRequest::new(
+            "GET",
+            "/api/display/socket?role=receiver",
+            vec![("cookie", "session=old; rshare_mobile=mobile-secret")],
+        );
+        assert!(mobile_gateway::is_authorized_mobile_request(
+            &cookie_request,
+            "mobile-secret"
+        ));
+        let wrong_cookie_request = mobile_gateway::MobileHttpRequest::new(
+            "GET",
+            "/api/display/socket?role=receiver",
+            vec![("cookie", "rshare_mobile=wrong")],
+        );
+        assert!(!mobile_gateway::is_authorized_mobile_request(
+            &wrong_cookie_request,
+            "mobile-secret"
         ));
     }
 

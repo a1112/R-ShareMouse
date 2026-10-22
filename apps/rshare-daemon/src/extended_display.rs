@@ -632,6 +632,13 @@ mod tests {
     }
 
     #[test]
+    fn extended_display_client_uses_cookie_authentication_without_url_bearer() {
+        assert!(!CLIENT.contains("searchParams.get('t')"));
+        assert!(!CLIENT.contains("searchParams.set('t'"));
+        assert!(CLIENT.contains("searchParams.set('role'"));
+    }
+
+    #[test]
     fn extended_display_limits_signal_and_touch_payloads() {
         assert!(validate_message(
             Role::Host,

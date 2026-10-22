@@ -130,6 +130,7 @@ import {
   buildDeviceTypeSummaries,
   buildEndpointAcceptance,
   buildLocalDeviceSelectItems,
+  buildMobilePairingPayload,
   buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
@@ -11197,15 +11198,19 @@ function SettingsPage({
         {mobileAccessView.available && (
           <div className="mt-4 space-y-2 rounded-md p-3 text-sm" style={{ border: `1px solid ${theme.border}` }}>
             <strong>扩展显示器 · 实验功能</strong>
-            <p style={{ color: theme.textMuted }}>Windows 主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。iPhone / iPad 应用可直接粘贴接收链接，或进入“扩展屏”；Android 可在系统浏览器打开接收链接。主机确认后可启用多点触摸。</p>
+            <p style={{ color: theme.textMuted }}>Windows 主机用 Edge / Chrome 打开发送页面，创建扩展屏并选择它。iPhone / iPad 应用可直接粘贴接收配对信息，或进入“扩展屏”；浏览器接收请从已认证的移动控制页面进入扩展屏。主机确认后可启用多点触摸。</p>
             <div className="flex flex-wrap gap-2">
               <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
-                void navigator.clipboard?.writeText(`http://localhost:${mobileAccessView.port}/display?role=host&t=${encodeURIComponent(mobileAccessView.token)}`);
+                const url = new URL(mobileAccessView.url);
+                url.hostname = "localhost";
+                url.pathname = "/display";
+                url.search = "";
+                void navigator.clipboard?.writeText(url.toString());
               }}>复制本机发送链接</button>
               <button type="button" style={secondaryButtonStyle(theme)} className="rounded-md px-3 py-2" onClick={() => {
                 const url = new URL(mobileAccessView.url); url.pathname = "/display";
-                void navigator.clipboard?.writeText(url.toString());
-              }}>复制接收链接</button>
+                void navigator.clipboard?.writeText(buildMobilePairingPayload(url.toString(), mobileAccessView.token));
+              }}>复制接收配对信息</button>
             </div>
             <p style={{ color: theme.textMuted }}>浏览器接收可使用 USB 网络共享或 USB 以太网。Mac 普通数据线直连请使用上方原生附屏入口。</p>
           </div>
@@ -11222,11 +11227,11 @@ function SettingsPage({
             }}
             disabled={!mobileAccessView.available}
             onClick={() => {
-              void navigator.clipboard?.writeText(mobileAccessView.url);
+              void navigator.clipboard?.writeText(mobileAccessView.pairingPayload);
             }}
           >
             <Copy size={14} />
-            复制链接
+            复制配对信息
           </button>
           <a
             className="flex items-center gap-2 rounded-md px-4 py-2 text-sm transition"

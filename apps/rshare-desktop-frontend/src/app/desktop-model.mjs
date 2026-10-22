@@ -36,6 +36,12 @@ function buildQrCodeSvgDataUri(value) {
   )}`;
 }
 
+export function buildMobilePairingPayload(url, token) {
+  if (!url || url === "不可用") return url || "不可用";
+  const bearer = typeof token === "string" ? token.trim() : "";
+  return bearer ? `${url}\nAuthorization: Bearer ${bearer}` : url;
+}
+
 function deviceColor(index) {
   return DEVICE_COLORS[index % DEVICE_COLORS.length];
 }
@@ -83,6 +89,10 @@ export function buildMobileAccessViewModel(snapshot, options = {}) {
   const url = typeof snapshot?.page_url === "string" && snapshot.page_url.length
     ? snapshot.page_url
     : "不可用";
+  const token = typeof snapshot?.token === "string" ? snapshot.token : "";
+  const pairingPayload = enabled && url !== "不可用"
+    ? buildMobilePairingPayload(url, token)
+    : url;
   const bindAddress = typeof snapshot?.bind_address === "string" ? snapshot.bind_address : "不可用";
   const portText = bindAddress.includes(":") ? bindAddress.split(":").pop() : "";
   const port = portText ? Number(portText) : null;
@@ -108,7 +118,8 @@ export function buildMobileAccessViewModel(snapshot, options = {}) {
   return {
     available: enabled && url !== "不可用",
     url,
-    token: typeof snapshot?.token === "string" ? snapshot.token : "",
+    token,
+    pairingPayload,
     bindAddress,
     port: Number.isFinite(port) && port > 0 ? port : null,
     clientStatus: lastClientAddr ? (clientStale ? "最近离线" : "已连接手机") : "未连接",
@@ -117,8 +128,8 @@ export function buildMobileAccessViewModel(snapshot, options = {}) {
       : enabled
         ? "等待手机扫码或打开链接"
         : "网关不可用",
-    qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(url) : null,
-    qrCodeAlt: "移动端控制二维码",
+    qrCodeSvgDataUri: enabled && url !== "不可用" ? buildQrCodeSvgDataUri(pairingPayload) : null,
+    qrCodeAlt: "移动端控制配对信息二维码",
     urlLabel: enabled ? "实验性明文局域网控制 URL" : "移动网关未启用",
     summary: enabled
       ? "实验性明文局域网控制：该 HTTP 链接未加密，仅应在可信局域网中临时使用。"

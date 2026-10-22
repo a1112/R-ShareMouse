@@ -588,6 +588,7 @@ pub(crate) fn is_authorized_mobile_request(request: &MobileHttpRequest, expected
 
     mobile_token_from_authorization(request.header("authorization"))
         .or_else(|| request.header("x-rshare-mobile-token").map(str::to_string))
+        .or_else(|| mobile_token_from_cookie(request.header("cookie")))
         .as_deref()
         == Some(expected)
 }
@@ -839,7 +840,11 @@ async fn handle_mobile_gateway_client_with_context(
         .await;
     }
 
-    let local_only_route = route == MobileGatewayRoute::Page && peer_addr.ip().is_loopback();
+    let local_sender = route == MobileGatewayRoute::DisplayPage
+        && mobile_query_value(&request.target, "role").as_deref() == Some("host")
+        && peer_addr.ip().is_loopback();
+    let local_only_route =
+        (route == MobileGatewayRoute::Page && peer_addr.ip().is_loopback()) || local_sender;
     if !local_only_route && !is_authorized_mobile_request(&request, access.token()) {
         return write_mobile_response_with_deadline(
             &mut stream,
@@ -866,9 +871,9 @@ async fn handle_mobile_gateway_client_with_context(
             .await
         }
         MobileGatewayRoute::DisplayPage => {
-            let local_sender =
-                mobile_query_value(&request.target, "role").as_deref() == Some("host");
-            if local_sender && !peer_addr.ip().is_loopback() {
+            if mobile_query_value(&request.target, "role").as_deref() == Some("host")
+                && !peer_addr.ip().is_loopback()
+            {
                 return write_mobile_response_with_deadline(
                     &mut stream,
                     401,
@@ -880,11 +885,12 @@ async fn handle_mobile_gateway_client_with_context(
                 )
                 .await;
             }
-            write_mobile_response_with_deadline(
+            write_mobile_response_with_cookie_with_deadline(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
                 crate::extended_display::PAGE.as_bytes().to_vec(),
+                access.token(),
                 limits.write_deadline,
             )
             .await
@@ -908,11 +914,12 @@ async fn handle_mobile_gateway_client_with_context(
         }
         MobileGatewayRoute::DisplayScript => unreachable!(),
         MobileGatewayRoute::Page => {
-            write_mobile_response_with_deadline(
+            write_mobile_response_with_cookie_with_deadline(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
                 render_mobile_page_with_token(access.token()).into_bytes(),
+                access.token(),
                 limits.write_deadline,
             )
             .await
@@ -2037,6 +2044,16 @@ async fn write_mobile_response(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<()> {
+    write_mobile_response_with_cookie(stream, status, content_type, body, None).await
+}
+
+async fn write_mobile_response_with_cookie(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    cookie: Option<&str>,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -2046,12 +2063,18 @@ async fn write_mobile_response(
         503 => "Service Unavailable",
         _ => "Error",
     };
+    let set_cookie = cookie
+        .map(|token| {
+            format!("Set-Cookie: rshare_mobile={token}; Path=/; HttpOnly; SameSite=Strict\r\n")
+        })
+        .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
+         {set_cookie}\
          Connection: close\r\n\r\n",
         body.len()
     );
@@ -2076,6 +2099,22 @@ async fn write_mobile_response_with_deadline(
     .context("mobile HTTP write deadline exceeded")?
 }
 
+async fn write_mobile_response_with_cookie_with_deadline(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    token: &str,
+    deadline: Duration,
+) -> Result<()> {
+    timeout(
+        deadline,
+        write_mobile_response_with_cookie(stream, status, content_type, body, Some(token)),
+    )
+    .await
+    .context("mobile HTTP write deadline exceeded")?
+}
+
 fn mobile_token_from_authorization(value: Option<&str>) -> Option<String> {
     let value = value?;
     value
@@ -2084,6 +2123,13 @@ fn mobile_token_from_authorization(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
+}
+
+fn mobile_token_from_cookie(value: Option<&str>) -> Option<String> {
+    value?.split(';').find_map(|part| {
+        let (name, token) = part.trim().split_once('=')?;
+        (name == "rshare_mobile" && !token.is_empty()).then(|| token.to_string())
+    })
 }
 
 fn mobile_query_value(target: &str, expected_key: &str) -> Option<String> {
@@ -3466,6 +3512,7 @@ mod tests {
                 "401 Unauthorized",
             ),
             ("/display?t=test", false, "200 OK"),
+            ("/display?role=host", false, "200 OK"),
             ("/display?role=host&t=test", true, "401 Unauthorized"),
             ("/display/client.mjs", false, "200 OK"),
         ] {
@@ -3503,10 +3550,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             task.await.unwrap().unwrap();
-            assert!(
-                String::from_utf8_lossy(&response).contains(expected),
-                "{target}"
-            );
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.contains(expected), "{target}");
+            if target == "/display?t=test" {
+                assert!(response
+                    .contains("Set-Cookie: rshare_mobile=test; Path=/; HttpOnly; SameSite=Strict"));
+            }
         }
     }
 
@@ -3633,7 +3682,7 @@ mod tests {
             MobileGatewayLimits::default(),
         ));
         let request = |role| {
-            let mut request = format!("ws://{addr}/api/display/socket?role={role}&t=socket-test")
+            let mut request = format!("ws://{addr}/api/display/socket?role={role}")
                 .into_client_request()
                 .unwrap();
             request
@@ -3641,7 +3690,7 @@ mod tests {
                 .insert("origin", format!("http://{addr}").parse().unwrap());
             request
                 .headers_mut()
-                .insert("authorization", "Bearer socket-test".parse().unwrap());
+                .insert("cookie", "rshare_mobile=socket-test".parse().unwrap());
             request
         };
         let (mut host, _) = connect_async(request("host")).await.unwrap();

@@ -5,6 +5,19 @@ struct PairingLink: Equatable {
     let controlURL: URL
     let displayURL: URL
     let hostLabel: String
+    let bearerToken: String
+    /// The path supplied by the user, retained so a display pairing opens in
+    /// the display tab even though both canonical URLs are stored together.
+    let initialPath: String
+
+    /// The URL deliberately contains no credential. The bearer is carried on
+    /// its own line so it is never copied into browser history, referrers or
+    /// navigation URLs.
+    var serialized: String {
+        "\(controlURL.absoluteString)\nAuthorization: Bearer \(bearerToken)"
+    }
+
+    var authorizationHeader: String { "Bearer \(bearerToken)" }
 
     enum Failure: LocalizedError {
         case invalid, missingToken, publicHost
@@ -18,8 +31,11 @@ struct PairingLink: Equatable {
     }
 
     init(_ text: String) throws {
-        guard text.utf8.count <= 4096,
-              var parts = URLComponents(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.utf8.count <= 4096 else { throw Failure.invalid }
+        let lines = trimmed.split(whereSeparator: \.isNewline).map(String.init)
+        guard let urlLine = lines.first,
+              var parts = URLComponents(string: urlLine),
               ["http", "https"].contains(parts.scheme?.lowercased() ?? ""),
               let host = parts.host, !host.isEmpty,
               parts.user == nil, parts.password == nil,
@@ -27,13 +43,27 @@ struct PairingLink: Equatable {
               parts.port == nil || (1...65535).contains(parts.port!)
         else { throw Failure.invalid }
         guard Self.isLocalHost(host) else { throw Failure.publicHost }
-        let tokens = (parts.queryItems ?? []).filter { $0.name == "t" }
-        guard tokens.count == 1, let token = tokens.first?.value,
-              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { throw Failure.missingToken }
+        let suppliedPath = parts.path.isEmpty ? "/mobile" : parts.path
+        let queryItems = parts.queryItems ?? []
+        let legacyTokens = queryItems.filter { $0.name == "t" }
+        let bearerTokens = lines.dropFirst().compactMap(Self.bearerToken(from:))
+        guard bearerTokens.count <= 1 else { throw Failure.invalid }
+        if !bearerTokens.isEmpty && !legacyTokens.isEmpty { throw Failure.invalid }
+        if !bearerTokens.isEmpty && !queryItems.isEmpty { throw Failure.invalid }
+        let token: String
+        if let bearer = bearerTokens.first {
+            token = bearer
+        } else if legacyTokens.count == 1, let legacy = legacyTokens.first?.value {
+            // Accept links issued by older desktop builds once, then strip
+            // the credential from the canonical URLs and Keychain payload.
+            token = legacy
+        } else {
+            throw Failure.missingToken
+        }
+        guard Self.isValidToken(token) else { throw Failure.missingToken }
         parts.scheme = parts.scheme?.lowercased()
         parts.fragment = nil
-        parts.queryItems = [URLQueryItem(name: "t", value: token)]
+        parts.queryItems = nil
         parts.path = "/mobile"
         guard let control = parts.url else { throw Failure.invalid }
         controlURL = control
@@ -41,6 +71,31 @@ struct PairingLink: Equatable {
         guard let display = parts.url else { throw Failure.invalid }
         displayURL = display
         hostLabel = host + (parts.port.map { ":\($0)" } ?? "")
+        bearerToken = token
+        initialPath = suppliedPath
+    }
+
+    private static func bearerToken(from line: String) -> String? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = trimmed.lowercased()
+        if lowercased.hasPrefix("authorization:") {
+            let value = String(trimmed.dropFirst("authorization:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard value.lowercased().hasPrefix("bearer ") else { return nil }
+            return String(value.dropFirst("bearer ".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        } else if lowercased.hasPrefix("bearer ") {
+            return String(trimmed.dropFirst("bearer ".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        } else {
+            return nil
+        }
+    }
+
+    private static func isValidToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= 4096
+            && token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+            && token.rangeOfCharacter(from: .controlCharacters) == nil
     }
 
     static func isLocalHost(_ name: String) -> Bool {
@@ -66,6 +121,7 @@ struct PairingLink: Equatable {
             && effectivePort(url) == effectivePort(controlURL)
             && ["/mobile", "/display"].contains(url.path)
             && url.user == nil && url.password == nil
+            && url.query == nil && url.fragment == nil
     }
 
     func allowsNavigation(to url: URL) -> Bool {
@@ -74,10 +130,7 @@ struct PairingLink: Equatable {
               ["/mobile", "/display"].contains(url.path),
               url.user == nil, url.password == nil
         else { return false }
-        let expected = URLComponents(url: controlURL, resolvingAgainstBaseURL: false)?.queryItems
-        let actual = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
-        return actual?.filter { $0.name == "t" } == expected
-            && !(actual ?? []).contains { $0.name == "role" && $0.value == "host" }
+        return url.query == nil && url.fragment == nil
     }
 
     private func effectivePort(_ url: URL) -> Int { url.port ?? (url.scheme == "https" ? 443 : 80) }

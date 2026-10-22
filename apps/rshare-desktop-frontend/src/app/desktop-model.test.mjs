@@ -14,6 +14,7 @@ import {
   buildLocalDeviceSelectItems,
   buildLocalLatencyFeedbackRows,
   buildLocalControlsViewModel,
+  buildMobilePairingPayload,
   buildMobileAccessViewModel,
   buildRemoteControlSnapshot,
   buildRemoteLatencySummary,
@@ -99,7 +100,7 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
   const view = buildMobileAccessViewModel({
     enabled: true,
     bind_address: "0.0.0.0:27437",
-    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    page_url: "http://192.168.1.50:27437/mobile",
     token: "abc123",
     last_client_addr: "192.168.1.80:53120",
     last_client_seen_at_ms: 1_000,
@@ -107,8 +108,9 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
   }, { nowMs: 6_000 });
 
   assert.equal(view.available, true);
-  assert.equal(view.url, "http://192.168.1.50:27437/mobile?t=abc123");
+  assert.equal(view.url, "http://192.168.1.50:27437/mobile");
   assert.equal(view.token, "abc123");
+  assert.equal(view.pairingPayload, "http://192.168.1.50:27437/mobile\nAuthorization: Bearer abc123");
   assert.equal(view.port, 27437);
   assert.equal(view.clientStatus, "已连接手机");
   assert.equal(view.clientDetail, "最近 192.168.1.80:53120 · 5 秒前 · 2 次请求");
@@ -134,7 +136,7 @@ test("buildMobileAccessViewModel exposes mobile controller link and token state"
     {
       enabled: true,
       bind_address: "0.0.0.0:27437",
-      page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+      page_url: "http://192.168.1.50:27437/mobile",
       token: "abc123",
       last_client_addr: "192.168.1.80:53120",
       last_client_seen_at_ms: 1_000,
@@ -150,7 +152,7 @@ test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile 
   const view = buildMobileAccessViewModel({
     enabled: true,
     bind_address: "0.0.0.0:27437",
-    page_url: "http://192.168.1.50:27437/mobile?t=abc123",
+    page_url: "http://192.168.1.50:27437/mobile",
     token: "abc123",
   });
 
@@ -158,10 +160,16 @@ test("buildMobileAccessViewModel creates a scannable qr svg data uri for mobile 
   const svg = decodeURIComponent(view.qrCodeSvgDataUri.split(",", 2)[1]);
   assert.match(svg, /<svg/);
   assert.match(svg, /<path/);
-  assert.equal(view.qrCodeAlt, "移动端控制二维码");
+  assert.equal(view.qrCodeAlt, "移动端控制配对信息二维码");
 
   const offline = buildMobileAccessViewModel(null);
   assert.equal(offline.qrCodeSvgDataUri, null);
+});
+
+test("buildMobilePairingPayload keeps the bearer outside the URL", () => {
+  const payload = buildMobilePairingPayload("http://192.168.1.50:27437/mobile", "abc123");
+  assert.equal(payload, "http://192.168.1.50:27437/mobile\nAuthorization: Bearer abc123");
+  assert.equal(new URL(payload.split("\n", 1)[0]).search, "");
 });
 
 test("buildDisplaySettingsViewModel exposes system display settings", () => {

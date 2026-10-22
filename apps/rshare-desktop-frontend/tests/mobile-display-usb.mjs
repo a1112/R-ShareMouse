@@ -68,7 +68,7 @@ function instrument() {
 const handler = async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   evidence.requests.push({ path: url.pathname, remote: req.socket.remoteAddress });
-  if (url.pathname === '/probe' && req.method === 'POST' && url.searchParams.get('t') === token) {
+  if (url.pathname === '/probe' && req.method === 'POST' && req.headers.cookie?.includes(`rshare_mobile=${token}`)) {
     let body = '';
     for await (const chunk of req) { body += chunk; if (body.length > 65536) { req.destroy(); return; } }
     try { evidence.reports.push({ at: Date.now(), remote: req.socket.remoteAddress, ...JSON.parse(body) }); }
@@ -76,19 +76,20 @@ const handler = async (req, res) => {
     res.end('ok'); return;
   }
   const script = url.pathname === '/display/client.mjs';
-  if (!script && (url.pathname !== '/display' || url.searchParams.get('t') !== token)) {
+  if (!script && url.pathname !== '/display') {
     res.writeHead(401); res.end(); return;
   }
   res.setHeader('Content-Type', script ? 'text/javascript' : 'text/html');
+  if (!script) res.setHeader('Set-Cookie', `rshare_mobile=${token}; Path=/; HttpOnly; SameSite=Strict`);
   let body = await readFile(new URL(script ? 'client.mjs' : 'page.html', assets), 'utf8');
-  if (!script) body = body.replace('<head>', `<head><script>(${instrument})();setInterval(async()=>{try{await fetch('/probe?t=${token}',{method:'POST',body:JSON.stringify(await window.usbProbe())})}catch{}},1000)</script>`);
+  if (!script) body = body.replace('<head>', `<head><script>(${instrument})();setInterval(async()=>{try{await fetch('/probe',{method:'POST',body:JSON.stringify(await window.usbProbe())})}catch{}},1000)</script>`);
   res.end(body);
 };
 const servers = [createServer(handler), createServer(handler)];
 for (const server of servers) server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, 'http://localhost');
   const role = url.searchParams.get('role');
-  if (url.pathname !== '/api/display/socket' || url.searchParams.get('t') !== token ||
+  if (url.pathname !== '/api/display/socket' || !request.headers.cookie?.includes(`rshare_mobile=${token}`) ||
       !['host', 'receiver'].includes(role) || peers.has(role)) { socket.destroy(); return; }
   sockets.handleUpgrade(request, socket, head, peer => {
     peers.set(role, peer);
@@ -128,11 +129,11 @@ try {
       return canvas.captureStream(30);
     };
   });
-  await host.goto(`http://127.0.0.1:${servers[0].address().port}/display?role=host&t=${token}`);
+  await host.goto(`http://127.0.0.1:${servers[0].address().port}/display?role=host`);
   await host.locator('#create').click(); await host.locator('#share').click();
-  const url = `http://[${usbHost}]:${servers[1].address().port}/display?t=${token}`;
+  const url = `http://[${usbHost}]:${servers[1].address().port}/display`;
   await run('xcrun', ['devicectl', 'device', 'process', 'launch', '--device', device, '--terminate-existing',
-    '--environment-variables', JSON.stringify({ RSHARE_PAIRING_URL: url }), 'com.rsharemouse.ios', '--ui-testing'], { timeout: 20000 });
+    '--environment-variables', JSON.stringify({ RSHARE_PAIRING_URL: `${url}\nBearer ${token}` }), 'com.rsharemouse.ios', '--ui-testing'], { timeout: 20000 });
   // Let gathering/negotiation and native playback finish; this is a finite probe.
   await new Promise(resolve => setTimeout(resolve, 25000));
   evidence.host = await host.evaluate(() => window.usbProbe());

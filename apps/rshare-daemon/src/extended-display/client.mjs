@@ -68,7 +68,6 @@ export class ScreenWakeLock {
 
 export function startPage() {
   const el = id => document.getElementById(id);
-  const token = new URL(location.href).searchParams.get('t') ?? '';
   const host = new URL(location.href).searchParams.get('role') === 'host';
   const video = el('video'), contacts = new ContactTracker(), wakeLock = new ScreenWakeLock(navigator.wakeLock);
   let socket, pc, stream, screen, receiver = false, sequence = 0, touchEnabled = false;
@@ -318,7 +317,7 @@ export function startPage() {
       if (typeof RTCPeerConnection !== 'function') throw new Error('此浏览器环境未提供 WebRTC，请使用支持 WebRTC 的浏览器');
       const url = new URL('/api/display/socket', location.href);
       url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      url.searchParams.set('t', token); url.searchParams.set('role', host ? 'host' : 'receiver');
+      url.searchParams.set('role', host ? 'host' : 'receiver');
       const next = new WebSocket(url); socket = next;
       next.onmessage = event => {
         signalChain = signalChain.then(() => { if (socket === next) return receive(JSON.parse(event.data)); }).catch(error => { if (socket === next) status(error.message); });

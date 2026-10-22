@@ -102,9 +102,9 @@ struct MainView: View {
                 }
                 VStack(alignment: .leading, spacing: 14) {
                     Text("连接一台电脑").font(.headline)
-                    Text("在电脑端打开「设置 → 移动端控制」，\n复制配对链接，然后粘贴到这里。")
+                    Text("在电脑端打开「设置 → 移动端控制」，\n复制配对信息，然后粘贴到这里。地址和 Authorization bearer 会分两行显示。")
                         .font(.subheadline).foregroundStyle(.secondary).lineSpacing(4)
-                    TextField("http://电脑地址:端口/mobile?t=…", text: $linkText, axis: .vertical)
+                    TextField("http://电脑地址:端口/mobile\nAuthorization: Bearer …", text: $linkText, axis: .vertical)
                         .font(.system(.subheadline, design: .monospaced))
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .keyboardType(.URL).lineLimit(2...3).padding(14)

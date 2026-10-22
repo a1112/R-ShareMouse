@@ -55,8 +55,8 @@ try {
       return canvas.captureStream(30);
     };
   });
-  await host.goto(`${base}/display?role=host&t=test`);
-  await receiver.goto(`${base}/display?t=test`);
+  await host.goto(`${base}/display?role=host`);
+  await receiver.goto(`${base}/display`);
   console.log('Sender and receiver pages loaded');
   await host.getByRole('button', { name: '1. 创建 1080p 扩展屏' }).click();
   await host.getByRole('button', { name: '2. 选择扩展屏并分享' }).click();

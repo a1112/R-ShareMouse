@@ -13,10 +13,11 @@ const assets = new URL('../../rshare-daemon/src/extended-display/', import.meta.
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const script = url.pathname === '/display/client.mjs';
-  if (!script && (url.pathname !== '/display' || url.searchParams.get('t') !== 'test')) {
+  if (!script && url.pathname !== '/display') {
     res.writeHead(401); res.end(); return;
   }
   res.setHeader('Content-Type', script ? 'text/javascript' : 'text/html');
+  if (!script) res.setHeader('Set-Cookie', 'rshare_mobile=test; Path=/; HttpOnly; SameSite=Strict');
   res.end(await readFile(new URL(script ? 'client.mjs' : 'page.html', assets)));
 });
 const sockets = new WebSocketServer({ noServer: true });
@@ -26,7 +27,7 @@ const display = { type: 'display', display: { display_id: 'fixture', friendly_na
 const send = (peer, message) => { if (peer?.readyState === 1) peer.send(JSON.stringify(message)); };
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, 'http://localhost');
-  if (url.pathname !== '/api/display/socket' || url.searchParams.get('t') !== 'test') { socket.destroy(); return; }
+  if (url.pathname !== '/api/display/socket' || !request.headers.cookie?.includes('rshare_mobile=test')) { socket.destroy(); return; }
   const role = url.searchParams.get('role');
   if (!['host', 'receiver'].includes(role) || peers.has(role)) { socket.destroy(); return; }
   sockets.handleUpgrade(request, socket, head, peer => {
@@ -69,7 +70,7 @@ try {
       return canvas.captureStream(30);
     };
   });
-  await host.goto(`${base}/display?role=host&t=test`);
+  await host.goto(`${base}/display?role=host`);
   await host.locator('#create').click(); await host.locator('#share').click();
   await mkdir(`${root}/target/mobile-display-validation`, { recursive: true });
   const destination = process.env.RSHARE_IOS_SIMULATOR;
@@ -81,7 +82,7 @@ try {
     '-destination', `platform=iOS Simulator,id=${destination}`,
     '-derivedDataPath', 'target/mobile-display-ios', '-resultBundlePath', resultPath,
     '-only-testing:RShareMouseUITests/LiveClientUITests/testMobileDisplayPlaybackFullscreenRotationAndRecovery', 'test'
-  ], { cwd: root, timeout: 180_000, env: { ...process.env, RSHARE_DISPLAY_TEST_URL: `${base}/display?t=test` } });
+  ], { cwd: root, timeout: 180_000, env: { ...process.env, RSHARE_DISPLAY_TEST_URL: `${base}/display\nBearer test` } });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', data => { output += data; process.stdout.write(data); });
   const code = await new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
   assert.equal(code, 0, 'iOS UI test must pass');

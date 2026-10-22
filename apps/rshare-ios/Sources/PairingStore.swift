@@ -19,7 +19,7 @@ enum PairingStore {
     }
 
     static func save(_ link: PairingLink) throws {
-        let data = Data(link.controlURL.absoluteString.utf8)
+        let data = Data(link.serialized.utf8)
         let attributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly

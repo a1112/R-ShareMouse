@@ -16,6 +16,7 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
     private var foreground = true
     fileprivate var requestedURL: URL?
     private var navigationRevision = 0
+    private var pendingAuthorizedNavigation: URL?
     private let persistent: Bool
     private let bridge = StatusBridge()
 
@@ -49,7 +50,11 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
         self.persistent = persistent
         #endif
         super.init()
-        if self.persistent, let saved = PairingStore.read() { pairing = try? PairingLink(saved) }
+        if self.persistent, let saved = PairingStore.read(), let savedPairing = try? PairingLink(saved) {
+            pairing = savedPairing
+            // Migrate older query-token links to the URL-free Keychain format.
+            try? PairingStore.save(savedPairing)
+        }
         #if DEBUG
         if let preset = ProcessInfo.processInfo.environment["RSHARE_PAIRING_URL"] {
             connect(preset)
@@ -63,7 +68,7 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
             if persistent { try PairingStore.save(link) }
             pairing = link
             error = nil
-            tab = URLComponents(string: text.trimmingCharacters(in: .whitespacesAndNewlines))?.path == "/display" ? .display : .remote
+            tab = link.initialPath == "/display" ? .display : .remote
             loadCurrentPage(force: true)
         } catch {
             self.error = error.localizedDescription
@@ -71,8 +76,8 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     func reconnect() {
-        guard let pairing else { return }
-        connect((tab == .display ? pairing.displayURL : pairing.controlURL).absoluteString)
+        guard pairing != nil else { return }
+        loadCurrentPage(force: true)
     }
 
     func updateDisplayPresentation(playing: Bool, immersive: Bool) {
@@ -90,6 +95,7 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
         navigationRevision += 1
         let revision = navigationRevision
         requestedURL = url
+        pendingAuthorizedNavigation = url
         loading = true
         error = nil
         status = tab == .display ? "等待扩展屏" : "正在连接"
@@ -98,8 +104,16 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
         // Wait for the old page's release handlers before replacing its document.
         webView.evaluateJavaScript("window.dispatchEvent(new Event('pagehide'))") { [weak self] _, _ in
             guard let self, self.navigationRevision == revision else { return }
-            self.webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12))
+            self.webView.load(self.authorizedRequest(for: url))
         }
+    }
+
+    func authorizedRequest(for url: URL) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        if let token = pairing?.bearerToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
     func suspend() {
@@ -125,6 +139,7 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
         let revision = navigationRevision
         suspend()
         requestedURL = nil
+        pendingAuthorizedNavigation = nil
         status = "未连接"
         backendStatus = ""
         error = nil
@@ -145,10 +160,21 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
         guard let url = action.request.url else { decisionHandler(.cancel); return }
         if url.absoluteString == "about:blank" { decisionHandler(.allow); return }
         guard action.targetFrame?.isMainFrame == true,
-              pairing?.allowsNavigation(to: url) == true else {
+              let pairing,
+              pairing.allowsNavigation(to: url) else {
             decisionHandler(.cancel)
             return
         }
+        if action.request.value(forHTTPHeaderField: "Authorization") == nil,
+           pendingAuthorizedNavigation != url {
+            pendingAuthorizedNavigation = url
+            var request = action.request
+            request.setValue(pairing.authorizationHeader, forHTTPHeaderField: "Authorization")
+            decisionHandler(.cancel)
+            webView.load(request)
+            return
+        }
+        pendingAuthorizedNavigation = nil
         requestedURL = url
         let next: AppTab = url.path == "/display" ? .display : .remote
         if tab != next { DispatchQueue.main.async { self.tab = next } }
