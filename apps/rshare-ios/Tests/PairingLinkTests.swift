@@ -90,6 +90,34 @@ final class PairingLinkTests: XCTestCase {
         session.disconnect()
     }
 
+    @MainActor
+    func testReconnectFromConnectionLoadsSavedMobilePairing() throws {
+        let session = RemoteSession(persistent: false)
+        session.pairing = try PairingLink("http://127.0.0.1:27437/mobile\nBearer test")
+        XCTAssertEqual(session.tab, .connection)
+
+        session.reconnect()
+
+        XCTAssertEqual(session.tab, .remote)
+        XCTAssertTrue(session.loading)
+        XCTAssertEqual(session.status, "正在连接")
+        session.disconnect()
+    }
+
+    @MainActor
+    func testReconnectFromConnectionLoadsSavedDisplayPairing() throws {
+        let session = RemoteSession(persistent: false)
+        session.pairing = try PairingLink("http://127.0.0.1:27437/display\nBearer test")
+        XCTAssertEqual(session.tab, .connection)
+
+        session.reconnect()
+
+        XCTAssertEqual(session.tab, .display)
+        XCTAssertTrue(session.loading)
+        XCTAssertEqual(session.status, "等待扩展屏")
+        session.disconnect()
+    }
+
     func testIPv6AndLocalNames() throws {
         for host in ["[fd12::1]", "[::1]", "macbook.local", "desktop.lan", "10.1.2.3", "172.16.0.1"] {
             XCTAssertNoThrow(try PairingLink("http://\(host):27437/mobile\nBearer secret"))

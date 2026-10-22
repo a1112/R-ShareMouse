@@ -76,7 +76,10 @@ final class RemoteSession: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     func reconnect() {
-        guard pairing != nil else { return }
+        guard let pairing else { return }
+        if tab != .remote && tab != .display {
+            tab = pairing.initialPath == "/display" ? .display : .remote
+        }
         loadCurrentPage(force: true)
     }
 
