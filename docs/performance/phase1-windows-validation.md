@@ -20,7 +20,12 @@ push. It runs:
 
 Hosted smoke does not compare commits, enforce fixed-runner UI/GPU timings, or
 establish a performance baseline. Its deliberately wide ceilings catch severe
-breakage only.
+breakage only. The workflow invokes the QUIC tool with the explicit
+`--validation-profile hosted-catastrophe` profile. That profile preserves the
+complete `available` artifact and all catastrophe checks while allowing the
+known `unstable_after_one_complete_retry` result from a shared hosted runner to
+be reported as `verdict: unstable`. The default profile remains the strict
+fixed-runner gate below; it still fails after the one permitted complete retry.
 
 `performance-nightly-windows.yml` runs only on a self-hosted runner carrying all
 four labels:

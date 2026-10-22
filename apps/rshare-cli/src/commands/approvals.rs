@@ -39,3 +39,11 @@ pub async fn approve(approval_id: String) -> Result<()> {
         other => anyhow::bail!("Unexpected daemon response: {other:?}"),
     }
 }
+
+pub async fn reject(approval_id: String) -> Result<()> {
+    match request(DaemonRequest::RejectPeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}

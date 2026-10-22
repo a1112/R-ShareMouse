@@ -3,7 +3,8 @@
 use anyhow::Result as AnyhowResult;
 use rshare_core::{
     daemon_client, BackendHealth, BackgroundProcessOwner, BackgroundRunMode,
-    CapabilityRegistrySnapshot, Config, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
+    CapabilityRegistrySnapshot, Config, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestStatusSnapshot, DaemonDeviceSnapshot, DaemonResponse, DeviceId,
     DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
     DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
     EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
@@ -478,6 +479,27 @@ async fn connect_device(device_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn pending_peer_approvals() -> Result<Vec<rshare_core::PendingPeerApproval>, String> {
+    daemon_client::request_pending_peer_approvals()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn approve_peer(approval_id: String) -> Result<(), String> {
+    daemon_client::request_approve_peer(approval_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn reject_peer(approval_id: String) -> Result<(), String> {
+    daemon_client::request_reject_peer(approval_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn disconnect_device(device_id: String) -> Result<(), String> {
     let device_id = parse_device_id(&device_id)?;
     daemon_client::request_disconnect(device_id)
@@ -793,6 +815,38 @@ async fn run_endpoint_events_stream(app: AppHandle, filter: EndpointEventFilter,
             }
         }
     }
+}
+
+#[tauri::command]
+async fn run_cross_device_test(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestReport, String> {
+    daemon_client::request_cross_device_test(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn start_cross_device_stress(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::start_cross_device_stress(request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn stop_cross_device_stress() -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::stop_cross_device_stress()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn cross_device_test_status() -> Result<CrossDeviceTestStatusSnapshot, String> {
+    daemon_client::request_cross_device_test_status()
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -1302,6 +1356,9 @@ fn main() {
             stop_service,
             capabilities_state,
             connect_device,
+            pending_peer_approvals,
+            approve_peer,
+            reject_peer,
             disconnect_device,
             wake_targets,
             wake_attempts,
@@ -1334,6 +1391,10 @@ fn main() {
             stop_endpoint_events_stream,
             run_local_input_test,
             run_remote_latency_test,
+            run_cross_device_test,
+            start_cross_device_stress,
+            stop_cross_device_stress,
+            cross_device_test_status,
             minimize_window,
             toggle_maximize_window,
             close_window,

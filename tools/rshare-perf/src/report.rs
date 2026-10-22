@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub const PERF_SCHEMA_VERSION: u16 = 1;
@@ -709,7 +708,7 @@ pub fn normalize_features(features: Vec<String>) -> Vec<String> {
 pub fn scenario_config_sha256(value: &Value) -> Result<String, serde_json::Error> {
     let canonical = canonicalize_json(value);
     let bytes = serde_json::to_vec(&canonical)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(crate::sha256_hex(bytes))
 }
 
 pub fn validate_json_schema(value: &Value, schema: &Value) -> Result<(), ReportError> {
@@ -757,7 +756,7 @@ fn canonicalize_json(value: &Value) -> Value {
 
 #[cfg(test)]
 fn digest_text(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    crate::sha256_hex(value.as_bytes())
 }
 
 fn is_sha256(value: &str) -> bool {

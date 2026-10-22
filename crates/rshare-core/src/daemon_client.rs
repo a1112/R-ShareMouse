@@ -12,18 +12,18 @@ use tokio_tungstenite::{
     connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::ipc::MacosInputPermissionsSnapshot;
 use crate::{
     default_ipc_addr, default_local_controls_ws_url, read_json_frame, read_optional_ui_state_frame,
-    write_json_frame, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DaemonRequest,
-    DaemonResponse, DeviceId, DisplayCaptureBlob, DisplayCaptureRequest, DisplayCaptureResult,
-    DisplayIdentifyRequest, DisplayIdentifyResult, DisplaySettingsUpdateRequest,
-    DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter, EndpointInjectRequest,
-    EndpointInjectResult, EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph,
-    LocalControlDeviceSnapshot, LocalInputTestRequest, LocalInputTestResult, MobileAccessSnapshot,
-    ServiceStatusSnapshot, UiCursor, UiEnvelope, UsbDescriptorProbeResult, UsbDeviceDescriptor,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot,
+    write_json_frame, CapabilityRegistrySnapshot, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestStatusSnapshot, DaemonDeviceSnapshot, DaemonRequest, DaemonResponse, DeviceId,
+    DisplayCaptureBlob, DisplayCaptureRequest, DisplayCaptureResult, DisplayIdentifyRequest,
+    DisplayIdentifyResult, DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult,
+    EndpointEvent, EndpointEventFilter, EndpointInjectRequest, EndpointInjectResult,
+    EndpointInjectTarget, IpcEnvelopeKind, IpcFrameCodec, LayoutGraph, LocalControlDeviceSnapshot,
+    LocalInputTestRequest, LocalInputTestResult, MacosInputPermissionsSnapshot,
+    MobileAccessSnapshot, PendingPeerApproval, ServiceStatusSnapshot, UiCursor, UiEnvelope,
+    UsbDescriptorProbeResult, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 
 async fn send_request(request: DaemonRequest) -> Result<DaemonResponse> {
@@ -189,6 +189,14 @@ pub async fn request_file_transfers() -> Result<Vec<crate::file_transfer::FileTr
     }
 }
 
+pub async fn request_approve_file_transfer(transfer_id: crate::DeviceId) -> Result<()> {
+    match send_request(DaemonRequest::ApproveFileTransfer { transfer_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(error) => anyhow::bail!(error),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
 pub async fn request_cancel_file_transfer(transfer_id: crate::DeviceId) -> Result<()> {
     match send_request(DaemonRequest::CancelFileTransfer { transfer_id }).await? {
         DaemonResponse::Ack => Ok(()),
@@ -220,6 +228,34 @@ pub async fn request_connect(device_id: crate::DeviceId) -> Result<()> {
         DaemonResponse::Ack => Ok(()),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+/// List inbound peer identities waiting for exact operator approval.
+pub async fn request_pending_peer_approvals() -> Result<Vec<PendingPeerApproval>> {
+    match send_request(DaemonRequest::ListPendingPeerApprovals).await? {
+        DaemonResponse::PendingPeerApprovals(approvals) => Ok(approvals),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Approve one opaque, single-use peer approval token after the UI has shown
+/// its exact device ID and certificate fingerprint to the operator.
+pub async fn request_approve_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::ApprovePeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Revoke one pending or approved peer approval token before it can be used.
+pub async fn request_reject_peer(approval_id: String) -> Result<()> {
+    match send_request(DaemonRequest::RejectPeer { approval_id }).await? {
+        DaemonResponse::Ack => Ok(()),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {other:?}"),
     }
 }
 
@@ -497,6 +533,42 @@ pub async fn request_remote_latency_test(
 ) -> Result<LocalInputTestResult> {
     match send_request(DaemonRequest::RunRemoteLatencyTest { device_id }).await? {
         DaemonResponse::LocalInputTest(result) => Ok(result),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_cross_device_test(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestReport> {
+    match send_request(DaemonRequest::RunCrossDeviceTest { request }).await? {
+        DaemonResponse::CrossDeviceTest(report) => Ok(report),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn start_cross_device_stress(
+    request: CrossDeviceTestRequest,
+) -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::StartCrossDeviceStress { request }).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn stop_cross_device_stress() -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::StopCrossDeviceStress).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
+        DaemonResponse::Error(message) => anyhow::bail!(message),
+        other => anyhow::bail!("Unexpected daemon response: {:?}", other),
+    }
+}
+
+pub async fn request_cross_device_test_status() -> Result<CrossDeviceTestStatusSnapshot> {
+    match send_request(DaemonRequest::CrossDeviceTestStatus).await? {
+        DaemonResponse::CrossDeviceTestStatus(status) => Ok(status),
         DaemonResponse::Error(message) => anyhow::bail!(message),
         other => anyhow::bail!("Unexpected daemon response: {:?}", other),
     }

@@ -250,6 +250,10 @@ pub struct EndpointInjectResult {
     pub health: BackendHealth,
     pub elapsed_ms: u64,
     pub loopback_event_id: Option<EndpointEventId>,
+    /// The event recorded by the target endpoint after a successful local
+    /// injection. This is optional for compatibility with older peers.
+    #[serde(default)]
+    pub observed_event: Option<EndpointEvent>,
     pub error: Option<EndpointInjectError>,
 }
 

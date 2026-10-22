@@ -7,15 +7,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     BackendHealth, BackendKind, BackgroundProcessOwner, BackgroundRunMode,
-    CapabilityRegistrySnapshot, ControlSessionState, DeviceId, DisplayCaptureRequest,
-    DisplayCaptureResult, DisplayIdentifyRequest, DisplayIdentifyResult,
-    DisplaySettingsUpdateRequest, DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter,
-    EndpointInjectRequest, EndpointInjectResult, EndpointInjectTarget, LayoutGraph,
-    LocalAudioCaptureSource, LocalAudioTestRequest, LocalAudioTestResult,
-    LocalControlDeviceSnapshot, LocalInputDiagnosticEvent, LocalInputTestRequest,
-    LocalInputTestResult, PrivilegeState, ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor,
-    VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayRemoveRequest,
-    VirtualDisplaySnapshot,
+    CapabilityRegistrySnapshot, ControlSessionState, CrossDeviceTestReport, CrossDeviceTestRequest,
+    CrossDeviceTestStatusSnapshot, DeviceId, DisplayCaptureRequest, DisplayCaptureResult,
+    DisplayIdentifyRequest, DisplayIdentifyResult, DisplaySettingsUpdateRequest,
+    DisplaySettingsUpdateResult, EndpointEvent, EndpointEventFilter, EndpointInjectRequest,
+    EndpointInjectResult, EndpointInjectTarget, LayoutGraph, LocalAudioCaptureSource,
+    LocalAudioTestRequest, LocalAudioTestResult, LocalControlDeviceSnapshot,
+    LocalInputDiagnosticEvent, LocalInputTestRequest, LocalInputTestResult, PrivilegeState,
+    ResolvedInputMode, TrayRuntimeState, UsbDeviceDescriptor, VirtualDisplayCreateRequest,
+    VirtualDisplayOperationResult, VirtualDisplayRemoveRequest, VirtualDisplaySnapshot,
 };
 use crate::{IpcEnvelopeKind, IpcFrameCodec};
 use crate::{UiCursor, UiEnvelope};
@@ -174,6 +174,14 @@ mod tests {
                 .unwrap(),
             request
         );
+        let reject = DaemonRequest::RejectPeer {
+            approval_id: "opaque-id".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&reject).unwrap())
+                .unwrap(),
+            reject
+        );
         let response = DaemonResponse::PendingPeerApprovals(vec![PendingPeerApproval {
             approval_id: "opaque-id".to_string(),
             device_id,
@@ -216,6 +224,34 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<DaemonResponse>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn cross_device_test_ipc_variants_round_trip() {
+        let request = CrossDeviceTestRequest::default();
+        for request in [
+            DaemonRequest::RunCrossDeviceTest {
+                request: request.clone(),
+            },
+            DaemonRequest::StartCrossDeviceStress { request },
+            DaemonRequest::StopCrossDeviceStress,
+            DaemonRequest::CrossDeviceTestStatus,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<DaemonRequest>(&serde_json::to_string(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+        let response = DaemonResponse::CrossDeviceTestStatus(CrossDeviceTestStatusSnapshot {
+            active: true,
+            report: None,
+        });
+        assert_eq!(
+            serde_json::from_str::<DaemonResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
             response
         );
     }
@@ -552,6 +588,9 @@ pub enum DaemonRequest {
     ApprovePeer {
         approval_id: String,
     },
+    RejectPeer {
+        approval_id: String,
+    },
     GetLayout,
     SetLayout {
         layout: LayoutGraph,
@@ -596,6 +635,14 @@ pub enum DaemonRequest {
     RunRemoteLatencyTest {
         device_id: DeviceId,
     },
+    RunCrossDeviceTest {
+        request: CrossDeviceTestRequest,
+    },
+    StartCrossDeviceStress {
+        request: CrossDeviceTestRequest,
+    },
+    StopCrossDeviceStress,
+    CrossDeviceTestStatus,
     RunRemoteUsbDescriptorProbe {
         device_id: DeviceId,
         bus_id: String,
@@ -642,6 +689,9 @@ pub enum DaemonRequest {
         paths: Vec<String>,
     },
     FileTransfers,
+    ApproveFileTransfer {
+        transfer_id: DeviceId,
+    },
     CancelFileTransfer {
         transfer_id: DeviceId,
     },
@@ -666,6 +716,8 @@ pub enum DaemonResponse {
     EndpointEvents(Vec<EndpointEvent>),
     EndpointEvent(EndpointEvent),
     EndpointInjectResult(EndpointInjectResult),
+    CrossDeviceTest(CrossDeviceTestReport),
+    CrossDeviceTestStatus(CrossDeviceTestStatusSnapshot),
     MobileAccess(MobileAccessSnapshot),
     LocalInputTest(LocalInputTestResult),
     LocalAudioTest(LocalAudioTestResult),
@@ -702,7 +754,10 @@ pub fn default_local_controls_ws_url() -> String {
 
 pub fn default_mobile_gateway_addr() -> SocketAddr {
     SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        // The gateway speaks plain HTTP and therefore must stay local. A
+        // deliberate LAN deployment needs a separately terminated TLS/WSS
+        // proxy rather than exposing the bearer token on the wire.
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
         DEFAULT_MOBILE_GATEWAY_PORT,
     )
 }

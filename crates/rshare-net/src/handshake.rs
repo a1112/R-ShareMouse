@@ -149,6 +149,16 @@ pub(crate) async fn complete_incoming_handshake(
     conn: &QuicConnection,
     local_device_id: DeviceId,
 ) -> Result<()> {
+    send_incoming_hello_back(conn, local_device_id).await?;
+    conn.complete_peer_protocol_handshake().await?;
+
+    Ok(())
+}
+
+pub(crate) async fn send_incoming_hello_back(
+    conn: &QuicConnection,
+    local_device_id: DeviceId,
+) -> Result<()> {
     conn.send_message(&hello_back_message(
         local_device_id,
         "R-ShareMouse".to_string(),
@@ -159,28 +169,57 @@ pub(crate) async fn complete_incoming_handshake(
         ScreenInfo::primary(),
     ))
     .await?;
-    conn.complete_peer_protocol_handshake().await?;
-
     Ok(())
 }
 
-/// Tell an inbound peer why its bootstrap was stopped before any authenticated
-/// QoS lanes or input receivers are installed.  Keeping this response on the
-/// compatibility stream lets the initiating side surface an actionable
-/// pending-approval state while the target remains fail-closed.
-pub(crate) async fn reject_incoming_handshake(
-    conn: &QuicConnection,
-    local_device_id: DeviceId,
-    reason: HandshakeRejectReason,
-) -> Result<()> {
-    send_rejection(conn, local_device_id, reason).await
-}
-
-pub(crate) async fn perform_outbound_handshake(
+pub(crate) async fn perform_outbound_handshake_with_approvals(
     conn: &mut QuicConnection,
     local_device_id: DeviceId,
+    approved_fingerprints: &[String],
 ) -> Result<NegotiatedPeer> {
-    perform_outbound_handshake_impl(conn, local_device_id, false).await
+    conn.send_message(&rshare_core::hello_message(
+        local_device_id,
+        "R-ShareMouse".to_string(),
+        hostname::get()
+            .unwrap_or_else(|_| "unknown".into())
+            .to_string_lossy()
+            .to_string(),
+    ))
+    .await?;
+
+    let response = receive_bootstrap(conn).await?;
+    let (peer_id, transport_capabilities) = match response {
+        Message::HelloRejected { reason, .. } => {
+            anyhow::bail!("peer rejected compatibility bootstrap: {reason:?}")
+        }
+        Message::HelloBack {
+            app_id,
+            device_id,
+            protocol_version,
+            transport_capabilities,
+            ..
+        } => {
+            if let Err(reason) = validate_hello(&app_id, protocol_version, &transport_capabilities)
+            {
+                anyhow::bail!("peer returned incompatible HelloBack: {reason:?}");
+            }
+            (device_id, transport_capabilities)
+        }
+        _ => anyhow::bail!("peer did not return HelloBack or HelloRejected"),
+    };
+
+    let certificate_fingerprint =
+        conn.confirm_peer_identity_with_approvals(peer_id, approved_fingerprints)?;
+    conn.complete_peer_protocol_handshake().await?;
+    Ok(NegotiatedPeer {
+        auth: PeerAuthContext {
+            peer_id,
+            certificate_fingerprint,
+            control_connection_id: ControlConnectionId::new(),
+        },
+        transport_capabilities,
+        inbound_trust_decision: None,
+    })
 }
 
 #[cfg(test)]
@@ -191,6 +230,7 @@ pub(crate) async fn perform_outbound_handshake_for_test(
     perform_outbound_handshake_impl(conn, local_device_id, true).await
 }
 
+#[cfg(test)]
 async fn perform_outbound_handshake_impl(
     conn: &mut QuicConnection,
     local_device_id: DeviceId,
@@ -228,14 +268,7 @@ async fn perform_outbound_handshake_impl(
     };
 
     let certificate_fingerprint = if test_auto_approve {
-        #[cfg(test)]
-        {
-            conn.confirm_peer_identity_for_test(peer_id)?
-        }
-        #[cfg(not(test))]
-        {
-            unreachable!("test auto-approval is unavailable in production builds")
-        }
+        conn.confirm_peer_identity_for_test(peer_id)?
     } else {
         conn.require_operator_approved_peer_identity(peer_id)?
     };

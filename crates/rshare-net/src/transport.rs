@@ -20,8 +20,8 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Once;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Once, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify, Semaphore};
@@ -48,6 +48,49 @@ const BOOTSTRAP_ALL_READERS_ACKED: u8 =
     BOOTSTRAP_RELIABLE_READER_ACK | BOOTSTRAP_DATAGRAM_READER_ACK;
 const AUTHENTICATED_UNI_STREAM_TASK_BUDGET: usize = 32;
 const AUTHENTICATED_UNI_STREAM_BUDGET_EXHAUSTED_CODE: u32 = 0x525342;
+// A peer must make progress while sending an authenticated frame. These
+// bounds apply before allocation, so a stalled or fragmented length prefix
+// cannot retain a large receive task indefinitely.
+const QOS_FRAME_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+const QOS_CONTROL_FRAME_MAX: usize = 256 * 1024;
+const QOS_TELEMETRY_FRAME_MAX: usize = 256 * 1024;
+// Clipboard and file-transfer payloads are JSON encoded before the QoS frame;
+// allow normal wire expansion while keeping any single authenticated bulk
+// frame small enough for the per-connection memory budget.
+const QOS_BULK_FRAME_MAX: usize = 4 * 1024 * 1024;
+const QOS_FRAME_MEMORY_UNIT: usize = 64 * 1024;
+const QOS_CONNECTION_FRAME_BUDGET: usize = 8 * 1024 * 1024;
+const QOS_PROCESS_FRAME_BUDGET: usize = 64 * 1024 * 1024;
+
+fn qos_lane_frame_limit(lane: u8, configured_limit: usize) -> usize {
+    let lane_limit = match lane {
+        value if value == LaneDiscriminator::Control as u8 => QOS_CONTROL_FRAME_MAX,
+        value if value == LaneDiscriminator::Telemetry as u8 => QOS_TELEMETRY_FRAME_MAX,
+        value if value == LaneDiscriminator::Bulk as u8 => QOS_BULK_FRAME_MAX,
+        _ => 0,
+    };
+    configured_limit.min(lane_limit)
+}
+
+fn qos_frame_permits(bytes: usize) -> u32 {
+    bytes
+        .saturating_add(QOS_FRAME_MEMORY_UNIT - 1)
+        .checked_div(QOS_FRAME_MEMORY_UNIT)
+        .unwrap_or(u32::MAX as usize)
+        .max(1)
+        .min(u32::MAX as usize) as u32
+}
+
+fn process_qos_frame_budget() -> Arc<Semaphore> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                qos_frame_permits(QOS_PROCESS_FRAME_BUDGET) as usize
+            ))
+        })
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuicServerStartError {
@@ -91,6 +134,15 @@ pub struct TransportConnectionDiagnostics {
     pub datagram_tx_dropped: u64,
     pub reliable_stream_reset_count: u64,
     pub cert_trust_state: Option<String>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "peer {device_id} requires explicit operator approval for certificate fingerprint {fingerprint}"
+)]
+pub(crate) struct PeerApprovalRequired {
+    pub(crate) device_id: DeviceId,
+    pub(crate) fingerprint: PeerCertificateFingerprint,
 }
 
 #[derive(Clone)]
@@ -343,6 +395,8 @@ pub struct QuicTransport {
     diagnostics_notifier: Option<TransportDiagnosticsNotifier>,
     state_lifetime: Option<Arc<StateLifetimeOwner>>,
     #[cfg(test)]
+    pub(crate) allow_unapproved_test_peers: bool,
+    #[cfg(test)]
     accept_task_barrier: Option<Arc<Notify>>,
     #[cfg(test)]
     accept_task_waiting: Arc<AtomicBool>,
@@ -423,6 +477,8 @@ impl QuicTransport {
             diagnostics_notifier: None,
             state_lifetime: None,
             #[cfg(test)]
+            allow_unapproved_test_peers: false,
+            #[cfg(test)]
             accept_task_barrier: None,
             #[cfg(test)]
             accept_task_waiting: Arc::new(AtomicBool::new(false)),
@@ -453,6 +509,7 @@ impl QuicTransport {
         let mut transport = Self::from_identity(local_device_id, identity)
             .with_trust_store_path(state_dir.join("quic-trust.json"));
         transport.state_lifetime = Some(lifetime);
+        transport.allow_unapproved_test_peers = true;
         transport
     }
 
@@ -464,18 +521,6 @@ impl QuicTransport {
     pub fn with_trust_store_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.trust_store_path = Some(path.into());
         self
-    }
-
-    pub(crate) fn approve_peer_identity(
-        &self,
-        device_id: DeviceId,
-        fingerprint: PeerCertificateFingerprint,
-    ) -> Result<()> {
-        let path = match &self.trust_store_path {
-            Some(path) => path.clone(),
-            None => super::encryption::trust_store_path()?,
-        };
-        QuicTrustStore::approve_at(path, device_id, fingerprint)
     }
 
     pub fn without_client_certificate(mut self) -> Self {
@@ -618,6 +663,16 @@ impl QuicTransport {
         remote_addr: &str,
         device_id: DeviceId,
     ) -> Result<QuicConnection> {
+        self.connect_with_approvals(remote_addr, device_id, &[])
+            .await
+    }
+
+    pub(crate) async fn connect_with_approvals(
+        &mut self,
+        remote_addr: &str,
+        device_id: DeviceId,
+        approved_fingerprints: &[String],
+    ) -> Result<QuicConnection> {
         let remote_addr: SocketAddr = remote_addr
             .parse()
             .map_err(|_| anyhow!("Invalid remote address: {}", remote_addr))?;
@@ -647,6 +702,7 @@ impl QuicTransport {
             &connection,
             device_id,
             trust_store_path.clone(),
+            approved_fingerprints,
             self.state_lifetime.clone(),
         )
         .await?;
@@ -741,6 +797,7 @@ struct QuicConnectionInner {
     qos_receive_notify: Notify,
     qos_inbound: StdMutex<QosInboundState>,
     authenticated_uni_stream_tasks: Arc<Semaphore>,
+    qos_frame_budget: Arc<Semaphore>,
     #[cfg(test)]
     qos_reliable_reader_start_barrier: StdMutex<Option<Arc<Notify>>>,
     #[cfg(test)]
@@ -842,6 +899,7 @@ pub struct QuicConnection {
     inner: Arc<QuicConnectionInner>,
     cert_trust_state: Option<String>,
     pending_peer_trust: Option<PendingPeerTrust>,
+    approved_peer_trust: Option<PendingPeerTrust>,
     peer_fingerprint: Option<PeerCertificateFingerprint>,
     trust_store_path: PathBuf,
 }
@@ -853,6 +911,7 @@ struct PendingPeerTrust {
     #[allow(dead_code)]
     trust_store_path: PathBuf,
     decision: QuicTrustDecision,
+    approved_fingerprints: Vec<String>,
     _state_lifetime: Option<Arc<StateLifetimeOwner>>,
 }
 
@@ -1029,6 +1088,9 @@ impl QuicConnection {
             authenticated_uni_stream_tasks: Arc::new(Semaphore::new(
                 AUTHENTICATED_UNI_STREAM_TASK_BUDGET,
             )),
+            qos_frame_budget: Arc::new(Semaphore::new(
+                qos_frame_permits(QOS_CONNECTION_FRAME_BUDGET) as usize,
+            )),
             #[cfg(test)]
             qos_reliable_reader_start_barrier: StdMutex::new(None),
             #[cfg(test)]
@@ -1097,6 +1159,7 @@ impl QuicConnection {
             inner,
             cert_trust_state,
             pending_peer_trust,
+            approved_peer_trust: None,
             peer_fingerprint,
             trust_store_path,
         }
@@ -1310,7 +1373,7 @@ impl QuicConnection {
         &mut self,
         actual_device_id: DeviceId,
     ) -> Result<PeerCertificateFingerprint> {
-        self.require_operator_approved_peer_identity(actual_device_id)
+        self.confirm_peer_identity_with_approvals(actual_device_id, &[])
     }
 
     /// Confirm an outbound peer only when the exact certificate fingerprint
@@ -1320,81 +1383,13 @@ impl QuicConnection {
         &mut self,
         actual_device_id: DeviceId,
     ) -> Result<PeerCertificateFingerprint> {
-        let pending = self
-            .pending_peer_trust
-            .take()
-            .ok_or_else(|| anyhow!("No pending outbound peer identity"))?;
-        if actual_device_id != pending.expected_device_id {
-            self.inner
-                .connection
-                .close(0u32.into(), b"peer identity mismatch");
-            anyhow::bail!(
-                "QUIC peer identity mismatch: expected {}, got {}",
-                pending.expected_device_id,
-                actual_device_id
-            );
-        }
-
-        let fingerprint = pending.fingerprint.clone();
-        match pending.decision {
-            QuicTrustDecision::OperatorApproved => {
-                self.cert_trust_state = Some("operator_approved".to_string());
-                Ok(fingerprint)
-            }
-            QuicTrustDecision::Rejected { expected, actual } => {
-                self.inner
-                    .connection
-                    .close(0u32.into(), b"certificate fingerprint mismatch");
-                anyhow::bail!(
-                    "QUIC certificate fingerprint changed for {} while confirming identity: expected {}, got {}",
-                    actual_device_id,
-                    expected,
-                    actual
-                );
-            }
-            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu => {
-                self.inner
-                    .connection
-                    .close(0u32.into(), b"operator approval required");
-                anyhow::bail!(
-                    "peer {} requires explicit operator approval before connecting",
-                    actual_device_id
-                )
-            }
-        }
+        self.confirm_peer_identity_with_approvals(actual_device_id, &[])
     }
 
-    /// Return the exact pending identity observed during an outbound TLS
-    /// handshake.  The caller may publish it as a pending approval request;
-    /// this method never mutates trust state.
-    pub(crate) fn pending_peer_identity(
-        &self,
-    ) -> Option<(DeviceId, PeerCertificateFingerprint, QuicTrustDecision)> {
-        self.pending_peer_trust.as_ref().map(|pending| {
-            (
-                pending.expected_device_id,
-                pending.fingerprint.clone(),
-                pending.decision.clone(),
-            )
-        })
-    }
-
-    /// Persist an explicit operator approval for a previously observed exact
-    /// device/fingerprint pair.  The trust store itself rejects pin changes.
-    pub(crate) fn approve_peer_identity(
-        &self,
-        device_id: DeviceId,
-        fingerprint: PeerCertificateFingerprint,
-    ) -> Result<()> {
-        QuicTrustStore::approve_at(&self.trust_store_path, device_id, fingerprint)
-    }
-
-    /// Test-only compatibility helper for the existing isolated transport
-    /// fixtures. Production handshake code never calls this promotion path.
-    #[cfg(test)]
-    pub(crate) fn confirm_peer_identity_for_test(
+    pub(crate) fn confirm_peer_identity_with_approvals(
         &mut self,
         actual_device_id: DeviceId,
+        approved_fingerprints: &[String],
     ) -> Result<PeerCertificateFingerprint> {
         let pending = self
             .pending_peer_trust
@@ -1410,29 +1405,117 @@ impl QuicConnection {
                 actual_device_id
             );
         }
+
         let fingerprint = pending.fingerprint.clone();
-        match pending.decision {
-            QuicTrustDecision::Rejected { expected, actual } => {
+        let explicitly_approved = pending
+            .approved_fingerprints
+            .iter()
+            .chain(approved_fingerprints.iter())
+            .any(|approved| approved == fingerprint.as_str());
+        let decision: Result<QuicTrustDecision> = match pending.decision {
+            QuicTrustDecision::OperatorApproved => Ok(QuicTrustDecision::OperatorApproved),
+            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu if explicitly_approved => {
+                self.approved_peer_trust = Some(pending);
+                Ok(QuicTrustDecision::OperatorApproved)
+            }
+            QuicTrustDecision::Rejected { .. } if explicitly_approved => {
+                self.approved_peer_trust = Some(pending);
+                Ok(QuicTrustDecision::OperatorApproved)
+            }
+            QuicTrustDecision::FirstSeen
+            | QuicTrustDecision::LegacyTofu
+            | QuicTrustDecision::Rejected { .. } => {
                 self.inner
                     .connection
-                    .close(0u32.into(), b"certificate fingerprint mismatch");
-                anyhow::bail!(
-                    "QUIC certificate fingerprint changed for {} while confirming identity: expected {}, got {}",
-                    actual_device_id,
-                    expected,
-                    actual
-                );
+                    .close(0u32.into(), b"operator approval required");
+                return Err(anyhow::Error::new(PeerApprovalRequired {
+                    device_id: pending.expected_device_id,
+                    fingerprint,
+                }));
             }
-            _ => {
+        };
+        match decision {
+            Ok(QuicTrustDecision::OperatorApproved) => {
+                self.cert_trust_state = Some(
+                    if self.approved_peer_trust.is_some() {
+                        "operator_approved_pending"
+                    } else {
+                        "operator_approved"
+                    }
+                    .to_string(),
+                );
+                Ok(fingerprint)
+            }
+            Ok(QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"invalid outbound trust state");
+                anyhow::bail!("outbound trust promotion did not commit operator approval")
+            }
+            Ok(QuicTrustDecision::Rejected { .. }) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"invalid outbound trust state");
+                anyhow::bail!("outbound trust replacement did not commit operator approval")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Persist a newly approved peer only after the compatibility bootstrap
+    /// has completed. Keeping this separate from identity confirmation makes
+    /// an interrupted handshake fail closed without leaving a trust pin.
+    pub(crate) fn commit_outbound_operator_approval(&mut self) -> Result<()> {
+        let Some(pending) = self.approved_peer_trust.take() else {
+            return Ok(());
+        };
+        let result = match pending.decision {
+            QuicTrustDecision::FirstSeen | QuicTrustDecision::LegacyTofu => {
                 QuicTrustStore::approve_at(
                     &pending.trust_store_path,
                     pending.expected_device_id,
                     pending.fingerprint,
-                )?;
+                )
+            }
+            QuicTrustDecision::Rejected { .. } => QuicTrustStore::replace_at(
+                &pending.trust_store_path,
+                pending.expected_device_id,
+                pending.fingerprint,
+            ),
+            QuicTrustDecision::OperatorApproved => Ok(()),
+        };
+        match result {
+            Ok(()) => {
                 self.cert_trust_state = Some("operator_approved".to_string());
-                Ok(fingerprint)
+                Ok(())
+            }
+            Err(error) => {
+                self.inner
+                    .connection
+                    .close(0u32.into(), b"failed to persist peer trust");
+                Err(error)
             }
         }
+    }
+
+    pub(crate) fn has_pending_operator_approval(&self) -> bool {
+        self.approved_peer_trust.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_peer_identity_for_test(
+        &mut self,
+        actual_device_id: DeviceId,
+    ) -> Result<PeerCertificateFingerprint> {
+        let approval = self
+            .pending_peer_trust
+            .as_ref()
+            .map(|pending| pending.fingerprint.as_str().to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let fingerprint = self.confirm_peer_identity_with_approvals(actual_device_id, &approval)?;
+        self.commit_outbound_operator_approval()?;
+        Ok(fingerprint)
     }
 
     pub fn inspect_inbound_peer_identity(
@@ -1449,17 +1532,27 @@ impl QuicConnection {
             QuicTrustDecision::FirstSeen
             | QuicTrustDecision::LegacyTofu
             | QuicTrustDecision::OperatorApproved => Ok((fingerprint, decision)),
-            QuicTrustDecision::Rejected { expected, actual } => {
-                anyhow::bail!(
-                    "QUIC certificate fingerprint changed for {}: expected {}, got {}",
-                    actual_device_id,
-                    expected,
-                    actual
-                )
-            }
+            QuicTrustDecision::Rejected { .. } => Ok((fingerprint, decision)),
         }
     }
 
+    pub fn commit_inbound_operator_approval(
+        &mut self,
+        device_id: DeviceId,
+        replace_existing: bool,
+    ) -> Result<()> {
+        let fingerprint = self
+            .peer_fingerprint
+            .clone()
+            .ok_or_else(|| anyhow!("peer certificate unavailable"))?;
+        if replace_existing {
+            QuicTrustStore::replace_at(&self.trust_store_path, device_id, fingerprint)?;
+        } else {
+            QuicTrustStore::approve_at(&self.trust_store_path, device_id, fingerprint)?;
+        }
+        self.cert_trust_state = Some("operator_approved".to_string());
+        Ok(())
+    }
     pub(crate) async fn complete_peer_protocol_handshake(&self) -> Result<()> {
         if self.inner.bootstrap_complete.load(Ordering::Acquire) {
             return Ok(());
@@ -1487,6 +1580,7 @@ impl QuicConnection {
 
     pub fn reject_pending_peer_identity(&mut self) {
         self.pending_peer_trust = None;
+        self.approved_peer_trust = None;
         self.inner
             .connection
             .close(0u32.into(), b"peer identity unavailable");
@@ -2126,7 +2220,16 @@ async fn read_authenticated_uni_stream(
             }
         }
     } else {
-        stream.read_exact(&mut prefix).await
+        match tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut prefix)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                inner
+                    .connection
+                    .close(0u32.into(), b"authenticated qos prefix timed out");
+                return;
+            }
+        }
     };
     if let Err(error) = prefix_result {
         if is_terminal_cancel_reset(&error) {
@@ -2166,7 +2269,18 @@ async fn read_authenticated_uni_stream(
     }
     if &prefix == QOS_LANE_MAGIC {
         let mut lane = [0u8; 1];
-        if let Err(error) = stream.read_exact(&mut lane).await {
+        let lane_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut lane)).await;
+        let lane_result = match lane_result {
+            Ok(result) => result,
+            Err(_) => {
+                inner
+                    .connection
+                    .close(0u32.into(), b"authenticated qos lane timed out");
+                return;
+            }
+        };
+        if let Err(error) = lane_result {
             if is_terminal_cancel_reset(&error) {
                 #[cfg(test)]
                 inner
@@ -2324,9 +2438,27 @@ async fn read_qos_message_stream(
                 .store(false, Ordering::Release);
         }
     }
+    let frame_limit = qos_lane_frame_limit(lane, max_message_size);
+    if frame_limit == 0 {
+        fail_close_current_qos_generation(&inner, &context, b"unknown qos message lane");
+        return;
+    }
     loop {
         let mut len_buf = [0u8; 4];
-        if let Err(error) = stream.read_exact(&mut len_buf).await {
+        let length_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = match length_result {
+            Ok(result) => result,
+            Err(_) => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos message length timed out",
+                );
+                return;
+            }
+        };
+        if let Err(error) = length_result {
             if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
                 #[cfg(test)]
                 inner
@@ -2338,12 +2470,59 @@ async fn read_qos_message_stream(
             return;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > max_message_size {
+        if len > frame_limit {
             fail_close_current_qos_generation(&inner, &context, b"oversized qos message frame");
             return;
         }
+        let permits = qos_frame_permits(len);
+        let connection_permit = match tokio::time::timeout(
+            QOS_FRAME_PROGRESS_TIMEOUT,
+            inner.qos_frame_budget.clone().acquire_many_owned(permits),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos connection frame budget exhausted",
+                );
+                return;
+            }
+        };
+        let process_permit = match tokio::time::timeout(
+            QOS_FRAME_PROGRESS_TIMEOUT,
+            process_qos_frame_budget().acquire_many_owned(permits),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                drop(connection_permit);
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos process frame budget exhausted",
+                );
+                return;
+            }
+        };
         let mut data = vec![0u8; len];
-        if let Err(error) = stream.read_exact(&mut data).await {
+        let payload_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut data)).await;
+        let payload_result = match payload_result {
+            Ok(result) => result,
+            Err(_) => {
+                fail_close_current_qos_generation(
+                    &inner,
+                    &context,
+                    b"qos message payload timed out",
+                );
+                return;
+            }
+        };
+        if let Err(error) = payload_result {
             if is_stream_reset(&error, AWAITED_CANCEL_RESET_CODE) {
                 #[cfg(test)]
                 inner
@@ -2451,6 +2630,8 @@ async fn read_qos_message_stream(
             }
             super::qos::ClassifiedMessage::Unsupported => unreachable!(),
         }
+        drop(process_permit);
+        drop(connection_permit);
     }
 }
 
@@ -2527,7 +2708,27 @@ async fn read_qos_reliable_stream(
             }
         }
         let mut len_buf = [0u8; 4];
-        if let Err(error) = stream.read_exact(&mut len_buf).await {
+        let length_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut len_buf)).await;
+        let length_result = match length_result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(context) = await_qos_receive_context(&inner).await {
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"qos reliable length timed out",
+                    );
+                } else {
+                    inner
+                        .connection
+                        .close(0u32.into(), b"qos reliable length timed out");
+                }
+                return;
+            }
+        };
+        if let Err(error) = length_result {
             if let Some(context) = await_qos_receive_context(&inner).await {
                 if !(is_terminal_cancel_reset(&error)
                     && handle_terminal_cancel_reset(&inner, &context, stream_epoch))
@@ -2562,7 +2763,27 @@ async fn read_qos_reliable_stream(
             return;
         }
         let mut data = vec![0u8; len];
-        if let Err(error) = stream.read_exact(&mut data).await {
+        let payload_result =
+            tokio::time::timeout(QOS_FRAME_PROGRESS_TIMEOUT, stream.read_exact(&mut data)).await;
+        let payload_result = match payload_result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(context) = await_qos_receive_context(&inner).await {
+                    fail_close_active_qos(
+                        &inner,
+                        &context,
+                        stream_epoch,
+                        b"qos reliable payload timed out",
+                    );
+                } else {
+                    inner
+                        .connection
+                        .close(0u32.into(), b"qos reliable payload timed out");
+                }
+                return;
+            }
+        };
+        if let Err(error) = payload_result {
             if let Some(context) = await_qos_receive_context(&inner).await {
                 if !(is_terminal_cancel_reset(&error)
                     && handle_terminal_cancel_reset(&inner, &context, stream_epoch))
@@ -3433,6 +3654,7 @@ async fn inspect_outbound_peer_trust(
     connection: &quinn::Connection,
     device_id: DeviceId,
     trust_store_path: PathBuf,
+    approved_fingerprints: &[String],
     state_lifetime: Option<Arc<StateLifetimeOwner>>,
 ) -> Result<PendingPeerTrust> {
     let fingerprint = match peer_certificate_fingerprint(connection) {
@@ -3453,21 +3675,14 @@ async fn inspect_outbound_peer_trust(
     match &decision {
         QuicTrustDecision::FirstSeen => {}
         QuicTrustDecision::LegacyTofu | QuicTrustDecision::OperatorApproved => {}
-        QuicTrustDecision::Rejected { expected, actual } => {
-            connection.close(0u32.into(), b"certificate fingerprint mismatch");
-            anyhow::bail!(
-                "QUIC certificate fingerprint changed for {}: expected {}, got {}",
-                device_id,
-                expected,
-                actual
-            );
-        }
+        QuicTrustDecision::Rejected { .. } => {}
     }
     Ok(PendingPeerTrust {
         expected_device_id: device_id,
         fingerprint,
         trust_store_path,
         decision,
+        approved_fingerprints: approved_fingerprints.to_vec(),
         _state_lifetime: state_lifetime,
     })
 }
@@ -3562,8 +3777,9 @@ impl ClientCertVerifier for OptionalBootstrapClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, RustlsError> {
-        // Self-signed identities are authorized only after the claimed DeviceId
-        // is checked against TOFU during the application bootstrap.
+        // Self-signed identities are accepted at TLS only so the application
+        // bootstrap can bind the claimed DeviceId to an explicit local
+        // operator approval for this certificate fingerprint.
         Ok(ClientCertVerified::assertion())
     }
 
@@ -7429,6 +7645,54 @@ mod tests {
         })
         .await
         .expect("the confirmed pending trust owner must clean its state");
+    }
+
+    #[tokio::test]
+    async fn approved_peer_trust_is_not_persisted_when_bootstrap_is_aborted() {
+        let server_id = DeviceId::new_v4();
+        let client_id = DeviceId::new_v4();
+        let mut server = QuicTransport::isolated_for_test(server_id);
+        server.require_peer_protocol_handshake();
+        server.start_server("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut incoming = server.incoming();
+        let mut client = QuicTransport::isolated_for_test(client_id);
+        let mut pending = client
+            .connect(&address.to_string(), server_id)
+            .await
+            .unwrap();
+        let remote = incoming.recv().await.unwrap().connection;
+        let fingerprint = pending
+            .peer_fingerprint
+            .clone()
+            .expect("test peer must present a certificate");
+        let fingerprint_text = fingerprint.to_string();
+
+        pending
+            .confirm_peer_identity_with_approvals(server_id, &[fingerprint_text])
+            .unwrap();
+        assert!(pending.has_pending_operator_approval());
+        assert_eq!(
+            QuicTrustStore::load(&pending.trust_store_path)
+                .unwrap()
+                .fingerprint_for(&server_id),
+            None,
+            "identity confirmation must not persist trust before bootstrap"
+        );
+
+        pending.reject_pending_peer_identity();
+        assert_eq!(
+            QuicTrustStore::load(&pending.trust_store_path)
+                .unwrap()
+                .fingerprint_for(&server_id),
+            None,
+            "an aborted bootstrap must leave no trust pin"
+        );
+        remote
+            .inner
+            .connection
+            .close(0u32.into(), b"forced bootstrap abort");
+        server.close().await.unwrap();
     }
 
     #[tokio::test]

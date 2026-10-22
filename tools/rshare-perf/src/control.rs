@@ -3,7 +3,6 @@ use crate::report::{
     ToolchainFingerprint, VerdictStatus, PERF_SCHEMA_VERSION,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub fn not_run_without_framed_ipc() -> PerfReport {
@@ -56,7 +55,7 @@ pub fn not_run_without_framed_ipc() -> PerfReport {
 }
 
 fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    crate::sha256_hex(value.as_bytes())
 }
 
 #[cfg(test)]

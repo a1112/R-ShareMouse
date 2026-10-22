@@ -341,7 +341,7 @@ async fn send_ui_envelope(
     envelope: &UiEnvelope,
 ) -> Result<()> {
     websocket
-        .send(WsMessage::Text(serde_json::to_string(envelope)?))
+        .send(WsMessage::Text(serde_json::to_string(envelope)?.into()))
         .await?;
     Ok(())
 }
@@ -352,7 +352,7 @@ async fn stream_local_controls(
 ) -> Result<()> {
     let response = DaemonResponse::LocalControls((feed.snapshot)().await?);
     websocket
-        .send(WsMessage::Text(serde_json::to_string(&response)?))
+        .send(WsMessage::Text(serde_json::to_string(&response)?.into()))
         .await?;
 
     let mut events = feed.events.subscribe();
@@ -363,7 +363,7 @@ async fn stream_local_controls(
                     Ok(event) => {
                         websocket.send(WsMessage::Text(serde_json::to_string(
                             &DaemonResponse::LocalControlEvent(event),
-                        )?)).await?;
+                        )?.into())).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,

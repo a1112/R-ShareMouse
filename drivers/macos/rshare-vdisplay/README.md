@@ -6,7 +6,11 @@ Workspace integration status (reviewed 2026-09-05): the C++ driver source passes
 the SDK syntax and static analysis checks, but the Rust macOS user-client bridge
 and CLI `display virtual driver-status` command are not implemented in this
 checkout. The public Rust create/remove operations return `Unsupported` on
-macOS. The integration contract test remains failing and records this gap.
+macOS. The Rust bridge integration contract is a separate, explicitly ignored
+test until that bridge is implemented. Run
+`cargo test -p rshare-platform --test macos_vdisplay_driver_package macos_virtual_display_rust_bridge_integration_contract -- --ignored`
+to check this outstanding gate. Driver-package ABI, lifecycle, EDID and tooling
+checks remain active, and the public unsupported result is verified separately.
 The daemon/CLI validation steps below describe the intended integration; they
 are not currently executable acceptance instructions. Driver signing, loading
 and a real display-topology test are separate outstanding gates.

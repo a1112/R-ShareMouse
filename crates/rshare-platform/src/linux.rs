@@ -17,6 +17,31 @@ mod linux_impl {
     #[cfg(feature = "x11")]
     use x11::xlib;
 
+    /// Enable Xlib's process-wide locks before any capture, injection or
+    /// display connection is opened. Enigo/libxdo and rdev share these same
+    /// Xlib globals even when they own separate display connections.
+    /// See https://www.x.org/releases/X11R7.6/doc/libX11/specs/libX11/libX11.html#Using_Xlib_with_Threads
+    pub fn ensure_xlib_thread_support() -> Result<()> {
+        #[cfg(feature = "x11")]
+        {
+            static INITIALIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let initialized = INITIALIZED.get_or_init(|| {
+                // SAFETY: OnceLock serializes the first initialization, and all
+                // application-owned Xlib entry points call this before opening
+                // a display or constructing an Xlib-backed dependency.
+                unsafe { xlib::XInitThreads() != 0 }
+            });
+            if !initialized {
+                anyhow::bail!("Xlib does not support concurrent input/display threads");
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "x11"))]
+        {
+            anyhow::bail!("X11 thread support is not enabled");
+        }
+    }
+
     // Wrapper to make X11 display pointer Send
     #[cfg(feature = "x11")]
     struct SendDisplay(*mut x11::xlib::Display);
@@ -115,6 +140,7 @@ mod linux_impl {
             {
                 use std::ptr;
 
+                ensure_xlib_thread_support()?;
                 // Open X11 display
                 let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
                 if display.is_null() {
@@ -313,6 +339,7 @@ mod linux_impl {
             {
                 use std::ptr;
 
+                ensure_xlib_thread_support()?;
                 let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
                 if display.is_null() {
                     anyhow::bail!("Failed to open X11 display");

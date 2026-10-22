@@ -3,7 +3,6 @@ use crate::report::{
     PerfRun, ScenarioContract, VerdictStatus, PERF_SCHEMA_VERSION, REQUIRED_COUNTERS,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
@@ -434,7 +433,7 @@ fn within_batch_context_fingerprint(report: &PerfReport) -> String {
         &report.cargo_lock_sha256,
     ))
     .expect("within-batch comparison context is serializable");
-    format!("{:x}", Sha256::digest(bytes))
+    crate::sha256_hex(bytes)
 }
 
 fn cross_revision_context_fingerprint(report: &PerfReport) -> String {
@@ -452,7 +451,7 @@ fn cross_revision_context_fingerprint(report: &PerfReport) -> String {
         &report.warmup,
     ))
     .expect("comparison context is serializable");
-    format!("{:x}", Sha256::digest(bytes))
+    crate::sha256_hex(bytes)
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -565,9 +564,8 @@ impl VerifiedApproval {
             approved_by_non_author: true,
             reviewed_diff_contains_entry_and_hash: true,
             reviewed_artifact_matches_hash: true,
-            github_api_evidence_sha256: format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&github_api_evidence).unwrap())
+            github_api_evidence_sha256: crate::sha256_hex(
+                serde_json::to_vec(&github_api_evidence).unwrap(),
             ),
             github_api_evidence,
         }
@@ -583,7 +581,7 @@ impl VerifiedApproval {
             && self.reviewed_artifact_matches_hash
             && is_sha256(&self.github_api_evidence_sha256)
             && serde_json::to_vec(&self.github_api_evidence)
-                .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                .map(|bytes| crate::sha256_hex(bytes))
                 .is_ok_and(|actual| actual == self.github_api_evidence_sha256)
     }
 }
@@ -765,7 +763,7 @@ pub fn validate_github_trust(
         reviewed_diff_contains_entry_and_hash: true,
         reviewed_artifact_matches_hash: true,
         github_api_evidence,
-        github_api_evidence_sha256: format!("{:x}", Sha256::digest(evidence_bytes)),
+        github_api_evidence_sha256: crate::sha256_hex(evidence_bytes),
     })
 }
 
@@ -944,7 +942,7 @@ pub fn verify_github_approval(
         )
         .map_err(BaselineError::GitHubVerification)?;
         pr_head_batch_artifact_references.insert(path.into(), sha256.into());
-        pr_head_batch_artifact_sha256.insert(path.into(), format!("{:x}", Sha256::digest(bytes)));
+        pr_head_batch_artifact_sha256.insert(path.into(), crate::sha256_hex(bytes));
     }
     let evidence = GithubApiEvidence {
         repository: repository.into(),
@@ -963,7 +961,7 @@ pub fn verify_github_approval(
         merge_commit_reachable_from_default,
         pr_base_manifest,
         pr_head_manifest,
-        pr_head_artifact_sha256: format!("{:x}", Sha256::digest(pr_head_artifact)),
+        pr_head_artifact_sha256: crate::sha256_hex(pr_head_artifact),
         pr_head_batch_artifact_references,
         pr_head_batch_artifact_sha256,
         reviews,
@@ -1114,7 +1112,7 @@ pub fn load_reviewed_baseline(
     }
     let bytes = fs::read(&canonical_artifact)
         .map_err(|error| BaselineError::ArtifactRead(error.to_string()))?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let actual = crate::sha256_hex(&bytes);
     if actual != entry.artifact_sha256 {
         return Err(BaselineError::ArtifactHashMismatch {
             expected: entry.artifact_sha256.clone(),
@@ -1159,7 +1157,7 @@ fn verify_local_sidecars(report: &PerfReport, repository_root: &Path) -> Result<
         }
         let bytes =
             fs::read(canonical).map_err(|error| BaselineError::ArtifactRead(error.to_string()))?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = crate::sha256_hex(&bytes);
         if actual != reference.sha256 {
             return Err(BaselineError::SchemaValidation(format!(
                 "reviewed baseline sidecar {} hash mismatch",
@@ -1297,7 +1295,6 @@ fn valid_approval_ref(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::report::{Availability, PerfReport, PerfRun, VerdictStatus, REQUIRED_COUNTERS};
-    use sha2::{Digest, Sha256};
     use std::{
         collections::BTreeMap,
         fs,
@@ -1848,7 +1845,7 @@ mod tests {
     }
 
     fn hex_sha256(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        crate::sha256_hex(bytes)
     }
 
     fn manifest_fixture(hash: &str, approval_ref: &str) -> BaselineManifest {

@@ -737,6 +737,7 @@ async fn daemon_responses_round_trip_endpoint_inject_result() {
         health: rshare_core::BackendHealth::Healthy,
         elapsed_ms: 3,
         loopback_event_id: Some(42),
+        observed_event: None,
         error: None,
     });
 

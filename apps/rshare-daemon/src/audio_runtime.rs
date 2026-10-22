@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rshare_core::{
-    AudioFormat, AudioFramePayload, AudioSampleFormat, DeviceId, LocalAudioCaptureSource,
+    AudioFormat, AudioFramePayload, AudioSampleFormat, ControlConnectionId, DeviceId,
+    LocalAudioCaptureSource,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -51,15 +52,23 @@ enum AudioRuntimeCommand {
     },
     StopCapture,
     StartRender {
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
         stream_id: DeviceId,
         format: AudioFormat,
         response: std_mpsc::Sender<std::result::Result<AudioRenderStats, String>>,
     },
     PushFrame {
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
         frame: AudioFramePayload,
         response: std_mpsc::Sender<std::result::Result<AudioRenderStats, String>>,
     },
-    StopRender,
+    StopRender {
+        owner_peer: Option<DeviceId>,
+        owner_connection: Option<ControlConnectionId>,
+        stream_id: Option<DeviceId>,
+    },
     Shutdown,
 }
 
@@ -93,25 +102,65 @@ impl AudioRuntimeHandle {
 
     pub fn start_render(
         &self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
         stream_id: DeviceId,
         format: AudioFormat,
     ) -> Result<AudioRenderStats> {
         self.request(|response| AudioRuntimeCommand::StartRender {
+            owner_peer,
+            owner_connection,
             stream_id,
             format,
             response,
         })
     }
 
-    pub fn push_frame(&self, frame: &AudioFramePayload) -> Result<AudioRenderStats> {
+    pub fn push_frame(
+        &self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        frame: &AudioFramePayload,
+    ) -> Result<AudioRenderStats> {
         self.request(|response| AudioRuntimeCommand::PushFrame {
+            owner_peer,
+            owner_connection,
             frame: frame.clone(),
             response,
         })
     }
 
-    pub fn stop_render(&self) {
-        let _ = self.tx.send(AudioRuntimeCommand::StopRender);
+    pub fn stop_render(
+        &self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        stream_id: DeviceId,
+    ) {
+        let _ = self.tx.send(AudioRuntimeCommand::StopRender {
+            owner_peer: Some(owner_peer),
+            owner_connection: Some(owner_connection),
+            stream_id: Some(stream_id),
+        });
+    }
+
+    pub fn stop_render_for_peer(
+        &self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+    ) {
+        let _ = self.tx.send(AudioRuntimeCommand::StopRender {
+            owner_peer: Some(owner_peer),
+            owner_connection: Some(owner_connection),
+            stream_id: None,
+        });
+    }
+
+    pub fn clear_render(&self) {
+        let _ = self.tx.send(AudioRuntimeCommand::StopRender {
+            owner_peer: None,
+            owner_connection: None,
+            stream_id: None,
+        });
     }
 
     pub fn shutdown(&self) {
@@ -165,20 +214,38 @@ fn run_audio_runtime(rx: std_mpsc::Receiver<AudioRuntimeCommand>) {
                 _capture = None;
             }
             AudioRuntimeCommand::StartRender {
+                owner_peer,
+                owner_connection,
                 stream_id,
                 format,
                 response,
             } => {
                 let result = render
-                    .start(stream_id, format)
+                    .start(owner_peer, owner_connection, stream_id, format)
                     .map_err(|error| error.to_string());
                 let _ = response.send(result);
             }
-            AudioRuntimeCommand::PushFrame { frame, response } => {
-                let result = render.push_frame(&frame).map_err(|error| error.to_string());
+            AudioRuntimeCommand::PushFrame {
+                owner_peer,
+                owner_connection,
+                frame,
+                response,
+            } => {
+                let result = render
+                    .push_frame(owner_peer, owner_connection, &frame)
+                    .map_err(|error| error.to_string());
                 let _ = response.send(result);
             }
-            AudioRuntimeCommand::StopRender => render.stop(),
+            AudioRuntimeCommand::StopRender {
+                owner_peer,
+                owner_connection,
+                stream_id,
+            } => match (owner_peer, owner_connection) {
+                (Some(peer), Some(connection)) => {
+                    render.stop_for_owner(peer, connection, stream_id)
+                }
+                _ => render.stop(),
+            },
             AudioRuntimeCommand::Shutdown => break,
         }
     }
@@ -275,29 +342,46 @@ impl AudioRenderRuntime {
         Self { active: None }
     }
 
-    pub fn start(&mut self, stream_id: DeviceId, format: AudioFormat) -> Result<AudioRenderStats> {
+    pub fn start(
+        &mut self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        stream_id: DeviceId,
+        format: AudioFormat,
+    ) -> Result<AudioRenderStats> {
+        if self.active.as_ref().is_some_and(|session| {
+            session.owner_peer != owner_peer || session.owner_connection != owner_connection
+        }) {
+            return Err(anyhow!(
+                "Audio render session is owned by another peer generation"
+            ));
+        }
         self.stop();
-        let session = AudioRenderSession::start(stream_id, format)?;
+        let session = AudioRenderSession::start(owner_peer, owner_connection, stream_id, format)?;
         let stats = session.stats();
         self.active = Some(session);
         Ok(stats)
     }
 
-    pub fn push_frame(&mut self, frame: &AudioFramePayload) -> Result<AudioRenderStats> {
+    pub fn push_frame(
+        &mut self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        frame: &AudioFramePayload,
+    ) -> Result<AudioRenderStats> {
         validate_audio_frame(frame, &frame.format)?;
-        if self
-            .active
-            .as_ref()
-            .map(|session| session.stream_id != frame.stream_id)
-            .unwrap_or(true)
-        {
-            self.start(frame.stream_id, frame.format.clone())?;
-        }
-
         let session = self
             .active
             .as_mut()
             .ok_or_else(|| anyhow!("Audio render session is not active"))?;
+        if session.owner_peer != owner_peer
+            || session.owner_connection != owner_connection
+            || session.stream_id != frame.stream_id
+        {
+            return Err(anyhow!(
+                "Audio frame is not owned by the active render session"
+            ));
+        }
         session.push_frame(frame)?;
         Ok(session.stats())
     }
@@ -305,9 +389,26 @@ impl AudioRenderRuntime {
     pub fn stop(&mut self) {
         self.active = None;
     }
+
+    pub fn stop_for_owner(
+        &mut self,
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        stream_id: Option<DeviceId>,
+    ) {
+        if self.active.as_ref().is_some_and(|session| {
+            session.owner_peer == owner_peer
+                && session.owner_connection == owner_connection
+                && stream_id.is_none_or(|stream_id| session.stream_id == stream_id)
+        }) {
+            self.stop();
+        }
+    }
 }
 
 struct AudioRenderSession {
+    owner_peer: DeviceId,
+    owner_connection: ControlConnectionId,
     stream_id: DeviceId,
     format: AudioFormat,
     buffer: Arc<Mutex<VecDeque<i16>>>,
@@ -318,7 +419,12 @@ struct AudioRenderSession {
 }
 
 impl AudioRenderSession {
-    fn start(stream_id: DeviceId, format: AudioFormat) -> Result<Self> {
+    fn start(
+        owner_peer: DeviceId,
+        owner_connection: ControlConnectionId,
+        stream_id: DeviceId,
+        format: AudioFormat,
+    ) -> Result<Self> {
         validate_audio_format(&format)?;
         let host = cpal::default_host();
         let device = host
@@ -367,6 +473,8 @@ impl AudioRenderSession {
             .context("Failed to start audio output stream")?;
 
         Ok(Self {
+            owner_peer,
+            owner_connection,
             stream_id,
             format,
             buffer,

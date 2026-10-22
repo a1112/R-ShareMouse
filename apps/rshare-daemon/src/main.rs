@@ -3,6 +3,7 @@
 //! Background service that handles input sharing and local IPC for status queries.
 
 mod audio_runtime;
+mod cross_device_test;
 mod endpoint_runtime;
 mod extended_display;
 mod mobile_gateway;
@@ -14,7 +15,6 @@ mod usb_service;
 use anyhow::{Context, Result};
 use endpoint_runtime::inject_endpoint_event;
 use futures_util::future::BoxFuture;
-use rshare_core::ipc::MacosInputPermissionsSnapshot;
 use rshare_core::{
     default_ipc_addr, default_mobile_gateway_addr, local_capability_snapshots,
     remote_capability_snapshots, AudioFormat, BackendFailureReason, BackendHealth, BackendKind,
@@ -29,11 +29,11 @@ use rshare_core::{
     LocalAudioCaptureSource, LocalAudioCaptureStatus, LocalAudioTestResult, LocalAudioTestStatus,
     LocalControlDeviceSnapshot, LocalDisplayInfo, LocalDisplayState, LocalGamepadState,
     LocalInputDeviceKind, LocalInputDiagnosticEvent, LocalInputEventSource, LocalInputFeedback,
-    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus, Message,
-    NetworkTransportSnapshot, RemoteDeviceLatencyFeedback, RemoteLatencyFeedback,
-    RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo, ServiceStatusSnapshot,
-    TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState, UiSnapshot,
-    UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
+    LocalInputTestKind, LocalInputTestRequest, LocalInputTestResult, LocalInputTestStatus,
+    MacosInputPermissionsSnapshot, Message, NetworkTransportSnapshot, RemoteDeviceLatencyFeedback,
+    RemoteLatencyFeedback, RemoteUsbDeviceSnapshot, ResolvedInputMode, RouterCommand, ScreenInfo,
+    ServiceStatusSnapshot, TransportFeedback, UiActiveSessions, UiDynamicState, UiPointerState,
+    UiSnapshot, UsbControlSetupPacket, UsbDescriptorProbeResult, UsbDescriptorProbeStatus,
     UsbDeviceClaimRequest, UsbDeviceDescriptor, UsbDeviceSpeed, UsbTransferDirection,
     UsbTransferKind, UsbTransferPayload, UsbTransferStatus, VirtualDesktopGeometry,
     VirtualDisplayCreateRequest, VirtualDisplayOperationResult, VirtualDisplayOperationStatus,
@@ -2622,7 +2622,18 @@ fn publication_item_to_local_diagnostic(
     item: &DiagnosticPublicationItem,
 ) -> LocalInputDiagnosticEvent {
     match &item.payload {
-        DiagnosticPayload::Discrete(event) => event.clone(),
+        DiagnosticPayload::Discrete(event) => {
+            let mut event = event.clone();
+            // A diagnostics subscription is a health stream, not a keylogger.
+            // Keep the event kind and timing useful while removing individual
+            // key/text values before serializing a live remote publication.
+            if event.device_kind == LocalInputDeviceKind::Keyboard {
+                event.payload.remove("key");
+                event.payload.remove("text");
+                event.summary = "Keyboard input event".to_string();
+            }
+            event
+        }
         DiagnosticPayload::Metrics(snapshot) => {
             let mut payload = BTreeMap::new();
             payload.insert("snapshot_json".to_string(), item.json.to_string());
@@ -2708,13 +2719,14 @@ fn spawn_peer_diagnostics_forwarder(
     input_registry: Arc<ConnectionRegistry>,
     local_device_id: DeviceId,
     subscriber_id: DiagnosticSubscriberId,
+    filter: EndpointEventFilter,
 ) {
     let Some(peer) = input_registry.peer(&subscriber_id.peer_id).filter(|peer| {
         diagnostic_generation_is_current(subscriber_id, Some(peer.auth.control_connection_id))
     }) else {
         return;
     };
-    let Some(subscription) = diagnostics.subscribe_current(subscriber_id) else {
+    let Some(subscription) = diagnostics.subscribe_current_filtered(subscriber_id, filter) else {
         return;
     };
     tokio::spawn(run_peer_diagnostics_forwarder(
@@ -4103,6 +4115,7 @@ fn endpoint_inject_failure_result(
         health,
         elapsed_ms,
         loopback_event_id: None,
+        observed_event: None,
         error: Some(error),
     }
 }
@@ -5140,6 +5153,7 @@ async fn handle_network_message(
                     input_registry.clone(),
                     local_device_id,
                     subscriber_id,
+                    filter,
                 );
             };
         }
@@ -5361,7 +5375,8 @@ async fn handle_network_message(
                     .await;
                 return;
             }
-            let render_result = audio_runtime.start_render(stream_id, format.clone());
+            let render_result =
+                audio_runtime.start_render(from, control_connection_id, stream_id, format.clone());
             let event = {
                 let mut state = state.write().await;
                 match render_result {
@@ -5421,7 +5436,7 @@ async fn handle_network_message(
             if !audio_forwarding_enabled {
                 return;
             }
-            let render_result = audio_runtime.push_frame(&frame);
+            let render_result = audio_runtime.push_frame(from, control_connection_id, &frame);
             let event = {
                 let mut state = state.write().await;
                 match render_result {
@@ -5480,7 +5495,7 @@ async fn handle_network_message(
             }
         }
         Message::AudioStreamStop { stream_id, reason } => {
-            audio_runtime.stop_render();
+            audio_runtime.stop_render(from, control_connection_id, stream_id);
             let event = {
                 let mut state = state.write().await;
                 state.local_controls.audio_stream_state.active = false;
@@ -7312,10 +7327,9 @@ async fn main() -> Result<()> {
         .with_config(NetworkManagerConfig {
             bind_address: bind_address.clone(),
             mdns_enabled: config.network.mdns_enabled,
-            // Compatible discovered peers connect automatically. The first
-            // certificate is pinned during the handshake; security policy can
-            // add an explicit approval mode later.
-            auto_connect: true,
+            // Discovery is untrusted. The operator must approve the pending
+            // certificate before a connection can be established.
+            auto_connect: false,
             ..Default::default()
         });
 
@@ -7445,6 +7459,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(8);
     let (local_events_tx, _) = broadcast::channel::<LocalInputDiagnosticEvent>(256);
     let (endpoint_events_tx, _) = broadcast::channel::<EndpointEvent>(256);
+    let cross_device_test = cross_device_test::CrossDeviceTestRuntime::default();
     let audio_runtime = audio_runtime::AudioRuntimeHandle::start()?;
     let usb_runtime = Arc::new(Mutex::new(
         rshare_platform::ExperimentalUsbHostRuntime::new(),
@@ -7658,7 +7673,8 @@ async fn main() -> Result<()> {
     let (input_state, input_feeds) = input_state_channel(32);
     let input_metrics = Arc::new(ControlMetrics::default());
     let diagnostics_runtime =
-        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY);
+        DiagnosticsRuntime::new(input_metrics.clone(), DIAGNOSTICS_HISTORY_CAPACITY)
+            .with_endpoint_id(device_id);
     let diagnostics_samples = diagnostics_runtime.latest_receiver();
     let diagnostics = diagnostics_runtime.handle();
     let (diagnostics_shutdown_tx, diagnostics_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -7789,6 +7805,7 @@ async fn main() -> Result<()> {
         usb_runtime.clone(),
         local_events_tx.clone(),
         endpoint_events_tx.clone(),
+        cross_device_test.clone(),
         layout_path.clone(),
         layout_update_lock.clone(),
         shutdown_tx.clone(),
@@ -8112,6 +8129,7 @@ async fn main() -> Result<()> {
                         }
                         let mut state = state.write().await;
                         // Notify session state machine of target disconnection
+                        audio_runtime.stop_render_for_peer(id, control_connection_id);
                         if let Some(service) = &state.file_transfers {
                             service.disconnect(id, control_connection_id);
                         }
@@ -8263,19 +8281,26 @@ async fn main() -> Result<()> {
 
     tracing::info!("tokio::select! exited, cleaning up");
     let _ = diagnostics_shutdown_tx.try_send(());
+    let _ = cross_device_test.stop().await;
     let _ = enqueue_router_command(&input_command_tx, RouterCommand::Shutdown).await;
     injection.request_release_all_sources(rshare_core::ReleaseAllReason::SessionEnded);
     set_local_shortcut_suppression(false);
     usb_maintenance.abort();
     audio_runtime.stop_capture();
-    audio_runtime.stop_render();
+    audio_runtime.clear_render();
     audio_runtime.shutdown();
     drop(system_safety_watcher);
     #[cfg(windows)]
     if let Some(capture) = windows_driver_capture.as_mut() {
         capture.stop();
     }
-    // Input listener cleanup is handled automatically by task drops
+    // Keep the native listener alive for the whole daemon lifetime. The
+    // listener status handle above only borrows/clones its atomics; without an
+    // explicit final use Rust may drop the listener after startup, which stops
+    // the CGEventTap immediately while the daemon still reports a healthy TCC
+    // permission state.
+    #[cfg(any(windows, target_os = "macos"))]
+    drop(_input_listener);
     let network_stop_result = network_manager.lock().await.stop().await;
     let injection_stop_result = tokio::task::spawn_blocking(move || injection.shutdown()).await?;
 
@@ -8299,6 +8324,7 @@ async fn run_ipc_server(
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -8318,6 +8344,7 @@ async fn run_ipc_server(
         let usb_runtime = usb_runtime.clone();
         let local_events_tx = local_events_tx.clone();
         let endpoint_events_tx = endpoint_events_tx.clone();
+        let cross_device_test = cross_device_test.clone();
         let layout_path = layout_path.clone();
         let layout_update_lock = layout_update_lock.clone();
         let shutdown_tx = shutdown_tx.clone();
@@ -8335,6 +8362,7 @@ async fn run_ipc_server(
                 usb_runtime,
                 local_events_tx,
                 endpoint_events_tx,
+                cross_device_test,
                 layout_path,
                 layout_update_lock,
                 shutdown_tx,
@@ -8358,6 +8386,7 @@ async fn handle_ipc_client(
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
     endpoint_events_tx: broadcast::Sender<EndpointEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -8492,6 +8521,7 @@ async fn handle_ipc_client(
         let audio_runtime = audio_runtime.clone();
         let usb_runtime = Arc::clone(&usb_runtime);
         let local_events_tx = local_events_tx.clone();
+        let cross_device_test = cross_device_test.clone();
         let layout_path = Arc::clone(&layout_path);
         let layout_update_lock = Arc::clone(&layout_update_lock);
         let shutdown_tx = shutdown_tx.clone();
@@ -8506,6 +8536,7 @@ async fn handle_ipc_client(
                 audio_runtime,
                 usb_runtime,
                 local_events_tx,
+                cross_device_test,
                 layout_path,
                 layout_update_lock,
                 shutdown_tx,
@@ -8666,10 +8697,14 @@ fn request_may_mutate_ui(request: &DaemonRequest) -> bool {
             | DaemonRequest::Connect { .. }
             | DaemonRequest::Disconnect { .. }
             | DaemonRequest::ApprovePeer { .. }
+            | DaemonRequest::RejectPeer { .. }
             | DaemonRequest::SetLayout { .. }
             | DaemonRequest::InjectEndpointEvent { .. }
             | DaemonRequest::RunLocalInputTest { .. }
             | DaemonRequest::RunRemoteLatencyTest { .. }
+            | DaemonRequest::RunCrossDeviceTest { .. }
+            | DaemonRequest::StartCrossDeviceStress { .. }
+            | DaemonRequest::StopCrossDeviceStress
             | DaemonRequest::RunRemoteUsbDescriptorProbe { .. }
             | DaemonRequest::SetAudioDefaultOutput { .. }
             | DaemonRequest::SetAudioOutputVolume { .. }
@@ -8780,6 +8815,7 @@ async fn dispatch_ipc_request(
     audio_runtime: audio_runtime::AudioRuntimeHandle,
     usb_runtime: UsbHostRuntime,
     local_events_tx: broadcast::Sender<LocalInputDiagnosticEvent>,
+    cross_device_test: cross_device_test::CrossDeviceTestRuntime,
     layout_path: Arc<PathBuf>,
     layout_update_lock: Arc<Mutex<()>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -8866,6 +8902,16 @@ async fn dispatch_ipc_request(
                 .clone()
                 .context("文件传输服务未启动")?;
             DaemonResponse::FileTransfers(service.snapshots())
+        }
+        DaemonRequest::ApproveFileTransfer { transfer_id } => {
+            let service = state
+                .read()
+                .await
+                .file_transfers
+                .clone()
+                .context("文件传输服务未启动")?;
+            service.approve_incoming(transfer_id)?;
+            DaemonResponse::Ack
         }
         DaemonRequest::CancelFileTransfer { transfer_id } => {
             let service = state
@@ -8981,6 +9027,14 @@ async fn dispatch_ipc_request(
         DaemonRequest::ApprovePeer { approval_id } => {
             let manager = network_manager.lock().await;
             if manager.approve_peer(&approval_id).await {
+                DaemonResponse::Ack
+            } else {
+                DaemonResponse::Error("Unknown, expired, or already-used peer approval".to_string())
+            }
+        }
+        DaemonRequest::RejectPeer { approval_id } => {
+            let manager = network_manager.lock().await;
+            if manager.reject_peer(&approval_id).await {
                 DaemonResponse::Ack
             } else {
                 DaemonResponse::Error("Unknown, expired, or already-used peer approval".to_string())
@@ -9159,6 +9213,32 @@ async fn dispatch_ipc_request(
                 run_remote_latency_test(&network_manager, &state, &local_events_tx, device_id)
                     .await;
             DaemonResponse::LocalInputTest(result)
+        }
+        DaemonRequest::RunCrossDeviceTest { request } => {
+            let context = cross_device_test::RunContext {
+                network_manager: network_manager.clone(),
+                injection: inject_backend.clone(),
+                state: state.clone(),
+                local_events_tx: local_events_tx.clone(),
+            };
+            let report = cross_device_test.run_once(context, request).await?;
+            DaemonResponse::CrossDeviceTest(report)
+        }
+        DaemonRequest::StartCrossDeviceStress { request } => {
+            let context = cross_device_test::RunContext {
+                network_manager: network_manager.clone(),
+                injection: inject_backend.clone(),
+                state: state.clone(),
+                local_events_tx: local_events_tx.clone(),
+            };
+            let status = cross_device_test.start_stress(context, request).await?;
+            DaemonResponse::CrossDeviceTestStatus(status)
+        }
+        DaemonRequest::StopCrossDeviceStress => {
+            DaemonResponse::CrossDeviceTestStatus(cross_device_test.stop().await)
+        }
+        DaemonRequest::CrossDeviceTestStatus => {
+            DaemonResponse::CrossDeviceTestStatus(cross_device_test.status().await)
         }
         DaemonRequest::RunRemoteUsbDescriptorProbe { device_id, bus_id } => {
             let result = run_remote_usb_descriptor_probe(
@@ -13062,10 +13142,10 @@ mod tests {
     }
 
     #[test]
-    fn mobile_gateway_authorizes_query_or_bearer_token() {
+    fn mobile_gateway_authorizes_header_token_only() {
         let query_request =
             mobile_gateway::MobileHttpRequest::new("GET", "/mobile?t=mobile-secret", Vec::new());
-        assert!(mobile_gateway::is_authorized_mobile_request(
+        assert!(!mobile_gateway::is_authorized_mobile_request(
             &query_request,
             "mobile-secret"
         ));
@@ -13085,7 +13165,7 @@ mod tests {
             "/mobile?t=mobile%2Bsecret%2Ftoken%3D",
             Vec::new(),
         );
-        assert!(mobile_gateway::is_authorized_mobile_request(
+        assert!(!mobile_gateway::is_authorized_mobile_request(
             &encoded_query_request,
             "mobile+secret/token="
         ));
@@ -13219,6 +13299,7 @@ mod tests {
                 health: BackendHealth::Healthy,
                 elapsed_ms: 1,
                 loopback_event_id: Some(9),
+                observed_event: None,
                 error: None,
             },
         ));

@@ -255,6 +255,7 @@ mod linux_impl {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::Arc;
 
+            crate::linux::ensure_xlib_thread_support()?;
             let running = Arc::new(AtomicBool::new(true));
             let tx = self.tx.clone();
             let running_clone = running.clone();

@@ -5,9 +5,9 @@ use rshare_core::{file_transfer::*, ControlConnectionId, DeviceId};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     fs,
@@ -19,6 +19,14 @@ use tokio::{
 const MAX_ACTIVE: usize = 4;
 const HISTORY: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_GLOBAL_RESERVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_PEER_RESERVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PUBLISHED_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_PEER_PUBLISHED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_FREE_BYTES_AFTER_RESERVATION: u64 = 256 * 1024 * 1024;
+const MAX_PENDING_OFFERS: usize = 32;
+const MAX_PENDING_OFFERS_PER_PEER: usize = 4;
+const PENDING_OFFER_TTL: Duration = Duration::from_secs(30);
 
 pub trait FolderDropResolver: Send + Sync {
     fn resolve(
@@ -31,6 +39,7 @@ pub trait FolderDropResolver: Send + Sync {
 struct Job {
     snapshot: FileTransferSnapshot,
     generation: ControlConnectionId,
+    reserved_bytes: u64,
     inbox: mpsc::Sender<FileTransferPacket>,
     cancel: watch::Sender<Option<String>>,
 }
@@ -38,7 +47,19 @@ struct Job {
 #[derive(Default)]
 struct Jobs {
     active: HashMap<DeviceId, Job>,
+    pending: HashMap<DeviceId, PendingOffer>,
     history: VecDeque<FileTransferSnapshot>,
+    reserved_bytes: u64,
+    reserved_by_peer: HashMap<DeviceId, u64>,
+    published_bytes: u64,
+    published_by_peer: HashMap<DeviceId, u64>,
+}
+
+struct PendingOffer {
+    peer: RegisteredPeer,
+    packet: FileTransferPacket,
+    snapshot: FileTransferSnapshot,
+    expires_at: Instant,
 }
 
 pub struct FileTransferService {
@@ -70,6 +91,7 @@ impl FileTransferService {
         root: PathBuf,
         folder_resolver: Option<Arc<dyn FolderDropResolver>>,
     ) -> Arc<Self> {
+        let published_bytes = directory_bytes(&root);
         let (rejections, mut rx) = mpsc::channel::<(RegisteredPeer, FileTransferPacket)>(16);
         tokio::spawn(async move {
             while let Some((peer, packet)) = rx.recv().await {
@@ -83,16 +105,27 @@ impl FileTransferService {
         Arc::new(Self {
             registry,
             root,
-            jobs: Mutex::new(Jobs::default()),
+            jobs: Mutex::new(Jobs {
+                published_bytes,
+                ..Jobs::default()
+            }),
             rejections,
             folder_resolver,
         })
     }
 
     pub fn snapshots(&self) -> Vec<FileTransferSnapshot> {
-        let jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock().unwrap();
+        prune_pending(&mut jobs, Instant::now());
         let mut active: Vec<_> = jobs.active.values().map(|j| j.snapshot.clone()).collect();
         active.sort_by_key(|s| s.id);
+        let mut pending: Vec<_> = jobs
+            .pending
+            .values()
+            .map(|offer| offer.snapshot.clone())
+            .collect();
+        pending.sort_by_key(|s| s.id);
+        active.extend(pending);
         active.extend(jobs.history.iter().rev().cloned());
         active
     }
@@ -118,9 +151,29 @@ impl FileTransferService {
     }
 
     pub fn cancel(&self, id: DeviceId) -> Result<()> {
-        let jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock().unwrap();
+        prune_pending(&mut jobs, Instant::now());
         if let Some(job) = jobs.active.get(&id) {
             let _ = job.cancel.send(Some("用户取消传输".into()));
+            return Ok(());
+        }
+        if let Some(mut offer) = jobs.pending.remove(&id) {
+            let _ = self.rejections.try_send((
+                offer.peer.clone(),
+                FileTransferPacket {
+                    transfer_id: id,
+                    sequence: offer.packet.sequence,
+                    body: FileTransferBody::Cancel {
+                        reason: "本机用户拒绝文件接收".into(),
+                    },
+                },
+            ));
+            offer.snapshot.status = FileTransferStatus::Cancelled;
+            offer.snapshot.error = Some("本机用户拒绝文件接收".into());
+            jobs.history.push_back(offer.snapshot);
+            while jobs.history.len() > HISTORY {
+                jobs.history.pop_front();
+            }
             return Ok(());
         }
         if jobs.history.iter().any(|s| s.id == id) {
@@ -129,8 +182,70 @@ impl FileTransferService {
         bail!("传输不存在")
     }
 
+    /// Approve one visible incoming offer. The exact transfer ID is surfaced
+    /// through `snapshots`; no inbound offer is acknowledged before this call.
+    pub fn approve_incoming(self: &Arc<Self>, id: DeviceId) -> Result<()> {
+        let offer = {
+            let mut jobs = self.jobs.lock().unwrap();
+            prune_pending(&mut jobs, Instant::now());
+            jobs.pending.remove(&id)
+        }
+        .with_context(|| "待审批的文件传输不存在、已过期或已处理")?;
+
+        let total = offer.snapshot.total_bytes;
+        match self.register(id, offer.peer.clone(), true, total) {
+            Ok(session) => {
+                tokio::spawn(session.run(None, Some(offer.packet), None));
+                Ok(())
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                let _ = self.rejections.try_send((
+                    offer.peer,
+                    FileTransferPacket {
+                        transfer_id: id,
+                        sequence: 0,
+                        body: FileTransferBody::Cancel {
+                            reason: reason.clone(),
+                        },
+                    },
+                ));
+                let mut snapshot = offer.snapshot;
+                snapshot.status = FileTransferStatus::Failed;
+                snapshot.error = Some(reason.clone());
+                let mut jobs = self.jobs.lock().unwrap();
+                jobs.history.push_back(snapshot);
+                while jobs.history.len() > HISTORY {
+                    jobs.history.pop_front();
+                }
+                bail!(reason)
+            }
+        }
+    }
+
     pub fn disconnect(&self, peer: DeviceId, generation: ControlConnectionId) {
-        for job in self.jobs.lock().unwrap().active.values() {
+        let mut jobs = self.jobs.lock().unwrap();
+        prune_pending(&mut jobs, Instant::now());
+        let pending_ids: Vec<_> = jobs
+            .pending
+            .iter()
+            .filter(|(_, offer)| {
+                offer.peer.auth.peer_id == peer
+                    && offer.peer.auth.control_connection_id == generation
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in pending_ids {
+            if let Some(mut offer) = jobs.pending.remove(&id) {
+                offer.snapshot.status = FileTransferStatus::Cancelled;
+                offer.snapshot.error = Some("设备连接已断开，请重新拖入文件".into());
+                jobs.history.push_back(offer.snapshot);
+            }
+        }
+        while jobs.history.len() > HISTORY {
+            jobs.history.pop_front();
+        }
+        for job in jobs.active.values() {
             if job.snapshot.peer_id == peer && job.generation == generation {
                 let _ = job
                     .cancel
@@ -144,6 +259,7 @@ impl FileTransferService {
         id: DeviceId,
         peer: RegisteredPeer,
         incoming: bool,
+        reserved_bytes: u64,
     ) -> Result<Session> {
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.active.len() >= MAX_ACTIVE {
@@ -151,6 +267,54 @@ impl FileTransferService {
         }
         if jobs.active.contains_key(&id) || jobs.history.iter().any(|s| s.id == id) {
             bail!("重复的文件传输标识");
+        }
+        if incoming && reserved_bytes > 0 {
+            if reserved_bytes > MAX_PEER_RESERVED_BYTES
+                || jobs
+                    .reserved_by_peer
+                    .get(&peer.auth.peer_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_add(reserved_bytes)
+                    > MAX_PEER_RESERVED_BYTES
+            {
+                bail!("该设备的文件暂存配额已用尽");
+            }
+            if jobs.reserved_bytes.saturating_add(reserved_bytes) > MAX_GLOBAL_RESERVED_BYTES {
+                bail!("文件暂存总配额已用尽");
+            }
+            if jobs
+                .published_bytes
+                .saturating_add(jobs.reserved_bytes)
+                .saturating_add(reserved_bytes)
+                > MAX_PUBLISHED_BYTES
+            {
+                bail!("文件接收目录配额已用尽");
+            }
+            if jobs
+                .published_by_peer
+                .get(&peer.auth.peer_id)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(
+                    jobs.reserved_by_peer
+                        .get(&peer.auth.peer_id)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .saturating_add(reserved_bytes)
+                > MAX_PEER_PUBLISHED_BYTES
+            {
+                bail!("该设备的文件接收配额已用尽");
+            }
+            if !available_space(&self.root).is_some_and(|free| {
+                free >= reserved_bytes.saturating_add(MIN_FREE_BYTES_AFTER_RESERVATION)
+            }) {
+                bail!("磁盘剩余空间不足，拒绝文件接收");
+            }
+            jobs.reserved_bytes = jobs.reserved_bytes.saturating_add(reserved_bytes);
+            let reserved = jobs.reserved_by_peer.entry(peer.auth.peer_id).or_default();
+            *reserved = reserved.saturating_add(reserved_bytes);
         }
         let (tx, inbox) = mpsc::channel(4);
         let (cancel_tx, cancel) = watch::channel(None);
@@ -170,6 +334,7 @@ impl FileTransferService {
                     error: None,
                 },
                 generation: peer.auth.control_connection_id,
+                reserved_bytes,
                 inbox: tx,
                 cancel: cancel_tx.clone(),
             },
@@ -218,7 +383,7 @@ impl FileTransferService {
             bail!("远端不支持文件夹跨屏拖拽，请更新远端或检查平台支持");
         }
         let id = DeviceId::new_v4();
-        let session = self.register(id, peer, false)?;
+        let session = self.register(id, peer, false, 0)?;
         let snapshot = self.jobs.lock().unwrap().active[&id].snapshot.clone();
         tokio::spawn(session.run(Some(paths), None, drop));
         Ok(snapshot)
@@ -242,7 +407,7 @@ impl FileTransferService {
         if let FileTransferBody::Offer { entries }
         | FileTransferBody::OfferToFolder { entries, .. } = &packet.body
         {
-            let result = validate_manifest(entries).and_then(|_| {
+            let result = validate_manifest(entries).and_then(|total| {
                 if matches!(&packet.body, FileTransferBody::OfferToFolder { .. })
                     && (peer.folder_drop_version != 1 || self.folder_resolver.is_none())
                 {
@@ -251,12 +416,10 @@ impl FileTransferService {
                 if packet.sequence != 0 {
                     bail!("无效的文件传输起始序号");
                 }
-                self.register(packet.transfer_id, peer.clone(), true)
+                self.queue_pending_offer(packet.transfer_id, peer.clone(), packet.clone(), total)
             });
             match result {
-                Ok(session) => {
-                    tokio::spawn(session.run(None, Some(packet), None));
-                }
+                Ok(()) => {}
                 Err(error) => {
                     // Reject without retaining another unbounded transfer worker.
                     // The peer will also time out if a saturated lane cannot send.
@@ -271,6 +434,26 @@ impl FileTransferService {
                 }
             }
             return;
+        }
+        if let FileTransferBody::Cancel { reason } = &packet.body {
+            let mut jobs = self.jobs.lock().unwrap();
+            let pending_matches = jobs.pending.get(&packet.transfer_id).is_some_and(|offer| {
+                offer.peer.auth.peer_id == peer_id
+                    && offer.peer.auth.control_connection_id == generation
+            });
+            if pending_matches {
+                let mut offer = jobs.pending.remove(&packet.transfer_id).unwrap();
+                offer.snapshot.status = FileTransferStatus::Cancelled;
+                offer.snapshot.error = Some(format!(
+                    "远端取消：{}",
+                    reason.chars().take(240).collect::<String>()
+                ));
+                jobs.history.push_back(offer.snapshot);
+                while jobs.history.len() > HISTORY {
+                    jobs.history.pop_front();
+                }
+                return;
+            }
         }
         let jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs
@@ -295,17 +478,96 @@ impl FileTransferService {
         }
     }
 
+    fn queue_pending_offer(
+        &self,
+        id: DeviceId,
+        peer: RegisteredPeer,
+        packet: FileTransferPacket,
+        total: u64,
+    ) -> Result<()> {
+        let mut jobs = self.jobs.lock().unwrap();
+        prune_pending(&mut jobs, Instant::now());
+        if jobs.active.contains_key(&id)
+            || jobs.pending.contains_key(&id)
+            || jobs.history.iter().any(|s| s.id == id)
+        {
+            bail!("重复的文件传输标识");
+        }
+        if jobs.pending.len() >= MAX_PENDING_OFFERS {
+            bail!("待审批的文件传输过多，请稍后重试");
+        }
+        let peer_pending = jobs
+            .pending
+            .values()
+            .filter(|offer| offer.peer.auth.peer_id == peer.auth.peer_id)
+            .count();
+        if peer_pending >= MAX_PENDING_OFFERS_PER_PEER {
+            bail!("该设备的待审批文件传输过多");
+        }
+        let (entries, entry_count) = match &packet.body {
+            FileTransferBody::Offer { entries }
+            | FileTransferBody::OfferToFolder { entries, .. } => {
+                (entries.iter().take(8).cloned().collect(), entries.len())
+            }
+            _ => unreachable!("queue_pending_offer only accepts file offers"),
+        };
+        jobs.pending.insert(
+            id,
+            PendingOffer {
+                peer: peer.clone(),
+                packet,
+                snapshot: FileTransferSnapshot {
+                    id,
+                    peer_id: peer.auth.peer_id,
+                    incoming: true,
+                    status: FileTransferStatus::Waiting,
+                    entries,
+                    entry_count,
+                    total_bytes: total,
+                    transferred_bytes: 0,
+                    destination: None,
+                    error: None,
+                },
+                expires_at: Instant::now() + PENDING_OFFER_TTL,
+            },
+        );
+        Ok(())
+    }
+
     fn finish(&self, id: DeviceId, status: FileTransferStatus, error: Option<String>) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(mut job) = jobs.active.remove(&id) {
+            if job.reserved_bytes > 0 {
+                jobs.reserved_bytes = jobs.reserved_bytes.saturating_sub(job.reserved_bytes);
+                if let Some(reserved) = jobs.reserved_by_peer.get_mut(&job.snapshot.peer_id) {
+                    *reserved = reserved.saturating_sub(job.reserved_bytes);
+                    if *reserved == 0 {
+                        jobs.reserved_by_peer.remove(&job.snapshot.peer_id);
+                    }
+                }
+            }
             job.snapshot.status = status;
             job.snapshot.error = error;
+            if status == FileTransferStatus::Completed && job.snapshot.incoming {
+                jobs.published_bytes = jobs
+                    .published_bytes
+                    .saturating_add(job.snapshot.total_bytes);
+                let published = jobs
+                    .published_by_peer
+                    .entry(job.snapshot.peer_id)
+                    .or_default();
+                *published = published.saturating_add(job.snapshot.total_bytes);
+            }
             jobs.history.push_back(job.snapshot);
             while jobs.history.len() > HISTORY {
                 jobs.history.pop_front();
             }
         }
     }
+}
+
+fn prune_pending(jobs: &mut Jobs, now: Instant) {
+    jobs.pending.retain(|_, offer| offer.expires_at > now);
 }
 
 impl Session {
@@ -656,6 +918,74 @@ async fn wait_for_cancel(mut receiver: watch::Receiver<Option<String>>) -> Strin
             return "文件传输服务关闭".into();
         }
     }
+}
+
+fn available_space(path: &Path) -> Option<u64> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+        let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: statvfs initializes the caller-provided struct on success.
+        let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        let stats = unsafe { stats.assume_init() };
+        Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide_path: Vec<u16> = probe.as_os_str().encode_wide().chain(once(0)).collect();
+        let mut available = 0_u64;
+        let mut total = 0_u64;
+        let mut free = 0_u64;
+        // SAFETY: The path is NUL-terminated and all output pointers refer to
+        // initialized stack storage owned by this call.
+        let result = unsafe {
+            GetDiskFreeSpaceExW(wide_path.as_ptr(), &mut available, &mut total, &mut free)
+        };
+        (result != 0).then_some(available)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = probe;
+        None
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return 0;
+            };
+            if metadata.file_type().is_symlink() {
+                return 0;
+            }
+            if metadata.is_dir() {
+                directory_bytes(&path)
+            } else {
+                metadata.len()
+            }
+        })
+        .fold(0_u64, u64::saturating_add)
 }
 
 async fn publish_folder_contents(

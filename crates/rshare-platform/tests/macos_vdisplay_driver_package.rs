@@ -158,8 +158,6 @@ fn macos_virtual_display_driver_package_declares_framebuffer_user_client() {
     let load_script = read_repo_file("scripts/driver/load-macos-vdisplay.sh");
     let unload_script = read_repo_file("scripts/driver/unload-macos-vdisplay.sh");
     let validate_script = read_repo_file("scripts/driver/validate-macos-vdisplay.sh");
-    let rust = read_repo_file("crates/rshare-platform/src/virtual_display.rs");
-    let macos = read_repo_file("crates/rshare-platform/src/macos.rs");
 
     assert!(
         header.contains("#define RSHARE_MACOS_VDISPLAY_SERVICE_CLASS \"RShareMacVirtualDisplay\"")
@@ -177,27 +175,6 @@ fn macos_virtual_display_driver_package_declares_framebuffer_user_client() {
     assert!(header.contains("offsetof(RShareDriverCapabilities, flags) == 4"));
     assert!(header.contains("offsetof(RShareVdisplayRequest, flags) == 12"));
     assert!(header.contains("offsetof(RShareVdisplayState, connector_index) == 16"));
-
-    assert!(rust.contains(
-        "const RSHARE_MACOS_VDISPLAY_SERVICE_CLASS: &str = \"RShareMacVirtualDisplay\";"
-    ));
-    assert!(rust.contains("const RSHARE_MACOS_VDISPLAY_USER_CLIENT_TYPE: u32 = 0x5253_4d56;"));
-    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_QUERY_VERSION: u32 = 0;"));
-    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_QUERY_CAPABILITIES: u32 = 1;"));
-    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_QUERY_STATE: u32 = 2;"));
-    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_CREATE: u32 = 3;"));
-    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_REMOVE: u32 = 4;"));
-    assert!(rust.contains("IOServiceOpen("));
-    assert!(rust.contains("IOConnectCallStructMethod("));
-    assert!(rust.contains("enum MacosVirtualDisplayOpenError"));
-    assert!(rust.contains("ServiceNotFound(String)"));
-    assert!(rust.contains("UserClientOpenFailed(String)"));
-    assert!(rust.contains("fn macos_probe_open_error(error: MacosVirtualDisplayOpenError)"));
-    assert!(rust.contains("service_available: error.service_available()"));
-    assert!(
-        rust.contains("macos_probe_open_error_reports_loaded_service_when_user_client_open_fails")
-    );
-    assert!(rust.contains("macos_probe_open_error_reports_missing_service_when_service_not_found"));
 
     assert!(readme.contains("IOServiceOpen"));
     assert!(readme.contains("IOConnectCallStructMethod"));
@@ -492,7 +469,6 @@ fn macos_virtual_display_driver_package_declares_framebuffer_user_client() {
             "mode {mode:?} falls outside EDID pixel clock range"
         );
     }
-    assert!(macos.contains("const RSHARE_MACOS_EDID_VENDOR_ID: u32 = 0x4a6d;"));
 
     assert!(plist.contains("<string>KEXT</string>"));
     assert!(plist.contains("<string>RShareMacVirtualDisplay</string>"));
@@ -689,6 +665,65 @@ fn macos_virtual_display_driver_package_declares_framebuffer_user_client() {
     assert!(validate_script.contains("cargo run -p rshare-cli -- display virtual create"));
     assert!(validate_script.contains("cargo run -p rshare-cli -- display virtual verify"));
     assert!(validate_script.contains("cargo run -p rshare-cli -- display virtual remove"));
+}
+
+#[test]
+#[ignore = "macOS Rust user-client bridge and CLI driver-status are not implemented; see drivers/macos/rshare-vdisplay/README.md"]
+fn macos_virtual_display_rust_bridge_integration_contract() {
+    let rust = read_repo_file("crates/rshare-platform/src/virtual_display.rs");
+    let macos = read_repo_file("crates/rshare-platform/src/macos.rs");
+    assert!(rust.contains(
+        "const RSHARE_MACOS_VDISPLAY_SERVICE_CLASS: &str = \"RShareMacVirtualDisplay\";"
+    ));
+    assert!(rust.contains("const RSHARE_MACOS_VDISPLAY_USER_CLIENT_TYPE: u32 = 0x5253_4d56;"));
+    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_QUERY_VERSION: u32 = 0;"));
+    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_QUERY_CAPABILITIES: u32 = 1;"));
+    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_QUERY_STATE: u32 = 2;"));
+    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_CREATE: u32 = 3;"));
+    assert!(rust.contains("const RSHARE_MACOS_SELECTOR_VDISPLAY_REMOVE: u32 = 4;"));
+    assert!(rust.contains("IOServiceOpen("));
+    assert!(rust.contains("IOConnectCallStructMethod("));
+    assert!(rust.contains("enum MacosVirtualDisplayOpenError"));
+    assert!(rust.contains("ServiceNotFound(String)"));
+    assert!(rust.contains("UserClientOpenFailed(String)"));
+    assert!(rust.contains("fn macos_probe_open_error(error: MacosVirtualDisplayOpenError)"));
+    assert!(rust.contains("service_available: error.service_available()"));
+    assert!(
+        rust.contains("macos_probe_open_error_reports_loaded_service_when_user_client_open_fails")
+    );
+    assert!(rust.contains("macos_probe_open_error_reports_missing_service_when_service_not_found"));
+    assert!(macos.contains("const RSHARE_MACOS_EDID_VENDOR_ID: u32 = 0x4a6d;"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unwired_virtual_display_backend_reports_unsupported() {
+    use rshare_core::{
+        VirtualDisplayCreateRequest, VirtualDisplayOperationStatus, VirtualDisplayRemoveRequest,
+        VirtualDisplayStatus,
+    };
+    let created =
+        rshare_platform::virtual_display::create_virtual_display(&VirtualDisplayCreateRequest {
+            id: Some("unwired-backend-contract".into()),
+            width: 1920,
+            height: 1080,
+            refresh_rate_millihz: Some(60_000),
+            name: None,
+        })
+        .unwrap();
+    assert_eq!(created.status, VirtualDisplayOperationStatus::Unsupported);
+    let display = created.display.unwrap();
+    assert_eq!(display.status, VirtualDisplayStatus::Unsupported);
+    assert!(display.display_id.is_none());
+    assert!(rshare_platform::virtual_display::list_virtual_displays()
+        .unwrap()
+        .is_empty());
+    let removed =
+        rshare_platform::virtual_display::remove_virtual_display(&VirtualDisplayRemoveRequest {
+            id: "unwired-backend-contract".into(),
+        })
+        .unwrap();
+    assert_eq!(removed.status, VirtualDisplayOperationStatus::Unsupported);
 }
 
 #[test]

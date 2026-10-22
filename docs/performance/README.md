@@ -19,6 +19,14 @@ above 10% makes the whole batch unstable. One complete identical five-run retry
 is allowed; both batches are preserved, individual runs are never replaced, and
 a second unstable batch fails as infrastructure instability.
 
+The hosted catastrophe workflow invokes the QUIC command with
+`--validation-profile hosted-catastrophe`. This explicit profile keeps the
+complete `available` artifact and applies the workflow's absolute delivery,
+queue, and p99 ceilings even when a shared hosted runner reports
+`unstable_after_one_complete_retry`. It does not change the fixed-runner CV
+policy: the default profile still fails that result, and `unsupported` or
+`not_run` artifacts never pass.
+
 The declared QUIC matrix is 125 Hz for 10 seconds, 500 Hz for 10 seconds,
 1000 Hz for 60 seconds, 1000 Hz for 60 seconds under diagnostics/status/audio/
 bulk load, slow/fast peer isolation, and recovery from an exact 100 ms stall.

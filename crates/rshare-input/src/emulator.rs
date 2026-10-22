@@ -104,6 +104,8 @@ pub struct EnigoInputEmulator {
 impl EnigoInputEmulator {
     /// Create a new enigo-based input emulator
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        rshare_platform::linux::ensure_xlib_thread_support()?;
         let enigo = Enigo::new(&enigo::Settings::default())
             .map_err(|e| anyhow::anyhow!("Failed to create enigo: {:?}", e))?;
 
