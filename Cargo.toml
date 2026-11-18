@@ -58,7 +58,7 @@ arboard = "3.6.1"
 # Configuration
 config = "0.15"
 directories = "5.0"
-toml = "0.8"
+toml = "1.1"
 
 # Utils
 uuid = { version = "1.15", features = ["v4", "serde"] }
