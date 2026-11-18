@@ -695,7 +695,7 @@ fn macos_virtual_display_rust_bridge_integration_contract() {
     assert!(macos.contains("const RSHARE_MACOS_EDID_VENDOR_ID: u32 = 0x4a6d;"));
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[test]
 fn unwired_virtual_display_backend_reports_unsupported() {
     use rshare_core::{

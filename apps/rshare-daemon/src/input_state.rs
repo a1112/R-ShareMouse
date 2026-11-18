@@ -141,7 +141,13 @@ pub fn input_state_channel(capacity: usize) -> (InputStatePublisher, InputStateF
 
 impl InputStatePublisher {
     pub fn publish_pointer(&self, pointer: InputPointerProjection) {
-        self.pointer_tx.send_replace(Some(pointer));
+        self.pointer_tx.send_if_modified(|current| {
+            if *current == Some(pointer) {
+                return false;
+            }
+            *current = Some(pointer);
+            true
+        });
     }
 
     pub fn publish_gamepads(&self, gamepads: Vec<LocalGamepadState>) {
@@ -376,6 +382,34 @@ impl ControlMetrics {
 mod tests {
     use super::*;
     use rshare_core::{GamepadButtonState, GamepadState};
+
+    #[test]
+    fn pointer_watch_notifies_only_when_position_or_session_changes() {
+        let (publisher, mut feeds) = input_state_channel(4);
+        let pointer = InputPointerProjection {
+            session_epoch: SessionEpoch(1),
+            x: 10,
+            y: -20,
+        };
+        publisher.publish_pointer(pointer);
+        assert_eq!(*feeds.pointer_rx.borrow_and_update(), Some(pointer));
+
+        for _ in 0..1_000 {
+            publisher.publish_pointer(pointer);
+        }
+        assert!(!feeds.pointer_rx.has_changed().unwrap());
+
+        let moved = InputPointerProjection { x: 11, ..pointer };
+        let next_session = InputPointerProjection {
+            session_epoch: SessionEpoch(2),
+            ..moved
+        };
+        for changed in [moved, next_session] {
+            publisher.publish_pointer(changed);
+            assert!(feeds.pointer_rx.has_changed().unwrap());
+            assert_eq!(*feeds.pointer_rx.borrow_and_update(), Some(changed));
+        }
+    }
 
     #[test]
     fn authoritative_gamepad_projection_is_atomic_with_pressed_truth_and_matches_latest_watch() {

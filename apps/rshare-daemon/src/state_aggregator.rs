@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::pending;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7,11 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
 use rshare_core::{
-    ButtonState, CapabilityRegistrySnapshot, DaemonDeviceSnapshot, DeviceId, KeyState,
-    LatencyFeedbackSnapshot, LayoutGraph, LocalDisplayState, LocalGamepadState,
-    ServiceStatusSnapshot, UiActiveSessions, UiChange, UiCursor, UiDelta, UiDiscreteInputState,
-    UiEnvelope, UiMediaSession, UiPointerState, UiResyncReason, UiRevisionSequencer, UiSnapshot,
-    UiView, UI_STATE_PROTOCOL_VERSION,
+    ButtonState, CapabilityRegistrySnapshot, ControlSessionState, DaemonDeviceSnapshot, DeviceId,
+    KeyState, LatencyFeedbackSnapshot, LayoutGraph, LocalControlDeviceSnapshot, LocalDisplayState,
+    LocalGamepadState, ServiceStatusSnapshot, UiActiveSessions, UiChange, UiCursor, UiDelta,
+    UiDiscreteInputState, UiEnvelope, UiMediaSession, UiPointerState, UiResyncReason,
+    UiRevisionSequencer, UiSnapshot, UiView, UI_STATE_PROTOCOL_VERSION,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -69,7 +69,7 @@ enum AggregatorCommand {
         response: oneshot::Sender<StateSubscriber>,
     },
     RecoverLag {
-        response: oneshot::Sender<(broadcast::Receiver<UiEnvelope>, Arc<UiSnapshot>)>,
+        response: oneshot::Sender<(broadcast::Receiver<UiEnvelope>, UiSnapshot)>,
     },
     Reconcile {
         response: oneshot::Sender<std::result::Result<(), String>>,
@@ -325,6 +325,38 @@ impl StateAggregatorHandle {
         self.published.borrow().materialize()
     }
 
+    pub fn latest_control_session(&self) -> Option<ControlSessionState> {
+        self.published.borrow().base.active_sessions.control.clone()
+    }
+
+    pub fn overlay_local_controls(&self, controls: &mut LocalControlDeviceSnapshot) {
+        // Keep the reliable fields and realtime overlays on the same published revision.
+        let published = self.published.borrow().clone();
+        if let Some(pointer) = &published.pointer {
+            controls.mouse.x = pointer.x;
+            controls.mouse.y = pointer.y;
+            controls
+                .mouse
+                .current_display_id
+                .clone_from(&pointer.display_id);
+        }
+        let dynamic = &published.base.dynamic_state;
+        controls.keyboard.pressed_keys = dynamic
+            .pressed_keys
+            .iter()
+            .map(|keycode| format!("{:?}", rshare_input::KeyCode::Raw(*keycode)))
+            .collect();
+        controls.mouse.pressed_buttons = dynamic
+            .pressed_mouse_buttons
+            .iter()
+            .map(|button| format!("{button:?}"))
+            .collect();
+        controls.gamepads.clone_from(&published.gamepads);
+        controls
+            .display
+            .clone_from(&published.base.display_inventory);
+    }
+
     pub fn heartbeat(&self, sent_at_ms: u64) -> UiEnvelope {
         let cursor = self.published.borrow().cursor;
         UiEnvelope::Heartbeat {
@@ -385,11 +417,11 @@ impl StateSubscriber {
                     .await
                     .context("UI state aggregator stopped during lag recovery")?;
                 self.live = live;
-                self.pending
-                    .push_back(UiEnvelope::Snapshot((*snapshot).clone()));
+                let cursor = snapshot.cursor();
+                self.pending.push_back(UiEnvelope::Snapshot(snapshot));
                 Ok(UiEnvelope::ResyncRequired {
-                    boot_id: snapshot.boot_id,
-                    current_revision: snapshot.revision,
+                    boot_id: cursor.boot_id,
+                    current_revision: cursor.revision,
                     reason: UiResyncReason::RevisionGap,
                 })
             }
@@ -534,38 +566,36 @@ impl AggregatorActor {
         match command {
             AggregatorCommand::Subscribe { cursor, response } => {
                 let live = self.envelopes.subscribe();
-                let snapshot = self.view.snapshot().clone();
+                let snapshot = self.view.snapshot();
                 let mut pending = VecDeque::new();
                 match cursor {
-                    None => pending.push_back(UiEnvelope::Snapshot(snapshot)),
+                    None => pending.push_back(UiEnvelope::Snapshot(snapshot.clone())),
                     Some(cursor) if cursor.boot_id != snapshot.boot_id => {
-                        push_resync_snapshot(&mut pending, &snapshot, UiResyncReason::BootChanged);
+                        push_resync_snapshot(&mut pending, snapshot, UiResyncReason::BootChanged);
                     }
                     Some(cursor) if cursor.revision > snapshot.revision => {
-                        push_resync_snapshot(&mut pending, &snapshot, UiResyncReason::RevisionGap);
+                        push_resync_snapshot(&mut pending, snapshot, UiResyncReason::RevisionGap);
                     }
                     Some(cursor) if cursor.revision == snapshot.revision => {}
                     Some(cursor) => {
                         let expected = cursor.revision.saturating_add(1);
-                        let replay = self
+                        let start = self
                             .replay
-                            .iter()
-                            .filter(|delta| delta.revision >= expected)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let contiguous = replay
-                            .iter()
-                            .enumerate()
-                            .all(|(offset, delta)| delta.revision == expected + offset as u64)
-                            && replay
-                                .last()
-                                .is_some_and(|delta| delta.revision == snapshot.revision);
+                            .partition_point(|delta| delta.revision < expected);
+                        let replay = self.replay.range(start..);
+                        let contiguous =
+                            self.replay
+                                .back()
+                                .is_some_and(|delta| delta.revision == snapshot.revision)
+                                && replay.clone().enumerate().all(|(offset, delta)| {
+                                    delta.revision == expected + offset as u64
+                                });
                         if contiguous {
-                            pending.extend(replay.into_iter().map(UiEnvelope::Delta));
+                            pending.extend(replay.cloned().map(UiEnvelope::Delta));
                         } else {
                             push_resync_snapshot(
                                 &mut pending,
-                                &snapshot,
+                                snapshot,
                                 UiResyncReason::HistoryExpired,
                             );
                         }
@@ -579,7 +609,7 @@ impl AggregatorActor {
             }
             AggregatorCommand::RecoverLag { response } => {
                 let live = self.envelopes.subscribe();
-                let snapshot = Arc::new(self.view.snapshot().clone());
+                let snapshot = self.view.snapshot().clone();
                 let _ = response.send((live, snapshot));
             }
             AggregatorCommand::Reconcile { response } => {
@@ -732,92 +762,56 @@ impl AggregatorActor {
 
     async fn reconcile_from_authoritative_projection(&mut self) -> Result<()> {
         let (mut snapshot, input_cut_generation) = self.project_authoritative_snapshot().await?;
+        let current = self.view.snapshot();
         if pointer_identity_eq(
             snapshot.dynamic_state.pointer.as_ref(),
-            self.view.snapshot().dynamic_state.pointer.as_ref(),
+            current.dynamic_state.pointer.as_ref(),
         ) {
-            snapshot.dynamic_state.pointer = self.view.snapshot().dynamic_state.pointer.clone();
+            snapshot
+                .dynamic_state
+                .pointer
+                .clone_from(&current.dynamic_state.pointer);
         }
-        if capabilities_semantically_eq(&snapshot.capabilities, &self.view.snapshot().capabilities)
-        {
-            snapshot.capabilities.generated_at_ms =
-                self.view.snapshot().capabilities.generated_at_ms;
+        if capabilities_semantically_eq(&snapshot.capabilities, &current.capabilities) {
+            snapshot.capabilities.generated_at_ms = current.capabilities.generated_at_ms;
         }
         if latency_feedback_semantically_eq(
             &snapshot.status.latency_feedback,
-            &self.view.snapshot().status.latency_feedback,
+            &current.status.latency_feedback,
         ) {
             snapshot.status.latency_feedback.generated_at_ms =
-                self.view.snapshot().status.latency_feedback.generated_at_ms;
-            snapshot.dynamic_state.diagnostics.generated_at_ms = self
-                .view
-                .snapshot()
-                .dynamic_state
-                .diagnostics
-                .generated_at_ms;
+                current.status.latency_feedback.generated_at_ms;
+            snapshot.dynamic_state.diagnostics.generated_at_ms =
+                current.dynamic_state.diagnostics.generated_at_ms;
         }
-        for projected in &mut snapshot.devices {
-            if let Some(current) = self
-                .view
-                .snapshot()
-                .devices
-                .iter()
-                .find(|current| current.id == projected.id)
-            {
-                if devices_semantically_eq_ignoring_last_seen(projected, current) {
-                    projected.last_seen_secs = current.last_seen_secs;
-                }
-            }
-        }
-        snapshot = UiView::from_snapshot(snapshot)
-            .context("authoritative UI projection is invalid")?
-            .snapshot()
-            .clone();
+        let projected_view =
+            UiView::from_snapshot(snapshot).context("authoritative UI projection is invalid")?;
+        let snapshot = projected_view.snapshot();
 
-        let current = self.view.snapshot().clone();
         if current.status != snapshot.status {
             self.emit_reliable(UiChange::Status(snapshot.status.clone()))?;
         }
-        if current.capabilities != snapshot.capabilities {
+        if self.view.snapshot().capabilities != snapshot.capabilities {
             self.emit_reliable(UiChange::Capabilities(snapshot.capabilities.clone()))?;
         }
 
-        let mut removed = current
-            .devices
-            .iter()
-            .filter(|device| {
-                !snapshot
-                    .devices
-                    .iter()
-                    .any(|candidate| candidate.id == device.id)
-            })
-            .map(|device| device.id)
-            .collect::<Vec<_>>();
-        removed.sort();
+        let (removed, upserts) = diff_by_id(
+            &self.view.snapshot().devices,
+            &snapshot.devices,
+            |device| device.id,
+            devices_semantically_eq_ignoring_last_seen,
+        );
         for device_id in removed {
             self.emit_reliable(UiChange::DeviceRemove(device_id))?;
         }
-        let mut upserts = snapshot
-            .devices
-            .iter()
-            .filter(|device| {
-                current
-                    .devices
-                    .iter()
-                    .find(|candidate| candidate.id == device.id)
-                    != Some(*device)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        upserts.sort_by_key(|device| device.id);
         for device in upserts {
-            self.emit_reliable(UiChange::DeviceUpsert(device))?;
+            self.emit_reliable(UiChange::DeviceUpsert(device.clone()))?;
         }
 
-        if current.layout != snapshot.layout {
+        if self.view.snapshot().layout != snapshot.layout {
             self.emit_reliable(UiChange::Topology(snapshot.layout.clone()))?;
         }
-        if current.display_inventory != snapshot.display_inventory {
+        if self.view.snapshot().display_inventory != snapshot.display_inventory {
             self.emit_reliable(UiChange::DisplayInventory(
                 snapshot.display_inventory.clone(),
             ))?;
@@ -836,12 +830,12 @@ impl AggregatorActor {
         ) {
             self.emit_reliable(UiChange::KeyButton(change))?;
         }
-        if current.dynamic_state.pointer != snapshot.dynamic_state.pointer {
+        if self.view.snapshot().dynamic_state.pointer != snapshot.dynamic_state.pointer {
             if let Some(pointer) = snapshot.dynamic_state.pointer.clone() {
                 self.emit_realtime(UiChange::Pointer(pointer))?;
             }
         }
-        if current.dynamic_state.gamepads != snapshot.dynamic_state.gamepads {
+        if self.view.snapshot().dynamic_state.gamepads != snapshot.dynamic_state.gamepads {
             self.emit_realtime(UiChange::Gamepads(snapshot.dynamic_state.gamepads.clone()))?;
         }
         if self.view.snapshot().dynamic_state.diagnostics != snapshot.dynamic_state.diagnostics {
@@ -849,43 +843,20 @@ impl AggregatorActor {
                 snapshot.dynamic_state.diagnostics.clone(),
             ))?;
         }
-        if current.active_sessions.control != snapshot.active_sessions.control {
+        if self.view.snapshot().active_sessions.control != snapshot.active_sessions.control {
             self.emit_reliable(UiChange::Session(snapshot.active_sessions.clone()))?;
         } else {
-            let mut removed_sessions = current
-                .active_sessions
-                .media_sessions
-                .iter()
-                .filter(|session| {
-                    !snapshot
-                        .active_sessions
-                        .media_sessions
-                        .iter()
-                        .any(|candidate| candidate.session_id == session.session_id)
-                })
-                .map(|session| session.session_id)
-                .collect::<Vec<_>>();
-            removed_sessions.sort();
+            let (removed_sessions, media_upserts) = diff_by_id(
+                &self.view.snapshot().active_sessions.media_sessions,
+                &snapshot.active_sessions.media_sessions,
+                |session| session.session_id,
+                UiMediaSession::eq,
+            );
             for session_id in removed_sessions {
                 self.emit_reliable(UiChange::MediaSessionRemove(session_id))?;
             }
-            let mut media_upserts = snapshot
-                .active_sessions
-                .media_sessions
-                .iter()
-                .filter(|session| {
-                    current
-                        .active_sessions
-                        .media_sessions
-                        .iter()
-                        .find(|candidate| candidate.session_id == session.session_id)
-                        != Some(*session)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            media_upserts.sort_by_key(|session| session.session_id);
             for session in media_upserts {
-                self.emit_reliable(UiChange::MediaSessionUpsert(session))?;
+                self.emit_reliable(UiChange::MediaSessionUpsert(session.clone()))?;
             }
         }
         self.input_cut_generation = input_cut_generation;
@@ -918,6 +889,29 @@ impl AggregatorActor {
         snapshot.revision = self.sequencer.revision();
         Ok((snapshot, input_cut_generation))
     }
+}
+
+/// Both input lists have validated, unique IDs. Only changed entries need sorting for replay.
+fn diff_by_id<'a, T>(
+    current: &[T],
+    projected: &'a [T],
+    id: impl Fn(&T) -> DeviceId,
+    equivalent: impl Fn(&T, &T) -> bool,
+) -> (Vec<DeviceId>, Vec<&'a T>) {
+    let mut remaining: HashMap<_, _> = current.iter().map(|item| (id(item), item)).collect();
+    let mut upserts = Vec::new();
+    for item in projected {
+        if remaining
+            .remove(&id(item))
+            .is_none_or(|old| !equivalent(old, item))
+        {
+            upserts.push(item);
+        }
+    }
+    let mut removed = remaining.into_keys().collect::<Vec<_>>();
+    removed.sort_unstable();
+    upserts.sort_unstable_by_key(|item| id(item));
+    (removed, upserts)
 }
 
 fn pointer_identity_eq(left: Option<&UiPointerState>, right: Option<&UiPointerState>) -> bool {
@@ -2413,6 +2407,61 @@ mod tests {
                 .is_err(),
             "volatile generated-at/last-seen fields must not create no-op deltas"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_emits_sorted_device_and_media_changes_when_lists_are_reordered() {
+        let session = |index| UiMediaSession {
+            session_id: DeviceId::from_u128(index),
+            peer_id: DeviceId::from_u128(99),
+            display_id: None,
+            state: rshare_core::UiMediaSessionState::Starting,
+        };
+        let mut initial = fixture_snapshot();
+        initial.devices = [4, 2, 3, 1].map(device).into();
+        initial.active_sessions.media_sessions = [7, 6, 5].map(session).into();
+        let mut projected = initial.clone();
+        let mut renamed = device(4);
+        renamed.name = "renamed".into();
+        renamed.last_seen_secs = Some(90);
+        let mut seen = device(2);
+        seen.last_seen_secs = Some(80);
+        projected.devices = vec![device(9), renamed.clone(), seen];
+        let mut streaming = session(7);
+        streaming.state = rshare_core::UiMediaSessionState::Streaming;
+        projected.active_sessions.media_sessions = vec![session(8), streaming.clone()];
+
+        let (_input, feeds) = input_state_channel(4);
+        let aggregator = StateAggregator::with_projection(
+            initial,
+            16,
+            feeds,
+            Arc::new(FixtureProjection {
+                snapshot: projected,
+            }),
+        );
+        let mut subscriber = aggregator.subscribe(None).await.unwrap();
+        let _ = subscriber.recv().await.unwrap();
+        aggregator.reconcile_from_projection().await.unwrap();
+
+        let expected = [
+            UiChange::DeviceRemove(device(1).id),
+            UiChange::DeviceRemove(device(3).id),
+            UiChange::DeviceUpsert(renamed),
+            UiChange::DeviceUpsert(device(9)),
+            UiChange::MediaSessionRemove(session(5).session_id),
+            UiChange::MediaSessionRemove(session(6).session_id),
+            UiChange::MediaSessionUpsert(streaming),
+            UiChange::MediaSessionUpsert(session(8)),
+        ];
+        assert_eq!(aggregator.reliable_history_len(), expected.len());
+        for (index, change) in expected.into_iter().enumerate() {
+            let UiEnvelope::Delta(delta) = subscriber.recv().await.unwrap() else {
+                panic!("expected a live delta");
+            };
+            assert_eq!(delta.revision, index as u64 + 1);
+            assert_eq!(delta.change, change);
+        }
     }
 
     #[tokio::test]

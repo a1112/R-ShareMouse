@@ -870,8 +870,8 @@ impl DaemonState {
         self.local_controls.clone()
     }
 
-    fn ui_snapshot(&self) -> UiSnapshot {
-        let status = self.status_snapshot();
+    fn ui_snapshot_for_connections(&self, connection_infos: &[ConnectionInfo]) -> UiSnapshot {
+        let status = self.status_snapshot_for_connections(connection_infos);
         let diagnostics = status.latency_feedback.clone();
         let capabilities = self.capability_registry_snapshot(&status.network, None);
         UiSnapshot {
@@ -899,15 +899,6 @@ impl DaemonState {
                 media_sessions: Vec::new(),
             },
         }
-    }
-
-    fn ui_snapshot_for_connections(&self, connection_infos: &[ConnectionInfo]) -> UiSnapshot {
-        let mut snapshot = self.ui_snapshot();
-        let status = self.status_snapshot_for_connections(connection_infos);
-        snapshot.capabilities = self.capability_registry_snapshot(&status.network, None);
-        snapshot.dynamic_state.diagnostics = status.latency_feedback.clone();
-        snapshot.status = status;
-        snapshot
     }
 
     fn local_input_feedback(&self) -> LocalInputFeedback {
@@ -8549,8 +8540,7 @@ async fn handle_ipc_client(
                     .context("failed to reconcile UI state after daemon command")?;
             }
             Ok(overlay_stream_truth_onto_fallback_response(
-                response,
-                ui_state.latest_snapshot().as_ref(),
+                response, &ui_state,
             ))
         }
     })
@@ -8621,7 +8611,7 @@ async fn local_controls_fallback_snapshot(
     state: &Arc<RwLock<DaemonState>>,
     ui_state: &StateAggregatorHandle,
 ) -> Result<LocalControlDeviceSnapshot> {
-    let local_controls = {
+    let mut local_controls = {
         let mut state = state.write().await;
         state.refresh_local_controls_platform();
         state.local_control_snapshot()
@@ -8630,56 +8620,32 @@ async fn local_controls_fallback_snapshot(
         .reconcile_from_projection()
         .await
         .context("failed to reconcile UI state for local-controls fallback")?;
-    let response = overlay_stream_truth_onto_fallback_response(
-        DaemonResponse::LocalControls(local_controls),
-        ui_state.latest_snapshot().as_ref(),
-    );
-    match response {
-        DaemonResponse::LocalControls(snapshot) => Ok(snapshot),
-        _ => unreachable!("local-controls overlay preserves the response variant"),
-    }
+    ui_state.overlay_local_controls(&mut local_controls);
+    Ok(local_controls)
 }
 
 fn overlay_stream_truth_onto_fallback_response(
     response: DaemonResponse,
-    snapshot: &UiSnapshot,
+    ui_state: &StateAggregatorHandle,
 ) -> DaemonResponse {
     match response {
         DaemonResponse::Status(mut status) => {
-            status.session_state = snapshot.active_sessions.control.clone();
-            status.active_target = snapshot
-                .active_sessions
-                .control
-                .as_ref()
-                .and_then(|session| match session {
-                    ControlSessionState::TransitioningToRemote { target, .. }
-                    | ControlSessionState::RemoteActive { target, .. } => Some(*target),
-                    ControlSessionState::LocalReady
-                    | ControlSessionState::ReturningLocal { .. }
-                    | ControlSessionState::Suspended { .. } => None,
-                });
+            status.session_state = ui_state.latest_control_session();
+            status.active_target =
+                status
+                    .session_state
+                    .as_ref()
+                    .and_then(|session| match session {
+                        ControlSessionState::TransitioningToRemote { target, .. }
+                        | ControlSessionState::RemoteActive { target, .. } => Some(*target),
+                        ControlSessionState::LocalReady
+                        | ControlSessionState::ReturningLocal { .. }
+                        | ControlSessionState::Suspended { .. } => None,
+                    });
             DaemonResponse::Status(status)
         }
         DaemonResponse::LocalControls(mut controls) => {
-            if let Some(pointer) = &snapshot.dynamic_state.pointer {
-                controls.mouse.x = pointer.x;
-                controls.mouse.y = pointer.y;
-                controls.mouse.current_display_id = pointer.display_id.clone();
-            }
-            controls.keyboard.pressed_keys = snapshot
-                .dynamic_state
-                .pressed_keys
-                .iter()
-                .map(|keycode| format!("{:?}", rshare_input::KeyCode::Raw(*keycode)))
-                .collect();
-            controls.mouse.pressed_buttons = snapshot
-                .dynamic_state
-                .pressed_mouse_buttons
-                .iter()
-                .map(|button| format!("{button:?}"))
-                .collect();
-            controls.gamepads = snapshot.dynamic_state.gamepads.clone();
-            controls.display = snapshot.display_inventory.clone();
+            ui_state.overlay_local_controls(&mut controls);
             DaemonResponse::LocalControls(controls)
         }
         other => other,
@@ -9859,7 +9825,7 @@ mod tests {
 
     #[tokio::test]
     async fn hot_input_classification_does_not_call_projection_but_low_frequency_change_does() {
-        let snapshot = test_daemon_state().ui_snapshot();
+        let snapshot = test_daemon_state().ui_snapshot_for_connections(&[]);
         let calls = Arc::new(AtomicUsize::new(0));
         let projection = Arc::new(CountingUiProjection {
             calls: calls.clone(),
@@ -9899,7 +9865,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_status_and_local_controls_overlay_latest_input_stream_truth() {
         let state = test_daemon_state();
-        let initial = state.ui_snapshot();
+        let initial = state.ui_snapshot_for_connections(&[]);
         let (input, feeds) = input_state_channel(8);
         let aggregator = StateAggregator::with_input(initial, 8, feeds);
         let target = DeviceId::from_u128(55);
@@ -9918,24 +9884,31 @@ mod tests {
             target,
             entered_via: Direction::Right,
         });
-        let latest = tokio::time::timeout(Duration::from_secs(1), aggregator.wait_for_revision(4))
+        let gamepad = LocalGamepadState::from_state(
+            &rshare_core::GamepadState::neutral(7, 1, 42),
+            Some("Test pad".into()),
+            true,
+        );
+        input.publish_gamepads(vec![gamepad.clone()]);
+        tokio::time::timeout(Duration::from_secs(1), aggregator.wait_for_revision(5))
             .await
             .expect("input projection did not reach fallback view")
             .unwrap();
 
         let DaemonResponse::LocalControls(controls) = overlay_stream_truth_onto_fallback_response(
             DaemonResponse::LocalControls(state.local_control_snapshot()),
-            latest.as_ref(),
+            &aggregator,
         ) else {
             panic!("expected fallback local-controls response");
         };
         assert_eq!((controls.mouse.x, controls.mouse.y), (321, -42));
         assert_eq!(controls.keyboard.pressed_keys, vec!["Raw(65)"]);
         assert_eq!(controls.mouse.pressed_buttons, vec!["Left"]);
+        assert_eq!(controls.gamepads, vec![gamepad]);
 
         let DaemonResponse::Status(status) = overlay_stream_truth_onto_fallback_response(
             DaemonResponse::Status(state.status_snapshot()),
-            latest.as_ref(),
+            &aggregator,
         ) else {
             panic!("expected fallback status response");
         };
@@ -9952,7 +9925,7 @@ mod tests {
     #[tokio::test]
     async fn dedicated_local_controls_subscription_writes_latest_input_truth_first() {
         let state = Arc::new(RwLock::new(test_daemon_state()));
-        let initial = state.read().await.ui_snapshot();
+        let initial = state.read().await.ui_snapshot_for_connections(&[]);
         let (input, feeds) = input_state_channel(8);
         let aggregator = StateAggregator::with_projection(
             initial,
