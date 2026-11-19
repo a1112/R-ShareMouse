@@ -19,17 +19,20 @@
       {
         "label": "main",
         "title": "R-ShareMouse",
-        "width": 1280,
-        "height": 820,
-        "minWidth": 980,
-        "minHeight": 680,
+        "width": 1000,
+        "height": 680,
+        "minWidth": 800,
+        "minHeight": 540,
         "center": true,
         "resizable": true,
         "maximizable": true,
         "minimizable": true,
         "closable": true,
         "decorations": false,
-        "shadow": true
+        "shadow": true,
+        "maximized": false,
+        "fullscreen": false,
+        "visible": false
       }
     ],
     "security": {
